@@ -24,3 +24,7 @@
 
 (annotation_type_element_declaration
   name: (identifier) @name) @definition.method
+
+(enum_constant
+  name: (identifier) @name
+  body: (class_body)) @definition.constant

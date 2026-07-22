@@ -167,3 +167,153 @@ def test_java_declaration_only_file_does_not_create_a_module_chunk() -> None:
 
 def test_identifier_normalization_splits_code_and_path_tokens() -> None:
     assert normalize_identifier("HTTPServer_v2/path-name.ts") == ("http server v2 path name ts")
+
+
+def test_java_local_classes_are_qualified_through_the_enclosing_method() -> None:
+    source = b"""class A {
+    void m() {
+        class Local {
+            Local() {}
+
+            void run() {}
+        }
+    }
+
+    void n() {
+        class Local {
+            void run() {}
+        }
+    }
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("A.java"), "java", source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert ("class", "A.m.Local") in symbols
+    assert ("constructor", "A.m.Local.Local") in symbols
+    assert ("method", "A.m.Local.run") in symbols
+    assert ("class", "A.n.Local") in symbols
+    assert ("method", "A.n.Local.run") in symbols
+
+
+def test_java_enum_constant_bodies_qualify_their_methods() -> None:
+    source = b"""enum E {
+    A(1) {
+        void go() {}
+    },
+    B;
+
+    void go() {}
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("E.java"), "java", source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert ("constant", "E.A") in symbols
+    assert ("method", "E.A.go") in symbols
+    assert ("method", "E.go") in symbols
+    assert not any(chunk.symbol == "B" for chunk in result.chunks)
+
+
+def test_container_chunks_stop_before_nested_type_declarations() -> None:
+    source = b"class Outer {\n    class Inner {\n        void work() {}\n    }\n}\n"
+
+    result = TreeSitterExtractor().extract(Path("Outer.java"), "java", source)
+
+    outer = next(chunk for chunk in result.chunks if chunk.qualified_symbol == "Outer")
+    inner = next(chunk for chunk in result.chunks if chunk.qualified_symbol == "Outer.Inner")
+    assert outer.content == "class Outer {"
+    assert inner.content == "class Inner {"
+
+
+def test_python_closures_are_qualified_through_the_enclosing_callable() -> None:
+    source = b"""def outer():
+    def inner():
+        pass
+
+
+class A:
+    def m(self):
+        def helper():
+            pass
+"""
+
+    result = TreeSitterExtractor().extract(Path("mod.py"), "python", source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert ("function", "outer.inner") in symbols
+    assert ("function", "A.m.helper") in symbols
+
+
+def test_qualified_symbols_are_unique_within_a_file() -> None:
+    sources = [
+        ("python", "mod.py", b"def outer():\n    def inner():\n        pass\n"),
+        ("javascript", "app.js", b"function outer() { function inner() {} }\n"),
+        ("java", "E.java", b"enum E {\n    A { void go() {} }\n    void go() {}\n}\n"),
+        (
+            "java",
+            "A.java",
+            b"class A {\n    void m() { class Local {} }\n    void n() { class Local {} }\n}\n",
+        ),
+    ]
+
+    for language, path, source in sources:
+        result = TreeSitterExtractor().extract(Path(path), language, source)
+        keys = [
+            (chunk.kind, chunk.qualified_symbol)
+            for chunk in result.chunks
+            if chunk.symbol is not None and not chunk.kind.endswith("_part")
+        ]
+        assert len(keys) == len(set(keys)), f"duplicate symbols in {path}: {keys}"
+
+
+def test_java_exotic_declarations_extract_surrounding_symbols() -> None:
+    source = b'''sealed interface Shape permits Circle, Square {
+}
+
+final class Circle implements Shape {
+    static final double PI = 3.14;
+
+    static {
+        int ignored = 1;
+    }
+
+    {
+        int alsoIgnored = 2;
+    }
+
+    <T> T pick(T value) {
+        return value;
+    }
+
+    String describe() {
+        String text = """
+                multi line
+                """;
+        java.util.function.Supplier<String> supplier = () -> text;
+        return supplier.get();
+    }
+}
+
+final class Square implements Shape {
+}
+
+@Deprecated
+class Old {
+}
+'''
+
+    result = TreeSitterExtractor().extract(Path("Shapes.java"), "java", source)
+
+    assert result.has_errors is False
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert ("interface", "Shape") in symbols
+    assert ("class", "Circle") in symbols
+    assert ("method", "Circle.pick") in symbols
+    assert ("method", "Circle.describe") in symbols
+    assert ("class", "Square") in symbols
+    assert ("class", "Old") in symbols
+    old_chunk = next(chunk for chunk in result.chunks if chunk.qualified_symbol == "Old")
+    assert old_chunk.content.startswith("@Deprecated")
