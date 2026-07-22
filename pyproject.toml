@@ -56,3 +56,6 @@ python_version = "3.12"
 strict = true
 packages = ["incode_mcp"]
 
+[[tool.mypy.overrides]]
+module = ["lancedb", "lancedb.*", "pyarrow", "pyarrow.*"]
+ignore_missing_imports = true

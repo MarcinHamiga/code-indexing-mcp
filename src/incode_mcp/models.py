@@ -73,3 +73,57 @@ class ExtractedChunk(FrozenModel):
 class ExtractionResult(FrozenModel):
     chunks: list[ExtractedChunk]
     has_errors: bool = False
+
+
+class StoredFile(FrozenModel):
+    file_id: str
+    project_id: str
+    path: str
+    language: str
+    size: int
+    mtime_ns: int
+    content_hash: str
+    has_errors: bool = False
+    error: str | None = None
+    indexed_at: int
+
+
+class StoredChunk(FrozenModel):
+    chunk_id: str
+    file_id: str
+    project_id: str
+    path: str
+    language: str
+    kind: str
+    symbol: str | None = None
+    qualified_symbol: str | None = None
+    parent_symbol: str | None = None
+    start_byte: int
+    end_byte: int
+    start_line: int
+    end_line: int
+    content: str
+    embedding_text: str
+    search_text: str
+    content_hash: str
+    part_index: int = 0
+    vector: list[float]
+
+
+class IndexIssue(FrozenModel):
+    path: str
+    message: str
+
+
+class IndexReport(FrozenModel):
+    project_id: str
+    discovered_files: int = 0
+    indexed_files: int = 0
+    parsed_files: int = 0
+    embedded_chunks: int = 0
+    unchanged_files: int = 0
+    metadata_only_files: int = 0
+    removed_files: int = 0
+    skipped_files: int = 0
+    errors: list[IndexIssue] = Field(default_factory=list)
+    duration_ms: int = 0
