@@ -21,3 +21,6 @@ class IncodeError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.details = details
+
+    def __str__(self) -> str:
+        return f"{self.code}: {super().__str__()}"

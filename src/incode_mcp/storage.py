@@ -14,6 +14,7 @@ from lancedb.table import LanceTable
 
 from .errors import ErrorCode, IncodeError
 from .models import ProjectInfo, StoredChunk, StoredFile
+from .projects import marker_path
 
 SCHEMA_VERSION = 1
 
@@ -44,6 +45,17 @@ class LanceStore:
                 "Project index uses an incompatible schema or embedding model",
                 project=project.id,
             )
+        if existing:
+            registered_root = Path(str(existing[0]["root"])).resolve()
+            incoming_root = project.root.resolve()
+            if registered_root != incoming_root and marker_path(registered_root).exists():
+                raise IncodeError(
+                    ErrorCode.PROJECT_ID_CONFLICT,
+                    "The project ID is already active at another path",
+                    project=project.id,
+                    registered_root=str(registered_root),
+                    incoming_root=str(incoming_root),
+                )
         row = {
             "id": project.id,
             "name": project.name,
@@ -60,6 +72,12 @@ class LanceStore:
     def list_projects(self) -> list[ProjectInfo]:
         rows = self._rows(self._projects)
         return [ProjectInfo.model_validate_json(row["payload"]) for row in rows]
+
+    def project_state(self, project_id: str) -> str:
+        rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
+        if not rows:
+            raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {project_id}")
+        return str(rows[0]["state"])
 
     def list_files(self, project_id: str) -> list[StoredFile]:
         return [

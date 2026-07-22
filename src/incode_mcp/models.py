@@ -172,3 +172,15 @@ class OutlineResponse(FrozenModel):
 
 class CodeChunk(StoredChunk):
     pass
+
+
+class ProjectStatus(FrozenModel):
+    project: ProjectInfo
+    state: str
+    file_count: int
+    chunk_count: int
+
+
+class RemovalReport(FrozenModel):
+    project_id: str
+    removed: bool
