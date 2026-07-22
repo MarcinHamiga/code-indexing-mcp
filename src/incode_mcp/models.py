@@ -53,3 +53,23 @@ class SkippedFile(FrozenModel):
 class ScanResult(FrozenModel):
     files: list[ScannedFile]
     skipped: list[SkippedFile]
+
+
+class ExtractedChunk(FrozenModel):
+    kind: str
+    symbol: str | None = None
+    qualified_symbol: str | None = None
+    parent_symbol: str | None = None
+    start_byte: int
+    end_byte: int
+    start_line: int
+    end_line: int
+    content: str
+    embedding_text: str
+    search_text: str
+    part_index: int = 0
+
+
+class ExtractionResult(FrozenModel):
+    chunks: list[ExtractedChunk]
+    has_errors: bool = False

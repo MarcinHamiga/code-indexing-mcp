@@ -1,0 +1,1 @@
+"""Packaged Tree-sitter queries."""
