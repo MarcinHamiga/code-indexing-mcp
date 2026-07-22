@@ -41,7 +41,7 @@ async def _roots(ctx: ServerContext) -> list[Path]:
 def create_server(application: Application | None = None) -> FastMCP:
     app = application or Application.from_environment()
     mcp = FastMCP(
-        "incode",
+        "code-indexing-mcp",
         instructions="Local Tree-sitter code indexing and hybrid search.",
         json_response=True,
     )

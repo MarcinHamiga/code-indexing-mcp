@@ -29,8 +29,11 @@ def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> N
     )
 
     project = app.init_project(root)
+    assert app.project_status(roots=[root]).state == "pending"
     report = app.index_project(roots=[root])
     status = app.project_status(roots=[root])
+
+    assert status.state == "ready"
     search = app.search_code("locate feature", roots=[root])
     removal = app.remove_project(project.id)
 

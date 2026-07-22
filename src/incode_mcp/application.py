@@ -88,7 +88,7 @@ class Application:
             name=name,
             force_new_id=force_new_id,
         )
-        self.store.upsert_project(project, model_id=self.embedder.model_id)
+        self.store.upsert_project(project, model_id=self.embedder.model_id, state="pending")
         return project
 
     def index_project(
@@ -108,7 +108,7 @@ class Application:
             project=resolved,
             state=self.store.project_state(resolved.id),
             file_count=len(self.store.list_files(resolved.id)),
-            chunk_count=len(self.store.list_chunks([resolved.id])),
+            chunk_count=self.store.count_chunks([resolved.id]),
         )
 
     def list_projects(self) -> list[ProjectInfo]:

@@ -1,8 +1,30 @@
 """Immutable domain models."""
 
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, GetJsonSchemaHandler
+from pydantic.json_schema import JsonSchemaValue
+
+
+class _PathAsPlainString:
+    """Emit a plain string schema for Path fields.
+
+    Pydantic marks ``pathlib.Path`` with ``"format": "path"``, which is not a
+    standard JSON Schema format and makes strict MCP clients warn.
+    """
+
+    def __get_pydantic_json_schema__(
+        self, schema: JsonSchemaValue, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        del handler
+        result = {"type": "string"}
+        if "title" in schema:
+            result["title"] = schema["title"]
+        return result
+
+
+SerializablePath = Annotated[Path, _PathAsPlainString()]
 
 DEFAULT_INCLUDES = [
     "**/*.py",
@@ -32,13 +54,13 @@ class ProjectInfo(FrozenModel):
     version: int = 1
     id: str
     name: str
-    root: Path
+    root: SerializablePath
     scan: ScanConfig = Field(default_factory=ScanConfig)
 
 
 class ScannedFile(FrozenModel):
-    path: Path
-    absolute_path: Path
+    path: SerializablePath
+    absolute_path: SerializablePath
     language: str
     size: int
     mtime_ns: int
@@ -46,7 +68,7 @@ class ScannedFile(FrozenModel):
 
 
 class SkippedFile(FrozenModel):
-    path: Path
+    path: SerializablePath
     reason: str
     detail: str | None = None
 

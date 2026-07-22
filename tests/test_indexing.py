@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from incode_mcp.extractor import TreeSitterExtractor
 from incode_mcp.indexing import Indexer
 from incode_mcp.projects import initialize_project
@@ -116,6 +118,50 @@ def test_failed_changed_file_preserves_previous_chunks(tmp_path: Path) -> None:
 
     assert len(report.errors) == 1
     assert store.list_chunks([project.id]) == original
+
+    # A failed file is recorded with its current size/mtime, so subsequent
+    # runs skip it instead of re-reading, re-parsing, and re-embedding it.
+    batches = len(embedder.passage_batches)
+    second = indexer.index(project)
+    assert len(embedder.passage_batches) == batches
+    assert second.unchanged_files == 1
+    assert store.list_chunks([project.id]) == original
+
+
+def test_force_reindexes_previously_failed_file(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def RAISE_EMBEDDING():\n    return 2\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    failed = indexer.index(project)
+    assert len(failed.errors) == 1
+
+    source.write_text("def stable():\n    return 3\n")
+    forced = indexer.index(project, force=True)
+
+    assert forced.errors == []
+    assert forced.indexed_files == 1
+    assert store.list_files(project.id)[0].has_errors is False
+
+
+def test_unexpected_index_failure_marks_project_error(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("x = 1\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+
+    with (
+        patch.object(SourceScanner, "scan", side_effect=RuntimeError("boom")),
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        indexer.index(project)
+
+    assert store.project_state(project.id) == "error"
 
 
 def test_store_keeps_projects_isolated_and_removal_does_not_touch_markers(

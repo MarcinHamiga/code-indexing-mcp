@@ -1,4 +1,4 @@
-"""Command-line interface for Incode administration and stdio serving."""
+"""Command-line interface for Code Indexing MCP administration and stdio serving."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .server import create_server
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="incode", description="Local MCP code indexer")
+    parser = argparse.ArgumentParser(prog="code-indexing-mcp", description="Local MCP code indexer")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("serve", help="Run the stdio MCP server")
     init = commands.add_parser("init", help="Initialize a local project marker")

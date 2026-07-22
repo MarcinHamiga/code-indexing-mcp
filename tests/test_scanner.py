@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import patch
 
 from incode_mcp.projects import initialize_project
 from incode_mcp.scanner import SourceScanner
@@ -75,3 +76,31 @@ def test_scanner_rejects_oversized_binary_and_symlink_files(tmp_path: Path) -> N
 
     assert result.files == []
     assert {skip.reason for skip in result.skipped} >= {"oversized", "binary", "symlink"}
+
+
+def test_scanner_never_walks_hard_excluded_directories(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    (root / "main.py").write_text("print('ok')\n")
+    vendor = root / "node_modules"
+    vendor.mkdir()
+    (vendor / "vendor.js").write_text("export default 1\n")
+    git = root / ".git"
+    git.mkdir()
+    (git / "hook.py").write_text("hook = True\n")
+
+    stat_failures = []
+    original_stat = Path.stat
+
+    def fail_if_excluded_is_statted(path: Path, *args, **kwargs):
+        if "node_modules" in path.parts or ".git" in path.parts:
+            stat_failures.append(path)
+            raise AssertionError(f"excluded path was statted: {path}")
+        return original_stat(path, *args, **kwargs)
+
+    with patch.object(Path, "stat", fail_if_excluded_is_statted):
+        result = SourceScanner().scan(project)
+
+    assert stat_failures == []
+    assert [item.path.as_posix() for item in result.files] == ["main.py"]

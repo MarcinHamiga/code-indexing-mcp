@@ -1,6 +1,6 @@
-# Incode MCP
+# Code Indexing MCP
 
-Incode is a local-only codebase indexer for MCP clients. It uses Tree-sitter to extract
+Code Indexing MCP is a local-only codebase indexer for MCP clients. It uses Tree-sitter to extract
 syntax-aware chunks, FastEmbed to create embeddings on the local machine, and LanceDB for
 persistent vector and full-text search.
 
@@ -17,7 +17,7 @@ search work offline.
 
 ```bash
 uv sync --all-groups
-uv run incode model pull
+uv run code-indexing-mcp model pull
 ```
 
 The model preparation step is optional; the first index operation downloads the model when it
@@ -28,7 +28,7 @@ is not already cached.
 Run the server over stdio:
 
 ```bash
-uv run incode serve
+uv run code-indexing-mcp serve
 ```
 
 A generic MCP client configuration looks like this:
@@ -36,13 +36,13 @@ A generic MCP client configuration looks like this:
 ```json
 {
   "mcpServers": {
-    "incode": {
+    "code-indexing-mcp": {
       "command": "uv",
       "args": [
         "--directory",
-        "/absolute/path/to/incode",
+        "/absolute/path/to/code-indexing-mcp",
         "run",
-        "incode",
+        "code-indexing-mcp",
         "serve"
       ]
     }
@@ -57,9 +57,9 @@ The server exposes `init_project`, `index_project`, `project_status`, `list_proj
 
 ```bash
 cd /path/to/project
-uv run --project /path/to/incode incode init
-uv run --project /path/to/incode incode index
-uv run --project /path/to/incode incode status
+uv run --project /path/to/code-indexing-mcp code-indexing-mcp init
+uv run --project /path/to/code-indexing-mcp code-indexing-mcp index
+uv run --project /path/to/code-indexing-mcp code-indexing-mcp status
 ```
 
 Initialization creates `.incode/project.toml` and a self-ignoring `.incode/.gitignore`. The
@@ -99,7 +99,7 @@ export INCODE_CACHE_DIR=/path/to/model-cache
 export INCODE_OFFLINE=1
 ```
 
-With `INCODE_OFFLINE=1`, Incode will not download a missing model and returns
+With `INCODE_OFFLINE=1`, Code Indexing MCP will not download a missing model and returns
 `MODEL_UNAVAILABLE` instead. Source code, embeddings, and search queries remain local; there is
 no telemetry.
 
@@ -121,3 +121,7 @@ INCODE_MODEL_TEST_CACHE=/path/to/cache uv run pytest -m model
 
 V1 intentionally excludes filesystem watching, HTTP transports, dependency/call graphs,
 cross-reference resolution, custom embedding profiles, and automatic storage migrations.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

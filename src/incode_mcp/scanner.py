@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pathspec import GitIgnoreSpec
@@ -47,11 +48,12 @@ class SourceScanner:
         known_files = known_files or {}
         config_excludes = GitIgnoreSpec.from_lines(project.scan.exclude)
         include_spec = GitIgnoreSpec.from_lines(project.scan.include)
-        ignore_specs = self._load_ignore_specs(root)
+        candidates, gitignores = self._walk(root)
+        ignore_specs = self._load_ignore_specs(root, gitignores)
         files: list[ScannedFile] = []
         skipped: list[SkippedFile] = []
 
-        for absolute in sorted(root.rglob("*")):
+        for absolute in candidates:
             relative = absolute.relative_to(root)
             if self._in_hard_excluded_directory(relative):
                 continue
@@ -111,13 +113,35 @@ class SourceScanner:
         return ScanResult(files=files, skipped=skipped)
 
     @staticmethod
+    def _walk(root: Path) -> tuple[list[Path], list[Path]]:
+        """Collect candidate files and .gitignore files without descending into
+        hard-excluded or symlinked directories."""
+        candidates: list[Path] = []
+        gitignores: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            base = Path(dirpath)
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if name not in HARD_EXCLUDED_DIRECTORIES and not (base / name).is_symlink()
+            )
+            for name in filenames:
+                path = base / name
+                candidates.append(path)
+                if name == ".gitignore":
+                    gitignores.append(path)
+        candidates.sort()
+        gitignores.sort()
+        return candidates, gitignores
+
+    @staticmethod
     def _in_hard_excluded_directory(path: Path) -> bool:
         return any(part in HARD_EXCLUDED_DIRECTORIES for part in path.parts[:-1])
 
     @staticmethod
-    def _load_ignore_specs(root: Path) -> list[tuple[Path, GitIgnoreSpec]]:
+    def _load_ignore_specs(root: Path, gitignores: list[Path]) -> list[tuple[Path, GitIgnoreSpec]]:
         specs: list[tuple[Path, GitIgnoreSpec]] = []
-        for path in sorted(root.rglob(".gitignore")):
+        for path in gitignores:
             relative = path.relative_to(root)
             if SourceScanner._in_hard_excluded_directory(relative):
                 continue

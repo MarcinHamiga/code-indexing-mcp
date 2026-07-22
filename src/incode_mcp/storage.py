@@ -121,6 +121,14 @@ class LanceStore:
         rows = self._rows(self._chunks, f"chunk_id = {_quoted(chunk_id)}")
         return StoredChunk.model_validate(rows[0]) if rows else None
 
+    def count_chunks(self, project_ids: Iterable[str] | None = None) -> int:
+        project_ids = list(project_ids or [])
+        condition = None
+        if project_ids:
+            values = ", ".join(_quoted(project_id) for project_id in project_ids)
+            condition = f"project_id IN ({values})"
+        return int(self._chunks.count_rows(condition))
+
     def hybrid_search(
         self,
         query_text: str,
@@ -138,7 +146,11 @@ class LanceStore:
         )
         return cast(list[dict[str, Any]], query.to_list())
 
-    def ensure_indexes(self) -> None:
+    def ensure_indexes(self, *, compact: bool = False) -> None:
+        # NOTE: lance 8.x has no incremental FTS/BTree indexing — create_index
+        # with replace=False fails once the index exists, so a rebuild
+        # (replace=True) is required whenever rows changed. Callers should
+        # therefore only invoke this when data actually changed.
         self._chunks.create_index(
             "search_text",
             config=FTS(lower_case=True, stem=False, remove_stop_words=False),
@@ -146,9 +158,10 @@ class LanceStore:
         )
         for column in ("project_id", "file_id", "language", "path", "symbol"):
             self._chunks.create_index(column, config=BTree(), replace=True)
-        if len(self._rows(self._chunks)) >= 20_000:
+        if self._chunks.count_rows() >= 20_000:
             self._chunks.create_index("vector", config=HnswSq(distance_type="cosine"), replace=True)
-        self._chunks.optimize()
+        if compact:
+            self._chunks.optimize()
 
     def remove_project(self, project_id: str) -> bool:
         existed = bool(self._rows(self._projects, f"id = {_quoted(project_id)}"))

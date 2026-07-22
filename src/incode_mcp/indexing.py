@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import time
 from pathlib import Path
@@ -55,6 +56,15 @@ class Indexer:
 
     def _index_locked(self, project: ProjectInfo, *, force: bool) -> IndexReport:
         self.store.upsert_project(project, model_id=self.embedder.model_id, state="indexing")
+        try:
+            return self._index_scan(project, force=force)
+        except Exception:
+            # Never leave the project stuck in "indexing" after a crash.
+            with contextlib.suppress(Exception):
+                self.store.upsert_project(project, model_id=self.embedder.model_id, state="error")
+            raise
+
+    def _index_scan(self, project: ProjectInfo, *, force: bool) -> IndexReport:
         existing = {record.path: record for record in self.store.list_files(project.id)}
         scan = self.scanner.scan(project, existing)
         current_paths = {item.path.as_posix() for item in scan.files}
@@ -72,6 +82,7 @@ class Indexer:
             ):
                 unchanged += 1
                 continue
+            content_hash: str | None = None
             try:
                 source = (
                     item.content if item.content is not None else item.absolute_path.read_bytes()
@@ -109,6 +120,30 @@ class Indexer:
                 embedded += len(chunks)
             except Exception as exc:
                 errors.append(IndexIssue(path=path, message=str(exc)))
+                # Record the failure so the file is not re-read, re-parsed, and
+                # re-embedded on every run. It is retried only when the file
+                # changes again or when force=True. Chunks from a previous
+                # successful index (if any) are left untouched.
+                self.store.upsert_file(
+                    StoredFile(
+                        file_id=_digest(f"{project.id}\0{path}"),
+                        project_id=project.id,
+                        path=path,
+                        language=item.language,
+                        size=item.size,
+                        mtime_ns=item.mtime_ns,
+                        content_hash=(
+                            content_hash
+                            if content_hash is not None
+                            else previous.content_hash
+                            if previous is not None
+                            else ""
+                        ),
+                        has_errors=True,
+                        error=str(exc),
+                        indexed_at=time.time_ns(),
+                    )
+                )
 
         for path, record in existing.items():
             if path not in current_paths:
@@ -116,7 +151,7 @@ class Indexer:
                 removed += 1
 
         if indexed or removed:
-            self.store.ensure_indexes()
+            self.store.ensure_indexes(compact=removed > 0)
 
         self.store.upsert_project(
             project,
