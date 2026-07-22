@@ -75,9 +75,14 @@ Index refreshes are explicit and incremental:
 - Removed files are deleted from the active index.
 - A parse or embedding failure preserves the previous indexed version.
 
-Python, Python stubs, JavaScript, JSX, TypeScript, and TSX are supported. The scanner respects
-root and nested `.gitignore` files and excludes symlinks, binary files, files over 1 MiB, build
-outputs, virtual environments, and dependency directories.
+Python, Python stubs, Java, JavaScript, JSX, TypeScript, and TSX are supported. Java indexing
+extracts classes, interfaces, records, enums, annotation types, methods, constructors, and nested
+declarations without requiring a JDK, Maven, or Gradle. The scanner respects root and nested
+`.gitignore` files and excludes symlinks, binary files, files over 1 MiB, build outputs, virtual
+environments, and dependency directories.
+
+Existing project markers that use the exact pre-Java default include list automatically include
+`**/*.java` at runtime. If you use a customized `scan.include` list, add `**/*.java` explicitly.
 
 ## Multi-project search
 

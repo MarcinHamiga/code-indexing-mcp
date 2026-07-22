@@ -12,6 +12,7 @@ from .models import ProjectInfo, ScannedFile, ScanResult, SkippedFile, StoredFil
 LANGUAGES = {
     ".py": "python",
     ".pyi": "python",
+    ".java": "java",
     ".js": "javascript",
     ".jsx": "javascript",
     ".mjs": "javascript",

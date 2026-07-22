@@ -27,6 +27,19 @@ def test_scanner_honors_languages_gitignore_and_hard_exclusions(tmp_path: Path) 
     assert {skip.reason for skip in result.skipped} >= {"unsupported", "ignored"}
 
 
+def test_scanner_discovers_java_files_by_default(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    (root / "Service.java").write_text("class Service {}\n")
+
+    result = SourceScanner().scan(project)
+
+    assert [(item.path.as_posix(), item.language) for item in result.files] == [
+        ("Service.java", "java"),
+    ]
+
+
 def test_scanner_applies_nested_gitignore_and_config_excludes(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     package = root / "package"
