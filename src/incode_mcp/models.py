@@ -42,6 +42,7 @@ class ScannedFile(FrozenModel):
     language: str
     size: int
     mtime_ns: int
+    content: bytes | None = None
 
 
 class SkippedFile(FrozenModel):

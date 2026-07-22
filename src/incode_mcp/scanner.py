@@ -6,7 +6,7 @@ from pathlib import Path
 
 from pathspec import GitIgnoreSpec
 
-from .models import ProjectInfo, ScannedFile, ScanResult, SkippedFile
+from .models import ProjectInfo, ScannedFile, ScanResult, SkippedFile, StoredFile
 
 LANGUAGES = {
     ".py": "python",
@@ -40,8 +40,11 @@ HARD_EXCLUDED_DIRECTORIES = {
 
 
 class SourceScanner:
-    def scan(self, project: ProjectInfo) -> ScanResult:
+    def scan(
+        self, project: ProjectInfo, known_files: dict[str, StoredFile] | None = None
+    ) -> ScanResult:
         root = project.root.resolve()
+        known_files = known_files or {}
         config_excludes = GitIgnoreSpec.from_lines(project.scan.exclude)
         include_spec = GitIgnoreSpec.from_lines(project.scan.include)
         ignore_specs = self._load_ignore_specs(root)
@@ -72,18 +75,29 @@ class SourceScanner:
                 if stat.st_size > project.scan.max_file_bytes:
                     skipped.append(SkippedFile(path=relative, reason="oversized"))
                     continue
-                sample = absolute.read_bytes()
             except OSError as exc:
                 skipped.append(SkippedFile(path=relative, reason="unreadable", detail=str(exc)))
                 continue
-            if b"\x00" in sample:
-                skipped.append(SkippedFile(path=relative, reason="binary"))
-                continue
-            try:
-                sample.decode("utf-8-sig")
-            except UnicodeDecodeError as exc:
-                skipped.append(SkippedFile(path=relative, reason="encoding", detail=str(exc)))
-                continue
+            previous = known_files.get(relative.as_posix())
+            content: bytes | None = None
+            if (
+                previous is None
+                or previous.size != stat.st_size
+                or previous.mtime_ns != stat.st_mtime_ns
+            ):
+                try:
+                    content = absolute.read_bytes()
+                except OSError as exc:
+                    skipped.append(SkippedFile(path=relative, reason="unreadable", detail=str(exc)))
+                    continue
+                if b"\x00" in content:
+                    skipped.append(SkippedFile(path=relative, reason="binary"))
+                    continue
+                try:
+                    content.decode("utf-8-sig")
+                except UnicodeDecodeError as exc:
+                    skipped.append(SkippedFile(path=relative, reason="encoding", detail=str(exc)))
+                    continue
             files.append(
                 ScannedFile(
                     path=relative,
@@ -91,6 +105,7 @@ class SourceScanner:
                     language=language,
                     size=stat.st_size,
                     mtime_ns=stat.st_mtime_ns,
+                    content=content,
                 )
             )
         return ScanResult(files=files, skipped=skipped)
@@ -119,11 +134,13 @@ class SourceScanner:
 
     @staticmethod
     def _is_ignored(path: Path, specs: list[tuple[Path, GitIgnoreSpec]]) -> bool:
+        ignored = False
         for base, spec in specs:
             try:
                 candidate = path if base == Path(".") else path.relative_to(base)
-                if spec.match_file(candidate.as_posix()):
-                    return True
+                result = spec.check_file(candidate.as_posix())
+                if result.include is not None:
+                    ignored = result.include
             except ValueError:
                 continue
-        return False
+        return ignored

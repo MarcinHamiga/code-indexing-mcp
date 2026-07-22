@@ -43,6 +43,21 @@ def test_scanner_applies_nested_gitignore_and_config_excludes(tmp_path: Path) ->
     assert result.files == []
 
 
+def test_nested_gitignore_can_reinclude_a_file(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    package = root / "package"
+    package.mkdir(parents=True)
+    project = initialize_project(root)
+    (root / ".gitignore").write_text("package/*.py\n")
+    (package / ".gitignore").write_text("!keep.py\n")
+    (package / "keep.py").write_text("keep = True\n")
+    (package / "drop.py").write_text("drop = True\n")
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["package/keep.py"]
+
+
 def test_scanner_rejects_oversized_binary_and_symlink_files(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()

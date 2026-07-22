@@ -69,8 +69,20 @@ class Application:
         return cls(RuntimePaths.from_environment(), cwd=cwd)
 
     def init_project(
-        self, path: Path | str | None = None, name: str | None = None, force_new_id: bool = False
+        self,
+        path: Path | str | None = None,
+        name: str | None = None,
+        force_new_id: bool = False,
+        *,
+        roots: list[Path] | None = None,
     ) -> ProjectInfo:
+        if path is None and roots:
+            if len(roots) > 1:
+                raise IncodeError(
+                    ErrorCode.AMBIGUOUS_PROJECT,
+                    "Multiple MCP roots are available; provide an explicit path",
+                )
+            path = roots[0]
         project = initialize_project(
             Path(path) if path is not None else self.cwd,
             name=name,

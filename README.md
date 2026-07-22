@@ -57,9 +57,9 @@ The server exposes `init_project`, `index_project`, `project_status`, `list_proj
 
 ```bash
 cd /path/to/project
-uv run --directory /path/to/incode incode init
-uv run --directory /path/to/incode incode index
-uv run --directory /path/to/incode incode status
+uv run --project /path/to/incode incode init
+uv run --project /path/to/incode incode index
+uv run --project /path/to/incode incode status
 ```
 
 Initialization creates `.incode/project.toml` and a self-ignoring `.incode/.gitignore`. The
@@ -121,4 +121,3 @@ INCODE_MODEL_TEST_CACHE=/path/to/cache uv run pytest -m model
 
 V1 intentionally excludes filesystem watching, HTTP transports, dependency/call graphs,
 cross-reference resolution, custom embedding profiles, and automatic storage migrations.
-

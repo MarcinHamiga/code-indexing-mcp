@@ -53,8 +53,13 @@ def create_server(application: Application | None = None) -> FastMCP:
         name: str | None = None,
         force_new_id: bool = False,
     ) -> ProjectInfo:
-        del ctx
-        return await asyncio.to_thread(app.init_project, path, name, force_new_id)
+        return await asyncio.to_thread(
+            app.init_project,
+            path,
+            name,
+            force_new_id,
+            roots=await _roots(ctx),
+        )
 
     @mcp.tool()
     async def index_project(

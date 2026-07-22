@@ -55,8 +55,8 @@ class Indexer:
 
     def _index_locked(self, project: ProjectInfo, *, force: bool) -> IndexReport:
         self.store.upsert_project(project, model_id=self.embedder.model_id, state="indexing")
-        scan = self.scanner.scan(project)
         existing = {record.path: record for record in self.store.list_files(project.id)}
+        scan = self.scanner.scan(project, existing)
         current_paths = {item.path.as_posix() for item in scan.files}
         indexed = parsed = embedded = unchanged = metadata_only = removed = 0
         errors: list[IndexIssue] = []
@@ -73,7 +73,9 @@ class Indexer:
                 unchanged += 1
                 continue
             try:
-                source = item.absolute_path.read_bytes()
+                source = (
+                    item.content if item.content is not None else item.absolute_path.read_bytes()
+                )
                 content_hash = _digest(source)
                 if not force and previous is not None and previous.content_hash == content_hash:
                     self.store.upsert_file(

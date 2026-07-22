@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 from incode_mcp.extractor import TreeSitterExtractor
 from incode_mcp.indexing import Indexer
@@ -51,7 +52,15 @@ def test_indexer_skips_unchanged_and_metadata_only_files(tmp_path: Path) -> None
     indexer, store = make_indexer(tmp_path, embedder)
 
     first = indexer.index(project)
-    second = indexer.index(project)
+    original_read_bytes = Path.read_bytes
+
+    def fail_if_source_is_read(path: Path) -> bytes:
+        if path == source:
+            raise AssertionError("unchanged source was read")
+        return original_read_bytes(path)
+
+    with patch.object(Path, "read_bytes", fail_if_source_is_read):
+        second = indexer.index(project)
     stat = source.stat()
     os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
     metadata_only = indexer.index(project)

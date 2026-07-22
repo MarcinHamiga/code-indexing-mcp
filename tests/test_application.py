@@ -43,6 +43,20 @@ def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> N
     assert (root / ".incode" / "project.toml").exists()
 
 
+def test_init_project_defaults_to_the_single_client_root(tmp_path: Path) -> None:
+    root = tmp_path / "client-root"
+    root.mkdir()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+
+    project = app.init_project(roots=[root])
+
+    assert project.root == root.resolve()
+
+
 def test_application_supports_explicit_cross_project_search(tmp_path: Path) -> None:
     app = Application(
         RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
