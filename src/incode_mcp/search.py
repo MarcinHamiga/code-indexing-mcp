@@ -1,0 +1,152 @@
+"""Hybrid retrieval and structural lookup services."""
+
+from __future__ import annotations
+
+from pathlib import PurePosixPath
+
+from .embedding import Embedder
+from .errors import ErrorCode, IncodeError
+from .models import (
+    CodeChunk,
+    OutlineItem,
+    OutlineResponse,
+    SearchHit,
+    SearchResponse,
+    StoredChunk,
+    SymbolResponse,
+)
+from .storage import LanceStore, _quoted
+
+
+class SearchService:
+    def __init__(self, store: LanceStore, embedder: Embedder) -> None:
+        self.store = store
+        self.embedder = embedder
+
+    def search_code(
+        self,
+        query: str,
+        project_ids: list[str],
+        *,
+        languages: list[str] | None = None,
+        paths: list[str] | None = None,
+        kinds: list[str] | None = None,
+        limit: int = 8,
+    ) -> SearchResponse:
+        query = query.strip()
+        if not query or not project_ids:
+            raise IncodeError(
+                ErrorCode.INVALID_FILTER, "Search requires a query and at least one project"
+            )
+        limit = max(1, min(limit, 50))
+        conditions = [self._in_condition("project_id", project_ids)]
+        if languages:
+            conditions.append(self._in_condition("language", languages))
+        if kinds:
+            conditions.append(self._in_condition("kind", kinds))
+        rows = self.store.hybrid_search(
+            query,
+            self.embedder.embed_query(query),
+            " AND ".join(conditions),
+            max(50, limit * 5),
+        )
+        names = {project.id: project.name for project in self.store.list_projects()}
+        hits: list[SearchHit] = []
+        seen: set[tuple[str, str, int, int]] = set()
+        for row in rows:
+            chunk = StoredChunk.model_validate(row)
+            if paths and not any(PurePosixPath(chunk.path).match(pattern) for pattern in paths):
+                continue
+            key = (chunk.project_id, chunk.path, chunk.start_line, chunk.end_line)
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(self._hit(chunk, names, float(row.get("_relevance_score", 0.0))))
+            if len(hits) == limit:
+                break
+        hits.sort(key=lambda hit: (-hit.score, hit.path, hit.start_line))
+        return SearchResponse(query=query, hits=hits)
+
+    def find_symbol(
+        self,
+        name: str,
+        project_id: str,
+        *,
+        match: str = "exact",
+        kinds: list[str] | None = None,
+        limit: int = 20,
+    ) -> SymbolResponse:
+        if match not in {"exact", "prefix", "contains"}:
+            raise IncodeError(ErrorCode.INVALID_FILTER, f"Invalid symbol match mode: {match}")
+        limit = max(1, min(limit, 50))
+        candidates = self.store.list_chunks([project_id])
+        names = {project.id: project.name for project in self.store.list_projects()}
+
+        def matches(chunk: StoredChunk) -> bool:
+            candidate = chunk.qualified_symbol or chunk.symbol or ""
+            if kinds and chunk.kind not in kinds:
+                return False
+            if match == "exact":
+                return candidate == name or chunk.symbol == name
+            if match == "prefix":
+                return candidate.startswith(name)
+            return name in candidate
+
+        selected = sorted(
+            (chunk for chunk in candidates if matches(chunk)),
+            key=lambda chunk: (chunk.path, chunk.start_line, chunk.kind),
+        )[:limit]
+        return SymbolResponse(name=name, hits=[self._hit(chunk, names, 1.0) for chunk in selected])
+
+    def file_outline(self, path: str, project_id: str) -> OutlineResponse:
+        items: list[OutlineItem] = []
+        seen: set[tuple[str, str]] = set()
+        for chunk in sorted(
+            self.store.list_chunks([project_id]), key=lambda item: (item.path, item.start_line)
+        ):
+            if chunk.path != path or not chunk.symbol or not chunk.qualified_symbol:
+                continue
+            key = (chunk.kind.removesuffix("_part"), chunk.qualified_symbol)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(
+                OutlineItem(
+                    kind=key[0],
+                    symbol=chunk.symbol,
+                    qualified_symbol=chunk.qualified_symbol,
+                    parent_symbol=chunk.parent_symbol,
+                    start_line=chunk.start_line,
+                    end_line=chunk.end_line,
+                )
+            )
+        return OutlineResponse(project_id=project_id, path=path, items=items)
+
+    def get_chunk(self, chunk_id: str) -> CodeChunk:
+        chunk = self.store.get_chunk(chunk_id)
+        if chunk is None:
+            raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown chunk: {chunk_id}")
+        return CodeChunk.model_validate(chunk.model_dump())
+
+    @staticmethod
+    def _in_condition(column: str, values: list[str]) -> str:
+        return f"{column} IN ({', '.join(_quoted(value) for value in values)})"
+
+    @staticmethod
+    def _hit(chunk: StoredChunk, names: dict[str, str], score: float) -> SearchHit:
+        snippet = chunk.content[:4_000]
+        return SearchHit(
+            chunk_id=chunk.chunk_id,
+            project_id=chunk.project_id,
+            project_name=names.get(chunk.project_id, chunk.project_id),
+            path=chunk.path,
+            language=chunk.language,
+            kind=chunk.kind,
+            symbol=chunk.symbol,
+            qualified_symbol=chunk.qualified_symbol,
+            start_line=chunk.start_line,
+            end_line=chunk.end_line,
+            score=score,
+            snippet=snippet,
+            truncated=len(chunk.content) > len(snippet),
+        )

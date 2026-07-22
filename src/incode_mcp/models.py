@@ -127,3 +127,48 @@ class IndexReport(FrozenModel):
     skipped_files: int = 0
     errors: list[IndexIssue] = Field(default_factory=list)
     duration_ms: int = 0
+
+
+class SearchHit(FrozenModel):
+    chunk_id: str
+    project_id: str
+    project_name: str
+    path: str
+    language: str
+    kind: str
+    symbol: str | None = None
+    qualified_symbol: str | None = None
+    start_line: int
+    end_line: int
+    score: float
+    snippet: str
+    truncated: bool = False
+
+
+class SearchResponse(FrozenModel):
+    query: str
+    hits: list[SearchHit]
+
+
+class SymbolResponse(FrozenModel):
+    name: str
+    hits: list[SearchHit]
+
+
+class OutlineItem(FrozenModel):
+    kind: str
+    symbol: str
+    qualified_symbol: str
+    parent_symbol: str | None = None
+    start_line: int
+    end_line: int
+
+
+class OutlineResponse(FrozenModel):
+    project_id: str
+    path: str
+    items: list[OutlineItem]
+
+
+class CodeChunk(StoredChunk):
+    pass

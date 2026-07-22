@@ -113,6 +113,9 @@ class Indexer:
                 self.store.remove_file(project.id, record.file_id)
                 removed += 1
 
+        if indexed or removed:
+            self.store.ensure_indexes()
+
         self.store.upsert_project(
             project,
             model_id=self.embedder.model_id,

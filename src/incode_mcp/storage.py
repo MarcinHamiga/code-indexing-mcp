@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import lancedb
 import pyarrow as pa
+from lancedb.index import FTS, BTree, HnswSq
 from lancedb.table import LanceTable
 
 from .errors import ErrorCode, IncodeError
@@ -101,6 +102,35 @@ class LanceStore:
     def get_chunk(self, chunk_id: str) -> StoredChunk | None:
         rows = self._rows(self._chunks, f"chunk_id = {_quoted(chunk_id)}")
         return StoredChunk.model_validate(rows[0]) if rows else None
+
+    def hybrid_search(
+        self,
+        query_text: str,
+        vector: list[float],
+        condition: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        query = (
+            self._chunks.search(query_type="hybrid", vector_column_name="vector")
+            .vector(vector)
+            .text(query_text)
+            .where(condition, prefilter=True)
+            .limit(limit)
+            .rerank()
+        )
+        return cast(list[dict[str, Any]], query.to_list())
+
+    def ensure_indexes(self) -> None:
+        self._chunks.create_index(
+            "search_text",
+            config=FTS(lower_case=True, stem=False, remove_stop_words=False),
+            replace=True,
+        )
+        for column in ("project_id", "file_id", "language", "path", "symbol"):
+            self._chunks.create_index(column, config=BTree(), replace=True)
+        if len(self._rows(self._chunks)) >= 20_000:
+            self._chunks.create_index("vector", config=HnswSq(distance_type="cosine"), replace=True)
+        self._chunks.optimize()
 
     def remove_project(self, project_id: str) -> bool:
         existed = bool(self._rows(self._projects, f"id = {_quoted(project_id)}"))
