@@ -18,6 +18,20 @@ class TinyEmbedder:
         return [1.0, 0.0, 0.0, float(len(text))]
 
 
+class OtherModelTinyEmbedder:
+    """Same vector dimension as TinyEmbedder but a different model_id, to
+    exercise LanceStore's incompatible-model detection."""
+
+    model_id = "test/other-tiny"
+    dimension = 4
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0, 0.0, float(len(text))] for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return [1.0, 0.0, 0.0, float(len(text))]
+
+
 def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
@@ -58,6 +72,50 @@ def test_init_project_defaults_to_the_single_client_root(tmp_path: Path) -> None
     project = app.init_project(roots=[root])
 
     assert project.root == root.resolve()
+
+
+def test_discover_project_requires_marker_and_supported_source(tmp_path: Path) -> None:
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    source_only = tmp_path / "source-only"
+    source_only.mkdir()
+    (source_only / "main.py").write_text("value = 1\n")
+
+    assert app.discover_project(source_only) is None
+    assert not (source_only / ".ci-mcp").exists()
+
+    (source_only / "pyproject.toml").write_text("[project]\nname = 'source-only'\n")
+
+    project = app.discover_project(source_only)
+
+    assert project is not None
+    assert project.root == source_only.resolve()
+    assert app.project_status(project.id).state == "pending"
+    assert (source_only / ".ci-mcp" / "project.toml").exists()
+
+
+def test_discover_project_accepts_javascript_manifest_and_existing_marker(tmp_path: Path) -> None:
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    javascript = tmp_path / "javascript"
+    javascript.mkdir()
+    (javascript / "package.json").write_text('{"name": "javascript"}\n')
+    (javascript / "main.ts").write_text("export const value = 1\n")
+
+    project = app.discover_project(javascript)
+
+    assert project is not None
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    existing = app.init_project(empty)
+
+    assert app.discover_project(empty) == existing
 
 
 def test_application_supports_explicit_cross_project_search(tmp_path: Path) -> None:
@@ -125,3 +183,32 @@ def test_duplicate_legacy_project_marker_is_still_rejected(tmp_path: Path) -> No
         app.index_project(str(duplicate))
 
     assert raised.value.code is ErrorCode.PROJECT_ID_CONFLICT
+
+
+def test_reregistering_a_known_project_preserves_state_and_still_validates_compatibility(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def locate_feature():\n    return True\n")
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=root)
+    project = app.init_project(root)
+    app.index_project(project.id)
+    assert app.project_status(project.id).state == "ready"
+
+    # Re-initializing (or re-discovering) an already-known, ready project
+    # must not reset its state back to "pending".
+    app.init_project(root)
+    assert app.project_status(project.id).state == "ready"
+    app.discover_project(root)
+    assert app.project_status(project.id).state == "ready"
+
+    other_app = Application(paths, embedder=OtherModelTinyEmbedder(), cwd=root)
+    with pytest.raises(IncodeError) as raised_init:
+        other_app.init_project(root)
+    assert raised_init.value.code is ErrorCode.INDEX_INCOMPATIBLE
+
+    with pytest.raises(IncodeError) as raised_discover:
+        other_app.discover_project(root)
+    assert raised_discover.value.code is ErrorCode.INDEX_INCOMPATIBLE

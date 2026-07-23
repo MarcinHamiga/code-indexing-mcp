@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import patch
 
+from incode_mcp.models import ScanConfig
 from incode_mcp.projects import initialize_project
 from incode_mcp.scanner import SourceScanner
 
@@ -25,6 +26,19 @@ def test_scanner_honors_languages_gitignore_and_hard_exclusions(tmp_path: Path) 
         ("main.py", "python"),
     ]
     assert {skip.reason for skip in result.skipped} >= {"unsupported", "ignored"}
+
+
+def test_scanner_discovers_java_files_by_default(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    (root / "Service.java").write_text("class Service {}\n")
+
+    result = SourceScanner().scan(project)
+
+    assert [(item.path.as_posix(), item.language) for item in result.files] == [
+        ("Service.java", "java"),
+    ]
 
 
 def test_scanner_applies_nested_gitignore_and_config_excludes(tmp_path: Path) -> None:
@@ -110,3 +124,36 @@ def test_scanner_never_walks_hard_excluded_directories(tmp_path: Path) -> None:
 
     assert stat_failures == []
     assert [item.path.as_posix() for item in result.files] == ["main.py"]
+
+
+def test_has_supported_source_respects_ignore_and_hard_exclusion_rules(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / ".gitignore").write_text("ignored.py\n")
+    (root / "ignored.py").write_text("value = 1\n")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "vendor.js").write_text("export default 1\n")
+
+    assert SourceScanner().has_supported_source(root, ScanConfig()) is False
+
+    (root / "main.ts").write_text("export const answer = 42\n")
+
+    assert SourceScanner().has_supported_source(root, ScanConfig()) is True
+
+
+def test_has_supported_source_applies_nested_gitignore_rules(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    package = root / "package"
+    package.mkdir(parents=True)
+    (root / ".gitignore").write_text("package/*.py\n")
+    (package / ".gitignore").write_text("!keep.py\n")
+    keep = package / "keep.py"
+    keep.write_text("keep = True\n")
+    (package / "drop.py").write_text("drop = True\n")
+    scanner = SourceScanner()
+
+    assert scanner.has_supported_source(root, ScanConfig()) is True
+
+    keep.unlink()
+
+    assert scanner.has_supported_source(root, ScanConfig()) is False

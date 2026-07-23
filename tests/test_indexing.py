@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from incode_mcp.errors import ErrorCode, IncodeError
 from incode_mcp.extractor import TreeSitterExtractor
 from incode_mcp.indexing import Indexer
 from incode_mcp.projects import initialize_project
@@ -161,6 +162,28 @@ def test_unexpected_index_failure_marks_project_error(tmp_path: Path) -> None:
     ):
         indexer.index(project)
 
+    assert store.project_state(project.id) == "error"
+
+
+def test_model_unavailable_marks_project_error(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("value = 1\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+
+    with (
+        patch.object(
+            embedder,
+            "embed_passages",
+            side_effect=IncodeError(ErrorCode.MODEL_UNAVAILABLE, "model missing"),
+        ),
+        pytest.raises(IncodeError) as raised,
+    ):
+        indexer.index(project)
+
+    assert raised.value.code is ErrorCode.MODEL_UNAVAILABLE
     assert store.project_state(project.id) == "error"
 
 

@@ -11,7 +11,7 @@ import tomli_w
 from pydantic import ValidationError
 
 from .errors import ErrorCode, IncodeError
-from .models import ProjectInfo, ScanConfig
+from .models import DEFAULT_INCLUDES, LEGACY_DEFAULT_INCLUDES_V1, ProjectInfo, ScanConfig
 
 MARKER_DIRECTORY = ".ci-mcp"
 LEGACY_MARKER_DIRECTORY = ".incode"
@@ -68,12 +68,15 @@ def read_project_marker(root: Path) -> ProjectInfo:
         if raw.get("version") != 1:
             raise ValueError("unsupported marker version")
         UUID(str(raw["id"]))
+        scan = ScanConfig.model_validate(raw.get("scan", {}))
+        if scan.include == LEGACY_DEFAULT_INCLUDES_V1:
+            scan = scan.model_copy(update={"include": list(DEFAULT_INCLUDES)})
         return ProjectInfo(
             version=raw["version"],
             id=str(raw["id"]),
             name=str(raw["name"]),
             root=root,
-            scan=ScanConfig.model_validate(raw.get("scan", {})),
+            scan=scan,
         )
     except (OSError, KeyError, TypeError, ValueError, ValidationError) as exc:
         raise IncodeError(

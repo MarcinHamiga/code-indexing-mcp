@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import tomli_w
 
 from incode_mcp.errors import ErrorCode, IncodeError
 from incode_mcp.projects import (
@@ -48,6 +49,63 @@ def test_initialize_project_is_idempotent_unless_forced(tmp_path: Path) -> None:
 
     assert second.id == first.id
     assert replacement.id != first.id
+
+
+def test_legacy_default_marker_adds_java_without_rewriting_file(tmp_path: Path) -> None:
+    root = tmp_path / "demo"
+    root.mkdir()
+    marker = root / ".incode" / "project.toml"
+    marker.parent.mkdir()
+    contents = tomli_w.dumps(
+        {
+            "version": 1,
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "demo",
+            "scan": {
+                "include": [
+                    "**/*.py",
+                    "**/*.pyi",
+                    "**/*.js",
+                    "**/*.jsx",
+                    "**/*.mjs",
+                    "**/*.cjs",
+                    "**/*.ts",
+                    "**/*.tsx",
+                    "**/*.mts",
+                    "**/*.cts",
+                ],
+                "exclude": [],
+                "max_file_bytes": 1_048_576,
+            },
+        }
+    )
+    marker.write_text(contents)
+
+    project = read_project_marker(root)
+
+    assert project.scan.include[-1] == "**/*.java"
+    assert marker.read_text() == contents
+
+
+def test_custom_marker_includes_are_preserved(tmp_path: Path) -> None:
+    root = tmp_path / "demo"
+    root.mkdir()
+    marker = root / ".incode" / "project.toml"
+    marker.parent.mkdir()
+    marker.write_text(
+        tomli_w.dumps(
+            {
+                "version": 1,
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "demo",
+                "scan": {"include": ["src/**/*.py"], "exclude": [], "max_file_bytes": 1_048_576},
+            }
+        )
+    )
+
+    project = read_project_marker(root)
+
+    assert project.scan.include == ["src/**/*.py"]
 
 
 def test_resolver_prefers_explicit_project(tmp_path: Path) -> None:

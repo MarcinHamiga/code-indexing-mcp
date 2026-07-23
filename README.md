@@ -113,7 +113,19 @@ marker contains a checkout-local UUID and scanning configuration. It is not inte
 committed. Markers created by earlier releases under `.incode` remain readable, but all new
 markers use `.ci-mcp`.
 
-Index refreshes are explicit and incremental:
+CLI index refreshes are explicit and incremental. When the MCP server is opened by a client that
+provides filesystem roots, it also starts an incremental background refresh for each qualifying
+root as soon as the client lists tools. A new root qualifies when it has at least one supported,
+non-ignored source file and contains `.git`, `pyproject.toml`, `setup.py`, `setup.cfg`,
+`package.json`, `tsconfig.json`, or `jsconfig.json`. The server creates the usual local
+`.ci-mcp/project.toml` marker only after that check passes.
+
+Tool discovery returns without waiting for indexing or the first model download. `project_status`
+reports startup state, while code-query tools wait for that root's initial indexing task to finish.
+Set `INCODE_AUTO_INDEX=0` (or `false` or `no`) to retain fully manual MCP indexing. Clients that
+do not provide filesystem roots keep the existing manual workflow.
+
+Incremental refreshes:
 
 - Matching size and nanosecond mtime skips reading the file.
 - Changed metadata triggers SHA-256 verification.
@@ -122,9 +134,14 @@ Index refreshes are explicit and incremental:
 - Removed files are deleted from the active index.
 - A parse or embedding failure preserves the previous indexed version.
 
-Python, Python stubs, JavaScript, JSX, TypeScript, and TSX are supported. The scanner respects
-root and nested `.gitignore` files and excludes symlinks, binary files, files over 1 MiB, build
-outputs, virtual environments, and dependency directories.
+Python, Python stubs, Java, JavaScript, JSX, TypeScript, and TSX are supported. Java indexing
+extracts classes, interfaces, records, enums, annotation types, methods, constructors, and nested
+declarations without requiring a JDK, Maven, or Gradle. The scanner respects root and nested
+`.gitignore` files and excludes symlinks, binary files, files over 1 MiB, build outputs, virtual
+environments, and dependency directories.
+
+Existing project markers that use the exact pre-Java default include list automatically include
+`**/*.java` at runtime. If you use a customized `scan.include` list, add `**/*.java` explicitly.
 
 ## Multi-project search
 

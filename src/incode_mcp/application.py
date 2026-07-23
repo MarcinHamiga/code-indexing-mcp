@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
+from filelock import FileLock
 from platformdirs import user_cache_path, user_data_path
 
 from .embedding import Embedder, FastEmbedder
@@ -19,10 +21,11 @@ from .models import (
     ProjectInfo,
     ProjectStatus,
     RemovalReport,
+    ScanConfig,
     SearchResponse,
     SymbolResponse,
 )
-from .projects import ProjectResolver, initialize_project
+from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
 from .scanner import SourceScanner
 from .search import SearchService
 from .storage import LanceStore
@@ -38,6 +41,17 @@ class RuntimePaths:
         data = Path(os.environ.get("INCODE_DATA_DIR", user_data_path("incode")))
         cache = Path(os.environ.get("INCODE_CACHE_DIR", user_cache_path("incode")))
         return cls(data=data.expanduser().resolve(), cache=cache.expanduser().resolve())
+
+
+PROJECT_SHAPE_MARKERS = {
+    ".git",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "package.json",
+    "tsconfig.json",
+    "jsconfig.json",
+}
 
 
 class Application:
@@ -88,8 +102,26 @@ class Application:
             name=name,
             force_new_id=force_new_id,
         )
-        self.store.upsert_project(project, model_id=self.embedder.model_id, state="pending")
+        self._register_project(project)
         return project
+
+    def discover_project(self, root: Path) -> ProjectInfo | None:
+        """Find an initialized project or initialize a qualifying client root."""
+        root = root.expanduser().resolve()
+        if not root.is_dir():
+            return None
+        lock_name = sha256(str(root).encode()).hexdigest()
+        lock = FileLock(self.paths.data / "locks" / f"discover-{lock_name}.lock")
+        with lock:
+            marker_root = find_project_root(root)
+            if marker_root is not None:
+                project = read_project_marker(marker_root)
+            else:
+                if not self._is_project_shaped(root):
+                    return None
+                project = initialize_project(root)
+            self._register_project(project)
+            return project
 
     def index_project(
         self,
@@ -97,8 +129,11 @@ class Application:
         *,
         roots: list[Path] | None = None,
         force: bool = False,
+        wait_for_lock: bool = False,
     ) -> IndexReport:
-        return self.indexer.index(self._resolve(project, roots), force=force)
+        return self.indexer.index(
+            self._resolve(project, roots), force=force, wait_for_lock=wait_for_lock
+        )
 
     def project_status(
         self, project: str | None = None, *, roots: list[Path] | None = None
@@ -133,7 +168,7 @@ class Application:
         limit: int = 8,
         roots: list[Path] | None = None,
     ) -> SearchResponse:
-        project_ids = self._search_scope(projects, all_projects, roots)
+        project_ids = self.resolve_search_scope(projects, all_projects, roots)
         return self.search.search_code(
             query,
             project_ids,
@@ -153,13 +188,13 @@ class Application:
         limit: int = 20,
         roots: list[Path] | None = None,
     ) -> SymbolResponse:
-        resolved = self._resolve(project, roots)
+        resolved = self.resolve_project(project, roots)
         return self.search.find_symbol(name, resolved.id, match=match, kinds=kinds, limit=limit)
 
     def file_outline(
         self, path: str, project: str | None = None, *, roots: list[Path] | None = None
     ) -> OutlineResponse:
-        resolved = self._resolve(project, roots)
+        resolved = self.resolve_project(project, roots)
         return self.search.file_outline(path, resolved.id)
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
@@ -169,6 +204,37 @@ class Application:
         if not isinstance(self.embedder, FastEmbedder):
             return
         self.embedder.prepare()
+
+    def _register_project(self, project: ProjectInfo) -> None:
+        """Persist *project*, upserting as pending if new or revalidating if known.
+
+        A brand-new project starts in the "pending" state. An already-known
+        project keeps its current state (e.g. "ready" is not reset back to
+        "pending"), but the upsert still runs so LanceStore.upsert_project can
+        apply its compatibility checks (incompatible embedding model/schema,
+        or a project id already active at another root).
+        """
+        known = {existing.id for existing in self.store.list_projects()}
+        state = self.store.project_state(project.id) if project.id in known else "pending"
+        self.store.upsert_project(project, model_id=self.embedder.model_id, state=state)
+
+    def _is_project_shaped(self, root: Path) -> bool:
+        return any(
+            (root / marker).exists() for marker in PROJECT_SHAPE_MARKERS
+        ) and self.indexer.scanner.has_supported_source(root, ScanConfig())
+
+    def resolve_project(self, explicit: str | None, roots: list[Path] | None = None) -> ProjectInfo:
+        """Resolve one project using the same rules as project-scoped tools."""
+        return self._resolve(explicit, roots)
+
+    def resolve_search_scope(
+        self,
+        projects: list[str] | None,
+        all_projects: bool,
+        roots: list[Path] | None = None,
+    ) -> list[str]:
+        """Resolve the project ids a search will use without executing it."""
+        return self._search_scope(projects, all_projects, roots)
 
     def _resolve(self, explicit: str | None, roots: list[Path] | None) -> ProjectInfo:
         return ProjectResolver(self.store.list_projects()).resolve(

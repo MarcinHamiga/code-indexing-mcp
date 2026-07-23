@@ -26,7 +26,7 @@ class _PathAsPlainString:
 
 SerializablePath = Annotated[Path, _PathAsPlainString()]
 
-DEFAULT_INCLUDES = [
+LEGACY_DEFAULT_INCLUDES_V1 = [
     "**/*.py",
     "**/*.pyi",
     "**/*.js",
@@ -38,6 +38,8 @@ DEFAULT_INCLUDES = [
     "**/*.mts",
     "**/*.cts",
 ]
+
+DEFAULT_INCLUDES = [*LEGACY_DEFAULT_INCLUDES_V1, "**/*.java"]
 
 
 class FrozenModel(BaseModel):
