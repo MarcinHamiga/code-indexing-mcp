@@ -7,10 +7,29 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+
+SERVER_NAME = "code-indexing-mcp"
+
+
+class HarnessChoice(NamedTuple):
+    slug: str
+    label: str
+
+
+HARNESS_CHOICES = [
+    HarnessChoice("codex", "Codex (CLI + Desktop)"),
+    HarnessChoice("claude-code", "Claude Code"),
+    HarnessChoice("kimi-code", "Kimi Code"),
+    HarnessChoice("claude-desktop", "Claude Desktop"),
+    HarnessChoice("opencode", "OpenCode"),
+    HarnessChoice("kilocode", "KiloCode"),
+]
 
 
 class InstallerError(RuntimeError):
@@ -295,7 +314,7 @@ def _split_toml_dotted_key(value: str) -> list[str]:
 def _codex_server_block(command: Path) -> str:
     encoded_command = json.dumps(str(command), ensure_ascii=False)
     return (
-        "[mcp_servers.code-indexing-mcp]\n"
+        f"[mcp_servers.{SERVER_NAME}]\n"
         f"command = {encoded_command}\n"
         'args = ["serve"]\n'
     )
@@ -319,7 +338,7 @@ def merge_codex_server(path: Path, command: Path) -> bool:
         except ValueError as exc:
             raise InstallerError(f"Invalid TOML table in {path}: {exc}") from exc
 
-    target = ["mcp_servers", "code-indexing-mcp"]
+    target = ["mcp_servers", SERVER_NAME]
     target_index = next(
         (index for index, (_, components) in enumerate(headings) if components == target),
         None,
@@ -340,3 +359,146 @@ def merge_codex_server(path: Path, command: Path) -> bool:
         updated = source[:start] + block + separator + suffix.lstrip("\n")
 
     return _write_changed_configuration(path, original, updated)
+
+
+def parse_harness_selection(selection: str) -> list[str]:
+    """Parse interactive menu numbers or stable harness slugs."""
+
+    value = selection.strip().lower()
+    if not value:
+        return []
+    if value == "all":
+        return [choice.slug for choice in HARNESS_CHOICES]
+
+    by_slug = {choice.slug: choice.slug for choice in HARNESS_CHOICES}
+    by_number = {str(index): choice.slug for index, choice in enumerate(HARNESS_CHOICES, start=1)}
+    selected: list[str] = []
+    for token in (part.strip().lower() for part in value.split(",")):
+        slug = by_number.get(token, by_slug.get(token))
+        if slug is None:
+            options = ", ".join(choice.slug for choice in HARNESS_CHOICES)
+            raise InstallerError(f"Unknown harness {token!r}; choose 1-6, all, or one of: {options}")
+        if slug not in selected:
+            selected.append(slug)
+    return selected
+
+
+def _configured_directory(
+    environment: Mapping[str, str],
+    variable: str,
+    default: Path,
+) -> Path:
+    configured = environment.get(variable)
+    return Path(configured).expanduser() if configured else default
+
+
+def _preferred_json_config(directory: Path, stem: str, *, default_suffix: str) -> Path:
+    json_path = directory / f"{stem}.json"
+    jsonc_path = directory / f"{stem}.jsonc"
+    if json_path.exists():
+        return json_path
+    if jsonc_path.exists():
+        return jsonc_path
+    return directory / f"{stem}{default_suffix}"
+
+
+def configuration_path(
+    slug: str,
+    *,
+    home: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    platform_name: str | None = None,
+) -> Path:
+    """Return the user-wide configuration path for a supported harness."""
+
+    home = home or Path.home()
+    environment = os.environ if environment is None else environment
+    platform_name = platform_name or sys.platform
+    xdg_config = _configured_directory(
+        environment,
+        "XDG_CONFIG_HOME",
+        home / ".config",
+    )
+
+    if slug == "codex":
+        return _configured_directory(environment, "CODEX_HOME", home / ".codex") / "config.toml"
+    if slug == "claude-code":
+        return home / ".claude.json"
+    if slug == "kimi-code":
+        return (
+            _configured_directory(environment, "KIMI_CODE_HOME", home / ".kimi-code")
+            / "mcp.json"
+        )
+    if slug == "claude-desktop":
+        if platform_name == "darwin":
+            return (
+                home
+                / "Library"
+                / "Application Support"
+                / "Claude"
+                / "claude_desktop_config.json"
+            )
+        if platform_name.startswith("win"):
+            app_data = environment.get("APPDATA")
+            if not app_data:
+                raise InstallerError("APPDATA is required to configure Claude Desktop on Windows")
+            return Path(app_data).expanduser() / "Claude" / "claude_desktop_config.json"
+        raise InstallerError(f"Claude Desktop configuration is not supported on {platform_name}")
+    if slug == "opencode":
+        configured = environment.get("OPENCODE_CONFIG")
+        if configured:
+            return Path(configured).expanduser()
+        directory = _configured_directory(
+            environment,
+            "OPENCODE_CONFIG_DIR",
+            xdg_config / "opencode",
+        )
+        return _preferred_json_config(directory, "opencode", default_suffix=".json")
+    if slug == "kilocode":
+        return _preferred_json_config(xdg_config / "kilo", "kilo", default_suffix=".jsonc")
+    raise InstallerError(f"Unknown harness {slug!r}")
+
+
+def configure_harness(
+    slug: str,
+    command: Path,
+    *,
+    home: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    platform_name: str | None = None,
+) -> Path:
+    """Merge the Code Indexing MCP entry into one user-wide harness config."""
+
+    path = configuration_path(
+        slug,
+        home=home,
+        environment=environment,
+        platform_name=platform_name,
+    )
+    if slug == "codex":
+        merge_codex_server(path, command)
+        return path
+
+    if slug == "claude-code":
+        object_key = "mcpServers"
+        entry: dict[str, Any] = {
+            "type": "stdio",
+            "command": str(command),
+            "args": ["serve"],
+            "env": {},
+        }
+    elif slug in {"kimi-code", "claude-desktop"}:
+        object_key = "mcpServers"
+        entry = {"command": str(command), "args": ["serve"]}
+    elif slug in {"opencode", "kilocode"}:
+        object_key = "mcp"
+        entry = {
+            "type": "local",
+            "command": [str(command), "serve"],
+            "enabled": True,
+        }
+    else:
+        raise InstallerError(f"Unknown harness {slug!r}")
+
+    merge_json_object_entry(path, object_key, SERVER_NAME, entry)
+    return path

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import tomllib
 from pathlib import Path
 from types import ModuleType
 
@@ -164,3 +165,160 @@ def test_codex_merge_is_idempotent(tmp_path: Path) -> None:
     assert installer.merge_codex_server(path, Path("/opt/ci-mcp")) is False
 
     assert path.read_text() == first
+
+
+def test_harness_menu_combines_codex_cli_and_desktop() -> None:
+    installer = load_installer()
+
+    assert [(choice.slug, choice.label) for choice in installer.HARNESS_CHOICES] == [
+        ("codex", "Codex (CLI + Desktop)"),
+        ("claude-code", "Claude Code"),
+        ("kimi-code", "Kimi Code"),
+        ("claude-desktop", "Claude Desktop"),
+        ("opencode", "OpenCode"),
+        ("kilocode", "KiloCode"),
+    ]
+
+
+def test_harness_selection_accepts_numbers_slugs_duplicates_and_all() -> None:
+    installer = load_installer()
+
+    assert installer.parse_harness_selection("1, 3, codex, opencode") == [
+        "codex",
+        "kimi-code",
+        "opencode",
+    ]
+    assert installer.parse_harness_selection("all") == [
+        choice.slug for choice in installer.HARNESS_CHOICES
+    ]
+    assert installer.parse_harness_selection("") == []
+    with pytest.raises(installer.InstallerError, match="Unknown harness"):
+        installer.parse_harness_selection("7")
+
+
+def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None:
+    installer = load_installer()
+    environment = {
+        "CODEX_HOME": str(tmp_path / "codex-home"),
+        "KIMI_CODE_HOME": str(tmp_path / "kimi-home"),
+        "OPENCODE_CONFIG": str(tmp_path / "custom-opencode.jsonc"),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+        "APPDATA": str(tmp_path / "appdata"),
+    }
+
+    assert installer.configuration_path(
+        "codex", home=tmp_path, environment=environment, platform_name="darwin"
+    ) == tmp_path / "codex-home" / "config.toml"
+    assert installer.configuration_path(
+        "kimi-code", home=tmp_path, environment=environment, platform_name="darwin"
+    ) == tmp_path / "kimi-home" / "mcp.json"
+    assert installer.configuration_path(
+        "opencode", home=tmp_path, environment=environment, platform_name="darwin"
+    ) == tmp_path / "custom-opencode.jsonc"
+    assert installer.configuration_path(
+        "kilocode", home=tmp_path, environment=environment, platform_name="darwin"
+    ) == tmp_path / "xdg" / "kilo" / "kilo.jsonc"
+    assert installer.configuration_path(
+        "claude-desktop", home=tmp_path, environment=environment, platform_name="win32"
+    ) == tmp_path / "appdata" / "Claude" / "claude_desktop_config.json"
+
+
+@pytest.mark.parametrize(
+    ("slug", "object_key", "relative_path", "expected_entry"),
+    [
+        (
+            "claude-code",
+            "mcpServers",
+            ".claude.json",
+            {
+                "type": "stdio",
+                "command": "/opt/ci-mcp",
+                "args": ["serve"],
+                "env": {},
+            },
+        ),
+        (
+            "kimi-code",
+            "mcpServers",
+            ".kimi-code/mcp.json",
+            {"command": "/opt/ci-mcp", "args": ["serve"]},
+        ),
+        (
+            "claude-desktop",
+            "mcpServers",
+            "Library/Application Support/Claude/claude_desktop_config.json",
+            {"command": "/opt/ci-mcp", "args": ["serve"]},
+        ),
+        (
+            "opencode",
+            "mcp",
+            ".config/opencode/opencode.json",
+            {
+                "type": "local",
+                "command": ["/opt/ci-mcp", "serve"],
+                "enabled": True,
+            },
+        ),
+        (
+            "kilocode",
+            "mcp",
+            ".config/kilo/kilo.jsonc",
+            {
+                "type": "local",
+                "command": ["/opt/ci-mcp", "serve"],
+                "enabled": True,
+            },
+        ),
+    ],
+)
+def test_configure_json_harnesses(
+    tmp_path: Path,
+    slug: str,
+    object_key: str,
+    relative_path: str,
+    expected_entry: dict[str, object],
+) -> None:
+    installer = load_installer()
+
+    path = installer.configure_harness(
+        slug,
+        Path("/opt/ci-mcp"),
+        home=tmp_path,
+        environment={},
+        platform_name="darwin",
+    )
+
+    assert path == tmp_path / relative_path
+    parsed = json.loads(path.read_text())
+    assert parsed[object_key]["code-indexing-mcp"] == expected_entry
+
+
+def test_configure_codex_uses_shared_toml(tmp_path: Path) -> None:
+    installer = load_installer()
+
+    path = installer.configure_harness(
+        "codex",
+        Path("/opt/ci-mcp"),
+        home=tmp_path,
+        environment={},
+        platform_name="darwin",
+    )
+
+    assert path == tmp_path / ".codex" / "config.toml"
+    parsed = tomllib.loads(path.read_text())
+    assert parsed["mcp_servers"]["code-indexing-mcp"] == {
+        "command": "/opt/ci-mcp",
+        "args": ["serve"],
+    }
+
+
+def test_claude_desktop_rejects_platform_without_standard_config(tmp_path: Path) -> None:
+    installer = load_installer()
+
+    with pytest.raises(installer.InstallerError, match="not supported on linux"):
+        installer.configuration_path(
+            "claude-desktop",
+            home=tmp_path,
+            environment={},
+            platform_name="linux",
+        )
