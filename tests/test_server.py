@@ -399,7 +399,7 @@ async def test_auto_index_can_be_disabled(tmp_path: Path, monkeypatch: pytest.Mo
         await client.call_tool("search_code", {"query": "value"})
         await asyncio.sleep(0.05)
 
-    assert not (root / ".incode").exists()
+    assert not (root / ".ci-mcp").exists()
     assert app.list_projects() == []
 
 
@@ -506,11 +506,15 @@ async def test_discovery_is_not_blocked_by_concurrent_indexing(tmp_path: Path) -
 
         # Discovery for both roots should complete quickly even though one of
         # them is now stuck indexing (blocked on the embedder) - discovery no
-        # longer shares the capacity limiter with indexing.
+        # longer shares the capacity limiter with indexing. Wait for the store
+        # registration too: the marker file is written before the project is
+        # upserted, and project_status below needs the registered project.
         for _ in range(100):
-            if (root_a / ".incode" / "project.toml").exists() and (
-                root_b / ".incode" / "project.toml"
-            ).exists():
+            if (
+                (root_a / ".ci-mcp" / "project.toml").exists()
+                and (root_b / ".ci-mcp" / "project.toml").exists()
+                and len(app.list_projects()) == 2
+            ):
                 break
             await asyncio.sleep(0.05)
         else:

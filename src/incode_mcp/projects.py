@@ -13,12 +13,27 @@ from pydantic import ValidationError
 from .errors import ErrorCode, IncodeError
 from .models import DEFAULT_INCLUDES, LEGACY_DEFAULT_INCLUDES_V1, ProjectInfo, ScanConfig
 
-MARKER_DIRECTORY = ".incode"
+MARKER_DIRECTORY = ".ci-mcp"
+LEGACY_MARKER_DIRECTORY = ".incode"
 MARKER_FILE = "project.toml"
 
 
 def marker_path(root: Path) -> Path:
     return root / MARKER_DIRECTORY / MARKER_FILE
+
+
+def legacy_marker_path(root: Path) -> Path:
+    return root / LEGACY_MARKER_DIRECTORY / MARKER_FILE
+
+
+def existing_marker_path(root: Path) -> Path | None:
+    current = marker_path(root)
+    if current.is_file():
+        return current
+    legacy = legacy_marker_path(root)
+    if legacy.is_file():
+        return legacy
+    return None
 
 
 def initialize_project(
@@ -27,10 +42,10 @@ def initialize_project(
     root = root.expanduser().resolve()
     if not root.is_dir():
         raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, f"Project directory does not exist: {root}")
-    existing_path = marker_path(root)
-    if existing_path.exists() and not force_new_id:
+    if existing_marker_path(root) is not None and not force_new_id:
         return read_project_marker(root)
 
+    existing_path = marker_path(root)
     project = ProjectInfo(id=str(uuid4()), name=name or root.name, root=root)
     directory = existing_path.parent
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -47,7 +62,7 @@ def initialize_project(
 
 def read_project_marker(root: Path) -> ProjectInfo:
     root = root.expanduser().resolve()
-    path = marker_path(root)
+    path = existing_marker_path(root) or marker_path(root)
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
         if raw.get("version") != 1:
@@ -76,7 +91,7 @@ def find_project_root(start: Path) -> Path | None:
     if current.is_file():
         current = current.parent
     for candidate in (current, *current.parents):
-        if marker_path(candidate).is_file():
+        if existing_marker_path(candidate) is not None:
             return candidate
     return None
 

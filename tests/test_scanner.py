@@ -103,12 +103,18 @@ def test_scanner_never_walks_hard_excluded_directories(tmp_path: Path) -> None:
     git = root / ".git"
     git.mkdir()
     (git / "hook.py").write_text("hook = True\n")
+    for marker_directory in (".incode", ".ci-mcp"):
+        marker = root / marker_directory
+        marker.mkdir(exist_ok=True)
+        (marker / "private.py").write_text("private = True\n")
 
     stat_failures = []
     original_stat = Path.stat
 
     def fail_if_excluded_is_statted(path: Path, *args, **kwargs):
-        if "node_modules" in path.parts or ".git" in path.parts:
+        if any(
+            excluded in path.parts for excluded in ("node_modules", ".git", ".incode", ".ci-mcp")
+        ):
             stat_failures.append(path)
             raise AssertionError(f"excluded path was statted: {path}")
         return original_stat(path, *args, **kwargs)

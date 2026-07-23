@@ -9,14 +9,60 @@ network access is the initial download of the default
 `jinaai/jina-embeddings-v2-base-code` model (approximately 640 MB). Once cached, indexing and
 search work offline.
 
-## Requirements and setup
+## Install
 
-- macOS, Linux, or Windows
-- Python 3.12 or 3.13
+- [Git](https://git-scm.com/)
 - [uv](https://docs.astral.sh/uv/)
+- Python 3.12 or 3.13
+
+On macOS or Linux:
 
 ```bash
-uv sync --all-groups
+curl -fsSL https://raw.githubusercontent.com/MarcinHamiga/code-indexing-mcp/main/install.sh | sh
+```
+
+On Windows PowerShell:
+
+```powershell
+$installer = Join-Path $env:TEMP "code-indexing-mcp-install.py"
+Invoke-WebRequest https://raw.githubusercontent.com/MarcinHamiga/code-indexing-mcp/main/install.py -OutFile $installer
+py -3 $installer
+```
+
+The installer clones the repository to `~/.local/share/code-indexing-mcp`, creates its locked
+virtual environment, and displays this multi-select menu:
+
+1. Codex (CLI + Desktop)
+2. Claude Code
+3. Kimi Code
+4. Claude Desktop
+5. OpenCode
+6. KiloCode
+
+Codex CLI and Codex Desktop share one configuration and therefore use one menu choice.
+Configuration changes are limited to the `code-indexing-mcp` entry. An existing configuration is
+backed up alongside the original with a `.bak` suffix before it changes.
+
+Run the same command later to update an existing clean checkout with a fast-forward-only pull and
+refresh its environment. The installer refuses to overwrite a different repository or a checkout
+with local changes.
+
+For a noninteractive installation, pass comma-separated harness slugs or `all`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MarcinHamiga/code-indexing-mcp/main/install.sh |
+  sh -s -- --harnesses codex,claude-code,opencode
+```
+
+Use `--install-dir /custom/path` or `CODE_INDEXING_MCP_INSTALL_DIR` to change the checkout
+location. Run `python3 install.py --help` for all installer options.
+
+## Manual setup
+
+```bash
+git clone https://github.com/MarcinHamiga/code-indexing-mcp.git
+cd code-indexing-mcp
+uv sync --locked
 uv run code-indexing-mcp model pull
 ```
 
@@ -62,16 +108,17 @@ uv run --project /path/to/code-indexing-mcp code-indexing-mcp index
 uv run --project /path/to/code-indexing-mcp code-indexing-mcp status
 ```
 
-Initialization creates `.incode/project.toml` and a self-ignoring `.incode/.gitignore`. The
+Initialization creates `.ci-mcp/project.toml` and a self-ignoring `.ci-mcp/.gitignore`. The
 marker contains a checkout-local UUID and scanning configuration. It is not intended to be
-committed.
+committed. Markers created by earlier releases under `.incode` remain readable, but all new
+markers use `.ci-mcp`.
 
 CLI index refreshes are explicit and incremental. When the MCP server is opened by a client that
 provides filesystem roots, it also starts an incremental background refresh for each qualifying
 root as soon as the client lists tools. A new root qualifies when it has at least one supported,
 non-ignored source file and contains `.git`, `pyproject.toml`, `setup.py`, `setup.cfg`,
 `package.json`, `tsconfig.json`, or `jsconfig.json`. The server creates the usual local
-`.incode/project.toml` marker only after that check passes.
+`.ci-mcp/project.toml` marker only after that check passes.
 
 Tool discovery returns without waiting for indexing or the first model download. `project_status`
 reports startup state, while code-query tools wait for that root's initial indexing task to finish.
@@ -98,12 +145,12 @@ Existing project markers that use the exact pre-Java default include list automa
 
 ## Multi-project search
 
-Tools use the current MCP root or nearest `.incode/project.toml` by default. `search_code` can
+Tools use the current MCP root or nearest `.ci-mcp/project.toml` by default. `search_code` can
 instead receive a list of project IDs/names/paths or set `all_projects=true`. Searching all
 projects is always explicit, preventing accidental context mixing.
 
 `remove_project` deletes only central index data. It never removes source files or the local
-`.incode` marker.
+`.ci-mcp` marker.
 
 ## Storage and offline operation
 

@@ -57,7 +57,7 @@ def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> N
     assert search.hits[0].symbol == "locate_feature"
     assert removal.removed is True
     assert app.list_projects() == []
-    assert (root / ".incode" / "project.toml").exists()
+    assert (root / ".ci-mcp" / "project.toml").exists()
 
 
 def test_init_project_defaults_to_the_single_client_root(tmp_path: Path) -> None:
@@ -85,7 +85,7 @@ def test_discover_project_requires_marker_and_supported_source(tmp_path: Path) -
     (source_only / "main.py").write_text("value = 1\n")
 
     assert app.discover_project(source_only) is None
-    assert not (source_only / ".incode").exists()
+    assert not (source_only / ".ci-mcp").exists()
 
     (source_only / "pyproject.toml").write_text("[project]\nname = 'source-only'\n")
 
@@ -94,7 +94,7 @@ def test_discover_project_requires_marker_and_supported_source(tmp_path: Path) -
     assert project is not None
     assert project.root == source_only.resolve()
     assert app.project_status(project.id).state == "pending"
-    assert (source_only / ".incode" / "project.toml").exists()
+    assert (source_only / ".ci-mcp" / "project.toml").exists()
 
 
 def test_discover_project_accepts_javascript_manifest_and_existing_marker(tmp_path: Path) -> None:
@@ -163,6 +163,26 @@ def test_duplicate_live_project_marker_is_rejected_but_moved_checkout_is_adopted
     report = app.index_project(str(duplicate))
     assert report.project_id == project.id
     assert app.list_projects()[0].root == duplicate.resolve()
+
+
+def test_duplicate_legacy_project_marker_is_still_rejected(tmp_path: Path) -> None:
+    original = tmp_path / "original"
+    duplicate = tmp_path / "duplicate"
+    original.mkdir()
+    (original / "main.py").write_text("value = 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    app.init_project(original)
+    (original / ".ci-mcp").rename(original / ".incode")
+    shutil.copytree(original, duplicate)
+
+    with pytest.raises(IncodeError) as raised:
+        app.index_project(str(duplicate))
+
+    assert raised.value.code is ErrorCode.PROJECT_ID_CONFLICT
 
 
 def test_reregistering_a_known_project_preserves_state_and_still_validates_compatibility(
