@@ -38,12 +38,14 @@ class Indexer:
         self.embedder = embedder
         self.lock_directory = lock_directory
 
-    def index(self, project: ProjectInfo, *, force: bool = False) -> IndexReport:
+    def index(
+        self, project: ProjectInfo, *, force: bool = False, wait_for_lock: bool = False
+    ) -> IndexReport:
         started = time.monotonic_ns()
         self.lock_directory.mkdir(parents=True, exist_ok=True)
         lock = FileLock(self.lock_directory / f"{project.id}.lock")
         try:
-            with lock.acquire(timeout=0):
+            with lock.acquire() if wait_for_lock else lock.acquire(timeout=0):
                 report = self._index_locked(project, force=force)
         except Timeout as exc:
             raise IncodeError(
@@ -119,6 +121,8 @@ class Indexer:
                 indexed += 1
                 embedded += len(chunks)
             except Exception as exc:
+                if isinstance(exc, IncodeError) and exc.code is ErrorCode.MODEL_UNAVAILABLE:
+                    raise
                 errors.append(IndexIssue(path=path, message=str(exc)))
                 # Record the failure so the file is not re-read, re-parsed, and
                 # re-embedded on every run. It is retried only when the file

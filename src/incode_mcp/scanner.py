@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pathspec import GitIgnoreSpec
 
-from .models import ProjectInfo, ScannedFile, ScanResult, SkippedFile, StoredFile
+from .models import ProjectInfo, ScanConfig, ScannedFile, ScanResult, SkippedFile, StoredFile
 
 LANGUAGES = {
     ".py": "python",
@@ -42,6 +42,49 @@ HARD_EXCLUDED_DIRECTORIES = {
 
 
 class SourceScanner:
+    def has_supported_source(self, root: Path, scan: ScanConfig) -> bool:
+        """Return whether *root* contains an eligible source file without reading it."""
+        root = root.expanduser().resolve()
+        config_excludes = GitIgnoreSpec.from_lines(scan.exclude)
+        include_spec = GitIgnoreSpec.from_lines(scan.include)
+        inherited_specs: dict[Path, list[tuple[Path, GitIgnoreSpec]]] = {root: []}
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            base = Path(dirpath)
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if name not in HARD_EXCLUDED_DIRECTORIES and not (base / name).is_symlink()
+            )
+            ignore_specs = inherited_specs.get(base, [])
+            gitignore = base / ".gitignore"
+            if ".gitignore" in filenames:
+                ignore_specs = [
+                    *ignore_specs,
+                    *self._load_ignore_specs(root, [gitignore]),
+                ]
+            for name in dirnames:
+                inherited_specs[base / name] = ignore_specs
+
+            for name in sorted(filenames):
+                absolute = base / name
+                relative = absolute.relative_to(root)
+                language, _ = self._classify(
+                    relative,
+                    absolute,
+                    include_spec=include_spec,
+                    config_excludes=config_excludes,
+                    ignore_specs=ignore_specs,
+                )
+                if language is None:
+                    continue
+                try:
+                    if absolute.stat().st_size <= scan.max_file_bytes:
+                        return True
+                except OSError:
+                    continue
+        return False
+
     def scan(
         self, project: ProjectInfo, known_files: dict[str, StoredFile] | None = None
     ) -> ScanResult:
@@ -56,22 +99,16 @@ class SourceScanner:
 
         for absolute in candidates:
             relative = absolute.relative_to(root)
-            if self._in_hard_excluded_directory(relative):
-                continue
-            if absolute.is_symlink():
-                if absolute.suffix.lower() in LANGUAGES:
-                    skipped.append(SkippedFile(path=relative, reason="symlink"))
-                continue
-            if not absolute.is_file():
-                continue
-            language = LANGUAGES.get(absolute.suffix.lower())
-            if language is None or not include_spec.match_file(relative.as_posix()):
-                skipped.append(SkippedFile(path=relative, reason="unsupported"))
-                continue
-            if config_excludes.match_file(relative.as_posix()) or self._is_ignored(
-                relative, ignore_specs
-            ):
-                skipped.append(SkippedFile(path=relative, reason="ignored"))
+            language, skip_reason = self._classify(
+                relative,
+                absolute,
+                include_spec=include_spec,
+                config_excludes=config_excludes,
+                ignore_specs=ignore_specs,
+            )
+            if language is None:
+                if skip_reason is not None:
+                    skipped.append(SkippedFile(path=relative, reason=skip_reason))
                 continue
             try:
                 stat = absolute.stat()
@@ -134,6 +171,45 @@ class SourceScanner:
         candidates.sort()
         gitignores.sort()
         return candidates, gitignores
+
+    @staticmethod
+    def _classify(
+        relative: Path,
+        absolute: Path,
+        *,
+        include_spec: GitIgnoreSpec,
+        config_excludes: GitIgnoreSpec,
+        ignore_specs: list[tuple[Path, GitIgnoreSpec]],
+    ) -> tuple[str | None, str | None]:
+        """Decide whether a candidate file is eligible for indexing.
+
+        Returns ``(language, skip_reason)``. ``language`` is set only when the
+        file passes every path-based eligibility check (not in a hard-excluded
+        directory, not a symlink, a regular file, a supported suffix that
+        matches the include spec, and not matched by config excludes or
+        gitignore rules); callers still need to apply their own size/content
+        checks on top. ``skip_reason`` carries the reason string ``scan``
+        records as a :class:`SkippedFile` (``"symlink"``, ``"unsupported"``,
+        or ``"ignored"``); it is ``None`` for rejections ``scan`` does not
+        record (hard-excluded directories, non-files, and symlinks whose
+        suffix is not supported to begin with).
+        """
+        if SourceScanner._in_hard_excluded_directory(relative):
+            return None, None
+        if absolute.is_symlink():
+            if absolute.suffix.lower() in LANGUAGES:
+                return None, "symlink"
+            return None, None
+        if not absolute.is_file():
+            return None, None
+        language = LANGUAGES.get(absolute.suffix.lower())
+        if language is None or not include_spec.match_file(relative.as_posix()):
+            return None, "unsupported"
+        if config_excludes.match_file(relative.as_posix()) or SourceScanner._is_ignored(
+            relative, ignore_specs
+        ):
+            return None, "ignored"
+        return language, None
 
     @staticmethod
     def _in_hard_excluded_directory(path: Path) -> bool:
