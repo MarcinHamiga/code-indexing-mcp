@@ -8,6 +8,7 @@ from types import ModuleType
 import pytest
 
 INSTALLER_PATH = Path(__file__).parents[1] / "install.py"
+SHELL_INSTALLER_PATH = Path(__file__).parents[1] / "install.sh"
 
 
 def load_installer() -> ModuleType:
@@ -546,3 +547,17 @@ def test_main_reports_actionable_installer_error(
 
     assert status == 1
     assert errors == ["Error: Git is required"]
+
+
+def test_posix_bootstrap_has_valid_syntax_and_runs_adjacent_installer() -> None:
+    assert SHELL_INSTALLER_PATH.exists(), "install.sh does not exist"
+
+    subprocess.run(["sh", "-n", str(SHELL_INSTALLER_PATH)], check=True)
+    completed = subprocess.run(
+        ["sh", str(SHELL_INSTALLER_PATH), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--harnesses" in completed.stdout
