@@ -43,7 +43,7 @@ def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> N
     assert search.hits[0].symbol == "locate_feature"
     assert removal.removed is True
     assert app.list_projects() == []
-    assert (root / ".incode" / "project.toml").exists()
+    assert (root / ".ci-mcp" / "project.toml").exists()
 
 
 def test_init_project_defaults_to_the_single_client_root(tmp_path: Path) -> None:

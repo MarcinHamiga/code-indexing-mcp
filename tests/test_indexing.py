@@ -182,4 +182,4 @@ def test_store_keeps_projects_isolated_and_removal_does_not_touch_markers(
 
     assert {project.id for project in store.list_projects()} == {projects[1].id}
     assert {chunk.project_id for chunk in store.list_chunks()} == {projects[1].id}
-    assert (projects[0].root / ".incode" / "project.toml").exists()
+    assert (projects[0].root / ".ci-mcp" / "project.toml").exists()

@@ -5,6 +5,7 @@ import pytest
 from incode_mcp.errors import ErrorCode, IncodeError
 from incode_mcp.projects import (
     ProjectResolver,
+    find_project_root,
     initialize_project,
     read_project_marker,
 )
@@ -16,11 +17,24 @@ def test_initialize_project_creates_local_marker(tmp_path: Path) -> None:
 
     project = initialize_project(root)
 
-    marker = root / ".incode" / "project.toml"
+    marker = root / ".ci-mcp" / "project.toml"
     assert marker.exists()
-    assert (root / ".incode" / ".gitignore").read_text() == "*\n"
+    assert (root / ".ci-mcp" / ".gitignore").read_text() == "*\n"
     assert project.root == root.resolve()
     assert project.name == "demo"
+    assert read_project_marker(root) == project
+
+
+def test_legacy_marker_remains_readable(tmp_path: Path) -> None:
+    root = tmp_path / "legacy"
+    root.mkdir()
+    project = initialize_project(root)
+    current_directory = root / ".ci-mcp"
+    legacy_directory = root / ".incode"
+    if current_directory.exists():
+        current_directory.rename(legacy_directory)
+
+    assert find_project_root(root / "src") == root.resolve()
     assert read_project_marker(root) == project
 
 

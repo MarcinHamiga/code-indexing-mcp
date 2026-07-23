@@ -24,6 +24,7 @@ LANGUAGES = {
 
 HARD_EXCLUDED_DIRECTORIES = {
     ".git",
+    ".ci-mcp",
     ".incode",
     ".venv",
     "venv",
