@@ -102,8 +102,7 @@ class Application:
             name=name,
             force_new_id=force_new_id,
         )
-        if not any(existing.id == project.id for existing in self.store.list_projects()):
-            self.store.upsert_project(project, model_id=self.embedder.model_id, state="pending")
+        self._register_project(project)
         return project
 
     def discover_project(self, root: Path) -> ProjectInfo | None:
@@ -121,8 +120,7 @@ class Application:
                 if not self._is_project_shaped(root):
                     return None
                 project = initialize_project(root)
-            if not any(existing.id == project.id for existing in self.store.list_projects()):
-                self.store.upsert_project(project, model_id=self.embedder.model_id, state="pending")
+            self._register_project(project)
             return project
 
     def index_project(
@@ -206,6 +204,19 @@ class Application:
         if not isinstance(self.embedder, FastEmbedder):
             return
         self.embedder.prepare()
+
+    def _register_project(self, project: ProjectInfo) -> None:
+        """Persist *project*, upserting as pending if new or revalidating if known.
+
+        A brand-new project starts in the "pending" state. An already-known
+        project keeps its current state (e.g. "ready" is not reset back to
+        "pending"), but the upsert still runs so LanceStore.upsert_project can
+        apply its compatibility checks (incompatible embedding model/schema,
+        or a project id already active at another root).
+        """
+        known = {existing.id for existing in self.store.list_projects()}
+        state = self.store.project_state(project.id) if project.id in known else "pending"
+        self.store.upsert_project(project, model_id=self.embedder.model_id, state=state)
 
     def _is_project_shaped(self, root: Path) -> bool:
         return any(

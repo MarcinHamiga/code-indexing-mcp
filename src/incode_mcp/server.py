@@ -9,13 +9,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
+from mcp.types import Tool as MCPTool
 
 from .application import Application
 from .models import (
@@ -56,7 +56,11 @@ class StartupCoordinator:
         async with self._lock:
             for root in roots:
                 root = root.resolve()
-                if root in self._jobs:
+                existing = self._jobs.get(root)
+                if existing is not None and not (
+                    existing.ready.is_set() and existing.error is not None
+                ):
+                    # A job is still in flight, or already finished successfully.
                     continue
                 job = _StartupJob()
                 self._jobs[root] = job
@@ -78,22 +82,22 @@ class StartupCoordinator:
 
     async def _run(self, root: Path, job: _StartupJob) -> None:
         try:
+            project = await asyncio.to_thread(self.application.discover_project, root)
+            job.discovered.set()
+            if project is None:
+                logger.info("Skipping automatic indexing for non-project root: %s", root)
+                return
             async with self._limiter:
-                project = await asyncio.to_thread(self.application.discover_project, root)
-                job.discovered.set()
-                if project is None:
-                    logger.info("Skipping automatic indexing for non-project root: %s", root)
-                    return
                 report = await asyncio.to_thread(
                     self.application.index_project,
                     project.id,
                     wait_for_lock=True,
                 )
-                logger.info(
-                    "Automatic indexing complete for %s: %s files indexed",
-                    project.root,
-                    report.indexed_files,
-                )
+            logger.info(
+                "Automatic indexing complete for %s: %s files indexed",
+                project.root,
+                report.indexed_files,
+            )
         except Exception as exc:
             job.error = exc
             if not job.discovered.is_set():
@@ -164,9 +168,15 @@ class AutoIndexingMCP(FastMCP):
     @asynccontextmanager
     async def _lifespan(self, _: FastMCP) -> AsyncIterator[StartupCoordinator]:
         async with anyio.create_task_group() as task_group:
-            yield StartupCoordinator(self.application, task_group, enabled=self.auto_index)
+            try:
+                yield StartupCoordinator(self.application, task_group, enabled=self.auto_index)
+            finally:
+                # Don't block shutdown on background indexing: cancel any still-running
+                # startup jobs. An embedding batch already running in a worker thread
+                # finishes detached (asyncio.to_thread is not cancellable).
+                task_group.cancel_scope.cancel()
 
-    async def list_tools(self) -> Any:
+    async def list_tools(self) -> list[MCPTool]:
         tools = await super().list_tools()
         if not self.auto_index:
             return tools
@@ -203,7 +213,11 @@ def create_server(
     async def index_project(
         ctx: ServerContext, project: str | None = None, force: bool = False
     ) -> IndexReport:
-        roots = await _startup_roots(ctx, wait_for="ready")
+        # Only wait for discovery, not the outcome of the automatic index this tool is
+        # meant to let callers manually recover from. If startup indexing is still
+        # running, app.index_project's 0-timeout file lock raises INDEX_BUSY, which is
+        # acceptable, pre-existing behavior.
+        roots = await _startup_roots(ctx, wait_for="discovery")
         await ctx.report_progress(0, 1, "Indexing project")
         report = await asyncio.to_thread(app.index_project, project, roots=roots, force=force)
         await ctx.report_progress(1, 1, "Index complete")

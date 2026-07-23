@@ -120,35 +120,9 @@ class Indexer:
                 self.store.replace_file(stored_file, chunks)
                 indexed += 1
                 embedded += len(chunks)
-            except IncodeError as exc:
-                if exc.code is ErrorCode.MODEL_UNAVAILABLE:
-                    raise
-                errors.append(IndexIssue(path=path, message=str(exc)))
-                # Record the failure so the file is not re-read, re-parsed, and
-                # re-embedded on every run. It is retried only when the file
-                # changes again or when force=True. Chunks from a previous
-                # successful index (if any) are left untouched.
-                self.store.upsert_file(
-                    StoredFile(
-                        file_id=_digest(f"{project.id}\0{path}"),
-                        project_id=project.id,
-                        path=path,
-                        language=item.language,
-                        size=item.size,
-                        mtime_ns=item.mtime_ns,
-                        content_hash=(
-                            content_hash
-                            if content_hash is not None
-                            else previous.content_hash
-                            if previous is not None
-                            else ""
-                        ),
-                        has_errors=True,
-                        error=str(exc),
-                        indexed_at=time.time_ns(),
-                    )
-                )
             except Exception as exc:
+                if isinstance(exc, IncodeError) and exc.code is ErrorCode.MODEL_UNAVAILABLE:
+                    raise
                 errors.append(IndexIssue(path=path, message=str(exc)))
                 # Record the failure so the file is not re-read, re-parsed, and
                 # re-embedded on every run. It is retried only when the file

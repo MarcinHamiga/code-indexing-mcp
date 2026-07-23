@@ -18,6 +18,20 @@ class TinyEmbedder:
         return [1.0, 0.0, 0.0, float(len(text))]
 
 
+class OtherModelTinyEmbedder:
+    """Same vector dimension as TinyEmbedder but a different model_id, to
+    exercise LanceStore's incompatible-model detection."""
+
+    model_id = "test/other-tiny"
+    dimension = 4
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0, 0.0, float(len(text))] for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return [1.0, 0.0, 0.0, float(len(text))]
+
+
 def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
@@ -149,3 +163,32 @@ def test_duplicate_live_project_marker_is_rejected_but_moved_checkout_is_adopted
     report = app.index_project(str(duplicate))
     assert report.project_id == project.id
     assert app.list_projects()[0].root == duplicate.resolve()
+
+
+def test_reregistering_a_known_project_preserves_state_and_still_validates_compatibility(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def locate_feature():\n    return True\n")
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=root)
+    project = app.init_project(root)
+    app.index_project(project.id)
+    assert app.project_status(project.id).state == "ready"
+
+    # Re-initializing (or re-discovering) an already-known, ready project
+    # must not reset its state back to "pending".
+    app.init_project(root)
+    assert app.project_status(project.id).state == "ready"
+    app.discover_project(root)
+    assert app.project_status(project.id).state == "ready"
+
+    other_app = Application(paths, embedder=OtherModelTinyEmbedder(), cwd=root)
+    with pytest.raises(IncodeError) as raised_init:
+        other_app.init_project(root)
+    assert raised_init.value.code is ErrorCode.INDEX_INCOMPATIBLE
+
+    with pytest.raises(IncodeError) as raised_discover:
+        other_app.discover_project(root)
+    assert raised_discover.value.code is ErrorCode.INDEX_INCOMPATIBLE
