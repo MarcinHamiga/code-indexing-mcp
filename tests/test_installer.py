@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from types import ModuleType
@@ -9,6 +10,11 @@ import pytest
 
 INSTALLER_PATH = Path(__file__).parents[1] / "install.py"
 SHELL_INSTALLER_PATH = Path(__file__).parents[1] / "install.sh"
+
+# The installer stringifies Path objects with the native separator, so expected
+# values must go through the same conversion to stay correct on Windows.
+SERVER_BINARY = Path("/opt/ci-mcp")
+SERVER_COMMAND = str(SERVER_BINARY)
 
 
 def load_installer() -> ModuleType:
@@ -126,11 +132,12 @@ def test_codex_merge_creates_server_table(tmp_path: Path) -> None:
     installer = load_installer()
     path = tmp_path / "config.toml"
 
-    changed = installer.merge_codex_server(path, Path("/opt/ci-mcp"))
+    changed = installer.merge_codex_server(path, SERVER_BINARY)
 
+    encoded_command = json.dumps(SERVER_COMMAND, ensure_ascii=False)
     assert changed is True
     assert path.read_text() == (
-        '[mcp_servers.code-indexing-mcp]\ncommand = "/opt/ci-mcp"\nargs = ["serve"]\n'
+        f'[mcp_servers.code-indexing-mcp]\ncommand = {encoded_command}\nargs = ["serve"]\n'
     )
 
 
@@ -167,7 +174,7 @@ example = true
     assert 'command = "old"' not in updated
     assert "OLD" not in updated
     assert updated.count("[mcp_servers.code-indexing-mcp]") == 1
-    assert 'command = "/new/ci-mcp"' in updated
+    assert f"command = {json.dumps(str(Path('/new/ci-mcp')), ensure_ascii=False)}" in updated
     assert path.with_name("config.toml.bak").read_text() == original
 
 
@@ -275,7 +282,7 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
             ".claude.json",
             {
                 "type": "stdio",
-                "command": "/opt/ci-mcp",
+                "command": SERVER_COMMAND,
                 "args": ["serve"],
                 "env": {},
             },
@@ -284,13 +291,13 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
             "kimi-code",
             "mcpServers",
             ".kimi-code/mcp.json",
-            {"command": "/opt/ci-mcp", "args": ["serve"]},
+            {"command": SERVER_COMMAND, "args": ["serve"]},
         ),
         (
             "claude-desktop",
             "mcpServers",
             "Library/Application Support/Claude/claude_desktop_config.json",
-            {"command": "/opt/ci-mcp", "args": ["serve"]},
+            {"command": SERVER_COMMAND, "args": ["serve"]},
         ),
         (
             "opencode",
@@ -298,7 +305,7 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
             ".config/opencode/opencode.json",
             {
                 "type": "local",
-                "command": ["/opt/ci-mcp", "serve"],
+                "command": [SERVER_COMMAND, "serve"],
                 "enabled": True,
             },
         ),
@@ -308,7 +315,7 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
             ".config/kilo/kilo.jsonc",
             {
                 "type": "local",
-                "command": ["/opt/ci-mcp", "serve"],
+                "command": [SERVER_COMMAND, "serve"],
                 "enabled": True,
             },
         ),
@@ -325,7 +332,7 @@ def test_configure_json_harnesses(
 
     path = installer.configure_harness(
         slug,
-        Path("/opt/ci-mcp"),
+        SERVER_BINARY,
         home=tmp_path,
         environment={},
         platform_name="darwin",
@@ -341,7 +348,7 @@ def test_configure_codex_uses_shared_toml(tmp_path: Path) -> None:
 
     path = installer.configure_harness(
         "codex",
-        Path("/opt/ci-mcp"),
+        SERVER_BINARY,
         home=tmp_path,
         environment={},
         platform_name="darwin",
@@ -350,7 +357,7 @@ def test_configure_codex_uses_shared_toml(tmp_path: Path) -> None:
     assert path == tmp_path / ".codex" / "config.toml"
     parsed = tomllib.loads(path.read_text())
     assert parsed["mcp_servers"]["code-indexing-mcp"] == {
-        "command": "/opt/ci-mcp",
+        "command": SERVER_COMMAND,
         "args": ["serve"],
     }
 
@@ -438,19 +445,31 @@ def test_sync_environment_runs_locked_sync_and_finds_server(tmp_path: Path) -> N
     installer = load_installer()
     checkout = tmp_path / "checkout"
     checkout.mkdir()
-    fake_uv = tmp_path / "uv"
-    fake_uv.write_text(
-        "#!/bin/sh\n"
-        'test "$1" = "sync"\n'
-        'test "$2" = "--locked"\n'
-        "mkdir -p .venv/bin\n"
-        "touch .venv/bin/code-indexing-mcp\n"
-    )
-    fake_uv.chmod(0o755)
+    expected = installer.server_executable(checkout)
+    if sys.platform == "win32":
+        fake_uv = tmp_path / "uv.bat"
+        fake_uv.write_text(
+            "@echo off\r\n"
+            'if not "%~1"=="sync" exit /b 1\r\n'
+            'if not "%~2"=="--locked" exit /b 1\r\n'
+            "md .venv\\Scripts\r\n"
+            "type nul > .venv\\Scripts\\code-indexing-mcp.exe\r\n",
+            newline="",
+        )
+    else:
+        fake_uv = tmp_path / "uv"
+        fake_uv.write_text(
+            "#!/bin/sh\n"
+            'test "$1" = "sync"\n'
+            'test "$2" = "--locked"\n'
+            "mkdir -p .venv/bin\n"
+            "touch .venv/bin/code-indexing-mcp\n"
+        )
+        fake_uv.chmod(0o755)
 
     command = installer.sync_environment(checkout, uv_executable=str(fake_uv))
 
-    assert command == checkout / ".venv" / "bin" / "code-indexing-mcp"
+    assert command == expected
 
 
 def test_configure_selected_harnesses_isolates_failures(
@@ -611,6 +630,10 @@ def test_main_reports_actionable_installer_error(
     assert errors == ["Error: Git is required"]
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="install.sh is a POSIX bootstrap; Windows sh receives a backslash $0 and misbehaves",
+)
 def test_posix_bootstrap_has_valid_syntax_and_runs_adjacent_installer() -> None:
     assert SHELL_INSTALLER_PATH.exists(), "install.sh does not exist"
 
