@@ -77,6 +77,38 @@ def test_symbol_lookup_and_outline_use_indexed_metadata(tmp_path: Path) -> None:
     assert [item.qualified_symbol for item in outline.items] == ["enforce_permissions"]
 
 
+def test_java_symbols_are_indexed_and_filterable(tmp_path: Path) -> None:
+    embedder = SemanticEmbedder()
+    store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "User.java").write_text(
+        "record User(String name) {\n    User {}\n    String display() { return name; }\n}\n"
+    )
+    project = initialize_project(root)
+    Indexer(
+        store=store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=embedder,
+        lock_directory=tmp_path / "locks",
+    ).index(project)
+    search = SearchService(store, embedder)
+
+    outline = search.file_outline("User.java", project.id)
+    constructors = search.find_symbol("User.User", project.id, kinds=["constructor"])
+    methods = search.search_code("display", [project.id], languages=["java"], kinds=["method"])
+
+    assert {(item.kind, item.qualified_symbol) for item in outline.items} >= {
+        ("record", "User"),
+        ("constructor", "User.User"),
+        ("method", "User.display"),
+    }
+    assert [hit.qualified_symbol for hit in constructors.hits] == ["User.User"]
+    assert methods.hits[0].language == "java"
+    assert methods.hits[0].kind == "method"
+
+
 def test_search_truncates_snippet_and_get_chunk_returns_full_content(tmp_path: Path) -> None:
     embedder = SemanticEmbedder()
     store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)

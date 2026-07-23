@@ -8,6 +8,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Final
 
+import tree_sitter_java
 import tree_sitter_javascript
 import tree_sitter_python
 import tree_sitter_typescript
@@ -18,6 +19,10 @@ from .models import ExtractedChunk, ExtractionResult
 _CAMEL_BOUNDARY_1: Final = re.compile(r"([a-z0-9])([A-Z])")
 _CAMEL_BOUNDARY_2: Final = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _NON_WORD: Final = re.compile(r"[^A-Za-z0-9]+")
+_CONTAINER_KINDS: Final = frozenset(
+    {"annotation", "class", "constant", "enum", "interface", "record"}
+)
+_CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 
 
 def normalize_identifier(value: str) -> str:
@@ -29,6 +34,7 @@ def normalize_identifier(value: str) -> str:
 def _languages() -> dict[str, Language]:
     return {
         "python": Language(tree_sitter_python.language()),
+        "java": Language(tree_sitter_java.language()),
         "javascript": Language(tree_sitter_javascript.language()),
         "typescript": Language(tree_sitter_typescript.language_typescript()),
         "tsx": Language(tree_sitter_typescript.language_tsx()),
@@ -68,7 +74,7 @@ class TreeSitterExtractor:
             if not self._has_definition_ancestor(definition.node, definitions):
                 covered.append((outer.start_byte, outer.end_byte))
             kind, parent, qualified = self._symbol_context(definition, definitions)
-            start, end = self._content_range(outer, kind, definitions)
+            start, end = self._content_range(outer, definition.node, kind, definitions)
             chunks.extend(
                 self._chunks_for_range(
                     path=path,
@@ -124,12 +130,10 @@ class TreeSitterExtractor:
 
     @staticmethod
     def _has_definition_ancestor(node: Node, definitions: list[_Definition]) -> bool:
-        definition_nodes = {
-            (definition.node.start_byte, definition.node.end_byte) for definition in definitions
-        }
+        definition_node_ids = {definition.node.id for definition in definitions}
         parent = node.parent
         while parent is not None:
-            if (parent.start_byte, parent.end_byte) in definition_nodes:
+            if parent.id in definition_node_ids:
                 return True
             parent = parent.parent
         return False
@@ -138,32 +142,38 @@ class TreeSitterExtractor:
     def _symbol_context(
         definition: _Definition, definitions: list[_Definition]
     ) -> tuple[str, str | None, str]:
-        containers: list[_Definition] = []
+        chain: list[_Definition] = []
+        definitions_by_id = {candidate.node.id: candidate for candidate in definitions}
         parent = definition.node.parent
         while parent is not None:
-            for candidate in definitions:
-                if candidate.kind in {"class", "interface"} and candidate.node == parent:
-                    containers.append(candidate)
-                    break
+            candidate = definitions_by_id.get(parent.id)
+            if candidate is not None:
+                chain.append(candidate)
             parent = parent.parent
-        containers.reverse()
-        parent_name = ".".join(item.name for item in containers) or None
+        chain.reverse()
+        if any(item.kind in _CALLABLE_KINDS for item in chain):
+            scope = chain
+        else:
+            scope = [item for item in chain if item.kind in _CONTAINER_KINDS]
+        parent_name = ".".join(item.name for item in scope) or None
         qualified = f"{parent_name}.{definition.name}" if parent_name else definition.name
         kind = definition.kind
-        if parent_name and kind == "function":
+        if scope and scope[-1].kind in _CONTAINER_KINDS and kind == "function":
             kind = "method"
         return kind, parent_name, qualified
 
     @staticmethod
-    def _content_range(outer: Node, kind: str, definitions: list[_Definition]) -> tuple[int, int]:
-        if kind not in {"class", "interface"}:
+    def _content_range(
+        outer: Node, node: Node, kind: str, definitions: list[_Definition]
+    ) -> tuple[int, int]:
+        if kind not in _CONTAINER_KINDS:
             return outer.start_byte, outer.end_byte
         nested_starts = [
             item.node.start_byte
             for item in definitions
-            if item.node.start_byte > outer.start_byte
+            if item.node != node
+            and item.node.start_byte > outer.start_byte
             and item.node.end_byte <= outer.end_byte
-            and item.kind in {"function", "method"}
         ]
         end = min(nested_starts) if nested_starts else outer.end_byte
         return outer.start_byte, end
