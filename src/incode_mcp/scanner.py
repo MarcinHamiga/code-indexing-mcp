@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pathspec import GitIgnoreSpec
 
-from .models import ProjectInfo, ScannedFile, ScanResult, SkippedFile, StoredFile
+from .models import ProjectInfo, ScanConfig, ScannedFile, ScanResult, SkippedFile, StoredFile
 
 LANGUAGES = {
     ".py": "python",
@@ -41,6 +41,33 @@ HARD_EXCLUDED_DIRECTORIES = {
 
 
 class SourceScanner:
+    def has_supported_source(self, root: Path, scan: ScanConfig) -> bool:
+        """Return whether *root* contains an eligible source file without reading it."""
+        root = root.expanduser().resolve()
+        config_excludes = GitIgnoreSpec.from_lines(scan.exclude)
+        include_spec = GitIgnoreSpec.from_lines(scan.include)
+        candidates, gitignores = self._walk(root)
+        ignore_specs = self._load_ignore_specs(root, gitignores)
+        for absolute in candidates:
+            relative = absolute.relative_to(root)
+            if self._in_hard_excluded_directory(relative) or absolute.is_symlink():
+                continue
+            if not absolute.is_file():
+                continue
+            if (
+                absolute.suffix.lower() not in LANGUAGES
+                or not include_spec.match_file(relative.as_posix())
+                or config_excludes.match_file(relative.as_posix())
+                or self._is_ignored(relative, ignore_specs)
+            ):
+                continue
+            try:
+                if absolute.stat().st_size <= scan.max_file_bytes:
+                    return True
+            except OSError:
+                continue
+        return False
+
     def scan(
         self, project: ProjectInfo, known_files: dict[str, StoredFile] | None = None
     ) -> ScanResult:

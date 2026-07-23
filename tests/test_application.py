@@ -60,6 +60,50 @@ def test_init_project_defaults_to_the_single_client_root(tmp_path: Path) -> None
     assert project.root == root.resolve()
 
 
+def test_discover_project_requires_marker_and_supported_source(tmp_path: Path) -> None:
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    source_only = tmp_path / "source-only"
+    source_only.mkdir()
+    (source_only / "main.py").write_text("value = 1\n")
+
+    assert app.discover_project(source_only) is None
+    assert not (source_only / ".incode").exists()
+
+    (source_only / "pyproject.toml").write_text("[project]\nname = 'source-only'\n")
+
+    project = app.discover_project(source_only)
+
+    assert project is not None
+    assert project.root == source_only.resolve()
+    assert app.project_status(project.id).state == "pending"
+    assert (source_only / ".incode" / "project.toml").exists()
+
+
+def test_discover_project_accepts_javascript_manifest_and_existing_marker(tmp_path: Path) -> None:
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    javascript = tmp_path / "javascript"
+    javascript.mkdir()
+    (javascript / "package.json").write_text('{"name": "javascript"}\n')
+    (javascript / "main.ts").write_text("export const value = 1\n")
+
+    project = app.discover_project(javascript)
+
+    assert project is not None
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    existing = app.init_project(empty)
+
+    assert app.discover_project(empty) == existing
+
+
 def test_application_supports_explicit_cross_project_search(tmp_path: Path) -> None:
     app = Application(
         RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),

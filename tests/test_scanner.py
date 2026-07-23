@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import patch
 
+from incode_mcp.models import ScanConfig
 from incode_mcp.projects import initialize_project
 from incode_mcp.scanner import SourceScanner
 
@@ -104,3 +105,18 @@ def test_scanner_never_walks_hard_excluded_directories(tmp_path: Path) -> None:
 
     assert stat_failures == []
     assert [item.path.as_posix() for item in result.files] == ["main.py"]
+
+
+def test_has_supported_source_respects_ignore_and_hard_exclusion_rules(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / ".gitignore").write_text("ignored.py\n")
+    (root / "ignored.py").write_text("value = 1\n")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "vendor.js").write_text("export default 1\n")
+
+    assert SourceScanner().has_supported_source(root, ScanConfig()) is False
+
+    (root / "main.ts").write_text("export const answer = 42\n")
+
+    assert SourceScanner().has_supported_source(root, ScanConfig()) is True
