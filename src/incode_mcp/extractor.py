@@ -130,10 +130,10 @@ class TreeSitterExtractor:
 
     @staticmethod
     def _has_definition_ancestor(node: Node, definitions: list[_Definition]) -> bool:
-        definition_nodes = [definition.node for definition in definitions]
+        definition_node_ids = {definition.node.id for definition in definitions}
         parent = node.parent
         while parent is not None:
-            if any(parent == definition_node for definition_node in definition_nodes):
+            if parent.id in definition_node_ids:
                 return True
             parent = parent.parent
         return False
@@ -143,12 +143,12 @@ class TreeSitterExtractor:
         definition: _Definition, definitions: list[_Definition]
     ) -> tuple[str, str | None, str]:
         chain: list[_Definition] = []
+        definitions_by_id = {candidate.node.id: candidate for candidate in definitions}
         parent = definition.node.parent
         while parent is not None:
-            for candidate in definitions:
-                if candidate.node == parent:
-                    chain.append(candidate)
-                    break
+            candidate = definitions_by_id.get(parent.id)
+            if candidate is not None:
+                chain.append(candidate)
             parent = parent.parent
         chain.reverse()
         if any(item.kind in _CALLABLE_KINDS for item in chain):
