@@ -99,8 +99,7 @@ def test_scanner_never_walks_hard_excluded_directories(tmp_path: Path) -> None:
 
     def fail_if_excluded_is_statted(path: Path, *args, **kwargs):
         if any(
-            excluded in path.parts
-            for excluded in ("node_modules", ".git", ".incode", ".ci-mcp")
+            excluded in path.parts for excluded in ("node_modules", ".git", ".incode", ".ci-mcp")
         ):
             stat_failures.append(path)
             raise AssertionError(f"excluded path was statted: {path}")

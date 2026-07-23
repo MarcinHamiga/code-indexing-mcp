@@ -117,9 +117,7 @@ def test_codex_merge_creates_server_table(tmp_path: Path) -> None:
 
     assert changed is True
     assert path.read_text() == (
-        "[mcp_servers.code-indexing-mcp]\n"
-        'command = "/opt/ci-mcp"\n'
-        'args = ["serve"]\n'
+        '[mcp_servers.code-indexing-mcp]\ncommand = "/opt/ci-mcp"\nargs = ["serve"]\n'
     )
 
 
@@ -208,21 +206,36 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
         "APPDATA": str(tmp_path / "appdata"),
     }
 
-    assert installer.configuration_path(
-        "codex", home=tmp_path, environment=environment, platform_name="darwin"
-    ) == tmp_path / "codex-home" / "config.toml"
-    assert installer.configuration_path(
-        "kimi-code", home=tmp_path, environment=environment, platform_name="darwin"
-    ) == tmp_path / "kimi-home" / "mcp.json"
-    assert installer.configuration_path(
-        "opencode", home=tmp_path, environment=environment, platform_name="darwin"
-    ) == tmp_path / "custom-opencode.jsonc"
-    assert installer.configuration_path(
-        "kilocode", home=tmp_path, environment=environment, platform_name="darwin"
-    ) == tmp_path / "xdg" / "kilo" / "kilo.jsonc"
-    assert installer.configuration_path(
-        "claude-desktop", home=tmp_path, environment=environment, platform_name="win32"
-    ) == tmp_path / "appdata" / "Claude" / "claude_desktop_config.json"
+    assert (
+        installer.configuration_path(
+            "codex", home=tmp_path, environment=environment, platform_name="darwin"
+        )
+        == tmp_path / "codex-home" / "config.toml"
+    )
+    assert (
+        installer.configuration_path(
+            "kimi-code", home=tmp_path, environment=environment, platform_name="darwin"
+        )
+        == tmp_path / "kimi-home" / "mcp.json"
+    )
+    assert (
+        installer.configuration_path(
+            "opencode", home=tmp_path, environment=environment, platform_name="darwin"
+        )
+        == tmp_path / "custom-opencode.jsonc"
+    )
+    assert (
+        installer.configuration_path(
+            "kilocode", home=tmp_path, environment=environment, platform_name="darwin"
+        )
+        == tmp_path / "xdg" / "kilo" / "kilo.jsonc"
+    )
+    assert (
+        installer.configuration_path(
+            "claude-desktop", home=tmp_path, environment=environment, platform_name="win32"
+        )
+        == tmp_path / "appdata" / "Claude" / "claude_desktop_config.json"
+    )
 
 
 @pytest.mark.parametrize(

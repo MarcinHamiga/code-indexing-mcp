@@ -12,9 +12,9 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, NamedTuple
 
 SERVER_NAME = "code-indexing-mcp"
 DEFAULT_REPOSITORY_URL = "https://github.com/MarcinHamiga/code-indexing-mcp.git"
@@ -190,9 +190,7 @@ def _insert_jsonc_member(
     encoded_key = json.dumps(key, ensure_ascii=False)
     encoded_value = _format_json_value(value, member_indent)
     leading_newline = "" if text[:insertion_point].endswith("\n") else "\n"
-    addition = (
-        f"{leading_newline}{member_indent}{encoded_key}: {encoded_value}\n{closing_suffix}"
-    )
+    addition = f"{leading_newline}{member_indent}{encoded_key}: {encoded_value}\n{closing_suffix}"
     return text[:insertion_point] + addition + text[insertion_point:]
 
 
@@ -316,11 +314,7 @@ def _split_toml_dotted_key(value: str) -> list[str]:
 
 def _codex_server_block(command: Path) -> str:
     encoded_command = json.dumps(str(command), ensure_ascii=False)
-    return (
-        f"[mcp_servers.{SERVER_NAME}]\n"
-        f"command = {encoded_command}\n"
-        'args = ["serve"]\n'
-    )
+    return f'[mcp_servers.{SERVER_NAME}]\ncommand = {encoded_command}\nargs = ["serve"]\n'
 
 
 def merge_codex_server(path: Path, command: Path) -> bool:
@@ -380,7 +374,9 @@ def parse_harness_selection(selection: str) -> list[str]:
         slug = by_number.get(token, by_slug.get(token))
         if slug is None:
             options = ", ".join(choice.slug for choice in HARNESS_CHOICES)
-            raise InstallerError(f"Unknown harness {token!r}; choose 1-6, all, or one of: {options}")
+            raise InstallerError(
+                f"Unknown harness {token!r}; choose 1-6, all, or one of: {options}"
+            )
         if slug not in selected:
             selected.append(slug)
     return selected
@@ -429,17 +425,12 @@ def configuration_path(
         return home / ".claude.json"
     if slug == "kimi-code":
         return (
-            _configured_directory(environment, "KIMI_CODE_HOME", home / ".kimi-code")
-            / "mcp.json"
+            _configured_directory(environment, "KIMI_CODE_HOME", home / ".kimi-code") / "mcp.json"
         )
     if slug == "claude-desktop":
         if platform_name == "darwin":
             return (
-                home
-                / "Library"
-                / "Application Support"
-                / "Claude"
-                / "claude_desktop_config.json"
+                home / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
             )
         if platform_name.startswith("win"):
             app_data = environment.get("APPDATA")
@@ -507,7 +498,9 @@ def configure_harness(
     return path
 
 
-def _run_command(arguments: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run_command(
+    arguments: list[str], *, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             arguments,
