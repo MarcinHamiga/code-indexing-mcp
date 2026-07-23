@@ -168,7 +168,7 @@ class Application:
         limit: int = 8,
         roots: list[Path] | None = None,
     ) -> SearchResponse:
-        project_ids = self._search_scope(projects, all_projects, roots)
+        project_ids = self.resolve_search_scope(projects, all_projects, roots)
         return self.search.search_code(
             query,
             project_ids,
@@ -188,13 +188,13 @@ class Application:
         limit: int = 20,
         roots: list[Path] | None = None,
     ) -> SymbolResponse:
-        resolved = self._resolve(project, roots)
+        resolved = self.resolve_project(project, roots)
         return self.search.find_symbol(name, resolved.id, match=match, kinds=kinds, limit=limit)
 
     def file_outline(
         self, path: str, project: str | None = None, *, roots: list[Path] | None = None
     ) -> OutlineResponse:
-        resolved = self._resolve(project, roots)
+        resolved = self.resolve_project(project, roots)
         return self.search.file_outline(path, resolved.id)
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
@@ -222,6 +222,19 @@ class Application:
         return any(
             (root / marker).exists() for marker in PROJECT_SHAPE_MARKERS
         ) and self.indexer.scanner.has_supported_source(root, ScanConfig())
+
+    def resolve_project(self, explicit: str | None, roots: list[Path] | None = None) -> ProjectInfo:
+        """Resolve one project using the same rules as project-scoped tools."""
+        return self._resolve(explicit, roots)
+
+    def resolve_search_scope(
+        self,
+        projects: list[str] | None,
+        all_projects: bool,
+        roots: list[Path] | None = None,
+    ) -> list[str]:
+        """Resolve the project ids a search will use without executing it."""
+        return self._search_scope(projects, all_projects, roots)
 
     def _resolve(self, explicit: str | None, roots: list[Path] | None) -> ProjectInfo:
         return ProjectResolver(self.store.list_projects()).resolve(

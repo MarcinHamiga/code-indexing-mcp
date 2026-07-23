@@ -3,6 +3,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 from mcp import types
 from mcp.shared.memory import create_connected_server_and_client_session
 
@@ -33,6 +34,19 @@ class BlockingEmbedder(TinyEmbedder):
         return super().embed_passages(texts)
 
 
+class SwitchableBlockingEmbedder(TinyEmbedder):
+    def __init__(self) -> None:
+        self.block = False
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        if self.block:
+            self.started.set()
+            assert self.release.wait(timeout=5)
+        return super().embed_passages(texts)
+
+
 class FlakyEmbedder(TinyEmbedder):
     """Fails the first call to embed_passages, then behaves like TinyEmbedder.
 
@@ -51,6 +65,15 @@ class FlakyEmbedder(TinyEmbedder):
         if self.calls == 1:
             raise IncodeError(ErrorCode.MODEL_UNAVAILABLE, "embedding backend unavailable")
         return super().embed_passages(texts)
+
+
+class FailingEmbedder(TinyEmbedder):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        raise IncodeError(ErrorCode.MODEL_UNAVAILABLE, "embedding backend unavailable")
 
 
 @pytest.mark.asyncio
@@ -114,6 +137,126 @@ async def test_server_starts_background_indexing_when_client_lists_tools(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_first_automatic_index_materializes_project_tree_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    server = create_server(app)
+    walks = 0
+    original_walk = app.indexer.scanner._walk
+
+    def counted_walk(path: Path) -> tuple[list[Path], list[Path]]:
+        nonlocal walks
+        walks += 1
+        return original_walk(path)
+
+    monkeypatch.setattr(app.indexer.scanner, "_walk", counted_walk)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        result = await client.call_tool("search_code", {"query": "answer"})
+
+    assert not result.isError
+    assert walks == 1
+
+
+@pytest.mark.asyncio
+async def test_server_shutdown_waits_for_active_startup_index(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    embedder = BlockingEmbedder()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=embedder,
+        cwd=tmp_path,
+    )
+    server = create_server(app)
+    entered = asyncio.Event()
+    leave = asyncio.Event()
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async def open_session() -> None:
+        async with create_connected_server_and_client_session(
+            server, list_roots_callback=list_roots
+        ) as client:
+            await client.list_tools()
+            assert await asyncio.to_thread(embedder.started.wait, 1)
+            entered.set()
+            await leave.wait()
+
+    session = asyncio.create_task(open_session())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    try:
+        leave.set()
+        await asyncio.sleep(0.05)
+        assert not session.done()
+    finally:
+        embedder.release.set()
+        await asyncio.wait_for(session, timeout=2)
+
+    assert app.project_status(roots=[root]).state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_server_shutdown_cancels_startup_job_waiting_for_index_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    project = app.init_project(root)
+    server = create_server(app)
+    attempted = threading.Event()
+    original_index = app.indexer.index
+
+    def observed_index(*args: object, **kwargs: object) -> object:
+        attempted.set()
+        return original_index(*args, **kwargs)
+
+    monkeypatch.setattr(app.indexer, "index", observed_index)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async def open_session() -> None:
+        async with create_connected_server_and_client_session(
+            server, list_roots_callback=list_roots
+        ) as client:
+            await client.list_tools()
+            assert await asyncio.to_thread(attempted.wait, 1)
+
+    lock = FileLock(paths.data / "locks" / f"{project.id}.lock")
+    with lock:
+        await asyncio.wait_for(open_session(), timeout=2)
+
+    for _ in range(50):
+        if app.project_status(project.id).state == "ready":
+            break
+        await asyncio.sleep(0.01)
+
+    assert app.project_status(project.id).state == "pending"
+
+
+@pytest.mark.asyncio
 async def test_code_query_waits_for_startup_index_to_finish(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
@@ -144,6 +287,92 @@ async def test_code_query_waits_for_startup_index_to_finish(tmp_path: Path) -> N
         result = await query
 
     assert result
+
+
+@pytest.mark.asyncio
+async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Path) -> None:
+    ready_root = tmp_path / "ready"
+    ready_root.mkdir()
+    (ready_root / "main.py").write_text("def answer():\n    return 42\n")
+
+    startup_root = tmp_path / "startup"
+    startup_root.mkdir()
+    (startup_root / "pyproject.toml").write_text("[project]\nname = 'startup'\n")
+    (startup_root / "slow.py").write_text("def slow():\n    return True\n")
+
+    embedder = SwitchableBlockingEmbedder()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=embedder,
+        cwd=tmp_path,
+    )
+    ready_project = app.init_project(ready_root)
+    app.index_project(ready_project.id)
+    embedder.block = True
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=startup_root.as_uri())])
+
+    try:
+        async with create_connected_server_and_client_session(
+            server, list_roots_callback=list_roots
+        ) as client:
+            await client.list_tools()
+            assert await asyncio.to_thread(embedder.started.wait, 1)
+
+            result = await asyncio.wait_for(
+                client.call_tool(
+                    "search_code",
+                    {"query": "answer", "projects": [ready_project.id]},
+                ),
+                timeout=0.5,
+            )
+
+            assert not result.isError
+    finally:
+        embedder.release.set()
+
+
+@pytest.mark.asyncio
+async def test_explicit_code_query_ignores_unrelated_startup_failure(tmp_path: Path) -> None:
+    ready_root = tmp_path / "ready"
+    ready_root.mkdir()
+    (ready_root / "main.py").write_text("def answer():\n    return 42\n")
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    setup_app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    ready_project = setup_app.init_project(ready_root)
+    setup_app.index_project(ready_project.id)
+
+    failing_root = tmp_path / "failing"
+    failing_root.mkdir()
+    (failing_root / "pyproject.toml").write_text("[project]\nname = 'failing'\n")
+    (failing_root / "broken.py").write_text("def broken():\n    return True\n")
+
+    embedder = FailingEmbedder()
+    app = Application(paths, embedder=embedder, cwd=tmp_path)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=failing_root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        for _ in range(100):
+            if embedder.calls == 1:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("expected the unrelated startup index to fail")
+
+        result = await client.call_tool(
+            "search_code",
+            {"query": "answer", "projects": [ready_project.id]},
+        )
+
+    assert not result.isError
 
 
 @pytest.mark.asyncio

@@ -120,3 +120,21 @@ def test_has_supported_source_respects_ignore_and_hard_exclusion_rules(tmp_path:
     (root / "main.ts").write_text("export const answer = 42\n")
 
     assert SourceScanner().has_supported_source(root, ScanConfig()) is True
+
+
+def test_has_supported_source_applies_nested_gitignore_rules(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    package = root / "package"
+    package.mkdir(parents=True)
+    (root / ".gitignore").write_text("package/*.py\n")
+    (package / ".gitignore").write_text("!keep.py\n")
+    keep = package / "keep.py"
+    keep.write_text("keep = True\n")
+    (package / "drop.py").write_text("drop = True\n")
+    scanner = SourceScanner()
+
+    assert scanner.has_supported_source(root, ScanConfig()) is True
+
+    keep.unlink()
+
+    assert scanner.has_supported_source(root, ScanConfig()) is False

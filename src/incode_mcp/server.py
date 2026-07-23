@@ -8,6 +8,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
@@ -18,6 +19,7 @@ from mcp.server.session import ServerSession
 from mcp.types import Tool as MCPTool
 
 from .application import Application
+from .errors import ErrorCode, IncodeError
 from .models import (
     CodeChunk,
     IndexReport,
@@ -36,7 +38,13 @@ logger = logging.getLogger(__name__)
 class _StartupJob:
     discovered: anyio.Event = field(default_factory=anyio.Event)
     ready: anyio.Event = field(default_factory=anyio.Event)
-    error: BaseException | None = None
+    project_id: str | None = None
+    discovery_error: BaseException | None = None
+    indexing_error: BaseException | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.discovery_error is not None or self.indexing_error is not None
 
 
 class StartupCoordinator:
@@ -57,9 +65,7 @@ class StartupCoordinator:
             for root in roots:
                 root = root.resolve()
                 existing = self._jobs.get(root)
-                if existing is not None and not (
-                    existing.ready.is_set() and existing.error is not None
-                ):
+                if existing is not None and not (existing.ready.is_set() and existing.failed):
                     # A job is still in flight, or already finished successfully.
                     continue
                 job = _StartupJob()
@@ -69,12 +75,18 @@ class StartupCoordinator:
     async def wait_for_discovery(self, roots: list[Path]) -> None:
         for job in await self._jobs_for(roots):
             await job.discovered.wait()
-            self._raise_error(job)
+            if job.discovery_error is not None:
+                raise job.discovery_error
 
-    async def wait_for_ready(self, roots: list[Path]) -> None:
+    async def wait_for_ready(self, roots: list[Path], project_ids: set[str]) -> None:
         for job in await self._jobs_for(roots):
+            if job.project_id not in project_ids:
+                continue
             await job.ready.wait()
-            self._raise_error(job)
+            if job.discovery_error is not None:
+                raise job.discovery_error
+            if job.indexing_error is not None:
+                raise job.indexing_error
 
     async def _jobs_for(self, roots: list[Path]) -> list[_StartupJob]:
         async with self._lock:
@@ -82,34 +94,42 @@ class StartupCoordinator:
 
     async def _run(self, root: Path, job: _StartupJob) -> None:
         try:
-            project = await asyncio.to_thread(self.application.discover_project, root)
+            project = await anyio.to_thread.run_sync(
+                self.application.discover_project,
+                root,
+                abandon_on_cancel=False,
+            )
+            job.project_id = project.id if project is not None else None
             job.discovered.set()
             if project is None:
                 logger.info("Skipping automatic indexing for non-project root: %s", root)
                 return
             async with self._limiter:
-                report = await asyncio.to_thread(
-                    self.application.index_project,
-                    project.id,
-                    wait_for_lock=True,
-                )
+                while True:
+                    try:
+                        report = await anyio.to_thread.run_sync(
+                            partial(self.application.index_project, project.id),
+                            abandon_on_cancel=False,
+                        )
+                        break
+                    except IncodeError as exc:
+                        if exc.code is not ErrorCode.INDEX_BUSY:
+                            raise
+                        await anyio.sleep(0.05)
             logger.info(
                 "Automatic indexing complete for %s: %s files indexed",
                 project.root,
                 report.indexed_files,
             )
         except Exception as exc:
-            job.error = exc
             if not job.discovered.is_set():
+                job.discovery_error = exc
                 job.discovered.set()
+            else:
+                job.indexing_error = exc
             logger.exception("Automatic indexing failed for %s", root)
         finally:
             job.ready.set()
-
-    @staticmethod
-    def _raise_error(job: _StartupJob) -> None:
-        if job.error is not None:
-            raise job.error
 
 
 ServerContext = Context[ServerSession, StartupCoordinator]
@@ -149,9 +169,15 @@ async def _startup_roots(ctx: ServerContext, *, wait_for: str | None = None) -> 
     await coordinator.schedule(roots)
     if wait_for == "discovery":
         await coordinator.wait_for_discovery(roots)
-    elif wait_for == "ready":
-        await coordinator.wait_for_ready(roots)
     return roots
+
+
+async def _wait_for_startup_projects(
+    ctx: ServerContext, roots: list[Path], project_ids: list[str]
+) -> None:
+    coordinator = _coordinator(ctx)
+    if coordinator is not None:
+        await coordinator.wait_for_ready(roots, set(project_ids))
 
 
 class AutoIndexingMCP(FastMCP):
@@ -171,9 +197,9 @@ class AutoIndexingMCP(FastMCP):
             try:
                 yield StartupCoordinator(self.application, task_group, enabled=self.auto_index)
             finally:
-                # Don't block shutdown on background indexing: cancel any still-running
-                # startup jobs. An embedding batch already running in a worker thread
-                # finishes detached (asyncio.to_thread is not cancellable).
+                # Lock waiters are cancellable between non-blocking attempts. A worker
+                # that has acquired the index lock remains owned until its write
+                # finishes because run_sync is not abandoned on cancellation.
                 task_group.cancel_scope.cancel()
 
     async def list_tools(self) -> list[MCPTool]:
@@ -249,12 +275,16 @@ def create_server(
         kinds: list[str] | None = None,
         limit: int = 8,
     ) -> SearchResponse:
-        roots = await _startup_roots(ctx, wait_for="ready")
+        roots = await _startup_roots(ctx, wait_for="discovery")
+        project_ids = await asyncio.to_thread(
+            app.resolve_search_scope, projects, all_projects, roots
+        )
+        await _wait_for_startup_projects(ctx, roots, project_ids)
         return await asyncio.to_thread(
             app.search_code,
             query,
-            projects=projects,
-            all_projects=all_projects,
+            projects=project_ids,
+            all_projects=False,
             languages=languages,
             paths=paths,
             kinds=kinds,
@@ -271,11 +301,13 @@ def create_server(
         kinds: list[str] | None = None,
         limit: int = 20,
     ) -> SymbolResponse:
-        roots = await _startup_roots(ctx, wait_for="ready")
+        roots = await _startup_roots(ctx, wait_for="discovery")
+        resolved = await asyncio.to_thread(app.resolve_project, project, roots)
+        await _wait_for_startup_projects(ctx, roots, [resolved.id])
         return await asyncio.to_thread(
             app.find_symbol,
             name,
-            project,
+            resolved.id,
             match=match,
             kinds=kinds,
             limit=limit,
@@ -286,8 +318,10 @@ def create_server(
     async def file_outline(
         ctx: ServerContext, path: str, project: str | None = None
     ) -> OutlineResponse:
-        roots = await _startup_roots(ctx, wait_for="ready")
-        return await asyncio.to_thread(app.file_outline, path, project, roots=roots)
+        roots = await _startup_roots(ctx, wait_for="discovery")
+        resolved = await asyncio.to_thread(app.resolve_project, project, roots)
+        await _wait_for_startup_projects(ctx, roots, [resolved.id])
+        return await asyncio.to_thread(app.file_outline, path, resolved.id, roots=roots)
 
     @mcp.tool()
     async def get_chunk(ctx: ServerContext, chunk_id: str) -> CodeChunk:

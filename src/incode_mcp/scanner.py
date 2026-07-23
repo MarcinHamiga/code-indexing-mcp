@@ -46,24 +46,42 @@ class SourceScanner:
         root = root.expanduser().resolve()
         config_excludes = GitIgnoreSpec.from_lines(scan.exclude)
         include_spec = GitIgnoreSpec.from_lines(scan.include)
-        candidates, gitignores = self._walk(root)
-        ignore_specs = self._load_ignore_specs(root, gitignores)
-        for absolute in candidates:
-            relative = absolute.relative_to(root)
-            language, _ = self._classify(
-                relative,
-                absolute,
-                include_spec=include_spec,
-                config_excludes=config_excludes,
-                ignore_specs=ignore_specs,
+        inherited_specs: dict[Path, list[tuple[Path, GitIgnoreSpec]]] = {root: []}
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            base = Path(dirpath)
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if name not in HARD_EXCLUDED_DIRECTORIES and not (base / name).is_symlink()
             )
-            if language is None:
-                continue
-            try:
-                if absolute.stat().st_size <= scan.max_file_bytes:
-                    return True
-            except OSError:
-                continue
+            ignore_specs = inherited_specs.get(base, [])
+            gitignore = base / ".gitignore"
+            if ".gitignore" in filenames:
+                ignore_specs = [
+                    *ignore_specs,
+                    *self._load_ignore_specs(root, [gitignore]),
+                ]
+            for name in dirnames:
+                inherited_specs[base / name] = ignore_specs
+
+            for name in sorted(filenames):
+                absolute = base / name
+                relative = absolute.relative_to(root)
+                language, _ = self._classify(
+                    relative,
+                    absolute,
+                    include_spec=include_spec,
+                    config_excludes=config_excludes,
+                    ignore_specs=ignore_specs,
+                )
+                if language is None:
+                    continue
+                try:
+                    if absolute.stat().st_size <= scan.max_file_bytes:
+                        return True
+                except OSError:
+                    continue
         return False
 
     def scan(
