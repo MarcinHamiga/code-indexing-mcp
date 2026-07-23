@@ -105,3 +105,23 @@ def test_duplicate_live_project_marker_is_rejected_but_moved_checkout_is_adopted
     report = app.index_project(str(duplicate))
     assert report.project_id == project.id
     assert app.list_projects()[0].root == duplicate.resolve()
+
+
+def test_duplicate_legacy_project_marker_is_still_rejected(tmp_path: Path) -> None:
+    original = tmp_path / "original"
+    duplicate = tmp_path / "duplicate"
+    original.mkdir()
+    (original / "main.py").write_text("value = 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    app.init_project(original)
+    (original / ".ci-mcp").rename(original / ".incode")
+    shutil.copytree(original, duplicate)
+
+    with pytest.raises(IncodeError) as raised:
+        app.index_project(str(duplicate))
+
+    assert raised.value.code is ErrorCode.PROJECT_ID_CONFLICT

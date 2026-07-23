@@ -161,6 +161,62 @@ def _format_json_value(value: Any, base_indent: str) -> str:
     return lines[0] + "".join(f"\n{base_indent}{line}" for line in lines[1:])
 
 
+def _jsonc_as_json(text: str) -> str:
+    without_comments: list[str] = []
+    position = 0
+    while position < len(text):
+        if text[position] == '"':
+            _, end = _parse_json_string(text, position)
+            without_comments.append(text[position:end])
+            position = end
+            continue
+        if text.startswith("//", position):
+            end = text.find("\n", position + 2)
+            if end == -1:
+                without_comments.append(" " * (len(text) - position))
+                break
+            without_comments.append(" " * (end - position))
+            position = end
+            continue
+        if text.startswith("/*", position):
+            end = text.find("*/", position + 2)
+            if end == -1:
+                raise ValueError("unterminated block comment")
+            comment = text[position : end + 2]
+            without_comments.append("".join("\n" if char == "\n" else " " for char in comment))
+            position = end + 2
+            continue
+        without_comments.append(text[position])
+        position += 1
+
+    cleaned = "".join(without_comments)
+    without_trailing_commas: list[str] = []
+    position = 0
+    while position < len(cleaned):
+        if cleaned[position] == '"':
+            _, end = _parse_json_string(cleaned, position)
+            without_trailing_commas.append(cleaned[position:end])
+            position = end
+            continue
+        if cleaned[position] == ",":
+            next_token = position + 1
+            while next_token < len(cleaned) and cleaned[next_token].isspace():
+                next_token += 1
+            if next_token < len(cleaned) and cleaned[next_token] in "]}":
+                position += 1
+                continue
+        without_trailing_commas.append(cleaned[position])
+        position += 1
+    return "".join(without_trailing_commas)
+
+
+def _validate_jsonc(text: str) -> None:
+    try:
+        json.loads(_jsonc_as_json(text))
+    except json.JSONDecodeError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _insert_jsonc_member(
     text: str,
     object_start: int,
@@ -258,6 +314,15 @@ def _write_changed_configuration(path: Path, original: str | None, updated: str)
     return True
 
 
+def _read_configuration(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise InstallerError(f"Configuration must be UTF-8: {path}") from exc
+
+
 def merge_json_object_entry(
     path: Path,
     object_key: str,
@@ -266,10 +331,12 @@ def merge_json_object_entry(
 ) -> bool:
     """Merge one entry into a top-level JSON/JSONC object without rewriting other text."""
 
-    original = path.read_text(encoding="utf-8") if path.exists() else None
+    original = _read_configuration(path)
     source = original if original and original.strip() else "{}\n"
     try:
+        _validate_jsonc(source)
         updated = _merge_jsonc_text(source, object_key, entry_key, entry_value)
+        _validate_jsonc(updated)
     except ValueError as exc:
         raise InstallerError(f"Invalid JSON/JSONC configuration in {path}: {exc}") from exc
     return _write_changed_configuration(path, original, updated)
@@ -317,14 +384,24 @@ def _codex_server_block(command: Path) -> str:
     return f'[mcp_servers.{SERVER_NAME}]\ncommand = {encoded_command}\nargs = ["serve"]\n'
 
 
+def _trailing_toml_trivia(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    for index in range(len(lines) - 1, -1, -1):
+        stripped = lines[index].strip()
+        if stripped and not stripped.startswith("#"):
+            return "".join(lines[index + 1 :])
+    return text
+
+
 def merge_codex_server(path: Path, command: Path) -> bool:
     """Create or replace only the Code Indexing MCP table in a Codex config."""
 
-    original = path.read_text(encoding="utf-8") if path.exists() else None
+    original = _read_configuration(path)
     source = original or ""
+    parsed: dict[str, Any] = {}
     if source.strip():
         try:
-            tomllib.loads(source)
+            parsed = tomllib.loads(source)
         except tomllib.TOMLDecodeError as exc:
             raise InstallerError(f"Invalid TOML configuration in {path}: {exc}") from exc
 
@@ -342,6 +419,12 @@ def merge_codex_server(path: Path, command: Path) -> bool:
     )
     block = _codex_server_block(command)
     if target_index is None:
+        mcp_servers = parsed.get("mcp_servers")
+        if isinstance(mcp_servers, dict) and SERVER_NAME in mcp_servers:
+            raise InstallerError(
+                f"Codex server {SERVER_NAME!r} uses an inline or dotted TOML definition in "
+                f"{path}; convert it to [mcp_servers.{SERVER_NAME}] before rerunning"
+            )
         prefix = f"{source.rstrip()}\n\n" if source.strip() else ""
         updated = prefix + block
     else:
@@ -351,10 +434,15 @@ def merge_codex_server(path: Path, command: Path) -> bool:
             if components[: len(target)] != target:
                 end = match.start()
                 break
-        suffix = source[end:]
-        separator = "" if not suffix or suffix.startswith("\n") else "\n"
-        updated = source[:start] + block + separator + suffix.lstrip("\n")
+        trailing_trivia = _trailing_toml_trivia(source[start:end])
+        updated = source[:start] + block + trailing_trivia + source[end:]
 
+    try:
+        tomllib.loads(updated)
+    except tomllib.TOMLDecodeError as exc:
+        raise InstallerError(
+            f"Refusing to write invalid TOML configuration to {path}: {exc}"
+        ) from exc
     return _write_changed_configuration(path, original, updated)
 
 
@@ -437,6 +525,8 @@ def configuration_path(
             if not app_data:
                 raise InstallerError("APPDATA is required to configure Claude Desktop on Windows")
             return Path(app_data).expanduser() / "Claude" / "claude_desktop_config.json"
+        if platform_name.startswith("linux"):
+            return xdg_config / "Claude" / "claude_desktop_config.json"
         raise InstallerError(f"Claude Desktop configuration is not supported on {platform_name}")
     if slug == "opencode":
         configured = environment.get("OPENCODE_CONFIG")

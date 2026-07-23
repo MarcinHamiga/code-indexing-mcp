@@ -14,7 +14,7 @@ from lancedb.table import LanceTable
 
 from .errors import ErrorCode, IncodeError
 from .models import ProjectInfo, StoredChunk, StoredFile
-from .projects import marker_path
+from .projects import existing_marker_path
 
 SCHEMA_VERSION = 1
 
@@ -48,7 +48,10 @@ class LanceStore:
         if existing:
             registered_root = Path(str(existing[0]["root"])).resolve()
             incoming_root = project.root.resolve()
-            if registered_root != incoming_root and marker_path(registered_root).exists():
+            if (
+                registered_root != incoming_root
+                and existing_marker_path(registered_root) is not None
+            ):
                 raise IncodeError(
                     ErrorCode.PROJECT_ID_CONFLICT,
                     "The project ID is already active at another path",

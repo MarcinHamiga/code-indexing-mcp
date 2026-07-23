@@ -109,6 +109,19 @@ def test_jsonc_merge_rejects_invalid_input_without_modifying_it(tmp_path: Path) 
     assert not path.with_name("config.jsonc.bak").exists()
 
 
+def test_jsonc_merge_validates_unrelated_nested_values(tmp_path: Path) -> None:
+    installer = load_installer()
+    path = tmp_path / "config.jsonc"
+    original = '{"unrelated": {"broken": nope}}\n'
+    path.write_text(original)
+
+    with pytest.raises(installer.InstallerError, match="Invalid JSON"):
+        installer.merge_json_object_entry(path, "mcp", "server", {"enabled": True})
+
+    assert path.read_text() == original
+    assert not path.with_name("config.jsonc.bak").exists()
+
+
 def test_codex_merge_creates_server_table(tmp_path: Path) -> None:
     installer = load_installer()
     path = tmp_path / "config.toml"
@@ -137,6 +150,7 @@ args = ["old"]
 [mcp_servers.code-indexing-mcp.env]
 OLD = "value"
 
+# Keep the feature explanation too.
 [features]
 example = true
 """
@@ -148,6 +162,7 @@ example = true
     assert changed is True
     assert "# Keep this comment." in updated
     assert '[mcp_servers.other]\ncommand = "other"' in updated
+    assert "# Keep the feature explanation too." in updated
     assert "[features]\nexample = true" in updated
     assert 'command = "old"' not in updated
     assert "OLD" not in updated
@@ -165,6 +180,19 @@ def test_codex_merge_is_idempotent(tmp_path: Path) -> None:
     assert installer.merge_codex_server(path, Path("/opt/ci-mcp")) is False
 
     assert path.read_text() == first
+
+
+def test_codex_merge_rejects_inline_target_without_corrupting_config(tmp_path: Path) -> None:
+    installer = load_installer()
+    path = tmp_path / "config.toml"
+    original = '[mcp_servers]\ncode-indexing-mcp = { command = "old", args = ["old"] }\n'
+    path.write_text(original)
+
+    with pytest.raises(installer.InstallerError, match="inline or dotted"):
+        installer.merge_codex_server(path, Path("/opt/ci-mcp"))
+
+    assert path.read_text() == original
+    assert not path.with_name("config.toml.bak").exists()
 
 
 def test_harness_menu_combines_codex_cli_and_desktop() -> None:
@@ -327,16 +355,18 @@ def test_configure_codex_uses_shared_toml(tmp_path: Path) -> None:
     }
 
 
-def test_claude_desktop_rejects_platform_without_standard_config(tmp_path: Path) -> None:
+def test_claude_desktop_uses_linux_config_directory(tmp_path: Path) -> None:
     installer = load_installer()
 
-    with pytest.raises(installer.InstallerError, match="not supported on linux"):
+    assert (
         installer.configuration_path(
             "claude-desktop",
             home=tmp_path,
             environment={},
             platform_name="linux",
         )
+        == tmp_path / ".config" / "Claude" / "claude_desktop_config.json"
+    )
 
 
 def run_git(*arguments: str, cwd: Path | None = None) -> None:
@@ -448,6 +478,25 @@ def test_configure_selected_harnesses_isolates_failures(
     assert attempted == ["codex", "claude-code", "kimi-code"]
     assert [slug for slug, _ in successes] == ["codex", "kimi-code"]
     assert failures == [("claude-code", "broken config")]
+
+
+def test_configure_selected_harnesses_isolates_non_utf8_config(tmp_path: Path) -> None:
+    installer = load_installer()
+    (tmp_path / ".claude.json").write_bytes(b"\xff")
+
+    successes, failures = installer.configure_selected_harnesses(
+        ["claude-code", "kimi-code"],
+        Path("/opt/ci-mcp"),
+        home=tmp_path,
+        environment={},
+        platform_name="darwin",
+    )
+
+    assert [slug for slug, _ in successes] == ["kimi-code"]
+    assert len(failures) == 1
+    assert failures[0][0] == "claude-code"
+    assert "UTF-8" in failures[0][1]
+    assert (tmp_path / ".kimi-code" / "mcp.json").exists()
 
 
 def test_main_runs_noninteractive_install_and_reports_harness_failures(
