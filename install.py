@@ -342,7 +342,13 @@ def merge_json_object_entry(
     return _write_changed_configuration(path, original, updated)
 
 
-_TOML_TABLE = re.compile(r"(?m)^[ \t]*\[\s*([^]\n]+?)\s*\][ \t]*(?:#.*)?$")
+_TOML_TABLE = re.compile(
+    r"(?m)^[ \t]*(?:"
+    r"\[\[\s*(?P<array_name>[^]\n]+?)\s*\]\]"
+    r"|"
+    r"\[\s*(?P<table_name>[^]\n]+?)\s*\]"
+    r")[ \t]*(?:#.*)?$"
+)
 
 
 def _split_toml_dotted_key(value: str) -> list[str]:
@@ -405,16 +411,22 @@ def merge_codex_server(path: Path, command: Path) -> bool:
         except tomllib.TOMLDecodeError as exc:
             raise InstallerError(f"Invalid TOML configuration in {path}: {exc}") from exc
 
-    headings: list[tuple[re.Match[str], list[str]]] = []
+    headings: list[tuple[re.Match[str], list[str], bool]] = []
     for match in _TOML_TABLE.finditer(source):
         try:
-            headings.append((match, _split_toml_dotted_key(match.group(1))))
+            array_name = match.group("array_name")
+            name = array_name or match.group("table_name")
+            headings.append((match, _split_toml_dotted_key(name), array_name is not None))
         except ValueError as exc:
             raise InstallerError(f"Invalid TOML table in {path}: {exc}") from exc
 
     target = ["mcp_servers", SERVER_NAME]
     target_index = next(
-        (index for index, (_, components) in enumerate(headings) if components == target),
+        (
+            index
+            for index, (_, components, is_array) in enumerate(headings)
+            if components == target and not is_array
+        ),
         None,
     )
     block = _codex_server_block(command)
@@ -430,7 +442,7 @@ def merge_codex_server(path: Path, command: Path) -> bool:
     else:
         start = headings[target_index][0].start()
         end = len(source)
-        for match, components in headings[target_index + 1 :]:
+        for match, components, _ in headings[target_index + 1 :]:
             if components[: len(target)] != target:
                 end = match.start()
                 break
@@ -510,7 +522,7 @@ def configuration_path(
     if slug == "codex":
         return _configured_directory(environment, "CODEX_HOME", home / ".codex") / "config.toml"
     if slug == "claude-code":
-        return home / ".claude.json"
+        return _configured_directory(environment, "CLAUDE_CONFIG_DIR", home) / ".claude.json"
     if slug == "kimi-code":
         return (
             _configured_directory(environment, "KIMI_CODE_HOME", home / ".kimi-code") / "mcp.json"
@@ -539,7 +551,15 @@ def configuration_path(
         )
         return _preferred_json_config(directory, "opencode", default_suffix=".json")
     if slug == "kilocode":
-        return _preferred_json_config(xdg_config / "kilo", "kilo", default_suffix=".jsonc")
+        configured = environment.get("KILO_CONFIG")
+        if configured:
+            return Path(configured).expanduser()
+        directory = _configured_directory(
+            environment,
+            "KILO_CONFIG_DIR",
+            xdg_config / "kilo",
+        )
+        return _preferred_json_config(directory, "kilo", default_suffix=".jsonc")
     raise InstallerError(f"Unknown harness {slug!r}")
 
 

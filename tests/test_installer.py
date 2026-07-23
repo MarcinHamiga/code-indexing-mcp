@@ -178,6 +178,30 @@ example = true
     assert path.with_name("config.toml.bak").read_text() == original
 
 
+def test_codex_merge_preserves_following_array_tables(tmp_path: Path) -> None:
+    installer = load_installer()
+    path = tmp_path / "config.toml"
+    original = """[mcp_servers.code-indexing-mcp]
+command = "old"
+
+[[skills.config]]
+path = "/tmp/skill"
+enabled = false
+"""
+    path.write_text(original)
+
+    installer.merge_codex_server(path, Path("/new/ci-mcp"))
+
+    parsed = tomllib.loads(path.read_text())
+    assert parsed["skills"]["config"] == [
+        {
+            "path": "/tmp/skill",
+            "enabled": False,
+        }
+    ]
+    assert path.with_name("config.toml.bak").read_text() == original
+
+
 def test_codex_merge_is_idempotent(tmp_path: Path) -> None:
     installer = load_installer()
     path = tmp_path / "config.toml"
@@ -270,6 +294,54 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
             "claude-desktop", home=tmp_path, environment=environment, platform_name="win32"
         )
         == tmp_path / "appdata" / "Claude" / "claude_desktop_config.json"
+    )
+
+
+def test_claude_code_honors_config_directory_override(tmp_path: Path) -> None:
+    installer = load_installer()
+    config_directory = tmp_path / "claude-config"
+
+    assert (
+        installer.configuration_path(
+            "claude-code",
+            home=tmp_path,
+            environment={"CLAUDE_CONFIG_DIR": str(config_directory)},
+            platform_name="linux",
+        )
+        == config_directory / ".claude.json"
+    )
+
+
+def test_kilocode_honors_config_file_override(tmp_path: Path) -> None:
+    installer = load_installer()
+    config_file = tmp_path / "custom-kilo.jsonc"
+
+    assert (
+        installer.configuration_path(
+            "kilocode",
+            home=tmp_path,
+            environment={
+                "KILO_CONFIG": str(config_file),
+                "KILO_CONFIG_DIR": str(tmp_path / "kilo-config"),
+            },
+            platform_name="linux",
+        )
+        == config_file
+    )
+
+
+def test_kilocode_honors_config_directory_override(tmp_path: Path) -> None:
+    installer = load_installer()
+    config_directory = tmp_path / "kilo-config"
+
+    assert (
+        installer.configuration_path(
+            "kilocode",
+            home=tmp_path,
+            environment={"KILO_CONFIG_DIR": str(config_directory)},
+            platform_name="linux",
+        )
+        == config_directory / "kilo.jsonc"
     )
 
 
