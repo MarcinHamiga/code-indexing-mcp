@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import tomllib
 from pathlib import Path
 from types import ModuleType
@@ -322,3 +323,226 @@ def test_claude_desktop_rejects_platform_without_standard_config(tmp_path: Path)
             environment={},
             platform_name="linux",
         )
+
+
+def run_git(*arguments: str, cwd: Path | None = None) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def create_test_remote(tmp_path: Path, name: str = "remote") -> tuple[Path, Path]:
+    remote = tmp_path / f"{name}.git"
+    publisher = tmp_path / f"{name}-publisher"
+    run_git("init", "--bare", "--initial-branch=main", str(remote))
+    run_git("init", "--initial-branch=main", str(publisher))
+    run_git("config", "user.name", "Installer Tests", cwd=publisher)
+    run_git("config", "user.email", "installer@example.test", cwd=publisher)
+    (publisher / "version.txt").write_text("one\n")
+    run_git("add", "version.txt", cwd=publisher)
+    run_git("commit", "-m", "initial", cwd=publisher)
+    run_git("remote", "add", "origin", str(remote), cwd=publisher)
+    run_git("push", "-u", "origin", "main", cwd=publisher)
+    return remote, publisher
+
+
+def test_repository_is_cloned_then_fast_forwarded_on_update(tmp_path: Path) -> None:
+    installer = load_installer()
+    remote, publisher = create_test_remote(tmp_path)
+    checkout = tmp_path / "installed" / "code-indexing-mcp"
+
+    assert installer.clone_or_update_repository(str(remote), checkout) == "installed"
+    assert (checkout / "version.txt").read_text() == "one\n"
+
+    (publisher / "version.txt").write_text("two\n")
+    run_git("add", "version.txt", cwd=publisher)
+    run_git("commit", "-m", "update", cwd=publisher)
+    run_git("push", cwd=publisher)
+
+    assert installer.clone_or_update_repository(str(remote), checkout) == "updated"
+    assert (checkout / "version.txt").read_text() == "two\n"
+
+
+def test_repository_update_rejects_non_repo_dirty_and_mismatched_targets(
+    tmp_path: Path,
+) -> None:
+    installer = load_installer()
+    remote, _ = create_test_remote(tmp_path, "expected")
+    other_remote, _ = create_test_remote(tmp_path, "other")
+
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+    with pytest.raises(installer.InstallerError, match="not a Git repository"):
+        installer.clone_or_update_repository(str(remote), non_repo)
+
+    checkout = tmp_path / "checkout"
+    installer.clone_or_update_repository(str(remote), checkout)
+    (checkout / "version.txt").write_text("local edit\n")
+    with pytest.raises(installer.InstallerError, match="uncommitted changes"):
+        installer.clone_or_update_repository(str(remote), checkout)
+
+    run_git("restore", "version.txt", cwd=checkout)
+    with pytest.raises(installer.InstallerError, match="origin does not match"):
+        installer.clone_or_update_repository(str(other_remote), checkout)
+
+
+def test_sync_environment_runs_locked_sync_and_finds_server(tmp_path: Path) -> None:
+    installer = load_installer()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        'test "$1" = "sync"\n'
+        'test "$2" = "--locked"\n'
+        "mkdir -p .venv/bin\n"
+        "touch .venv/bin/code-indexing-mcp\n"
+    )
+    fake_uv.chmod(0o755)
+
+    command = installer.sync_environment(checkout, uv_executable=str(fake_uv))
+
+    assert command == checkout / ".venv" / "bin" / "code-indexing-mcp"
+
+
+def test_configure_selected_harnesses_isolates_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    attempted: list[str] = []
+
+    def fake_configure(slug: str, command: Path, **kwargs: object) -> Path:
+        attempted.append(slug)
+        if slug == "claude-code":
+            raise installer.InstallerError("broken config")
+        return tmp_path / f"{slug}.json"
+
+    monkeypatch.setattr(installer, "configure_harness", fake_configure)
+
+    successes, failures = installer.configure_selected_harnesses(
+        ["codex", "claude-code", "kimi-code"],
+        Path("/opt/ci-mcp"),
+        home=tmp_path,
+        environment={},
+        platform_name="darwin",
+    )
+
+    assert attempted == ["codex", "claude-code", "kimi-code"]
+    assert [slug for slug, _ in successes] == ["codex", "kimi-code"]
+    assert failures == [("claude-code", "broken config")]
+
+
+def test_main_runs_noninteractive_install_and_reports_harness_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    checkout = tmp_path / "checkout"
+    command = checkout / ".venv" / "bin" / "code-indexing-mcp"
+    calls: list[object] = []
+    output: list[str] = []
+    errors: list[str] = []
+
+    def fake_repository(repository_url: str, install_directory: Path) -> str:
+        calls.append(("repository", repository_url, install_directory))
+        return "installed"
+
+    def fake_sync(install_directory: Path) -> Path:
+        calls.append(("sync", install_directory))
+        return command
+
+    def fake_configure(
+        slugs: list[str], server_command: Path
+    ) -> tuple[list[tuple[str, Path]], list[tuple[str, str]]]:
+        calls.append(("configure", slugs, server_command))
+        return [("codex", tmp_path / "config.toml")], [("kimi-code", "invalid JSON")]
+
+    monkeypatch.setattr(installer, "clone_or_update_repository", fake_repository)
+    monkeypatch.setattr(installer, "sync_environment", fake_sync)
+    monkeypatch.setattr(installer, "configure_selected_harnesses", fake_configure)
+
+    status = installer.main(
+        [
+            "--repo-url",
+            "https://example.test/repo.git",
+            "--install-dir",
+            str(checkout),
+            "--harnesses",
+            "codex,kimi-code",
+        ],
+        output_fn=output.append,
+        error_fn=errors.append,
+    )
+
+    assert status == 1
+    assert calls == [
+        ("repository", "https://example.test/repo.git", checkout),
+        ("sync", checkout),
+        ("configure", ["codex", "kimi-code"], command),
+    ]
+    assert any("Installed repository" in line for line in output)
+    assert any("Configured Codex" in line for line in output)
+    assert errors == ["Failed to configure Kimi Code: invalid JSON"]
+
+
+def test_main_prompts_for_harnesses_when_option_is_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    selected: list[str] = []
+    output: list[str] = []
+
+    monkeypatch.setattr(
+        installer,
+        "clone_or_update_repository",
+        lambda repository_url, install_directory: "updated",
+    )
+    monkeypatch.setattr(
+        installer,
+        "sync_environment",
+        lambda install_directory: tmp_path / "server",
+    )
+
+    def fake_configure(
+        slugs: list[str], command: Path
+    ) -> tuple[list[tuple[str, Path]], list[tuple[str, str]]]:
+        selected.extend(slugs)
+        return [], []
+
+    monkeypatch.setattr(installer, "configure_selected_harnesses", fake_configure)
+
+    status = installer.main(
+        ["--install-dir", str(tmp_path / "checkout")],
+        input_fn=lambda prompt: "1,3",
+        output_fn=output.append,
+        error_fn=output.append,
+    )
+
+    assert status == 0
+    assert selected == ["codex", "kimi-code"]
+    assert any("Codex (CLI + Desktop)" in line for line in output)
+    assert any("Updated repository" in line for line in output)
+
+
+def test_main_reports_actionable_installer_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    errors: list[str] = []
+
+    def fail(repository_url: str, install_directory: Path) -> str:
+        raise installer.InstallerError("Git is required")
+
+    monkeypatch.setattr(installer, "clone_or_update_repository", fail)
+
+    status = installer.main(
+        ["--install-dir", str(tmp_path / "checkout"), "--harnesses", ""],
+        output_fn=lambda message: None,
+        error_fn=errors.append,
+    )
+
+    assert status == 1
+    assert errors == ["Error: Git is required"]

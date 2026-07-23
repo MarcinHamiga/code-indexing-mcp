@@ -3,18 +3,21 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 SERVER_NAME = "code-indexing-mcp"
+DEFAULT_REPOSITORY_URL = "https://github.com/MarcinHamiga/code-indexing-mcp.git"
 
 
 class HarnessChoice(NamedTuple):
@@ -502,3 +505,231 @@ def configure_harness(
 
     merge_json_object_entry(path, object_key, SERVER_NAME, entry)
     return path
+
+
+def _run_command(arguments: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            arguments,
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise InstallerError(f"Required command was not found: {arguments[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        command = " ".join(arguments)
+        message = f"Command failed: {command}"
+        if detail:
+            message = f"{message}\n{detail}"
+        raise InstallerError(message) from exc
+
+
+def _canonical_repository_url(url: str) -> str:
+    value = url.strip().rstrip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    if value.startswith("git@github.com:"):
+        return f"github.com/{value.removeprefix('git@github.com:').lower()}"
+    for prefix in ("https://github.com/", "http://github.com/", "ssh://git@github.com/"):
+        if value.startswith(prefix):
+            return f"github.com/{value.removeprefix(prefix).lower()}"
+    if "://" not in value:
+        return str(Path(value).expanduser().resolve())
+    return value
+
+
+def clone_or_update_repository(repository_url: str, install_directory: Path) -> str:
+    """Clone a fresh checkout or fast-forward an existing clean checkout."""
+
+    git = shutil.which("git")
+    if git is None:
+        raise InstallerError("Git is required but was not found in PATH")
+    install_directory = install_directory.expanduser().resolve()
+
+    if not install_directory.exists():
+        install_directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _run_command([git, "clone", "--", repository_url, str(install_directory)])
+        return "installed"
+
+    if not (install_directory / ".git").exists():
+        raise InstallerError(
+            f"Install target exists but is not a Git repository: {install_directory}"
+        )
+
+    origin = _run_command(
+        [git, "remote", "get-url", "origin"],
+        cwd=install_directory,
+    ).stdout.strip()
+    if _canonical_repository_url(origin) != _canonical_repository_url(repository_url):
+        raise InstallerError(
+            "Existing checkout origin does not match the requested repository: "
+            f"{origin} != {repository_url}"
+        )
+
+    status = _run_command(
+        [git, "status", "--porcelain"],
+        cwd=install_directory,
+    ).stdout
+    if status.strip():
+        raise InstallerError(
+            f"Existing checkout has uncommitted changes; update it manually: {install_directory}"
+        )
+
+    _run_command([git, "pull", "--ff-only"], cwd=install_directory)
+    return "updated"
+
+
+def server_executable(
+    install_directory: Path,
+    *,
+    platform_name: str | None = None,
+) -> Path:
+    platform_name = platform_name or sys.platform
+    if platform_name.startswith("win"):
+        return install_directory / ".venv" / "Scripts" / "code-indexing-mcp.exe"
+    return install_directory / ".venv" / "bin" / "code-indexing-mcp"
+
+
+def sync_environment(
+    install_directory: Path,
+    *,
+    uv_executable: str | None = None,
+    platform_name: str | None = None,
+) -> Path:
+    """Create or refresh the locked virtual environment and return its server command."""
+
+    uv = uv_executable or shutil.which("uv")
+    if uv is None:
+        raise InstallerError(
+            "uv is required but was not found in PATH. Install it from https://docs.astral.sh/uv/"
+        )
+    _run_command([uv, "sync", "--locked"], cwd=install_directory)
+    command = server_executable(install_directory, platform_name=platform_name)
+    if not command.is_file():
+        raise InstallerError(f"uv sync completed but the MCP executable is missing: {command}")
+    return command
+
+
+def configure_selected_harnesses(
+    slugs: list[str],
+    command: Path,
+    *,
+    home: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    platform_name: str | None = None,
+) -> tuple[list[tuple[str, Path]], list[tuple[str, str]]]:
+    """Configure every selection while keeping one client's failure isolated."""
+
+    successes: list[tuple[str, Path]] = []
+    failures: list[tuple[str, str]] = []
+    for slug in slugs:
+        try:
+            path = configure_harness(
+                slug,
+                command,
+                home=home,
+                environment=environment,
+                platform_name=platform_name,
+            )
+        except (InstallerError, OSError) as exc:
+            failures.append((slug, str(exc)))
+        else:
+            successes.append((slug, path))
+    return successes, failures
+
+
+def _default_install_directory() -> Path:
+    configured = os.environ.get("CODE_INDEXING_MCP_INSTALL_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local" / "share" / "code-indexing-mcp"
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Install or update Code Indexing MCP and configure it for selected MCP harnesses."
+        )
+    )
+    parser.add_argument(
+        "--install-dir",
+        default=str(_default_install_directory()),
+        help="checkout location (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--repo-url",
+        default=os.environ.get("CODE_INDEXING_MCP_REPO_URL", DEFAULT_REPOSITORY_URL),
+        help="Git repository to clone or update (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--harnesses",
+        help=(
+            "comma-separated harness numbers/slugs or 'all'; omit for the interactive menu "
+            "(codex, claude-code, kimi-code, claude-desktop, opencode, kilocode)"
+        ),
+    )
+    return parser
+
+
+def _harness_label(slug: str) -> str:
+    return next((choice.label for choice in HARNESS_CHOICES if choice.slug == slug), slug)
+
+
+def _print_error(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
+    error_fn: Callable[[str], None] = _print_error,
+) -> int:
+    parser = build_argument_parser()
+    arguments = parser.parse_args(argv)
+    install_directory = Path(arguments.install_dir).expanduser().resolve()
+
+    try:
+        action = clone_or_update_repository(arguments.repo_url, install_directory)
+        output_fn(f"{action.title()} repository: {install_directory}")
+        command = sync_environment(install_directory)
+        output_fn(f"Prepared MCP executable: {command}")
+
+        if arguments.harnesses is None:
+            output_fn("Select the harnesses to configure:")
+            for index, choice in enumerate(HARNESS_CHOICES, start=1):
+                output_fn(f"  {index}. {choice.label}")
+            selected = parse_harness_selection(
+                input_fn("Enter comma-separated choices, 'all', or leave blank to skip: ")
+            )
+        else:
+            selected = parse_harness_selection(arguments.harnesses)
+
+        if not selected:
+            output_fn("No harness configuration selected.")
+            output_fn("Installation complete.")
+            return 0
+
+        successes, failures = configure_selected_harnesses(selected, command)
+        for slug, path in successes:
+            output_fn(f"Configured {_harness_label(slug)}: {path}")
+        for slug, message in failures:
+            error_fn(f"Failed to configure {_harness_label(slug)}: {message}")
+        if failures:
+            return 1
+        output_fn("Installation complete. Restart configured clients to load the MCP server.")
+        return 0
+    except InstallerError as exc:
+        error_fn(f"Error: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        error_fn("Installation cancelled.")
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
