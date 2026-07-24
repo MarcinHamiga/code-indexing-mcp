@@ -57,6 +57,15 @@ curl -fsSL https://raw.githubusercontent.com/MarcinHamiga/code-indexing-mcp/main
 Use `--install-dir /custom/path` or `CODE_INDEXING_MCP_INSTALL_DIR` to change the checkout
 location. Run `python3 install.py --help` for all installer options.
 
+### Bundled skills
+
+The installer also symlinks four agent skills into skill-capable harnesses
+(Claude Code, Kimi Code, Codex, OpenCode), pointing into the cloned repo so
+they update on every re-install: `codebase-exploration` (index-first
+navigation), `feature-dev` (index-grounded feature workflow), `indexed-review`
+(angle-based code review), and `impact-analysis` (blast-radius mapping before a
+change). Harnesses without skill support are skipped.
+
 ## Manual setup
 
 ```bash
