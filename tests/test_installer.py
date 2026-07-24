@@ -27,6 +27,9 @@ def load_installer() -> ModuleType:
     return module
 
 
+installer = load_installer()
+
+
 def test_json_merge_creates_parent_and_top_level_object(tmp_path: Path) -> None:
     installer = load_installer()
     path = tmp_path / "nested" / "config.json"
@@ -718,3 +721,107 @@ def test_posix_bootstrap_has_valid_syntax_and_runs_adjacent_installer() -> None:
     )
 
     assert "--harnesses" in completed.stdout
+
+
+def _skills_source(tmp_path: Path, names: tuple[str, ...] = ("alpha", "beta")) -> Path:
+    root = tmp_path / "repo" / "src" / "incode_mcp" / "skills"
+    for name in names:
+        skill = root / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: test\n---\n", encoding="utf-8"
+        )
+    return tmp_path / "repo"
+
+
+def test_skill_directories_cover_supported_harnesses(tmp_path: Path) -> None:
+    assert (
+        installer.skill_directory("claude-code", home=tmp_path, environment={})
+        == tmp_path / ".claude" / "skills"
+    )
+    assert (
+        installer.skill_directory("codex", home=tmp_path, environment={})
+        == tmp_path / ".agents" / "skills"
+    )
+    assert (
+        installer.skill_directory("kimi-code", home=tmp_path, environment={})
+        == tmp_path / ".agents" / "skills"
+    )
+    assert (
+        installer.skill_directory(
+            "opencode", home=tmp_path, environment={"XDG_CONFIG_HOME": str(tmp_path / "xdg")}
+        )
+        == tmp_path / "xdg" / "opencode" / "skills"
+    )
+    assert installer.skill_directory("claude-desktop", home=tmp_path, environment={}) is None
+    assert installer.skill_directory("kilocode", home=tmp_path, environment={}) is None
+
+
+def test_skill_directory_honors_claude_config_dir(tmp_path: Path) -> None:
+    environment = {"CLAUDE_CONFIG_DIR": str(tmp_path / "custom-claude")}
+    assert (
+        installer.skill_directory("claude-code", home=tmp_path, environment=environment)
+        == tmp_path / "custom-claude" / "skills"
+    )
+
+
+def test_install_skills_links_bundled_skills(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path)
+
+    results = installer.install_skills(["claude-code"], repo, home=tmp_path, environment={})
+
+    skills_dir = tmp_path / ".claude" / "skills"
+    for name in ("alpha", "beta"):
+        link = skills_dir / name
+        assert link.is_symlink()
+        assert link.resolve() == (repo / "src" / "incode_mcp" / "skills" / name).resolve()
+    assert len(results) == 1
+    slug, message = results[0]
+    assert slug == "claude-code"
+    assert "2 linked" in message
+
+
+def test_install_skills_is_idempotent(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path)
+    installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+
+    results = installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+
+    _slug, message = results[0]
+    assert "0 linked" in message
+    assert "already installed" in message
+
+
+def test_install_skills_backs_up_clashing_directory(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path)
+    clash = tmp_path / ".agents" / "skills" / "alpha"
+    clash.mkdir(parents=True)
+    (clash / "SKILL.md").write_text("old", encoding="utf-8")
+
+    installer.install_skills(["kimi-code"], repo, home=tmp_path, environment={})
+
+    assert (tmp_path / ".agents" / "skills" / "alpha").is_symlink()
+    backup = tmp_path / ".agents" / "skills" / "alpha.bak"
+    assert backup.is_dir() and not backup.is_symlink()
+    assert (backup / "SKILL.md").read_text(encoding="utf-8") == "old"
+
+
+def test_install_skills_skips_unsupported_harness(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path)
+
+    results = installer.install_skills(["claude-desktop"], repo, home=tmp_path, environment={})
+
+    slug, message = results[0]
+    assert slug == "claude-desktop"
+    assert "skipped" in message
+    assert not (tmp_path / ".claude").exists()
+
+
+def test_install_skills_reports_missing_source(tmp_path: Path) -> None:
+    results = installer.install_skills(
+        ["codex"], tmp_path / "empty-repo", home=tmp_path, environment={}
+    )
+
+    _slug, message = results[0]
+    assert "skipped" in message
+    assert not (tmp_path / ".agents").exists()
