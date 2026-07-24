@@ -135,6 +135,22 @@ class StoredChunk(FrozenModel):
     vector: list[float]
 
 
+class ChunkPreview(FrozenModel):
+    """A query result that deliberately excludes embedding and index payloads."""
+
+    chunk_id: str
+    project_id: str
+    path: str
+    language: str
+    kind: str
+    symbol: str | None = None
+    qualified_symbol: str | None = None
+    parent_symbol: str | None = None
+    start_line: int
+    end_line: int
+    content: str = ""
+
+
 class IndexIssue(FrozenModel):
     path: str
     message: str
@@ -152,6 +168,9 @@ class IndexReport(FrozenModel):
     skipped_files: int = 0
     errors: list[IndexIssue] = Field(default_factory=list)
     duration_ms: int = 0
+    memory_budget_bytes: int | None = None
+    peak_memory_bytes: int | None = None
+    worker_used: bool = False
 
 
 class SearchHit(FrozenModel):

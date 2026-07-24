@@ -1,44 +1,77 @@
-"""LanceDB persistence for projects, files, and chunks."""
+"""Partitioned LanceDB persistence for projects, files, and chunks."""
 
 from __future__ import annotations
 
+import gc
+import shutil
+import threading
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
 
 import lancedb
 import pyarrow as pa
+from filelock import FileLock
 from lancedb.index import FTS, BTree, HnswSq
 from lancedb.table import LanceTable
 
 from .errors import ErrorCode, IncodeError
-from .models import ProjectInfo, StoredChunk, StoredFile
+from .models import ChunkPreview, ProjectInfo, StoredChunk, StoredFile
 from .projects import existing_marker_path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _quoted(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+@dataclass(frozen=True)
+class _ProjectTables:
+    files: LanceTable
+    chunks: LanceTable
+
+
 class LanceStore:
-    def __init__(self, directory: Path, *, vector_dimension: int = 768) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        vector_dimension: int = 768,
+        vector_index: str = "exact",
+    ) -> None:
         self.directory = directory
         self.vector_dimension = vector_dimension
+        self.vector_index = vector_index
+        legacy_rows = self._migrate_v1(directory)
         directory.mkdir(parents=True, exist_ok=True)
-        self._db = lancedb.connect(directory)
-        self._projects = self._table("projects", self._project_schema())
-        self._files = self._table("files", self._file_schema())
-        self._chunks = self._table("chunks", self._chunk_schema(vector_dimension))
+        self._db = lancedb.connect(directory / "registry", read_consistency_interval=timedelta(0))
+        self._projects = self._table(self._db, "projects", self._project_schema())
+        self._partitions: dict[str, _ProjectTables] = {}
+        self._partitions_lock = threading.Lock()
+        for row in legacy_rows:
+            row = {
+                **row,
+                "vector_dimension": vector_dimension,
+                "schema_version": SCHEMA_VERSION,
+                "state": "pending",
+                "updated_at": time.time_ns(),
+            }
+            self._merge(self._projects, "id", [row])
 
     def upsert_project(self, project: ProjectInfo, *, model_id: str, state: str = "ready") -> None:
         existing = self._rows(self._projects, f"id = {_quoted(project.id)}")
-        if existing and (
-            existing[0]["model_id"] != model_id
-            or int(existing[0]["vector_dimension"]) != self.vector_dimension
-            or int(existing[0]["schema_version"]) != SCHEMA_VERSION
+        if (
+            existing
+            and str(existing[0]["state"]) != "pending"
+            and (
+                existing[0]["model_id"] != model_id
+                or int(existing[0]["vector_dimension"]) != self.vector_dimension
+                or int(existing[0]["schema_version"]) != SCHEMA_VERSION
+            )
         ):
             raise IncodeError(
                 ErrorCode.INDEX_INCOMPATIBLE,
@@ -73,8 +106,9 @@ class LanceStore:
         self._merge(self._projects, "id", [row])
 
     def list_projects(self) -> list[ProjectInfo]:
-        rows = self._rows(self._projects)
-        return [ProjectInfo.model_validate_json(row["payload"]) for row in rows]
+        return [
+            ProjectInfo.model_validate_json(row["payload"]) for row in self._rows(self._projects)
+        ]
 
     def project_state(self, project_id: str) -> str:
         rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
@@ -83,95 +117,182 @@ class LanceStore:
         return str(rows[0]["state"])
 
     def list_files(self, project_id: str) -> list[StoredFile]:
-        return [
-            StoredFile.model_validate(row)
-            for row in self._rows(self._files, f"project_id = {_quoted(project_id)}")
-        ]
+        table = self._tables(project_id).files
+        return [StoredFile.model_validate(row) for row in self._rows(table)]
 
     def upsert_file(self, record: StoredFile) -> None:
-        self._merge(self._files, "file_id", [record.model_dump()])
+        self._merge(
+            self._tables(record.project_id).files,
+            "file_id",
+            [record.model_dump()],
+        )
 
     def replace_file(self, record: StoredFile, chunks: list[StoredChunk]) -> None:
-        condition = (
-            f"project_id = {_quoted(record.project_id)} AND file_id = {_quoted(record.file_id)}"
-        )
+        tables = self._tables(record.project_id)
+        condition = f"file_id = {_quoted(record.file_id)}"
         if chunks:
             (
-                self._chunks.merge_insert("chunk_id")
+                tables.chunks.merge_insert("chunk_id")
                 .when_matched_update_all()
                 .when_not_matched_insert_all()
                 .when_not_matched_by_source_delete(condition)
                 .execute([chunk.model_dump() for chunk in chunks])
             )
         else:
-            self._chunks.delete(condition)
+            tables.chunks.delete(condition)
         self.upsert_file(record)
 
     def remove_file(self, project_id: str, file_id: str) -> None:
-        condition = f"project_id = {_quoted(project_id)} AND file_id = {_quoted(file_id)}"
-        self._chunks.delete(condition)
-        self._files.delete(condition)
+        tables = self._tables(project_id)
+        condition = f"file_id = {_quoted(file_id)}"
+        tables.chunks.delete(condition)
+        tables.files.delete(condition)
 
     def list_chunks(self, project_ids: Iterable[str] | None = None) -> list[StoredChunk]:
-        project_ids = list(project_ids or [])
-        condition = None
-        if project_ids:
-            values = ", ".join(_quoted(project_id) for project_id in project_ids)
-            condition = f"project_id IN ({values})"
-        return [StoredChunk.model_validate(row) for row in self._rows(self._chunks, condition)]
+        ids = list(project_ids or [project.id for project in self.list_projects()])
+        chunks: list[StoredChunk] = []
+        for project_id in ids:
+            chunks.extend(
+                StoredChunk.model_validate(row)
+                for row in self._rows(self._tables(project_id).chunks)
+            )
+        return chunks
 
     def get_chunk(self, chunk_id: str) -> StoredChunk | None:
-        rows = self._rows(self._chunks, f"chunk_id = {_quoted(chunk_id)}")
-        return StoredChunk.model_validate(rows[0]) if rows else None
+        for project in self.list_projects():
+            rows = self._rows(
+                self._tables(project.id).chunks,
+                f"chunk_id = {_quoted(chunk_id)}",
+            )
+            if rows:
+                return StoredChunk.model_validate(rows[0])
+        return None
 
     def count_chunks(self, project_ids: Iterable[str] | None = None) -> int:
-        project_ids = list(project_ids or [])
-        condition = None
-        if project_ids:
-            values = ", ".join(_quoted(project_id) for project_id in project_ids)
-            condition = f"project_id IN ({values})"
-        return int(self._chunks.count_rows(condition))
+        ids = list(project_ids or [project.id for project in self.list_projects()])
+        return sum(self._tables(project_id).chunks.count_rows() for project_id in ids)
 
     def hybrid_search(
         self,
         query_text: str,
         vector: list[float],
-        condition: str,
+        project_ids: Iterable[str],
+        condition: str | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        query = (
-            self._chunks.search(query_type="hybrid", vector_column_name="vector")
-            .vector(vector)
-            .text(query_text)
-            .where(condition, prefilter=True)
-            .limit(limit)
-            .rerank()
-        )
-        return cast(list[dict[str, Any]], query.to_list())
+        rows: list[dict[str, Any]] = []
+        for project_id in project_ids:
+            query = (
+                self._tables(project_id)
+                .chunks.search(query_type="hybrid", vector_column_name="vector")
+                .vector(vector)
+                .text(query_text)
+            )
+            if condition:
+                query = query.where(condition, prefilter=True)
+            query = (
+                query.limit(limit)
+                .select(
+                    [
+                        "chunk_id",
+                        "project_id",
+                        "path",
+                        "language",
+                        "kind",
+                        "symbol",
+                        "qualified_symbol",
+                        "parent_symbol",
+                        "start_line",
+                        "end_line",
+                        "content",
+                    ]
+                )
+                .rerank()
+            )
+            if self.vector_index == "exact":
+                query = query.bypass_vector_index()
+            rows.extend(cast(list[dict[str, Any]], query.to_list()))
+        rows.sort(key=lambda row: float(row.get("_relevance_score", 0.0)), reverse=True)
+        return rows[:limit]
 
-    def ensure_indexes(self, *, compact: bool = False) -> None:
-        # NOTE: lance 8.x has no incremental FTS/BTree indexing — create_index
-        # with replace=False fails once the index exists, so a rebuild
-        # (replace=True) is required whenever rows changed. Callers should
-        # therefore only invoke this when data actually changed.
-        self._chunks.create_index(
-            "search_text",
-            config=FTS(lower_case=True, stem=False, remove_stop_words=False),
-            replace=True,
+    def find_symbol_chunks(
+        self,
+        name: str,
+        project_id: str,
+        *,
+        match: str,
+        kinds: list[str] | None,
+        limit: int,
+    ) -> list[ChunkPreview]:
+        escaped = _quoted(name)
+        if match == "exact":
+            symbol = f"(qualified_symbol = {escaped} OR symbol = {escaped})"
+        elif match == "prefix":
+            prefix = _quoted(name + "%")
+            symbol = f"(qualified_symbol LIKE {prefix} OR symbol LIKE {prefix})"
+        else:
+            contains = _quoted("%" + name + "%")
+            symbol = f"(qualified_symbol LIKE {contains} OR symbol LIKE {contains})"
+        conditions = [symbol]
+        if kinds:
+            values = ", ".join(_quoted(kind) for kind in kinds)
+            conditions.append(f"kind IN ({values})")
+        rows = self._projected_chunks(
+            self._tables(project_id).chunks,
+            " AND ".join(conditions),
+            limit=limit,
+            content=True,
         )
-        for column in ("project_id", "file_id", "language", "path", "symbol"):
-            self._chunks.create_index(column, config=BTree(), replace=True)
-        if self._chunks.count_rows() >= 20_000:
-            self._chunks.create_index("vector", config=HnswSq(distance_type="cosine"), replace=True)
-        if compact:
-            self._chunks.optimize()
+        return [ChunkPreview.model_validate(row) for row in rows]
+
+    def outline_chunks(self, path: str, project_id: str) -> list[ChunkPreview]:
+        condition = (
+            f"path = {_quoted(path)} AND symbol IS NOT NULL AND qualified_symbol IS NOT NULL"
+        )
+        rows = self._projected_chunks(
+            self._tables(project_id).chunks,
+            condition,
+            limit=None,
+            content=False,
+        )
+        return [ChunkPreview.model_validate(row) for row in rows]
+
+    def ensure_indexes(self, project_id: str, *, compact: bool = False) -> None:
+        chunks = self._tables(project_id).chunks
+        indices = list(chunks.list_indices())
+        indexed_columns = {column for index in indices for column in index.columns}
+        if "search_text" not in indexed_columns:
+            chunks.create_index(
+                "search_text",
+                config=FTS(lower_case=True, stem=False, remove_stop_words=False),
+                replace=False,
+            )
+        for column in ("file_id", "language", "path", "symbol"):
+            if column not in indexed_columns:
+                chunks.create_index(column, config=BTree(), replace=False)
+        vector_indices = [index for index in indices if "vector" in index.columns]
+        if self.vector_index == "exact":
+            for index in vector_indices:
+                chunks.drop_index(index.name)
+        elif not vector_indices and chunks.count_rows() >= 20_000:
+            chunks.create_index(
+                "vector",
+                config=HnswSq(distance_type="cosine"),
+                replace=False,
+            )
+        chunks.optimize(
+            cleanup_older_than=timedelta(0) if compact else None,
+            delete_unverified=compact,
+        )
 
     def remove_project(self, project_id: str) -> bool:
         existed = bool(self._rows(self._projects, f"id = {_quoted(project_id)}"))
-        condition = f"project_id = {_quoted(project_id)}"
-        self._chunks.delete(condition)
-        self._files.delete(condition)
         self._projects.delete(f"id = {_quoted(project_id)}")
+        with self._partitions_lock:
+            self._partitions.pop(project_id, None)
+        partition = self.directory / "projects" / project_id
+        if partition.exists():
+            shutil.rmtree(partition)
         return existed
 
     @staticmethod
@@ -229,12 +350,39 @@ class LanceStore:
                 ("search_text", pa.string()),
                 ("content_hash", pa.string()),
                 ("part_index", pa.int32()),
-                ("vector", pa.list_(pa.float32(), vector_dimension)),
+                (
+                    "vector",
+                    pa.list_(pa.float32(), vector_dimension),
+                ),
             ]
         )
 
-    def _table(self, name: str, schema: pa.Schema) -> LanceTable:
-        return self._db.create_table(name, schema=schema, exist_ok=True)
+    def _tables(self, project_id: str) -> _ProjectTables:
+        with self._partitions_lock:
+            cached = self._partitions.get(project_id)
+            if cached is not None:
+                return cached
+            database = lancedb.connect(
+                self.directory / "projects" / project_id,
+                read_consistency_interval=timedelta(0),
+            )
+            tables = _ProjectTables(
+                files=self._table(database, "files", self._file_schema()),
+                chunks=self._table(
+                    database,
+                    "chunks",
+                    self._chunk_schema(self.vector_dimension),
+                ),
+            )
+            self._partitions[project_id] = tables
+            return tables
+
+    @staticmethod
+    def _table(database: Any, name: str, schema: pa.Schema) -> LanceTable:
+        return cast(
+            LanceTable,
+            database.create_table(name, schema=schema, exist_ok=True),
+        )
 
     @staticmethod
     def _merge(table: LanceTable, key: str, rows: list[dict[str, Any]]) -> None:
@@ -251,3 +399,49 @@ class LanceStore:
         if condition:
             query = query.where(condition)
         return cast(list[dict[str, Any]], query.to_list())
+
+    @staticmethod
+    def _projected_chunks(
+        table: LanceTable,
+        condition: str,
+        *,
+        limit: int | None,
+        content: bool,
+    ) -> list[dict[str, Any]]:
+        columns = [
+            "chunk_id",
+            "project_id",
+            "path",
+            "language",
+            "kind",
+            "symbol",
+            "qualified_symbol",
+            "parent_symbol",
+            "start_line",
+            "end_line",
+        ]
+        if content:
+            columns.append("content")
+        query = table.search().where(condition).select(columns)
+        if limit is not None:
+            query = query.limit(limit)
+        return cast(list[dict[str, Any]], query.to_list())
+
+    @classmethod
+    def _migrate_v1(cls, directory: Path) -> list[dict[str, Any]]:
+        legacy_projects = directory / "projects.lance"
+        if not legacy_projects.exists():
+            return []
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(directory.parent / f".{directory.name}-migrate.lock"):
+            if not legacy_projects.exists():
+                return []
+            database = lancedb.connect(directory, read_consistency_interval=timedelta(0))
+            table = database.open_table("projects")
+            rows = cast(list[dict[str, Any]], table.search().to_list())
+            del table
+            del database
+            gc.collect()
+            backup = directory.with_name(f"{directory.name}-v1-backup-{time.time_ns()}")
+            shutil.move(str(directory), str(backup))
+            return rows

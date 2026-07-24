@@ -11,6 +11,7 @@ from filelock import FileLock
 from platformdirs import user_cache_path, user_data_path
 
 from .embedding import Embedder, FastEmbedder
+from .embedding_worker import EmbeddingWorkerSession, WorkerConfig
 from .errors import ErrorCode, IncodeError
 from .extractor import TreeSitterExtractor
 from .indexing import Indexer
@@ -28,6 +29,7 @@ from .models import (
 from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
 from .scanner import SourceScanner
 from .search import SearchService
+from .settings import IndexSettings
 from .storage import LanceStore
 
 
@@ -61,20 +63,50 @@ class Application:
         *,
         embedder: Embedder | None = None,
         cwd: Path | None = None,
+        settings: IndexSettings | None = None,
     ) -> None:
         self.paths = paths
         self.cwd = (cwd or Path.cwd()).resolve()
+        self.settings = settings or IndexSettings.from_environment()
         if embedder is None:
             offline = os.environ.get("INCODE_OFFLINE", "").lower() in {"1", "true", "yes"}
-            embedder = FastEmbedder(paths.cache / "models", offline=offline)
+            embedder = FastEmbedder(
+                paths.cache / "models",
+                offline=offline,
+                threads=self.settings.embedding_threads,
+                enable_cpu_mem_arena=self.settings.embedding_cpu_arena,
+            )
         self.embedder = embedder
-        self.store = LanceStore(paths.data / "lancedb", vector_dimension=embedder.dimension)
+        self.store = LanceStore(
+            paths.data / "lancedb",
+            vector_dimension=embedder.dimension,
+            vector_index=self.settings.vector_index,
+        )
+        passage_session_factory = None
+        if isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker":
+            worker_config = WorkerConfig(
+                cache_directory=str(embedder.cache_directory),
+                offline=embedder.offline,
+                threads=self.settings.embedding_threads,
+                enable_cpu_mem_arena=self.settings.embedding_cpu_arena,
+                dimension=embedder.dimension,
+                model_id=embedder.model_id,
+            )
+
+            def passage_session_factory() -> EmbeddingWorkerSession:
+                return EmbeddingWorkerSession(
+                    worker_config,
+                    configured_ceiling_bytes=self.settings.index_memory_bytes,
+                )
+
         self.indexer = Indexer(
             store=self.store,
             scanner=SourceScanner(),
             extractor=TreeSitterExtractor(),
             embedder=embedder,
             lock_directory=paths.data / "locks",
+            batch_size=self.settings.embedding_batch_size,
+            passage_session_factory=passage_session_factory,
         )
         self.search = SearchService(self.store, embedder)
 

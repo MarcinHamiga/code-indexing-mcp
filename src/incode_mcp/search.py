@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 from .embedding import Embedder
 from .errors import ErrorCode, IncodeError
 from .models import (
+    ChunkPreview,
     CodeChunk,
     OutlineItem,
     OutlineResponse,
@@ -39,7 +40,7 @@ class SearchService:
                 ErrorCode.INVALID_FILTER, "Search requires a query and at least one project"
             )
         limit = max(1, min(limit, 50))
-        conditions = [self._in_condition("project_id", project_ids)]
+        conditions: list[str] = []
         if languages:
             conditions.append(self._in_condition("language", languages))
         if kinds:
@@ -47,14 +48,15 @@ class SearchService:
         rows = self.store.hybrid_search(
             query,
             self.embedder.embed_query(query),
-            " AND ".join(conditions),
+            project_ids,
+            " AND ".join(conditions) if conditions else None,
             max(50, limit * 5),
         )
         names = {project.id: project.name for project in self.store.list_projects()}
         hits: list[SearchHit] = []
         seen: set[tuple[str, str, int, int]] = set()
         for row in rows:
-            chunk = StoredChunk.model_validate(row)
+            chunk = ChunkPreview.model_validate(row)
             if paths and not any(PurePosixPath(chunk.path).match(pattern) for pattern in paths):
                 continue
             key = (chunk.project_id, chunk.path, chunk.start_line, chunk.end_line)
@@ -79,21 +81,13 @@ class SearchService:
         if match not in {"exact", "prefix", "contains"}:
             raise IncodeError(ErrorCode.INVALID_FILTER, f"Invalid symbol match mode: {match}")
         limit = max(1, min(limit, 50))
-        candidates = self.store.list_chunks([project_id])
+        candidates = self.store.find_symbol_chunks(
+            name, project_id, match=match, kinds=kinds, limit=limit
+        )
         names = {project.id: project.name for project in self.store.list_projects()}
 
-        def matches(chunk: StoredChunk) -> bool:
-            candidate = chunk.qualified_symbol or chunk.symbol or ""
-            if kinds and chunk.kind not in kinds:
-                return False
-            if match == "exact":
-                return candidate == name or chunk.symbol == name
-            if match == "prefix":
-                return candidate.startswith(name)
-            return name in candidate
-
         selected = sorted(
-            (chunk for chunk in candidates if matches(chunk)),
+            candidates,
             key=lambda chunk: (chunk.path, chunk.start_line, chunk.kind),
         )[:limit]
         return SymbolResponse(name=name, hits=[self._hit(chunk, names, 1.0) for chunk in selected])
@@ -102,7 +96,8 @@ class SearchService:
         items: list[OutlineItem] = []
         seen: set[tuple[str, str]] = set()
         for chunk in sorted(
-            self.store.list_chunks([project_id]), key=lambda item: (item.path, item.start_line)
+            self.store.outline_chunks(path, project_id),
+            key=lambda item: (item.path, item.start_line),
         ):
             if chunk.path != path or not chunk.symbol or not chunk.qualified_symbol:
                 continue
@@ -133,7 +128,7 @@ class SearchService:
         return f"{column} IN ({', '.join(_quoted(value) for value in values)})"
 
     @staticmethod
-    def _hit(chunk: StoredChunk, names: dict[str, str], score: float) -> SearchHit:
+    def _hit(chunk: StoredChunk | ChunkPreview, names: dict[str, str], score: float) -> SearchHit:
         snippet = chunk.content[:4_000]
         return SearchHit(
             chunk_id=chunk.chunk_id,

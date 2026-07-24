@@ -139,6 +139,15 @@ def test_splits_oversized_function_into_bounded_parts() -> None:
     assert all(chunk.start_line <= chunk.end_line for chunk in parts)
 
 
+def test_splits_a_single_oversized_line_into_bounded_chunks() -> None:
+    source = ("payload = '" + ("x" * 10_000) + "'\n").encode()
+
+    result = TreeSitterExtractor(max_chars=1024).extract(Path("payload.py"), "python", source)
+
+    assert len(result.chunks) > 1
+    assert all(len(chunk.content) <= 1024 for chunk in result.chunks)
+
+
 def test_syntax_errors_are_reported_but_valid_symbols_survive() -> None:
     source = b"def valid():\n    return 1\n\ndef broken(:\n"
 

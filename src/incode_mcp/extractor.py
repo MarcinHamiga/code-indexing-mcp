@@ -52,7 +52,7 @@ class TreeSitterExtractor:
     def __init__(
         self,
         *,
-        max_chars: int = 12_000,
+        max_chars: int = 4_096,
         max_lines: int = 200,
         overlap_lines: int = 20,
     ) -> None:
@@ -211,6 +211,37 @@ class TreeSitterExtractor:
             ]
 
         lines = content.splitlines(keepends=True)
+        if any(len(line) > self.max_chars for line in lines):
+            long_line_chunks: list[ExtractedChunk] = []
+            relative_byte = 0
+            part = 0
+            part_kind = f"{kind}_part" if kind != "module" else "module"
+            for line_offset, line in enumerate(lines):
+                cursor = 0
+                while cursor < len(line):
+                    fragment = line[cursor : cursor + self.max_chars]
+                    prefix_bytes = len(line[:cursor].encode("utf-8"))
+                    fragment_bytes = len(fragment.encode("utf-8"))
+                    byte_start = start + relative_byte + prefix_bytes
+                    long_line_chunks.append(
+                        self._make_chunk(
+                            path,
+                            language,
+                            part_kind,
+                            symbol,
+                            qualified,
+                            parent,
+                            byte_start,
+                            byte_start + fragment_bytes,
+                            start_line + line_offset,
+                            fragment.rstrip(),
+                            part,
+                        )
+                    )
+                    cursor += len(fragment)
+                    part += 1
+                relative_byte += len(line.encode("utf-8"))
+            return long_line_chunks
         chunks: list[ExtractedChunk] = []
         cursor = 0
         part = 0

@@ -14,11 +14,13 @@ DEFAULT_MODEL = "jinaai/jina-embeddings-v2-base-code"
 DEFAULT_DIMENSION = 768
 
 
-class Embedder(Protocol):
+class PassageEmbedder(Protocol):
+    def embed_passages(self, texts: list[str]) -> list[list[float]]: ...
+
+
+class Embedder(PassageEmbedder, Protocol):
     model_id: str
     dimension: int
-
-    def embed_passages(self, texts: list[str]) -> list[list[float]]: ...
 
     def embed_query(self, text: str) -> list[float]: ...
 
@@ -27,9 +29,18 @@ class FastEmbedder:
     model_id = DEFAULT_MODEL
     dimension = DEFAULT_DIMENSION
 
-    def __init__(self, cache_directory: Path, *, offline: bool = False) -> None:
+    def __init__(
+        self,
+        cache_directory: Path,
+        *,
+        offline: bool = False,
+        threads: int | None = None,
+        enable_cpu_mem_arena: bool = False,
+    ) -> None:
         self.cache_directory = cache_directory
         self.offline = offline
+        self.threads = threads
+        self.enable_cpu_mem_arena = enable_cpu_mem_arena
         self._model: TextEmbedding | None = None
 
     def prepare(self) -> None:
@@ -51,6 +62,8 @@ class FastEmbedder:
                 model_name=self.model_id,
                 cache_dir=str(self.cache_directory),
                 local_files_only=self.offline,
+                threads=self.threads,
+                enable_cpu_mem_arena=self.enable_cpu_mem_arena,
             )
         except Exception as exc:
             raise IncodeError(

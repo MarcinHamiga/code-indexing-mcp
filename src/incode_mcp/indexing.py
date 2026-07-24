@@ -5,11 +5,14 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import time
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 
 from filelock import FileLock, Timeout
 
-from .embedding import Embedder
+from .embedding import Embedder, PassageEmbedder
+from .embedding_worker import EmbeddingWorkerSession
 from .errors import ErrorCode, IncodeError
 from .extractor import TreeSitterExtractor
 from .models import IndexIssue, IndexReport, ProjectInfo, StoredChunk, StoredFile
@@ -31,26 +34,35 @@ class Indexer:
         extractor: TreeSitterExtractor,
         embedder: Embedder,
         lock_directory: Path,
+        batch_size: int = 1,
+        passage_session_factory: Callable[[], AbstractContextManager[PassageEmbedder]]
+        | None = None,
     ) -> None:
         self.store = store
         self.scanner = scanner
         self.extractor = extractor
         self.embedder = embedder
         self.lock_directory = lock_directory
+        self.batch_size = batch_size
+        self.passage_session_factory = passage_session_factory
 
     def index(
         self, project: ProjectInfo, *, force: bool = False, wait_for_lock: bool = False
     ) -> IndexReport:
         started = time.monotonic_ns()
         self.lock_directory.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(self.lock_directory / f"{project.id}.lock")
+        global_lock = FileLock(self.lock_directory / "index-global.lock")
+        project_lock = FileLock(self.lock_directory / f"{project.id}.lock")
         try:
-            with lock.acquire() if wait_for_lock else lock.acquire(timeout=0):
+            with (
+                global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
+                project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
+            ):
                 report = self._index_locked(project, force=force)
         except Timeout as exc:
             raise IncodeError(
                 ErrorCode.INDEX_BUSY,
-                f"Project is already being indexed: {project.name}",
+                f"Another indexing job is already active: {project.name}",
                 project=project.id,
             ) from exc
         duration_ms = (time.monotonic_ns() - started) // 1_000_000
@@ -59,14 +71,31 @@ class Indexer:
     def _index_locked(self, project: ProjectInfo, *, force: bool) -> IndexReport:
         self.store.upsert_project(project, model_id=self.embedder.model_id, state="indexing")
         try:
-            return self._index_scan(project, force=force)
+            context = (
+                self.passage_session_factory()
+                if self.passage_session_factory is not None
+                else contextlib.nullcontext(self.embedder)
+            )
+            with context as passage_embedder:
+                report = self._index_scan(project, force=force, passage_embedder=passage_embedder)
+            if isinstance(context, EmbeddingWorkerSession):
+                report = report.model_copy(
+                    update={
+                        "memory_budget_bytes": context.effective_ceiling_bytes,
+                        "peak_memory_bytes": context.peak_combined_rss,
+                        "worker_used": True,
+                    }
+                )
+            return report
         except Exception:
             # Never leave the project stuck in "indexing" after a crash.
             with contextlib.suppress(Exception):
                 self.store.upsert_project(project, model_id=self.embedder.model_id, state="error")
             raise
 
-    def _index_scan(self, project: ProjectInfo, *, force: bool) -> IndexReport:
+    def _index_scan(
+        self, project: ProjectInfo, *, force: bool, passage_embedder: PassageEmbedder
+    ) -> IndexReport:
         existing = {record.path: record for record in self.store.list_files(project.id)}
         scan = self.scanner.scan(project, existing)
         current_paths = {item.path.as_posix() for item in scan.files}
@@ -100,8 +129,10 @@ class Indexer:
                 parsed += 1
                 vectors: list[list[float]] = []
                 texts = [chunk.embedding_text for chunk in extraction.chunks]
-                for offset in range(0, len(texts), 32):
-                    vectors.extend(self.embedder.embed_passages(texts[offset : offset + 32]))
+                for offset in range(0, len(texts), self.batch_size):
+                    vectors.extend(
+                        passage_embedder.embed_passages(texts[offset : offset + self.batch_size])
+                    )
                 stored_file = StoredFile(
                     file_id=_digest(f"{project.id}\0{path}"),
                     project_id=project.id,
@@ -155,7 +186,7 @@ class Indexer:
                 removed += 1
 
         if indexed or removed:
-            self.store.ensure_indexes(compact=removed > 0)
+            self.store.ensure_indexes(project.id, compact=removed > 0)
 
         self.store.upsert_project(
             project,

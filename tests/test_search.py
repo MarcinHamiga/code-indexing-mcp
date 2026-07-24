@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from incode_mcp.extractor import TreeSitterExtractor
 from incode_mcp.indexing import Indexer
 from incode_mcp.projects import initialize_project
@@ -65,6 +67,40 @@ def test_hybrid_search_respects_project_scope_and_filters(tmp_path: Path) -> Non
     assert search.search_code("invoice", [projects[0]], paths=["billing/**"]).hits == []
 
 
+def test_structural_queries_do_not_materialize_full_chunk_vectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, search, projects = indexed_projects(tmp_path)
+
+    def reject_full_rows(*_: object, **__: object) -> object:
+        raise AssertionError("structural queries must not call list_chunks")
+
+    monkeypatch.setattr(store, "list_chunks", reject_full_rows)
+
+    symbols = search.find_symbol("enforce_permissions", projects[0])
+    outline = search.file_outline("auth.py", projects[0])
+
+    assert symbols.hits[0].symbol == "enforce_permissions"
+    assert outline.items[0].symbol == "enforce_permissions"
+
+
+def test_hybrid_search_projects_result_columns(tmp_path: Path) -> None:
+    store, _, projects = indexed_projects(tmp_path)
+
+    rows = store.hybrid_search(
+        "permissions",
+        [1.0, 0.0, 0.0, 0.0],
+        [projects[0]],
+        None,
+        5,
+    )
+
+    assert rows
+    assert "vector" not in rows[0]
+    assert "embedding_text" not in rows[0]
+    assert "search_text" not in rows[0]
+
+
 def test_symbol_lookup_and_outline_use_indexed_metadata(tmp_path: Path) -> None:
     _, search, projects = indexed_projects(tmp_path)
 
@@ -122,7 +158,7 @@ def test_search_truncates_snippet_and_get_chunk_returns_full_content(tmp_path: P
     Indexer(
         store=store,
         scanner=SourceScanner(),
-        extractor=TreeSitterExtractor(),
+        extractor=TreeSitterExtractor(max_chars=8_000),
         embedder=embedder,
         lock_directory=tmp_path / "locks",
     ).index(project)

@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from filelock import FileLock
 
 from incode_mcp.errors import ErrorCode, IncodeError
 from incode_mcp.extractor import TreeSitterExtractor
@@ -29,6 +30,14 @@ class RecordingEmbedder:
     def embed_query(self, text: str) -> list[float]:
         self.queries.append(text)
         return [float(len(text) % 7), 1.0, 2.0, 3.0]
+
+
+class SessionEmbedder(RecordingEmbedder):
+    def __enter__(self) -> "SessionEmbedder":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
 
 
 def make_indexer(tmp_path: Path, embedder: RecordingEmbedder) -> tuple[Indexer, LanceStore]:
@@ -119,7 +128,6 @@ def test_failed_changed_file_preserves_previous_chunks(tmp_path: Path) -> None:
 
     assert len(report.errors) == 1
     assert store.list_chunks([project.id]) == original
-
     # A failed file is recorded with its current size/mtime, so subsequent
     # runs skip it instead of re-reading, re-parsing, and re-embedding it.
     batches = len(embedder.passage_batches)
@@ -127,6 +135,43 @@ def test_failed_changed_file_preserves_previous_chunks(tmp_path: Path) -> None:
     assert len(embedder.passage_batches) == batches
     assert second.unchanged_files == 1
     assert store.list_chunks([project.id]) == original
+
+
+def test_global_index_lock_serializes_different_projects(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("value = 1\n")
+    project = initialize_project(root)
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+
+    lock = FileLock(tmp_path / "locks" / "index-global.lock")
+    with lock, pytest.raises(IncodeError) as caught:
+        indexer.index(project)
+
+    assert caught.value.code is ErrorCode.INDEX_BUSY
+
+
+def test_indexer_uses_passage_worker_session_when_configured(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("value = 1\n")
+    project = initialize_project(root)
+    parent_embedder = RecordingEmbedder()
+    worker_embedder = SessionEmbedder()
+    store = LanceStore(tmp_path / "data", vector_dimension=parent_embedder.dimension)
+    indexer = Indexer(
+        store=store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=parent_embedder,
+        lock_directory=tmp_path / "locks",
+        passage_session_factory=lambda: worker_embedder,
+    )
+
+    indexer.index(project)
+
+    assert worker_embedder.passage_batches
+    assert parent_embedder.passage_batches == []
 
 
 def test_force_reindexes_previously_failed_file(tmp_path: Path) -> None:

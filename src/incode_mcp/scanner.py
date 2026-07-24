@@ -120,7 +120,6 @@ class SourceScanner:
                 skipped.append(SkippedFile(path=relative, reason="unreadable", detail=str(exc)))
                 continue
             previous = known_files.get(relative.as_posix())
-            content: bytes | None = None
             if (
                 previous is None
                 or previous.size != stat.st_size
@@ -146,7 +145,7 @@ class SourceScanner:
                     language=language,
                     size=stat.st_size,
                     mtime_ns=stat.st_mtime_ns,
-                    content=content,
+                    content=None,
                 )
             )
         return ScanResult(files=files, skipped=skipped)

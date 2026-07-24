@@ -92,6 +92,18 @@ def test_scanner_rejects_oversized_binary_and_symlink_files(tmp_path: Path) -> N
     assert {skip.reason for skip in result.skipped} >= {"oversized", "binary", "symlink"}
 
 
+def test_scanner_does_not_retain_changed_file_contents(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("value = 1\n")
+    project = initialize_project(root)
+
+    result = SourceScanner().scan(project)
+
+    assert len(result.files) == 1
+    assert result.files[0].content is None
+
+
 def test_scanner_never_walks_hard_excluded_directories(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()

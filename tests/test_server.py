@@ -102,7 +102,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_server_starts_background_indexing_when_client_lists_tools(tmp_path: Path) -> None:
+async def test_default_server_defers_indexing_until_first_code_query(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
     (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
@@ -124,15 +124,16 @@ async def test_server_starts_background_indexing_when_client_lists_tools(tmp_pat
         tools = await client.list_tools()
 
         assert tools
+        assert not embedder.started.is_set()
+        assert not (root / ".ci-mcp").exists()
+
+        query = asyncio.create_task(client.call_tool("search_code", {"query": "answer"}))
         assert await asyncio.to_thread(embedder.started.wait, 1)
-        assert app.project_status(roots=[root]).state == "indexing"
-
+        assert not query.done()
         embedder.release.set()
-        for _ in range(100):
-            if app.project_status(roots=[root]).state == "ready":
-                break
-            await asyncio.sleep(0.05)
+        result = await query
 
+    assert not result.isError
     assert app.project_status(roots=[root]).state == "ready"
 
 
@@ -185,7 +186,7 @@ async def test_server_shutdown_waits_for_active_startup_index(tmp_path: Path) ->
         embedder=embedder,
         cwd=tmp_path,
     )
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
     entered = asyncio.Event()
     leave = asyncio.Event()
 
@@ -224,7 +225,7 @@ async def test_server_shutdown_cancels_startup_job_waiting_for_index_lock(
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
     project = app.init_project(root)
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
     attempted = threading.Event()
     original_index = app.indexer.index
 
@@ -268,7 +269,7 @@ async def test_code_query_waits_for_startup_index_to_finish(tmp_path: Path) -> N
         embedder=embedder,
         cwd=tmp_path,
     )
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
         return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
@@ -309,7 +310,7 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
     ready_project = app.init_project(ready_root)
     app.index_project(ready_project.id)
     embedder.block = True
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
         return types.ListRootsResult(roots=[types.Root(uri=startup_root.as_uri())])
@@ -351,7 +352,7 @@ async def test_explicit_code_query_ignores_unrelated_startup_failure(tmp_path: P
 
     embedder = FailingEmbedder()
     app = Application(paths, embedder=embedder, cwd=tmp_path)
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
         return types.ListRootsResult(roots=[types.Root(uri=failing_root.as_uri())])
@@ -491,7 +492,7 @@ async def test_discovery_is_not_blocked_by_concurrent_indexing(tmp_path: Path) -
         embedder=embedder,
         cwd=tmp_path,
     )
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
         return types.ListRootsResult(

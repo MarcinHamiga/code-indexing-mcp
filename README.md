@@ -4,7 +4,8 @@ Code Indexing MCP is a local-only codebase indexer for MCP clients. It uses Tree
 syntax-aware chunks, FastEmbed to create embeddings on the local machine, and LanceDB for
 persistent vector and full-text search.
 
-It does not require a hosted database, embedding API, daemon, or network transport. The only
+It does not require a hosted database, embedding API, or network service. A private per-user
+daemon is started on demand so all connected MCP clients share one scheduler and model. The only
 network access is the initial download of the default
 `jinaai/jina-embeddings-v2-base-code` model (approximately 640 MB). Once cached, indexing and
 search work offline.
@@ -113,17 +114,17 @@ marker contains a checkout-local UUID and scanning configuration. It is not inte
 committed. Markers created by earlier releases under `.incode` remain readable, but all new
 markers use `.ci-mcp`.
 
-CLI index refreshes are explicit and incremental. When the MCP server is opened by a client that
-provides filesystem roots, it also starts an incremental background refresh for each qualifying
-root as soon as the client lists tools. A new root qualifies when it has at least one supported,
+CLI index refreshes are explicit and incremental. MCP indexing is lazy by default: listing tools
+does not discover projects, load the model, or start indexing. The first project-scoped code query
+discovers and refreshes each qualifying root, then waits for that bounded refresh. A new root
+qualifies when it has at least one supported,
 non-ignored source file and contains `.git`, `pyproject.toml`, `setup.py`, `setup.cfg`,
 `package.json`, `tsconfig.json`, or `jsconfig.json`. The server creates the usual local
 `.ci-mcp/project.toml` marker only after that check passes.
 
-Tool discovery returns without waiting for indexing or the first model download. `project_status`
-reports startup state, while code-query tools wait for that root's initial indexing task to finish.
-Set `INCODE_AUTO_INDEX=0` (or `false` or `no`) to retain fully manual MCP indexing. Clients that
-do not provide filesystem roots keep the existing manual workflow.
+Set `INCODE_INDEX_MODE=eager` to refresh when tools are listed or
+`INCODE_INDEX_MODE=manual` for explicit-only indexing. The legacy `INCODE_AUTO_INDEX` flag remains
+supported. Clients that do not provide filesystem roots keep the explicit workflow.
 
 Incremental refreshes:
 
@@ -163,6 +164,37 @@ export INCODE_CACHE_DIR=/path/to/model-cache
 export INCODE_OFFLINE=1
 ```
 
+Indexing uses a spawned embedding worker with an adaptive ceiling of 25% of physical RAM, clamped
+to 1–2 GiB and reduced further to retain 512 MiB of currently available RAM for the system.
+Configure it with:
+
+```bash
+export INCODE_INDEX_MEMORY_MB=1536
+export INCODE_EMBED_BATCH_SIZE=1
+export INCODE_EMBED_THREADS=2
+export INCODE_EMBED_CPU_ARENA=0
+export INCODE_VECTOR_INDEX=exact
+```
+
+`INCODE_INDEX_EXECUTION=in-process` is a temporary diagnostic rollback. It does not enforce the
+worker ceiling. `INCODE_VECTOR_INDEX=hnsw` opts into approximate vector indexing; exact search is
+the safer default.
+
+All stdio adapters use the per-user daemon by default. Administrative commands are:
+
+```bash
+uv run code-indexing-mcp daemon status
+uv run code-indexing-mcp daemon restart
+uv run code-indexing-mcp daemon stop
+```
+
+Set `INCODE_BROKER=off` or run `serve --direct` to bypass it. The daemon authenticates over a
+current-user-only local socket, starts under leader election, and exits after five idle minutes.
+
+Storage schema v2 keeps a registry plus one LanceDB partition per project. On first upgrade from
+v1, the old global store is moved to a timestamped `lancedb-v1-backup-*` directory and projects are
+rebuilt lazily from source. Old chunk rows are never copied, which repairs duplicate chunk IDs.
+
 With `INCODE_OFFLINE=1`, Code Indexing MCP will not download a missing model and returns
 `MODEL_UNAVAILABLE` instead. Source code, embeddings, and search queries remain local; there is
 no telemetry.
@@ -183,8 +215,8 @@ To exercise the real model integration, provide a persistent cache directory and
 INCODE_MODEL_TEST_CACHE=/path/to/cache uv run pytest -m model
 ```
 
-V1 intentionally excludes filesystem watching, HTTP transports, dependency/call graphs,
-cross-reference resolution, custom embedding profiles, and automatic storage migrations.
+The project intentionally excludes filesystem watching, HTTP transports, dependency/call graphs,
+cross-reference resolution, and custom embedding profiles.
 
 ## License
 

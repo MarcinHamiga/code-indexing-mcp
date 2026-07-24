@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -19,6 +18,7 @@ from mcp.server.session import ServerSession
 from mcp.types import Tool as MCPTool
 
 from .application import Application
+from .daemon import BrokerApplication
 from .errors import ErrorCode, IncodeError
 from .models import (
     CodeChunk,
@@ -30,6 +30,7 @@ from .models import (
     SearchResponse,
     SymbolResponse,
 )
+from .settings import IndexMode, IndexSettings
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class _StartupJob:
     project_id: str | None = None
     discovery_error: BaseException | None = None
     indexing_error: BaseException | None = None
+    indexes: bool = False
 
     @property
     def failed(self) -> bool:
@@ -49,26 +51,32 @@ class _StartupJob:
 
 class StartupCoordinator:
     def __init__(
-        self, application: Application, task_group: anyio.abc.TaskGroup, *, enabled: bool
+        self,
+        application: Application | BrokerApplication,
+        task_group: anyio.abc.TaskGroup,
+        *,
+        mode: IndexMode,
     ) -> None:
         self.application = application
         self.task_group = task_group
-        self.enabled = enabled
+        self.mode = mode
         self._jobs: dict[Path, _StartupJob] = {}
         self._lock = asyncio.Lock()
         self._limiter = anyio.CapacityLimiter(1)
 
-    async def schedule(self, roots: list[Path]) -> None:
-        if not self.enabled:
+    async def schedule(self, roots: list[Path], *, indexes: bool) -> None:
+        if self.mode is IndexMode.MANUAL:
             return
         async with self._lock:
             for root in roots:
                 root = root.resolve()
                 existing = self._jobs.get(root)
-                if existing is not None and not (existing.ready.is_set() and existing.failed):
-                    # A job is still in flight, or already finished successfully.
-                    continue
-                job = _StartupJob()
+                if existing is not None:
+                    if not existing.ready.is_set():
+                        continue
+                    if not existing.failed and (existing.indexes or not indexes):
+                        continue
+                job = _StartupJob(indexes=indexes)
                 self._jobs[root] = job
                 self.task_group.start_soon(self._run, root, job)
 
@@ -101,7 +109,7 @@ class StartupCoordinator:
             )
             job.project_id = project.id if project is not None else None
             job.discovered.set()
-            if project is None:
+            if project is None or not job.indexes:
                 logger.info("Skipping automatic indexing for non-project root: %s", root)
                 return
             async with self._limiter:
@@ -148,12 +156,6 @@ async def _roots(ctx: ServerContext) -> list[Path]:
     return roots
 
 
-def _auto_index_enabled(value: bool | None) -> bool:
-    if value is not None:
-        return value
-    return os.environ.get("INCODE_AUTO_INDEX", "1").lower() not in {"0", "false", "no"}
-
-
 def _coordinator(ctx: ServerContext) -> StartupCoordinator | None:
     try:
         return ctx.request_context.lifespan_context
@@ -161,13 +163,15 @@ def _coordinator(ctx: ServerContext) -> StartupCoordinator | None:
         return None
 
 
-async def _startup_roots(ctx: ServerContext, *, wait_for: str | None = None) -> list[Path]:
+async def _startup_roots(
+    ctx: ServerContext, *, discover: bool = False, indexes: bool = False
+) -> list[Path]:
     roots = await _roots(ctx)
     coordinator = _coordinator(ctx)
     if coordinator is None:
         return roots
-    await coordinator.schedule(roots)
-    if wait_for == "discovery":
+    await coordinator.schedule(roots, indexes=indexes)
+    if discover or indexes:
         await coordinator.wait_for_discovery(roots)
     return roots
 
@@ -181,9 +185,9 @@ async def _wait_for_startup_projects(
 
 
 class AutoIndexingMCP(FastMCP):
-    def __init__(self, application: Application, *, auto_index: bool) -> None:
+    def __init__(self, application: Application | BrokerApplication, *, mode: IndexMode) -> None:
         self.application = application
-        self.auto_index = auto_index
+        self.mode = mode
         super().__init__(
             "code-indexing-mcp",
             instructions="Local Tree-sitter code indexing and hybrid search.",
@@ -195,7 +199,7 @@ class AutoIndexingMCP(FastMCP):
     async def _lifespan(self, _: FastMCP) -> AsyncIterator[StartupCoordinator]:
         async with anyio.create_task_group() as task_group:
             try:
-                yield StartupCoordinator(self.application, task_group, enabled=self.auto_index)
+                yield StartupCoordinator(self.application, task_group, mode=self.mode)
             finally:
                 # Lock waiters are cancellable between non-blocking attempts. A worker
                 # that has acquired the index lock remains owned until its write
@@ -204,20 +208,29 @@ class AutoIndexingMCP(FastMCP):
 
     async def list_tools(self) -> list[MCPTool]:
         tools = await super().list_tools()
-        if not self.auto_index:
+        if self.mode is not IndexMode.EAGER:
             return tools
         context = self.get_context()
         coordinator = _coordinator(context)
         if coordinator is not None:
-            await coordinator.schedule(await _roots(context))
+            await coordinator.schedule(await _roots(context), indexes=True)
         return tools
 
 
 def create_server(
-    application: Application | None = None, *, auto_index: bool | None = None
+    application: Application | BrokerApplication | None = None,
+    *,
+    auto_index: bool | None = None,
 ) -> FastMCP:
     app = application or Application.from_environment()
-    mcp = AutoIndexingMCP(app, auto_index=_auto_index_enabled(auto_index))
+    mode = (
+        IndexMode.EAGER
+        if auto_index
+        else IndexMode.MANUAL
+        if auto_index is not None
+        else IndexSettings.from_environment().mode
+    )
+    mcp = AutoIndexingMCP(app, mode=mode)
 
     @mcp.tool()
     async def init_project(
@@ -226,7 +239,7 @@ def create_server(
         name: str | None = None,
         force_new_id: bool = False,
     ) -> ProjectInfo:
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(
             app.init_project,
             path,
@@ -243,7 +256,7 @@ def create_server(
         # meant to let callers manually recover from. If startup indexing is still
         # running, app.index_project's 0-timeout file lock raises INDEX_BUSY, which is
         # acceptable, pre-existing behavior.
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, discover=True)
         await ctx.report_progress(0, 1, "Indexing project")
         report = await asyncio.to_thread(app.index_project, project, roots=roots, force=force)
         await ctx.report_progress(1, 1, "Index complete")
@@ -251,7 +264,7 @@ def create_server(
 
     @mcp.tool()
     async def project_status(ctx: ServerContext, project: str | None = None) -> ProjectStatus:
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(app.project_status, project, roots=roots)
 
     @mcp.tool()
@@ -275,7 +288,7 @@ def create_server(
         kinds: list[str] | None = None,
         limit: int = 8,
     ) -> SearchResponse:
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, indexes=True)
         project_ids = await asyncio.to_thread(
             app.resolve_search_scope, projects, all_projects, roots
         )
@@ -301,7 +314,7 @@ def create_server(
         kinds: list[str] | None = None,
         limit: int = 20,
     ) -> SymbolResponse:
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, indexes=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved.id])
         return await asyncio.to_thread(
@@ -318,7 +331,7 @@ def create_server(
     async def file_outline(
         ctx: ServerContext, path: str, project: str | None = None
     ) -> OutlineResponse:
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, indexes=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved.id])
         return await asyncio.to_thread(app.file_outline, path, resolved.id, roots=roots)
