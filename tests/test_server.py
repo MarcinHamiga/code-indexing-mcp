@@ -533,3 +533,25 @@ async def test_discovery_is_not_blocked_by_concurrent_indexing(tmp_path: Path) -
         embedder.release.set()
 
     assert not result.isError
+
+
+def test_server_instructions_guide_index_first_usage(tmp_path: Path) -> None:
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    server = create_server(app)
+
+    instructions = server.instructions
+
+    assert instructions is not None
+    for tool in (
+        "search_code",
+        "find_symbol",
+        "file_outline",
+        "get_chunk",
+        "project_status",
+        "index_project",
+    ):
+        assert tool in instructions

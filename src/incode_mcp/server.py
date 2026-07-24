@@ -33,6 +33,15 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+SERVER_INSTRUCTIONS = (
+    "Local Tree-sitter code indexing and hybrid search. "
+    "When exploring code, prefer these index tools over grep-style file reading: "
+    "search_code (semantic natural-language queries), find_symbol (definitions and call "
+    "sites), file_outline (file structure before reading), get_chunk (exact code for a "
+    "search hit). Check list_projects/project_status for index freshness first and run "
+    "index_project if the index is missing or stale."
+)
+
 
 @dataclass
 class _StartupJob:
@@ -186,7 +195,7 @@ class AutoIndexingMCP(FastMCP):
         self.auto_index = auto_index
         super().__init__(
             "code-indexing-mcp",
-            instructions="Local Tree-sitter code indexing and hybrid search.",
+            instructions=SERVER_INSTRUCTIONS,
             json_response=True,
             lifespan=self._lifespan,
         )
