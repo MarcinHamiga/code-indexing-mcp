@@ -15,15 +15,74 @@ parts of this plan. It remains the post-merge roadmap; read these corrections fi
   sequence drove the embedding worker past every ceiling measured (2,048 / 3,072 / 4,096 MiB, batch
   sizes 1 and 4), aborting the run with `INDEX_RESOURCE_LIMIT`. Character-based windows bound
   characters, not the token count that drives memory — so Task 2 is a correctness fix for that
-  shape, not only a boundary-quality improvement. `tests/test_memory_acceptance.py::
-  test_a_minified_file_stays_within_its_ceiling` pins this as a strict xfail and will fail loudly
-  once Tasks 2–3 land.
+  shape, not only a boundary-quality improvement.
+
+  > **Done (2026-07-25).** Token-bounded windowing shipped; see "Task 2 and Task 3 as implemented"
+  > below. The minified shape now indexes cleanly and
+  > `tests/test_memory_acceptance.py::test_a_minified_file_stays_within_its_ceiling` is a plain
+  > passing gate rather than a strict xfail.
 - **Task 3's retry design has no effect at the shipped default.** It specifies a `4 → 2 → 1`
   microbatch backoff, but `INCODE_EMBED_BATCH_SIZE` defaulted to 1, so there was nothing to halve.
   Retry only becomes meaningful once the default is raised, which the 07-25 plan's Task 3 does.
+
+  > **Done (2026-07-25), with the caveat intact.** The `4 → 2 → 1` backoff is implemented and
+  > covered, but `INCODE_EMBED_BATCH_SIZE` still defaults to 1 for the reasons in the 07-25 plan's
+  > Task 3, so it stays dormant unless an operator raises the batch size.
 - **Task 3 Step 3's duration fields are done.** The scan/parse/embed/commit durations were
-  implemented as part of the 07-25 plan's Task 3; the remaining Step 3 telemetry (retry counts,
-  token/segment counts, termination reason) is still open.
+  implemented as part of the 07-25 plan's Task 3.
+
+  > **Extended (2026-07-25).** `IndexReport` now also carries `embedded_segments`,
+  > `embedded_tokens`, `embedding_retries`, `worker_termination_reason`, and `token_windowing`.
+  > Still open from Step 3: configured-vs-effective ceiling split, separate parent/worker/combined
+  > peaks, batch count, and vector-index mode.
+
+## Task 2 and Task 3 as implemented (2026-07-25)
+
+Both tasks landed, but the design deviates from the steps written below. The deviations are
+deliberate; the steps are left unedited as the original reasoning.
+
+**What shipped.** `src/incode_mcp/token_batching.py` holds pure window planning and microbatch
+packing. The embedding worker resolves the tokenizer from the already-loaded FastEmbed model and
+serves a `plan_and_embed` command; `FastEmbedder` implements the same interface in-process. The
+indexer expands each returned window into its own stored chunk, deriving byte and line offsets from
+the window's character offsets against the chunk's own content.
+
+**Measured.** The minified shape moved from 261/2,345/2,534 MiB parent/worker/combined with
+`INDEX_RESOURCE_LIMIT` aborting the run in 2.9 s, to 321/1,879/2,073 MiB indexing cleanly in 188 s
+(1,066 chunks, 0 errors, 0 retries) against a 2,048 MiB ceiling. Isolating the mechanism: one
+2,157-token minified sequence adds ~1,172 MiB of resident memory; the same characters as three
+token-bounded windows add ~266 MiB, and embed faster.
+
+**Deviations from the steps below.**
+
+- **The extractor still splits by characters.** Step 1 has it emit semantic candidates with a
+  16,384-character emergency ceiling and no hardware-dependent splitting. Instead its 4,096-character
+  chunking is left exactly as-is and token windows subdivide those chunks. The memory fix does not
+  need the extractor to change, and leaving boundaries stable keeps every chunk id for files that do
+  not window — verified by a test asserting the windowed and unwindowed paths produce identical
+  chunks for ordinary source. Making candidate boundaries purely semantic remains open as the
+  boundary-quality improvement it always was.
+- **No `ChunkCandidate` / `PackedEmbeddingBatch` models.** `PassageCandidate`, `EmbeddedSegment`, and
+  `TokenWindow` cover the same ground; contiguous little-endian float32 bytes remain the wire format.
+- **The file-level caps are different numbers.** Step 4 specifies at most 512 segments per file and
+  emitted text no greater than twice the source. 512 would reject the `near_cap` shape, which
+  indexes fine today at 6,330 chunks, so the cap that shipped bounds *what windowing adds*: at most
+  16 windows per candidate (a tripwire — 4,096 characters cannot exceed five windows at the default
+  budget), and emitted segment text at most twice the extractor's own chunk text. Both raise a
+  `ValueError`, which the indexer charges to the file as an `IndexIssue` and which leaves the
+  previous generation of that file's chunks in place.
+- **Planning errors are distinguished from environment errors on the wire.** A window plan the
+  worker cannot satisfy returns a `plan_error` frame rather than an `error` frame, because
+  `EMBEDDING_WORKER_FAILED` is in `ENVIRONMENT_ERROR_CODES` and would abort every remaining file for
+  what is one bad file — the exact failure mode this task exists to remove.
+- **Retry granularity is the candidate group, not the unfinished segment.** Step 2 of Task 3 retries
+  only unfinished segments. Requests are already bounded to 256 candidates or 256 KiB of text, so a
+  retry re-embeds at most that much; window boundaries are a pure function of the tokenization, so
+  the retried plan is identical.
+- **No tokenizer in the parent process.** The worker owns the tokenizer because it already has the
+  model loaded. If a FastEmbed layout change makes it unreachable, planning degrades to
+  whole-candidate embedding and logs, rather than failing the run; `IndexReport.token_windowing`
+  reports which path ran.
 - **Task 1's benchmark corpus is under-specified.** Deterministic Python files at varying counts do
   not exercise the memory peak, which tracks the largest *single* file. Task 1 was implemented with
   the corpus extended per the 07-25 plan's Task 5: a file just under `max_file_bytes`, a

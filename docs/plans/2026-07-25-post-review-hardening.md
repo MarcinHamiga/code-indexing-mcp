@@ -43,6 +43,10 @@ rather than rewriting it; it remains the post-merge roadmap.
   > exceeded every ceiling and `INDEX_RESOURCE_LIMIT` aborted the whole run. Character-based
   > windows bound characters, not the token count that actually drives memory. Task 2 is a
   > correctness fix for that shape; keep it below Tasks 4–6 only if minified files stay excluded.
+  >
+  > **Resolved (2026-07-25).** Token-bounded windowing landed as Task 7 below, so minified files no
+  > longer need excluding. The 07-24 plan's Tasks 2–3 are marked done there, with the deviations
+  > recorded.
 - **Task 3's retry design has no effect at the shipped default.** It specifies a `4 → 2 → 1`
   microbatch backoff, but `INCODE_EMBED_BATCH_SIZE` defaults to 1, so there is nothing to halve.
   Retry only becomes meaningful once Task 3 of *this* plan raises the default.
@@ -224,6 +228,10 @@ strict xfail so it cannot be forgotten.
 `near_cap` also shows parent RSS reaching 706 MiB against 194 MiB for ordinary files — the
 list-of-floats ingestion path the 07-24 plan's Task 4 replaces with Arrow staging.
 
+> **Superseded for `minified` (2026-07-25).** Task 7 below fixed the breach. The strict xfail is now
+> a plain passing gate, and the README no longer presents `scan.exclude` as a workaround for
+> correctness — only as a way to avoid spending time and index space on generated files.
+
 ## Task 6: Small correctness items
 
 **Files:** `src/incode_mcp/storage.py`, `tests/test_storage.py`
@@ -242,6 +250,48 @@ list-of-floats ingestion path the 07-24 plan's Task 4 replaces with Arrow stagin
   `max(limit * 10, 200)` rows before applying exact match semantics. If the LIKE pre-filter matches
   more than that and the real matches sort late, they are dropped with no signal. Log at debug when
   the pre-filter returns exactly the cap, so the condition is diagnosable.
+
+## Task 7: Bound embedding sequences by tokens (added 2026-07-25)
+
+**Problem.** Task 5's harness found the one shape that still breaches: a single-line minified file
+near the 1 MiB cap. It exceeds the ceiling at 2,048 / 3,072 / 4,096 MiB and at batch sizes 1 and 4,
+so it is not a tuning problem, and because `INDEX_RESOURCE_LIMIT` is an environment error it aborts
+the entire run — one bundled file blocks indexing for the whole project.
+
+**Cause, measured.** Attention is quadratic in sequence length, and character windows bound the
+wrong quantity. 4,096 characters of ordinary source is 984 tokens; the same 4,096 characters of
+minified source is 2,157. Embedding the long sequence adds ~1,172 MiB of resident memory; the same
+characters as three token-bounded windows add ~266 MiB, and finish faster (0.78 s against 1.07 s).
+
+**Files:** `src/incode_mcp/token_batching.py`, `src/incode_mcp/embedding.py`,
+`src/incode_mcp/embedding_worker.py`, `src/incode_mcp/indexing.py`, `src/incode_mcp/extractor.py`,
+`src/incode_mcp/models.py`, `src/incode_mcp/settings.py`, `src/incode_mcp/application.py`,
+`tests/test_token_batching.py`, `tests/test_indexing.py`, `tests/test_embedding.py`,
+`tests/test_embedding_worker.py`, `tests/test_settings.py`, `tests/test_memory_acceptance.py`,
+`README.md`
+
+**Approach.** This is the 07-24 plan's Tasks 2–3, implemented ahead of the rest of that plan because
+it is the only correctness defect left on this PR. The design and its deviations from those steps
+are recorded under "Task 2 and Task 3 as implemented" in
+`docs/plans/2026-07-24-indexing-memory-hardening-completion.md`, not duplicated here.
+
+### Measured outcome
+
+Peak parent / worker / combined RSS at batch size 1 against a 2,048 MiB ceiling:
+
+| Shape                  | Before                          | After                          |
+| ---------------------- | ------------------------------- | ------------------------------ |
+| `minified`             | 261 / 2,345 / 2,534 MiB, aborts | 321 / 1,879 / 2,073 MiB, clean |
+| `near_cap`+`blank_run` | 706 / 1,430 / 1,656 MiB         | 728 / 1,435 / 1,681 MiB        |
+
+For `minified`, `INDEX_RESOURCE_LIMIT` in 2.9 s became 1,066 chunks in 188 s with 0 errors and 0
+retries. The shapes that already passed are unchanged within noise — they never exceed the token
+budget, so no chunk of theirs is windowed, and a test asserts the windowed and unwindowed paths
+produce identical chunks for source that fits.
+
+`test_a_minified_file_stays_within_its_ceiling` is now a plain passing gate that also asserts
+`token_windowing` is true, so a silent fallback to whole-candidate embedding cannot pass it for the
+wrong reason.
 
 ## Verification
 

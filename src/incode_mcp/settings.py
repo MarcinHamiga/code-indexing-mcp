@@ -10,6 +10,7 @@ from enum import StrEnum
 import psutil
 
 from .errors import ErrorCode, IncodeError
+from .token_batching import DEFAULT_MAX_TOKENS, DEFAULT_OVERLAP_TOKENS
 
 
 class IndexMode(StrEnum):
@@ -59,6 +60,8 @@ class IndexSettings:
     mode: IndexMode
     index_wait_seconds: int
     embedding_batch_size: int
+    embedding_max_tokens: int
+    embedding_overlap_tokens: int
     embedding_threads: int
     embedding_cpu_arena: bool
     vector_index: str
@@ -111,6 +114,16 @@ class IndexSettings:
                 environment, "INCODE_INDEX_WAIT_SECONDS", 300, 0, 24 * 60 * 60
             ),
             embedding_batch_size=_integer(environment, "INCODE_EMBED_BATCH_SIZE", 1, 1, 32),
+            # Sequence length, not character count, drives embedding memory:
+            # attention is quadratic in tokens. 1,024 keeps the widest window
+            # well inside the model's 8,192-token limit and inside the default
+            # memory ceiling even for token-dense minified source.
+            embedding_max_tokens=_integer(
+                environment, "INCODE_EMBED_MAX_TOKENS", DEFAULT_MAX_TOKENS, 64, 8192
+            ),
+            embedding_overlap_tokens=_integer(
+                environment, "INCODE_EMBED_OVERLAP_TOKENS", DEFAULT_OVERLAP_TOKENS, 0, 4096
+            ),
             embedding_threads=_integer(
                 environment,
                 "INCODE_EMBED_THREADS",

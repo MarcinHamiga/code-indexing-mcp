@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import os
 import time
 from multiprocessing.connection import Connection
 
+import numpy as np
 import pytest
+from test_token_batching import fake_encode
 
+from incode_mcp.embedding import (
+    PassageCandidate,
+    SegmentPlan,
+    embed_windows,
+    plan_passages,
+)
 from incode_mcp.embedding_worker import (
     MINIMUM_WORKER_BYTES,
     EmbeddingWorkerSession,
@@ -166,3 +175,119 @@ def test_worker_growth_still_trips_the_ceiling(monkeypatch: pytest.MonkeyPatch) 
 
     assert caught.value.code is ErrorCode.INDEX_RESOURCE_LIMIT
     assert caught.value.details["indexing_memory_bytes"] == 8 * 1024**3
+
+
+def _planning_worker(connection: Connection, _: WorkerConfig) -> None:
+    """Windows candidates with the deterministic tokenizer, no model involved."""
+    while True:
+        command, payload = connection.recv()
+        if command == "stop":
+            return
+        candidates_raw, plan = payload
+        candidates = [PassageCandidate(prefix, content) for prefix, content in candidates_raw]
+        try:
+            windows = plan_passages(fake_encode, candidates, plan)
+        except ValueError as exc:
+            connection.send(("plan_error", str(exc)))
+            continue
+        planned = embed_windows(
+            lambda texts: [
+                np.asarray([float(len(text)), 1.0, 2.0, 3.0], dtype="<f4").tobytes()
+                for text in texts
+            ],
+            candidates,
+            windows,
+            plan,
+        )
+        connection.send(
+            (
+                "planned",
+                (
+                    [
+                        [(w.start_char, w.end_char, w.token_count, vector) for w, vector in group]
+                        for group in planned
+                    ],
+                    True,
+                ),
+            )
+        )
+
+
+def test_plan_and_embed_returns_a_segment_per_token_window() -> None:
+    session = _session(_planning_worker, 2 * 1024**3)
+    content = " ".join(f"tok{index}" for index in range(30))
+
+    with session:
+        segments = session.plan_and_embed(
+            [PassageCandidate("kind: module", content)],
+            SegmentPlan(max_tokens=8, overlap_tokens=2),
+        )
+
+    assert len(segments[0]) > 1
+    assert all(len(segment.vector) == 4 for segment in segments[0])
+    assert segments[0][0].start_char == 0
+    assert segments[0][-1].end_char == len(content)
+    assert session.segment_count == len(segments[0])
+    assert session.token_count == sum(segment.token_count for segment in segments[0])
+    assert session.tokenizer_available is True
+
+
+def test_an_unplannable_candidate_raises_a_plain_error_the_file_absorbs() -> None:
+    session = _session(_planning_worker, 2 * 1024**3)
+    content = " ".join(f"tok{index}" for index in range(500))
+
+    with session, pytest.raises(ValueError, match="exceeded 2 windows"):
+        session.plan_and_embed(
+            [PassageCandidate("", content)],
+            SegmentPlan(max_tokens=8, overlap_tokens=2, max_windows=2),
+        )
+
+    # Deliberately not an IncodeError: the indexer's environment-error set would
+    # abort the whole run for what is one bad file.
+    assert session.termination_reason is None
+
+
+def _batch_size_sensitive_worker(connection: Connection, _: WorkerConfig) -> None:
+    """Dies whenever a microbatch carries more than one item."""
+    while True:
+        command, payload = connection.recv()
+        if command == "stop":
+            return
+        _, plan = payload
+        if plan.max_items > 1:
+            os._exit(1)
+        connection.send(("planned", ([[(0, 1, 1, np.zeros(4, dtype="<f4").tobytes())]], True)))
+
+
+def test_a_failed_batch_is_retried_at_a_halved_microbatch_size() -> None:
+    session = _session(_batch_size_sensitive_worker, 2 * 1024**3)
+
+    with session:
+        segments = session.plan_and_embed(
+            [PassageCandidate("", "x")], SegmentPlan(max_tokens=8, max_items=4)
+        )
+
+    # 4 -> 2 -> 1, so two retries, and the run survives.
+    assert session.retry_count == 2
+    assert len(segments[0]) == 1
+
+
+def _always_failing_worker(connection: Connection, _: WorkerConfig) -> None:
+    while True:
+        command, _payload = connection.recv()
+        if command == "stop":
+            return
+        os._exit(1)
+
+
+def test_retries_stop_and_the_error_surfaces_once_the_batch_cannot_shrink() -> None:
+    session = _session(_always_failing_worker, 2 * 1024**3)
+
+    with session, pytest.raises(IncodeError) as caught:
+        session.plan_and_embed([PassageCandidate("", "x")], SegmentPlan(max_tokens=8, max_items=2))
+
+    assert caught.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
+    assert session.retry_count == 1
+    # Either the liveness poll or the closed pipe notices first, depending on
+    # how the two processes interleave; both name a dead worker.
+    assert session.termination_reason in {"worker_exited", "channel_closed"}

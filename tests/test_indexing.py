@@ -1,11 +1,20 @@
+import itertools
 import os
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from filelock import FileLock
+from test_token_batching import fake_encode
 
+from incode_mcp.embedding import (
+    EmbeddedSegment,
+    PassageCandidate,
+    SegmentPlan,
+    embed_planned_segments,
+)
 from incode_mcp.errors import ErrorCode, IncodeError
 from incode_mcp.extractor import TreeSitterExtractor
 from incode_mcp.indexing import Indexer
@@ -325,3 +334,179 @@ def test_resource_limit_aborts_instead_of_poisoning_the_file_record(tmp_path: Pa
     assert report.errors == []
     assert len(store.list_files(project.id)) == 2
     assert store.project_state(project.id) == "ready"
+
+
+class WindowingEmbedder(RecordingEmbedder):
+    """A double that windows candidates the way the real worker does.
+
+    It runs the production planner over the deterministic tokenizer from
+    ``test_token_batching``, so the offsets under test are the ones the real
+    path produces, without loading a model.
+    """
+
+    def plan_and_embed(
+        self, candidates: Sequence[PassageCandidate], plan: SegmentPlan
+    ) -> list[list[EmbeddedSegment]]:
+        planned = embed_planned_segments(fake_encode, self.embed_passages, candidates, plan)
+        return [
+            [
+                EmbeddedSegment(window.start_char, window.end_char, window.token_count, vector)
+                for window, vector in segments
+            ]
+            for segments in planned
+        ]
+
+
+def make_windowing_indexer(
+    tmp_path: Path, embedder: RecordingEmbedder, plan: SegmentPlan
+) -> tuple[Indexer, LanceStore]:
+    store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
+    return (
+        Indexer(
+            store=store,
+            scanner=SourceScanner(),
+            extractor=TreeSitterExtractor(),
+            embedder=embedder,
+            lock_directory=tmp_path / "locks",
+            segment_plan=plan,
+        ),
+        store,
+    )
+
+
+DENSE_SOURCE = (
+    "def answer():\n"
+    "    total = 0\n"
+    "    for index in range(10):\n"
+    "        total = total + index\n"
+    "    return total\n"
+)
+
+
+def test_a_token_dense_chunk_is_split_into_several_stored_chunks(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text(DENSE_SOURCE)
+    project = initialize_project(root)
+    indexer, store = make_windowing_indexer(
+        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
+    )
+
+    report = indexer.index(project)
+    chunks = store.list_chunks([project.id])
+
+    assert report.errors == []
+    assert len(chunks) > 1
+    assert {chunk.qualified_symbol for chunk in chunks} == {"answer"}
+
+
+def test_windowed_chunk_offsets_still_slice_the_original_source(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text(DENSE_SOURCE)
+    project = initialize_project(root)
+    indexer, store = make_windowing_indexer(
+        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
+    )
+
+    indexer.index(project)
+    source = (root / "main.py").read_bytes()
+
+    for chunk in store.list_chunks([project.id]):
+        assert source[chunk.start_byte : chunk.end_byte].decode("utf-8") == chunk.content
+        assert source[: chunk.start_byte].decode("utf-8").count("\n") + 1 == chunk.start_line
+        assert chunk.end_line == chunk.start_line + chunk.content.count("\n")
+
+
+def test_every_window_keeps_the_context_header_and_identifier_tail(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text(DENSE_SOURCE)
+    project = initialize_project(root)
+    indexer, store = make_windowing_indexer(
+        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
+    )
+
+    indexer.index(project)
+    chunks = store.list_chunks([project.id])
+
+    for chunk in chunks:
+        assert chunk.embedding_text.startswith("language: python\npath: main.py\n")
+        assert "symbol: answer" in chunk.embedding_text
+        assert chunk.embedding_text.endswith(chunk.content)
+        assert chunk.search_text.startswith(chunk.embedding_text)
+        assert chunk.search_text.endswith("main py answer answer")
+
+
+def test_windows_cover_the_symbol_without_dropping_source(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text(DENSE_SOURCE)
+    project = initialize_project(root)
+    indexer, store = make_windowing_indexer(
+        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
+    )
+
+    indexer.index(project)
+    chunks = sorted(store.list_chunks([project.id]), key=lambda chunk: chunk.start_byte)
+    source = (root / "main.py").read_bytes()
+
+    covered = source[chunks[0].start_byte : chunks[0].end_byte]
+    for previous, chunk in itertools.pairwise(chunks):
+        assert chunk.start_byte <= previous.end_byte
+        covered += source[max(chunk.start_byte, previous.end_byte) : chunk.end_byte]
+    assert covered == source[chunks[0].start_byte : chunks[-1].end_byte]
+    assert covered.decode("utf-8").strip() == DENSE_SOURCE.strip()
+
+
+def test_a_chunk_within_the_budget_is_stored_unchanged(tmp_path: Path) -> None:
+    """Windowing must be invisible to files that never exceed the budget."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    windowing, windowed_store = make_windowing_indexer(
+        tmp_path / "windowed", WindowingEmbedder(), SegmentPlan(max_tokens=1_024)
+    )
+    plain, plain_store = make_indexer(tmp_path / "plain", RecordingEmbedder())
+
+    windowing.index(project)
+    plain.index(project)
+
+    def comparable(store: LanceStore) -> list[tuple[object, ...]]:
+        return sorted(
+            (chunk.chunk_id, chunk.start_byte, chunk.end_byte, chunk.content, chunk.search_text)
+            for chunk in store.list_chunks([project.id])
+        )
+
+    assert comparable(windowed_store) == comparable(plain_store)
+
+
+class UnplannableEmbedder(WindowingEmbedder):
+    """Rejects one file's candidates the way an exploding window plan would."""
+
+    def plan_and_embed(
+        self, candidates: Sequence[PassageCandidate], plan: SegmentPlan
+    ) -> list[list[EmbeddedSegment]]:
+        if any("REJECT" in candidate.content for candidate in candidates):
+            raise ValueError("Token planning exceeded 16 windows")
+        return super().plan_and_embed(candidates, plan)
+
+
+def test_an_unplannable_file_is_charged_to_the_file_not_the_run(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "good.py").write_text("value = 1\n")
+    (root / "bad.py").write_text("REJECT = 'x'\n")
+    project = initialize_project(root)
+    indexer, store = make_windowing_indexer(
+        tmp_path, UnplannableEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
+    )
+
+    report = indexer.index(project)
+
+    # The run completes and the healthy file is indexed; only the file that
+    # could not be planned is recorded as an issue.
+    assert [issue.path for issue in report.errors] == ["bad.py"]
+    assert store.project_state(project.id) == "partial"
+    assert {chunk.path for chunk in store.list_chunks([project.id])} == {"good.py"}

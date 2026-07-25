@@ -356,7 +356,8 @@ class TreeSitterExtractor:
         context = [f"language: {language}", f"path: {path.as_posix()}", f"kind: {kind}"]
         if qualified:
             context.append(f"symbol: {qualified}")
-        embedding_text = "\n".join([*context, content])
+        prefix = "\n".join(context)
+        embedding_text = f"{prefix}\n{content}"
         normalized = normalize_identifier(
             " ".join(filter(None, [path.as_posix(), qualified or "", symbol or ""]))
         )
@@ -373,4 +374,6 @@ class TreeSitterExtractor:
             embedding_text=embedding_text,
             search_text=f"{embedding_text}\n{normalized}",
             part_index=part_index,
+            embedding_prefix=prefix,
+            search_suffix=normalized,
         )

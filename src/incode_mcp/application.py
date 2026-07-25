@@ -11,7 +11,7 @@ from pathlib import Path
 from filelock import FileLock
 from platformdirs import user_cache_path, user_data_path
 
-from .embedding import Embedder, FastEmbedder
+from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig
 from .errors import ErrorCode, IncodeError
 from .extractor import TreeSitterExtractor
@@ -106,6 +106,11 @@ class Application:
             embedder=embedder,
             lock_directory=paths.data / "locks",
             batch_size=self.settings.embedding_batch_size,
+            segment_plan=SegmentPlan(
+                max_tokens=self.settings.embedding_max_tokens,
+                overlap_tokens=self.settings.embedding_overlap_tokens,
+                max_items=self.settings.embedding_batch_size,
+            ),
             passage_session_factory=passage_session_factory,
         )
         self.search = SearchService(self.store, embedder)

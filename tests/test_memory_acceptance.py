@@ -194,20 +194,24 @@ def test_real_model_index_stays_within_its_ceiling(tmp_path: Path) -> None:
 
 
 @pytest.mark.memory
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A single-line file near the 1 MiB cap drives the embedding worker past "
-        "any ceiling measured (2048/3072/4096 MiB at batch sizes 1 and 4), and "
-        "INDEX_RESOURCE_LIMIT aborts the whole run. Fixing it needs the "
-        "tokenizer-bounded chunk planning and adaptive microbatch retry in "
-        "docs/plans/2026-07-24-indexing-memory-hardening-completion.md Tasks 2-3. "
-        "This turns XPASS - and fails loudly - once that lands."
-    ),
-)
 def test_a_minified_file_stays_within_its_ceiling(tmp_path: Path) -> None:
+    """The shape that character-bounded chunking could not survive.
+
+    A single-line file near the 1 MiB cap used to breach every ceiling measured
+    (2048/3072/4096 MiB at batch sizes 1 and 4) and abort the whole run with
+    INDEX_RESOURCE_LIMIT, because 4,096 characters of minified source is ~2,157
+    tokens and attention is quadratic in sequence length. Token-bounded windows
+    hold it at 321/1,879/2,073 MiB parent/worker/combined, indexing cleanly.
+    """
     run = _real_model_run(tmp_path, ["minified"])
 
     verdict = evaluate_result(run)
 
     assert verdict.passed, f"{verdict.reasons}\n{run.stderr_tail}"
+    assert run.report is not None
+    assert run.report["errors"] == []
+    # Windowing is what makes this shape survivable; a silent fallback to
+    # whole-candidate embedding would pass on memory but for the wrong reason.
+    assert run.report["token_windowing"] is True
+    assert run.report["embedded_tokens"] > 0
+    assert run.report["embedded_segments"] > 0

@@ -186,6 +186,8 @@ Configure it with:
 ```bash
 export INCODE_INDEX_MEMORY_MB=1536
 export INCODE_EMBED_BATCH_SIZE=1
+export INCODE_EMBED_MAX_TOKENS=1024
+export INCODE_EMBED_OVERLAP_TOKENS=64
 export INCODE_EMBED_THREADS=2
 export INCODE_EMBED_CPU_ARENA=0
 export INCODE_VECTOR_INDEX=exact
@@ -195,6 +197,24 @@ The ceiling covers indexing memory: the embedding worker plus any growth in the 
 indexing runs. Memory the host already held when the worker started — the daemon's query model and
 open Lance datasets — is not charged to the budget, so a warm daemon can still index. `IndexReport`
 reports both the budget and the true combined peak, plus a scan/parse/embed/commit duration split.
+
+### Token-bounded chunks
+
+Sequence length, not character count, drives embedding memory: attention is quadratic in tokens.
+The same 4,096 characters cost wildly different amounts depending on how densely they tokenize —
+ordinary source is ~984 tokens, a minified line ~2,157 — and embedding the latter as one sequence
+adds ~1,172 MiB of resident memory against ~266 MiB for the same characters split into windows.
+
+Every chunk is therefore windowed to at most `INCODE_EMBED_MAX_TOKENS` tokens with
+`INCODE_EMBED_OVERLAP_TOKENS` of overlap before it reaches the model, and each window is stored as
+its own chunk with its own byte and line offsets. Ordinary code is unaffected: a 1,024-token budget
+is roughly 4,096 characters of source, so chunks that already fit stay whole and unchanged.
+`IndexReport` carries `embedded_segments`, `embedded_tokens`, `embedding_retries`, and
+`token_windowing` so a run's shape is visible without re-running it.
+
+When a batch does trip the ceiling, the worker is replaced and the batch retried at half the
+microbatch size (4 → 2 → 1) before the error surfaces. Window boundaries come only from the
+tokenization, so a retry re-derives identical chunks.
 
 ### Measured throughput
 
@@ -216,24 +236,25 @@ the first `search_code` call waits for that work. On a large repository prefer
 `INCODE_INDEX_MODE=eager` (index during tool listing) or `INCODE_INDEX_MODE=manual` with an
 explicit `code-indexing-mcp index`, so no query blocks on a cold index.
 
-### Known limit: single-line files
+### Single-line and generated files
 
-A single-line source file near the 1 MiB scan cap — a bundled or minified artifact — drives the
-embedding worker past its ceiling and aborts the run with `INDEX_RESOURCE_LIMIT`. Raising
-`INCODE_INDEX_MEMORY_MB` does not help: measured at 2048, 3072, and 4096 MiB, the worker grows to
-exceed each one. Until chunk planning becomes tokenizer-aware, exclude such files in
-`.ci-mcp/project.toml`:
+A single-line source file near the 1 MiB scan cap — a bundled or minified artifact — used to drive
+the embedding worker past every ceiling measured (2048, 3072, and 4096 MiB alike) and abort the run
+with `INDEX_RESOURCE_LIMIT`. Token-bounded windows fix that: the same file now indexes cleanly at
+321/1,879/2,073 MiB parent/worker/combined against a 2,048 MiB ceiling.
+
+Such files still cost time and index space for little retrieval value, so excluding them in
+`.ci-mcp/project.toml` remains worthwhile:
 
 ```toml
 [scan]
 exclude = ["**/*.min.js", "**/*.bundle.js", "**/generated/**"]
 ```
 
-A file that cannot be parsed or embedded is recorded as a per-file issue and skipped until it
-changes. Environment failures — `MODEL_UNAVAILABLE`, `INDEX_RESOURCE_LIMIT`, and
-`EMBEDDING_WORKER_FAILED` — are not attributable to a file, so they abort the run and surface to
-the caller instead of silently leaving that file permanently unindexed. That is why one oversized
-single-line file stops the whole run rather than being skipped.
+A file that cannot be parsed, planned, or embedded is recorded as a per-file issue and skipped until
+it changes. Environment failures — `MODEL_UNAVAILABLE`, `INDEX_RESOURCE_LIMIT`, and
+`EMBEDDING_WORKER_FAILED` — are not attributable to a file, so they abort the run and surface to the
+caller instead of silently leaving that file permanently unindexed.
 
 `INCODE_INDEX_EXECUTION=in-process` is a temporary diagnostic rollback. It does not enforce the
 worker ceiling. `INCODE_VECTOR_INDEX=hnsw` opts into approximate vector indexing; exact search is

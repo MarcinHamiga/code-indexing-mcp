@@ -8,7 +8,15 @@ from typing import Any
 import pytest
 
 from incode_mcp import embedding
-from incode_mcp.embedding import FastEmbedder
+from incode_mcp.embedding import (
+    FastEmbedder,
+    PassageCandidate,
+    SegmentPlan,
+    compose_passage,
+    embed_planned_segments,
+    plan_passages,
+    resolve_tokenizer,
+)
 
 
 class _FakeModel:
@@ -44,3 +52,51 @@ def test_concurrent_first_use_builds_a_single_model(
 
     assert not any(thread.is_alive() for thread in threads)
     assert len(builds) == 1
+
+
+def test_compose_passage_matches_the_extractor_layout() -> None:
+    assert compose_passage("kind: module", "value = 1") == "kind: module\nvalue = 1"
+    assert compose_passage("", "value = 1") == "value = 1"
+
+
+def test_resolve_tokenizer_finds_the_nested_fastembed_tokenizer() -> None:
+    class Tokenizer:
+        def encode(self, text: str) -> object:
+            return text
+
+    class Inner:
+        tokenizer = Tokenizer()
+
+    class Model:
+        model = Inner()
+
+    assert isinstance(resolve_tokenizer(Model()), Tokenizer)
+
+
+def test_resolve_tokenizer_returns_none_when_the_layout_moved() -> None:
+    class Model:
+        pass
+
+    assert resolve_tokenizer(Model()) is None
+
+
+def test_planning_without_a_tokenizer_leaves_candidates_whole() -> None:
+    candidates = [PassageCandidate("kind: module", "value = 1")]
+
+    windows = plan_passages(None, candidates, SegmentPlan())
+
+    assert [(window.start_char, window.end_char) for window in windows[0]] == [(0, 9)]
+
+
+def test_embedding_without_a_tokenizer_sends_the_whole_candidate() -> None:
+    seen: list[list[str]] = []
+
+    def embed(texts: list[str]) -> list[str]:
+        seen.append(texts)
+        return ["vector" for _ in texts]
+
+    candidates = [PassageCandidate("kind: module", "value = 1")]
+    result = embed_planned_segments(None, embed, candidates, SegmentPlan())
+
+    assert seen == [["kind: module\nvalue = 1"]]
+    assert len(result[0]) == 1

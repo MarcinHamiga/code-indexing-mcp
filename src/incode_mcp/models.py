@@ -93,6 +93,12 @@ class ExtractedChunk(FrozenModel):
     embedding_text: str
     search_text: str
     part_index: int = 0
+    # The two halves ``embedding_text`` and ``search_text`` are composed from.
+    # Keeping them lets a token window be recomposed with the same context
+    # header and identifier tail as the whole chunk, instead of the header being
+    # windowed away from every part after the first.
+    embedding_prefix: str = ""
+    search_suffix: str = ""
 
 
 class ExtractionResult(FrozenModel):
@@ -178,6 +184,16 @@ class IndexReport(FrozenModel):
     memory_budget_bytes: int | None = None
     peak_memory_bytes: int | None = None
     worker_used: bool = False
+    # Token-window telemetry, populated only on worker runs. embedded_segments
+    # counts what the worker embedded, which includes segments from files that
+    # later failed and were not committed, so it can exceed embedded_chunks.
+    # token_windowing=False means no tokenizer was reachable and sequence length
+    # went unbounded.
+    embedded_segments: int | None = None
+    embedded_tokens: int | None = None
+    embedding_retries: int | None = None
+    worker_termination_reason: str | None = None
+    token_windowing: bool | None = None
 
 
 class SearchHit(FrozenModel):

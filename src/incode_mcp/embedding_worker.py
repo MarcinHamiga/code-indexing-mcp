@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -17,12 +18,26 @@ import numpy as np
 import psutil
 from fastembed import TextEmbedding
 
-from .embedding import DEFAULT_MODEL
+from .embedding import (
+    DEFAULT_MODEL,
+    EmbeddedSegment,
+    PassageCandidate,
+    SegmentPlan,
+    embed_windows,
+    plan_passages,
+    resolve_tokenizer,
+)
 from .errors import ErrorCode, IncodeError
 
 SYSTEM_RESERVE_BYTES = 512 * 1024**2
 MINIMUM_WORKER_BYTES = 1024**3
 HARD_OVERSHOOT_BYTES = 128 * 1024**2
+# Failures a smaller microbatch can plausibly survive. Model, protocol, and
+# validation errors are not retried: they fail identically at any batch size.
+RETRYABLE_CODES = frozenset({ErrorCode.INDEX_RESOURCE_LIMIT, ErrorCode.EMBEDDING_WORKER_FAILED})
+MAX_BATCH_RETRIES = 2
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -66,16 +81,50 @@ def _worker_main(connection: Connection, config: WorkerConfig) -> None:
             threads=config.threads,
             enable_cpu_mem_arena=config.enable_cpu_mem_arena,
         )
+        tokenizer = resolve_tokenizer(model)
+
+        def embed_packed(texts: list[str]) -> list[bytes]:
+            return [
+                np.asarray(vector, dtype="<f4").tobytes() for vector in model.passage_embed(texts)
+            ]
+
         while True:
             command, payload = connection.recv()
             if command == "stop":
                 return
-            if command != "embed":
+            if command == "embed":
+                connection.send(("packed", embed_packed(payload)))
+                continue
+            if command != "plan_and_embed":
                 raise ValueError(f"Unknown worker command: {command}")
-            packed = [
-                np.asarray(vector, dtype="<f4").tobytes() for vector in model.passage_embed(payload)
-            ]
-            connection.send(("packed", packed))
+            raw_candidates, plan = payload
+            candidates = [PassageCandidate(prefix, content) for prefix, content in raw_candidates]
+            try:
+                windows = plan_passages(
+                    None if tokenizer is None else tokenizer.encode, candidates, plan
+                )
+            except ValueError as exc:
+                # A file the planner cannot window is a bad file, not a broken
+                # environment. Reported separately so the parent charges it to
+                # the file instead of aborting every remaining file in the run.
+                connection.send(("plan_error", str(exc)))
+                continue
+            planned = embed_windows(embed_packed, candidates, windows, plan)
+            connection.send(
+                (
+                    "planned",
+                    (
+                        [
+                            [
+                                (window.start_char, window.end_char, window.token_count, vector)
+                                for window, vector in segments
+                            ]
+                            for segments in planned
+                        ],
+                        tokenizer is not None,
+                    ),
+                )
+            )
     except BaseException as exc:
         with suppress(BaseException):
             connection.send(("error", f"{type(exc).__name__}: {exc}"))
@@ -115,6 +164,13 @@ class EmbeddingWorkerSession:
         self._process: BaseProcess | None = None
         self._connection: Connection | None = None
         self.peak_combined_rss = 0
+        # Telemetry surfaced on IndexReport so a run's shape is diagnosable
+        # without re-running it under a profiler.
+        self.retry_count = 0
+        self.segment_count = 0
+        self.token_count = 0
+        self.termination_reason: str | None = None
+        self.tokenizer_available: bool | None = None
         # RSS the parent already held before the worker existed. The daemon keeps
         # a query model resident in-process, and charging that to the indexing
         # budget would trip the ceiling before any indexing work happens. Only
@@ -137,14 +193,79 @@ class EmbeddingWorkerSession:
         self.close()
 
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        status, payload = self._request("embed", texts)
+        if status == "packed":
+            return [
+                np.frombuffer(vector, dtype="<f4", count=self.config.dimension).tolist()
+                for vector in payload
+            ]
+        return [[float(value) for value in vector] for vector in payload]
+
+    def plan_and_embed(
+        self, candidates: Sequence[PassageCandidate], plan: SegmentPlan
+    ) -> list[list[EmbeddedSegment]]:
+        """Window candidates by token count in the worker, retrying smaller.
+
+        Window boundaries are a pure function of the tokenization, so a retry
+        re-derives the identical segments; only the microbatch packing shrinks.
+        """
+        request = [(candidate.prefix, candidate.content) for candidate in candidates]
+        attempt = plan
+        for retry in range(MAX_BATCH_RETRIES + 1):
+            try:
+                status, payload = self._request("plan_and_embed", (request, attempt))
+                if status == "plan_error":
+                    raise ValueError(str(payload))
+                break
+            except IncodeError as exc:
+                if (
+                    exc.code not in RETRYABLE_CODES
+                    or attempt.max_items <= 1
+                    or retry == MAX_BATCH_RETRIES
+                ):
+                    # _request already recorded the specific reason; keep it
+                    # rather than flattening it back to the error code.
+                    raise
+                attempt = replace(attempt, max_items=max(1, attempt.max_items // 2))
+                self.retry_count += 1
+                logger.warning(
+                    "Embedding batch failed with %s; retrying with max_items=%d",
+                    exc.code.value,
+                    attempt.max_items,
+                )
+                # _request already terminated the worker, so the next attempt
+                # spawns a fresh process with a fresh ONNX arena.
+                self.close()
+
+        segments_payload, tokenizer_available = payload
+        self.tokenizer_available = bool(tokenizer_available)
+        results: list[list[EmbeddedSegment]] = []
+        for segments in segments_payload:
+            decoded = [
+                EmbeddedSegment(
+                    start_char=start_char,
+                    end_char=end_char,
+                    token_count=token_count,
+                    vector=np.frombuffer(vector, dtype="<f4", count=self.config.dimension).tolist(),
+                )
+                for start_char, end_char, token_count, vector in segments
+            ]
+            self.segment_count += len(decoded)
+            self.token_count += sum(segment.token_count for segment in decoded)
+            results.append(decoded)
+        return results
+
+    def _request(self, command: str, payload: object) -> tuple[str, Any]:
+        """Send one command and wait for its reply under the memory ceiling."""
         self._start()
         assert self._connection is not None
         assert self._process is not None
-        self._connection.send(("embed", texts))
+        self._connection.send((command, payload))
         consecutive_over = 0
         while not self._connection.poll(0.1):
             if not self._process.is_alive():
                 self.close()
+                self.termination_reason = "worker_exited"
                 raise IncodeError(
                     ErrorCode.EMBEDDING_WORKER_FAILED,
                     "Embedding worker exited without returning a result",
@@ -164,6 +285,7 @@ class EmbeddingWorkerSession:
                 or consecutive_over >= 5
             ):
                 self._terminate()
+                self.termination_reason = "memory_ceiling"
                 raise IncodeError(
                     ErrorCode.INDEX_RESOURCE_LIMIT,
                     "Indexing exceeded its memory ceiling",
@@ -176,19 +298,16 @@ class EmbeddingWorkerSession:
             status, payload = self._connection.recv()
         except EOFError as exc:
             self.close()
+            self.termination_reason = "channel_closed"
             raise IncodeError(
                 ErrorCode.EMBEDDING_WORKER_FAILED,
                 "Embedding worker closed its result channel",
             ) from exc
         if status == "error":
             self.close()
+            self.termination_reason = "worker_error"
             raise IncodeError(ErrorCode.EMBEDDING_WORKER_FAILED, str(payload))
-        if status == "packed":
-            return [
-                np.frombuffer(vector, dtype="<f4", count=self.config.dimension).tolist()
-                for vector in payload
-            ]
-        return [[float(value) for value in vector] for vector in payload]
+        return status, payload
 
     def close(self) -> None:
         process = self._process

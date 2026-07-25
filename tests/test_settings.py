@@ -68,3 +68,26 @@ def test_memory_budget_override_and_worker_default(monkeypatch: pytest.MonkeyPat
 
     assert settings.index_memory_bytes == 1536 * 1024 * 1024
     assert settings.index_execution == "worker"
+
+
+def test_token_window_settings_default_to_the_measured_budget() -> None:
+    settings = IndexSettings.from_environment({})
+
+    assert settings.embedding_max_tokens == 1024
+    assert settings.embedding_overlap_tokens == 64
+
+
+def test_token_window_settings_are_configurable() -> None:
+    settings = IndexSettings.from_environment(
+        {"INCODE_EMBED_MAX_TOKENS": "512", "INCODE_EMBED_OVERLAP_TOKENS": "32"}
+    )
+
+    assert settings.embedding_max_tokens == 512
+    assert settings.embedding_overlap_tokens == 32
+
+
+def test_a_token_budget_above_the_model_limit_is_rejected() -> None:
+    with pytest.raises(IncodeError) as caught:
+        IndexSettings.from_environment({"INCODE_EMBED_MAX_TOKENS": "16384"})
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
