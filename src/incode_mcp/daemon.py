@@ -39,10 +39,15 @@ from .settings import IndexSettings
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 16 * 1024**2
 
+# Looked up dynamically because Windows' socket stubs have no AF_UNIX at all,
+# so a direct reference fails type checking there even though it never runs.
+# daemon_supported() gates every use.
+_AF_UNIX: int | None = getattr(socket, "AF_UNIX", None)
+
 
 def daemon_supported() -> bool:
     """Return whether this platform exposes Unix domain sockets."""
-    return hasattr(socket, "AF_UNIX")
+    return _AF_UNIX is not None
 
 
 def require_daemon_support() -> None:
@@ -58,7 +63,8 @@ def require_daemon_support() -> None:
 
 def _local_socket() -> socket.socket:
     require_daemon_support()
-    return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    assert _AF_UNIX is not None  # require_daemon_support raises otherwise
+    return socket.socket(_AF_UNIX, socket.SOCK_STREAM)
 
 
 def _private_directory(directory: Path) -> Path:
@@ -68,7 +74,9 @@ def _private_directory(directory: Path) -> Path:
     only trusted when it is a real directory (not a symlink) owned by this user.
     """
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if os.name == "nt":
+    # Gate on the ownership primitive rather than on the platform name, which
+    # also keeps this type-checkable where os.getuid is absent from the stubs.
+    if not hasattr(os, "getuid"):
         return directory
     info = os.lstat(directory)
     if not stat.S_ISDIR(info.st_mode):

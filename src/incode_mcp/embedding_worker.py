@@ -11,6 +11,7 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import TracebackType
+from typing import Any
 
 import numpy as np
 import psutil
@@ -221,7 +222,12 @@ class EmbeddingWorkerSession:
         process.start()
         child.close()
         self._process = process
-        self._connection = parent
+        # Pipe() yields PipeConnection on Windows and Connection elsewhere, and
+        # typeshed does not relate the two even though both carry the send/recv/
+        # poll/close surface used here. Widening on this one line keeps the
+        # attribute itself typed, and keeps a cast from being redundant on POSIX.
+        connection: Any = parent
+        self._connection = connection
 
     def _sample_rss(self) -> tuple[int, int]:
         """Return the current (parent, worker) resident set sizes in bytes."""

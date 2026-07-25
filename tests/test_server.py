@@ -652,6 +652,16 @@ async def test_a_second_root_gives_up_instead_of_queueing_behind_the_first(
             await client.list_tools()
             assert await asyncio.to_thread(embedder.started.wait, 5)
 
+            # Discovery writes the on-disk marker before it registers the
+            # project, so a root can resolve to an id the store does not know
+            # yet. Wait for both registrations before reading any state.
+            for _ in range(100):
+                if len(app.list_projects()) == 2:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                pytest.fail("expected both roots to be registered")
+
             # Exactly one root won the limiter and is stuck on the embedder;
             # target the other, which is the one that had to wait.
             blocked = root_a if app.project_status(roots=[root_a]).state == "indexing" else root_b
