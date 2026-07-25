@@ -19,6 +19,7 @@ from .daemon import (
     DaemonServer,
     daemon_status,
     ensure_daemon,
+    require_daemon_support,
 )
 from .errors import IncodeError
 from .server import create_server
@@ -96,11 +97,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
         settings = IndexSettings.from_environment()
         if args.command == "serve":
-            app = (
-                Application(paths, cwd=Path.cwd())
-                if args.direct or settings.broker_mode == "off"
-                else ensure_daemon(paths)
-            )
+            use_daemon = not args.direct and settings.broker_mode != "off"
+            if use_daemon:
+                try:
+                    require_daemon_support()
+                except IncodeError:
+                    # An explicit opt-in cannot be silently downgraded, but the
+                    # default "auto" serves directly rather than failing.
+                    if settings.broker_mode == "on":
+                        raise
+                    logging.warning(
+                        "Unix domain sockets are unavailable on this platform; "
+                        "serving directly instead of via the shared daemon"
+                    )
+                    use_daemon = False
+            app = ensure_daemon(paths) if use_daemon else Application(paths, cwd=Path.cwd())
             create_server(app).run(transport="stdio")
             return 0
         app = Application(paths, cwd=Path.cwd())

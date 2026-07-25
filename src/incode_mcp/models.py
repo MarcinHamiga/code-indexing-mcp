@@ -168,6 +168,13 @@ class IndexReport(FrozenModel):
     skipped_files: int = 0
     errors: list[IndexIssue] = Field(default_factory=list)
     duration_ms: int = 0
+    # Phase breakdown of duration_ms. They do not sum to it: lock acquisition and
+    # project bookkeeping sit outside, and embedding includes the one-time worker
+    # spawn and model load. Optional so older clients keep validating reports.
+    scan_duration_ms: int | None = None
+    parse_duration_ms: int | None = None
+    embed_duration_ms: int | None = None
+    commit_duration_ms: int | None = None
     memory_budget_bytes: int | None = None
     peak_memory_bytes: int | None = None
     worker_used: bool = False

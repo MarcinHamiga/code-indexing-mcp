@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
@@ -42,6 +43,9 @@ class FastEmbedder:
         self.threads = threads
         self.enable_cpu_mem_arena = enable_cpu_mem_arena
         self._model: TextEmbedding | None = None
+        # The daemon serves each client connection on its own thread, so the
+        # lazy load must not be able to build two ONNX sessions concurrently.
+        self._model_lock = threading.Lock()
 
     def prepare(self) -> None:
         self._get_model()
@@ -56,23 +60,26 @@ class FastEmbedder:
     def _get_model(self) -> TextEmbedding:
         if self._model is not None:
             return self._model
-        self.cache_directory.mkdir(parents=True, exist_ok=True)
-        try:
-            self._model = TextEmbedding(
-                model_name=self.model_id,
-                cache_dir=str(self.cache_directory),
-                local_files_only=self.offline,
-                threads=self.threads,
-                enable_cpu_mem_arena=self.enable_cpu_mem_arena,
-            )
-        except Exception as exc:
-            raise IncodeError(
-                ErrorCode.MODEL_UNAVAILABLE,
-                f"Embedding model is unavailable: {self.model_id}",
-                model=self.model_id,
-                offline=self.offline,
-            ) from exc
-        return self._model
+        with self._model_lock:
+            if self._model is not None:
+                return self._model
+            self.cache_directory.mkdir(parents=True, exist_ok=True)
+            try:
+                self._model = TextEmbedding(
+                    model_name=self.model_id,
+                    cache_dir=str(self.cache_directory),
+                    local_files_only=self.offline,
+                    threads=self.threads,
+                    enable_cpu_mem_arena=self.enable_cpu_mem_arena,
+                )
+            except Exception as exc:
+                raise IncodeError(
+                    ErrorCode.MODEL_UNAVAILABLE,
+                    f"Embedding model is unavailable: {self.model_id}",
+                    model=self.model_id,
+                    offline=self.offline,
+                ) from exc
+            return self._model
 
     @staticmethod
     def _vectors(values: Sequence[object] | object) -> list[list[float]]:

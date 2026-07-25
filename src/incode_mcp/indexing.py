@@ -5,8 +5,9 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from filelock import FileLock, Timeout
@@ -19,10 +20,38 @@ from .models import IndexIssue, IndexReport, ProjectInfo, StoredChunk, StoredFil
 from .scanner import SourceScanner
 from .storage import LanceStore
 
+# Failures caused by the environment rather than by a file's own content. They
+# abort the run instead of being recorded against whichever file was in flight.
+ENVIRONMENT_ERROR_CODES = frozenset(
+    {
+        ErrorCode.MODEL_UNAVAILABLE,
+        ErrorCode.INDEX_RESOURCE_LIMIT,
+        ErrorCode.EMBEDDING_WORKER_FAILED,
+    }
+)
+
 
 def _digest(value: str | bytes) -> str:
     data = value.encode() if isinstance(value, str) else value
     return hashlib.sha256(data).hexdigest()
+
+
+@dataclass
+class _PhaseTimer:
+    """Accumulate wall time per indexing phase across an interleaved run."""
+
+    totals: dict[str, int] = field(default_factory=dict)
+
+    @contextlib.contextmanager
+    def measure(self, phase: str) -> Iterator[None]:
+        started = time.monotonic_ns()
+        try:
+            yield
+        finally:
+            self.totals[phase] = self.totals.get(phase, 0) + (time.monotonic_ns() - started)
+
+    def milliseconds(self, phase: str) -> int:
+        return self.totals.get(phase, 0) // 1_000_000
 
 
 class Indexer:
@@ -96,8 +125,10 @@ class Indexer:
     def _index_scan(
         self, project: ProjectInfo, *, force: bool, passage_embedder: PassageEmbedder
     ) -> IndexReport:
-        existing = {record.path: record for record in self.store.list_files(project.id)}
-        scan = self.scanner.scan(project, existing)
+        timer = _PhaseTimer()
+        with timer.measure("scan"):
+            existing = {record.path: record for record in self.store.list_files(project.id)}
+            scan = self.scanner.scan(project, existing)
         current_paths = {item.path.as_posix() for item in scan.files}
         indexed = parsed = embedded = unchanged = metadata_only = removed = 0
         errors: list[IndexIssue] = []
@@ -115,24 +146,31 @@ class Indexer:
                 continue
             content_hash: str | None = None
             try:
-                source = (
-                    item.content if item.content is not None else item.absolute_path.read_bytes()
-                )
-                content_hash = _digest(source)
-                if not force and previous is not None and previous.content_hash == content_hash:
-                    self.store.upsert_file(
-                        previous.model_copy(update={"size": item.size, "mtime_ns": item.mtime_ns})
+                with timer.measure("scan"):
+                    source = (
+                        item.content
+                        if item.content is not None
+                        else item.absolute_path.read_bytes()
                     )
+                    content_hash = _digest(source)
+                if not force and previous is not None and previous.content_hash == content_hash:
+                    with timer.measure("commit"):
+                        self.store.upsert_file(
+                            previous.model_copy(
+                                update={"size": item.size, "mtime_ns": item.mtime_ns}
+                            )
+                        )
                     metadata_only += 1
                     continue
-                extraction = self.extractor.extract(item.path, item.language, source)
+                with timer.measure("parse"):
+                    extraction = self.extractor.extract(item.path, item.language, source)
                 parsed += 1
                 vectors: list[list[float]] = []
                 texts = [chunk.embedding_text for chunk in extraction.chunks]
-                for offset in range(0, len(texts), self.batch_size):
-                    vectors.extend(
-                        passage_embedder.embed_passages(texts[offset : offset + self.batch_size])
-                    )
+                with timer.measure("embed"):
+                    for offset in range(0, len(texts), self.batch_size):
+                        batch = texts[offset : offset + self.batch_size]
+                        vectors.extend(passage_embedder.embed_passages(batch))
                 stored_file = StoredFile(
                     file_id=_digest(f"{project.id}\0{path}"),
                     project_id=project.id,
@@ -148,51 +186,58 @@ class Indexer:
                     self._stored_chunk(project.id, stored_file, chunk, vector)
                     for chunk, vector in zip(extraction.chunks, vectors, strict=True)
                 ]
-                self.store.replace_file(stored_file, chunks)
+                with timer.measure("commit"):
+                    self.store.replace_file(stored_file, chunks)
                 indexed += 1
                 embedded += len(chunks)
             except Exception as exc:
-                if isinstance(exc, IncodeError) and exc.code is ErrorCode.MODEL_UNAVAILABLE:
+                if isinstance(exc, IncodeError) and exc.code in ENVIRONMENT_ERROR_CODES:
+                    # Not attributable to this file. Recording it below would
+                    # stamp the file's current content hash and skip it on every
+                    # later run, leaving a permanent hole in the index for what
+                    # is really a transient condition.
                     raise
                 errors.append(IndexIssue(path=path, message=str(exc)))
                 # Record the failure so the file is not re-read, re-parsed, and
                 # re-embedded on every run. It is retried only when the file
                 # changes again or when force=True. Chunks from a previous
                 # successful index (if any) are left untouched.
-                self.store.upsert_file(
-                    StoredFile(
-                        file_id=_digest(f"{project.id}\0{path}"),
-                        project_id=project.id,
-                        path=path,
-                        language=item.language,
-                        size=item.size,
-                        mtime_ns=item.mtime_ns,
-                        content_hash=(
-                            content_hash
-                            if content_hash is not None
-                            else previous.content_hash
-                            if previous is not None
-                            else ""
-                        ),
-                        has_errors=True,
-                        error=str(exc),
-                        indexed_at=time.time_ns(),
+                with timer.measure("commit"):
+                    self.store.upsert_file(
+                        StoredFile(
+                            file_id=_digest(f"{project.id}\0{path}"),
+                            project_id=project.id,
+                            path=path,
+                            language=item.language,
+                            size=item.size,
+                            mtime_ns=item.mtime_ns,
+                            content_hash=(
+                                content_hash
+                                if content_hash is not None
+                                else previous.content_hash
+                                if previous is not None
+                                else ""
+                            ),
+                            has_errors=True,
+                            error=str(exc),
+                            indexed_at=time.time_ns(),
+                        )
                     )
-                )
 
-        for path, record in existing.items():
-            if path not in current_paths:
-                self.store.remove_file(project.id, record.file_id)
-                removed += 1
+        with timer.measure("commit"):
+            for path, record in existing.items():
+                if path not in current_paths:
+                    self.store.remove_file(project.id, record.file_id)
+                    removed += 1
 
-        if indexed or removed:
-            self.store.ensure_indexes(project.id, compact=removed > 0)
+            if indexed or removed:
+                self.store.ensure_indexes(project.id, compact=removed > 0)
 
-        self.store.upsert_project(
-            project,
-            model_id=self.embedder.model_id,
-            state="partial" if errors else "ready",
-        )
+            self.store.upsert_project(
+                project,
+                model_id=self.embedder.model_id,
+                state="partial" if errors else "ready",
+            )
         return IndexReport(
             project_id=project.id,
             discovered_files=len(scan.files),
@@ -204,6 +249,10 @@ class Indexer:
             removed_files=removed,
             skipped_files=len(scan.skipped),
             errors=errors,
+            scan_duration_ms=timer.milliseconds("scan"),
+            parse_duration_ms=timer.milliseconds("parse"),
+            embed_duration_ms=timer.milliseconds("embed"),
+            commit_duration_ms=timer.milliseconds("commit"),
         )
 
     @staticmethod

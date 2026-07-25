@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import shutil
 import threading
 import time
@@ -16,17 +17,36 @@ import lancedb
 import pyarrow as pa
 from filelock import FileLock
 from lancedb.index import FTS, BTree, HnswSq
+from lancedb.query import ColumnOrdering
 from lancedb.table import LanceTable
 
 from .errors import ErrorCode, IncodeError
 from .models import ChunkPreview, ProjectInfo, StoredChunk, StoredFile
 from .projects import existing_marker_path
 
+logger = logging.getLogger(__name__)
+
 SCHEMA_VERSION = 2
+
+# Symbol lookups over-fetch because the LIKE pushdown over-matches; these bound
+# how many rows are scanned before the exact filter and the caller's limit apply.
+OVERFETCH_FACTOR = 10
+MINIMUM_OVERFETCH = 200
 
 
 def _quoted(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _symbol_matches(chunk: ChunkPreview, name: str, match: str) -> bool:
+    """Apply exact symbol-match semantics that the SQL pre-filter cannot."""
+    candidate = chunk.qualified_symbol or chunk.symbol or ""
+    symbol = chunk.symbol or ""
+    if match == "exact":
+        return candidate == name or symbol == name
+    if match == "prefix":
+        return candidate.startswith(name) or symbol.startswith(name)
+    return name in candidate or name in symbol
 
 
 @dataclass(frozen=True)
@@ -117,8 +137,10 @@ class LanceStore:
         return str(rows[0]["state"])
 
     def list_files(self, project_id: str) -> list[StoredFile]:
-        table = self._tables(project_id).files
-        return [StoredFile.model_validate(row) for row in self._rows(table)]
+        tables = self._existing_tables(project_id)
+        if tables is None:
+            return []
+        return [StoredFile.model_validate(row) for row in self._rows(tables.files)]
 
     def upsert_file(self, record: StoredFile) -> None:
         self._merge(
@@ -152,25 +174,31 @@ class LanceStore:
         ids = list(project_ids or [project.id for project in self.list_projects()])
         chunks: list[StoredChunk] = []
         for project_id in ids:
-            chunks.extend(
-                StoredChunk.model_validate(row)
-                for row in self._rows(self._tables(project_id).chunks)
-            )
+            tables = self._existing_tables(project_id)
+            if tables is None:
+                continue
+            chunks.extend(StoredChunk.model_validate(row) for row in self._rows(tables.chunks))
         return chunks
 
     def get_chunk(self, chunk_id: str) -> StoredChunk | None:
+        # chunk_id is a one-way digest of file_id, which is itself a digest of
+        # the project id and path, so the owning project cannot be recovered
+        # from the id. Scanning every project is inherent without an id-format
+        # change and a full re-index; do not "fix" it by narrowing the loop.
+        # The partitions open read-only so the scan leaves nothing behind.
         for project in self.list_projects():
-            rows = self._rows(
-                self._tables(project.id).chunks,
-                f"chunk_id = {_quoted(chunk_id)}",
-            )
+            tables = self._existing_tables(project.id)
+            if tables is None:
+                continue
+            rows = self._rows(tables.chunks, f"chunk_id = {_quoted(chunk_id)}")
             if rows:
                 return StoredChunk.model_validate(rows[0])
         return None
 
     def count_chunks(self, project_ids: Iterable[str] | None = None) -> int:
         ids = list(project_ids or [project.id for project in self.list_projects()])
-        return sum(self._tables(project_id).chunks.count_rows() for project_id in ids)
+        tables = (self._existing_tables(project_id) for project_id in ids)
+        return sum(table.chunks.count_rows() for table in tables if table is not None)
 
     def hybrid_search(
         self,
@@ -182,9 +210,11 @@ class LanceStore:
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for project_id in project_ids:
+            tables = self._existing_tables(project_id)
+            if tables is None:
+                continue
             query = (
-                self._tables(project_id)
-                .chunks.search(query_type="hybrid", vector_column_name="vector")
+                tables.chunks.search(query_type="hybrid", vector_column_name="vector")
                 .vector(vector)
                 .text(query_text)
             )
@@ -237,20 +267,49 @@ class LanceStore:
         if kinds:
             values = ", ".join(_quoted(kind) for kind in kinds)
             conditions.append(f"kind IN ({values})")
+        tables = self._existing_tables(project_id)
+        if tables is None:
+            return []
+        # LIKE is only a pushdown pre-filter. The query engine ignores escape
+        # sequences, so `_` and `%` inside an identifier stay wildcards and the
+        # predicate over-matches (`load_user` also matches `loadXuser`). It never
+        # under-matches, so exact semantics are re-applied below. Over-fetch so
+        # the caller's limit is applied to real matches in a stable order.
+        scan_limit = max(limit * OVERFETCH_FACTOR, MINIMUM_OVERFETCH)
         rows = self._projected_chunks(
-            self._tables(project_id).chunks,
+            tables.chunks,
             " AND ".join(conditions),
-            limit=limit,
+            limit=scan_limit,
             content=True,
+            order_by=["path", "start_line", "kind"],
         )
-        return [ChunkPreview.model_validate(row) for row in rows]
+        if len(rows) == scan_limit:
+            # The pre-filter filled the scan window, so real matches sorting
+            # after it were never seen. Silent truncation is otherwise
+            # indistinguishable from "no more matches exist".
+            logger.debug(
+                "Symbol pre-filter for %r in project %s hit the %d-row scan cap; "
+                "later exact matches may be missing",
+                name,
+                project_id,
+                scan_limit,
+            )
+        matches = [
+            preview
+            for preview in (ChunkPreview.model_validate(row) for row in rows)
+            if _symbol_matches(preview, name, match)
+        ]
+        return matches[:limit]
 
     def outline_chunks(self, path: str, project_id: str) -> list[ChunkPreview]:
+        tables = self._existing_tables(project_id)
+        if tables is None:
+            return []
         condition = (
             f"path = {_quoted(path)} AND symbol IS NOT NULL AND qualified_symbol IS NOT NULL"
         )
         rows = self._projected_chunks(
-            self._tables(project_id).chunks,
+            tables.chunks,
             condition,
             limit=None,
             content=False,
@@ -280,10 +339,10 @@ class LanceStore:
                 config=HnswSq(distance_type="cosine"),
                 replace=False,
             )
-        chunks.optimize(
-            cleanup_older_than=timedelta(0) if compact else None,
-            delete_unverified=compact,
-        )
+        # Reclaim space after deletions, but never with delete_unverified or a
+        # zero age: searches run concurrently from the daemon and from direct
+        # CLI processes, so versions in active use must not be reaped.
+        chunks.optimize(cleanup_older_than=timedelta(days=1) if compact else None)
 
     def remove_project(self, project_id: str) -> bool:
         existed = bool(self._rows(self._projects, f"id = {_quoted(project_id)}"))
@@ -358,6 +417,7 @@ class LanceStore:
         )
 
     def _tables(self, project_id: str) -> _ProjectTables:
+        """Open *project_id*'s partition, creating it. For write paths only."""
         with self._partitions_lock:
             cached = self._partitions.get(project_id)
             if cached is not None:
@@ -374,6 +434,32 @@ class LanceStore:
                     self._chunk_schema(self.vector_dimension),
                 ),
             )
+            self._partitions[project_id] = tables
+            return tables
+
+    def _existing_tables(self, project_id: str) -> _ProjectTables | None:
+        """Open *project_id*'s partition without creating it, or return None.
+
+        Reads must not materialise storage for a project they are only looking
+        at. get_chunk in particular scans every registered project, so going
+        through the create-on-write _tables() would leave an empty partition
+        directory behind for each project that has never been indexed.
+        """
+        with self._partitions_lock:
+            cached = self._partitions.get(project_id)
+            if cached is not None:
+                return cached
+            directory = self.directory / "projects" / project_id
+            if not directory.is_dir():
+                return None
+            database = lancedb.connect(directory, read_consistency_interval=timedelta(0))
+            try:
+                tables = _ProjectTables(
+                    files=cast(LanceTable, database.open_table("files")),
+                    chunks=cast(LanceTable, database.open_table("chunks")),
+                )
+            except (ValueError, FileNotFoundError):
+                return None
             self._partitions[project_id] = tables
             return tables
 
@@ -407,6 +493,7 @@ class LanceStore:
         *,
         limit: int | None,
         content: bool,
+        order_by: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         columns = [
             "chunk_id",
@@ -423,6 +510,10 @@ class LanceStore:
         if content:
             columns.append("content")
         query = table.search().where(condition).select(columns)
+        if order_by is not None:
+            # A stable scan order makes a truncated result set deterministic
+            # rather than dependent on physical row layout.
+            query = query.order_by([ColumnOrdering(column_name=name) for name in order_by])
         if limit is not None:
             query = query.limit(limit)
         return cast(list[dict[str, Any]], query.to_list())

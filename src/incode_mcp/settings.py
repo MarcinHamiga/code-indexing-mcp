@@ -57,6 +57,7 @@ def _boolean(environment: Mapping[str, str], name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class IndexSettings:
     mode: IndexMode
+    index_wait_seconds: int
     embedding_batch_size: int
     embedding_threads: int
     embedding_cpu_arena: bool
@@ -103,6 +104,12 @@ class IndexSettings:
 
         return cls(
             mode=mode,
+            # How long a startup index waits out a competing job before failing.
+            # The global index lock serializes every job on the machine, so a
+            # cold index elsewhere can hold it for minutes; 0 disables waiting.
+            index_wait_seconds=_integer(
+                environment, "INCODE_INDEX_WAIT_SECONDS", 300, 0, 24 * 60 * 60
+            ),
             embedding_batch_size=_integer(environment, "INCODE_EMBED_BATCH_SIZE", 1, 1, 32),
             embedding_threads=_integer(
                 environment,

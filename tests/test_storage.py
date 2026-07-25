@@ -5,8 +5,22 @@ from pathlib import Path
 
 import lancedb
 
+from incode_mcp.models import StoredChunk, StoredFile
 from incode_mcp.projects import initialize_project
 from incode_mcp.storage import LanceStore
+
+
+def stored_file(project_id: str, *, file_id: str = "file-1") -> StoredFile:
+    return StoredFile(
+        file_id=file_id,
+        project_id=project_id,
+        path="module.py",
+        language="python",
+        size=4,
+        mtime_ns=1,
+        content_hash="hash",
+        indexed_at=time.time_ns(),
+    )
 
 
 def test_storage_uses_one_partition_per_project(tmp_path: Path) -> None:
@@ -16,11 +30,29 @@ def test_storage_uses_one_partition_per_project(tmp_path: Path) -> None:
     project = initialize_project(root)
 
     store.upsert_project(project, model_id="test/model", state="pending")
-    store.list_files(project.id)
+    store.upsert_file(stored_file(project.id))
 
     assert (store.directory / "registry" / "projects.lance").exists()
     assert (store.directory / "projects" / project.id / "files.lance").exists()
     assert (store.directory / "projects" / project.id / "chunks.lance").exists()
+
+
+def test_reads_never_materialize_a_partition(tmp_path: Path) -> None:
+    """get_chunk scans every project; a registered-but-unindexed one stays empty."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model", state="pending")
+
+    assert store.get_chunk("no-such-chunk") is None
+    assert store.list_files(project.id) == []
+    assert store.list_chunks([project.id]) == []
+    assert store.count_chunks([project.id]) == 0
+    assert store.outline_chunks("module.py", project.id) == []
+    assert store.find_symbol_chunks("answer", project.id, match="exact", kinds=None, limit=5) == []
+
+    assert not (store.directory / "projects").exists()
 
 
 def test_v1_store_is_backed_up_and_registered_for_lazy_rebuild(tmp_path: Path) -> None:
@@ -54,3 +86,55 @@ def test_v1_store_is_backed_up_and_registered_for_lazy_rebuild(tmp_path: Path) -
     assert store.list_projects() == [project]
     assert store.project_state(project.id) == "pending"
     assert list(tmp_path.glob("lancedb-v1-backup-*"))
+
+
+def test_compaction_keeps_recent_versions_readable(tmp_path: Path) -> None:
+    """Concurrent readers must survive the maintenance pass after deletions."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    chunks = [
+        StoredChunk(
+            chunk_id=f"chunk-{index}",
+            project_id=project.id,
+            file_id="file-1",
+            path="module.py",
+            language="python",
+            kind="function",
+            symbol=f"symbol_{index}",
+            qualified_symbol=f"symbol_{index}",
+            parent_symbol=None,
+            start_byte=0,
+            end_byte=1,
+            start_line=index + 1,
+            end_line=index + 1,
+            content="pass",
+            embedding_text="pass",
+            search_text="pass",
+            content_hash="hash",
+            part_index=0,
+            vector=[0.0, 0.0, 0.0, 1.0],
+        )
+        for index in range(4)
+    ]
+    record = StoredFile(
+        file_id="file-1",
+        project_id=project.id,
+        path="module.py",
+        language="python",
+        size=4,
+        mtime_ns=1,
+        content_hash="hash",
+        indexed_at=time.time_ns(),
+    )
+    store.replace_file(record, chunks)
+    store.ensure_indexes(project.id)
+
+    store.remove_file(project.id, "file-1")
+    store.ensure_indexes(project.id, compact=True)
+
+    # A version reaped mid-read would surface here as a Lance IO failure.
+    assert store.count_chunks([project.id]) == 0
+    assert store.list_files(project.id) == []

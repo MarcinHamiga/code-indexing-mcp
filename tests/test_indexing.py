@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -87,6 +88,36 @@ def test_indexer_skips_unchanged_and_metadata_only_files(tmp_path: Path) -> None
     assert metadata_only.parsed_files == 0
     assert len(embedder.passage_batches) == 1
     assert len(store.list_files(project.id)) == 1
+
+
+def test_index_report_splits_duration_into_phases(tmp_path: Path) -> None:
+    """Embedding cost must be separable from scan/parse/commit cost in the report."""
+
+    class SlowEmbedder(RecordingEmbedder):
+        def embed_passages(self, texts: list[str]) -> list[list[float]]:
+            time.sleep(0.05)
+            return super().embed_passages(texts)
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    indexer, _ = make_indexer(tmp_path, SlowEmbedder())
+
+    report = indexer.index(project)
+
+    assert report.embed_duration_ms is not None
+    assert report.embed_duration_ms >= 45
+    phases = [
+        report.scan_duration_ms,
+        report.parse_duration_ms,
+        report.embed_duration_ms,
+        report.commit_duration_ms,
+    ]
+    assert all(phase is not None and phase >= 0 for phase in phases)
+    # The phases partition the indexing work, so together they cannot exceed the
+    # total, which also covers lock acquisition and project bookkeeping.
+    assert sum(phase or 0 for phase in phases) <= report.duration_ms
 
 
 def test_indexer_replaces_changed_files_and_removes_deleted_files(tmp_path: Path) -> None:
@@ -251,3 +282,46 @@ def test_store_keeps_projects_isolated_and_removal_does_not_touch_markers(
     assert {project.id for project in store.list_projects()} == {projects[1].id}
     assert {chunk.project_id for chunk in store.list_chunks()} == {projects[1].id}
     assert (projects[0].root / ".ci-mcp" / "project.toml").exists()
+
+
+class ResourceLimitEmbedder(RecordingEmbedder):
+    """Trips the memory ceiling on the second file, as a busy machine would."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.files_seen = 0
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        self.files_seen += 1
+        if self.files_seen == 2:
+            raise IncodeError(
+                ErrorCode.INDEX_RESOURCE_LIMIT, "Indexing exceeded its memory ceiling"
+            )
+        return super().embed_passages(texts)
+
+
+def test_resource_limit_aborts_instead_of_poisoning_the_file_record(tmp_path: Path) -> None:
+    """A transient ceiling trip must not mark the file as up to date."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("value = 1\n")
+    (root / "b.py").write_text("value = 2\n")
+    project = initialize_project(root)
+    embedder = ResourceLimitEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+
+    with pytest.raises(IncodeError) as caught:
+        indexer.index(project)
+
+    assert caught.value.code is ErrorCode.INDEX_RESOURCE_LIMIT
+    # The file that failed was never recorded, so a later run retries it rather
+    # than skipping it as unchanged forever.
+    recorded = {record.path for record in store.list_files(project.id)}
+    assert len(recorded) < 2
+
+    healthy, _ = make_indexer(tmp_path, RecordingEmbedder())
+    report = healthy.index(project)
+
+    assert report.errors == []
+    assert len(store.list_files(project.id)) == 2
+    assert store.project_state(project.id) == "ready"

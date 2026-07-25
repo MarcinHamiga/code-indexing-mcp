@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -39,16 +40,64 @@ PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 16 * 1024**2
 
 
-def daemon_endpoint(paths: RuntimePaths) -> Path:
-    """Return a short, per-user socket path (macOS limits AF_UNIX paths)."""
-    identity = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
-    temporary_root = (
-        Path("/private/tmp") if Path("/private/tmp").is_dir() else Path(tempfile.gettempdir())
-    )
-    directory = temporary_root / f"incode-{identity}"
+def daemon_supported() -> bool:
+    """Return whether this platform exposes Unix domain sockets."""
+    return hasattr(socket, "AF_UNIX")
+
+
+def require_daemon_support() -> None:
+    if not daemon_supported():
+        raise IncodeError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "The shared indexing daemon requires Unix domain sockets, which are "
+            "unavailable on this platform; set INCODE_BROKER=off or run "
+            "'code-indexing-mcp serve --direct'",
+            platform=sys.platform,
+        )
+
+
+def _local_socket() -> socket.socket:
+    require_daemon_support()
+    return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+
+def _private_directory(directory: Path) -> Path:
+    """Create *directory* as a user-private directory, refusing hostile paths.
+
+    The endpoint may live under a shared temporary root, so an existing entry is
+    only trusted when it is a real directory (not a symlink) owned by this user.
+    """
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if os.name != "nt":
-        directory.chmod(0o700)
+    if os.name == "nt":
+        return directory
+    info = os.lstat(directory)
+    if not stat.S_ISDIR(info.st_mode):
+        raise IncodeError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "The daemon runtime path is not a directory",
+            path=str(directory),
+        )
+    if info.st_uid != os.getuid():
+        raise IncodeError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "The daemon runtime directory is not owned by the current user",
+            path=str(directory),
+            owner_uid=info.st_uid,
+        )
+    if info.st_mode & 0o077:
+        os.chmod(directory, 0o700)
+    return directory
+
+
+def daemon_endpoint(paths: RuntimePaths) -> Path:
+    """Return a short, per-user socket path (macOS limits AF_UNIX paths to ~104 bytes)."""
+    identity = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
+    # XDG_RUNTIME_DIR is already per-user and mode 0700. Otherwise fall back to
+    # the platform temporary directory, which is per-user on macOS and Windows
+    # and validated by _private_directory everywhere.
+    runtime_root = os.environ.get("XDG_RUNTIME_DIR")
+    root = Path(runtime_root) if runtime_root else Path(tempfile.gettempdir())
+    directory = _private_directory(root / f"incode-{identity}")
     digest = sha256(str(paths.data.resolve()).encode()).hexdigest()[:16]
     return directory / f"{digest}.sock"
 
@@ -69,7 +118,7 @@ def send_frame(connection: socket.socket, payload: Mapping[str, Any]) -> None:
     encoded = json.dumps(payload, separators=(",", ":")).encode()
     if len(encoded) > MAX_FRAME_BYTES:
         raise IncodeError(
-            ErrorCode.INVALID_FILTER,
+            ErrorCode.PROTOCOL_ERROR,
             "Local daemon request exceeds the maximum frame size",
             maximum_bytes=MAX_FRAME_BYTES,
         )
@@ -80,7 +129,7 @@ def receive_frame(connection: socket.socket) -> dict[str, Any]:
     size = struct.unpack("!I", _receive_exact(connection, 4))[0]
     if size > MAX_FRAME_BYTES:
         raise IncodeError(
-            ErrorCode.INVALID_FILTER,
+            ErrorCode.PROTOCOL_ERROR,
             "Local daemon frame exceeds the maximum size",
             maximum_bytes=MAX_FRAME_BYTES,
         )
@@ -137,7 +186,7 @@ class DaemonServer:
         self._token = self._load_or_create_token()
         if self.endpoint.exists():
             self.endpoint.unlink()
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener = _local_socket()
         self._listener = listener
         try:
             listener.bind(str(self.endpoint))
@@ -161,12 +210,20 @@ class DaemonServer:
                 with self._activity_lock:
                     self._last_activity = time.monotonic()
                     self._active_requests += 1
-                threading.Thread(
-                    target=self._handle,
-                    args=(connection,),
-                    name="incode-daemon-request",
-                    daemon=True,
-                ).start()
+                try:
+                    threading.Thread(
+                        target=self._handle,
+                        args=(connection,),
+                        name="incode-daemon-request",
+                        daemon=True,
+                    ).start()
+                except BaseException:
+                    # A thread that never started will never run _handle's
+                    # finally block, so release the request slot here.
+                    with self._activity_lock:
+                        self._active_requests -= 1
+                    connection.close()
+                    raise
         finally:
             listener.close()
             self._listener = None
@@ -212,7 +269,7 @@ class DaemonServer:
                     {
                         "id": request_id,
                         "error": {
-                            "code": ErrorCode.EMBEDDING_WORKER_FAILED.value,
+                            "code": ErrorCode.PROTOCOL_ERROR.value,
                             "message": f"{type(exc).__name__}: {exc}",
                             "details": {},
                         },
@@ -256,15 +313,20 @@ class DaemonServer:
             return app.file_outline(roots=roots, **params)
         if method == "get_chunk":
             return app.get_chunk(**params)
-        raise IncodeError(ErrorCode.INVALID_FILTER, f"Unknown daemon method: {method}")
+        raise IncodeError(ErrorCode.PROTOCOL_ERROR, f"Unknown daemon method: {method}")
 
     def _load_or_create_token(self) -> str:
         if self.token_path.exists():
             return self.token_path.read_text().strip()
         token = secrets.token_hex(32)
-        self.token_path.write_text(token)
-        if os.name != "nt":
-            self.token_path.chmod(0o600)
+        # Create the file already restricted rather than widening a default-mode
+        # file afterwards, which would leave the token briefly world-readable.
+        try:
+            descriptor = os.open(self.token_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return self.token_path.read_text().strip()
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(token)
         return token
 
 
@@ -284,7 +346,7 @@ class BrokerApplication:
 
     def _call(self, method: str, **params: Any) -> Any:
         token = self.token_path.read_text().strip()
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        with _local_socket() as connection:
             connection.settimeout(5)
             connection.connect(str(self.endpoint))
             connection.settimeout(None)
@@ -304,7 +366,7 @@ class BrokerApplication:
             try:
                 code = ErrorCode(error["code"])
             except ValueError:
-                code = ErrorCode.EMBEDDING_WORKER_FAILED
+                code = ErrorCode.PROTOCOL_ERROR
             raise IncodeError(code, str(error["message"]), **error.get("details", {}))
         return response.get("result")
 
@@ -407,35 +469,42 @@ class BrokerApplication:
 def daemon_status(paths: RuntimePaths) -> dict[str, Any]:
     try:
         return {"running": True, **BrokerApplication(paths).ping()}
-    except (OSError, IncodeError, FileNotFoundError):
+    except (OSError, IncodeError):
         return {"running": False}
 
 
 def ensure_daemon(paths: RuntimePaths, *, timeout_seconds: float = 10) -> BrokerApplication:
+    require_daemon_support()
     status = daemon_status(paths)
     if status["running"]:
         return BrokerApplication(paths)
     paths.data.mkdir(parents=True, exist_ok=True)
     (paths.data / "locks").mkdir(parents=True, exist_ok=True)
+    log_path = paths.data / "daemon.log"
     with FileLock(paths.data / "locks" / "daemon-start.lock"):
         if daemon_status(paths)["running"]:
             return BrokerApplication(paths)
-        subprocess.Popen(
-            [sys.executable, "-m", "incode_mcp.cli", "daemon", "run"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        # Keep the child's stderr: a daemon that dies during startup is otherwise
+        # indistinguishable from a slow one, and surfaces only as a timeout.
+        with log_path.open("a") as log:
+            subprocess.Popen(
+                [sys.executable, "-m", "incode_mcp.cli", "daemon", "run"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=log,
+                start_new_session=True,
+            )
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             broker = BrokerApplication(paths)
             try:
                 broker.ping()
                 return broker
-            except (OSError, IncodeError, FileNotFoundError):
+            except (OSError, IncodeError):
                 time.sleep(0.05)
     raise IncodeError(
-        ErrorCode.EMBEDDING_WORKER_FAILED,
-        "Timed out starting the local indexing daemon",
+        ErrorCode.DAEMON_UNAVAILABLE,
+        f"Timed out starting the local indexing daemon; see {log_path}",
+        log_path=str(log_path),
+        timeout_seconds=timeout_seconds,
     )

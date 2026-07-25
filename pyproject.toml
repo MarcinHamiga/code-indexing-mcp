@@ -46,7 +46,11 @@ packages = ["src/incode_mcp"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
-markers = ["model: downloads and exercises the real embedding model"]
+pythonpath = ["scripts"]
+markers = [
+    "model: downloads and exercises the real embedding model",
+    "memory: runs the real-model indexing memory gate",
+]
 
 [tool.ruff]
 line-length = 100

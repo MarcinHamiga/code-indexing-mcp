@@ -2,6 +2,33 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
+## Errata (2026-07-25)
+
+Measurements taken while preparing `docs/plans/2026-07-25-post-review-hardening.md` contradict
+parts of this plan. It remains the post-merge roadmap; read these corrections first.
+
+- **Task 2's stated premise is wrong, but the task matters more than first thought.** It specifies
+  1,024-token windows to avoid overrunning the model. Measured: `jina-embeddings-v2-base-code` has
+  `model_max_length = 8192`, the tokenizer truncates at 8192, and 4,096 characters of ordinary code
+  is **963 tokens**. There is no silent truncation today. However, a minified single-line file near
+  the 1 MiB scan cap packs far more tokens into the same 4,096 characters, and the resulting
+  sequence drove the embedding worker past every ceiling measured (2,048 / 3,072 / 4,096 MiB, batch
+  sizes 1 and 4), aborting the run with `INDEX_RESOURCE_LIMIT`. Character-based windows bound
+  characters, not the token count that drives memory — so Task 2 is a correctness fix for that
+  shape, not only a boundary-quality improvement. `tests/test_memory_acceptance.py::
+  test_a_minified_file_stays_within_its_ceiling` pins this as a strict xfail and will fail loudly
+  once Tasks 2–3 land.
+- **Task 3's retry design has no effect at the shipped default.** It specifies a `4 → 2 → 1`
+  microbatch backoff, but `INCODE_EMBED_BATCH_SIZE` defaulted to 1, so there was nothing to halve.
+  Retry only becomes meaningful once the default is raised, which the 07-25 plan's Task 3 does.
+- **Task 3 Step 3's duration fields are done.** The scan/parse/embed/commit durations were
+  implemented as part of the 07-25 plan's Task 3; the remaining Step 3 telemetry (retry counts,
+  token/segment counts, termination reason) is still open.
+- **Task 1's benchmark corpus is under-specified.** Deterministic Python files at varying counts do
+  not exercise the memory peak, which tracks the largest *single* file. Task 1 was implemented with
+  the corpus extended per the 07-25 plan's Task 5: a file just under `max_file_bytes`, a
+  single-line minified file near the cap, and a long blank run adjacent to an oversized line.
+
 **Goal:** Complete the bounded-memory, migration-safety, daemon-hardening, and release-validation work that remains after PR #4.
 
 **Architecture:** Keep PR #4's lazy indexing, per-project storage, global lock, spawned embedding worker, and daemon facade. Add token-aware chunk planning inside the worker, packed Arrow staging with recoverable Lance version journals, a read-only legacy fallback during migration, and a daemon-owned coalescing scheduler. Finish with cross-platform IPC, installer draining, and reproducible real-model memory gates.

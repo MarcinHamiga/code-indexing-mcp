@@ -122,9 +122,24 @@ non-ignored source file and contains `.git`, `pyproject.toml`, `setup.py`, `setu
 `package.json`, `tsconfig.json`, or `jsconfig.json`. The server creates the usual local
 `.ci-mcp/project.toml` marker only after that check passes.
 
-Set `INCODE_INDEX_MODE=eager` to refresh when tools are listed or
-`INCODE_INDEX_MODE=manual` for explicit-only indexing. The legacy `INCODE_AUTO_INDEX` flag remains
-supported. Clients that do not provide filesystem roots keep the explicit workflow.
+Because that first query waits for the refresh, it reports progress while the initial index builds
+so clients can tell a slow index from a stalled tool call. On a large repository the first query
+can still take a while; `INCODE_INDEX_MODE=eager` moves the refresh to tool listing instead, and
+`INCODE_INDEX_MODE=manual` restricts indexing to explicit `index_project` calls. The legacy
+`INCODE_AUTO_INDEX` flag remains supported. Clients that do not provide filesystem roots keep the
+explicit workflow.
+
+Two things can make an automatic refresh wait: another root queued ahead of it in the same session,
+and another process holding the global index lock. One budget covers both. The refresh retries with
+exponential backoff for up to five minutes, then fails the waiting query with `INDEX_BUSY` rather
+than blocking indefinitely:
+
+```bash
+export INCODE_INDEX_WAIT_SECONDS=300
+```
+
+Set it to `0` to fail immediately whenever anything else is already indexing, or raise it when a
+single cold index legitimately takes longer than the default.
 
 Incremental refreshes:
 
@@ -176,6 +191,50 @@ export INCODE_EMBED_CPU_ARENA=0
 export INCODE_VECTOR_INDEX=exact
 ```
 
+The ceiling covers indexing memory: the embedding worker plus any growth in the host process while
+indexing runs. Memory the host already held when the worker started — the daemon's query model and
+open Lance datasets — is not charged to the budget, so a warm daemon can still index. `IndexReport`
+reports both the budget and the true combined peak, plus a scan/parse/embed/commit duration split.
+
+### Measured throughput
+
+`INCODE_EMBED_BATCH_SIZE` stays at 1. Measured with
+`scripts/benchmark_index_memory.py` on Apple Silicon macOS against a 1.0 MiB, 6,330-chunk
+dense-Python corpus at `INCODE_INDEX_MEMORY_MB=2048`:
+
+| `INCODE_EMBED_BATCH_SIZE` | Wall clock | Chunks/s | Peak worker RSS |
+| ------------------------- | ---------- | -------- | --------------- |
+| 1 (default)               | 147.0 s    | 44.8     | 1,415 MiB       |
+| 2                         | 136.2 s    | 48.7     | 1,419 MiB       |
+| 4                         | 130.4 s    | 50.9     | 1,427 MiB       |
+| 8                         | 126.7 s    | 52.5     | 1,451 MiB       |
+
+Batch size 8 buys 17% throughput for 36 MiB more resident memory — not enough to justify spending
+headroom that the worst-case file shape already needs. Embedding dominates: 141 s of the 147 s at
+batch size 1. Plan for roughly **45 chunks per second**, and remember that in the default lazy mode
+the first `search_code` call waits for that work. On a large repository prefer
+`INCODE_INDEX_MODE=eager` (index during tool listing) or `INCODE_INDEX_MODE=manual` with an
+explicit `code-indexing-mcp index`, so no query blocks on a cold index.
+
+### Known limit: single-line files
+
+A single-line source file near the 1 MiB scan cap — a bundled or minified artifact — drives the
+embedding worker past its ceiling and aborts the run with `INDEX_RESOURCE_LIMIT`. Raising
+`INCODE_INDEX_MEMORY_MB` does not help: measured at 2048, 3072, and 4096 MiB, the worker grows to
+exceed each one. Until chunk planning becomes tokenizer-aware, exclude such files in
+`.ci-mcp/project.toml`:
+
+```toml
+[scan]
+exclude = ["**/*.min.js", "**/*.bundle.js", "**/generated/**"]
+```
+
+A file that cannot be parsed or embedded is recorded as a per-file issue and skipped until it
+changes. Environment failures — `MODEL_UNAVAILABLE`, `INDEX_RESOURCE_LIMIT`, and
+`EMBEDDING_WORKER_FAILED` — are not attributable to a file, so they abort the run and surface to
+the caller instead of silently leaving that file permanently unindexed. That is why one oversized
+single-line file stops the whole run rather than being skipped.
+
 `INCODE_INDEX_EXECUTION=in-process` is a temporary diagnostic rollback. It does not enforce the
 worker ceiling. `INCODE_VECTOR_INDEX=hnsw` opts into approximate vector indexing; exact search is
 the safer default.
@@ -190,6 +249,14 @@ uv run code-indexing-mcp daemon stop
 
 Set `INCODE_BROKER=off` or run `serve --direct` to bypass it. The daemon authenticates over a
 current-user-only local socket, starts under leader election, and exits after five idle minutes.
+The socket lives under `XDG_RUNTIME_DIR` when set and the platform temporary directory otherwise;
+the containing directory must be a real directory owned by the current user, or startup fails
+rather than binding somewhere another user controls. Startup output goes to `daemon.log` in the
+data directory.
+
+The daemon needs Unix domain sockets. Where they are unavailable — currently Windows — the default
+`INCODE_BROKER=auto` serves directly and logs a warning; an explicit `INCODE_BROKER=on` fails with
+`INVALID_CONFIGURATION` instead of being silently downgraded.
 
 Storage schema v2 keeps a registry plus one LanceDB partition per project. On first upgrade from
 v1, the old global store is moved to a timestamped `lancedb-v1-backup-*` directory and projects are

@@ -42,6 +42,19 @@ def effective_memory_ceiling(*, configured_bytes: int, available_bytes: int) -> 
     return min(configured_bytes, max(0, available_bytes - SYSTEM_RESERVE_BYTES))
 
 
+def indexing_memory_bytes(
+    *, parent_bytes: int, worker_bytes: int, parent_baseline_bytes: int
+) -> int:
+    """Return the memory attributable to indexing.
+
+    The parent may already hold a query model and open Lance datasets before any
+    indexing starts, and charging that resident footprint to the indexing budget
+    would trip the ceiling before the first batch runs. Only the worker plus
+    parent growth since the worker started counts.
+    """
+    return worker_bytes + max(0, parent_bytes - parent_baseline_bytes)
+
+
 def _worker_main(connection: Connection, config: WorkerConfig) -> None:
     try:
         Path(config.cache_directory).mkdir(parents=True, exist_ok=True)
@@ -101,6 +114,11 @@ class EmbeddingWorkerSession:
         self._process: BaseProcess | None = None
         self._connection: Connection | None = None
         self.peak_combined_rss = 0
+        # RSS the parent already held before the worker existed. The daemon keeps
+        # a query model resident in-process, and charging that to the indexing
+        # budget would trip the ceiling before any indexing work happens. Only
+        # parent growth during indexing counts against the budget.
+        self._parent_baseline_bytes = 0
 
     @property
     def pid(self) -> int | None:
@@ -130,16 +148,28 @@ class EmbeddingWorkerSession:
                     ErrorCode.EMBEDDING_WORKER_FAILED,
                     "Embedding worker exited without returning a result",
                 )
-            rss = self._combined_rss()
-            self.peak_combined_rss = max(self.peak_combined_rss, rss)
-            consecutive_over = consecutive_over + 1 if rss > self.effective_ceiling_bytes else 0
-            if rss > self.effective_ceiling_bytes + HARD_OVERSHOOT_BYTES or consecutive_over >= 5:
+            parent_rss, worker_rss = self._sample_rss()
+            self.peak_combined_rss = max(self.peak_combined_rss, parent_rss + worker_rss)
+            budgeted = indexing_memory_bytes(
+                parent_bytes=parent_rss,
+                worker_bytes=worker_rss,
+                parent_baseline_bytes=self._parent_baseline_bytes,
+            )
+            consecutive_over = (
+                consecutive_over + 1 if budgeted > self.effective_ceiling_bytes else 0
+            )
+            if (
+                budgeted > self.effective_ceiling_bytes + HARD_OVERSHOOT_BYTES
+                or consecutive_over >= 5
+            ):
                 self._terminate()
                 raise IncodeError(
                     ErrorCode.INDEX_RESOURCE_LIMIT,
                     "Indexing exceeded its memory ceiling",
                     effective_memory_bytes=self.effective_ceiling_bytes,
+                    indexing_memory_bytes=budgeted,
                     peak_memory_bytes=self.peak_combined_rss,
+                    parent_baseline_bytes=self._parent_baseline_bytes,
                 )
         try:
             status, payload = self._connection.recv()
@@ -179,6 +209,7 @@ class EmbeddingWorkerSession:
     def _start(self) -> None:
         if self._process is not None:
             return
+        self._parent_baseline_bytes = psutil.Process().memory_info().rss
         context = mp.get_context("spawn")
         parent, child = context.Pipe()
         process = context.Process(
@@ -192,14 +223,15 @@ class EmbeddingWorkerSession:
         self._process = process
         self._connection = parent
 
-    def _combined_rss(self) -> int:
+    def _sample_rss(self) -> tuple[int, int]:
+        """Return the current (parent, worker) resident set sizes in bytes."""
         assert self._process is not None
         parent_rss = psutil.Process().memory_info().rss
         try:
             worker_rss = psutil.Process(self._process.pid).memory_info().rss
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             worker_rss = 0
-        return int(parent_rss + worker_rss)
+        return int(parent_rss), int(worker_rss)
 
     def _terminate(self) -> None:
         assert self._process is not None

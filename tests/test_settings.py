@@ -17,6 +17,18 @@ def test_indexing_defaults_to_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.embedding_threads >= 1
     assert settings.embedding_cpu_arena is False
     assert settings.vector_index == "exact"
+    assert settings.index_wait_seconds == 300
+
+
+def test_index_wait_seconds_is_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "0")
+    assert IndexSettings.from_environment().index_wait_seconds == 0
+
+    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "-1")
+    with pytest.raises(IncodeError) as caught:
+        IndexSettings.from_environment()
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
 
 
 @pytest.mark.parametrize(
