@@ -770,11 +770,9 @@ def _link_skill(source: Path, target: Path) -> bool:
     Returns True when a new link was created, False when it already existed.
     """
 
-    if target.is_symlink():
-        if Path(os.readlink(target)) == source:
-            return False
-        target.unlink()
-    elif target.exists():
+    if target.is_symlink() and Path(os.readlink(target)) == source:
+        return False
+    if target.is_symlink() or target.exists():
         backup = target.with_name(f"{target.name}.bak")
         if backup.is_symlink() or backup.is_file():
             backup.unlink()

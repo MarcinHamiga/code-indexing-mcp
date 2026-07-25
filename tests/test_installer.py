@@ -806,6 +806,25 @@ def test_install_skills_backs_up_clashing_directory(tmp_path: Path) -> None:
     assert (backup / "SKILL.md").read_text(encoding="utf-8") == "old"
 
 
+def test_install_skills_backs_up_clashing_symlink(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path)
+    elsewhere = tmp_path / "dotfiles" / "alpha"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "SKILL.md").write_text("mine", encoding="utf-8")
+    skills_dir = tmp_path / ".agents" / "skills"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "alpha").symlink_to(elsewhere, target_is_directory=True)
+
+    installer.install_skills(["kimi-code"], repo, home=tmp_path, environment={})
+
+    link = skills_dir / "alpha"
+    assert link.is_symlink()
+    assert link.resolve() == (repo / "src" / "incode_mcp" / "skills" / "alpha").resolve()
+    backup = skills_dir / "alpha.bak"
+    assert backup.is_symlink()
+    assert backup.resolve() == elsewhere.resolve()
+
+
 def test_install_skills_skips_unsupported_harness(tmp_path: Path) -> None:
     repo = _skills_source(tmp_path)
 
