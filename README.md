@@ -250,6 +250,12 @@ When a batch does trip the ceiling, the worker is replaced and the batch retried
 microbatch size (4 → 2 → 1) before the error surfaces. Window boundaries come only from the
 tokenization, so a retry re-derives identical chunks.
 
+Extraction is linear in file size and in definition count. Each Tree-sitter query is compiled once
+per language per process, and the definition and newline indexes are built once per file. A
+definition-dense generated file near the 1 MiB scan cap — 699 KB, 16,384 definitions — extracts in
+well under a second; earlier releases took roughly 31 seconds on the same shape because those
+indexes were rebuilt per definition.
+
 ### Measured throughput
 
 `INCODE_EMBED_BATCH_SIZE` stays at 1. Measured with

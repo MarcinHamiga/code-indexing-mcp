@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib.resources import files
@@ -76,6 +76,29 @@ class _DefinitionIndex:
         )
 
 
+class _LineIndex:
+    """Byte offsets of every newline in one file, for O(log n) line lookups.
+
+    ``source[:start].count(b"\\n")`` is O(file size) per chunk, so computing a start
+    line per chunk was O(chunks x file size). ``bytes.find`` scans at C speed, so
+    building this costs one pass and one append per line.
+    """
+
+    __slots__ = ("_newlines",)
+
+    def __init__(self, source: bytes) -> None:
+        newlines: list[int] = []
+        position = source.find(b"\n")
+        while position != -1:
+            newlines.append(position)
+            position = source.find(b"\n", position + 1)
+        self._newlines = newlines
+
+    def line_at(self, byte_offset: int) -> int:
+        """Return the 1-based line number containing *byte_offset*."""
+        return bisect_left(self._newlines, byte_offset) + 1
+
+
 class TreeSitterExtractor:
     def __init__(
         self,
@@ -119,6 +142,7 @@ class TreeSitterExtractor:
         tree = Parser(language_impl).parse(normalized_source)
         definitions = self._definitions(language, tree.root_node, normalized_source)
         index = _DefinitionIndex.build(definitions)
+        line_index = _LineIndex(normalized_source)
         chunks: list[ExtractedChunk] = []
         covered: list[tuple[int, int]] = []
 
@@ -139,10 +163,11 @@ class TreeSitterExtractor:
                     source=normalized_source,
                     start=start,
                     end=end,
+                    line_index=line_index,
                 )
             )
 
-        chunks.extend(self._module_chunks(path, language, normalized_source, covered))
+        chunks.extend(self._module_chunks(path, language, normalized_source, covered, line_index))
         chunks.sort(key=lambda chunk: (chunk.start_byte, chunk.end_byte, chunk.kind))
         return ExtractionResult(chunks=chunks, has_errors=tree.root_node.has_error)
 
@@ -241,9 +266,10 @@ class TreeSitterExtractor:
         source: bytes,
         start: int,
         end: int,
+        line_index: _LineIndex,
     ) -> list[ExtractedChunk]:
         content = source[start:end].decode("utf-8").rstrip()
-        start_line = source[:start].count(b"\n") + 1
+        start_line = line_index.line_at(start)
         if len(content) <= self.max_chars and content.count("\n") + 1 <= self.max_lines:
             return [
                 self._make_chunk(
@@ -353,7 +379,12 @@ class TreeSitterExtractor:
             byte_offset += len(fragment.encode("utf-8"))
 
     def _module_chunks(
-        self, path: Path, language: str, source: bytes, covered: list[tuple[int, int]]
+        self,
+        path: Path,
+        language: str,
+        source: bytes,
+        covered: list[tuple[int, int]],
+        line_index: _LineIndex,
     ) -> list[ExtractedChunk]:
         chunks: list[ExtractedChunk] = []
         cursor = 0
@@ -370,6 +401,7 @@ class TreeSitterExtractor:
                         source=source,
                         start=cursor,
                         end=start,
+                        line_index=line_index,
                     )
                 )
             cursor = max(cursor, end)
@@ -385,6 +417,7 @@ class TreeSitterExtractor:
                     source=source,
                     start=cursor,
                     end=len(source),
+                    line_index=line_index,
                 )
             )
         return chunks
