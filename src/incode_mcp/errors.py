@@ -8,6 +8,7 @@ class ErrorCode(StrEnum):
     PROJECT_NOT_FOUND = "PROJECT_NOT_FOUND"
     AMBIGUOUS_PROJECT = "AMBIGUOUS_PROJECT"
     PROJECT_ID_CONFLICT = "PROJECT_ID_CONFLICT"
+    CHUNK_NOT_FOUND = "CHUNK_NOT_FOUND"
     MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
     INDEX_INCOMPATIBLE = "INDEX_INCOMPATIBLE"
     INDEX_BUSY = "INDEX_BUSY"
@@ -30,3 +31,15 @@ class IncodeError(RuntimeError):
 
     def __str__(self) -> str:
         return f"{self.code}: {super().__str__()}"
+
+    def for_client(self) -> str:
+        """Render code, message, and details as one line for an MCP tool error.
+
+        ``__str__`` deliberately omits details: it is embedded in ``IndexIssue``
+        messages and in daemon frames that already carry ``details`` as a
+        separate field, where appending them would duplicate the payload.
+        """
+        if not self.details:
+            return str(self)
+        rendered = "; ".join(f"{key}={value}" for key, value in self.details.items())
+        return f"{self} [{rendered}]"

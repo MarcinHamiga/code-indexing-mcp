@@ -110,6 +110,7 @@ class ProjectResolver:
         if explicit:
             return self._resolve_explicit(explicit)
 
+        roots = list(roots)
         marked = self._marked_projects(roots)
         if len(marked) == 1:
             return marked[0]
@@ -122,7 +123,12 @@ class ProjectResolver:
 
         if cwd is not None and (root := find_project_root(cwd)) is not None:
             return self._by_root_or_marker(root)
-        raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, "No active Incode project was detected")
+        raise IncodeError(
+            ErrorCode.PROJECT_NOT_FOUND,
+            "No active Incode project was detected; pass an explicit project id, name, or "
+            "path, or run init_project for this directory",
+            searched_roots=[str(root) for root in roots],
+        )
 
     def _resolve_explicit(self, explicit: str) -> ProjectInfo:
         direct = [

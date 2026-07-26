@@ -120,7 +120,12 @@ class SearchService:
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         chunk = self.store.get_chunk(chunk_id)
         if chunk is None:
-            raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown chunk: {chunk_id}")
+            raise IncodeError(
+                ErrorCode.CHUNK_NOT_FOUND,
+                f"Unknown chunk: {chunk_id}; chunk ids come from search_code or find_symbol "
+                "results and change when the file is re-indexed",
+                chunk_id=chunk_id,
+            )
         return CodeChunk.model_validate(chunk.model_dump())
 
     @staticmethod

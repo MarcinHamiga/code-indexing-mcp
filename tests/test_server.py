@@ -771,3 +771,26 @@ def test_server_instructions_guide_index_first_usage(tmp_path: Path) -> None:
         "index_project",
     ):
         assert tool in instructions
+
+
+def test_error_renders_code_message_and_details_for_clients() -> None:
+    error = IncodeError(
+        ErrorCode.INDEX_BUSY,
+        "Another indexing job is already active",
+        waited_seconds=3.5,
+        wait_timeout_seconds=300,
+    )
+
+    rendered = error.for_client()
+
+    assert rendered.startswith("INDEX_BUSY: Another indexing job is already active")
+    assert "waited_seconds=3.5" in rendered
+    assert "wait_timeout_seconds=300" in rendered
+    # __str__ stays detail-free: IndexIssue messages and daemon frames embed it.
+    assert str(error) == "INDEX_BUSY: Another indexing job is already active"
+
+
+def test_error_without_details_renders_as_plain_string() -> None:
+    error = IncodeError(ErrorCode.CHUNK_NOT_FOUND, "Unknown chunk: abc")
+
+    assert error.for_client() == "CHUNK_NOT_FOUND: Unknown chunk: abc"

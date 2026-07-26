@@ -337,5 +337,9 @@ class Application:
         else:
             project_ids = [self._resolve(None, roots).id]
         if not project_ids:
-            raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, "No indexed projects are available")
+            raise IncodeError(
+                ErrorCode.PROJECT_NOT_FOUND,
+                "No indexed projects are available; init_project registers one and "
+                "index_project builds its index",
+            )
         return project_ids
