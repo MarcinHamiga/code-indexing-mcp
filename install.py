@@ -782,12 +782,23 @@ def _backup_path(target: Path) -> Path:
     return candidate
 
 
+def _link_destination(link: Path) -> Path:
+    """Where a symlink points, in a form that compares reliably.
+
+    Raw os.readlink output is not comparable: Windows hands back an extended-length
+    "\\\\?\\C:\\..." path that never equals the plain path the link was created from,
+    which would make every re-install look like a first install.
+    """
+
+    return link.resolve()
+
+
 def _is_stale_bundled_link(target: Path) -> bool:
     """True when target is a link this installer left pointing at an older checkout."""
 
     if not target.is_symlink():
         return False
-    skills_dir = Path(os.readlink(target)).parent
+    skills_dir = _link_destination(target).parent
     return skills_dir.name == "skills" and skills_dir.parent.name == "incode_mcp"
 
 
@@ -797,7 +808,7 @@ def _link_skill(source: Path, target: Path) -> bool:
     Returns True when a new link was created, False when it already existed.
     """
 
-    if target.is_symlink() and Path(os.readlink(target)) == source:
+    if target.is_symlink() and _link_destination(target) == source.resolve():
         return False
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Build the replacement link before disturbing what is already there, so a

@@ -792,6 +792,25 @@ def test_install_skills_is_idempotent(tmp_path: Path) -> None:
     assert "already installed" in message
 
 
+def test_install_skills_is_idempotent_across_equivalent_source_paths(tmp_path: Path) -> None:
+    """The already-installed check must compare real paths, not raw link text.
+
+    Windows readlink returns an extended-length "\\\\?\\C:\\..." path that never
+    equals the plain path the link was made from; a symlinked parent directory
+    reproduces the same mismatch on POSIX.
+    """
+    repo = _skills_source(tmp_path, names=("alpha",))
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    installer.install_skills(["codex"], alias, home=tmp_path, environment={})
+
+    results = installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+
+    _slug, message = results[0]
+    assert "0 linked" in message
+    assert "1 already installed" in message
+
+
 def test_install_skills_backs_up_clashing_directory(tmp_path: Path) -> None:
     repo = _skills_source(tmp_path)
     clash = tmp_path / ".agents" / "skills" / "alpha"
