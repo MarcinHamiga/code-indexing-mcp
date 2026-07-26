@@ -189,6 +189,12 @@ Tools use the current MCP root or nearest `.ci-mcp/project.toml` by default. `se
 instead receive a list of project IDs/names/paths or set `all_projects=true`. Searching all
 projects is always explicit, preventing accidental context mixing.
 
+`search_code`'s `paths` argument takes glob patterns relative to the project root. Patterns match
+from the right, so `*.py` matches a Python file at any depth while `src/*` matches only direct
+children of `src`. A single `*` and `**` both span one path segment. Patterns are translated into
+the index scan itself, so a filtered search finds matches that rank below the unfiltered result
+window instead of returning an empty result.
+
 `remove_project` deletes only central index data. It never removes source files or the local
 `.ci-mcp` marker.
 
