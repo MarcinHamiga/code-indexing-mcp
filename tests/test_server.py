@@ -102,7 +102,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_server_starts_background_indexing_when_client_lists_tools(tmp_path: Path) -> None:
+async def test_default_server_defers_indexing_until_first_code_query(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
     (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
@@ -124,15 +124,16 @@ async def test_server_starts_background_indexing_when_client_lists_tools(tmp_pat
         tools = await client.list_tools()
 
         assert tools
+        assert not embedder.started.is_set()
+        assert not (root / ".ci-mcp").exists()
+
+        query = asyncio.create_task(client.call_tool("search_code", {"query": "answer"}))
         assert await asyncio.to_thread(embedder.started.wait, 1)
-        assert app.project_status(roots=[root]).state == "indexing"
-
+        assert not query.done()
         embedder.release.set()
-        for _ in range(100):
-            if app.project_status(roots=[root]).state == "ready":
-                break
-            await asyncio.sleep(0.05)
+        result = await query
 
+    assert not result.isError
     assert app.project_status(roots=[root]).state == "ready"
 
 
@@ -185,7 +186,7 @@ async def test_server_shutdown_waits_for_active_startup_index(tmp_path: Path) ->
         embedder=embedder,
         cwd=tmp_path,
     )
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
     entered = asyncio.Event()
     leave = asyncio.Event()
 
@@ -224,7 +225,7 @@ async def test_server_shutdown_cancels_startup_job_waiting_for_index_lock(
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
     project = app.init_project(root)
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
     attempted = threading.Event()
     original_index = app.indexer.index
 
@@ -268,7 +269,7 @@ async def test_code_query_waits_for_startup_index_to_finish(tmp_path: Path) -> N
         embedder=embedder,
         cwd=tmp_path,
     )
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
         return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
@@ -309,7 +310,7 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
     ready_project = app.init_project(ready_root)
     app.index_project(ready_project.id)
     embedder.block = True
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
         return types.ListRootsResult(roots=[types.Root(uri=startup_root.as_uri())])
@@ -351,7 +352,7 @@ async def test_explicit_code_query_ignores_unrelated_startup_failure(tmp_path: P
 
     embedder = FailingEmbedder()
     app = Application(paths, embedder=embedder, cwd=tmp_path)
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
         return types.ListRootsResult(roots=[types.Root(uri=failing_root.as_uri())])
@@ -491,7 +492,7 @@ async def test_discovery_is_not_blocked_by_concurrent_indexing(tmp_path: Path) -
         embedder=embedder,
         cwd=tmp_path,
     )
-    server = create_server(app)
+    server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
         return types.ListRootsResult(
@@ -533,6 +534,221 @@ async def test_discovery_is_not_blocked_by_concurrent_indexing(tmp_path: Path) -
         embedder.release.set()
 
     assert not result.isError
+
+
+@pytest.mark.asyncio
+async def test_first_query_reports_progress_while_the_initial_index_runs(
+    tmp_path: Path,
+) -> None:
+    """A blocking lazy index must look like work in progress, not a hung tool."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    embedder = BlockingEmbedder()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=embedder,
+        cwd=tmp_path,
+    )
+    server = create_server(app)
+    progress: list[str | None] = []
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async def on_progress(_: float, __: float | None, message: str | None) -> None:
+        progress.append(message)
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        query = asyncio.create_task(
+            client.call_tool("search_code", {"query": "answer"}, progress_callback=on_progress)
+        )
+        assert await asyncio.to_thread(embedder.started.wait, 5)
+        embedder.release.set()
+        result = await query
+
+    assert not result.isError
+    assert "Building the initial index" in progress
+
+
+@pytest.mark.asyncio
+async def test_first_query_fails_when_a_competing_index_holds_the_lock_past_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held global lock must surface INDEX_BUSY at the deadline, not hang."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "1")
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    lock_directory = paths.data / "locks"
+    lock_directory.mkdir(parents=True, exist_ok=True)
+    # A separate FileLock instance contends for the same file, which is exactly
+    # what a second process (or a second MCP client) does.
+    competing = FileLock(lock_directory / "index-global.lock")
+    with competing:
+        async with create_connected_server_and_client_session(
+            server, list_roots_callback=list_roots
+        ) as client:
+            result = await asyncio.wait_for(
+                client.call_tool("search_code", {"query": "answer"}), timeout=20
+            )
+
+    assert result.isError
+    message = "".join(
+        block.text for block in result.content if isinstance(block, types.TextContent)
+    )
+    assert ErrorCode.INDEX_BUSY.value in message
+
+
+@pytest.mark.asyncio
+async def test_a_second_root_gives_up_instead_of_queueing_behind_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wait budget covers queueing inside this process, not only the file lock.
+
+    One capacity limiter serializes roots in a session, so a second root waits
+    even though no other process holds the global lock. To a first query the two
+    are indistinguishable, so both count against INCODE_INDEX_WAIT_SECONDS.
+    """
+    root_a = tmp_path / "project_a"
+    root_a.mkdir()
+    (root_a / "pyproject.toml").write_text("[project]\nname = 'project-a'\n")
+    (root_a / "main.py").write_text("def a():\n    return 1\n")
+
+    root_b = tmp_path / "project_b"
+    root_b.mkdir()
+    (root_b / "pyproject.toml").write_text("[project]\nname = 'project-b'\n")
+    (root_b / "main.py").write_text("def b():\n    return 2\n")
+
+    embedder = BlockingEmbedder()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=embedder,
+        cwd=tmp_path,
+    )
+    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "0")
+    server = create_server(app, auto_index=True)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(
+            roots=[types.Root(uri=root_a.as_uri()), types.Root(uri=root_b.as_uri())]
+        )
+
+    try:
+        async with create_connected_server_and_client_session(
+            server, list_roots_callback=list_roots
+        ) as client:
+            await client.list_tools()
+            assert await asyncio.to_thread(embedder.started.wait, 5)
+
+            # Discovery writes the on-disk marker before it registers the
+            # project, so a root can resolve to an id the store does not know
+            # yet. Wait for both registrations before reading any state.
+            for _ in range(100):
+                if len(app.list_projects()) == 2:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                pytest.fail("expected both roots to be registered")
+
+            # Exactly one root won the limiter and is stuck on the embedder;
+            # target the other, which is the one that had to wait.
+            blocked = root_a if app.project_status(roots=[root_a]).state == "indexing" else root_b
+            waiting = root_b if blocked is root_a else root_a
+            waiting_id = app.project_status(roots=[waiting]).project.id
+
+            result = await asyncio.wait_for(
+                client.call_tool("search_code", {"query": "value", "projects": [waiting_id]}),
+                timeout=10,
+            )
+    finally:
+        embedder.release.set()
+
+    assert result.isError
+    message = "".join(
+        block.text for block in result.content if isinstance(block, types.TextContent)
+    )
+    assert ErrorCode.INDEX_BUSY.value in message
+
+
+@pytest.mark.asyncio
+async def test_first_query_succeeds_when_the_index_lock_frees_before_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "60")
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    lock_directory = paths.data / "locks"
+    lock_directory.mkdir(parents=True, exist_ok=True)
+    competing = FileLock(lock_directory / "index-global.lock")
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        competing.acquire()
+        try:
+            query = asyncio.create_task(client.call_tool("search_code", {"query": "answer"}))
+            await asyncio.sleep(0.3)
+            assert not query.done()
+        finally:
+            competing.release()
+        result = await asyncio.wait_for(query, timeout=20)
+
+    assert not result.isError
+    assert app.project_status(roots=[root]).state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_a_ready_project_does_not_report_indexing_progress(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    server = create_server(app)
+    progress: list[str | None] = []
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async def on_progress(_: float, __: float | None, message: str | None) -> None:
+        progress.append(message)
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.call_tool("search_code", {"query": "answer"})
+        progress.clear()
+        result = await client.call_tool(
+            "search_code", {"query": "answer"}, progress_callback=on_progress
+        )
+
+    assert not result.isError
+    assert progress == []
 
 
 def test_server_instructions_guide_index_first_usage(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 from pathspec import GitIgnoreSpec
@@ -89,14 +90,32 @@ class SourceScanner:
     def scan(
         self, project: ProjectInfo, known_files: dict[str, StoredFile] | None = None
     ) -> ScanResult:
+        files: list[ScannedFile] = []
+        skipped: list[SkippedFile] = []
+        for item in self.iter_scan(project, known_files):
+            if isinstance(item, ScannedFile):
+                # The collected result must not retain source bytes; only the
+                # streaming path may hold one file's content at a time.
+                files.append(item.model_copy(update={"content": None}))
+            else:
+                skipped.append(item)
+        return ScanResult(files=files, skipped=skipped)
+
+    def iter_scan(
+        self, project: ProjectInfo, known_files: dict[str, StoredFile] | None = None
+    ) -> Iterator[ScannedFile | SkippedFile]:
+        """Yield scan results one file at a time.
+
+        Changed files carry their source bytes so the caller never reads a
+        file twice; the bytes die with the yielded item, so at most one file's
+        source is live at any moment.
+        """
         root = project.root.resolve()
         known_files = known_files or {}
         config_excludes = GitIgnoreSpec.from_lines(project.scan.exclude)
         include_spec = GitIgnoreSpec.from_lines(project.scan.include)
         candidates, gitignores = self._walk(root)
         ignore_specs = self._load_ignore_specs(root, gitignores)
-        files: list[ScannedFile] = []
-        skipped: list[SkippedFile] = []
 
         for absolute in candidates:
             relative = absolute.relative_to(root)
@@ -109,15 +128,15 @@ class SourceScanner:
             )
             if language is None:
                 if skip_reason is not None:
-                    skipped.append(SkippedFile(path=relative, reason=skip_reason))
+                    yield SkippedFile(path=relative, reason=skip_reason)
                 continue
             try:
                 stat = absolute.stat()
                 if stat.st_size > project.scan.max_file_bytes:
-                    skipped.append(SkippedFile(path=relative, reason="oversized"))
+                    yield SkippedFile(path=relative, reason="oversized")
                     continue
             except OSError as exc:
-                skipped.append(SkippedFile(path=relative, reason="unreadable", detail=str(exc)))
+                yield SkippedFile(path=relative, reason="unreadable", detail=str(exc))
                 continue
             previous = known_files.get(relative.as_posix())
             content: bytes | None = None
@@ -129,27 +148,24 @@ class SourceScanner:
                 try:
                     content = absolute.read_bytes()
                 except OSError as exc:
-                    skipped.append(SkippedFile(path=relative, reason="unreadable", detail=str(exc)))
+                    yield SkippedFile(path=relative, reason="unreadable", detail=str(exc))
                     continue
                 if b"\x00" in content:
-                    skipped.append(SkippedFile(path=relative, reason="binary"))
+                    yield SkippedFile(path=relative, reason="binary")
                     continue
                 try:
                     content.decode("utf-8-sig")
                 except UnicodeDecodeError as exc:
-                    skipped.append(SkippedFile(path=relative, reason="encoding", detail=str(exc)))
+                    yield SkippedFile(path=relative, reason="encoding", detail=str(exc))
                     continue
-            files.append(
-                ScannedFile(
-                    path=relative,
-                    absolute_path=absolute,
-                    language=language,
-                    size=stat.st_size,
-                    mtime_ns=stat.st_mtime_ns,
-                    content=content,
-                )
+            yield ScannedFile(
+                path=relative,
+                absolute_path=absolute,
+                language=language,
+                size=stat.st_size,
+                mtime_ns=stat.st_mtime_ns,
+                content=content,
             )
-        return ScanResult(files=files, skipped=skipped)
 
     @staticmethod
     def _walk(root: Path) -> tuple[list[Path], list[Path]]:

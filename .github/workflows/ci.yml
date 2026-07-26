@@ -3,6 +3,11 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      corpus_scale:
+        description: Corpus scale for the real-model memory gate
+        default: "1"
 
 jobs:
   test:
@@ -18,8 +23,65 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
+      - id: sync
+        run: uv sync --all-groups --locked
+      - name: Test
+        run: uv run pytest
+      # Lint and type checks are independent of the tests, so a failing test
+      # must not hide them: a red run should report every problem at once
+      # rather than one per push. They still skip when the environment itself
+      # could not be built, where their output would only be noise.
+      - name: Lint
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff check .
+      - name: Format
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff format --check .
+      - name: Types
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run mypy src
+      - name: Types (scripts)
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run mypy scripts/benchmark_index_memory.py
+
+  # The real-model memory gate downloads ~640 MB and takes minutes, so it is
+  # manually dispatched rather than run on every push. Normal CI still checks
+  # the acceptance criteria through the pure evaluate_result tests above.
+  memory:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
       - run: uv sync --all-groups --locked
-      - run: uv run pytest
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run mypy src
+      - name: Restore the embedding model cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.model-cache
+          key: incode-model-jina-v2-base-code
+      - name: Populate the model cache
+        env:
+          INCODE_CACHE_DIR: ${{ github.workspace }}/.model-cache
+        run: uv run code-indexing-mcp model pull
+      - name: Run the memory gate
+        env:
+          INCODE_MODEL_TEST_CACHE: ${{ github.workspace }}/.model-cache
+        run: uv run pytest -q -m memory
+      - name: Benchmark at the dispatched corpus scale
+        if: always()
+        run: |
+          uv run python scripts/benchmark_index_memory.py \
+            --corpus-scale "${{ inputs.corpus_scale }}" \
+            --model-cache ${{ github.workspace }}/.model-cache \
+            --offline \
+            --output benchmark-memory.json
+      - name: Upload the benchmark document
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-index-memory
+          path: benchmark-memory.json
+          if-no-files-found: warn
