@@ -22,7 +22,14 @@ from lancedb.query import ColumnOrdering
 from lancedb.table import LanceTable
 
 from .errors import ErrorCode, IncodeError
-from .models import ChunkPreview, CodeChunk, ProjectInfo, StoredChunk, StoredFile
+from .models import (
+    ChunkPreview,
+    CodeChunk,
+    IndexedChunk,
+    ProjectInfo,
+    StoredChunk,
+    StoredFile,
+)
 from .projects import existing_marker_path
 
 logger = logging.getLogger(__name__)
@@ -59,6 +66,29 @@ CHUNK_PAYLOAD_COLUMNS = [
     "start_line",
     "end_line",
     "content",
+    "content_hash",
+    "part_index",
+]
+
+# Every chunk column except the vector. list_chunks has no production caller and its
+# test callers read text and offsets, so decoding vectors was pure waste.
+INDEXED_CHUNK_COLUMNS = [
+    "chunk_id",
+    "file_id",
+    "project_id",
+    "path",
+    "language",
+    "kind",
+    "symbol",
+    "qualified_symbol",
+    "parent_symbol",
+    "start_byte",
+    "end_byte",
+    "start_line",
+    "end_line",
+    "content",
+    "embedding_text",
+    "search_text",
     "content_hash",
     "part_index",
 ]
@@ -286,14 +316,18 @@ class LanceStore:
             tables.chunks.delete(condition)
             tables.files.delete(condition)
 
-    def list_chunks(self, project_ids: Iterable[str] | None = None) -> list[StoredChunk]:
+    def list_chunks(self, project_ids: Iterable[str] | None = None) -> list[IndexedChunk]:
         ids = list(project_ids or [project.id for project in self.list_projects()])
-        chunks: list[StoredChunk] = []
+        chunks: list[IndexedChunk] = []
         for project_id in ids:
             tables = self._existing_tables(project_id)
             if tables is None:
                 continue
-            chunks.extend(StoredChunk.model_validate(row) for row in self._rows(tables.chunks))
+            rows = cast(
+                list[dict[str, Any]],
+                tables.chunks.search().select(INDEXED_CHUNK_COLUMNS).to_list(),
+            )
+            chunks.extend(IndexedChunk.model_validate(row) for row in rows)
         return chunks
 
     def get_chunk(self, chunk_id: str) -> CodeChunk | None:

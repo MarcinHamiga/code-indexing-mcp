@@ -234,3 +234,32 @@ def test_evicted_partition_reopens_with_its_data(tmp_path: Path) -> None:
     assert project not in store._partitions
     assert store.count_chunks([project]) == 1
     assert store.get_chunk(chunk_id) is not None
+
+
+def test_list_chunks_does_not_materialize_vectors(tmp_path: Path) -> None:
+    """Nothing in production calls list_chunks; the vectors were read for no one."""
+    from incode_mcp.models import IndexedChunk
+
+    store, project, _ = _store_with_one_chunk(tmp_path)
+
+    chunks = store.list_chunks([project])
+
+    assert chunks
+    assert all(isinstance(chunk, IndexedChunk) for chunk in chunks)
+    assert not any(hasattr(chunk, "vector") for chunk in chunks)
+    # The fields the tests actually read must survive the projection.
+    assert chunks[0].search_text
+    assert chunks[0].content
+    assert chunks[0].chunk_id
+
+
+def test_stored_chunk_still_carries_its_vector(tmp_path: Path) -> None:
+    """The write path is unaffected: StoredChunk keeps the vector it commits."""
+    from incode_mcp.models import IndexedChunk, StoredChunk
+
+    assert issubclass(StoredChunk, IndexedChunk)
+    assert "vector" in StoredChunk.model_fields
+    assert "vector" not in IndexedChunk.model_fields
+    # Field order matters to nothing in LanceDB, but the schema lists vector last
+    # and keeping it there makes the inheritance a pure refactor.
+    assert list(StoredChunk.model_fields)[-1] == "vector"

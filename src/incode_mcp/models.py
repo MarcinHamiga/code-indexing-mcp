@@ -150,7 +150,13 @@ class StoredFile(FrozenModel):
     indexed_at: int
 
 
-class StoredChunk(FrozenModel):
+class IndexedChunk(FrozenModel):
+    """A committed chunk without its embedding vector.
+
+    Read paths that only need chunk text and offsets use this so a whole project's
+    768-float vectors are not decoded into Python lists for no consumer.
+    """
+
     chunk_id: str
     file_id: str
     project_id: str
@@ -169,6 +175,11 @@ class StoredChunk(FrozenModel):
     search_text: str
     content_hash: str
     part_index: int = 0
+
+
+class StoredChunk(IndexedChunk):
+    """A chunk as written to storage, vector included."""
+
     vector: list[float]
 
 
