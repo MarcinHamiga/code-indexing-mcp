@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import unquote, urlparse
@@ -16,6 +16,7 @@ from urllib.request import url2pathname
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.session import ServerSession
 from mcp.types import Tool as MCPTool
 from mcp.types import ToolAnnotations
@@ -357,6 +358,27 @@ class AutoIndexingMCP(FastMCP):
         return tools
 
 
+def _with_error_details[**P, R](
+    handler: Callable[P, Awaitable[R]],
+) -> Callable[P, Awaitable[R]]:
+    """Re-raise IncodeError as a ToolError that keeps its code and details.
+
+    FastMCP stringifies an uncaught exception, and ``IncodeError.__str__`` omits
+    ``details`` on purpose, so the machine-readable half of every error — which
+    project, how long it waited, which memory ceiling — never reached the client.
+    ``functools.wraps`` keeps the signature FastMCP introspects for the schema.
+    """
+
+    @wraps(handler)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            return await handler(*args, **kwargs)
+        except IncodeError as exc:
+            raise ToolError(exc.for_client()) from exc
+
+    return wrapper
+
+
 def create_server(
     application: Application | BrokerApplication | None = None,
     *,
@@ -384,6 +406,7 @@ def create_server(
         ),
         annotations=_WRITES,
     )
+    @_with_error_details
     async def init_project(
         ctx: ServerContext,
         path: Annotated[
@@ -429,6 +452,7 @@ def create_server(
         ),
         annotations=_WRITES,
     )
+    @_with_error_details
     async def index_project(
         ctx: ServerContext,
         project: Annotated[
@@ -469,6 +493,7 @@ def create_server(
         ),
         annotations=_READ_ONLY,
     )
+    @_with_error_details
     async def project_status(
         ctx: ServerContext,
         project: Annotated[
@@ -493,6 +518,7 @@ def create_server(
         ),
         annotations=_READ_ONLY,
     )
+    @_with_error_details
     async def list_projects(ctx: ServerContext) -> list[ProjectInfo]:
         del ctx
         return await asyncio.to_thread(app.list_projects)
@@ -507,6 +533,7 @@ def create_server(
         ),
         annotations=_DESTRUCTIVE,
     )
+    @_with_error_details
     async def remove_project(
         ctx: ServerContext,
         project: Annotated[
@@ -528,6 +555,7 @@ def create_server(
         ),
         annotations=_READ_ONLY,
     )
+    @_with_error_details
     async def search_code(
         ctx: ServerContext,
         query: Annotated[
@@ -610,6 +638,7 @@ def create_server(
         ),
         annotations=_READ_ONLY,
     )
+    @_with_error_details
     async def find_symbol(
         ctx: ServerContext,
         name: Annotated[
@@ -671,6 +700,7 @@ def create_server(
         ),
         annotations=_READ_ONLY,
     )
+    @_with_error_details
     async def file_outline(
         ctx: ServerContext,
         path: Annotated[
@@ -707,6 +737,7 @@ def create_server(
         ),
         annotations=_READ_ONLY,
     )
+    @_with_error_details
     async def get_chunk(
         ctx: ServerContext,
         chunk_id: Annotated[

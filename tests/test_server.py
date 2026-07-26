@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from filelock import FileLock
 from mcp import types
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from incode_mcp.application import Application, RuntimePaths
@@ -857,3 +858,16 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "prefix",
         "contains",
     ]
+
+
+@pytest.mark.asyncio
+async def test_tool_error_carries_code_and_details(tmp_path: Path) -> None:
+    server = create_server(_tiny_application(tmp_path), auto_index=False)
+
+    with pytest.raises(ToolError) as caught:
+        await server.call_tool("get_chunk", {"chunk_id": "missing"})
+
+    message = str(caught.value)
+    assert "CHUNK_NOT_FOUND" in message
+    assert "chunk_id=missing" in message
+    assert "search_code or find_symbol" in message

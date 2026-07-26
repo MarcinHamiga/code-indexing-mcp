@@ -106,8 +106,23 @@ A generic MCP client configuration looks like this:
 }
 ```
 
-The server exposes `init_project`, `index_project`, `project_status`, `list_projects`,
-`remove_project`, `search_code`, `find_symbol`, `file_outline`, and `get_chunk`.
+The server exposes nine tools. Read tools are annotated `readOnlyHint` so hosts may auto-approve
+them; `remove_project` is annotated `destructiveHint`.
+
+| Tool | Kind | Purpose |
+| --- | --- | --- |
+| `init_project` | write | Register a directory and write its `.ci-mcp/project.toml` marker. |
+| `index_project` | write | Incrementally scan, parse, embed, and commit changed files. |
+| `remove_project` | destructive | Delete a registration and its whole index partition. |
+| `project_status` | read | Index state plus file and chunk counts. |
+| `list_projects` | read | Every registered project, sorted by name. |
+| `search_code` | read | Hybrid semantic and keyword search returning ranked snippets. |
+| `find_symbol` | read | Exact, prefix, or substring lookup of declaration names. |
+| `file_outline` | read | One file's declared symbols, metadata only. |
+| `get_chunk` | read | Full stored text for one `chunk_id`. |
+
+`limit` is capped at 50 and `match` accepts only `exact`, `prefix`, or `contains`; both are
+enforced by the tool schema, so an out-of-range value is rejected rather than silently clamped.
 
 ## Project workflow
 
