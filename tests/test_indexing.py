@@ -386,7 +386,9 @@ DENSE_SOURCE = (
 def test_a_token_dense_chunk_is_split_into_several_stored_chunks(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "main.py").write_text(DENSE_SOURCE)
+    # Bytes, not text: write_text translates "\n" to "\r\n" on Windows, and
+    # these tests compare on-disk offsets against DENSE_SOURCE itself.
+    (root / "main.py").write_bytes(DENSE_SOURCE.encode("utf-8"))
     project = initialize_project(root)
     indexer, store = make_windowing_indexer(
         tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
@@ -403,7 +405,9 @@ def test_a_token_dense_chunk_is_split_into_several_stored_chunks(tmp_path: Path)
 def test_windowed_chunk_offsets_still_slice_the_original_source(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "main.py").write_text(DENSE_SOURCE)
+    # Bytes, not text: write_text translates "\n" to "\r\n" on Windows, and
+    # these tests compare on-disk offsets against DENSE_SOURCE itself.
+    (root / "main.py").write_bytes(DENSE_SOURCE.encode("utf-8"))
     project = initialize_project(root)
     indexer, store = make_windowing_indexer(
         tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
@@ -421,7 +425,9 @@ def test_windowed_chunk_offsets_still_slice_the_original_source(tmp_path: Path) 
 def test_every_window_keeps_the_context_header_and_identifier_tail(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "main.py").write_text(DENSE_SOURCE)
+    # Bytes, not text: write_text translates "\n" to "\r\n" on Windows, and
+    # these tests compare on-disk offsets against DENSE_SOURCE itself.
+    (root / "main.py").write_bytes(DENSE_SOURCE.encode("utf-8"))
     project = initialize_project(root)
     indexer, store = make_windowing_indexer(
         tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
@@ -441,7 +447,9 @@ def test_every_window_keeps_the_context_header_and_identifier_tail(tmp_path: Pat
 def test_windows_cover_the_symbol_without_dropping_source(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "main.py").write_text(DENSE_SOURCE)
+    # Bytes, not text: write_text translates "\n" to "\r\n" on Windows, and
+    # these tests compare on-disk offsets against DENSE_SOURCE itself.
+    (root / "main.py").write_bytes(DENSE_SOURCE.encode("utf-8"))
     project = initialize_project(root)
     indexer, store = make_windowing_indexer(
         tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
