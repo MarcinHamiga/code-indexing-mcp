@@ -499,6 +499,10 @@ def test_staging_phase_leftovers_are_removed_without_touching_live_tables(
     job.stage_chunks([chunk_row(project.id, "file-1", [1.0, 1.0, 1.0, 1.0])])
     journal = json.loads((job.directory / JOURNAL_NAME).read_text())
     assert journal["phase"] == PHASE_STAGING
+    # The staging process died, so its handles are closed and only the journal
+    # and the unfinished .tmp payloads survive. Leaving the writers open here
+    # would not model any real crash, and Windows would refuse to unlink them.
+    job._close_writers(finalize=False)
 
     recovered = recover_staged_commits(tmp_path / "staging", store)
 

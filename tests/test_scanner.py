@@ -112,8 +112,10 @@ def test_iter_scan_reads_one_file_source_at_a_time(
     """Streaming means laziness: a file's bytes are read only as it is yielded."""
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "a.py").write_text("a = 1\n")
-    (root / "b.py").write_text("b = 2\n")
+    # Written as bytes: the assertions below are byte-exact, and write_text
+    # would turn the newlines into CRLF on Windows.
+    (root / "a.py").write_bytes(b"a = 1\n")
+    (root / "b.py").write_bytes(b"b = 2\n")
     project = initialize_project(root)
     reads: list[Path] = []
     original = Path.read_bytes
