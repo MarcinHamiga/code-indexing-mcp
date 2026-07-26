@@ -146,9 +146,16 @@ def test_staged_chunks_round_trip_through_the_store(tmp_path: Path) -> None:
     chunks = store.list_chunks([project.id])
 
     assert len(chunks) == 1
-    expected = len(chunks[0].embedding_text) % 7
-    assert chunks[0].vector == [float(expected), 1.0, 2.0, 3.0]
-    assert store.get_chunk(chunks[0].chunk_id) == chunks[0]
+    tables = store._existing_tables(project.id)
+    assert tables is not None
+    stored = tables.chunks.search().select(["embedding_text", "vector"]).to_list()[0]
+    expected = len(stored["embedding_text"]) % 7
+    assert stored["vector"] == [float(expected), 1.0, 2.0, 3.0]
+
+    fetched = store.get_chunk(chunks[0].chunk_id)
+    assert fetched is not None
+    assert fetched.chunk_id == chunks[0].chunk_id
+    assert fetched.content == chunks[0].content
 
 
 def test_a_file_that_now_extracts_no_chunks_has_its_old_chunks_deleted(

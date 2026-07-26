@@ -521,3 +521,51 @@ def test_an_unplannable_file_is_charged_to_the_file_not_the_run(tmp_path: Path) 
     assert [issue.path for issue in report.errors] == ["bad.py"]
     assert store.project_state(project.id) == "partial"
     assert {chunk.path for chunk in store.list_chunks([project.id])} == {"good.py"}
+
+
+def test_binary_and_undecodable_files_are_skipped_by_the_indexer(tmp_path: Path) -> None:
+    """Content rejection moved to where the bytes are already read.
+
+    The file must not be indexed, must not be committed as a stored file, and any
+    chunks from an earlier text version of it must be dropped.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    (root / "good.py").write_text("def good():\n    return 1\n")
+    (root / "turned_binary.py").write_text("def old():\n    return 0\n")
+    indexer.index(project)
+    assert {chunk.path for chunk in store.list_chunks([project.id])} >= {"turned_binary.py"}
+
+    (root / "turned_binary.py").write_bytes(b"def old():\x00\n")
+    (root / "latin.py").write_bytes(b"# caf\xe9\ndef latin():\n    return 2\n")
+    report = indexer.index(project)
+
+    indexed = {chunk.path for chunk in store.list_chunks([project.id])}
+    assert indexed == {"good.py"}
+    assert report.skipped_files >= 2
+    assert {issue.path for issue in report.errors} == set()
+
+
+def test_each_changed_file_is_read_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+    for index in range(5):
+        (root / f"m{index}.py").write_text(f"def f{index}():\n    return {index}\n")
+
+    reads: dict[str, int] = {}
+    original = Path.read_bytes
+
+    def counting(self: Path) -> bytes:
+        if self.suffix == ".py":
+            reads[str(self)] = reads.get(str(self), 0) + 1
+        return original(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting)
+    indexer.index(project)
+
+    assert len(reads) == 5
+    assert set(reads.values()) == {1}, f"expected one read per file, got {reads}"

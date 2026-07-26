@@ -177,6 +177,9 @@ Incremental refreshes:
 - Changed files are replaced transactionally in LanceDB.
 - Removed files are deleted from the active index.
 - A parse or embedding failure preserves the previous indexed version.
+- Binary and undecodable files are detected while the file is read for indexing, not during the
+  scan, so each changed file is read once. They count toward `skipped_files` and are not recorded as
+  per-file errors.
 
 Python, Python stubs, Java, JavaScript, JSX, TypeScript, and TSX are supported. Java indexing
 extracts classes, interfaces, records, enums, annotation types, methods, constructors, and nested

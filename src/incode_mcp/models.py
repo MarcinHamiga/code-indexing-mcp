@@ -97,6 +97,8 @@ class ScannedFile(FrozenModel):
     language: str
     size: int
     mtime_ns: int
+    # Streaming scans attach changed-file bytes so the indexer consumes them
+    # without a second read. Collected scans deliberately leave this as None.
     content: bytes | None = None
 
 
