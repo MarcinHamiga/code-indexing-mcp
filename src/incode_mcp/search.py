@@ -150,7 +150,7 @@ class SearchService:
                 "results and change when the file is re-indexed",
                 chunk_id=chunk_id,
             )
-        return CodeChunk.model_validate(chunk.model_dump())
+        return chunk
 
     @staticmethod
     def _in_condition(column: str, values: list[str]) -> str:

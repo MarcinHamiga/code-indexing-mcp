@@ -268,8 +268,32 @@ class OutlineResponse(FrozenModel):
     items: list[OutlineItem]
 
 
-class CodeChunk(StoredChunk):
-    pass
+class CodeChunk(FrozenModel):
+    """One indexed chunk as returned to a caller.
+
+    Deliberately not a StoredChunk subclass. Inheriting the storage row shipped the
+    768-dimension vector and both derived text columns to MCP clients: 72% of the
+    response was the vector, and the code arrived three times over as content,
+    embedding_text, and search_text. Adding a storage column must not silently
+    widen this payload, so the fields are listed rather than inherited.
+    """
+
+    chunk_id: str
+    file_id: str
+    project_id: str
+    path: str
+    language: str
+    kind: str
+    symbol: str | None = None
+    qualified_symbol: str | None = None
+    parent_symbol: str | None = None
+    start_byte: int
+    end_byte: int
+    start_line: int
+    end_line: int
+    content: str
+    content_hash: str
+    part_index: int = 0
 
 
 class ProjectStatus(FrozenModel):

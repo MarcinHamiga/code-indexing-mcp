@@ -124,6 +124,10 @@ them; `remove_project` is annotated `destructiveHint`.
 `limit` is capped at 50 and `match` accepts only `exact`, `prefix`, or `contains`; both are
 enforced by the tool schema, so an out-of-range value is rejected rather than silently clamped.
 
+`get_chunk` returns one chunk's full stored text with its path, symbol, line range, byte range, and
+content hash. It deliberately excludes the embedding vector and the derived `embedding_text` and
+`search_text` columns, which exist for ranking and are not useful to a caller.
+
 ## Project workflow
 
 ```bash

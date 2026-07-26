@@ -88,17 +88,11 @@ def test_v1_store_is_backed_up_and_registered_for_lazy_rebuild(tmp_path: Path) -
     assert list(tmp_path.glob("lancedb-v1-backup-*"))
 
 
-def test_compaction_keeps_recent_versions_readable(tmp_path: Path) -> None:
-    """Concurrent readers must survive the maintenance pass after deletions."""
-    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
-    root = tmp_path / "repo"
-    root.mkdir()
-    project = initialize_project(root)
-    store.upsert_project(project, model_id="test/model")
-    chunks = [
+def _stored_chunks(project_id: str, count: int) -> list[StoredChunk]:
+    return [
         StoredChunk(
             chunk_id=f"chunk-{index}",
-            project_id=project.id,
+            project_id=project_id,
             file_id="file-1",
             path="module.py",
             language="python",
@@ -117,8 +111,30 @@ def test_compaction_keeps_recent_versions_readable(tmp_path: Path) -> None:
             part_index=0,
             vector=[0.0, 0.0, 0.0, 1.0],
         )
-        for index in range(4)
+        for index in range(count)
     ]
+
+
+def _store_with_one_chunk(tmp_path: Path) -> tuple[LanceStore, str, str]:
+    """A store holding a single committed chunk, with its project and chunk ids."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    chunks = _stored_chunks(project.id, 1)
+    store.replace_file(stored_file(project.id), chunks)
+    return store, project.id, chunks[0].chunk_id
+
+
+def test_compaction_keeps_recent_versions_readable(tmp_path: Path) -> None:
+    """Concurrent readers must survive the maintenance pass after deletions."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    chunks = _stored_chunks(project.id, 4)
     record = StoredFile(
         file_id="file-1",
         project_id=project.id,
@@ -138,3 +154,15 @@ def test_compaction_keeps_recent_versions_readable(tmp_path: Path) -> None:
     # A version reaped mid-read would surface here as a Lance IO failure.
     assert store.count_chunks([project.id]) == 0
     assert store.list_files(project.id) == []
+
+
+def test_get_chunk_does_not_read_the_vector_column(tmp_path: Path) -> None:
+    from incode_mcp.models import CodeChunk
+
+    store, _project, chunk_id = _store_with_one_chunk(tmp_path)
+
+    chunk = store.get_chunk(chunk_id)
+
+    assert isinstance(chunk, CodeChunk)
+    assert not hasattr(chunk, "vector")
+    assert store.get_chunk("no-such-chunk") is None

@@ -21,7 +21,7 @@ from lancedb.query import ColumnOrdering
 from lancedb.table import LanceTable
 
 from .errors import ErrorCode, IncodeError
-from .models import ChunkPreview, ProjectInfo, StoredChunk, StoredFile
+from .models import ChunkPreview, CodeChunk, ProjectInfo, StoredChunk, StoredFile
 from .projects import existing_marker_path
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,28 @@ SCHEMA_VERSION = 2
 # how many rows are scanned before the exact filter and the caller's limit apply.
 OVERFETCH_FACTOR = 10
 MINIMUM_OVERFETCH = 200
+
+# Columns get_chunk reads. The vector and the two derived text columns are excluded:
+# nothing outside indexing and ranking can use them, and reading them made a
+# single-chunk fetch an order of magnitude larger than the code it returned.
+CHUNK_PAYLOAD_COLUMNS = [
+    "chunk_id",
+    "file_id",
+    "project_id",
+    "path",
+    "language",
+    "kind",
+    "symbol",
+    "qualified_symbol",
+    "parent_symbol",
+    "start_byte",
+    "end_byte",
+    "start_line",
+    "end_line",
+    "content",
+    "content_hash",
+    "part_index",
+]
 
 
 def _quoted(value: str) -> str:
@@ -266,7 +288,7 @@ class LanceStore:
             chunks.extend(StoredChunk.model_validate(row) for row in self._rows(tables.chunks))
         return chunks
 
-    def get_chunk(self, chunk_id: str) -> StoredChunk | None:
+    def get_chunk(self, chunk_id: str) -> CodeChunk | None:
         # chunk_id is a one-way digest of file_id, which is itself a digest of
         # the project id and path, so the owning project cannot be recovered
         # from the id. Scanning every project is inherent without an id-format
@@ -276,9 +298,15 @@ class LanceStore:
             tables = self._existing_tables(project.id)
             if tables is None:
                 continue
-            rows = self._rows(tables.chunks, f"chunk_id = {_quoted(chunk_id)}")
+            rows = cast(
+                list[dict[str, Any]],
+                tables.chunks.search()
+                .where(f"chunk_id = {_quoted(chunk_id)}")
+                .select(CHUNK_PAYLOAD_COLUMNS)
+                .to_list(),
+            )
             if rows:
-                return StoredChunk.model_validate(rows[0])
+                return CodeChunk.model_validate(rows[0])
         return None
 
     def count_chunks(self, project_ids: Iterable[str] | None = None) -> int:

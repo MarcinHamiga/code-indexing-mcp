@@ -294,3 +294,58 @@ def test_untranslatable_path_pattern_still_filters_in_python(tmp_path: Path) -> 
     # An absolute pattern disables the pushdown; the post-filter must still apply,
     # and PurePosixPath.match never matches an absolute pattern against these paths.
     assert search.search_code("alpha", [project], paths=["/src/a.py"]).hits == []
+
+
+CHUNK_PAYLOAD_FIELDS = {
+    "chunk_id",
+    "file_id",
+    "project_id",
+    "path",
+    "language",
+    "kind",
+    "symbol",
+    "qualified_symbol",
+    "parent_symbol",
+    "start_byte",
+    "end_byte",
+    "start_line",
+    "end_line",
+    "content",
+    "content_hash",
+    "part_index",
+}
+
+
+def test_get_chunk_excludes_embedding_and_duplicated_text(tmp_path: Path) -> None:
+    """get_chunk is the full-text counterpart to a snippet, not a storage row dump.
+
+    The vector was 72% of the old payload and the code text appeared three times
+    over, in content, embedding_text, and search_text.
+    """
+    search, project = _indexed_source(tmp_path, "def authenticate(user):\n    return user.token\n")
+    hit = search.search_code("authenticate", [project]).hits[0]
+
+    payload = search.get_chunk(hit.chunk_id).model_dump()
+
+    assert set(payload) == CHUNK_PAYLOAD_FIELDS
+    assert "vector" not in payload
+    assert "embedding_text" not in payload
+    assert "search_text" not in payload
+    assert "return user.token" in payload["content"]
+
+
+def test_get_chunk_payload_is_dominated_by_content(tmp_path: Path) -> None:
+    import json
+
+    source = "def authenticate(user):\n" + "".join(
+        f"    step_{index} = user.token\n" for index in range(80)
+    )
+    search, project = _indexed_source(tmp_path, source)
+    hit = search.search_code("authenticate", [project]).hits[0]
+
+    chunk = search.get_chunk(hit.chunk_id)
+    encoded = json.dumps(chunk.model_dump(mode="json"))
+
+    # Metadata is ~290 chars of ids and offsets; anything beyond a small multiple of
+    # the content means a payload field crept back in.
+    assert len(encoded) < len(chunk.content) * 2
