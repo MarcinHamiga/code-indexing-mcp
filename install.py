@@ -764,6 +764,33 @@ def skill_directory(
     return None
 
 
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
+def _backup_path(target: Path) -> Path:
+    """Pick a backup name that does not overwrite a backup from an earlier install."""
+
+    candidate = target.with_name(f"{target.name}.bak")
+    counter = 2
+    while candidate.is_symlink() or candidate.exists():
+        candidate = target.with_name(f"{target.name}.bak.{counter}")
+        counter += 1
+    return candidate
+
+
+def _is_stale_bundled_link(target: Path) -> bool:
+    """True when target is a link this installer left pointing at an older checkout."""
+
+    if not target.is_symlink():
+        return False
+    skills_dir = Path(os.readlink(target)).parent
+    return skills_dir.name == "skills" and skills_dir.parent.name == "incode_mcp"
+
+
 def _link_skill(source: Path, target: Path) -> bool:
     """Symlink one bundled skill folder, backing up any clashing entry.
 
@@ -772,15 +799,23 @@ def _link_skill(source: Path, target: Path) -> bool:
 
     if target.is_symlink() and Path(os.readlink(target)) == source:
         return False
-    if target.is_symlink() or target.exists():
-        backup = target.with_name(f"{target.name}.bak")
-        if backup.is_symlink() or backup.is_file():
-            backup.unlink()
-        elif backup.exists():
-            shutil.rmtree(backup)
-        target.rename(backup)
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    target.symlink_to(source, target_is_directory=True)
+    # Build the replacement link before disturbing what is already there, so a
+    # platform that cannot create symlinks at all fails without having moved a
+    # skill the user owns out from under its harness.
+    staged = target.with_name(f"{target.name}.incoming")
+    if staged.is_symlink() or staged.exists():
+        _remove_path(staged)
+    staged.symlink_to(source, target_is_directory=True)
+    try:
+        if _is_stale_bundled_link(target):
+            target.unlink()
+        elif target.is_symlink() or target.exists():
+            target.rename(_backup_path(target))
+        staged.rename(target)
+    except OSError:
+        staged.unlink(missing_ok=True)
+        raise
     return True
 
 

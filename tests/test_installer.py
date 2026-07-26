@@ -844,3 +844,60 @@ def test_install_skills_reports_missing_source(tmp_path: Path) -> None:
     _slug, message = results[0]
     assert "skipped" in message
     assert not (tmp_path / ".agents").exists()
+
+
+def test_reinstall_from_a_new_checkout_keeps_the_original_backup(tmp_path: Path) -> None:
+    """Relinking must not treat an earlier install's own link as user content."""
+    first = _skills_source(tmp_path / "first", names=("alpha",))
+    second = _skills_source(tmp_path / "second", names=("alpha",))
+    skills_dir = tmp_path / ".agents" / "skills"
+    mine = skills_dir / "alpha"
+    mine.mkdir(parents=True)
+    (mine / "SKILL.md").write_text("mine", encoding="utf-8")
+
+    installer.install_skills(["codex"], first, home=tmp_path, environment={})
+    installer.install_skills(["codex"], second, home=tmp_path, environment={})
+
+    assert (skills_dir / "alpha").resolve() == (
+        second / "src" / "incode_mcp" / "skills" / "alpha"
+    ).resolve()
+    assert (skills_dir / "alpha.bak" / "SKILL.md").read_text(encoding="utf-8") == "mine"
+    assert not (skills_dir / "alpha.bak.2").exists()
+
+
+def test_install_skills_never_overwrites_an_existing_backup(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path, names=("alpha",))
+    skills_dir = tmp_path / ".agents" / "skills"
+    for name, content in (("alpha", "current"), ("alpha.bak", "older")):
+        entry = skills_dir / name
+        entry.mkdir(parents=True)
+        (entry / "SKILL.md").write_text(content, encoding="utf-8")
+
+    installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+
+    assert (skills_dir / "alpha").is_symlink()
+    assert (skills_dir / "alpha.bak" / "SKILL.md").read_text(encoding="utf-8") == "older"
+    assert (skills_dir / "alpha.bak.2" / "SKILL.md").read_text(encoding="utf-8") == "current"
+
+
+def test_install_skills_leaves_existing_skills_in_place_when_symlinks_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows without the symlink privilege must not displace a user's skill."""
+    repo = _skills_source(tmp_path, names=("alpha",))
+    mine = tmp_path / ".agents" / "skills" / "alpha"
+    mine.mkdir(parents=True)
+    (mine / "SKILL.md").write_text("mine", encoding="utf-8")
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise OSError(1314, "A required privilege is not held by the client")
+
+    monkeypatch.setattr(Path, "symlink_to", refuse)
+
+    results = installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+
+    _slug, message = results[0]
+    assert "skipped" in message
+    assert (mine / "SKILL.md").read_text(encoding="utf-8") == "mine"
+    assert not (tmp_path / ".agents" / "skills" / "alpha.bak").exists()
+    assert not (tmp_path / ".agents" / "skills" / "alpha.incoming").exists()
