@@ -202,3 +202,12 @@ def test_has_supported_source_applies_nested_gitignore_rules(tmp_path: Path) -> 
     keep.unlink()
 
     assert scanner.has_supported_source(root, ScanConfig()) is False
+
+
+def test_language_name_literal_matches_scanner_languages() -> None:
+    from typing import get_args
+
+    from incode_mcp.models import LanguageName
+    from incode_mcp.scanner import LANGUAGES
+
+    assert set(get_args(LanguageName)) == set(LANGUAGES.values())

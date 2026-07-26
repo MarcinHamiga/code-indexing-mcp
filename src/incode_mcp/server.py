@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Annotated, Literal
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
@@ -17,13 +18,17 @@ import anyio
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 from mcp.types import Tool as MCPTool
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from .application import Application
 from .daemon import BrokerApplication
 from .errors import ErrorCode, IncodeError
 from .models import (
+    ChunkKind,
     CodeChunk,
     IndexReport,
+    LanguageName,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
@@ -278,6 +283,35 @@ async def _wait_for_startup_projects(
         await ctx.report_progress(1, 1, "Index ready")
 
 
+_TOOL_INSTRUCTIONS = """\
+Local Tree-sitter code indexing with hybrid semantic and full-text search over repositories on \
+this machine. No code leaves the machine: embeddings are computed locally and stored in a local \
+LanceDB index.
+
+search_code answers "where is the code that does X". find_symbol resolves a declaration whose name \
+is already known. file_outline lists one file's structure without returning code. Both search \
+tools return chunk_id values that get_chunk expands to full text.
+
+Scope defaults to the active MCP root, or the nearest .ci-mcp/project.toml above the working \
+directory. Searching every registered project requires all_projects=true, so cross-project results \
+are never mixed in by accident.
+
+In the default lazy mode the first code query builds the initial index, which can take minutes on \
+a large repository; it reports progress while it runs."""
+
+# openWorldHint is False on every tool: this server touches only the local
+# filesystem and a local index, never the network.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_WRITES = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+)
+
+
 class AutoIndexingMCP(FastMCP):
     def __init__(
         self,
@@ -291,7 +325,7 @@ class AutoIndexingMCP(FastMCP):
         self.wait_seconds = wait_seconds
         super().__init__(
             "code-indexing-mcp",
-            instructions=SERVER_INSTRUCTIONS,
+            instructions=f"{_TOOL_INSTRUCTIONS}\n\n{SERVER_INSTRUCTIONS}",
             json_response=True,
             lifespan=self._lifespan,
         )
@@ -339,12 +373,41 @@ def create_server(
     )
     mcp = AutoIndexingMCP(app, mode=mode, wait_seconds=settings.index_wait_seconds)
 
-    @mcp.tool()
+    @mcp.tool(
+        title="Initialize project",
+        description=(
+            "Register a directory as an indexable project and write its local "
+            ".ci-mcp/project.toml marker, which holds a checkout-local id and the scan "
+            "configuration. Returns the project id, name, root, and scan settings. Building the "
+            "index is a separate operation (index_project). Re-running on an already-initialized "
+            "directory returns the existing project unless force_new_id is set."
+        ),
+        annotations=_WRITES,
+    )
     async def init_project(
         ctx: ServerContext,
-        path: str | None = None,
-        name: str | None = None,
-        force_new_id: bool = False,
+        path: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Directory to initialize. Defaults to the single MCP root when exactly one "
+                    "is offered, otherwise to the server's working directory."
+                )
+            ),
+        ] = None,
+        name: Annotated[
+            str | None,
+            Field(description="Display name for the project. Defaults to the directory name."),
+        ] = None,
+        force_new_id: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Mint a new project id even if a marker already exists, orphaning the "
+                    "previous index for this directory."
+                )
+            ),
+        ] = False,
     ) -> ProjectInfo:
         roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(
@@ -355,9 +418,37 @@ def create_server(
             roots=roots,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        title="Index project",
+        description=(
+            "Incrementally index a project: scan for supported source files, parse changed files "
+            "with Tree-sitter, embed their chunks, and commit them. Files whose size, mtime, and "
+            "content hash are unchanged are skipped without being re-read. Returns per-phase "
+            "counts and durations plus any per-file errors. Indexes Python, Java, JavaScript, and "
+            "TypeScript only, skipping symlinks, binaries, and files over 1 MiB."
+        ),
+        annotations=_WRITES,
+    )
     async def index_project(
-        ctx: ServerContext, project: str | None = None, force: bool = False
+        ctx: ServerContext,
+        project: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Project id, name, or path. Defaults to the active MCP root or the nearest "
+                    ".ci-mcp/project.toml."
+                )
+            ),
+        ] = None,
+        force: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Re-parse and re-embed every discovered file, ignoring change detection. "
+                    "Use after changing the embedding model or chunking settings."
+                )
+            ),
+        ] = False,
     ) -> IndexReport:
         # Only wait for discovery, not the outcome of the automatic index this tool is
         # meant to let callers manually recover from. If startup indexing is still
@@ -369,82 +460,259 @@ def create_server(
         await ctx.report_progress(1, 1, "Index complete")
         return report
 
-    @mcp.tool()
-    async def project_status(ctx: ServerContext, project: str | None = None) -> ProjectStatus:
+    @mcp.tool(
+        title="Project status",
+        description=(
+            "Report one project's index state — pending, indexing, ready, partial, or error — "
+            "with its indexed file count and chunk count. Reads the index without modifying it, "
+            "and does not check the filesystem for changes; index_project does that."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def project_status(
+        ctx: ServerContext,
+        project: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Project id, name, or path. Defaults to the active MCP root or the nearest "
+                    ".ci-mcp/project.toml."
+                )
+            ),
+        ] = None,
+    ) -> ProjectStatus:
         roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(app.project_status, project, roots=roots)
 
-    @mcp.tool()
+    @mcp.tool(
+        title="List projects",
+        description=(
+            "List every project registered with this server — id, name, root directory, and scan "
+            "configuration — sorted by name. Takes no arguments and returns registrations only, "
+            "not index state; project_status reports that."
+        ),
+        annotations=_READ_ONLY,
+    )
     async def list_projects(ctx: ServerContext) -> list[ProjectInfo]:
         del ctx
         return await asyncio.to_thread(app.list_projects)
 
-    @mcp.tool()
-    async def remove_project(ctx: ServerContext, project: str) -> RemovalReport:
+    @mcp.tool(
+        title="Remove project",
+        description=(
+            "Permanently delete a project's registration and its entire on-disk index partition. "
+            "The .ci-mcp/project.toml marker in the working tree is left in place, so a later "
+            "init_project re-registers the same id with an empty index. Irreversible: the only "
+            "way back is a full re-index. Returns whether a registration existed."
+        ),
+        annotations=_DESTRUCTIVE,
+    )
+    async def remove_project(
+        ctx: ServerContext,
+        project: Annotated[
+            str, Field(description="Project id, name, or path to remove. Required — no default.")
+        ],
+    ) -> RemovalReport:
         del ctx
         return await asyncio.to_thread(app.remove_project, project)
 
-    @mcp.tool()
+    @mcp.tool(
+        title="Search code",
+        description=(
+            "Hybrid semantic and keyword search over indexed code chunks. Returns hits ranked by "
+            "relevance, each with a code snippet, file path, line range, and a chunk_id that "
+            "get_chunk expands to the full text. Searches indexed source only — not commit "
+            "history, not comments in unindexed files, and not files excluded by .gitignore or "
+            "the 1 MiB size cap. For a declaration whose name is already known, find_symbol is "
+            "direct; for one file's structure, file_outline is cheaper."
+        ),
+        annotations=_READ_ONLY,
+    )
     async def search_code(
         ctx: ServerContext,
-        query: str,
-        projects: list[str] | None = None,
-        all_projects: bool = False,
-        languages: list[str] | None = None,
-        paths: list[str] | None = None,
-        kinds: list[str] | None = None,
-        limit: int = 8,
+        query: Annotated[
+            str,
+            Field(
+                description=(
+                    "What to look for, as natural language or keywords. Matched against chunk "
+                    "text and against normalized identifier names."
+                )
+            ),
+        ],
+        projects: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Restrict the search to these project ids, names, or paths. Mutually "
+                    "exclusive with all_projects."
+                )
+            ),
+        ] = None,
+        all_projects: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Search every registered project. Off by default so results from unrelated "
+                    "repositories are never mixed in implicitly."
+                )
+            ),
+        ] = False,
+        languages: Annotated[
+            list[LanguageName] | None,
+            Field(description="Restrict to these languages."),
+        ] = None,
+        paths: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Restrict to paths matching these glob patterns, relative to the project "
+                    "root, for example 'src/*' or '**/*.py'. Patterns match from the right, so "
+                    "'*.py' matches any Python file at any depth."
+                )
+            ),
+        ] = None,
+        kinds: Annotated[
+            list[ChunkKind] | None,
+            Field(description="Restrict to these chunk kinds."),
+        ] = None,
+        limit: Annotated[
+            int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
+        ] = 8,
     ) -> SearchResponse:
         roots = await _startup_roots(ctx, indexes=True)
         project_ids = await asyncio.to_thread(
             app.resolve_search_scope, projects, all_projects, roots
         )
         await _wait_for_startup_projects(ctx, roots, project_ids)
+        # The service layer takes open list[str]; the closed Literal lists exist to
+        # constrain the tool schema, and list invariance blocks passing them through.
+        selected_languages: list[str] | None = list(languages) if languages else None
+        selected_kinds: list[str] | None = list(kinds) if kinds else None
         return await asyncio.to_thread(
             app.search_code,
             query,
             projects=project_ids,
             all_projects=False,
-            languages=languages,
+            languages=selected_languages,
             paths=paths,
-            kinds=kinds,
+            kinds=selected_kinds,
             limit=limit,
             roots=roots,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        title="Find symbol",
+        description=(
+            "Look up indexed code chunks by symbol name, matching exactly, by prefix, or by "
+            "substring. Returns hits ordered by path and line, each with a snippet and a "
+            "chunk_id. Matches declaration names only — not call sites, imports, or other "
+            "references. For a conceptual query rather than a known name, search_code applies."
+        ),
+        annotations=_READ_ONLY,
+    )
     async def find_symbol(
         ctx: ServerContext,
-        name: str,
-        project: str | None = None,
-        match: str = "exact",
-        kinds: list[str] | None = None,
-        limit: int = 20,
+        name: Annotated[
+            str,
+            Field(
+                description=(
+                    "Symbol name to look up. Either the bare name or the dotted qualified name, "
+                    "for example 'LanceStore' or 'LanceStore.upsert_project'."
+                )
+            ),
+        ],
+        project: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Project id, name, or path. Defaults to the active MCP root or the nearest "
+                    ".ci-mcp/project.toml."
+                )
+            ),
+        ] = None,
+        match: Annotated[
+            Literal["exact", "prefix", "contains"],
+            Field(
+                description=(
+                    "How to compare name against stored symbols. 'exact' requires a full match "
+                    "on the bare or qualified name."
+                )
+            ),
+        ] = "exact",
+        kinds: Annotated[
+            list[ChunkKind] | None,
+            Field(description="Restrict to these chunk kinds."),
+        ] = None,
+        limit: Annotated[
+            int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
+        ] = 20,
     ) -> SymbolResponse:
         roots = await _startup_roots(ctx, indexes=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved.id])
+        selected_kinds: list[str] | None = list(kinds) if kinds else None
         return await asyncio.to_thread(
             app.find_symbol,
             name,
             resolved.id,
             match=match,
-            kinds=kinds,
+            kinds=selected_kinds,
             limit=limit,
             roots=roots,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        title="File outline",
+        description=(
+            "List the symbols declared in one indexed file, in source order, with kind, "
+            "qualified name, parent, and line range. Returns structure metadata only, never code "
+            "text, so it is the cheap way to understand a file before fetching parts of it. The "
+            "file must already be indexed."
+        ),
+        annotations=_READ_ONLY,
+    )
     async def file_outline(
-        ctx: ServerContext, path: str, project: str | None = None
+        ctx: ServerContext,
+        path: Annotated[
+            str,
+            Field(
+                description=(
+                    "File path relative to the project root, using forward slashes, exactly as "
+                    "reported in search_code hits."
+                )
+            ),
+        ],
+        project: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Project id, name, or path. Defaults to the active MCP root or the nearest "
+                    ".ci-mcp/project.toml."
+                )
+            ),
+        ] = None,
     ) -> OutlineResponse:
         roots = await _startup_roots(ctx, indexes=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved.id])
         return await asyncio.to_thread(app.file_outline, path, resolved.id, roots=roots)
 
-    @mcp.tool()
-    async def get_chunk(ctx: ServerContext, chunk_id: str) -> CodeChunk:
+    @mcp.tool(
+        title="Get chunk",
+        description=(
+            "Fetch one indexed chunk's full stored text by the chunk_id returned from search_code "
+            "or find_symbol, with its path, symbol, and line range. Chunk ids are content-derived "
+            "and change when the file is re-indexed, so a stale id returns CHUNK_NOT_FOUND rather "
+            "than the wrong code."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def get_chunk(
+        ctx: ServerContext,
+        chunk_id: Annotated[
+            str, Field(description="Chunk id from a search_code or find_symbol hit.")
+        ],
+    ) -> CodeChunk:
         del ctx
         return await asyncio.to_thread(app.get_chunk, chunk_id)
 

@@ -370,3 +370,24 @@ class Old {
     assert ("class", "Old") in symbols
     old_chunk = next(chunk for chunk in result.chunks if chunk.qualified_symbol == "Old")
     assert old_chunk.content.startswith("@Deprecated")
+
+
+def test_chunk_kind_literal_covers_every_kind_the_queries_capture() -> None:
+    from importlib.resources import files
+    from typing import get_args
+
+    from incode_mcp.models import ChunkKind
+
+    declared = set(get_args(ChunkKind))
+    captured = set()
+    for language in ("python", "java", "javascript", "typescript", "tsx"):
+        text = files("incode_mcp.queries").joinpath(f"{language}.scm").read_text()
+        captured |= {
+            line.split("@definition.", 1)[1].split()[0].strip(")")
+            for line in text.splitlines()
+            if "@definition." in line
+        }
+
+    missing = captured - declared
+    assert not missing, f"ChunkKind is missing extractor kinds: {sorted(missing)}"
+    assert {f"{kind}_part" for kind in captured if kind != "module"} <= declared

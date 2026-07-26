@@ -794,3 +794,66 @@ def test_error_without_details_renders_as_plain_string() -> None:
     error = IncodeError(ErrorCode.CHUNK_NOT_FOUND, "Unknown chunk: abc")
 
     assert error.for_client() == "CHUNK_NOT_FOUND: Unknown chunk: abc"
+
+
+READ_ONLY_TOOLS = frozenset(
+    {"project_status", "list_projects", "search_code", "find_symbol", "file_outline", "get_chunk"}
+)
+WRITE_TOOLS = frozenset({"init_project", "index_project", "remove_project"})
+
+
+def _tiny_application(tmp_path: Path) -> Application:
+    return Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_tool_declares_description_title_and_annotations(tmp_path: Path) -> None:
+    tools = await create_server(_tiny_application(tmp_path), auto_index=False).list_tools()
+
+    assert {tool.name for tool in tools} == READ_ONLY_TOOLS | WRITE_TOOLS
+    for tool in tools:
+        assert tool.description, f"{tool.name} has no description"
+        assert len(tool.description) > 60, f"{tool.name} description is a stub"
+        assert tool.title, f"{tool.name} has no title"
+        assert tool.annotations is not None, f"{tool.name} has no annotations"
+        assert tool.annotations.openWorldHint is False, f"{tool.name} is not local-only"
+
+
+@pytest.mark.asyncio
+async def test_read_and_write_tools_are_annotated_distinctly(tmp_path: Path) -> None:
+    tools = await create_server(_tiny_application(tmp_path), auto_index=False).list_tools()
+    annotations = {tool.name: tool.annotations for tool in tools}
+
+    for name in READ_ONLY_TOOLS:
+        assert annotations[name] is not None and annotations[name].readOnlyHint is True, name
+        assert annotations[name].destructiveHint is False, name
+    for name in WRITE_TOOLS:
+        assert annotations[name] is not None and annotations[name].readOnlyHint is False, name
+    # remove_project is the only tool that destroys data.
+    assert annotations["remove_project"].destructiveHint is True
+    assert annotations["index_project"].destructiveHint is False
+    assert annotations["init_project"].destructiveHint is False
+
+
+@pytest.mark.asyncio
+async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) -> None:
+    tools = {
+        tool.name: tool
+        for tool in await create_server(_tiny_application(tmp_path), auto_index=False).list_tools()
+    }
+
+    for name, tool in tools.items():
+        for parameter, spec in tool.inputSchema.get("properties", {}).items():
+            assert "description" in spec, f"{name}.{parameter} has no description"
+
+    limit = tools["search_code"].inputSchema["properties"]["limit"]
+    assert (limit["minimum"], limit["maximum"]) == (1, 50)
+    assert tools["find_symbol"].inputSchema["properties"]["match"]["enum"] == [
+        "exact",
+        "prefix",
+        "contains",
+    ]

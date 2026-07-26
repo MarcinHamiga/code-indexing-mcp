@@ -1,7 +1,7 @@
 """Immutable domain models."""
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, GetJsonSchemaHandler
 from pydantic.json_schema import JsonSchemaValue
@@ -40,6 +40,37 @@ LEGACY_DEFAULT_INCLUDES_V1 = [
 ]
 
 DEFAULT_INCLUDES = [*LEGACY_DEFAULT_INCLUDES_V1, "**/*.java"]
+
+# The kinds TreeSitterExtractor emits, plus the "_part" variants it produces when a
+# definition is split across chunks. Closed so MCP clients get an enum instead of a
+# free-text field; extend both halves together when a query file gains a capture.
+ChunkKind = Literal[
+    "annotation",
+    "class",
+    "constant",
+    "constructor",
+    "enum",
+    "function",
+    "interface",
+    "method",
+    "module",
+    "record",
+    "type",
+    "annotation_part",
+    "class_part",
+    "constant_part",
+    "constructor_part",
+    "enum_part",
+    "function_part",
+    "interface_part",
+    "method_part",
+    "record_part",
+    "type_part",
+]
+
+# Mirrors scanner.LANGUAGES values. Kept here rather than imported from scanner so
+# models stays free of scanner imports.
+LanguageName = Literal["python", "java", "javascript", "typescript", "tsx"]
 
 
 class FrozenModel(BaseModel):
