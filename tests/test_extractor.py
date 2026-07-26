@@ -391,3 +391,28 @@ def test_chunk_kind_literal_covers_every_kind_the_queries_capture() -> None:
     missing = captured - declared
     assert not missing, f"ChunkKind is missing extractor kinds: {sorted(missing)}"
     assert {f"{kind}_part" for kind in captured if kind != "module"} <= declared
+
+
+def test_compiled_query_is_built_once_per_language(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The .scm files are package data and Language objects are built in __init__.
+
+    Re-reading and recompiling per file cost 44% of extraction time over 35 files.
+    """
+    import incode_mcp.extractor as extractor_module
+
+    compiled: list[str] = []
+    original = extractor_module.Query
+
+    def counting_query(language: object, text: str) -> object:
+        compiled.append(text[:40])
+        return original(language, text)
+
+    monkeypatch.setattr(extractor_module, "Query", counting_query)
+    extractor = extractor_module.TreeSitterExtractor()
+    source = b"def one():\n    return 1\n"
+
+    for _ in range(5):
+        extractor.extract(Path("a.py"), "python", source)
+    extractor.extract(Path("b.ts"), "typescript", b"export const x = 1;\n")
+
+    assert len(compiled) == 2, f"compiled {len(compiled)} times, expected one per language"

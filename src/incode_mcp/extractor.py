@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib.resources import files
@@ -61,12 +62,36 @@ class TreeSitterExtractor:
         self.max_lines = max_lines
         self.overlap_lines = min(overlap_lines, max(0, max_lines - 1))
         self._languages = _languages()
+        self._queries: dict[str, Query] = {}
+        # Indexer holds one extractor and the daemon serves each client on its own
+        # thread, so the lazy compile must not build two queries concurrently. Same
+        # double-checked shape as FastEmbedder's model load.
+        self._queries_lock = threading.Lock()
+
+    def _query(self, language_name: str) -> Query:
+        """Return the compiled query for *language_name*, compiling once per process.
+
+        The .scm files are package data and never change at runtime, but the previous
+        code re-read and recompiled one per extracted file, which measured at 44% of
+        extraction time across a 35-file pass.
+        """
+        cached = self._queries.get(language_name)
+        if cached is not None:
+            return cached
+        with self._queries_lock:
+            cached = self._queries.get(language_name)
+            if cached is not None:
+                return cached
+            text = files("incode_mcp.queries").joinpath(f"{language_name}.scm").read_text()
+            compiled = Query(self._languages[language_name], text)
+            self._queries[language_name] = compiled
+            return compiled
 
     def extract(self, path: Path, language: str, source: bytes) -> ExtractionResult:
         language_impl = self._languages[language]
         normalized_source = source.decode("utf-8-sig").encode("utf-8")
         tree = Parser(language_impl).parse(normalized_source)
-        definitions = self._definitions(language, language_impl, tree.root_node, normalized_source)
+        definitions = self._definitions(language, tree.root_node, normalized_source)
         chunks: list[ExtractedChunk] = []
         covered: list[tuple[int, int]] = []
 
@@ -94,12 +119,8 @@ class TreeSitterExtractor:
         chunks.sort(key=lambda chunk: (chunk.start_byte, chunk.end_byte, chunk.kind))
         return ExtractionResult(chunks=chunks, has_errors=tree.root_node.has_error)
 
-    @staticmethod
-    def _definitions(
-        language_name: str, language: Language, root: Node, source: bytes
-    ) -> list[_Definition]:
-        query_text = files("incode_mcp.queries").joinpath(f"{language_name}.scm").read_text()
-        matches = QueryCursor(Query(language, query_text)).matches(root)
+    def _definitions(self, language_name: str, root: Node, source: bytes) -> list[_Definition]:
+        matches = QueryCursor(self._query(language_name)).matches(root)
         found: dict[tuple[int, int, str], _Definition] = {}
         for _, captures in matches:
             name_nodes = captures.get("name", [])
