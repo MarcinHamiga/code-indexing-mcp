@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -52,7 +53,7 @@ class TreeSitterExtractor:
     def __init__(
         self,
         *,
-        max_chars: int = 12_000,
+        max_chars: int = 4_096,
         max_lines: int = 200,
         overlap_lines: int = 20,
     ) -> None:
@@ -211,6 +212,12 @@ class TreeSitterExtractor:
             ]
 
         lines = content.splitlines(keepends=True)
+        # Cumulative UTF-8 byte offset of each line, so chunk offsets stay linear
+        # to compute instead of re-encoding every preceding line per part.
+        line_offsets = [0]
+        for line in lines:
+            line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+        part_kind = f"{kind}_part" if kind != "module" else "module"
         chunks: list[ExtractedChunk] = []
         cursor = 0
         part = 0
@@ -220,38 +227,80 @@ class TreeSitterExtractor:
             end_cursor = cursor
             while end_cursor < len(lines) and len(part_lines) < self.max_lines:
                 line = lines[end_cursor]
-                if part_lines and char_count + len(line) > self.max_chars:
+                if char_count + len(line) > self.max_chars:
+                    # With no lines accumulated this means the line is oversized
+                    # on its own, and the fragment path below handles it.
                     break
                 part_lines.append(line)
                 char_count += len(line)
                 end_cursor += 1
             if not part_lines:
-                part_lines = [lines[cursor][: self.max_chars]]
-                end_cursor = cursor + 1
+                # This single line is wider than max_chars on its own. Split just
+                # that line into bounded fragments; the surrounding lines keep
+                # using the ordinary line windows below.
+                for offset, fragment in self._line_fragments(lines[cursor]):
+                    fragment_content = fragment.rstrip()
+                    if not fragment_content:
+                        continue
+                    byte_start = start + line_offsets[cursor] + offset
+                    chunks.append(
+                        self._make_chunk(
+                            path,
+                            language,
+                            part_kind,
+                            symbol,
+                            qualified,
+                            parent,
+                            byte_start,
+                            byte_start + len(fragment.encode("utf-8")),
+                            start_line + cursor,
+                            fragment_content,
+                            part,
+                        )
+                    )
+                    part += 1
+                cursor += 1
+                continue
             part_content = "".join(part_lines).rstrip()
-            byte_start = start + len("".join(lines[:cursor]).encode("utf-8"))
-            byte_end = byte_start + len("".join(part_lines).encode("utf-8"))
-            part_kind = f"{kind}_part" if kind != "module" else "module"
-            chunks.append(
-                self._make_chunk(
-                    path,
-                    language,
-                    part_kind,
-                    symbol,
-                    qualified,
-                    parent,
-                    byte_start,
-                    byte_end,
-                    start_line + cursor,
-                    part_content,
-                    part,
+            if part_content:
+                byte_start = start + line_offsets[cursor]
+                byte_end = byte_start + len("".join(part_lines).encode("utf-8"))
+                chunks.append(
+                    self._make_chunk(
+                        path,
+                        language,
+                        part_kind,
+                        symbol,
+                        qualified,
+                        parent,
+                        byte_start,
+                        byte_end,
+                        start_line + cursor,
+                        part_content,
+                        part,
+                    )
                 )
-            )
+                part += 1
             if end_cursor >= len(lines):
                 break
-            cursor = max(cursor + 1, end_cursor - self.overlap_lines)
-            part += 1
+            if len(lines[end_cursor]) > self.max_chars:
+                # The window stopped because the next line is oversized, not
+                # because it filled up. Overlapping back into it would emit a
+                # near-duplicate window per line until the cursor crawls there.
+                cursor = end_cursor
+            else:
+                cursor = max(cursor + 1, end_cursor - self.overlap_lines)
         return chunks
+
+    def _line_fragments(self, line: str) -> Iterator[tuple[int, str]]:
+        """Yield (byte offset within *line*, fragment) for an oversized line."""
+        cursor = 0
+        byte_offset = 0
+        while cursor < len(line):
+            fragment = line[cursor : cursor + self.max_chars]
+            yield byte_offset, fragment
+            cursor += len(fragment)
+            byte_offset += len(fragment.encode("utf-8"))
 
     def _module_chunks(
         self, path: Path, language: str, source: bytes, covered: list[tuple[int, int]]
@@ -307,7 +356,8 @@ class TreeSitterExtractor:
         context = [f"language: {language}", f"path: {path.as_posix()}", f"kind: {kind}"]
         if qualified:
             context.append(f"symbol: {qualified}")
-        embedding_text = "\n".join([*context, content])
+        prefix = "\n".join(context)
+        embedding_text = f"{prefix}\n{content}"
         normalized = normalize_identifier(
             " ".join(filter(None, [path.as_posix(), qualified or "", symbol or ""]))
         )
@@ -324,4 +374,6 @@ class TreeSitterExtractor:
             embedding_text=embedding_text,
             search_text=f"{embedding_text}\n{normalized}",
             part_index=part_index,
+            embedding_prefix=prefix,
+            search_suffix=normalized,
         )

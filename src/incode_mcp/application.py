@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -10,7 +11,8 @@ from pathlib import Path
 from filelock import FileLock
 from platformdirs import user_cache_path, user_data_path
 
-from .embedding import Embedder, FastEmbedder
+from .embedding import Embedder, FastEmbedder, SegmentPlan
+from .embedding_worker import EmbeddingWorkerSession, WorkerConfig
 from .errors import ErrorCode, IncodeError
 from .extractor import TreeSitterExtractor
 from .indexing import Indexer
@@ -28,6 +30,7 @@ from .models import (
 from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
 from .scanner import SourceScanner
 from .search import SearchService
+from .settings import IndexSettings
 from .storage import LanceStore
 
 
@@ -61,20 +64,54 @@ class Application:
         *,
         embedder: Embedder | None = None,
         cwd: Path | None = None,
+        settings: IndexSettings | None = None,
     ) -> None:
         self.paths = paths
         self.cwd = (cwd or Path.cwd()).resolve()
+        self.settings = settings or IndexSettings.from_environment()
         if embedder is None:
             offline = os.environ.get("INCODE_OFFLINE", "").lower() in {"1", "true", "yes"}
-            embedder = FastEmbedder(paths.cache / "models", offline=offline)
+            embedder = FastEmbedder(
+                paths.cache / "models",
+                offline=offline,
+                threads=self.settings.embedding_threads,
+                enable_cpu_mem_arena=self.settings.embedding_cpu_arena,
+            )
         self.embedder = embedder
-        self.store = LanceStore(paths.data / "lancedb", vector_dimension=embedder.dimension)
+        self.store = LanceStore(
+            paths.data / "lancedb",
+            vector_dimension=embedder.dimension,
+            vector_index=self.settings.vector_index,
+        )
+        passage_session_factory: Callable[[], EmbeddingWorkerSession] | None = None
+        if isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker":
+            worker_config = WorkerConfig(
+                cache_directory=str(embedder.cache_directory),
+                offline=embedder.offline,
+                threads=self.settings.embedding_threads,
+                enable_cpu_mem_arena=self.settings.embedding_cpu_arena,
+                dimension=embedder.dimension,
+                model_id=embedder.model_id,
+            )
+            ceiling_bytes = self.settings.index_memory_bytes
+
+            def new_worker_session() -> EmbeddingWorkerSession:
+                return EmbeddingWorkerSession(worker_config, configured_ceiling_bytes=ceiling_bytes)
+
+            passage_session_factory = new_worker_session
         self.indexer = Indexer(
             store=self.store,
             scanner=SourceScanner(),
             extractor=TreeSitterExtractor(),
             embedder=embedder,
             lock_directory=paths.data / "locks",
+            batch_size=self.settings.embedding_batch_size,
+            segment_plan=SegmentPlan(
+                max_tokens=self.settings.embedding_max_tokens,
+                overlap_tokens=self.settings.embedding_overlap_tokens,
+                max_items=self.settings.embedding_batch_size,
+            ),
+            passage_session_factory=passage_session_factory,
         )
         self.search = SearchService(self.store, embedder)
 
@@ -97,12 +134,14 @@ class Application:
                     "Multiple MCP roots are available; provide an explicit path",
                 )
             path = roots[0]
-        project = initialize_project(
-            Path(path) if path is not None else self.cwd,
-            name=name,
-            force_new_id=force_new_id,
-        )
-        self._register_project(project)
+        root = Path(path) if path is not None else self.cwd
+        # The daemon serves every client on its own thread, so N clients calling
+        # this for one root would otherwise all miss the marker and register N
+        # ids for the same project. Marker creation and registration are one
+        # critical section, keyed the same way as discovery.
+        with self._root_lock(root):
+            project = initialize_project(root, name=name, force_new_id=force_new_id)
+            self._register_project(project)
         return project
 
     def discover_project(self, root: Path) -> ProjectInfo | None:
@@ -110,9 +149,7 @@ class Application:
         root = root.expanduser().resolve()
         if not root.is_dir():
             return None
-        lock_name = sha256(str(root).encode()).hexdigest()
-        lock = FileLock(self.paths.data / "locks" / f"discover-{lock_name}.lock")
-        with lock:
+        with self._root_lock(root):
             marker_root = find_project_root(root)
             if marker_root is not None:
                 project = read_project_marker(marker_root)
@@ -204,6 +241,13 @@ class Application:
         if not isinstance(self.embedder, FastEmbedder):
             return
         self.embedder.prepare()
+
+    def _root_lock(self, root: Path) -> FileLock:
+        """Return the cross-thread, cross-process lock guarding *root*'s marker."""
+        directory = self.paths.data / "locks"
+        directory.mkdir(parents=True, exist_ok=True)
+        digest = sha256(str(root.expanduser().resolve()).encode()).hexdigest()
+        return FileLock(directory / f"discover-{digest}.lock")
 
     def _register_project(self, project: ProjectInfo) -> None:
         """Persist *project*, upserting as pending if new or revalidating if known.

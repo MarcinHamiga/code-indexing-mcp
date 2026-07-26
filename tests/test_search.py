@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from incode_mcp.extractor import TreeSitterExtractor
 from incode_mcp.indexing import Indexer
 from incode_mcp.projects import initialize_project
@@ -65,6 +67,40 @@ def test_hybrid_search_respects_project_scope_and_filters(tmp_path: Path) -> Non
     assert search.search_code("invoice", [projects[0]], paths=["billing/**"]).hits == []
 
 
+def test_structural_queries_do_not_materialize_full_chunk_vectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, search, projects = indexed_projects(tmp_path)
+
+    def reject_full_rows(*_: object, **__: object) -> object:
+        raise AssertionError("structural queries must not call list_chunks")
+
+    monkeypatch.setattr(store, "list_chunks", reject_full_rows)
+
+    symbols = search.find_symbol("enforce_permissions", projects[0])
+    outline = search.file_outline("auth.py", projects[0])
+
+    assert symbols.hits[0].symbol == "enforce_permissions"
+    assert outline.items[0].symbol == "enforce_permissions"
+
+
+def test_hybrid_search_projects_result_columns(tmp_path: Path) -> None:
+    store, _, projects = indexed_projects(tmp_path)
+
+    rows = store.hybrid_search(
+        "permissions",
+        [1.0, 0.0, 0.0, 0.0],
+        [projects[0]],
+        None,
+        5,
+    )
+
+    assert rows
+    assert "vector" not in rows[0]
+    assert "embedding_text" not in rows[0]
+    assert "search_text" not in rows[0]
+
+
 def test_symbol_lookup_and_outline_use_indexed_metadata(tmp_path: Path) -> None:
     _, search, projects = indexed_projects(tmp_path)
 
@@ -122,7 +158,7 @@ def test_search_truncates_snippet_and_get_chunk_returns_full_content(tmp_path: P
     Indexer(
         store=store,
         scanner=SourceScanner(),
-        extractor=TreeSitterExtractor(),
+        extractor=TreeSitterExtractor(max_chars=8_000),
         embedder=embedder,
         lock_directory=tmp_path / "locks",
     ).index(project)
@@ -134,3 +170,44 @@ def test_search_truncates_snippet_and_get_chunk_returns_full_content(tmp_path: P
     assert len(result.hits[0].snippet) == 4_000
     assert result.hits[0].truncated is True
     assert len(full.content) > len(result.hits[0].snippet)
+
+
+def _indexed_source(tmp_path: Path, source: str) -> tuple[SearchService, str]:
+    embedder = SemanticEmbedder()
+    store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
+    indexer = Indexer(
+        store=store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=embedder,
+        lock_directory=tmp_path / "locks",
+    )
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "module.py").write_text(source)
+    project = initialize_project(root)
+    indexer.index(project)
+    return SearchService(store, embedder), project.id
+
+
+def test_symbol_match_does_not_treat_underscores_as_wildcards(tmp_path: Path) -> None:
+    """The LIKE pushdown over-matches; exact semantics must be re-applied."""
+    search, project_id = _indexed_source(
+        tmp_path,
+        "def load_user():\n    return 1\n\n\ndef loadXuser():\n    return 2\n",
+    )
+
+    prefix = search.find_symbol("load_user", project_id, match="prefix")
+    contains = search.find_symbol("load_user", project_id, match="contains")
+
+    assert {hit.symbol for hit in prefix.hits} == {"load_user"}
+    assert {hit.symbol for hit in contains.hits} == {"load_user"}
+
+
+def test_symbol_results_are_ordered_before_the_limit_applies(tmp_path: Path) -> None:
+    source = "".join(f"def handler_{index}():\n    return {index}\n\n\n" for index in range(12))
+    search, project_id = _indexed_source(tmp_path, source)
+
+    hits = search.find_symbol("handler_", project_id, match="prefix", limit=3)
+
+    assert [hit.symbol for hit in hits.hits] == ["handler_0", "handler_1", "handler_2"]

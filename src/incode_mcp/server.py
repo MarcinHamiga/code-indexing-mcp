@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -19,6 +19,7 @@ from mcp.server.session import ServerSession
 from mcp.types import Tool as MCPTool
 
 from .application import Application
+from .daemon import BrokerApplication
 from .errors import ErrorCode, IncodeError
 from .models import (
     CodeChunk,
@@ -30,8 +31,16 @@ from .models import (
     SearchResponse,
     SymbolResponse,
 )
+from .settings import IndexMode, IndexSettings
 
 logger = logging.getLogger(__name__)
+
+# Bounds on the retry cadence used while another indexing job holds the global
+# lock. Polling stays cancellable between non-blocking attempts, so the first
+# delays are short enough to pick up a briefly held lock quickly, and the cap
+# keeps a long wait from spinning.
+INITIAL_RETRY_DELAY_SECONDS = 0.05
+MAXIMUM_RETRY_DELAY_SECONDS = 1.0
 
 
 @dataclass
@@ -41,6 +50,7 @@ class _StartupJob:
     project_id: str | None = None
     discovery_error: BaseException | None = None
     indexing_error: BaseException | None = None
+    indexes: bool = False
 
     @property
     def failed(self) -> bool:
@@ -49,26 +59,34 @@ class _StartupJob:
 
 class StartupCoordinator:
     def __init__(
-        self, application: Application, task_group: anyio.abc.TaskGroup, *, enabled: bool
+        self,
+        application: Application | BrokerApplication,
+        task_group: anyio.abc.TaskGroup,
+        *,
+        mode: IndexMode,
+        wait_seconds: int = 300,
     ) -> None:
         self.application = application
         self.task_group = task_group
-        self.enabled = enabled
+        self.mode = mode
+        self.wait_seconds = wait_seconds
         self._jobs: dict[Path, _StartupJob] = {}
         self._lock = asyncio.Lock()
         self._limiter = anyio.CapacityLimiter(1)
 
-    async def schedule(self, roots: list[Path]) -> None:
-        if not self.enabled:
+    async def schedule(self, roots: list[Path], *, indexes: bool) -> None:
+        if self.mode is IndexMode.MANUAL:
             return
         async with self._lock:
             for root in roots:
                 root = root.resolve()
                 existing = self._jobs.get(root)
-                if existing is not None and not (existing.ready.is_set() and existing.failed):
-                    # A job is still in flight, or already finished successfully.
-                    continue
-                job = _StartupJob()
+                if existing is not None:
+                    if not existing.ready.is_set():
+                        continue
+                    if not existing.failed and (existing.indexes or not indexes):
+                        continue
+                job = _StartupJob(indexes=indexes)
                 self._jobs[root] = job
                 self.task_group.start_soon(self._run, root, job)
 
@@ -77,6 +95,13 @@ class StartupCoordinator:
             await job.discovered.wait()
             if job.discovery_error is not None:
                 raise job.discovery_error
+
+    async def has_pending_indexing(self, roots: list[Path], project_ids: set[str]) -> bool:
+        """Return whether a caller would actually block waiting on these roots."""
+        return any(
+            job.project_id in project_ids and job.indexes and not job.ready.is_set()
+            for job in await self._jobs_for(roots)
+        )
 
     async def wait_for_ready(self, roots: list[Path], project_ids: set[str]) -> None:
         for job in await self._jobs_for(roots):
@@ -101,21 +126,10 @@ class StartupCoordinator:
             )
             job.project_id = project.id if project is not None else None
             job.discovered.set()
-            if project is None:
+            if project is None or not job.indexes:
                 logger.info("Skipping automatic indexing for non-project root: %s", root)
                 return
-            async with self._limiter:
-                while True:
-                    try:
-                        report = await anyio.to_thread.run_sync(
-                            partial(self.application.index_project, project.id),
-                            abandon_on_cancel=False,
-                        )
-                        break
-                    except IncodeError as exc:
-                        if exc.code is not ErrorCode.INDEX_BUSY:
-                            raise
-                        await anyio.sleep(0.05)
+            report = await self._index_when_free(project.id)
             logger.info(
                 "Automatic indexing complete for %s: %s files indexed",
                 project.root,
@@ -130,6 +144,75 @@ class StartupCoordinator:
             logger.exception("Automatic indexing failed for %s", root)
         finally:
             job.ready.set()
+
+    async def _index_when_free(self, project_id: str) -> IndexReport:
+        """Index *project_id* once the machine is free, within ``wait_seconds``.
+
+        Two separate things make a job wait: another root queued ahead of it in
+        this process, and another process holding the global index lock. Both
+        look identical to a first query - someone else is indexing - so one
+        deadline spans both rather than restarting at the hand-off.
+        """
+        started = time.monotonic()
+        deadline = started + self.wait_seconds
+        await self._acquire_slot(deadline, started=started)
+        try:
+            return await self._index_with_backoff(project_id, deadline=deadline, started=started)
+        finally:
+            self._limiter.release()
+
+    async def _acquire_slot(self, deadline: float, *, started: float) -> None:
+        """Take this process's single indexing slot, giving up at *deadline*."""
+        try:
+            self._limiter.acquire_nowait()
+            return
+        except anyio.WouldBlock:
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            with anyio.move_on_after(remaining):
+                await self._limiter.acquire()
+                return
+        raise self._busy(time.monotonic() - started)
+
+    async def _index_with_backoff(
+        self, project_id: str, *, deadline: float, started: float
+    ) -> IndexReport:
+        """Index *project_id*, waiting out a competing process up to *deadline*.
+
+        The global index lock is taken non-blockingly so this task stays
+        cancellable between attempts; a blocking acquire inside ``run_sync``
+        could not be abandoned at shutdown. Without a deadline the retry loop
+        would make a first query hang for as long as any other job runs.
+        """
+        delay = INITIAL_RETRY_DELAY_SECONDS
+        while True:
+            try:
+                return await anyio.to_thread.run_sync(
+                    partial(self.application.index_project, project_id),
+                    abandon_on_cancel=False,
+                )
+            except IncodeError as exc:
+                if exc.code is not ErrorCode.INDEX_BUSY:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise self._busy(time.monotonic() - started, cause=exc) from exc
+                await anyio.sleep(min(delay, remaining))
+                delay = min(delay * 2, MAXIMUM_RETRY_DELAY_SECONDS)
+
+    def _busy(self, waited: float, *, cause: IncodeError | None = None) -> IncodeError:
+        message = (
+            str(cause.args[0]) if cause is not None else "Another indexing job is already active"
+        )
+        details = dict(cause.details) if cause is not None else {}
+        details["waited_seconds"] = round(waited, 3)
+        details["wait_timeout_seconds"] = self.wait_seconds
+        return IncodeError(
+            ErrorCode.INDEX_BUSY,
+            f"{message}; gave up after waiting {waited:.1f}s",
+            **details,
+        )
 
 
 ServerContext = Context[ServerSession, StartupCoordinator]
@@ -148,12 +231,6 @@ async def _roots(ctx: ServerContext) -> list[Path]:
     return roots
 
 
-def _auto_index_enabled(value: bool | None) -> bool:
-    if value is not None:
-        return value
-    return os.environ.get("INCODE_AUTO_INDEX", "1").lower() not in {"0", "false", "no"}
-
-
 def _coordinator(ctx: ServerContext) -> StartupCoordinator | None:
     try:
         return ctx.request_context.lifespan_context
@@ -161,13 +238,15 @@ def _coordinator(ctx: ServerContext) -> StartupCoordinator | None:
         return None
 
 
-async def _startup_roots(ctx: ServerContext, *, wait_for: str | None = None) -> list[Path]:
+async def _startup_roots(
+    ctx: ServerContext, *, discover: bool = False, indexes: bool = False
+) -> list[Path]:
     roots = await _roots(ctx)
     coordinator = _coordinator(ctx)
     if coordinator is None:
         return roots
-    await coordinator.schedule(roots)
-    if wait_for == "discovery":
+    await coordinator.schedule(roots, indexes=indexes)
+    if discover or indexes:
         await coordinator.wait_for_discovery(roots)
     return roots
 
@@ -176,14 +255,31 @@ async def _wait_for_startup_projects(
     ctx: ServerContext, roots: list[Path], project_ids: list[str]
 ) -> None:
     coordinator = _coordinator(ctx)
-    if coordinator is not None:
-        await coordinator.wait_for_ready(roots, set(project_ids))
+    if coordinator is None:
+        return
+    wanted = set(project_ids)
+    # In lazy mode the first code query blocks on a full initial index. Report
+    # progress so the client can distinguish a slow index from a hung tool call.
+    pending = await coordinator.has_pending_indexing(roots, wanted)
+    if pending:
+        logger.info("Waiting for the initial index before serving the first query")
+        await ctx.report_progress(0, 1, "Building the initial index")
+    await coordinator.wait_for_ready(roots, wanted)
+    if pending:
+        await ctx.report_progress(1, 1, "Index ready")
 
 
 class AutoIndexingMCP(FastMCP):
-    def __init__(self, application: Application, *, auto_index: bool) -> None:
+    def __init__(
+        self,
+        application: Application | BrokerApplication,
+        *,
+        mode: IndexMode,
+        wait_seconds: int = 300,
+    ) -> None:
         self.application = application
-        self.auto_index = auto_index
+        self.mode = mode
+        self.wait_seconds = wait_seconds
         super().__init__(
             "code-indexing-mcp",
             instructions="Local Tree-sitter code indexing and hybrid search.",
@@ -195,7 +291,12 @@ class AutoIndexingMCP(FastMCP):
     async def _lifespan(self, _: FastMCP) -> AsyncIterator[StartupCoordinator]:
         async with anyio.create_task_group() as task_group:
             try:
-                yield StartupCoordinator(self.application, task_group, enabled=self.auto_index)
+                yield StartupCoordinator(
+                    self.application,
+                    task_group,
+                    mode=self.mode,
+                    wait_seconds=self.wait_seconds,
+                )
             finally:
                 # Lock waiters are cancellable between non-blocking attempts. A worker
                 # that has acquired the index lock remains owned until its write
@@ -204,20 +305,30 @@ class AutoIndexingMCP(FastMCP):
 
     async def list_tools(self) -> list[MCPTool]:
         tools = await super().list_tools()
-        if not self.auto_index:
+        if self.mode is not IndexMode.EAGER:
             return tools
         context = self.get_context()
         coordinator = _coordinator(context)
         if coordinator is not None:
-            await coordinator.schedule(await _roots(context))
+            await coordinator.schedule(await _roots(context), indexes=True)
         return tools
 
 
 def create_server(
-    application: Application | None = None, *, auto_index: bool | None = None
+    application: Application | BrokerApplication | None = None,
+    *,
+    auto_index: bool | None = None,
 ) -> FastMCP:
     app = application or Application.from_environment()
-    mcp = AutoIndexingMCP(app, auto_index=_auto_index_enabled(auto_index))
+    settings = IndexSettings.from_environment()
+    mode = (
+        IndexMode.EAGER
+        if auto_index
+        else IndexMode.MANUAL
+        if auto_index is not None
+        else settings.mode
+    )
+    mcp = AutoIndexingMCP(app, mode=mode, wait_seconds=settings.index_wait_seconds)
 
     @mcp.tool()
     async def init_project(
@@ -226,7 +337,7 @@ def create_server(
         name: str | None = None,
         force_new_id: bool = False,
     ) -> ProjectInfo:
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(
             app.init_project,
             path,
@@ -243,7 +354,7 @@ def create_server(
         # meant to let callers manually recover from. If startup indexing is still
         # running, app.index_project's 0-timeout file lock raises INDEX_BUSY, which is
         # acceptable, pre-existing behavior.
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, discover=True)
         await ctx.report_progress(0, 1, "Indexing project")
         report = await asyncio.to_thread(app.index_project, project, roots=roots, force=force)
         await ctx.report_progress(1, 1, "Index complete")
@@ -251,7 +362,7 @@ def create_server(
 
     @mcp.tool()
     async def project_status(ctx: ServerContext, project: str | None = None) -> ProjectStatus:
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(app.project_status, project, roots=roots)
 
     @mcp.tool()
@@ -275,7 +386,7 @@ def create_server(
         kinds: list[str] | None = None,
         limit: int = 8,
     ) -> SearchResponse:
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, indexes=True)
         project_ids = await asyncio.to_thread(
             app.resolve_search_scope, projects, all_projects, roots
         )
@@ -301,7 +412,7 @@ def create_server(
         kinds: list[str] | None = None,
         limit: int = 20,
     ) -> SymbolResponse:
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, indexes=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved.id])
         return await asyncio.to_thread(
@@ -318,7 +429,7 @@ def create_server(
     async def file_outline(
         ctx: ServerContext, path: str, project: str | None = None
     ) -> OutlineResponse:
-        roots = await _startup_roots(ctx, wait_for="discovery")
+        roots = await _startup_roots(ctx, indexes=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved.id])
         return await asyncio.to_thread(app.file_outline, path, resolved.id, roots=roots)

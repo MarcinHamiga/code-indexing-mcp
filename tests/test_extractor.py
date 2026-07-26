@@ -1,3 +1,4 @@
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,58 @@ def test_splits_oversized_function_into_bounded_parts() -> None:
     assert all(chunk.kind == "function_part" for chunk in parts)
     assert [chunk.part_index for chunk in parts] == list(range(len(parts)))
     assert all(chunk.start_line <= chunk.end_line for chunk in parts)
+
+
+def test_splits_a_single_oversized_line_into_bounded_chunks() -> None:
+    source = ("payload = '" + ("x" * 10_000) + "'\n").encode()
+
+    result = TreeSitterExtractor(max_chars=1024).extract(Path("payload.py"), "python", source)
+
+    assert len(result.chunks) > 1
+    assert all(len(chunk.content) <= 1024 for chunk in result.chunks)
+
+
+def test_one_oversized_line_does_not_split_its_neighbours_per_line() -> None:
+    """An oversized line is fragmented on its own; the rest keeps line windows."""
+    body = "\n".join(f"    value_{index} = {index}" for index in range(400))
+    ordinary = f"def big():\n{body}\n".encode()
+    with_long_line = f"def big():\n{body}\n    blob = '{'x' * 5_000}'\n".encode()
+    extractor = TreeSitterExtractor()
+
+    baseline = extractor.extract(Path("ordinary.py"), "python", ordinary)
+    mixed = extractor.extract(Path("mixed.py"), "python", with_long_line)
+
+    # The long line only adds its own fragments; it must not force every
+    # surrounding line onto a chunk of its own.
+    assert len(mixed.chunks) < len(baseline.chunks) + 10
+    assert all(len(chunk.content) <= extractor.max_chars for chunk in mixed.chunks)
+
+
+def test_blank_runs_around_an_oversized_line_produce_no_empty_chunks() -> None:
+    lines = []
+    for index in range(50):
+        lines.append(f"    value_{index} = {index}")
+        lines.append("")
+    lines.append(f"    blob = '{'x' * 5_000}'")
+    source = ("def spaced():\n" + "\n".join(lines) + "\n").encode()
+
+    result = TreeSitterExtractor().extract(Path("spaced.py"), "python", source)
+
+    assert result.chunks
+    assert all(chunk.content.strip() for chunk in result.chunks)
+
+
+def test_oversized_line_fragments_carry_contiguous_byte_ranges() -> None:
+    prefix = "value = 1\n"
+    source = (prefix + "blob = '" + ("x" * 5_000) + "'\n").encode()
+
+    result = TreeSitterExtractor(max_chars=1024).extract(Path("offsets.py"), "python", source)
+    fragments = [chunk for chunk in result.chunks if chunk.start_byte >= len(prefix)]
+
+    assert len(fragments) > 1
+    for earlier, later in pairwise(fragments):
+        assert earlier.end_byte == later.start_byte
+    assert fragments[-1].end_byte <= len(source)
 
 
 def test_syntax_errors_are_reported_but_valid_symbols_survive() -> None:

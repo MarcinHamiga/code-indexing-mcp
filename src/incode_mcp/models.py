@@ -93,6 +93,12 @@ class ExtractedChunk(FrozenModel):
     embedding_text: str
     search_text: str
     part_index: int = 0
+    # The two halves ``embedding_text`` and ``search_text`` are composed from.
+    # Keeping them lets a token window be recomposed with the same context
+    # header and identifier tail as the whole chunk, instead of the header being
+    # windowed away from every part after the first.
+    embedding_prefix: str = ""
+    search_suffix: str = ""
 
 
 class ExtractionResult(FrozenModel):
@@ -135,6 +141,22 @@ class StoredChunk(FrozenModel):
     vector: list[float]
 
 
+class ChunkPreview(FrozenModel):
+    """A query result that deliberately excludes embedding and index payloads."""
+
+    chunk_id: str
+    project_id: str
+    path: str
+    language: str
+    kind: str
+    symbol: str | None = None
+    qualified_symbol: str | None = None
+    parent_symbol: str | None = None
+    start_line: int
+    end_line: int
+    content: str = ""
+
+
 class IndexIssue(FrozenModel):
     path: str
     message: str
@@ -152,6 +174,26 @@ class IndexReport(FrozenModel):
     skipped_files: int = 0
     errors: list[IndexIssue] = Field(default_factory=list)
     duration_ms: int = 0
+    # Phase breakdown of duration_ms. They do not sum to it: lock acquisition and
+    # project bookkeeping sit outside, and embedding includes the one-time worker
+    # spawn and model load. Optional so older clients keep validating reports.
+    scan_duration_ms: int | None = None
+    parse_duration_ms: int | None = None
+    embed_duration_ms: int | None = None
+    commit_duration_ms: int | None = None
+    memory_budget_bytes: int | None = None
+    peak_memory_bytes: int | None = None
+    worker_used: bool = False
+    # Token-window telemetry, populated only on worker runs. embedded_segments
+    # counts what the worker embedded, which includes segments from files that
+    # later failed and were not committed, so it can exceed embedded_chunks.
+    # token_windowing=False means no tokenizer was reachable and sequence length
+    # went unbounded.
+    embedded_segments: int | None = None
+    embedded_tokens: int | None = None
+    embedding_retries: int | None = None
+    worker_termination_reason: str | None = None
+    token_windowing: bool | None = None
 
 
 class SearchHit(FrozenModel):
