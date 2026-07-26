@@ -246,7 +246,9 @@ class EmbeddingWorkerSession:
                     start_char=start_char,
                     end_char=end_char,
                     token_count=token_count,
-                    vector=np.frombuffer(vector, dtype="<f4", count=self.config.dimension).tolist(),
+                    # Already packed little-endian float32 on the wire; keep it
+                    # packed so staging never builds a list of Python floats.
+                    vector=vector,
                 )
                 for start_char, end_char, token_count, vector in segments
             ]

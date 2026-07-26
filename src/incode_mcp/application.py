@@ -31,6 +31,7 @@ from .projects import ProjectResolver, find_project_root, initialize_project, re
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
+from .staging import recover_staged_commits
 from .storage import LanceStore
 
 
@@ -83,6 +84,14 @@ class Application:
             vector_dimension=embedder.dimension,
             vector_index=self.settings.vector_index,
         )
+        # Roll back any commit interrupted by a crash before queries are
+        # accepted, so a half-written project never becomes searchable. The
+        # global index lock keeps recovery from running underneath a commit
+        # another process is legitimately writing right now.
+        lock_directory = paths.data / "locks"
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        with FileLock(lock_directory / "index-global.lock"):
+            recover_staged_commits(paths.data / "staging", self.store)
         passage_session_factory: Callable[[], EmbeddingWorkerSession] | None = None
         if isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker":
             worker_config = WorkerConfig(
@@ -112,6 +121,7 @@ class Application:
                 max_items=self.settings.embedding_batch_size,
             ),
             passage_session_factory=passage_session_factory,
+            staging_directory=paths.data / "staging",
         )
         self.search = SearchService(self.store, embedder)
 

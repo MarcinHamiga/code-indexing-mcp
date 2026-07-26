@@ -224,7 +224,7 @@ def test_plan_and_embed_returns_a_segment_per_token_window() -> None:
         )
 
     assert len(segments[0]) > 1
-    assert all(len(segment.vector) == 4 for segment in segments[0])
+    assert all(len(segment.vector) == 4 * 4 for segment in segments[0])
     assert segments[0][0].start_char == 0
     assert segments[0][-1].end_char == len(content)
     assert session.segment_count == len(segments[0])

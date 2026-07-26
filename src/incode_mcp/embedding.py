@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+import numpy as np
 from fastembed import TextEmbedding
 
 from .errors import ErrorCode, IncodeError
@@ -42,12 +43,22 @@ class PassageCandidate:
 
 @dataclass(frozen=True)
 class EmbeddedSegment:
-    """One token-bounded window of a candidate and its vector."""
+    """One token-bounded window of a candidate and its vector.
+
+    ``vector`` is contiguous little-endian float32 bytes -- the same wire
+    format the embedding worker returns -- so the indexing write path never
+    materializes a list of Python floats per chunk.
+    """
 
     start_char: int
     end_char: int
     token_count: int
-    vector: list[float]
+    vector: bytes
+
+
+def pack_vector(vector: Sequence[float] | np.ndarray[Any, Any]) -> bytes:
+    """Pack a float vector into the little-endian float32 wire format."""
+    return np.asarray(vector, dtype="<f4").tobytes()
 
 
 @dataclass(frozen=True)
@@ -217,7 +228,7 @@ class FastEmbedder:
             )
         planned = embed_planned_segments(
             None if tokenizer is None else tokenizer.encode,
-            lambda texts: self._vectors(model.passage_embed(texts)),
+            lambda texts: [pack_vector(vector) for vector in model.passage_embed(texts)],
             candidates,
             plan,
         )

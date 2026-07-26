@@ -5,8 +5,9 @@
 ## Status (2026-07-26)
 
 PR #4 merged as `961a7c2`. Tasks 1, 2, and 3 are done — Task 1 with the corpus extended per the
-07-25 plan's Task 5, Tasks 2–3 with the deviations recorded below. **Task 4 is next**, and completes
-the bounded-memory release. Tasks 5–8 are unchanged.
+07-25 plan's Task 5, Tasks 2–3 with the deviations recorded below. **Task 4 is done** as of PR #6 —
+see "Task 4 as implemented" below — which completes the bounded-memory release. Tasks 5–8 are
+unchanged.
 
 ## Errata (2026-07-25)
 
@@ -307,6 +308,28 @@ git commit -m "feat: retry bounded embedding batches"
 ```
 
 ### Task 4: Stream Arrow staging and add crash-recoverable commits
+
+> **Done (2026-07-26), with these deviations.**
+>
+> - **The commit unit is the run, not the file.** The live tables are untouched until the whole
+>   run is staged; only then does the journal switch to `committing` and the staged Arrow batches
+>   apply. That is what makes "cancellation during staging leaves live tables unchanged" true: an
+>   aborted run discards its staging directory and no file from it ever becomes visible. The
+>   trade-off is that a resource-limit abort no longer keeps earlier files of the same run — they
+>   are re-staged on the next run.
+> - **Vectors are packed little-endian float32 bytes end to end.** `EmbeddedSegment.vector`
+>   changed from `list[float]` to `bytes` — the worker's wire format — so nothing between the
+>   worker and the Arrow writer materializes Python floats. `StoredChunk` remains for reads and
+>   test fixtures only; `tests/test_staging.py` fails the write path if `model_dump` is called.
+> - **Startup recovery runs under the global index lock.** Without it, a process starting while
+>   another is legitimately mid-commit would read its `committing` journal as a crash and roll
+>   back live writes.
+> - **Measured.** Real-model benchmark (`near_cap`+`blank_run`, batch size 1, 2,048 MiB ceiling):
+>   peak parent RSS **480 MiB** against the **728 MiB** baseline, with the parent flat at ~245 MiB
+>   until the final commit phase; verdict passed. In-process attribution with a fake embedder
+>   under the same harness: parent growth 330 MiB on this branch against 416 MiB on `main` — the
+>   ~97 MiB Python triple materialization is gone; the rest is extractor chunk models and native
+>   Lance/FTS work, which this task did not set out to move.
 
 > **Measured refinement (2026-07-26), before implementing.** The 07-25 plan attributed the parent's
 > peak to "the list-of-floats ingestion path". Attributing it directly — indexing the `near_cap`
