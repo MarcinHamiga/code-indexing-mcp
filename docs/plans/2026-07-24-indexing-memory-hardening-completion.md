@@ -2,6 +2,12 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
+## Status (2026-07-26)
+
+PR #4 merged as `961a7c2`. Tasks 1, 2, and 3 are done — Task 1 with the corpus extended per the
+07-25 plan's Task 5, Tasks 2–3 with the deviations recorded below. **Task 4 is next**, and completes
+the bounded-memory release. Tasks 5–8 are unchanged.
+
 ## Errata (2026-07-25)
 
 Measurements taken while preparing `docs/plans/2026-07-25-post-review-hardening.md` contradict
@@ -301,6 +307,26 @@ git commit -m "feat: retry bounded embedding batches"
 ```
 
 ### Task 4: Stream Arrow staging and add crash-recoverable commits
+
+> **Measured refinement (2026-07-26), before implementing.** The 07-25 plan attributed the parent's
+> peak to "the list-of-floats ingestion path". Attributing it directly — indexing the `near_cap`
+> corpus in-process with a fake embedder returning real-width vectors, under `tracemalloc` — gives a
+> more useful picture, and Step 4 should be sized against it:
+>
+> - RSS grows **333 MiB** while `tracemalloc` peaks at **150 MiB**, so **more than half the growth is
+>   native**, in PyArrow/Lance rather than on the Python heap. Step 4 has to shrink the Arrow
+>   conversion itself, not only what Python holds.
+> - Within Python, **pydantic `StoredChunk` validation is the largest term (~60 MiB), ahead of the
+>   vectors (~37 MiB)**. Dropping `StoredChunk` from the write path — Step 4's "keep `StoredChunk`
+>   only for public single-chunk reads" — is therefore the bigger win, and the stated rationale
+>   should not lead with the vectors.
+> - The mechanism is triple materialization in `LanceStore.replace_file`:
+>   `[chunk.model_dump() for chunk in chunks]` holds the pydantic models, the dumped dicts (768
+>   Python floats each), and the Arrow conversion live simultaneously.
+>
+> The remedy the steps below specify is right; only the accounting above was off. Baseline to beat:
+> peak parent RSS **728 MiB** for `near_cap`+`blank_run` against **194 MiB** for ordinary source, at
+> batch size 1 and a 2,048 MiB ceiling.
 
 **Files:**
 - Create: `src/incode_mcp/staging.py`
