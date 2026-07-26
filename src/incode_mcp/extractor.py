@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+from bisect import bisect_right
 from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib.resources import files
@@ -50,6 +51,31 @@ class _Definition:
     name: str
 
 
+@dataclass(frozen=True)
+class _DefinitionIndex:
+    """Per-file lookups the definition walk needs, built once instead of per definition.
+
+    ``_has_definition_ancestor``, ``_symbol_context``, and ``_content_range`` each
+    rebuilt a whole-file dict or set on every call, making extraction quadratic in
+    definition count: a 699 KB generated file with 16,384 definitions spent 31 s
+    here against 8 ms of parsing.
+    """
+
+    definitions: list[_Definition]
+    by_node_id: dict[int, _Definition]
+    starts: list[int]
+
+    @classmethod
+    def build(cls, definitions: list[_Definition]) -> _DefinitionIndex:
+        return cls(
+            definitions=definitions,
+            by_node_id={definition.node.id: definition for definition in definitions},
+            # _definitions returns rows sorted by (start_byte, -end_byte), so this
+            # is ascending and safe to bisect.
+            starts=[definition.node.start_byte for definition in definitions],
+        )
+
+
 class TreeSitterExtractor:
     def __init__(
         self,
@@ -92,15 +118,16 @@ class TreeSitterExtractor:
         normalized_source = source.decode("utf-8-sig").encode("utf-8")
         tree = Parser(language_impl).parse(normalized_source)
         definitions = self._definitions(language, tree.root_node, normalized_source)
+        index = _DefinitionIndex.build(definitions)
         chunks: list[ExtractedChunk] = []
         covered: list[tuple[int, int]] = []
 
         for definition in definitions:
             outer = self._outer_node(definition.node)
-            if not self._has_definition_ancestor(definition.node, definitions):
+            if not self._has_definition_ancestor(definition.node, index):
                 covered.append((outer.start_byte, outer.end_byte))
-            kind, parent, qualified = self._symbol_context(definition, definitions)
-            start, end = self._content_range(outer, definition.node, kind, definitions)
+            kind, parent, qualified = self._symbol_context(definition, index)
+            start, end = self._content_range(outer, definition.node, kind, index)
             chunks.extend(
                 self._chunks_for_range(
                     path=path,
@@ -151,24 +178,22 @@ class TreeSitterExtractor:
         return outer
 
     @staticmethod
-    def _has_definition_ancestor(node: Node, definitions: list[_Definition]) -> bool:
-        definition_node_ids = {definition.node.id for definition in definitions}
+    def _has_definition_ancestor(node: Node, index: _DefinitionIndex) -> bool:
         parent = node.parent
         while parent is not None:
-            if parent.id in definition_node_ids:
+            if parent.id in index.by_node_id:
                 return True
             parent = parent.parent
         return False
 
     @staticmethod
     def _symbol_context(
-        definition: _Definition, definitions: list[_Definition]
+        definition: _Definition, index: _DefinitionIndex
     ) -> tuple[str, str | None, str]:
         chain: list[_Definition] = []
-        definitions_by_id = {candidate.node.id: candidate for candidate in definitions}
         parent = definition.node.parent
         while parent is not None:
-            candidate = definitions_by_id.get(parent.id)
+            candidate = index.by_node_id.get(parent.id)
             if candidate is not None:
                 chain.append(candidate)
             parent = parent.parent
@@ -186,19 +211,23 @@ class TreeSitterExtractor:
 
     @staticmethod
     def _content_range(
-        outer: Node, node: Node, kind: str, definitions: list[_Definition]
+        outer: Node, node: Node, kind: str, index: _DefinitionIndex
     ) -> tuple[int, int]:
         if kind not in _CONTAINER_KINDS:
             return outer.start_byte, outer.end_byte
-        nested_starts = [
-            item.node.start_byte
-            for item in definitions
-            if item.node != node
-            and item.node.start_byte > outer.start_byte
-            and item.node.end_byte <= outer.end_byte
-        ]
-        end = min(nested_starts) if nested_starts else outer.end_byte
-        return outer.start_byte, end
+        # The old code scanned every definition to take the minimum qualifying start.
+        # Definitions are start-ascending, so the first qualifying one after
+        # outer.start_byte *is* that minimum. A definition starting at or after
+        # outer.end_byte cannot end inside outer, which bounds the scan.
+        position = bisect_right(index.starts, outer.start_byte)
+        while position < len(index.definitions):
+            candidate = index.definitions[position].node
+            if candidate.start_byte >= outer.end_byte:
+                break
+            if candidate.id != node.id and candidate.end_byte <= outer.end_byte:
+                return outer.start_byte, candidate.start_byte
+            position += 1
+        return outer.start_byte, outer.end_byte
 
     def _chunks_for_range(
         self,
