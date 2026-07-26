@@ -9,7 +9,10 @@ from unittest.mock import patch
 
 import pyarrow as pa
 import pytest
+from filelock import FileLock
 
+from incode_mcp import application
+from incode_mcp.application import Application, RuntimePaths
 from incode_mcp.embedding import pack_vector
 from incode_mcp.errors import ErrorCode, IncodeError
 from incode_mcp.extractor import TreeSitterExtractor
@@ -20,6 +23,7 @@ from incode_mcp.scanner import SourceScanner
 from incode_mcp.staging import (
     CHUNKS_NAME,
     JOURNAL_NAME,
+    MAX_RECOVERY_ATTEMPTS,
     PHASE_COMMITTING,
     PHASE_STAGING,
     ChunkRow,
@@ -267,6 +271,51 @@ def test_a_failed_commit_restores_both_table_versions(tmp_path: Path) -> None:
     assert {chunk.qualified_symbol for chunk in store.list_chunks([project.id])} == {"renamed"}
 
 
+def test_a_commit_whose_rollback_fails_keeps_its_journal_for_recovery(
+    tmp_path: Path,
+) -> None:
+    """Commit fails, then the rollback fails too: recovery must still be possible.
+
+    The staged directory is the only record of the versions the live tables
+    have to return to, so discarding it here would strand a half-committed
+    project. It has to survive in ``committing`` for the next startup.
+    """
+    root = tmp_path / "repo"
+    project = make_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    files_before = store.list_files(project.id)
+    chunks_before = store.list_chunks([project.id])
+
+    (root / "main.py").write_text("def renamed():\n    return 43\n")
+    original = LanceStore.replace_files_from_arrow
+
+    def apply_then_crash(self: LanceStore, project_id: str, **kwargs: object) -> None:
+        original(self, project_id, **kwargs)  # type: ignore[arg-type]
+        raise RuntimeError("simulated crash after the live writes")
+
+    def restore_fails(self: LanceStore, *args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated rollback failure")
+
+    with (
+        patch.object(LanceStore, "replace_files_from_arrow", apply_then_crash),
+        patch.object(LanceStore, "restore_versions", restore_fails),
+        # The original commit failure is reported, not the rollback failure.
+        pytest.raises(RuntimeError, match="simulated crash"),
+    ):
+        indexer.index(project)
+
+    journals = sorted((tmp_path / "staging").glob(f"*/*/{JOURNAL_NAME}"))
+    assert len(journals) == 1
+    assert json.loads(journals[0].read_text())["phase"] == PHASE_COMMITTING
+
+    # With the journal intact, startup recovery still returns both tables.
+    assert recover_staged_commits(tmp_path / "staging", store) == 1
+    assert store.list_files(project.id) == files_before
+    assert store.list_chunks([project.id]) == chunks_before
+    assert list((tmp_path / "staging").glob("*/*/")) == []
+
+
 def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     project = make_project(root)
@@ -334,6 +383,106 @@ def test_repeated_recovery_is_idempotent(tmp_path: Path) -> None:
         assert list((tmp_path / "staging").glob("*/*/")) == []
 
     assert recover_staged_commits(tmp_path / "staging", store) == 0
+
+
+def _committing_journal(directory: Path, project_id: str, versions: TableVersions) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / JOURNAL_NAME
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "job_id": directory.name,
+                "project_id": project_id,
+                "phase": PHASE_COMMITTING,
+                "files_version": versions.files,
+                "chunks_version": versions.chunks,
+                "replace_file_ids": [],
+                "removed_file_ids": [],
+            }
+        )
+    )
+    return path
+
+
+def test_recovery_for_a_removed_project_does_not_recreate_its_partition(
+    tmp_path: Path,
+) -> None:
+    """A journal outliving its project must not materialise empty tables.
+
+    Going through the create-on-write path would build a fresh partition whose
+    versions can never match the journal, so the rollback would fail on every
+    startup for a project that no longer exists.
+    """
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    directory = tmp_path / "staging" / "ghost-project" / "job-1"
+    _committing_journal(directory, "ghost-project", TableVersions(files=3, chunks=3))
+
+    assert recover_staged_commits(tmp_path / "staging", store) == 0
+
+    assert not (tmp_path / "data" / "projects" / "ghost-project").exists()
+    assert list((tmp_path / "staging").glob("*/*/")) == []
+
+
+def test_a_rollback_that_never_succeeds_is_abandoned_after_bounded_retries(
+    tmp_path: Path,
+) -> None:
+    """Recovery runs on the startup path, so it must not retry a lost cause forever."""
+    root = tmp_path / "repo"
+    project = make_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    versions = store.table_versions(project.id)
+    directory = tmp_path / "staging" / project.id / "job-1"
+    journal_path = _committing_journal(directory, project.id, versions)
+
+    def restore_fails(self: LanceStore, *args: object, **kwargs: object) -> bool:
+        raise RuntimeError("simulated permanent rollback failure")
+
+    with patch.object(LanceStore, "restore_versions", restore_fails):
+        for attempt in range(1, MAX_RECOVERY_ATTEMPTS):
+            assert recover_staged_commits(tmp_path / "staging", store) == 0
+            # Still retryable: the journal survives with the attempt recorded.
+            assert json.loads(journal_path.read_text())["recovery_attempts"] == attempt
+
+        assert recover_staged_commits(tmp_path / "staging", store) == 0
+
+    # Given up on: the journal is gone and the project is flagged for re-index.
+    assert list((tmp_path / "staging").glob("*/*/")) == []
+    assert store.project_state(project.id) == "error"
+    # A later startup has nothing left to retry.
+    assert recover_staged_commits(tmp_path / "staging", store) == 0
+
+
+def test_startup_recovery_does_not_wait_out_an_active_index_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Building an Application must not block for the length of an index run.
+
+    The global index lock is held from scan to commit, and every CLI call and
+    daemon start builds an Application. Recovery yields instead of waiting.
+    """
+    monkeypatch.setattr(application, "RECOVERY_LOCK_TIMEOUT_SECONDS", 0.05)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    root = tmp_path / "repo"
+    make_project(root)
+    directory = paths.data / "staging" / "ghost-project" / "job-1"
+    journal_path = _committing_journal(directory, "ghost-project", TableVersions(files=1, chunks=1))
+    lock_directory = paths.data / "locks"
+    lock_directory.mkdir(parents=True, exist_ok=True)
+
+    with FileLock(lock_directory / "index-global.lock"):
+        started = time.monotonic()
+        Application(paths, embedder=RecordingEmbedder(), cwd=root)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 2
+    # Recovery was skipped rather than run against a live commit.
+    assert journal_path.exists()
+
+    # Once the run finishes, the next start picks the journal up.
+    Application(paths, embedder=RecordingEmbedder(), cwd=root)
+    assert not journal_path.exists()
 
 
 def test_staging_phase_leftovers_are_removed_without_touching_live_tables(

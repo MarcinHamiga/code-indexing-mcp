@@ -15,6 +15,7 @@ rename, so a journal or Arrow payload is never observed half-written.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -43,6 +44,13 @@ PHASE_COMPLETE = "complete"
 PHASE_ROLLED_BACK = "rolled_back"
 
 JOURNAL_FORMAT_VERSION = 1
+
+# A rollback that keeps failing must not be retried forever: every startup
+# would pay for it, under the global index lock, with no prospect of success.
+# Lance prunes versions older than a day during compaction, so a journal that
+# survives long enough can name a version that no longer exists. Retry a few
+# times to ride out transient I/O, then give up loudly.
+MAX_RECOVERY_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -247,7 +255,21 @@ class StagingJob:
         shutil.rmtree(self.directory)
 
     def discard(self) -> None:
-        """Abandon a job that never started committing; live tables untouched."""
+        """Abandon a job that never started committing; live tables untouched.
+
+        Once :meth:`begin_commit` has switched the journal to ``committing``
+        the directory is the only record of which versions the live tables
+        must return to. A commit whose own rollback failed leaves the journal
+        in that phase deliberately, so discarding it here would strand a
+        half-committed project with no way back -- keep it for recovery.
+        """
+        if self._journal.get("phase") == PHASE_COMMITTING:
+            logger.warning(
+                "Keeping staged commit %s: its rollback did not finish, so startup "
+                "recovery still needs the journal",
+                self.directory,
+            )
+            return
         try:
             self._close_writers(finalize=False)
         except Exception:
@@ -294,6 +316,11 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
     both tables to the recorded versions, mark the journal ``rolled_back``,
     and remove the directory. Restoring an already-restored table is safe, so
     repeated recovery over the same journal is idempotent.
+
+    A rollback that fails is retried on later startups, but only up to
+    :data:`MAX_RECOVERY_ATTEMPTS`. Past that the journal is retired and its
+    project marked ``error``: the rollback is never going to succeed, and
+    retrying it forever would block every startup behind a lost cause.
     """
     if not staging_root.is_dir():
         return 0
@@ -308,18 +335,51 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
         if journal.get("phase") != PHASE_COMMITTING:
             shutil.rmtree(directory, ignore_errors=True)
             continue
+        project_id = str(journal["project_id"])
         try:
-            store.restore_versions(
-                str(journal["project_id"]),
+            restored = store.restore_versions(
+                project_id,
                 TableVersions(
                     files=int(journal["files_version"]),
                     chunks=int(journal["chunks_version"]),
                 ),
             )
         except Exception:
-            # Leave the journal in place so the next startup retries instead of
-            # silently serving a half-committed project.
-            logger.exception("Could not roll back interrupted commit in %s", directory)
+            attempts = int(journal.get("recovery_attempts", 0)) + 1
+            if attempts < MAX_RECOVERY_ATTEMPTS:
+                # Could be transient. Record the attempt so the retries are
+                # bounded even though the journal survives this startup.
+                logger.exception(
+                    "Could not roll back interrupted commit in %s (attempt %d of %d)",
+                    directory,
+                    attempts,
+                    MAX_RECOVERY_ATTEMPTS,
+                )
+                journal["recovery_attempts"] = attempts
+                _write_atomically(
+                    journal_path, json.dumps(journal, indent=2, sort_keys=True).encode()
+                )
+                continue
+            logger.exception(
+                "Giving up on the interrupted commit in %s after %d attempts. Project "
+                "%s may hold partially committed data; re-index it to rebuild.",
+                directory,
+                attempts,
+                project_id,
+            )
+            # Flagging the project is a courtesy to the operator; recovery runs
+            # during startup, so it must not fail construction if this does.
+            with contextlib.suppress(Exception):
+                store.mark_project_state(project_id, "error")
+            shutil.rmtree(directory, ignore_errors=True)
+            continue
+        if not restored:
+            # The project was removed after the journal was written, so there
+            # is no longer anything to roll back.
+            logger.info(
+                "Discarding staged commit for removed project %s in %s", project_id, directory
+            )
+            shutil.rmtree(directory, ignore_errors=True)
             continue
         journal["phase"] = PHASE_ROLLED_BACK
         _write_atomically(journal_path, json.dumps(journal, indent=2, sort_keys=True).encode())

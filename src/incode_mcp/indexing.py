@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import logging
 import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
@@ -29,6 +30,8 @@ from .models import ExtractedChunk, IndexIssue, IndexReport, ProjectInfo, Skippe
 from .scanner import SourceScanner
 from .staging import ChunkRow, StagingJob
 from .storage import LanceStore
+
+logger = logging.getLogger(__name__)
 
 # Token windows overlap by at most half a budget, so windowing a file can never
 # legitimately double the text its chunks already carried. Exceeding this means
@@ -324,8 +327,10 @@ class Indexer:
                     )
         except BaseException:
             # A run that never reached the commit phase has not touched the
-            # live tables; a run that failed mid-commit was already rolled
-            # back by _commit_staged. Either way the staged bytes are dead.
+            # live tables, and one whose rollback succeeded is already undone;
+            # in both cases the staged bytes are dead. discard() keeps the
+            # directory only when the journal is still "committing", which
+            # means the rollback failed and recovery still needs it.
             if job is not None:
                 job.discard()
             raise
@@ -373,10 +378,21 @@ class Indexer:
                 state="partial" if errors else "ready",
             )
         except BaseException:
-            # If the restore itself fails the journal stays in "committing",
-            # so the next startup's recovery retries it.
-            self.store.restore_versions(project.id, versions)
-            job.rolled_back()
+            try:
+                self.store.restore_versions(project.id, versions)
+            except Exception:
+                # The journal stays in "committing" and StagingJob.discard
+                # deliberately keeps the directory, so the next startup's
+                # recovery retries the rollback. Report the original commit
+                # failure rather than this one -- it is the real cause.
+                logger.exception(
+                    "Could not roll back the interrupted commit for %s; keeping %s "
+                    "for startup recovery",
+                    project.id,
+                    job.directory,
+                )
+            else:
+                job.rolled_back()
             raise
         job.complete()
 

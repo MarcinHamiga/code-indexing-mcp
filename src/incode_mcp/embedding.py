@@ -57,7 +57,16 @@ class EmbeddedSegment:
 
 
 def pack_vector(vector: Sequence[float] | np.ndarray[Any, Any]) -> bytes:
-    """Pack a float vector into the little-endian float32 wire format."""
+    """Pack a float vector into the little-endian float32 wire format.
+
+    A model's row is whatever its backend returns. FastEmbed hands back a
+    numpy array, which packs without copying through Python floats, but the
+    embedder contract this module has always accepted -- see ``_vectors`` --
+    is only that a row exposes ``tolist()``. Honour both, so a backend or a
+    test double that is not numpy-backed still indexes.
+    """
+    if not isinstance(vector, np.ndarray) and hasattr(vector, "tolist"):
+        vector = vector.tolist()
     return np.asarray(vector, dtype="<f4").tobytes()
 
 
