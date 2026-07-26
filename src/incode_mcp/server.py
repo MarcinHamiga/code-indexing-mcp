@@ -35,6 +35,15 @@ from .settings import IndexMode, IndexSettings
 
 logger = logging.getLogger(__name__)
 
+SERVER_INSTRUCTIONS = (
+    "Local Tree-sitter code indexing and hybrid search. "
+    "When exploring code, prefer these index tools over grep-style file reading: "
+    "search_code (semantic natural-language queries), find_symbol (definitions and call "
+    "sites), file_outline (file structure before reading), get_chunk (exact code for a "
+    "search hit). Check list_projects/project_status for index freshness first and run "
+    "index_project if the index is missing or stale."
+)
+
 # Bounds on the retry cadence used while another indexing job holds the global
 # lock. Polling stays cancellable between non-blocking attempts, so the first
 # delays are short enough to pick up a briefly held lock quickly, and the cap
@@ -282,7 +291,7 @@ class AutoIndexingMCP(FastMCP):
         self.wait_seconds = wait_seconds
         super().__init__(
             "code-indexing-mcp",
-            instructions="Local Tree-sitter code indexing and hybrid search.",
+            instructions=SERVER_INSTRUCTIONS,
             json_response=True,
             lifespan=self._lifespan,
         )
