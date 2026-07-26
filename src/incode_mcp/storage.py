@@ -55,6 +55,14 @@ class _ProjectTables:
     chunks: LanceTable
 
 
+@dataclass(frozen=True)
+class TableVersions:
+    """A point-in-time snapshot of a project partition's two tables."""
+
+    files: int
+    chunks: int
+
+
 class LanceStore:
     def __init__(
         self,
@@ -169,6 +177,84 @@ class LanceStore:
         condition = f"file_id = {_quoted(file_id)}"
         tables.chunks.delete(condition)
         tables.files.delete(condition)
+
+    def table_versions(self, project_id: str) -> TableVersions:
+        """Snapshot both partition tables' versions before a commit begins."""
+        tables = self._tables(project_id)
+        return TableVersions(files=tables.files.version, chunks=tables.chunks.version)
+
+    def restore_versions(self, project_id: str, versions: TableVersions) -> bool:
+        """Return both partition tables to *versions*' data.
+
+        ``restore`` followed by ``checkout_latest`` makes the recorded version
+        the live one; restoring a table that is already at that version's data
+        is a no-op, so repeated recovery over the same journal is idempotent.
+
+        Returns False when the partition no longer exists -- a project removed
+        since the journal was written has nothing left to roll back. Recovery
+        must not go through the create-on-write path here: materialising an
+        empty partition would leave a version the journal can never name.
+        """
+        tables = self._existing_tables(project_id)
+        if tables is None:
+            return False
+        tables.files.restore(versions.files)
+        tables.chunks.restore(versions.chunks)
+        tables.files.checkout_latest()
+        tables.chunks.checkout_latest()
+        return True
+
+    def mark_project_state(self, project_id: str, state: str) -> bool:
+        """Set a registered project's state, leaving its other columns alone.
+
+        Returns False when the project is not registered. Recovery uses this
+        to flag a project whose rollback could not be completed, since it only
+        has the ID from the journal rather than a full ProjectInfo.
+        """
+        rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
+        if not rows:
+            return False
+        row = dict(rows[0])
+        row["state"] = state
+        row["updated_at"] = time.time_ns()
+        self._merge(self._projects, "id", [row])
+        return True
+
+    def replace_files_from_arrow(
+        self,
+        project_id: str,
+        *,
+        files: pa.Table,
+        chunk_groups: Iterable[tuple[str, pa.Table]],
+        removed_file_ids: Iterable[str] = (),
+    ) -> None:
+        """Commit staged Arrow batches without materializing chunk objects.
+
+        *chunk_groups* yields one ``(file_id, table)`` pair per replaced file,
+        so at most one file's chunks are live in Arrow form at a time; the
+        vector columns stay fixed-size-list float32 arrays end to end. A group
+        with zero rows means the file now extracts to no chunks, so its
+        previous chunks are deleted.
+        """
+        tables = self._tables(project_id)
+        for file_id, chunks in chunk_groups:
+            condition = f"file_id = {_quoted(file_id)}"
+            if chunks.num_rows:
+                (
+                    tables.chunks.merge_insert("chunk_id")
+                    .when_matched_update_all()
+                    .when_not_matched_insert_all()
+                    .when_not_matched_by_source_delete(condition)
+                    .execute(chunks)
+                )
+            else:
+                tables.chunks.delete(condition)
+        if files.num_rows:
+            self._merge(tables.files, "file_id", files)
+        for file_id in removed_file_ids:
+            condition = f"file_id = {_quoted(file_id)}"
+            tables.chunks.delete(condition)
+            tables.files.delete(condition)
 
     def list_chunks(self, project_ids: Iterable[str] | None = None) -> list[StoredChunk]:
         ids = list(project_ids or [project.id for project in self.list_projects()])
@@ -471,7 +557,15 @@ class LanceStore:
         )
 
     @staticmethod
-    def _merge(table: LanceTable, key: str, rows: list[dict[str, Any]]) -> None:
+    def file_arrow_schema() -> pa.Schema:
+        return LanceStore._file_schema()
+
+    @staticmethod
+    def chunk_arrow_schema(vector_dimension: int) -> pa.Schema:
+        return LanceStore._chunk_schema(vector_dimension)
+
+    @staticmethod
+    def _merge(table: LanceTable, key: str, rows: list[dict[str, Any]] | pa.Table) -> None:
         (
             table.merge_insert(key)
             .when_matched_update_all()

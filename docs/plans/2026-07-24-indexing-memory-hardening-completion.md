@@ -2,6 +2,13 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
+## Status (2026-07-26)
+
+PR #4 merged as `961a7c2`. Tasks 1, 2, and 3 are done — Task 1 with the corpus extended per the
+07-25 plan's Task 5, Tasks 2–3 with the deviations recorded below. **Task 4 is done** as of PR #6 —
+see "Task 4 as implemented" below — which completes the bounded-memory release. Tasks 5–8 are
+unchanged.
+
 ## Errata (2026-07-25)
 
 Measurements taken while preparing `docs/plans/2026-07-25-post-review-hardening.md` contradict
@@ -301,6 +308,48 @@ git commit -m "feat: retry bounded embedding batches"
 ```
 
 ### Task 4: Stream Arrow staging and add crash-recoverable commits
+
+> **Done (2026-07-26), with these deviations.**
+>
+> - **The commit unit is the run, not the file.** The live tables are untouched until the whole
+>   run is staged; only then does the journal switch to `committing` and the staged Arrow batches
+>   apply. That is what makes "cancellation during staging leaves live tables unchanged" true: an
+>   aborted run discards its staging directory and no file from it ever becomes visible. The
+>   trade-off is that a resource-limit abort no longer keeps earlier files of the same run — they
+>   are re-staged on the next run.
+> - **Vectors are packed little-endian float32 bytes end to end.** `EmbeddedSegment.vector`
+>   changed from `list[float]` to `bytes` — the worker's wire format — so nothing between the
+>   worker and the Arrow writer materializes Python floats. `StoredChunk` remains for reads and
+>   test fixtures only; `tests/test_staging.py` fails the write path if `model_dump` is called.
+> - **Startup recovery runs under the global index lock.** Without it, a process starting while
+>   another is legitimately mid-commit would read its `committing` journal as a crash and roll
+>   back live writes.
+> - **Measured.** Real-model benchmark (`near_cap`+`blank_run`, batch size 1, 2,048 MiB ceiling):
+>   peak parent RSS **480 MiB** against the **728 MiB** baseline, with the parent flat at ~245 MiB
+>   until the final commit phase; verdict passed. In-process attribution with a fake embedder
+>   under the same harness: parent growth 330 MiB on this branch against 416 MiB on `main` — the
+>   ~97 MiB Python triple materialization is gone; the rest is extractor chunk models and native
+>   Lance/FTS work, which this task did not set out to move.
+
+> **Measured refinement (2026-07-26), before implementing.** The 07-25 plan attributed the parent's
+> peak to "the list-of-floats ingestion path". Attributing it directly — indexing the `near_cap`
+> corpus in-process with a fake embedder returning real-width vectors, under `tracemalloc` — gives a
+> more useful picture, and Step 4 should be sized against it:
+>
+> - RSS grows **333 MiB** while `tracemalloc` peaks at **150 MiB**, so **more than half the growth is
+>   native**, in PyArrow/Lance rather than on the Python heap. Step 4 has to shrink the Arrow
+>   conversion itself, not only what Python holds.
+> - Within Python, **pydantic `StoredChunk` validation is the largest term (~60 MiB), ahead of the
+>   vectors (~37 MiB)**. Dropping `StoredChunk` from the write path — Step 4's "keep `StoredChunk`
+>   only for public single-chunk reads" — is therefore the bigger win, and the stated rationale
+>   should not lead with the vectors.
+> - The mechanism is triple materialization in `LanceStore.replace_file`:
+>   `[chunk.model_dump() for chunk in chunks]` holds the pydantic models, the dumped dicts (768
+>   Python floats each), and the Arrow conversion live simultaneously.
+>
+> The remedy the steps below specify is right; only the accounting above was off. Baseline to beat:
+> peak parent RSS **728 MiB** for `near_cap`+`blank_run` against **194 MiB** for ordinary source, at
+> batch size 1 and a 2,048 MiB ceiling.
 
 **Files:**
 - Create: `src/incode_mcp/staging.py`

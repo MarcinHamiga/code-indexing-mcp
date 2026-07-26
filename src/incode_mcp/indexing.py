@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import logging
 import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
@@ -20,13 +21,17 @@ from .embedding import (
     SegmentingEmbedder,
     SegmentPlan,
     compose_passage,
+    pack_vector,
 )
 from .embedding_worker import EmbeddingWorkerSession
 from .errors import ErrorCode, IncodeError
 from .extractor import TreeSitterExtractor
-from .models import ExtractedChunk, IndexIssue, IndexReport, ProjectInfo, StoredChunk, StoredFile
+from .models import ExtractedChunk, IndexIssue, IndexReport, ProjectInfo, SkippedFile, StoredFile
 from .scanner import SourceScanner
+from .staging import ChunkRow, StagingJob
 from .storage import LanceStore
+
+logger = logging.getLogger(__name__)
 
 # Token windows overlap by at most half a budget, so windowing a file can never
 # legitimately double the text its chunks already carried. Exceeding this means
@@ -103,6 +108,7 @@ class Indexer:
         segment_plan: SegmentPlan | None = None,
         passage_session_factory: Callable[[], AbstractContextManager[PassageEmbedder]]
         | None = None,
+        staging_directory: Path | None = None,
     ) -> None:
         self.store = store
         self.scanner = scanner
@@ -112,6 +118,7 @@ class Indexer:
         self.batch_size = batch_size
         self.segment_plan = segment_plan or SegmentPlan(max_items=batch_size)
         self.passage_session_factory = passage_session_factory
+        self.staging_directory = staging_directory or lock_directory.parent / "staging"
 
     def index(
         self, project: ProjectInfo, *, force: bool = False, wait_for_lock: bool = False
@@ -171,123 +178,172 @@ class Indexer:
         timer = _PhaseTimer()
         with timer.measure("scan"):
             existing = {record.path: record for record in self.store.list_files(project.id)}
-            scan = self.scanner.scan(project, existing)
-        current_paths = {item.path.as_posix() for item in scan.files}
-        indexed = parsed = embedded = unchanged = metadata_only = removed = 0
+        current_paths: set[str] = set()
+        indexed = parsed = embedded = unchanged = metadata_only = removed = skipped = 0
         errors: list[IndexIssue] = []
+        job: StagingJob | None = None
 
-        for item in scan.files:
-            path = item.path.as_posix()
-            previous = existing.get(path)
-            if (
-                not force
-                and previous is not None
-                and previous.size == item.size
-                and previous.mtime_ns == item.mtime_ns
-            ):
-                unchanged += 1
-                continue
-            content_hash: str | None = None
-            try:
+        def staging_job() -> StagingJob:
+            nonlocal job
+            if job is None:
+                job = StagingJob(
+                    self.staging_directory,
+                    project.id,
+                    file_schema=LanceStore.file_arrow_schema(),
+                    chunk_schema=LanceStore.chunk_arrow_schema(self.store.vector_dimension),
+                )
+                job.begin()
+            return job
+
+        stream = self.scanner.iter_scan(project, existing)
+        try:
+            while True:
                 with timer.measure("scan"):
-                    source = (
-                        item.content
-                        if item.content is not None
-                        else item.absolute_path.read_bytes()
+                    item = next(stream, None)
+                if item is None:
+                    break
+                if isinstance(item, SkippedFile):
+                    skipped += 1
+                    continue
+                path = item.path.as_posix()
+                current_paths.add(path)
+                previous = existing.get(path)
+                if (
+                    not force
+                    and previous is not None
+                    and previous.size == item.size
+                    and previous.mtime_ns == item.mtime_ns
+                ):
+                    unchanged += 1
+                    continue
+                content_hash: str | None = None
+                try:
+                    with timer.measure("scan"):
+                        source = (
+                            item.content
+                            if item.content is not None
+                            else item.absolute_path.read_bytes()
+                        )
+                        content_hash = _digest(source)
+                    if not force and previous is not None and previous.content_hash == content_hash:
+                        with timer.measure("commit"):
+                            staging_job().stage_file(
+                                previous.model_copy(
+                                    update={"size": item.size, "mtime_ns": item.mtime_ns}
+                                )
+                            )
+                        metadata_only += 1
+                        continue
+                    with timer.measure("parse"):
+                        extraction = self.extractor.extract(item.path, item.language, source)
+                    parsed += 1
+                    stored_file = StoredFile(
+                        file_id=_digest(f"{project.id}\0{path}"),
+                        project_id=project.id,
+                        path=path,
+                        language=item.language,
+                        size=item.size,
+                        mtime_ns=item.mtime_ns,
+                        content_hash=content_hash,
+                        has_errors=extraction.has_errors,
+                        indexed_at=time.time_ns(),
                     )
-                    content_hash = _digest(source)
-                if not force and previous is not None and previous.content_hash == content_hash:
+                    file_chunks = 0
+                    emitted = 0
+                    source_chars = sum(len(chunk.content) for chunk in extraction.chunks)
+                    for group in _candidate_groups(extraction.chunks):
+                        with timer.measure("embed"):
+                            segments = self._embed_chunks(passage_embedder, group)
+                            windowed = self._windowed_chunks(group, segments)
+                        rows = [
+                            self._chunk_row(project.id, stored_file, chunk, vector)
+                            for chunk, vector in windowed
+                        ]
+                        # Staged rows are only applied for files that reach
+                        # mark_replaced, so a file failing below leaves these
+                        # behind in the staging file without affecting the
+                        # live tables.
+                        with timer.measure("commit"):
+                            staging_job().stage_chunks(rows)
+                        file_chunks += len(rows)
+                        emitted += sum(len(chunk.content) for chunk, _ in windowed)
+                    if emitted > SEGMENT_TEXT_GROWTH_LIMIT * source_chars:
+                        raise ValueError(
+                            f"Token windowing emitted {emitted} characters from "
+                            f"{source_chars} characters of chunk text, above the "
+                            f"{SEGMENT_TEXT_GROWTH_LIMIT}x limit"
+                        )
                     with timer.measure("commit"):
-                        self.store.upsert_file(
-                            previous.model_copy(
-                                update={"size": item.size, "mtime_ns": item.mtime_ns}
+                        staging_job().stage_file(stored_file)
+                        staging_job().mark_replaced(stored_file.file_id)
+                    indexed += 1
+                    embedded += file_chunks
+                except Exception as exc:
+                    if isinstance(exc, IncodeError) and exc.code in ENVIRONMENT_ERROR_CODES:
+                        # Not attributable to this file. Recording it below would
+                        # stamp the file's current content hash and skip it on every
+                        # later run, leaving a permanent hole in the index for what
+                        # is really a transient condition.
+                        raise
+                    errors.append(IndexIssue(path=path, message=str(exc)))
+                    # Record the failure so the file is not re-read, re-parsed, and
+                    # re-embedded on every run. It is retried only when the file
+                    # changes again or when force=True. Chunks from a previous
+                    # successful index (if any) are left untouched.
+                    with timer.measure("commit"):
+                        staging_job().stage_file(
+                            StoredFile(
+                                file_id=_digest(f"{project.id}\0{path}"),
+                                project_id=project.id,
+                                path=path,
+                                language=item.language,
+                                size=item.size,
+                                mtime_ns=item.mtime_ns,
+                                content_hash=(
+                                    content_hash
+                                    if content_hash is not None
+                                    else previous.content_hash
+                                    if previous is not None
+                                    else ""
+                                ),
+                                has_errors=True,
+                                error=str(exc),
+                                indexed_at=time.time_ns(),
                             )
                         )
-                    metadata_only += 1
-                    continue
-                with timer.measure("parse"):
-                    extraction = self.extractor.extract(item.path, item.language, source)
-                parsed += 1
-                with timer.measure("embed"):
-                    segments = self._embed_chunks(passage_embedder, extraction.chunks)
-                windowed = self._windowed_chunks(extraction.chunks, segments)
-                stored_file = StoredFile(
-                    file_id=_digest(f"{project.id}\0{path}"),
-                    project_id=project.id,
-                    path=path,
-                    language=item.language,
-                    size=item.size,
-                    mtime_ns=item.mtime_ns,
-                    content_hash=content_hash,
-                    has_errors=extraction.has_errors,
-                    indexed_at=time.time_ns(),
-                )
-                chunks = [
-                    self._stored_chunk(project.id, stored_file, chunk, vector)
-                    for chunk, vector in windowed
-                ]
-                with timer.measure("commit"):
-                    self.store.replace_file(stored_file, chunks)
-                indexed += 1
-                embedded += len(chunks)
-            except Exception as exc:
-                if isinstance(exc, IncodeError) and exc.code in ENVIRONMENT_ERROR_CODES:
-                    # Not attributable to this file. Recording it below would
-                    # stamp the file's current content hash and skip it on every
-                    # later run, leaving a permanent hole in the index for what
-                    # is really a transient condition.
-                    raise
-                errors.append(IndexIssue(path=path, message=str(exc)))
-                # Record the failure so the file is not re-read, re-parsed, and
-                # re-embedded on every run. It is retried only when the file
-                # changes again or when force=True. Chunks from a previous
-                # successful index (if any) are left untouched.
-                with timer.measure("commit"):
-                    self.store.upsert_file(
-                        StoredFile(
-                            file_id=_digest(f"{project.id}\0{path}"),
-                            project_id=project.id,
-                            path=path,
-                            language=item.language,
-                            size=item.size,
-                            mtime_ns=item.mtime_ns,
-                            content_hash=(
-                                content_hash
-                                if content_hash is not None
-                                else previous.content_hash
-                                if previous is not None
-                                else ""
-                            ),
-                            has_errors=True,
-                            error=str(exc),
-                            indexed_at=time.time_ns(),
-                        )
+
+            with timer.measure("commit"):
+                for path, record in existing.items():
+                    if path not in current_paths:
+                        staging_job().mark_removed(record.file_id)
+                        removed += 1
+                if job is not None:
+                    self._commit_staged(project, job, errors=errors)
+                else:
+                    self.store.upsert_project(
+                        project,
+                        model_id=self.embedder.model_id,
+                        state="partial" if errors else "ready",
                     )
-
-        with timer.measure("commit"):
-            for path, record in existing.items():
-                if path not in current_paths:
-                    self.store.remove_file(project.id, record.file_id)
-                    removed += 1
-
-            if indexed or removed:
-                self.store.ensure_indexes(project.id, compact=removed > 0)
-
-            self.store.upsert_project(
-                project,
-                model_id=self.embedder.model_id,
-                state="partial" if errors else "ready",
-            )
+        except BaseException:
+            # A run that never reached the commit phase has not touched the
+            # live tables, and one whose rollback succeeded is already undone;
+            # in both cases the staged bytes are dead. discard() keeps the
+            # directory only when the journal is still "committing", which
+            # means the rollback failed and recovery still needs it.
+            if job is not None:
+                job.discard()
+            raise
         return IndexReport(
             project_id=project.id,
-            discovered_files=len(scan.files),
+            discovered_files=len(current_paths),
             indexed_files=indexed,
             parsed_files=parsed,
             embedded_chunks=embedded,
             unchanged_files=unchanged,
             metadata_only_files=metadata_only,
             removed_files=removed,
-            skipped_files=len(scan.skipped),
+            skipped_files=skipped,
             errors=errors,
             scan_duration_ms=timer.milliseconds("scan"),
             parse_duration_ms=timer.milliseconds("parse"),
@@ -295,20 +351,62 @@ class Indexer:
             commit_duration_ms=timer.milliseconds("commit"),
         )
 
+    def _commit_staged(
+        self, project: ProjectInfo, job: StagingJob, *, errors: list[IndexIssue]
+    ) -> None:
+        """Apply a fully staged run, rolling the live tables back on any failure.
+
+        The journal switches to ``committing`` -- with the versions to restore
+        -- before the first live write, so a crash anywhere in this method is
+        recoverable: the rollback here handles the live failure, and startup
+        recovery handles a process death.
+        """
+        versions = self.store.table_versions(project.id)
+        job.begin_commit(versions)
+        try:
+            self.store.replace_files_from_arrow(
+                project.id,
+                files=job.files_table(),
+                chunk_groups=job.iter_chunk_groups(),
+                removed_file_ids=job.removed_file_ids,
+            )
+            if job.replace_file_ids or job.removed_file_ids:
+                self.store.ensure_indexes(project.id, compact=bool(job.removed_file_ids))
+            self.store.upsert_project(
+                project,
+                model_id=self.embedder.model_id,
+                state="partial" if errors else "ready",
+            )
+        except BaseException:
+            try:
+                self.store.restore_versions(project.id, versions)
+            except Exception:
+                # The journal stays in "committing" and StagingJob.discard
+                # deliberately keeps the directory, so the next startup's
+                # recovery retries the rollback. Report the original commit
+                # failure rather than this one -- it is the real cause.
+                logger.exception(
+                    "Could not roll back the interrupted commit for %s; keeping %s "
+                    "for startup recovery",
+                    project.id,
+                    job.directory,
+                )
+            else:
+                job.rolled_back()
+            raise
+        job.complete()
+
     def _embed_chunks(
         self, passage_embedder: PassageEmbedder, chunks: list[ExtractedChunk]
     ) -> list[list[EmbeddedSegment]]:
-        """Embed each chunk, bounded by tokens where the embedder supports it."""
+        """Embed one candidate group, bounded by tokens where supported."""
         if not chunks:
             return []
         if isinstance(passage_embedder, SegmentingEmbedder):
-            segments: list[list[EmbeddedSegment]] = []
-            for group in _candidate_groups(chunks):
-                candidates = [
-                    PassageCandidate(chunk.embedding_prefix, chunk.content) for chunk in group
-                ]
-                segments.extend(passage_embedder.plan_and_embed(candidates, self.segment_plan))
-            return segments
+            candidates = [
+                PassageCandidate(chunk.embedding_prefix, chunk.content) for chunk in chunks
+            ]
+            return passage_embedder.plan_and_embed(candidates, self.segment_plan)
         # An embedder without token planning (a test double, or a future
         # backend) still indexes; its sequence length is simply unbounded.
         vectors: list[list[float]] = []
@@ -318,15 +416,15 @@ class Indexer:
                 passage_embedder.embed_passages(texts[offset : offset + self.batch_size])
             )
         return [
-            [EmbeddedSegment(0, len(chunk.content), 0, vector)]
+            [EmbeddedSegment(0, len(chunk.content), 0, pack_vector(vector))]
             for chunk, vector in zip(chunks, vectors, strict=True)
         ]
 
     def _windowed_chunks(
         self, chunks: list[ExtractedChunk], segments: list[list[EmbeddedSegment]]
-    ) -> list[tuple[ExtractedChunk, list[float]]]:
+    ) -> list[tuple[ExtractedChunk, bytes]]:
         """Pair each chunk's token windows with the vector that covers them."""
-        windowed: list[tuple[ExtractedChunk, list[float]]] = []
+        windowed: list[tuple[ExtractedChunk, bytes]] = []
         for chunk, planned in zip(chunks, segments, strict=True):
             if not planned:
                 continue
@@ -341,14 +439,6 @@ class Indexer:
                 continue
             windowed.extend(
                 (self._window_chunk(chunk, segment), segment.vector) for segment in planned
-            )
-
-        emitted = sum(len(chunk.content) for chunk, _ in windowed)
-        source = sum(len(chunk.content) for chunk in chunks)
-        if emitted > SEGMENT_TEXT_GROWTH_LIMIT * source:
-            raise ValueError(
-                f"Token windowing emitted {emitted} characters from {source} characters "
-                f"of chunk text, above the {SEGMENT_TEXT_GROWTH_LIMIT}x limit"
             )
         return windowed
 
@@ -378,40 +468,37 @@ class Indexer:
         )
 
     @staticmethod
-    def _stored_chunk(
-        project_id: str, file: StoredFile, chunk: object, vector: list[float]
-    ) -> StoredChunk:
-        from .models import ExtractedChunk
-
-        extracted = ExtractedChunk.model_validate(chunk)
+    def _chunk_row(
+        project_id: str, file: StoredFile, chunk: ExtractedChunk, vector: bytes
+    ) -> ChunkRow:
         identity = "\0".join(
             [
                 file.file_id,
-                extracted.kind,
-                extracted.qualified_symbol or "",
-                str(extracted.start_byte),
-                str(extracted.end_byte),
-                str(extracted.part_index),
+                chunk.kind,
+                chunk.qualified_symbol or "",
+                str(chunk.start_byte),
+                str(chunk.end_byte),
+                str(chunk.part_index),
             ]
         )
-        return StoredChunk(
+        return ChunkRow(
             chunk_id=_digest(identity),
             file_id=file.file_id,
             project_id=project_id,
             path=file.path,
             language=file.language,
-            kind=extracted.kind,
-            symbol=extracted.symbol,
-            qualified_symbol=extracted.qualified_symbol,
-            parent_symbol=extracted.parent_symbol,
-            start_byte=extracted.start_byte,
-            end_byte=extracted.end_byte,
-            start_line=extracted.start_line,
-            end_line=extracted.end_line,
-            content=extracted.content,
-            embedding_text=extracted.embedding_text,
-            search_text=extracted.search_text,
+            kind=chunk.kind,
+            symbol=chunk.symbol,
+            qualified_symbol=chunk.qualified_symbol,
+            parent_symbol=chunk.parent_symbol,
+            start_byte=chunk.start_byte,
+            end_byte=chunk.end_byte,
+            start_line=chunk.start_line,
+            end_line=chunk.end_line,
+            content=chunk.content,
+            embedding_text=chunk.embedding_text,
+            search_text=chunk.search_text,
             content_hash=file.content_hash,
-            part_index=extracted.part_index,
+            part_index=chunk.part_index,
             vector=vector,
         )

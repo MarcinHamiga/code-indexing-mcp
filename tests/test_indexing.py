@@ -14,6 +14,7 @@ from incode_mcp.embedding import (
     PassageCandidate,
     SegmentPlan,
     embed_planned_segments,
+    pack_vector,
 )
 from incode_mcp.errors import ErrorCode, IncodeError
 from incode_mcp.extractor import TreeSitterExtractor
@@ -242,7 +243,7 @@ def test_unexpected_index_failure_marks_project_error(tmp_path: Path) -> None:
     indexer, store = make_indexer(tmp_path, embedder)
 
     with (
-        patch.object(SourceScanner, "scan", side_effect=RuntimeError("boom")),
+        patch.object(SourceScanner, "iter_scan", side_effect=RuntimeError("boom")),
         pytest.raises(RuntimeError, match="boom"),
     ):
         indexer.index(project)
@@ -350,7 +351,9 @@ class WindowingEmbedder(RecordingEmbedder):
         planned = embed_planned_segments(fake_encode, self.embed_passages, candidates, plan)
         return [
             [
-                EmbeddedSegment(window.start_char, window.end_char, window.token_count, vector)
+                EmbeddedSegment(
+                    window.start_char, window.end_char, window.token_count, pack_vector(vector)
+                )
                 for window, vector in segments
             ]
             for segments in planned

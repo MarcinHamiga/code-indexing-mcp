@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from incode_mcp.models import ScanConfig
 from incode_mcp.projects import initialize_project
 from incode_mcp.scanner import SourceScanner
@@ -102,6 +104,37 @@ def test_scanner_does_not_retain_changed_file_contents(tmp_path: Path) -> None:
 
     assert len(result.files) == 1
     assert result.files[0].content is None
+
+
+def test_iter_scan_reads_one_file_source_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Streaming means laziness: a file's bytes are read only as it is yielded."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    # Written as bytes: the assertions below are byte-exact, and write_text
+    # would turn the newlines into CRLF on Windows.
+    (root / "a.py").write_bytes(b"a = 1\n")
+    (root / "b.py").write_bytes(b"b = 2\n")
+    project = initialize_project(root)
+    reads: list[Path] = []
+    original = Path.read_bytes
+
+    def tracking_read_bytes(path: Path) -> bytes:
+        reads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", tracking_read_bytes)
+    stream = SourceScanner().iter_scan(project)
+
+    first = next(stream)
+    assert len(reads) == 1
+    second = next(stream)
+    assert len(reads) == 2
+
+    # The streaming path hands the source to the caller instead of re-reading.
+    assert first.content == b"a = 1\n"
+    assert second.content == b"b = 2\n"
 
 
 def test_scanner_never_walks_hard_excluded_directories(tmp_path: Path) -> None:

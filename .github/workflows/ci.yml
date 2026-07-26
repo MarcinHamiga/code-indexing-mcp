@@ -23,12 +23,26 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
-      - run: uv sync --all-groups --locked
-      - run: uv run pytest
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run mypy src
-      - run: uv run mypy scripts/benchmark_index_memory.py
+      - id: sync
+        run: uv sync --all-groups --locked
+      - name: Test
+        run: uv run pytest
+      # Lint and type checks are independent of the tests, so a failing test
+      # must not hide them: a red run should report every problem at once
+      # rather than one per push. They still skip when the environment itself
+      # could not be built, where their output would only be noise.
+      - name: Lint
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff check .
+      - name: Format
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff format --check .
+      - name: Types
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run mypy src
+      - name: Types (scripts)
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run mypy scripts/benchmark_index_memory.py
 
   # The real-model memory gate downloads ~640 MB and takes minutes, so it is
   # manually dispatched rather than run on every push. Normal CI still checks

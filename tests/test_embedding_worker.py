@@ -12,6 +12,7 @@ from incode_mcp.embedding import (
     PassageCandidate,
     SegmentPlan,
     embed_windows,
+    pack_vector,
     plan_passages,
 )
 from incode_mcp.embedding_worker import (
@@ -32,6 +33,24 @@ def _fake_worker(connection: Connection, _: WorkerConfig) -> None:
             return
         vectors = [[float(len(text)), 1.0, 2.0, 3.0] for text in payload]
         connection.send(("ok", vectors))
+
+
+class _ToListOnlyVector:
+    """A model row exposing only ``tolist()``, which the contract permits."""
+
+    def __init__(self, values: list[float]) -> None:
+        self._values = values
+
+    def tolist(self) -> list[float]:
+        return list(self._values)
+
+
+def test_pack_vector_accepts_rows_that_only_expose_tolist() -> None:
+    # FastEmbedder._vectors has always accepted any row with tolist(), so the
+    # packing path must too; a non-numpy row previously raised inside asarray.
+    values = [0.5, -1.5, 2.0, 3.25]
+
+    assert pack_vector(_ToListOnlyVector(values)) == pack_vector(np.asarray(values, dtype="<f4"))
 
 
 def test_effective_memory_ceiling_reserves_system_memory() -> None:
@@ -224,7 +243,7 @@ def test_plan_and_embed_returns_a_segment_per_token_window() -> None:
         )
 
     assert len(segments[0]) > 1
-    assert all(len(segment.vector) == 4 for segment in segments[0])
+    assert all(len(segment.vector) == 4 * 4 for segment in segments[0])
     assert segments[0][0].start_char == 0
     assert segments[0][-1].end_char == len(content)
     assert session.segment_count == len(segments[0])

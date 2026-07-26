@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from platformdirs import user_cache_path, user_data_path
 
 from .embedding import Embedder, FastEmbedder, SegmentPlan
@@ -31,7 +32,15 @@ from .projects import ProjectResolver, find_project_root, initialize_project, re
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
+from .staging import recover_staged_commits
 from .storage import LanceStore
+
+logger = logging.getLogger(__name__)
+
+# Startup recovery needs the global index lock, but that lock is held for the
+# whole of an index run. Wait only long enough to lose a race against a commit
+# that is about to finish; a run genuinely in flight is left to a later start.
+RECOVERY_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,28 @@ class Application:
             vector_dimension=embedder.dimension,
             vector_index=self.settings.vector_index,
         )
+        # Roll back any commit interrupted by a crash before queries are
+        # accepted, so a half-written project never becomes searchable. The
+        # global index lock keeps recovery from running underneath a commit
+        # another process is legitimately writing right now.
+        #
+        # Waiting that lock out is not an option: it is held for the length of
+        # an index run, and every CLI invocation and daemon start builds an
+        # Application. If a run is in flight, skip recovery -- that run commits
+        # or rolls back on its own, and anything left by an older crash is
+        # picked up by the next start that finds the lock free.
+        lock_directory = paths.data / "locks"
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        try:
+            with FileLock(
+                lock_directory / "index-global.lock", timeout=RECOVERY_LOCK_TIMEOUT_SECONDS
+            ):
+                recover_staged_commits(paths.data / "staging", self.store)
+        except Timeout:
+            logger.warning(
+                "Skipping staged-commit recovery: an index run holds the global lock. "
+                "Any commit interrupted earlier is rolled back on a later start."
+            )
         passage_session_factory: Callable[[], EmbeddingWorkerSession] | None = None
         if isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker":
             worker_config = WorkerConfig(
@@ -112,6 +143,7 @@ class Application:
                 max_items=self.settings.embedding_batch_size,
             ),
             passage_session_factory=passage_session_factory,
+            staging_directory=paths.data / "staging",
         )
         self.search = SearchService(self.store, embedder)
 
