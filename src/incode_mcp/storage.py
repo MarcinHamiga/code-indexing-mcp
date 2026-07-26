@@ -7,6 +7,7 @@ import logging
 import shutil
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -32,6 +33,13 @@ SCHEMA_VERSION = 2
 # how many rows are scanned before the exact filter and the caller's limit apply.
 OVERFETCH_FACTOR = 10
 MINIMUM_OVERFETCH = 200
+
+# Open partitions kept resident. Each entry holds two LanceTable handles and their
+# caches, and nothing evicted them before: the daemon is long-lived and get_chunk
+# walks every registered project, so one call could fault in every project a user
+# has ever indexed. Sixteen covers the projects one developer works across while
+# keeping the ceiling independent of how many they have registered.
+MAX_CACHED_PARTITIONS = 16
 
 # Columns get_chunk reads. The vector and the two derived text columns are excluded:
 # nothing outside indexing and ranking can use them, and reading them made a
@@ -100,7 +108,7 @@ class LanceStore:
         directory.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(directory / "registry", read_consistency_interval=timedelta(0))
         self._projects = self._table(self._db, "projects", self._project_schema())
-        self._partitions: dict[str, _ProjectTables] = {}
+        self._partitions: OrderedDict[str, _ProjectTables] = OrderedDict()
         self._partitions_lock = threading.Lock()
         for row in legacy_rows:
             row = {
@@ -530,26 +538,52 @@ class LanceStore:
             ]
         )
 
-    def _tables(self, project_id: str) -> _ProjectTables:
-        """Open *project_id*'s partition, creating it. For write paths only."""
+    def _cached(self, project_id: str) -> _ProjectTables | None:
+        """Return the cached partition for *project_id*, marking it recently used."""
         with self._partitions_lock:
             cached = self._partitions.get(project_id)
             if cached is not None:
-                return cached
-            database = lancedb.connect(
-                self.directory / "projects" / project_id,
-                read_consistency_interval=timedelta(0),
-            )
-            tables = _ProjectTables(
-                files=self._table(database, "files", self._file_schema()),
-                chunks=self._table(
-                    database,
-                    "chunks",
-                    self._chunk_schema(self.vector_dimension),
-                ),
-            )
+                self._partitions.move_to_end(project_id)
+            return cached
+
+    def _remember(self, project_id: str, tables: _ProjectTables) -> _ProjectTables:
+        """Cache *tables*, evicting the least recently used partition past the bound.
+
+        Eviction only drops this dictionary's reference. A caller mid-query holds its
+        own reference to the tables, so the underlying dataset stays open until that
+        caller is done — the daemon serves each client on its own thread and must not
+        have a table closed underneath it.
+        """
+        with self._partitions_lock:
+            existing = self._partitions.get(project_id)
+            if existing is not None:
+                # Another thread opened it first; keep one instance so both callers
+                # share a single set of handles.
+                self._partitions.move_to_end(project_id)
+                return existing
             self._partitions[project_id] = tables
+            while len(self._partitions) > MAX_CACHED_PARTITIONS:
+                self._partitions.popitem(last=False)
             return tables
+
+    def _tables(self, project_id: str) -> _ProjectTables:
+        """Open *project_id*'s partition, creating it. For write paths only."""
+        cached = self._cached(project_id)
+        if cached is not None:
+            return cached
+        database = lancedb.connect(
+            self.directory / "projects" / project_id,
+            read_consistency_interval=timedelta(0),
+        )
+        tables = _ProjectTables(
+            files=self._table(database, "files", self._file_schema()),
+            chunks=self._table(
+                database,
+                "chunks",
+                self._chunk_schema(self.vector_dimension),
+            ),
+        )
+        return self._remember(project_id, tables)
 
     def _existing_tables(self, project_id: str) -> _ProjectTables | None:
         """Open *project_id*'s partition without creating it, or return None.
@@ -559,23 +593,21 @@ class LanceStore:
         through the create-on-write _tables() would leave an empty partition
         directory behind for each project that has never been indexed.
         """
-        with self._partitions_lock:
-            cached = self._partitions.get(project_id)
-            if cached is not None:
-                return cached
-            directory = self.directory / "projects" / project_id
-            if not directory.is_dir():
-                return None
-            database = lancedb.connect(directory, read_consistency_interval=timedelta(0))
-            try:
-                tables = _ProjectTables(
-                    files=cast(LanceTable, database.open_table("files")),
-                    chunks=cast(LanceTable, database.open_table("chunks")),
-                )
-            except (ValueError, FileNotFoundError):
-                return None
-            self._partitions[project_id] = tables
-            return tables
+        cached = self._cached(project_id)
+        if cached is not None:
+            return cached
+        directory = self.directory / "projects" / project_id
+        if not directory.is_dir():
+            return None
+        database = lancedb.connect(directory, read_consistency_interval=timedelta(0))
+        try:
+            tables = _ProjectTables(
+                files=cast(LanceTable, database.open_table("files")),
+                chunks=cast(LanceTable, database.open_table("chunks")),
+            )
+        except (ValueError, FileNotFoundError):
+            return None
+        return self._remember(project_id, tables)
 
     @staticmethod
     def _table(database: Any, name: str, schema: pa.Schema) -> LanceTable:

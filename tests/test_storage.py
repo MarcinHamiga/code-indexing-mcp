@@ -5,7 +5,7 @@ from pathlib import Path
 
 import lancedb
 
-from incode_mcp.models import StoredChunk, StoredFile
+from incode_mcp.models import ProjectInfo, StoredChunk, StoredFile
 from incode_mcp.projects import initialize_project
 from incode_mcp.storage import LanceStore
 
@@ -166,3 +166,71 @@ def test_get_chunk_does_not_read_the_vector_column(tmp_path: Path) -> None:
     assert isinstance(chunk, CodeChunk)
     assert not hasattr(chunk, "vector")
     assert store.get_chunk("no-such-chunk") is None
+
+
+def test_partition_cache_evicts_least_recently_used(tmp_path: Path) -> None:
+    """The daemon is long-lived and get_chunk faults in every project's partition.
+
+    Without a bound, two open LanceTable handles per project accumulate for the life
+    of the process.
+    """
+    from incode_mcp import storage as storage_module
+
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    projects = []
+    for index in range(storage_module.MAX_CACHED_PARTITIONS + 3):
+        root = tmp_path / f"p{index}"
+        root.mkdir()
+        project = ProjectInfo(id=f"id-{index:02d}", name=f"p{index}", root=root)
+        store.upsert_project(project, model_id="test")
+        store._tables(project.id)  # fault the partition in
+        projects.append(project)
+
+    assert len(store._partitions) == storage_module.MAX_CACHED_PARTITIONS
+    # The oldest three were evicted; the most recent are still resident.
+    assert projects[0].id not in store._partitions
+    assert projects[1].id not in store._partitions
+    assert projects[2].id not in store._partitions
+    assert projects[-1].id in store._partitions
+
+
+def test_partition_cache_keeps_recently_used_entries(tmp_path: Path) -> None:
+    from incode_mcp import storage as storage_module
+
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    ids = []
+    for index in range(storage_module.MAX_CACHED_PARTITIONS):
+        root = tmp_path / f"p{index}"
+        root.mkdir()
+        project = ProjectInfo(id=f"id-{index:02d}", name=f"p{index}", root=root)
+        store.upsert_project(project, model_id="test")
+        store._tables(project.id)
+        ids.append(project.id)
+
+    # Touch the oldest so it is no longer the eviction candidate, then overflow by one.
+    store._tables(ids[0])
+    overflow_root = tmp_path / "overflow"
+    overflow_root.mkdir()
+    overflow = ProjectInfo(id="id-overflow", name="overflow", root=overflow_root)
+    store.upsert_project(overflow, model_id="test")
+    store._tables(overflow.id)
+
+    assert ids[0] in store._partitions, "a freshly used partition must not be evicted"
+    assert ids[1] not in store._partitions
+
+
+def test_evicted_partition_reopens_with_its_data(tmp_path: Path) -> None:
+    """Eviction is a cache decision, never a data decision."""
+    from incode_mcp import storage as storage_module
+
+    store, project, chunk_id = _store_with_one_chunk(tmp_path)
+    for index in range(storage_module.MAX_CACHED_PARTITIONS + 1):
+        root = tmp_path / f"filler{index}"
+        root.mkdir()
+        filler = ProjectInfo(id=f"filler-{index:02d}", name=f"f{index}", root=root)
+        store.upsert_project(filler, model_id="test")
+        store._tables(filler.id)
+
+    assert project not in store._partitions
+    assert store.count_chunks([project]) == 1
+    assert store.get_chunk(chunk_id) is not None
