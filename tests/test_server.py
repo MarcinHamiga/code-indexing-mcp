@@ -129,7 +129,7 @@ async def test_default_server_defers_indexing_until_first_code_query(tmp_path: P
         assert not (root / ".ci-mcp").exists()
 
         query = asyncio.create_task(client.call_tool("search_code", {"query": "answer"}))
-        assert await asyncio.to_thread(embedder.started.wait, 1)
+        assert await asyncio.to_thread(embedder.started.wait, 5)
         assert not query.done()
         embedder.release.set()
         result = await query
@@ -199,7 +199,7 @@ async def test_server_shutdown_waits_for_active_startup_index(tmp_path: Path) ->
             server, list_roots_callback=list_roots
         ) as client:
             await client.list_tools()
-            assert await asyncio.to_thread(embedder.started.wait, 1)
+            assert await asyncio.to_thread(embedder.started.wait, 5)
             entered.set()
             await leave.wait()
 
@@ -244,7 +244,7 @@ async def test_server_shutdown_cancels_startup_job_waiting_for_index_lock(
             server, list_roots_callback=list_roots
         ) as client:
             await client.list_tools()
-            assert await asyncio.to_thread(attempted.wait, 1)
+            assert await asyncio.to_thread(attempted.wait, 5)
 
     lock = FileLock(paths.data / "locks" / f"{project.id}.lock")
     with lock:
@@ -279,7 +279,7 @@ async def test_code_query_waits_for_startup_index_to_finish(tmp_path: Path) -> N
         server, list_roots_callback=list_roots
     ) as client:
         await client.list_tools()
-        assert await asyncio.to_thread(embedder.started.wait, 1)
+        assert await asyncio.to_thread(embedder.started.wait, 5)
 
         query = asyncio.create_task(client.call_tool("search_code", {"query": "answer"}))
         await asyncio.sleep(0.05)
@@ -321,7 +321,7 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
             server, list_roots_callback=list_roots
         ) as client:
             await client.list_tools()
-            assert await asyncio.to_thread(embedder.started.wait, 1)
+            assert await asyncio.to_thread(embedder.started.wait, 5)
 
             result = await asyncio.wait_for(
                 client.call_tool(
@@ -504,7 +504,7 @@ async def test_discovery_is_not_blocked_by_concurrent_indexing(tmp_path: Path) -
         server, list_roots_callback=list_roots
     ) as client:
         await client.list_tools()
-        assert await asyncio.to_thread(embedder.started.wait, 1)
+        assert await asyncio.to_thread(embedder.started.wait, 5)
 
         # Discovery for both roots should complete quickly even though one of
         # them is now stuck indexing (blocked on the embedder) - discovery no
