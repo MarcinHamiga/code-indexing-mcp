@@ -797,9 +797,10 @@ def test_error_without_details_renders_as_plain_string() -> None:
     assert error.for_client() == "CHUNK_NOT_FOUND: Unknown chunk: abc"
 
 
-READ_ONLY_TOOLS = frozenset(
-    {"project_status", "list_projects", "search_code", "find_symbol", "file_outline", "get_chunk"}
-)
+READ_ONLY_TOOLS = frozenset({"list_projects", "get_chunk"})
+# These answer read queries but first go through _startup_roots, which registers
+# an unknown root as a project — writing its marker — before serving the call.
+AUTO_REGISTERING_TOOLS = frozenset({"project_status", "search_code", "find_symbol", "file_outline"})
 WRITE_TOOLS = frozenset({"init_project", "index_project", "remove_project"})
 
 
@@ -815,7 +816,7 @@ def _tiny_application(tmp_path: Path) -> Application:
 async def test_every_tool_declares_description_title_and_annotations(tmp_path: Path) -> None:
     tools = await create_server(_tiny_application(tmp_path), auto_index=False).list_tools()
 
-    assert {tool.name for tool in tools} == READ_ONLY_TOOLS | WRITE_TOOLS
+    assert {tool.name for tool in tools} == READ_ONLY_TOOLS | AUTO_REGISTERING_TOOLS | WRITE_TOOLS
     for tool in tools:
         assert tool.description, f"{tool.name} has no description"
         assert len(tool.description) > 60, f"{tool.name} description is a stub"
@@ -832,12 +833,47 @@ async def test_read_and_write_tools_are_annotated_distinctly(tmp_path: Path) -> 
     for name in READ_ONLY_TOOLS:
         assert annotations[name] is not None and annotations[name].readOnlyHint is True, name
         assert annotations[name].destructiveHint is False, name
+    # Registering a root is a write, so these cannot be auto-approved as reads.
+    for name in AUTO_REGISTERING_TOOLS:
+        assert annotations[name] is not None and annotations[name].readOnlyHint is False, name
+        assert annotations[name].destructiveHint is False, name
+        assert annotations[name].idempotentHint is True, name
     for name in WRITE_TOOLS:
         assert annotations[name] is not None and annotations[name].readOnlyHint is False, name
-    # remove_project is the only tool that destroys data.
+    # force_new_id lets init_project overwrite a marker and orphan the old
+    # registration, so the tool as a whole cannot claim additive/idempotent use.
     assert annotations["remove_project"].destructiveHint is True
+    assert annotations["remove_project"].idempotentHint is True
     assert annotations["index_project"].destructiveHint is False
-    assert annotations["init_project"].destructiveHint is False
+    assert annotations["index_project"].idempotentHint is True
+    assert annotations["init_project"].destructiveHint is True
+    assert annotations["init_project"].idempotentHint is False
+
+
+@pytest.mark.asyncio
+async def test_project_status_registers_an_unmarked_root(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        assert not (root / ".ci-mcp").exists()
+
+        result = await client.call_tool("project_status", {})
+
+    assert not result.isError
+    # The marker and the registration are both new: project_status wrote to the
+    # repository and to the store, which is why it cannot claim readOnlyHint.
+    assert (root / ".ci-mcp" / "project.toml").is_file()
+    assert [project.root for project in app.list_projects()] == [root.resolve()]
 
 
 @pytest.mark.asyncio

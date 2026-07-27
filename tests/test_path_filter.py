@@ -39,6 +39,9 @@ PATTERNS = [
     "with space.py",
     "d$e.py",
     "g{1}.py",
+    # PurePosixPath normalizes these before matching.
+    "*/",
+    "foo//bar",
 ]
 
 
@@ -88,15 +91,21 @@ def test_absolute_and_empty_patterns_are_not_translated() -> None:
     assert glob_to_regex("/absolute/x.py") is None
 
 
-def test_unterminated_character_class_is_not_translated() -> None:
-    assert glob_to_regex("[abc") is None
+@pytest.mark.parametrize("pattern", ["[abc", "*[]", "*[!]", "*[a-]", r"*[a\\]"])
+def test_unsafe_character_class_is_not_translated(pattern: str) -> None:
+    assert glob_to_regex(pattern) is None
+
+
+def test_redundant_and_trailing_separators_are_normalized() -> None:
+    assert glob_to_regex("*/") == glob_to_regex("*")
+    assert glob_to_regex("foo//bar") == glob_to_regex("foo/bar")
 
 
 def test_path_condition_ors_every_pattern() -> None:
     condition = path_condition(["rare/*", "tests/*"])
 
     assert condition == (
-        "(regexp_match(path, '(^|/)rare/[^/]*$') OR regexp_match(path, '(^|/)tests/[^/]*$'))"
+        "(regexp_like(path, '(^|/)rare/[^/]*$') OR regexp_like(path, '(^|/)tests/[^/]*$'))"
     )
 
 

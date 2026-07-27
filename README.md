@@ -106,20 +106,24 @@ A generic MCP client configuration looks like this:
 }
 ```
 
-The server exposes nine tools. Read tools are annotated `readOnlyHint` so hosts may auto-approve
-them; `remove_project` is annotated `destructiveHint`.
+The server exposes nine tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
+so hosts may auto-approve them. The other query tools are not: on a root the server has not seen
+before they register it first, which writes a `.ci-mcp/project.toml` marker, and the three code
+queries also build its initial index. `remove_project` is annotated `destructiveHint`;
+`init_project` carries the same hint and is non-idempotent because `force_new_id=true` can
+overwrite a marker and orphan the previous index.
 
 | Tool | Kind | Purpose |
 | --- | --- | --- |
-| `init_project` | write | Register a directory and write its `.ci-mcp/project.toml` marker. |
+| `init_project` | destructive write | Register a directory and write its `.ci-mcp/project.toml` marker. |
 | `index_project` | write | Incrementally scan, parse, embed, and commit changed files. |
 | `remove_project` | destructive | Delete a registration and its whole index partition. |
-| `project_status` | read | Index state plus file and chunk counts. |
-| `list_projects` | read | Every registered project, sorted by name. |
-| `search_code` | read | Hybrid semantic and keyword search returning ranked snippets. |
-| `find_symbol` | read | Exact, prefix, or substring lookup of declaration names. |
-| `file_outline` | read | One file's declared symbols, metadata only. |
-| `get_chunk` | read | Full stored text for one `chunk_id`. |
+| `project_status` | read, registers | Index state plus file and chunk counts. |
+| `list_projects` | read only | Every registered project, sorted by name. |
+| `search_code` | read, registers and indexes | Hybrid semantic and keyword search returning ranked snippets. |
+| `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
+| `file_outline` | read, registers and indexes | One file's declared symbols, metadata only. |
+| `get_chunk` | read only | Full stored text for one `chunk_id`. |
 
 `limit` is capped at 50 and `match` accepts only `exact`, `prefix`, or `contains`; both are
 enforced by the tool schema, so an out-of-range value is rejected rather than silently clamped.

@@ -305,6 +305,16 @@ a large repository; it reports progress while it runs."""
 _READ_ONLY = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
 )
+# Tools that answer a read query but route through _startup_roots first. On a
+# root the server has not seen, that registers the project — writing a
+# .ci-mcp/project.toml marker and a store row, and for the query tools building
+# the initial index — so readOnlyHint would be a lie a host could act on.
+_READS_AND_REGISTERS = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_INITIALIZES = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
 _WRITES = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
 )
@@ -404,7 +414,7 @@ def create_server(
             "index is a separate operation (index_project). Re-running on an already-initialized "
             "directory returns the existing project unless force_new_id is set."
         ),
-        annotations=_WRITES,
+        annotations=_INITIALIZES,
     )
     @_with_error_details
     async def init_project(
@@ -488,10 +498,11 @@ def create_server(
         title="Project status",
         description=(
             "Report one project's index state — pending, indexing, ready, partial, or error — "
-            "with its indexed file count and chunk count. Reads the index without modifying it, "
-            "and does not check the filesystem for changes; index_project does that."
+            "with its indexed file count and chunk count. Does not scan for file changes or "
+            "rebuild the index; index_project does that. A root that is not registered yet is "
+            "registered first, which writes its .ci-mcp/project.toml marker."
         ),
-        annotations=_READ_ONLY,
+        annotations=_READS_AND_REGISTERS,
     )
     @_with_error_details
     async def project_status(
@@ -551,9 +562,10 @@ def create_server(
             "get_chunk expands to the full text. Searches indexed source only — not commit "
             "history, not comments in unindexed files, and not files excluded by .gitignore or "
             "the 1 MiB size cap. For a declaration whose name is already known, find_symbol is "
-            "direct; for one file's structure, file_outline is cheaper."
+            "direct; for one file's structure, file_outline is cheaper. A root that is not "
+            "registered yet is registered and indexed before the first query is answered."
         ),
-        annotations=_READ_ONLY,
+        annotations=_READS_AND_REGISTERS,
     )
     @_with_error_details
     async def search_code(
@@ -634,9 +646,11 @@ def create_server(
             "Look up indexed code chunks by symbol name, matching exactly, by prefix, or by "
             "substring. Returns hits ordered by path and line, each with a snippet and a "
             "chunk_id. Matches declaration names only — not call sites, imports, or other "
-            "references. For a conceptual query rather than a known name, search_code applies."
+            "references. For a conceptual query rather than a known name, search_code applies. A "
+            "root that is not registered yet is registered and indexed before the first query is "
+            "answered."
         ),
-        annotations=_READ_ONLY,
+        annotations=_READS_AND_REGISTERS,
     )
     @_with_error_details
     async def find_symbol(
@@ -696,9 +710,10 @@ def create_server(
             "List the symbols declared in one indexed file, in source order, with kind, "
             "qualified name, parent, and line range. Returns structure metadata only, never code "
             "text, so it is the cheap way to understand a file before fetching parts of it. The "
-            "file must already be indexed."
+            "file must already be indexed; a root that is not registered yet is registered and "
+            "indexed first."
         ),
-        annotations=_READ_ONLY,
+        annotations=_READS_AND_REGISTERS,
     )
     @_with_error_details
     async def file_outline(

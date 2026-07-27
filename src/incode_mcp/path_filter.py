@@ -17,6 +17,38 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from pathlib import PurePosixPath
+
+
+def _character_class(pattern: str, cursor: int) -> tuple[str, int] | None:
+    """Translate one conservative fnmatch character class.
+
+    Returning ``None`` is always safe: the caller then skips pushdown and lets
+    ``PurePosixPath.match`` remain the authority. Ranges and regex set-operation
+    characters are deliberately left to that fallback because Python's fnmatch
+    rules and LanceDB's regex engine do not share identical class syntax.
+    """
+    search = cursor + 1
+    if search < len(pattern) and pattern[search] == "!":
+        search += 1
+    # A leading ] is a class member in fnmatch, not the closing delimiter.
+    if search < len(pattern) and pattern[search] == "]":
+        search += 1
+    closing = pattern.find("]", search)
+    if closing == -1:
+        return None
+
+    body = pattern[cursor + 1 : closing]
+    negated = body.startswith("!")
+    members = body[1:] if negated else body
+    if not members or any(character in members for character in r"-\/&~|"):
+        return None
+
+    escaped = "".join(
+        f"\\{character}" if character in "[]^" else character for character in members
+    )
+    prefix = "^" if negated else ""
+    return f"[{prefix}{escaped}]", closing + 1
 
 
 def glob_to_regex(pattern: str) -> str | None:
@@ -36,6 +68,10 @@ def glob_to_regex(pattern: str) -> str | None:
     """
     if not pattern or pattern.startswith("/"):
         return None
+    # PurePosixPath.match normalizes redundant and trailing separators before
+    # matching. Translate that canonical spelling so the database predicate is
+    # never narrower than the authoritative post-filter.
+    pattern = PurePosixPath(pattern).as_posix()
     parts: list[str] = []
     cursor = 0
     while cursor < len(pattern):
@@ -48,13 +84,11 @@ def glob_to_regex(pattern: str) -> str | None:
             parts.append("[^/]")
             cursor += 1
         elif character == "[":
-            closing = pattern.find("]", cursor + 1)
-            if closing == -1:
+            translated = _character_class(pattern, cursor)
+            if translated is None:
                 return None
-            body = pattern[cursor + 1 : closing]
-            # fnmatch spells negation "[!abc]"; regex spells it "[^abc]".
-            parts.append("[" + ("^" + body[1:] if body.startswith("!") else body) + "]")
-            cursor = closing + 1
+            expression, cursor = translated
+            parts.append(expression)
         else:
             parts.append(re.escape(character))
             cursor += 1
@@ -77,5 +111,5 @@ def path_condition(patterns: Sequence[str], *, column: str = "path") -> str | No
         if translated is None:
             return None
         quoted = "'" + translated.replace("'", "''") + "'"
-        expressions.append(f"regexp_match({column}, {quoted})")
+        expressions.append(f"regexp_like({column}, {quoted})")
     return "(" + " OR ".join(expressions) + ")"

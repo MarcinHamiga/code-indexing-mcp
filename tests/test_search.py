@@ -280,6 +280,14 @@ def test_path_filter_respects_right_anchored_glob_semantics(tmp_path: Path) -> N
         "src/a.py",
         "tests/c.py",
     }
+    assert [
+        hit.path for hit in search.search_code("alpha", [project], paths=["src//a.py"]).hits
+    ] == ["src/a.py"]
+    assert {hit.path for hit in search.search_code("alpha", [project], paths=["*/"]).hits} == {
+        "src/deep/b.py",
+        "src/a.py",
+        "tests/c.py",
+    }
 
 
 def test_untranslatable_path_pattern_still_filters_in_python(tmp_path: Path) -> None:
@@ -294,6 +302,17 @@ def test_untranslatable_path_pattern_still_filters_in_python(tmp_path: Path) -> 
     # An absolute pattern disables the pushdown; the post-filter must still apply,
     # and PurePosixPath.match never matches an absolute pattern against these paths.
     assert search.search_code("alpha", [project], paths=["/src/a.py"]).hits == []
+
+
+def test_literal_empty_character_class_falls_back_without_a_regex_error(tmp_path: Path) -> None:
+    search, project = _indexed_tree(
+        tmp_path,
+        {"literal/a[].py": "def alpha_literal():\n    return 1\n"},
+    )
+
+    assert [hit.path for hit in search.search_code("alpha", [project], paths=["*[]*.py"]).hits] == [
+        "literal/a[].py"
+    ]
 
 
 CHUNK_PAYLOAD_FIELDS = {
