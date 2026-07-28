@@ -301,3 +301,26 @@ def test_endpoint_directory_and_token_are_private(
     assert stat.S_IMODE(endpoint.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(server.token_path.stat().st_mode) == 0o600
     assert token and server._load_or_create_token() == token
+
+
+@requires_local_sockets
+def test_the_daemon_reports_the_backend_it_would_index_with(tmp_path: Path) -> None:
+    """The daemon answers, because the daemon is what runs indexing."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+
+    try:
+        status = broker.model_status()
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+    assert status.embedding_model == "test/tiny"
+    assert status.dimension == 4
+    assert status.requested_accelerator == "auto"
+    assert "CPUExecutionProvider" in status.available_providers

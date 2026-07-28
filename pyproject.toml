@@ -69,5 +69,5 @@ strict = true
 packages = ["incode_mcp"]
 
 [[tool.mypy.overrides]]
-module = ["lancedb", "lancedb.*", "pyarrow", "pyarrow.*"]
+module = ["lancedb", "lancedb.*", "onnxruntime", "onnxruntime.*", "pyarrow", "pyarrow.*"]
 ignore_missing_imports = true

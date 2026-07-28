@@ -24,7 +24,7 @@ from .embedding import (
     compose_passage,
     pack_vector,
 )
-from .embedding_worker import EmbeddingWorkerSession
+from .embedding_worker import TelemetrySource
 from .errors import ErrorCode, IncodeError
 from .extractor import TreeSitterExtractor
 from .models import ExtractedChunk, IndexIssue, IndexReport, ProjectInfo, SkippedFile, StoredFile
@@ -51,6 +51,9 @@ ENVIRONMENT_ERROR_CODES = frozenset(
         ErrorCode.MODEL_UNAVAILABLE,
         ErrorCode.INDEX_RESOURCE_LIMIT,
         ErrorCode.EMBEDDING_WORKER_FAILED,
+        # Strict mode's refusal to fall back is a property of the machine and
+        # the configuration, never of whichever file happened to be in flight.
+        ErrorCode.BACKEND_UNAVAILABLE,
     }
 )
 
@@ -186,18 +189,24 @@ class Indexer:
             )
             with context as passage_embedder:
                 report = self._index_scan(project, force=force, passage_embedder=passage_embedder)
-            if isinstance(context, EmbeddingWorkerSession):
+            if isinstance(context, TelemetrySource):
+                # Read after the context exits, so a session that fell back from
+                # an accelerator to CPU reports the backend it finished on and
+                # the totals from both.
+                measured = context.telemetry()
                 report = report.model_copy(
                     update={
-                        "memory_budget_bytes": context.effective_ceiling_bytes,
-                        "peak_memory_bytes": context.peak_combined_rss,
+                        "embedding_backend": measured.backend,
+                        "memory_budget_bytes": measured.memory_budget_bytes,
+                        "peak_memory_bytes": measured.peak_memory_bytes,
                         "worker_used": True,
-                        "embedded_segments": context.segment_count,
-                        "embedded_tokens": context.token_count,
-                        "embedding_retries": context.retry_count,
-                        "fallback_count": report.fallback_count + context.retry_count,
-                        "worker_termination_reason": context.termination_reason,
-                        "token_windowing": context.tokenizer_available,
+                        "embedded_segments": measured.segment_count,
+                        "embedded_tokens": measured.token_count,
+                        "embedding_retries": measured.retry_count,
+                        "fallback_count": report.fallback_count + measured.fallback_count,
+                        "worker_termination_reason": measured.termination_reason,
+                        "token_windowing": measured.tokenizer_available,
+                        "embedding_fallback_reason": measured.fallback_reason,
                     }
                 )
             return report

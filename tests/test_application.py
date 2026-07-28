@@ -1,11 +1,14 @@
 import shutil
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from incode_mcp.application import Application, RuntimePaths
+from incode_mcp.backends import CPU_BACKEND, Accelerator
 from incode_mcp.errors import ErrorCode, IncodeError
+from incode_mcp.settings import IndexSettings
 
 
 class TinyEmbedder:
@@ -245,3 +248,77 @@ def test_reregistering_a_known_project_preserves_state_and_still_validates_compa
     with pytest.raises(IncodeError) as raised_discover:
         other_app.discover_project(root)
     assert raised_discover.value.code is ErrorCode.INDEX_INCOMPATIBLE
+
+
+def test_the_application_resolves_a_backend_and_reports_it(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(IndexSettings.from_environment({}), embedding_accelerator=Accelerator.CPU)
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+
+    status = app.model_status()
+    assert app.backend_selection.accelerator is Accelerator.CPU
+    assert status.embedding_model == "test/tiny"
+    assert status.batch_calibration == "default"
+    assert status.probe_cache_state == "not-applicable"
+
+
+def test_an_explicit_batch_size_is_not_overridden_by_calibration(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(
+        IndexSettings.from_environment({}),
+        embedding_batch_size=12,
+        embedding_batch_auto=False,
+    )
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+
+    assert app.model_status().batch_size == 12
+    assert app.model_status().batch_calibration == "explicit"
+
+
+def test_the_query_model_stays_in_process_regardless_of_the_backend(tmp_path: Path) -> None:
+    """Acceleration targets passage indexing; a query must never wait on it."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    embedder = TinyEmbedder()
+
+    app = Application(paths, embedder=embedder, cwd=tmp_path)
+
+    assert app.search.embedder is embedder
+    assert app.embedder is embedder
+
+
+def test_a_backend_that_failed_once_is_not_attempted_again(tmp_path: Path) -> None:
+    """Only successful probes are cached, so the failure has to be remembered.
+
+    Without this the daemon would spawn a worker, load the model onto a dead
+    device, and terminate it again before every single index run.
+    """
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(IndexSettings.from_environment({}), embedding_accelerator=Accelerator.CPU)
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+    resolved = app.backend_selection
+    assert app.effective_backend_selection is resolved
+
+    app._remember_fallback(resolved.fell_back_to(CPU_BACKEND, "the device fell off the bus"))
+
+    assert app.effective_backend_selection is not resolved
+    assert app.effective_backend_selection.accelerator is Accelerator.CPU
+    # backend_selection still records what capability alone resolved to; only
+    # the effective selection carries the verdict a real run reached.
+    assert app.backend_selection is resolved
+
+
+def test_model_status_reports_a_runtime_fallback_rather_than_the_original_choice(
+    tmp_path: Path,
+) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    app._remember_fallback(
+        app.backend_selection.fell_back_to(CPU_BACKEND, "the accelerator died on load")
+    )
+
+    status = app.model_status()
+    assert status.resolved_accelerator == "cpu"
+    assert status.fallback_reason == "the accelerator died on load"

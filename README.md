@@ -237,8 +237,8 @@ to 1–2 GiB and reduced further to retain 512 MiB of currently available RAM fo
 Configure it with:
 
 ```bash
-export INCODE_INDEX_MEMORY_MB=1536
-export INCODE_EMBED_BATCH_SIZE=1
+export INCODE_EMBED_MEMORY_MB=1536   # INCODE_INDEX_MEMORY_MB is the older name and still works
+export INCODE_EMBED_BATCH_SIZE=auto  # auto, or 1–256
 export INCODE_EMBED_MAX_TOKENS=1024
 export INCODE_EMBED_OVERLAP_TOKENS=64
 export INCODE_EMBED_THREADS=2
@@ -250,6 +250,78 @@ The ceiling covers indexing memory: the embedding worker plus any growth in the 
 indexing runs. Memory the host already held when the worker started — the daemon's query model and
 open Lance datasets — is not charged to the budget, so a warm daemon can still index. `IndexReport`
 reports both the budget and the true combined peak, plus a scan/parse/embed/commit duration split.
+
+### Embedding backends
+
+Acceleration targets passage indexing only. The query model stays in the serving process on CPU, so
+a search never waits on a worker spawning or a model loading onto a device.
+
+```bash
+export INCODE_EMBED_ACCELERATOR=auto  # auto, cpu, cuda, webgpu, migraphx, coreml
+export INCODE_EMBED_STRICT=0          # 1 disables the CPU fallback
+```
+
+`auto` selects the best backend that has passed its promotion gates *and* whose execution provider
+this installation actually offers. No accelerator has been promoted yet, so `auto` resolves to CPU
+everywhere; naming one explicitly overrides that and is how a backend earns its benchmark evidence.
+
+Passage embedding runs in a disposable worker that is torn down after indexing, releasing VRAM or
+unified memory. Before any real content reaches an accelerator, the worker loads the model and runs
+a minimum-batch inference, and the parent checks that the vectors are the right width, finite, and
+normalised. A backend that fails to load, silently falls back to a different execution provider,
+returns unusable vectors, overruns the memory ceiling, or dies mid-run is terminated, and the
+chunks it had not committed are re-embedded on CPU. Chunks are committed per file only after they
+are fully embedded, so a worker crash can neither fail the run nor corrupt an existing index.
+
+The ceiling is measured as host resident memory, which on unified memory covers the accelerator too.
+A discrete GPU's VRAM is not visible to it, so exhausting a graphics card surfaces as a worker that
+died rather than as a budget that was exceeded — both fall back to CPU, but only one names a number.
+
+`INCODE_EMBED_STRICT=1` refuses that fallback and raises `BACKEND_UNAVAILABLE` instead, for callers
+who would rather fail than index at CPU speed without noticing. An `auto` selection that settles on
+CPU is not a fallback and is unaffected.
+
+Successful probes are cached under the cache directory, keyed by model artifact, execution
+provider, ONNX Runtime version, OS/architecture, and device — so any of those moving invalidates
+the record rather than vouching for a backend that no longer works. The key reserves a driver
+version too, but nothing populates it yet: driver detection ships with the locked accelerator
+installations, alongside the first backend promoted to automatic selection. A cached probe skips
+the inference but never the model load, which is what proves the provider still initialises on this
+boot — so a driver change that breaks a provider outright still surfaces as a failed load.
+
+A backend that fails is not retried for the life of the process. Only successes are cached, so
+without that a long-lived daemon would reload a dead accelerator onto the device before every
+index run.
+
+`code-indexing-mcp model status` reports the whole resolution without loading or probing anything:
+
+```console
+$ code-indexing-mcp model status
+{
+  "available_providers": ["CoreMLExecutionProvider", "AzureExecutionProvider", "CPUExecutionProvider"],
+  "batch_calibration": "default",
+  "batch_size": 1,
+  "device": "cpu",
+  "dimension": 768,
+  "embedding_model": "jinaai/jina-embeddings-v2-base-code",
+  "execution_provider": "CPUExecutionProvider",
+  "fallback_reason": "no accelerator has reached automatic selection on this machine; set INCODE_EMBED_ACCELERATOR to override",
+  "precision": "float32",
+  "probe_cache_state": "not-applicable",
+  "requested_accelerator": "auto",
+  "resolved_accelerator": "cpu",
+  "runtime_version": "1.27.0",
+  "stability": "automatic",
+  "strict": false
+}
+```
+
+`IndexReport` carries `embedding_backend`, `embedding_fallback_reason`, and `fallback_count`, so a
+run that started on an accelerator and finished on CPU says so rather than merely being slow.
+
+The embedding model, tokenizer, pooling, normalisation, and vector dimension are the same on every
+backend, and execution provider and precision are diagnostic metadata rather than part of index
+compatibility — switching backends never requires a reindex.
 
 ### Token-bounded chunks
 
@@ -277,9 +349,9 @@ indexes were rebuilt per definition.
 
 ### Measured throughput
 
-`INCODE_EMBED_BATCH_SIZE` stays at 1. Measured with
+`INCODE_EMBED_BATCH_SIZE` resolves to 1 on CPU. Measured with
 `scripts/benchmark_index_memory.py` on Apple Silicon macOS against a 1.0 MiB, 6,330-chunk
-dense-Python corpus at `INCODE_INDEX_MEMORY_MB=2048`:
+dense-Python corpus at `INCODE_EMBED_MEMORY_MB=2048`:
 
 | `INCODE_EMBED_BATCH_SIZE` | Wall clock | Chunks/s | Peak worker RSS |
 | ------------------------- | ---------- | -------- | --------------- |

@@ -49,6 +49,7 @@ def _parser() -> argparse.ArgumentParser:
     model = commands.add_parser("model", help="Manage the local embedding model")
     model_commands = model.add_subparsers(dest="model_command", required=True)
     model_commands.add_parser("pull")
+    model_commands.add_parser("status", help="Show the resolved embedding backend")
     benchmark = commands.add_parser("benchmark", help="Run reproducible local benchmarks")
     benchmark_commands = benchmark.add_subparsers(dest="benchmark_command", required=True)
     benchmark_index = benchmark_commands.add_parser(
@@ -149,6 +150,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "model" and args.model_command == "pull":
             app.prepare_model()
             result = {"model": app.embedder.model_id, "prepared": True}
+        elif args.command == "model" and args.model_command == "status":
+            result = app.model_status()
         else:
             raise AssertionError("unreachable command")
         print(_json(result))

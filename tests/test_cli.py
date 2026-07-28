@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from incode_mcp import cli, daemon
 from incode_mcp.application import Application
 from incode_mcp.cli import main
@@ -100,3 +102,39 @@ def test_serve_refuses_an_explicit_broker_opt_in_without_local_sockets(
 
     assert cli.main(["serve"]) == 2
     assert "INCODE_BROKER=off" in capsys.readouterr().err
+
+
+def test_cli_reports_the_resolved_embedding_backend(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("INCODE_EMBED_ACCELERATOR", "cpu")
+
+    assert main(["model", "status"]) == 0
+
+    status = json.loads(capsys.readouterr().out)
+    assert status["requested_accelerator"] == "cpu"
+    assert status["resolved_accelerator"] == "cpu"
+    assert status["execution_provider"] == "CPUExecutionProvider"
+    assert status["probe_cache_state"] == "not-applicable"
+    assert status["fallback_reason"] is None
+    assert status["strict"] is False
+
+
+def test_model_status_explains_an_accelerator_it_cannot_honour(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("INCODE_EMBED_ACCELERATOR", "cuda")
+
+    assert main(["model", "status"]) == 0
+
+    status = json.loads(capsys.readouterr().out)
+    if "CUDAExecutionProvider" in status["available_providers"]:
+        # Skipped rather than passed vacuously: on a CUDA host the request is
+        # honoured and there is no unhonourable request left to explain.
+        pytest.skip("this host offers CUDA, so the request is honoured")
+    # Status reports the CPU it will really use and names the reason rather
+    # than claiming the CUDA it cannot deliver.
+    assert status["resolved_accelerator"] == "cpu"
+    assert "CUDAExecutionProvider" in status["fallback_reason"]

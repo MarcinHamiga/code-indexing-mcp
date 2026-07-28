@@ -12,6 +12,15 @@ from pathlib import Path
 from filelock import FileLock, Timeout
 from platformdirs import user_cache_path, user_data_path
 
+from .backends import (
+    CPU_BACKEND,
+    BackendSelection,
+    available_execution_providers,
+    describe_environment,
+    platform_fingerprint,
+    runtime_version,
+    select_backend,
+)
 from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig
 from .errors import ErrorCode, IncodeError
@@ -20,6 +29,7 @@ from .indexing import Indexer
 from .models import (
     CodeChunk,
     IndexReport,
+    ModelStatus,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
@@ -28,6 +38,8 @@ from .models import (
     SearchResponse,
     SymbolResponse,
 )
+from .passage_backend import PassageBackendSession
+from .probe_cache import ProbeCache, ProbeKey, model_artifact_fingerprint
 from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
 from .scanner import SourceScanner
 from .search import SearchService
@@ -114,38 +126,162 @@ class Application:
                 "Skipping staged-commit recovery: an index run holds the global lock. "
                 "Any commit interrupted earlier is rolled back on a later start."
             )
-        passage_session_factory: Callable[[], EmbeddingWorkerSession] | None = None
+        # Passage embedding is the only role acceleration targets. The query
+        # model stays in this process on CPU so a search never waits on a
+        # worker spawning or a model loading onto a device.
+        self.backend_selection = select_backend(
+            self.settings.embedding_accelerator,
+            available_providers=available_execution_providers(),
+        )
+        self.probe_cache = ProbeCache(paths.cache / "backend-probes.json")
+        self._probe_key: ProbeKey | None = None
+        # Set when a run actually tried the selected accelerator and it failed.
+        # Only successful probes are cached, so without this memo every index
+        # run in a long-lived daemon would re-spawn a known-dead backend and
+        # reload its model onto the device before giving up again.
+        self._runtime_fallback: BackendSelection | None = None
+        self.embedding_batch_size = self.settings.embedding_batch_size
+        self.batch_calibration = "explicit"
+        if self.settings.embedding_batch_auto:
+            self.batch_calibration = "default"
+            if self.backend_selection.uses_accelerator:
+                self._probe_key = self._build_probe_key(embedder)
+                cached = self.probe_cache.load(self._probe_key)
+                if cached is not None and cached.batch_size > 0:
+                    self.embedding_batch_size = cached.batch_size
+                    self.batch_calibration = "calibrated"
+
+        passage_session_factory: Callable[[], PassageBackendSession] | None = None
         if isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker":
-            worker_config = WorkerConfig(
-                cache_directory=str(embedder.cache_directory),
-                offline=embedder.offline,
-                threads=self.settings.embedding_threads,
-                enable_cpu_mem_arena=self.settings.embedding_cpu_arena,
-                dimension=embedder.dimension,
-                model_id=embedder.model_id,
-            )
-            ceiling_bytes = self.settings.index_memory_bytes
-
-            def new_worker_session() -> EmbeddingWorkerSession:
-                return EmbeddingWorkerSession(worker_config, configured_ceiling_bytes=ceiling_bytes)
-
-            passage_session_factory = new_worker_session
+            passage_session_factory = self._passage_session_factory(embedder)
         self.indexer = Indexer(
             store=self.store,
             scanner=SourceScanner(),
             extractor=TreeSitterExtractor(),
             embedder=embedder,
             lock_directory=paths.data / "locks",
-            batch_size=self.settings.embedding_batch_size,
+            batch_size=self.embedding_batch_size,
             segment_plan=SegmentPlan(
                 max_tokens=self.settings.embedding_max_tokens,
                 overlap_tokens=self.settings.embedding_overlap_tokens,
-                max_items=self.settings.embedding_batch_size,
+                max_items=self.embedding_batch_size,
             ),
             passage_session_factory=passage_session_factory,
             staging_directory=paths.data / "staging",
         )
         self.search = SearchService(self.store, embedder)
+
+    @property
+    def effective_backend_selection(self) -> BackendSelection:
+        """The backend the next run will attempt, after any runtime fallback.
+
+        ``backend_selection`` records what selection resolved to from static
+        capability alone. Once a run has tried it and been degraded, that
+        verdict stands for the life of this process.
+        """
+        return self._runtime_fallback or self.backend_selection
+
+    def _remember_fallback(self, degraded: BackendSelection) -> None:
+        logger.warning(
+            "Pinning passage embedding to CPU for the rest of this process: %s",
+            degraded.fallback_reason,
+        )
+        self._runtime_fallback = degraded
+
+    def _build_probe_key(self, embedder: Embedder) -> ProbeKey:
+        descriptor = self.backend_selection.descriptor
+        cache_directory = getattr(embedder, "cache_directory", self.paths.cache / "models")
+        return ProbeKey(
+            model_id=embedder.model_id,
+            model_artifact=model_artifact_fingerprint(Path(cache_directory), embedder.model_id),
+            accelerator=descriptor.accelerator.value,
+            provider=descriptor.provider,
+            runtime_version=runtime_version(),
+            platform=platform_fingerprint(),
+            device=descriptor.device,
+            driver_version=descriptor.driver_version,
+        )
+
+    def _passage_session_factory(
+        self, embedder: FastEmbedder
+    ) -> Callable[[], PassageBackendSession]:
+        """Build the factory that opens one passage session per index run.
+
+        Both backends are described up front, but neither process is started
+        until indexing asks for one, and the accelerator's is only started if
+        the selection actually chose it.
+        """
+        ceiling_bytes = self.settings.index_memory_bytes
+        strict = self.settings.embedding_strict
+        probe_key = self._probe_key
+
+        def worker_config(providers: tuple[str, ...], accelerator: str) -> WorkerConfig:
+            return WorkerConfig(
+                cache_directory=str(embedder.cache_directory),
+                offline=embedder.offline,
+                threads=self.settings.embedding_threads,
+                enable_cpu_mem_arena=self.settings.embedding_cpu_arena,
+                dimension=embedder.dimension,
+                model_id=embedder.model_id,
+                providers=providers,
+                accelerator=accelerator,
+            )
+
+        descriptor = self.backend_selection.descriptor
+        accelerator_config = worker_config(descriptor.providers, descriptor.accelerator.value)
+        cpu_config = worker_config(CPU_BACKEND.providers, CPU_BACKEND.accelerator.value)
+
+        def session(config: WorkerConfig) -> EmbeddingWorkerSession:
+            return EmbeddingWorkerSession(config, configured_ceiling_bytes=ceiling_bytes)
+
+        def new_passage_session() -> PassageBackendSession:
+            return PassageBackendSession(
+                # Read per run, not captured: a fallback recorded by an earlier
+                # run keeps this one from paying for the same dead backend.
+                self.effective_backend_selection,
+                accelerator_factory=lambda: session(accelerator_config),
+                cpu_factory=lambda: session(cpu_config),
+                strict=strict,
+                probe_cache=self.probe_cache,
+                probe_key=probe_key,
+                # Phase 5 measures a batch size per backend and stores it here.
+                # Until then nothing has been calibrated, and saying otherwise
+                # would make ``model status`` report the configured default as
+                # though it were a measurement.
+                calibrated_batch_size=0,
+                dimension=embedder.dimension,
+                on_degrade=self._remember_fallback,
+            )
+
+        return new_passage_session
+
+    def model_status(self) -> ModelStatus:
+        """Report the resolved embedding stack without loading or probing it."""
+        selection: BackendSelection = self.effective_backend_selection
+        descriptor = describe_environment(selection.descriptor)
+        if not selection.uses_accelerator:
+            # CPU is the reference backend; it needs no probe to be trusted.
+            probe_state = "not-applicable"
+        else:
+            key = self._probe_key or self._build_probe_key(self.embedder)
+            probe_state = self.probe_cache.state(key)
+        return ModelStatus(
+            embedding_model=self.embedder.model_id,
+            dimension=self.embedder.dimension,
+            requested_accelerator=selection.requested.value,
+            resolved_accelerator=descriptor.accelerator.value,
+            device=descriptor.device,
+            execution_provider=descriptor.provider,
+            available_providers=list(selection.available_providers),
+            stability=descriptor.stability.value,
+            precision=descriptor.precision.value,
+            runtime_version=descriptor.runtime_version,
+            batch_size=self.embedding_batch_size,
+            batch_calibration=self.batch_calibration,
+            probe_cache_state=probe_state,
+            strict=self.settings.embedding_strict,
+            fallback_reason=selection.fallback_reason,
+        )
 
     @classmethod
     def from_environment(cls, *, cwd: Path | None = None) -> Application:

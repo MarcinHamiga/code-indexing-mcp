@@ -9,8 +9,16 @@ from enum import StrEnum
 
 import psutil
 
+from .backends import Accelerator, parse_accelerator
 from .errors import ErrorCode, IncodeError
 from .token_batching import DEFAULT_MAX_TOKENS, DEFAULT_OVERLAP_TOKENS
+
+# The batch size ``auto`` resolves to when no calibration record applies. One
+# item per microbatch is what CPU indexing has always used and what the memory
+# ceiling was measured against; a larger default belongs to a backend that has
+# earned it through calibration.
+DEFAULT_AUTO_BATCH_SIZE = 1
+MAX_BATCH_SIZE = 256
 
 
 class IndexMode(StrEnum):
@@ -55,6 +63,31 @@ def _boolean(environment: Mapping[str, str], name: str, default: bool) -> bool:
     raise _configuration_error(name, raw, "a boolean")
 
 
+def _batch_size(environment: Mapping[str, str]) -> tuple[int, bool]:
+    """Return the configured microbatch size and whether it was left automatic."""
+    raw = environment.get("INCODE_EMBED_BATCH_SIZE")
+    if raw is None or raw.strip().lower() == "auto":
+        return DEFAULT_AUTO_BATCH_SIZE, True
+    return _integer(environment, "INCODE_EMBED_BATCH_SIZE", 1, 1, MAX_BATCH_SIZE), False
+
+
+def _memory_bytes(environment: Mapping[str, str], default_megabytes: int) -> int:
+    """Resolve the indexing memory ceiling from either accepted variable.
+
+    ``INCODE_EMBED_MEMORY_MB`` is the documented name. ``INCODE_INDEX_MEMORY_MB``
+    predates it and keeps working; the newer name wins when both are set.
+    """
+    # Truthiness, not membership: an exported-but-empty variable is how a shell
+    # says "unset", and letting it win would both fail on int("") and shadow a
+    # perfectly good value under the legacy name.
+    name = (
+        "INCODE_EMBED_MEMORY_MB"
+        if environment.get("INCODE_EMBED_MEMORY_MB")
+        else "INCODE_INDEX_MEMORY_MB"
+    )
+    return _integer(environment, name, default_megabytes, 1024, 1024 * 1024) * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class IndexSettings:
     mode: IndexMode
@@ -68,6 +101,14 @@ class IndexSettings:
     index_memory_bytes: int
     index_execution: str
     broker_mode: str
+    embedding_accelerator: Accelerator = Accelerator.AUTO
+    # True when the batch size was left to the runtime, which lets calibration
+    # raise it for a backend that was measured to handle more.
+    embedding_batch_auto: bool = True
+    # Strict mode refuses the CPU fallback. A run that cannot reach the
+    # requested accelerator fails with BACKEND_UNAVAILABLE instead of quietly
+    # indexing more slowly than the caller asked for.
+    embedding_strict: bool = False
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> IndexSettings:
@@ -104,6 +145,8 @@ class IndexSettings:
             1024,
             min(2048, int(psutil.virtual_memory().total * 0.25) // (1024 * 1024)),
         )
+        batch_size, batch_auto = _batch_size(environment)
+        accelerator = parse_accelerator(environment.get("INCODE_EMBED_ACCELERATOR", "auto"))
 
         return cls(
             mode=mode,
@@ -113,7 +156,10 @@ class IndexSettings:
             index_wait_seconds=_integer(
                 environment, "INCODE_INDEX_WAIT_SECONDS", 300, 0, 24 * 60 * 60
             ),
-            embedding_batch_size=_integer(environment, "INCODE_EMBED_BATCH_SIZE", 1, 1, 32),
+            embedding_batch_size=batch_size,
+            embedding_batch_auto=batch_auto,
+            embedding_accelerator=accelerator,
+            embedding_strict=_boolean(environment, "INCODE_EMBED_STRICT", False),
             # Sequence length, not character count, drives embedding memory:
             # attention is quadratic in tokens. 1,024 keeps the widest window
             # well inside the model's 8,192-token limit and inside the default
@@ -133,15 +179,7 @@ class IndexSettings:
             ),
             embedding_cpu_arena=_boolean(environment, "INCODE_EMBED_CPU_ARENA", False),
             vector_index=vector_index,
-            index_memory_bytes=_integer(
-                environment,
-                "INCODE_INDEX_MEMORY_MB",
-                default_memory_mb,
-                1024,
-                1024 * 1024,
-            )
-            * 1024
-            * 1024,
+            index_memory_bytes=_memory_bytes(environment, default_memory_mb),
             index_execution=execution,
             broker_mode=broker_mode,
         )

@@ -9,6 +9,7 @@ import pytest
 from test_token_batching import fake_encode
 
 from incode_mcp.embedding import (
+    PROBE_TEXTS,
     PassageCandidate,
     SegmentPlan,
     embed_windows,
@@ -310,3 +311,124 @@ def test_retries_stop_and_the_error_surfaces_once_the_batch_cannot_shrink() -> N
     # Either the liveness poll or the closed pipe notices first, depending on
     # how the two processes interleave; both name a dead worker.
     assert session.termination_reason in {"worker_exited", "channel_closed"}
+
+
+def _protocol_worker(connection: Connection, config: WorkerConfig) -> None:
+    """Answers the lifecycle commands the backend contract added."""
+    while True:
+        command, payload = connection.recv()
+        if command == "stop":
+            return
+        if command == "initialize":
+            connection.send(("initialized", (tuple(config.providers), config.dimension)))
+            continue
+        if command == "memory":
+            connection.send(("memory", 4096))
+            continue
+        if command == "probe":
+            connection.send(
+                ("probed", [_unit_row() for _ in range(len(PROBE_TEXTS))]),
+            )
+            continue
+        connection.send(("packed", [_unit_row() for _ in payload]))
+
+
+def _unit_row() -> bytes:
+    row = np.zeros(4, dtype="<f4")
+    row[0] = 1.0
+    return row.tobytes()
+
+
+def test_initialize_reports_the_providers_the_session_resolved() -> None:
+    config = WorkerConfig(
+        cache_directory="unused",
+        offline=True,
+        threads=1,
+        enable_cpu_mem_arena=False,
+        dimension=4,
+        providers=("CUDAExecutionProvider", "CPUExecutionProvider"),
+        accelerator="cuda",
+    )
+    session = EmbeddingWorkerSession(
+        config, effective_ceiling_bytes=2 * 1024**3, target=_protocol_worker
+    )
+
+    with session:
+        info = session.initialize()
+
+    assert info.resolved_providers == ("CUDAExecutionProvider", "CPUExecutionProvider")
+    assert info.dimension == 4
+
+
+def test_a_probe_that_returns_usable_vectors_is_accepted() -> None:
+    session = _session(_protocol_worker, 2 * 1024**3)
+
+    with session:
+        vectors = session.probe()
+
+    assert len(vectors) == len(PROBE_TEXTS)
+
+
+def test_report_memory_returns_the_workers_own_footprint() -> None:
+    session = _session(_protocol_worker, 2 * 1024**3)
+
+    with session:
+        assert session.report_memory() == 4096
+
+
+def _bad_dimension_worker(connection: Connection, _: WorkerConfig) -> None:
+    while True:
+        command, _payload = connection.recv()
+        if command == "stop":
+            return
+        connection.send(("probed", [np.zeros(8, dtype="<f4").tobytes() for _ in PROBE_TEXTS]))
+
+
+def _unnormalized_worker(connection: Connection, _: WorkerConfig) -> None:
+    while True:
+        command, _payload = connection.recv()
+        if command == "stop":
+            return
+        connection.send(("probed", [np.full(4, 5.0, dtype="<f4").tobytes() for _ in PROBE_TEXTS]))
+
+
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [
+        (_bad_dimension_worker, "wide"),
+        (_unnormalized_worker, "norm"),
+    ],
+)
+def test_a_probe_whose_vectors_could_not_search_an_index_is_rejected(
+    target: WorkerTarget, message: str
+) -> None:
+    # Deliberately a ValueError rather than an IncodeError: the caller decides
+    # whether an unusable backend means fall back or fail.
+    session = _session(target, 2 * 1024**3)
+
+    with session, pytest.raises(ValueError, match=message):
+        session.probe()
+
+
+def test_the_default_worker_config_requests_no_providers() -> None:
+    """The CPU path must call the model exactly as it always has."""
+    config = WorkerConfig(
+        cache_directory="unused",
+        offline=True,
+        threads=1,
+        enable_cpu_mem_arena=False,
+        dimension=4,
+    )
+
+    assert config.is_cpu is True
+    assert config.providers == ()
+
+
+def test_telemetry_names_the_backend_the_worker_ran_on() -> None:
+    session = _session(_protocol_worker, 2 * 1024**3)
+
+    with session:
+        session.embed_passages(["a"])
+
+    assert session.telemetry().backend == "cpu"
+    assert session.telemetry().memory_budget_bytes == 2 * 1024**3
