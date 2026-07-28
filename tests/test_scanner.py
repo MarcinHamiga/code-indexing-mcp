@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from incode_mcp.models import ScanConfig
 from incode_mcp.projects import initialize_project
 from incode_mcp.scanner import SourceScanner
@@ -73,7 +75,12 @@ def test_nested_gitignore_can_reinclude_a_file(tmp_path: Path) -> None:
     assert [item.path.as_posix() for item in result.files] == ["package/keep.py"]
 
 
-def test_scanner_rejects_oversized_binary_and_symlink_files(tmp_path: Path) -> None:
+def test_scanner_rejects_oversized_and_symlink_files_without_reading(tmp_path: Path) -> None:
+    """Size and symlink checks are stat-only; content checks belong to the indexer.
+
+    The scanner used to read every changed file to test for NUL bytes and UTF-8
+    validity, then discard the bytes, so the indexer read the same file again.
+    """
     root = tmp_path / "repo"
     root.mkdir()
     project = initialize_project(root)
@@ -88,8 +95,59 @@ def test_scanner_rejects_oversized_binary_and_symlink_files(tmp_path: Path) -> N
 
     result = SourceScanner().scan(project)
 
-    assert result.files == []
-    assert {skip.reason for skip in result.skipped} >= {"oversized", "binary", "symlink"}
+    reasons = {skip.reason for skip in result.skipped}
+    assert reasons >= {"oversized", "symlink"}
+    assert "binary" not in reasons
+    assert "encoding" not in reasons
+    # binary.py is 3 bytes, so it now passes the stat-only scan.
+    assert {item.path.as_posix() for item in result.files} == {"binary.py"}
+
+
+def test_scanner_does_not_read_file_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "ok.py").write_text("def ok():\n    return 1\n")
+    project = initialize_project(root)
+
+    def reject_read(self: Path) -> bytes:
+        raise AssertionError(f"scan must not read {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_read)
+
+    assert len(SourceScanner().scan(project).files) == 1
+
+
+def test_iter_scan_reads_one_file_source_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Streaming means laziness: a file's bytes are read only as it is yielded."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    # Written as bytes: the assertions below are byte-exact, and write_text
+    # would turn the newlines into CRLF on Windows.
+    (root / "a.py").write_bytes(b"a = 1\n")
+    (root / "b.py").write_bytes(b"b = 2\n")
+    project = initialize_project(root)
+    reads: list[Path] = []
+    original = Path.read_bytes
+
+    def tracking_read_bytes(path: Path) -> bytes:
+        reads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", tracking_read_bytes)
+    stream = SourceScanner().iter_scan(project)
+
+    first = next(stream)
+    assert len(reads) == 1
+    second = next(stream)
+    assert len(reads) == 2
+
+    # The streaming path hands the source to the caller instead of re-reading.
+    assert first.content == b"a = 1\n"
+    assert second.content == b"b = 2\n"
 
 
 def test_scanner_never_walks_hard_excluded_directories(tmp_path: Path) -> None:
@@ -157,3 +215,12 @@ def test_has_supported_source_applies_nested_gitignore_rules(tmp_path: Path) -> 
     keep.unlink()
 
     assert scanner.has_supported_source(root, ScanConfig()) is False
+
+
+def test_language_name_literal_matches_scanner_languages() -> None:
+    from typing import get_args
+
+    from incode_mcp.models import LanguageName
+    from incode_mcp.scanner import LANGUAGES
+
+    assert set(get_args(LanguageName)) == set(LANGUAGES.values())

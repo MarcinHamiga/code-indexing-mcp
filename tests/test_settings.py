@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import pytest
+
+from incode_mcp.errors import ErrorCode, IncodeError
+from incode_mcp.settings import IndexMode, IndexSettings
+
+
+def test_indexing_defaults_to_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("INCODE_INDEX_MODE", raising=False)
+    monkeypatch.delenv("INCODE_AUTO_INDEX", raising=False)
+
+    settings = IndexSettings.from_environment()
+
+    assert settings.mode is IndexMode.LAZY
+    assert settings.embedding_batch_size == 1
+    assert settings.embedding_threads >= 1
+    assert settings.embedding_cpu_arena is False
+    assert settings.vector_index == "exact"
+    assert settings.index_wait_seconds == 300
+
+
+def test_index_wait_seconds_is_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "0")
+    assert IndexSettings.from_environment().index_wait_seconds == 0
+
+    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "-1")
+    with pytest.raises(IncodeError) as caught:
+        IndexSettings.from_environment()
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+
+
+@pytest.mark.parametrize(
+    ("legacy", "expected"),
+    [("1", IndexMode.EAGER), ("true", IndexMode.EAGER), ("0", IndexMode.MANUAL)],
+)
+def test_legacy_auto_index_maps_to_index_mode(
+    monkeypatch: pytest.MonkeyPatch, legacy: str, expected: IndexMode
+) -> None:
+    monkeypatch.delenv("INCODE_INDEX_MODE", raising=False)
+    monkeypatch.setenv("INCODE_AUTO_INDEX", legacy)
+
+    assert IndexSettings.from_environment().mode is expected
+
+
+def test_index_mode_takes_precedence_over_legacy_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INCODE_INDEX_MODE", "manual")
+    monkeypatch.setenv("INCODE_AUTO_INDEX", "1")
+
+    assert IndexSettings.from_environment().mode is IndexMode.MANUAL
+
+
+def test_invalid_index_settings_raise_stable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INCODE_EMBED_BATCH_SIZE", "0")
+
+    with pytest.raises(IncodeError) as caught:
+        IndexSettings.from_environment()
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+
+
+def test_memory_budget_override_and_worker_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INCODE_INDEX_MEMORY_MB", "1536")
+    monkeypatch.delenv("INCODE_INDEX_EXECUTION", raising=False)
+
+    settings = IndexSettings.from_environment()
+
+    assert settings.index_memory_bytes == 1536 * 1024 * 1024
+    assert settings.index_execution == "worker"
+
+
+def test_token_window_settings_default_to_the_measured_budget() -> None:
+    settings = IndexSettings.from_environment({})
+
+    assert settings.embedding_max_tokens == 1024
+    assert settings.embedding_overlap_tokens == 64
+
+
+def test_token_window_settings_are_configurable() -> None:
+    settings = IndexSettings.from_environment(
+        {"INCODE_EMBED_MAX_TOKENS": "512", "INCODE_EMBED_OVERLAP_TOKENS": "32"}
+    )
+
+    assert settings.embedding_max_tokens == 512
+    assert settings.embedding_overlap_tokens == 32
+
+
+def test_a_token_budget_above_the_model_limit_is_rejected() -> None:
+    with pytest.raises(IncodeError) as caught:
+        IndexSettings.from_environment({"INCODE_EMBED_MAX_TOKENS": "16384"})
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION

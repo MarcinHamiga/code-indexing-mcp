@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-indexing-mcp"
-version = "0.1.0"
+version = "0.3.0"
 description = "Local-only Tree-sitter code indexer exposed over MCP"
 license = "MIT"
 readme = "README.md"
@@ -16,6 +16,7 @@ dependencies = [
     "mcp>=1.27,<2",
     "pathspec>=0.12,<1",
     "platformdirs>=4.3,<5",
+    "psutil>=7,<8",
     "pyarrow>=20,<24",
     "pydantic>=2.11,<3",
     "tomli-w>=1.2,<2",
@@ -36,6 +37,7 @@ dev = [
     "pytest-asyncio>=1.1,<2",
     "pytest-cov>=6.2,<8",
     "ruff>=0.12,<1",
+    "types-psutil>=7,<8",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -44,11 +46,19 @@ packages = ["src/incode_mcp"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
-markers = ["model: downloads and exercises the real embedding model"]
+pythonpath = ["scripts"]
+markers = [
+    "model: downloads and exercises the real embedding model",
+    "memory: runs the real-model indexing memory gate",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Extractor fixtures are input data, not project code. Their shapes are deliberate —
+# the oversized line exists to drive the line-fragment path — and reformatting them
+# would invalidate the committed output snapshot.
+extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

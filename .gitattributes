@@ -1,0 +1,5 @@
+# The extractor corpus is compared byte-for-byte against a committed snapshot of
+# chunk offsets (tests/test_extractor_equivalence.py), so these files must check
+# out identically on every platform. Without this, Windows checkouts get CRLF and
+# every offset in the snapshot shifts by one byte per preceding line.
+tests/fixtures/extractor_corpus/** text eol=lf

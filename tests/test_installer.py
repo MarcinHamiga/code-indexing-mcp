@@ -27,6 +27,9 @@ def load_installer() -> ModuleType:
     return module
 
 
+installer = load_installer()
+
+
 def test_json_merge_creates_parent_and_top_level_object(tmp_path: Path) -> None:
     installer = load_installer()
     path = tmp_path / "nested" / "config.json"
@@ -718,3 +721,202 @@ def test_posix_bootstrap_has_valid_syntax_and_runs_adjacent_installer() -> None:
     )
 
     assert "--harnesses" in completed.stdout
+
+
+def _skills_source(tmp_path: Path, names: tuple[str, ...] = ("alpha", "beta")) -> Path:
+    root = tmp_path / "repo" / "src" / "incode_mcp" / "skills"
+    for name in names:
+        skill = root / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: test\n---\n", encoding="utf-8"
+        )
+    return tmp_path / "repo"
+
+
+def test_skill_directories_cover_supported_harnesses(tmp_path: Path) -> None:
+    assert (
+        installer.skill_directory("claude-code", home=tmp_path, environment={})
+        == tmp_path / ".claude" / "skills"
+    )
+    assert (
+        installer.skill_directory("codex", home=tmp_path, environment={})
+        == tmp_path / ".agents" / "skills"
+    )
+    assert (
+        installer.skill_directory("kimi-code", home=tmp_path, environment={})
+        == tmp_path / ".agents" / "skills"
+    )
+    assert (
+        installer.skill_directory(
+            "opencode", home=tmp_path, environment={"XDG_CONFIG_HOME": str(tmp_path / "xdg")}
+        )
+        == tmp_path / "xdg" / "opencode" / "skills"
+    )
+    assert installer.skill_directory("claude-desktop", home=tmp_path, environment={}) is None
+    assert installer.skill_directory("kilocode", home=tmp_path, environment={}) is None
+
+
+def test_skill_directory_honors_claude_config_dir(tmp_path: Path) -> None:
+    environment = {"CLAUDE_CONFIG_DIR": str(tmp_path / "custom-claude")}
+    assert (
+        installer.skill_directory("claude-code", home=tmp_path, environment=environment)
+        == tmp_path / "custom-claude" / "skills"
+    )
+
+
+def test_install_skills_links_bundled_skills(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path)
+
+    results = installer.install_skills(["claude-code"], repo, home=tmp_path, environment={})
+
+    skills_dir = tmp_path / ".claude" / "skills"
+    for name in ("alpha", "beta"):
+        link = skills_dir / name
+        assert link.is_symlink()
+        assert link.resolve() == (repo / "src" / "incode_mcp" / "skills" / name).resolve()
+    assert len(results) == 1
+    slug, message = results[0]
+    assert slug == "claude-code"
+    assert "2 linked" in message
+
+
+def test_install_skills_is_idempotent(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path)
+    installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+
+    results = installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+
+    _slug, message = results[0]
+    assert "0 linked" in message
+    assert "already installed" in message
+
+
+def test_install_skills_is_idempotent_across_equivalent_source_paths(tmp_path: Path) -> None:
+    """The already-installed check must compare real paths, not raw link text.
+
+    Windows readlink returns an extended-length "\\\\?\\C:\\..." path that never
+    equals the plain path the link was made from; a symlinked parent directory
+    reproduces the same mismatch on POSIX.
+    """
+    repo = _skills_source(tmp_path, names=("alpha",))
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    installer.install_skills(["codex"], alias, home=tmp_path, environment={})
+
+    results = installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+
+    _slug, message = results[0]
+    assert "0 linked" in message
+    assert "1 already installed" in message
+
+
+def test_install_skills_backs_up_clashing_directory(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path)
+    clash = tmp_path / ".agents" / "skills" / "alpha"
+    clash.mkdir(parents=True)
+    (clash / "SKILL.md").write_text("old", encoding="utf-8")
+
+    installer.install_skills(["kimi-code"], repo, home=tmp_path, environment={})
+
+    assert (tmp_path / ".agents" / "skills" / "alpha").is_symlink()
+    backup = tmp_path / ".agents" / "skills" / "alpha.bak"
+    assert backup.is_dir() and not backup.is_symlink()
+    assert (backup / "SKILL.md").read_text(encoding="utf-8") == "old"
+
+
+def test_install_skills_backs_up_clashing_symlink(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path)
+    elsewhere = tmp_path / "dotfiles" / "alpha"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "SKILL.md").write_text("mine", encoding="utf-8")
+    skills_dir = tmp_path / ".agents" / "skills"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "alpha").symlink_to(elsewhere, target_is_directory=True)
+
+    installer.install_skills(["kimi-code"], repo, home=tmp_path, environment={})
+
+    link = skills_dir / "alpha"
+    assert link.is_symlink()
+    assert link.resolve() == (repo / "src" / "incode_mcp" / "skills" / "alpha").resolve()
+    backup = skills_dir / "alpha.bak"
+    assert backup.is_symlink()
+    assert backup.resolve() == elsewhere.resolve()
+
+
+def test_install_skills_skips_unsupported_harness(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path)
+
+    results = installer.install_skills(["claude-desktop"], repo, home=tmp_path, environment={})
+
+    slug, message = results[0]
+    assert slug == "claude-desktop"
+    assert "skipped" in message
+    assert not (tmp_path / ".claude").exists()
+
+
+def test_install_skills_reports_missing_source(tmp_path: Path) -> None:
+    results = installer.install_skills(
+        ["codex"], tmp_path / "empty-repo", home=tmp_path, environment={}
+    )
+
+    _slug, message = results[0]
+    assert "skipped" in message
+    assert not (tmp_path / ".agents").exists()
+
+
+def test_reinstall_from_a_new_checkout_keeps_the_original_backup(tmp_path: Path) -> None:
+    """Relinking must not treat an earlier install's own link as user content."""
+    first = _skills_source(tmp_path / "first", names=("alpha",))
+    second = _skills_source(tmp_path / "second", names=("alpha",))
+    skills_dir = tmp_path / ".agents" / "skills"
+    mine = skills_dir / "alpha"
+    mine.mkdir(parents=True)
+    (mine / "SKILL.md").write_text("mine", encoding="utf-8")
+
+    installer.install_skills(["codex"], first, home=tmp_path, environment={})
+    installer.install_skills(["codex"], second, home=tmp_path, environment={})
+
+    assert (skills_dir / "alpha").resolve() == (
+        second / "src" / "incode_mcp" / "skills" / "alpha"
+    ).resolve()
+    assert (skills_dir / "alpha.bak" / "SKILL.md").read_text(encoding="utf-8") == "mine"
+    assert not (skills_dir / "alpha.bak.2").exists()
+
+
+def test_install_skills_never_overwrites_an_existing_backup(tmp_path: Path) -> None:
+    repo = _skills_source(tmp_path, names=("alpha",))
+    skills_dir = tmp_path / ".agents" / "skills"
+    for name, content in (("alpha", "current"), ("alpha.bak", "older")):
+        entry = skills_dir / name
+        entry.mkdir(parents=True)
+        (entry / "SKILL.md").write_text(content, encoding="utf-8")
+
+    installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+
+    assert (skills_dir / "alpha").is_symlink()
+    assert (skills_dir / "alpha.bak" / "SKILL.md").read_text(encoding="utf-8") == "older"
+    assert (skills_dir / "alpha.bak.2" / "SKILL.md").read_text(encoding="utf-8") == "current"
+
+
+def test_install_skills_leaves_existing_skills_in_place_when_symlinks_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows without the symlink privilege must not displace a user's skill."""
+    repo = _skills_source(tmp_path, names=("alpha",))
+    mine = tmp_path / ".agents" / "skills" / "alpha"
+    mine.mkdir(parents=True)
+    (mine / "SKILL.md").write_text("mine", encoding="utf-8")
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise OSError(1314, "A required privilege is not held by the client")
+
+    monkeypatch.setattr(Path, "symlink_to", refuse)
+
+    results = installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+
+    _slug, message = results[0]
+    assert "skipped" in message
+    assert (mine / "SKILL.md").read_text(encoding="utf-8") == "mine"
+    assert not (tmp_path / ".agents" / "skills" / "alpha.bak").exists()
+    assert not (tmp_path / ".agents" / "skills" / "alpha.incoming").exists()

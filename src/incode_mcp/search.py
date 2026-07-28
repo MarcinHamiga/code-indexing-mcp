@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import PurePosixPath
 
 from .embedding import Embedder
 from .errors import ErrorCode, IncodeError
 from .models import (
+    ChunkPreview,
     CodeChunk,
     OutlineItem,
     OutlineResponse,
@@ -15,7 +17,15 @@ from .models import (
     StoredChunk,
     SymbolResponse,
 )
+from .path_filter import path_condition
 from .storage import LanceStore, _quoted
+
+logger = logging.getLogger(__name__)
+
+# Rows fetched when path patterns cannot be pushed into the scan. Ten times the
+# ordinary window: enough that a moderately low-ranking match survives the Python
+# filter, without materialising a whole project's chunks.
+_FALLBACK_FETCH_ROWS = 500
 
 
 class SearchService:
@@ -39,22 +49,38 @@ class SearchService:
                 ErrorCode.INVALID_FILTER, "Search requires a query and at least one project"
             )
         limit = max(1, min(limit, 50))
-        conditions = [self._in_condition("project_id", project_ids)]
+        conditions: list[str] = []
         if languages:
             conditions.append(self._in_condition("language", languages))
         if kinds:
             conditions.append(self._in_condition("kind", kinds))
+        pushed_paths = path_condition(paths) if paths else None
+        if pushed_paths is not None:
+            conditions.append(pushed_paths)
+        elif paths:
+            # Without a pushdown the Python filter below runs on rows the scan
+            # already truncated, so a low-ranking match can be missed. Widen the
+            # window to make that less likely and say so, rather than reporting a
+            # confident empty result.
+            logger.debug(
+                "Path patterns %r could not be pushed down; filtering %d fetched rows in "
+                "Python, so low-ranking matches may be missed",
+                paths,
+                _FALLBACK_FETCH_ROWS,
+            )
+        fetch = _FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5)
         rows = self.store.hybrid_search(
             query,
             self.embedder.embed_query(query),
-            " AND ".join(conditions),
-            max(50, limit * 5),
+            project_ids,
+            " AND ".join(conditions) if conditions else None,
+            fetch,
         )
         names = {project.id: project.name for project in self.store.list_projects()}
         hits: list[SearchHit] = []
         seen: set[tuple[str, str, int, int]] = set()
         for row in rows:
-            chunk = StoredChunk.model_validate(row)
+            chunk = ChunkPreview.model_validate(row)
             if paths and not any(PurePosixPath(chunk.path).match(pattern) for pattern in paths):
                 continue
             key = (chunk.project_id, chunk.path, chunk.start_line, chunk.end_line)
@@ -79,21 +105,13 @@ class SearchService:
         if match not in {"exact", "prefix", "contains"}:
             raise IncodeError(ErrorCode.INVALID_FILTER, f"Invalid symbol match mode: {match}")
         limit = max(1, min(limit, 50))
-        candidates = self.store.list_chunks([project_id])
+        candidates = self.store.find_symbol_chunks(
+            name, project_id, match=match, kinds=kinds, limit=limit
+        )
         names = {project.id: project.name for project in self.store.list_projects()}
 
-        def matches(chunk: StoredChunk) -> bool:
-            candidate = chunk.qualified_symbol or chunk.symbol or ""
-            if kinds and chunk.kind not in kinds:
-                return False
-            if match == "exact":
-                return candidate == name or chunk.symbol == name
-            if match == "prefix":
-                return candidate.startswith(name)
-            return name in candidate
-
         selected = sorted(
-            (chunk for chunk in candidates if matches(chunk)),
+            candidates,
             key=lambda chunk: (chunk.path, chunk.start_line, chunk.kind),
         )[:limit]
         return SymbolResponse(name=name, hits=[self._hit(chunk, names, 1.0) for chunk in selected])
@@ -102,7 +120,8 @@ class SearchService:
         items: list[OutlineItem] = []
         seen: set[tuple[str, str]] = set()
         for chunk in sorted(
-            self.store.list_chunks([project_id]), key=lambda item: (item.path, item.start_line)
+            self.store.outline_chunks(path, project_id),
+            key=lambda item: (item.path, item.start_line),
         ):
             if chunk.path != path or not chunk.symbol or not chunk.qualified_symbol:
                 continue
@@ -125,15 +144,20 @@ class SearchService:
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         chunk = self.store.get_chunk(chunk_id)
         if chunk is None:
-            raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown chunk: {chunk_id}")
-        return CodeChunk.model_validate(chunk.model_dump())
+            raise IncodeError(
+                ErrorCode.CHUNK_NOT_FOUND,
+                f"Unknown chunk: {chunk_id}; chunk ids come from search_code or find_symbol "
+                "results and change when the file is re-indexed",
+                chunk_id=chunk_id,
+            )
+        return chunk
 
     @staticmethod
     def _in_condition(column: str, values: list[str]) -> str:
         return f"{column} IN ({', '.join(_quoted(value) for value in values)})"
 
     @staticmethod
-    def _hit(chunk: StoredChunk, names: dict[str, str], score: float) -> SearchHit:
+    def _hit(chunk: StoredChunk | ChunkPreview, names: dict[str, str], score: float) -> SearchHit:
         snippet = chunk.content[:4_000]
         return SearchHit(
             chunk_id=chunk.chunk_id,

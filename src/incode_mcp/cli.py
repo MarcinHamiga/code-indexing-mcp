@@ -6,21 +6,31 @@ import argparse
 import json
 import logging
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
-from .application import Application
+from .application import Application, RuntimePaths
+from .daemon import (
+    BrokerApplication,
+    DaemonServer,
+    daemon_status,
+    ensure_daemon,
+    require_daemon_support,
+)
 from .errors import IncodeError
 from .server import create_server
+from .settings import IndexSettings
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="code-indexing-mcp", description="Local MCP code indexer")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("serve", help="Run the stdio MCP server")
+    serve = commands.add_parser("serve", help="Run the stdio MCP server")
+    serve.add_argument("--direct", action="store_true", help="Bypass the per-user daemon")
     init = commands.add_parser("init", help="Initialize a local project marker")
     init.add_argument("path", nargs="?")
     init.add_argument("--name")
@@ -38,6 +48,12 @@ def _parser() -> argparse.ArgumentParser:
     model = commands.add_parser("model", help="Manage the local embedding model")
     model_commands = model.add_subparsers(dest="model_command", required=True)
     model_commands.add_parser("pull")
+    daemon = commands.add_parser("daemon", help="Manage the shared indexing daemon")
+    daemon_commands = daemon.add_subparsers(dest="daemon_command", required=True)
+    daemon_commands.add_parser("run", help=argparse.SUPPRESS)
+    daemon_commands.add_parser("status")
+    daemon_commands.add_parser("stop")
+    daemon_commands.add_parser("restart")
     return parser
 
 
@@ -54,11 +70,51 @@ def _json(value: BaseModel | Sequence[BaseModel] | dict[str, Any]) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-    app = Application.from_environment(cwd=Path.cwd())
+    paths = RuntimePaths.from_environment()
     try:
+        if args.command == "daemon":
+            if args.daemon_command == "run":
+                DaemonServer(paths).serve()
+                return 0
+            if args.daemon_command == "status":
+                print(_json(daemon_status(paths)))
+                return 0
+            if args.daemon_command == "stop":
+                status = daemon_status(paths)
+                if status["running"]:
+                    BrokerApplication(paths).stop()
+                print(_json({"stopped": bool(status["running"])}))
+                return 0
+            if args.daemon_command == "restart":
+                if daemon_status(paths)["running"]:
+                    BrokerApplication(paths).stop()
+                    for _ in range(100):
+                        if not daemon_status(paths)["running"]:
+                            break
+                        time.sleep(0.05)
+                broker = ensure_daemon(paths)
+                print(_json({"restarted": True, **broker.ping()}))
+                return 0
+        settings = IndexSettings.from_environment()
         if args.command == "serve":
+            use_daemon = not args.direct and settings.broker_mode != "off"
+            if use_daemon:
+                try:
+                    require_daemon_support()
+                except IncodeError:
+                    # An explicit opt-in cannot be silently downgraded, but the
+                    # default "auto" serves directly rather than failing.
+                    if settings.broker_mode == "on":
+                        raise
+                    logging.warning(
+                        "Unix domain sockets are unavailable on this platform; "
+                        "serving directly instead of via the shared daemon"
+                    )
+                    use_daemon = False
+            app = ensure_daemon(paths) if use_daemon else Application(paths, cwd=Path.cwd())
             create_server(app).run(transport="stdio")
             return 0
+        app = Application(paths, cwd=Path.cwd())
         result: BaseModel | Sequence[BaseModel] | dict[str, Any]
         if args.command == "init":
             result = app.init_project(args.path, args.name, args.force_new_id)

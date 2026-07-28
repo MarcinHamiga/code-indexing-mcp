@@ -1,3 +1,4 @@
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,58 @@ def test_splits_oversized_function_into_bounded_parts() -> None:
     assert all(chunk.kind == "function_part" for chunk in parts)
     assert [chunk.part_index for chunk in parts] == list(range(len(parts)))
     assert all(chunk.start_line <= chunk.end_line for chunk in parts)
+
+
+def test_splits_a_single_oversized_line_into_bounded_chunks() -> None:
+    source = ("payload = '" + ("x" * 10_000) + "'\n").encode()
+
+    result = TreeSitterExtractor(max_chars=1024).extract(Path("payload.py"), "python", source)
+
+    assert len(result.chunks) > 1
+    assert all(len(chunk.content) <= 1024 for chunk in result.chunks)
+
+
+def test_one_oversized_line_does_not_split_its_neighbours_per_line() -> None:
+    """An oversized line is fragmented on its own; the rest keeps line windows."""
+    body = "\n".join(f"    value_{index} = {index}" for index in range(400))
+    ordinary = f"def big():\n{body}\n".encode()
+    with_long_line = f"def big():\n{body}\n    blob = '{'x' * 5_000}'\n".encode()
+    extractor = TreeSitterExtractor()
+
+    baseline = extractor.extract(Path("ordinary.py"), "python", ordinary)
+    mixed = extractor.extract(Path("mixed.py"), "python", with_long_line)
+
+    # The long line only adds its own fragments; it must not force every
+    # surrounding line onto a chunk of its own.
+    assert len(mixed.chunks) < len(baseline.chunks) + 10
+    assert all(len(chunk.content) <= extractor.max_chars for chunk in mixed.chunks)
+
+
+def test_blank_runs_around_an_oversized_line_produce_no_empty_chunks() -> None:
+    lines = []
+    for index in range(50):
+        lines.append(f"    value_{index} = {index}")
+        lines.append("")
+    lines.append(f"    blob = '{'x' * 5_000}'")
+    source = ("def spaced():\n" + "\n".join(lines) + "\n").encode()
+
+    result = TreeSitterExtractor().extract(Path("spaced.py"), "python", source)
+
+    assert result.chunks
+    assert all(chunk.content.strip() for chunk in result.chunks)
+
+
+def test_oversized_line_fragments_carry_contiguous_byte_ranges() -> None:
+    prefix = "value = 1\n"
+    source = (prefix + "blob = '" + ("x" * 5_000) + "'\n").encode()
+
+    result = TreeSitterExtractor(max_chars=1024).extract(Path("offsets.py"), "python", source)
+    fragments = [chunk for chunk in result.chunks if chunk.start_byte >= len(prefix)]
+
+    assert len(fragments) > 1
+    for earlier, later in pairwise(fragments):
+        assert earlier.end_byte == later.start_byte
+    assert fragments[-1].end_byte <= len(source)
 
 
 def test_syntax_errors_are_reported_but_valid_symbols_survive() -> None:
@@ -317,3 +370,66 @@ class Old {
     assert ("class", "Old") in symbols
     old_chunk = next(chunk for chunk in result.chunks if chunk.qualified_symbol == "Old")
     assert old_chunk.content.startswith("@Deprecated")
+
+
+def test_chunk_kind_literal_covers_every_kind_the_queries_capture() -> None:
+    from importlib.resources import files
+    from typing import get_args
+
+    from incode_mcp.models import ChunkKind
+
+    declared = set(get_args(ChunkKind))
+    captured = set()
+    for language in ("python", "java", "javascript", "typescript", "tsx"):
+        text = files("incode_mcp.queries").joinpath(f"{language}.scm").read_text()
+        captured |= {
+            line.split("@definition.", 1)[1].split()[0].strip(")")
+            for line in text.splitlines()
+            if "@definition." in line
+        }
+
+    missing = captured - declared
+    assert not missing, f"ChunkKind is missing extractor kinds: {sorted(missing)}"
+    assert {f"{kind}_part" for kind in captured if kind != "module"} <= declared
+
+
+def test_compiled_query_is_built_once_per_language(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The .scm files are package data and Language objects are built in __init__.
+
+    Re-reading and recompiling per file cost 44% of extraction time over 35 files.
+    """
+    import incode_mcp.extractor as extractor_module
+
+    compiled: list[str] = []
+    original = extractor_module.Query
+
+    def counting_query(language: object, text: str) -> object:
+        compiled.append(text[:40])
+        return original(language, text)
+
+    monkeypatch.setattr(extractor_module, "Query", counting_query)
+    extractor = extractor_module.TreeSitterExtractor()
+    source = b"def one():\n    return 1\n"
+
+    for _ in range(5):
+        extractor.extract(Path("a.py"), "python", source)
+    extractor.extract(Path("b.ts"), "typescript", b"export const x = 1;\n")
+
+    assert len(compiled) == 2, f"compiled {len(compiled)} times, expected one per language"
+
+
+def test_line_index_matches_a_naive_newline_count() -> None:
+    from incode_mcp.extractor import _LineIndex
+
+    source = b"alpha\nbeta\n\ngamma\r\ndelta"
+    index = _LineIndex(source)
+
+    for offset in range(len(source) + 1):
+        assert index.line_at(offset) == source[:offset].count(b"\n") + 1, f"offset {offset}"
+
+
+def test_line_index_handles_empty_and_newline_only_sources() -> None:
+    from incode_mcp.extractor import _LineIndex
+
+    assert _LineIndex(b"").line_at(0) == 1
+    assert _LineIndex(b"\n\n\n").line_at(3) == 4

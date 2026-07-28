@@ -1,4 +1,5 @@
 import shutil
+import threading
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,38 @@ class OtherModelTinyEmbedder:
 
     def embed_query(self, text: str) -> list[float]:
         return [1.0, 0.0, 0.0, float(len(text))]
+
+
+def test_concurrent_init_project_registers_one_project(tmp_path: Path) -> None:
+    """The daemon serves each client on its own thread; one root, one project id."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    callers = 8
+    barrier = threading.Barrier(callers)
+    identifiers: list[str] = []
+    lock = threading.Lock()
+
+    def initialize() -> None:
+        barrier.wait(timeout=10)
+        project = app.init_project(root)
+        with lock:
+            identifiers.append(project.id)
+
+    threads = [threading.Thread(target=initialize) for _ in range(callers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(set(identifiers)) == 1
+    assert len(app.list_projects()) == 1
 
 
 def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> None:
