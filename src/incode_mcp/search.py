@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import PurePosixPath
 
 from .embedding import Embedder
@@ -16,7 +17,15 @@ from .models import (
     StoredChunk,
     SymbolResponse,
 )
+from .path_filter import path_condition
 from .storage import LanceStore, _quoted
+
+logger = logging.getLogger(__name__)
+
+# Rows fetched when path patterns cannot be pushed into the scan. Ten times the
+# ordinary window: enough that a moderately low-ranking match survives the Python
+# filter, without materialising a whole project's chunks.
+_FALLBACK_FETCH_ROWS = 500
 
 
 class SearchService:
@@ -45,12 +54,27 @@ class SearchService:
             conditions.append(self._in_condition("language", languages))
         if kinds:
             conditions.append(self._in_condition("kind", kinds))
+        pushed_paths = path_condition(paths) if paths else None
+        if pushed_paths is not None:
+            conditions.append(pushed_paths)
+        elif paths:
+            # Without a pushdown the Python filter below runs on rows the scan
+            # already truncated, so a low-ranking match can be missed. Widen the
+            # window to make that less likely and say so, rather than reporting a
+            # confident empty result.
+            logger.debug(
+                "Path patterns %r could not be pushed down; filtering %d fetched rows in "
+                "Python, so low-ranking matches may be missed",
+                paths,
+                _FALLBACK_FETCH_ROWS,
+            )
+        fetch = _FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5)
         rows = self.store.hybrid_search(
             query,
             self.embedder.embed_query(query),
             project_ids,
             " AND ".join(conditions) if conditions else None,
-            max(50, limit * 5),
+            fetch,
         )
         names = {project.id: project.name for project in self.store.list_projects()}
         hits: list[SearchHit] = []
@@ -120,8 +144,13 @@ class SearchService:
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         chunk = self.store.get_chunk(chunk_id)
         if chunk is None:
-            raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown chunk: {chunk_id}")
-        return CodeChunk.model_validate(chunk.model_dump())
+            raise IncodeError(
+                ErrorCode.CHUNK_NOT_FOUND,
+                f"Unknown chunk: {chunk_id}; chunk ids come from search_code or find_symbol "
+                "results and change when the file is re-indexed",
+                chunk_id=chunk_id,
+            )
+        return chunk
 
     @staticmethod
     def _in_condition(column: str, values: list[str]) -> str:

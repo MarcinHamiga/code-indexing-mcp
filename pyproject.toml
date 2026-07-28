@@ -55,6 +55,10 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Extractor fixtures are input data, not project code. Their shapes are deliberate —
+# the oversized line exists to drive the line-fragment path — and reformatting them
+# would invalidate the committed output snapshot.
+extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

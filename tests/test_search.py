@@ -211,3 +211,160 @@ def test_symbol_results_are_ordered_before_the_limit_applies(tmp_path: Path) -> 
     hits = search.find_symbol("handler_", project_id, match="prefix", limit=3)
 
     assert [hit.symbol for hit in hits.hits] == ["handler_0", "handler_1", "handler_2"]
+
+
+def _indexed_tree(tmp_path: Path, sources: dict[str, str]) -> tuple[SearchService, str]:
+    """Index one project whose files are given as {relative path: source}."""
+    embedder = SemanticEmbedder()
+    store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
+    indexer = Indexer(
+        store=store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=embedder,
+        lock_directory=tmp_path / "locks",
+    )
+    root = tmp_path / "tree"
+    root.mkdir()
+    for relative, source in sources.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    project = initialize_project(root)
+    indexer.index(project)
+    return SearchService(store, embedder), project.id
+
+
+def test_path_filter_finds_matches_below_the_fetch_window(tmp_path: Path) -> None:
+    """A match that ranks outside the fetch window must survive a path filter.
+
+    Before the pushdown, `paths` was applied in Python to rows the scan had already
+    truncated, so a low-ranking match in a rare directory returned zero hits even
+    though find_symbol proved it was indexed. The noise files repeat the query terms
+    so they all outrank the needle deterministically, rather than by tie-break luck.
+    """
+    sources = {
+        f"noise/m{index}.py": (
+            f"def enforce_permissions_{index}(user):\n"
+            "    'permission permission permission check'\n"
+            "    return user.permission\n"
+        )
+        for index in range(120)
+    }
+    sources["rare/needle.py"] = "def audit_gate(user):\n    'permission'\n    return user.allowed\n"
+    search, project = _indexed_tree(tmp_path, sources)
+
+    unfiltered = search.search_code("permission check", [project], limit=8)
+    filtered = search.search_code("permission check", [project], paths=["rare/*"], limit=8)
+
+    assert {hit.path.split("/")[0] for hit in unfiltered.hits} == {"noise"}
+    assert [hit.path for hit in filtered.hits] == ["rare/needle.py"]
+
+
+def test_path_filter_respects_right_anchored_glob_semantics(tmp_path: Path) -> None:
+    search, project = _indexed_tree(
+        tmp_path,
+        {
+            "src/deep/b.py": "def alpha_one():\n    return 1\n",
+            "src/a.py": "def alpha_two():\n    return 2\n",
+            "tests/c.py": "def alpha_three():\n    return 3\n",
+        },
+    )
+
+    # "src/*" spans one segment; "*.py" matches at any depth.
+    assert {hit.path for hit in search.search_code("alpha", [project], paths=["src/*"]).hits} == {
+        "src/a.py"
+    }
+    assert {hit.path for hit in search.search_code("alpha", [project], paths=["*.py"]).hits} == {
+        "src/deep/b.py",
+        "src/a.py",
+        "tests/c.py",
+    }
+    assert [
+        hit.path for hit in search.search_code("alpha", [project], paths=["src//a.py"]).hits
+    ] == ["src/a.py"]
+    assert {hit.path for hit in search.search_code("alpha", [project], paths=["*/"]).hits} == {
+        "src/deep/b.py",
+        "src/a.py",
+        "tests/c.py",
+    }
+
+
+def test_untranslatable_path_pattern_still_filters_in_python(tmp_path: Path) -> None:
+    search, project = _indexed_tree(
+        tmp_path,
+        {
+            "src/a.py": "def alpha_two():\n    return 2\n",
+            "tests/c.py": "def alpha_three():\n    return 3\n",
+        },
+    )
+
+    # An absolute pattern disables the pushdown; the post-filter must still apply,
+    # and PurePosixPath.match never matches an absolute pattern against these paths.
+    assert search.search_code("alpha", [project], paths=["/src/a.py"]).hits == []
+
+
+def test_literal_empty_character_class_falls_back_without_a_regex_error(tmp_path: Path) -> None:
+    search, project = _indexed_tree(
+        tmp_path,
+        {"literal/a[].py": "def alpha_literal():\n    return 1\n"},
+    )
+
+    assert [hit.path for hit in search.search_code("alpha", [project], paths=["*[]*.py"]).hits] == [
+        "literal/a[].py"
+    ]
+
+
+CHUNK_PAYLOAD_FIELDS = {
+    "chunk_id",
+    "file_id",
+    "project_id",
+    "path",
+    "language",
+    "kind",
+    "symbol",
+    "qualified_symbol",
+    "parent_symbol",
+    "start_byte",
+    "end_byte",
+    "start_line",
+    "end_line",
+    "content",
+    "content_hash",
+    "part_index",
+}
+
+
+def test_get_chunk_excludes_embedding_and_duplicated_text(tmp_path: Path) -> None:
+    """get_chunk is the full-text counterpart to a snippet, not a storage row dump.
+
+    The vector was 72% of the old payload and the code text appeared three times
+    over, in content, embedding_text, and search_text.
+    """
+    search, project = _indexed_source(tmp_path, "def authenticate(user):\n    return user.token\n")
+    hit = search.search_code("authenticate", [project]).hits[0]
+
+    payload = search.get_chunk(hit.chunk_id).model_dump()
+
+    assert set(payload) == CHUNK_PAYLOAD_FIELDS
+    assert "vector" not in payload
+    assert "embedding_text" not in payload
+    assert "search_text" not in payload
+    assert "return user.token" in payload["content"]
+
+
+def test_get_chunk_payload_is_dominated_by_content(tmp_path: Path) -> None:
+    import json
+
+    source = "def authenticate(user):\n" + "".join(
+        f"    step_{index} = user.token\n" for index in range(80)
+    )
+    search, project = _indexed_source(tmp_path, source)
+    hit = search.search_code("authenticate", [project]).hits[0]
+
+    chunk = search.get_chunk(hit.chunk_id)
+    encoded = json.dumps(chunk.model_dump(mode="json"))
+
+    # Metadata is ~290 chars of ids and offsets; anything beyond a small multiple of
+    # the content means a payload field crept back in.
+    assert len(encoded) < len(chunk.content) * 2

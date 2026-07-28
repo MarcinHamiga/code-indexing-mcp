@@ -77,6 +77,21 @@ def _digest(value: str | bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _content_rejection(source: bytes) -> str | None:
+    """Return why *source* cannot be indexed, or None when it can.
+
+    Runs where the bytes are already in hand. The scanner used to do this and throw
+    the bytes away, which cost every changed file a second full read.
+    """
+    if b"\x00" in source:
+        return "binary"
+    try:
+        source.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return "encoding"
+    return None
+
+
 @dataclass
 class _PhaseTimer:
     """Accumulate wall time per indexing phase across an interleaved run."""
@@ -224,7 +239,17 @@ class Indexer:
                             if item.content is not None
                             else item.absolute_path.read_bytes()
                         )
+                        rejection = _content_rejection(source)
                         content_hash = _digest(source)
+                    if rejection is not None:
+                        # Content rejection is a skip, not a syntax/indexing error.
+                        # Stage removal so an earlier text version disappears only
+                        # when the rest of this indexing transaction commits.
+                        if previous is not None:
+                            with timer.measure("commit"):
+                                staging_job().mark_removed(previous.file_id)
+                        skipped += 1
+                        continue
                     if not force and previous is not None and previous.content_hash == content_hash:
                         with timer.measure("commit"):
                             staging_job().stage_file(

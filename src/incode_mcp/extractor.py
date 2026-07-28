@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import threading
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib.resources import files
@@ -49,6 +51,54 @@ class _Definition:
     name: str
 
 
+@dataclass(frozen=True)
+class _DefinitionIndex:
+    """Per-file lookups the definition walk needs, built once instead of per definition.
+
+    ``_has_definition_ancestor``, ``_symbol_context``, and ``_content_range`` each
+    rebuilt a whole-file dict or set on every call, making extraction quadratic in
+    definition count: a 699 KB generated file with 16,384 definitions spent 31 s
+    here against 8 ms of parsing.
+    """
+
+    definitions: list[_Definition]
+    by_node_id: dict[int, _Definition]
+    starts: list[int]
+
+    @classmethod
+    def build(cls, definitions: list[_Definition]) -> _DefinitionIndex:
+        return cls(
+            definitions=definitions,
+            by_node_id={definition.node.id: definition for definition in definitions},
+            # _definitions returns rows sorted by (start_byte, -end_byte), so this
+            # is ascending and safe to bisect.
+            starts=[definition.node.start_byte for definition in definitions],
+        )
+
+
+class _LineIndex:
+    """Byte offsets of every newline in one file, for O(log n) line lookups.
+
+    ``source[:start].count(b"\\n")`` is O(file size) per chunk, so computing a start
+    line per chunk was O(chunks x file size). ``bytes.find`` scans at C speed, so
+    building this costs one pass and one append per line.
+    """
+
+    __slots__ = ("_newlines",)
+
+    def __init__(self, source: bytes) -> None:
+        newlines: list[int] = []
+        position = source.find(b"\n")
+        while position != -1:
+            newlines.append(position)
+            position = source.find(b"\n", position + 1)
+        self._newlines = newlines
+
+    def line_at(self, byte_offset: int) -> int:
+        """Return the 1-based line number containing *byte_offset*."""
+        return bisect_left(self._newlines, byte_offset) + 1
+
+
 class TreeSitterExtractor:
     def __init__(
         self,
@@ -61,21 +111,47 @@ class TreeSitterExtractor:
         self.max_lines = max_lines
         self.overlap_lines = min(overlap_lines, max(0, max_lines - 1))
         self._languages = _languages()
+        self._queries: dict[str, Query] = {}
+        # Indexer holds one extractor and the daemon serves each client on its own
+        # thread, so the lazy compile must not build two queries concurrently. Same
+        # double-checked shape as FastEmbedder's model load.
+        self._queries_lock = threading.Lock()
+
+    def _query(self, language_name: str) -> Query:
+        """Return the compiled query for *language_name*, compiling once per process.
+
+        The .scm files are package data and never change at runtime, but the previous
+        code re-read and recompiled one per extracted file, which measured at 44% of
+        extraction time across a 35-file pass.
+        """
+        cached = self._queries.get(language_name)
+        if cached is not None:
+            return cached
+        with self._queries_lock:
+            cached = self._queries.get(language_name)
+            if cached is not None:
+                return cached
+            text = files("incode_mcp.queries").joinpath(f"{language_name}.scm").read_text()
+            compiled = Query(self._languages[language_name], text)
+            self._queries[language_name] = compiled
+            return compiled
 
     def extract(self, path: Path, language: str, source: bytes) -> ExtractionResult:
         language_impl = self._languages[language]
         normalized_source = source.decode("utf-8-sig").encode("utf-8")
         tree = Parser(language_impl).parse(normalized_source)
-        definitions = self._definitions(language, language_impl, tree.root_node, normalized_source)
+        definitions = self._definitions(language, tree.root_node, normalized_source)
+        index = _DefinitionIndex.build(definitions)
+        line_index = _LineIndex(normalized_source)
         chunks: list[ExtractedChunk] = []
         covered: list[tuple[int, int]] = []
 
         for definition in definitions:
             outer = self._outer_node(definition.node)
-            if not self._has_definition_ancestor(definition.node, definitions):
+            if not self._has_definition_ancestor(definition.node, index):
                 covered.append((outer.start_byte, outer.end_byte))
-            kind, parent, qualified = self._symbol_context(definition, definitions)
-            start, end = self._content_range(outer, definition.node, kind, definitions)
+            kind, parent, qualified = self._symbol_context(definition, index)
+            start, end = self._content_range(outer, definition.node, kind, index)
             chunks.extend(
                 self._chunks_for_range(
                     path=path,
@@ -87,19 +163,16 @@ class TreeSitterExtractor:
                     source=normalized_source,
                     start=start,
                     end=end,
+                    line_index=line_index,
                 )
             )
 
-        chunks.extend(self._module_chunks(path, language, normalized_source, covered))
+        chunks.extend(self._module_chunks(path, language, normalized_source, covered, line_index))
         chunks.sort(key=lambda chunk: (chunk.start_byte, chunk.end_byte, chunk.kind))
         return ExtractionResult(chunks=chunks, has_errors=tree.root_node.has_error)
 
-    @staticmethod
-    def _definitions(
-        language_name: str, language: Language, root: Node, source: bytes
-    ) -> list[_Definition]:
-        query_text = files("incode_mcp.queries").joinpath(f"{language_name}.scm").read_text()
-        matches = QueryCursor(Query(language, query_text)).matches(root)
+    def _definitions(self, language_name: str, root: Node, source: bytes) -> list[_Definition]:
+        matches = QueryCursor(self._query(language_name)).matches(root)
         found: dict[tuple[int, int, str], _Definition] = {}
         for _, captures in matches:
             name_nodes = captures.get("name", [])
@@ -130,24 +203,22 @@ class TreeSitterExtractor:
         return outer
 
     @staticmethod
-    def _has_definition_ancestor(node: Node, definitions: list[_Definition]) -> bool:
-        definition_node_ids = {definition.node.id for definition in definitions}
+    def _has_definition_ancestor(node: Node, index: _DefinitionIndex) -> bool:
         parent = node.parent
         while parent is not None:
-            if parent.id in definition_node_ids:
+            if parent.id in index.by_node_id:
                 return True
             parent = parent.parent
         return False
 
     @staticmethod
     def _symbol_context(
-        definition: _Definition, definitions: list[_Definition]
+        definition: _Definition, index: _DefinitionIndex
     ) -> tuple[str, str | None, str]:
         chain: list[_Definition] = []
-        definitions_by_id = {candidate.node.id: candidate for candidate in definitions}
         parent = definition.node.parent
         while parent is not None:
-            candidate = definitions_by_id.get(parent.id)
+            candidate = index.by_node_id.get(parent.id)
             if candidate is not None:
                 chain.append(candidate)
             parent = parent.parent
@@ -165,19 +236,23 @@ class TreeSitterExtractor:
 
     @staticmethod
     def _content_range(
-        outer: Node, node: Node, kind: str, definitions: list[_Definition]
+        outer: Node, node: Node, kind: str, index: _DefinitionIndex
     ) -> tuple[int, int]:
         if kind not in _CONTAINER_KINDS:
             return outer.start_byte, outer.end_byte
-        nested_starts = [
-            item.node.start_byte
-            for item in definitions
-            if item.node != node
-            and item.node.start_byte > outer.start_byte
-            and item.node.end_byte <= outer.end_byte
-        ]
-        end = min(nested_starts) if nested_starts else outer.end_byte
-        return outer.start_byte, end
+        # The old code scanned every definition to take the minimum qualifying start.
+        # Definitions are start-ascending, so the first qualifying one after
+        # outer.start_byte *is* that minimum. A definition starting at or after
+        # outer.end_byte cannot end inside outer, which bounds the scan.
+        position = bisect_right(index.starts, outer.start_byte)
+        while position < len(index.definitions):
+            candidate = index.definitions[position].node
+            if candidate.start_byte >= outer.end_byte:
+                break
+            if candidate.id != node.id and candidate.end_byte <= outer.end_byte:
+                return outer.start_byte, candidate.start_byte
+            position += 1
+        return outer.start_byte, outer.end_byte
 
     def _chunks_for_range(
         self,
@@ -191,9 +266,10 @@ class TreeSitterExtractor:
         source: bytes,
         start: int,
         end: int,
+        line_index: _LineIndex,
     ) -> list[ExtractedChunk]:
         content = source[start:end].decode("utf-8").rstrip()
-        start_line = source[:start].count(b"\n") + 1
+        start_line = line_index.line_at(start)
         if len(content) <= self.max_chars and content.count("\n") + 1 <= self.max_lines:
             return [
                 self._make_chunk(
@@ -303,7 +379,12 @@ class TreeSitterExtractor:
             byte_offset += len(fragment.encode("utf-8"))
 
     def _module_chunks(
-        self, path: Path, language: str, source: bytes, covered: list[tuple[int, int]]
+        self,
+        path: Path,
+        language: str,
+        source: bytes,
+        covered: list[tuple[int, int]],
+        line_index: _LineIndex,
     ) -> list[ExtractedChunk]:
         chunks: list[ExtractedChunk] = []
         cursor = 0
@@ -320,6 +401,7 @@ class TreeSitterExtractor:
                         source=source,
                         start=cursor,
                         end=start,
+                        line_index=line_index,
                     )
                 )
             cursor = max(cursor, end)
@@ -335,6 +417,7 @@ class TreeSitterExtractor:
                     source=source,
                     start=cursor,
                     end=len(source),
+                    line_index=line_index,
                 )
             )
         return chunks

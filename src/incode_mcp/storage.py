@@ -7,6 +7,7 @@ import logging
 import shutil
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -21,7 +22,14 @@ from lancedb.query import ColumnOrdering
 from lancedb.table import LanceTable
 
 from .errors import ErrorCode, IncodeError
-from .models import ChunkPreview, ProjectInfo, StoredChunk, StoredFile
+from .models import (
+    ChunkPreview,
+    CodeChunk,
+    IndexedChunk,
+    ProjectInfo,
+    StoredChunk,
+    StoredFile,
+)
 from .projects import existing_marker_path
 
 logger = logging.getLogger(__name__)
@@ -32,6 +40,58 @@ SCHEMA_VERSION = 2
 # how many rows are scanned before the exact filter and the caller's limit apply.
 OVERFETCH_FACTOR = 10
 MINIMUM_OVERFETCH = 200
+
+# Open partitions kept resident. Each entry holds two LanceTable handles and their
+# caches, and nothing evicted them before: the daemon is long-lived and get_chunk
+# walks every registered project, so one call could fault in every project a user
+# has ever indexed. Sixteen covers the projects one developer works across while
+# keeping the ceiling independent of how many they have registered.
+MAX_CACHED_PARTITIONS = 16
+
+# Columns get_chunk reads. The vector and the two derived text columns are excluded:
+# nothing outside indexing and ranking can use them, and reading them made a
+# single-chunk fetch an order of magnitude larger than the code it returned.
+CHUNK_PAYLOAD_COLUMNS = [
+    "chunk_id",
+    "file_id",
+    "project_id",
+    "path",
+    "language",
+    "kind",
+    "symbol",
+    "qualified_symbol",
+    "parent_symbol",
+    "start_byte",
+    "end_byte",
+    "start_line",
+    "end_line",
+    "content",
+    "content_hash",
+    "part_index",
+]
+
+# Every chunk column except the vector. list_chunks has no production caller and its
+# test callers read text and offsets, so decoding vectors was pure waste.
+INDEXED_CHUNK_COLUMNS = [
+    "chunk_id",
+    "file_id",
+    "project_id",
+    "path",
+    "language",
+    "kind",
+    "symbol",
+    "qualified_symbol",
+    "parent_symbol",
+    "start_byte",
+    "end_byte",
+    "start_line",
+    "end_line",
+    "content",
+    "embedding_text",
+    "search_text",
+    "content_hash",
+    "part_index",
+]
 
 
 def _quoted(value: str) -> str:
@@ -78,7 +138,7 @@ class LanceStore:
         directory.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(directory / "registry", read_consistency_interval=timedelta(0))
         self._projects = self._table(self._db, "projects", self._project_schema())
-        self._partitions: dict[str, _ProjectTables] = {}
+        self._partitions: OrderedDict[str, _ProjectTables] = OrderedDict()
         self._partitions_lock = threading.Lock()
         for row in legacy_rows:
             row = {
@@ -256,17 +316,21 @@ class LanceStore:
             tables.chunks.delete(condition)
             tables.files.delete(condition)
 
-    def list_chunks(self, project_ids: Iterable[str] | None = None) -> list[StoredChunk]:
+    def list_chunks(self, project_ids: Iterable[str] | None = None) -> list[IndexedChunk]:
         ids = list(project_ids or [project.id for project in self.list_projects()])
-        chunks: list[StoredChunk] = []
+        chunks: list[IndexedChunk] = []
         for project_id in ids:
             tables = self._existing_tables(project_id)
             if tables is None:
                 continue
-            chunks.extend(StoredChunk.model_validate(row) for row in self._rows(tables.chunks))
+            rows = cast(
+                list[dict[str, Any]],
+                tables.chunks.search().select(INDEXED_CHUNK_COLUMNS).to_list(),
+            )
+            chunks.extend(IndexedChunk.model_validate(row) for row in rows)
         return chunks
 
-    def get_chunk(self, chunk_id: str) -> StoredChunk | None:
+    def get_chunk(self, chunk_id: str) -> CodeChunk | None:
         # chunk_id is a one-way digest of file_id, which is itself a digest of
         # the project id and path, so the owning project cannot be recovered
         # from the id. Scanning every project is inherent without an id-format
@@ -276,9 +340,15 @@ class LanceStore:
             tables = self._existing_tables(project.id)
             if tables is None:
                 continue
-            rows = self._rows(tables.chunks, f"chunk_id = {_quoted(chunk_id)}")
+            rows = cast(
+                list[dict[str, Any]],
+                tables.chunks.search()
+                .where(f"chunk_id = {_quoted(chunk_id)}")
+                .select(CHUNK_PAYLOAD_COLUMNS)
+                .to_list(),
+            )
             if rows:
-                return StoredChunk.model_validate(rows[0])
+                return CodeChunk.model_validate(rows[0])
         return None
 
     def count_chunks(self, project_ids: Iterable[str] | None = None) -> int:
@@ -502,26 +572,52 @@ class LanceStore:
             ]
         )
 
-    def _tables(self, project_id: str) -> _ProjectTables:
-        """Open *project_id*'s partition, creating it. For write paths only."""
+    def _cached(self, project_id: str) -> _ProjectTables | None:
+        """Return the cached partition for *project_id*, marking it recently used."""
         with self._partitions_lock:
             cached = self._partitions.get(project_id)
             if cached is not None:
-                return cached
-            database = lancedb.connect(
-                self.directory / "projects" / project_id,
-                read_consistency_interval=timedelta(0),
-            )
-            tables = _ProjectTables(
-                files=self._table(database, "files", self._file_schema()),
-                chunks=self._table(
-                    database,
-                    "chunks",
-                    self._chunk_schema(self.vector_dimension),
-                ),
-            )
+                self._partitions.move_to_end(project_id)
+            return cached
+
+    def _remember(self, project_id: str, tables: _ProjectTables) -> _ProjectTables:
+        """Cache *tables*, evicting the least recently used partition past the bound.
+
+        Eviction only drops this dictionary's reference. A caller mid-query holds its
+        own reference to the tables, so the underlying dataset stays open until that
+        caller is done — the daemon serves each client on its own thread and must not
+        have a table closed underneath it.
+        """
+        with self._partitions_lock:
+            existing = self._partitions.get(project_id)
+            if existing is not None:
+                # Another thread opened it first; keep one instance so both callers
+                # share a single set of handles.
+                self._partitions.move_to_end(project_id)
+                return existing
             self._partitions[project_id] = tables
+            while len(self._partitions) > MAX_CACHED_PARTITIONS:
+                self._partitions.popitem(last=False)
             return tables
+
+    def _tables(self, project_id: str) -> _ProjectTables:
+        """Open *project_id*'s partition, creating it. For write paths only."""
+        cached = self._cached(project_id)
+        if cached is not None:
+            return cached
+        database = lancedb.connect(
+            self.directory / "projects" / project_id,
+            read_consistency_interval=timedelta(0),
+        )
+        tables = _ProjectTables(
+            files=self._table(database, "files", self._file_schema()),
+            chunks=self._table(
+                database,
+                "chunks",
+                self._chunk_schema(self.vector_dimension),
+            ),
+        )
+        return self._remember(project_id, tables)
 
     def _existing_tables(self, project_id: str) -> _ProjectTables | None:
         """Open *project_id*'s partition without creating it, or return None.
@@ -531,23 +627,21 @@ class LanceStore:
         through the create-on-write _tables() would leave an empty partition
         directory behind for each project that has never been indexed.
         """
-        with self._partitions_lock:
-            cached = self._partitions.get(project_id)
-            if cached is not None:
-                return cached
-            directory = self.directory / "projects" / project_id
-            if not directory.is_dir():
-                return None
-            database = lancedb.connect(directory, read_consistency_interval=timedelta(0))
-            try:
-                tables = _ProjectTables(
-                    files=cast(LanceTable, database.open_table("files")),
-                    chunks=cast(LanceTable, database.open_table("chunks")),
-                )
-            except (ValueError, FileNotFoundError):
-                return None
-            self._partitions[project_id] = tables
-            return tables
+        cached = self._cached(project_id)
+        if cached is not None:
+            return cached
+        directory = self.directory / "projects" / project_id
+        if not directory.is_dir():
+            return None
+        database = lancedb.connect(directory, read_consistency_interval=timedelta(0))
+        try:
+            tables = _ProjectTables(
+                files=cast(LanceTable, database.open_table("files")),
+                chunks=cast(LanceTable, database.open_table("chunks")),
+            )
+        except (ValueError, FileNotFoundError):
+            return None
+        return self._remember(project_id, tables)
 
     @staticmethod
     def _table(database: Any, name: str, schema: pa.Schema) -> LanceTable:

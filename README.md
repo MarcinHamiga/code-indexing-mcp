@@ -106,8 +106,31 @@ A generic MCP client configuration looks like this:
 }
 ```
 
-The server exposes `init_project`, `index_project`, `project_status`, `list_projects`,
-`remove_project`, `search_code`, `find_symbol`, `file_outline`, and `get_chunk`.
+The server exposes nine tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
+so hosts may auto-approve them. The other query tools are not: on a root the server has not seen
+before they register it first, which writes a `.ci-mcp/project.toml` marker, and the three code
+queries also build its initial index. `remove_project` is annotated `destructiveHint`;
+`init_project` carries the same hint and is non-idempotent because `force_new_id=true` can
+overwrite a marker and orphan the previous index.
+
+| Tool | Kind | Purpose |
+| --- | --- | --- |
+| `init_project` | destructive write | Register a directory and write its `.ci-mcp/project.toml` marker. |
+| `index_project` | write | Incrementally scan, parse, embed, and commit changed files. |
+| `remove_project` | destructive | Delete a registration and its whole index partition. |
+| `project_status` | read, registers | Index state plus file and chunk counts. |
+| `list_projects` | read only | Every registered project, sorted by name. |
+| `search_code` | read, registers and indexes | Hybrid semantic and keyword search returning ranked snippets. |
+| `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
+| `file_outline` | read, registers and indexes | One file's declared symbols, metadata only. |
+| `get_chunk` | read only | Full stored text for one `chunk_id`. |
+
+`limit` is capped at 50 and `match` accepts only `exact`, `prefix`, or `contains`; both are
+enforced by the tool schema, so an out-of-range value is rejected rather than silently clamped.
+
+`get_chunk` returns one chunk's full stored text with its path, symbol, line range, byte range, and
+content hash. It deliberately excludes the embedding vector and the derived `embedding_text` and
+`search_text` columns, which exist for ranking and are not useful to a caller.
 
 ## Project workflow
 
@@ -158,6 +181,9 @@ Incremental refreshes:
 - Changed files are replaced transactionally in LanceDB.
 - Removed files are deleted from the active index.
 - A parse or embedding failure preserves the previous indexed version.
+- Binary and undecodable files are detected while the file is read for indexing, not during the
+  scan, so each changed file is read once. They count toward `skipped_files` and are not recorded as
+  per-file errors.
 
 Python, Python stubs, Java, JavaScript, JSX, TypeScript, and TSX are supported. Java indexing
 extracts classes, interfaces, records, enums, annotation types, methods, constructors, and nested
@@ -173,6 +199,12 @@ Existing project markers that use the exact pre-Java default include list automa
 Tools use the current MCP root or nearest `.ci-mcp/project.toml` by default. `search_code` can
 instead receive a list of project IDs/names/paths or set `all_projects=true`. Searching all
 projects is always explicit, preventing accidental context mixing.
+
+`search_code`'s `paths` argument takes glob patterns relative to the project root. Patterns match
+from the right, so `*.py` matches a Python file at any depth while `src/*` matches only direct
+children of `src`. A single `*` and `**` both span one path segment. Patterns are translated into
+the index scan itself, so a filtered search finds matches that rank below the unfiltered result
+window instead of returning an empty result.
 
 `remove_project` deletes only central index data. It never removes source files or the local
 `.ci-mcp` marker.
@@ -224,6 +256,12 @@ is roughly 4,096 characters of source, so chunks that already fit stay whole and
 When a batch does trip the ceiling, the worker is replaced and the batch retried at half the
 microbatch size (4 → 2 → 1) before the error surfaces. Window boundaries come only from the
 tokenization, so a retry re-derives identical chunks.
+
+Extraction is linear in file size and in definition count. Each Tree-sitter query is compiled once
+per language per process, and the definition and newline indexes are built once per file. A
+definition-dense generated file near the 1 MiB scan cap — 699 KB, 16,384 definitions — extracts in
+well under a second; earlier releases took roughly 31 seconds on the same shape because those
+indexes were rebuilt per definition.
 
 ### Measured throughput
 

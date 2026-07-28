@@ -75,7 +75,12 @@ def test_nested_gitignore_can_reinclude_a_file(tmp_path: Path) -> None:
     assert [item.path.as_posix() for item in result.files] == ["package/keep.py"]
 
 
-def test_scanner_rejects_oversized_binary_and_symlink_files(tmp_path: Path) -> None:
+def test_scanner_rejects_oversized_and_symlink_files_without_reading(tmp_path: Path) -> None:
+    """Size and symlink checks are stat-only; content checks belong to the indexer.
+
+    The scanner used to read every changed file to test for NUL bytes and UTF-8
+    validity, then discard the bytes, so the indexer read the same file again.
+    """
     root = tmp_path / "repo"
     root.mkdir()
     project = initialize_project(root)
@@ -90,20 +95,28 @@ def test_scanner_rejects_oversized_binary_and_symlink_files(tmp_path: Path) -> N
 
     result = SourceScanner().scan(project)
 
-    assert result.files == []
-    assert {skip.reason for skip in result.skipped} >= {"oversized", "binary", "symlink"}
+    reasons = {skip.reason for skip in result.skipped}
+    assert reasons >= {"oversized", "symlink"}
+    assert "binary" not in reasons
+    assert "encoding" not in reasons
+    # binary.py is 3 bytes, so it now passes the stat-only scan.
+    assert {item.path.as_posix() for item in result.files} == {"binary.py"}
 
 
-def test_scanner_does_not_retain_changed_file_contents(tmp_path: Path) -> None:
+def test_scanner_does_not_read_file_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "main.py").write_text("value = 1\n")
+    (root / "ok.py").write_text("def ok():\n    return 1\n")
     project = initialize_project(root)
 
-    result = SourceScanner().scan(project)
+    def reject_read(self: Path) -> bytes:
+        raise AssertionError(f"scan must not read {self}")
 
-    assert len(result.files) == 1
-    assert result.files[0].content is None
+    monkeypatch.setattr(Path, "read_bytes", reject_read)
+
+    assert len(SourceScanner().scan(project).files) == 1
 
 
 def test_iter_scan_reads_one_file_source_at_a_time(
@@ -202,3 +215,12 @@ def test_has_supported_source_applies_nested_gitignore_rules(tmp_path: Path) -> 
     keep.unlink()
 
     assert scanner.has_supported_source(root, ScanConfig()) is False
+
+
+def test_language_name_literal_matches_scanner_languages() -> None:
+    from typing import get_args
+
+    from incode_mcp.models import LanguageName
+    from incode_mcp.scanner import LANGUAGES
+
+    assert set(get_args(LanguageName)) == set(LANGUAGES.values())
