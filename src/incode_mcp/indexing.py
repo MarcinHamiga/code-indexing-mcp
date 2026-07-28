@@ -11,6 +11,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import psutil
 from filelock import FileLock, Timeout
 
 from .embedding import (
@@ -54,20 +55,38 @@ ENVIRONMENT_ERROR_CODES = frozenset(
 )
 
 
-def _candidate_groups(chunks: list[ExtractedChunk]) -> Iterator[list[ExtractedChunk]]:
-    """Split a file's chunks into groups small enough for one worker round trip."""
-    group: list[ExtractedChunk] = []
+@dataclass
+class _PendingFile:
+    record: StoredFile
+    chunks: list[ExtractedChunk]
+    source_chars: int
+    error: Exception | None = None
+    embedded_chunks: int = 0
+    emitted_chars: int = 0
+
+
+@dataclass(frozen=True)
+class _PendingCandidate:
+    owner: int
+    chunk: ExtractedChunk
+
+
+def _candidate_groups(
+    candidates: list[_PendingCandidate],
+) -> Iterator[list[_PendingCandidate]]:
+    """Split cross-file candidates into bounded worker round trips."""
+    group: list[_PendingCandidate] = []
     characters = 0
-    for chunk in chunks:
+    for candidate in candidates:
         if group and (
             len(group) >= CANDIDATE_GROUP_COUNT
-            or characters + len(chunk.content) > CANDIDATE_GROUP_CHARS
+            or characters + len(candidate.chunk.content) > CANDIDATE_GROUP_CHARS
         ):
             yield group
             group = []
             characters = 0
-        group.append(chunk)
-        characters += len(chunk.content)
+        group.append(candidate)
+        characters += len(candidate.chunk.content)
     if group:
         yield group
 
@@ -176,6 +195,7 @@ class Indexer:
                         "embedded_segments": context.segment_count,
                         "embedded_tokens": context.token_count,
                         "embedding_retries": context.retry_count,
+                        "fallback_count": report.fallback_count + context.retry_count,
                         "worker_termination_reason": context.termination_reason,
                         "token_windowing": context.tokenizer_available,
                     }
@@ -195,8 +215,22 @@ class Indexer:
             existing = {record.path: record for record in self.store.list_files(project.id)}
         current_paths: set[str] = set()
         indexed = parsed = embedded = unchanged = metadata_only = removed = skipped = 0
+        fallback_count = 0
         errors: list[IndexIssue] = []
         job: StagingJob | None = None
+        pending: list[_PendingFile] = []
+        pending_chunks = 0
+        pending_chars = 0
+        process = psutil.Process()
+        peak_memory_bytes = 0
+
+        def sample_memory() -> None:
+            nonlocal peak_memory_bytes
+            # Diagnostics must never turn a successful index into a failure.
+            with contextlib.suppress(psutil.Error):
+                peak_memory_bytes = max(peak_memory_bytes, process.memory_info().rss)
+
+        sample_memory()
 
         def staging_job() -> StagingJob:
             nonlocal job
@@ -209,6 +243,84 @@ class Indexer:
                 )
                 job.begin()
             return job
+
+        def stage_failure(record: StoredFile, exc: Exception) -> None:
+            errors.append(IndexIssue(path=record.path, message=str(exc)))
+            staging_job().stage_file(
+                record.model_copy(
+                    update={
+                        "has_errors": True,
+                        "error": str(exc),
+                        "indexed_at": time.time_ns(),
+                    }
+                )
+            )
+
+        def flush_pending() -> None:
+            nonlocal indexed, embedded, fallback_count, pending_chunks, pending_chars
+            if not pending:
+                return
+            candidates = [
+                _PendingCandidate(owner, chunk)
+                for owner, staged_file in enumerate(pending)
+                for chunk in staged_file.chunks
+            ]
+            for group in _candidate_groups(candidates):
+                active = [
+                    candidate for candidate in group if pending[candidate.owner].error is None
+                ]
+                if not active:
+                    continue
+                with timer.measure("embed"):
+                    try:
+                        succeeded, failed, retries = self._embed_candidates(
+                            passage_embedder, active
+                        )
+                    finally:
+                        sample_memory()
+                fallback_count += retries
+                staged_rows: dict[int, list[ChunkRow]] = {}
+                for candidate, segments in succeeded:
+                    target = pending[candidate.owner]
+                    if target.error is not None:
+                        continue
+                    windowed = self._windowed_chunks([candidate.chunk], [segments])
+                    rows = [
+                        self._chunk_row(project.id, target.record, chunk, vector)
+                        for chunk, vector in windowed
+                    ]
+                    staged_rows.setdefault(candidate.owner, []).extend(rows)
+                    target.embedded_chunks += len(rows)
+                    target.emitted_chars += sum(len(chunk.content) for chunk, _ in windowed)
+                for candidate, exc in failed:
+                    target = pending[candidate.owner]
+                    if target.error is None:
+                        target.error = exc
+                with timer.measure("commit"):
+                    for owner in sorted(staged_rows):
+                        staging_job().stage_chunks(staged_rows[owner])
+
+            with timer.measure("commit"):
+                for target in pending:
+                    if (
+                        target.error is None
+                        and target.emitted_chars > SEGMENT_TEXT_GROWTH_LIMIT * target.source_chars
+                    ):
+                        target.error = ValueError(
+                            f"Token windowing emitted {target.emitted_chars} characters from "
+                            f"{target.source_chars} characters of chunk text, above the "
+                            f"{SEGMENT_TEXT_GROWTH_LIMIT}x limit"
+                        )
+                    if target.error is not None:
+                        stage_failure(target.record, target.error)
+                        continue
+                    staging_job().stage_file(target.record)
+                    staging_job().mark_replaced(target.record.file_id)
+                    indexed += 1
+                    embedded += target.embedded_chunks
+            pending.clear()
+            pending_chunks = 0
+            pending_chars = 0
 
         stream = self.scanner.iter_scan(project, existing)
         try:
@@ -232,6 +344,7 @@ class Indexer:
                     unchanged += 1
                     continue
                 content_hash: str | None = None
+                record: StoredFile | None = None
                 try:
                     with timer.measure("scan"):
                         source = (
@@ -259,10 +372,7 @@ class Indexer:
                             )
                         metadata_only += 1
                         continue
-                    with timer.measure("parse"):
-                        extraction = self.extractor.extract(item.path, item.language, source)
-                    parsed += 1
-                    stored_file = StoredFile(
+                    record = StoredFile(
                         file_id=_digest(f"{project.id}\0{path}"),
                         project_id=project.id,
                         path=path,
@@ -270,39 +380,27 @@ class Indexer:
                         size=item.size,
                         mtime_ns=item.mtime_ns,
                         content_hash=content_hash,
-                        has_errors=extraction.has_errors,
                         indexed_at=time.time_ns(),
                     )
-                    file_chunks = 0
-                    emitted = 0
+                    with timer.measure("parse"):
+                        extraction = self.extractor.extract(item.path, item.language, source)
+                    parsed += 1
                     source_chars = sum(len(chunk.content) for chunk in extraction.chunks)
-                    for group in _candidate_groups(extraction.chunks):
-                        with timer.measure("embed"):
-                            segments = self._embed_chunks(passage_embedder, group)
-                            windowed = self._windowed_chunks(group, segments)
-                        rows = [
-                            self._chunk_row(project.id, stored_file, chunk, vector)
-                            for chunk, vector in windowed
-                        ]
-                        # Staged rows are only applied for files that reach
-                        # mark_replaced, so a file failing below leaves these
-                        # behind in the staging file without affecting the
-                        # live tables.
-                        with timer.measure("commit"):
-                            staging_job().stage_chunks(rows)
-                        file_chunks += len(rows)
-                        emitted += sum(len(chunk.content) for chunk, _ in windowed)
-                    if emitted > SEGMENT_TEXT_GROWTH_LIMIT * source_chars:
-                        raise ValueError(
-                            f"Token windowing emitted {emitted} characters from "
-                            f"{source_chars} characters of chunk text, above the "
-                            f"{SEGMENT_TEXT_GROWTH_LIMIT}x limit"
+                    if pending and (
+                        len(pending) >= CANDIDATE_GROUP_COUNT
+                        or pending_chunks + len(extraction.chunks) > CANDIDATE_GROUP_COUNT
+                        or pending_chars + source_chars > CANDIDATE_GROUP_CHARS
+                    ):
+                        flush_pending()
+                    pending.append(
+                        _PendingFile(
+                            record=record.model_copy(update={"has_errors": extraction.has_errors}),
+                            chunks=extraction.chunks,
+                            source_chars=source_chars,
                         )
-                    with timer.measure("commit"):
-                        staging_job().stage_file(stored_file)
-                        staging_job().mark_replaced(stored_file.file_id)
-                    indexed += 1
-                    embedded += file_chunks
+                    )
+                    pending_chunks += len(extraction.chunks)
+                    pending_chars += source_chars
                 except Exception as exc:
                     if isinstance(exc, IncodeError) and exc.code in ENVIRONMENT_ERROR_CODES:
                         # Not attributable to this file. Recording it below would
@@ -310,14 +408,14 @@ class Indexer:
                         # later run, leaving a permanent hole in the index for what
                         # is really a transient condition.
                         raise
-                    errors.append(IndexIssue(path=path, message=str(exc)))
                     # Record the failure so the file is not re-read, re-parsed, and
                     # re-embedded on every run. It is retried only when the file
                     # changes again or when force=True. Chunks from a previous
                     # successful index (if any) are left untouched.
                     with timer.measure("commit"):
-                        staging_job().stage_file(
-                            StoredFile(
+                        stage_failure(
+                            record
+                            or StoredFile(
                                 file_id=_digest(f"{project.id}\0{path}"),
                                 project_id=project.id,
                                 path=path,
@@ -331,12 +429,12 @@ class Indexer:
                                     if previous is not None
                                     else ""
                                 ),
-                                has_errors=True,
-                                error=str(exc),
                                 indexed_at=time.time_ns(),
-                            )
+                            ),
+                            exc,
                         )
 
+            flush_pending()
             with timer.measure("commit"):
                 for path, record in existing.items():
                     if path not in current_paths:
@@ -374,6 +472,14 @@ class Indexer:
             parse_duration_ms=timer.milliseconds("parse"),
             embed_duration_ms=timer.milliseconds("embed"),
             commit_duration_ms=timer.milliseconds("commit"),
+            embedding_backend="cpu",
+            embedding_batch_size=self.batch_size,
+            scan_ms=timer.milliseconds("scan"),
+            parse_ms=timer.milliseconds("parse"),
+            embed_ms=timer.milliseconds("embed"),
+            commit_ms=timer.milliseconds("commit"),
+            fallback_count=fallback_count,
+            peak_memory_bytes=peak_memory_bytes,
         )
 
     def _commit_staged(
@@ -444,6 +550,41 @@ class Indexer:
             [EmbeddedSegment(0, len(chunk.content), 0, pack_vector(vector))]
             for chunk, vector in zip(chunks, vectors, strict=True)
         ]
+
+    def _embed_candidates(
+        self,
+        passage_embedder: PassageEmbedder,
+        candidates: list[_PendingCandidate],
+    ) -> tuple[
+        list[tuple[_PendingCandidate, list[EmbeddedSegment]]],
+        list[tuple[_PendingCandidate, Exception]],
+        int,
+    ]:
+        """Embed a bounded group, bisecting only content-attributable failures."""
+        try:
+            segments = self._embed_chunks(
+                passage_embedder, [candidate.chunk for candidate in candidates]
+            )
+        except Exception as exc:
+            if isinstance(exc, MemoryError) or (
+                isinstance(exc, IncodeError) and exc.code in ENVIRONMENT_ERROR_CODES
+            ):
+                raise
+            if len(candidates) == 1:
+                return [], [(candidates[0], exc)], 0
+            midpoint = len(candidates) // 2
+            left_ok, left_failed, left_retries = self._embed_candidates(
+                passage_embedder, candidates[:midpoint]
+            )
+            right_ok, right_failed, right_retries = self._embed_candidates(
+                passage_embedder, candidates[midpoint:]
+            )
+            return (
+                [*left_ok, *right_ok],
+                [*left_failed, *right_failed],
+                1 + left_retries + right_retries,
+            )
+        return list(zip(candidates, segments, strict=True)), [], 0
 
     def _windowed_chunks(
         self, chunks: list[ExtractedChunk], segments: list[list[EmbeddedSegment]]

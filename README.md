@@ -141,6 +141,18 @@ uv run --project /path/to/code-indexing-mcp code-indexing-mcp index
 uv run --project /path/to/code-indexing-mcp code-indexing-mcp status
 ```
 
+Benchmark the CPU indexing pipeline with a generated, deterministic corpus:
+
+```bash
+uv run --project /path/to/code-indexing-mcp code-indexing-mcp benchmark index \
+  --files 128 --functions-per-file 2 --batch-size 8
+```
+
+The command writes one JSON document to stdout with `cold_start`, `warm_index`,
+`incremental_index`, and `forced_reindex` results, including phase timings, peak memory, and
+chunks per second. It reuses the configured model cache but isolates index data in a temporary
+workspace. Pass `--work-dir /fresh/path` to retain the corpus and index for inspection.
+
 Initialization creates `.ci-mcp/project.toml` and a self-ignoring `.ci-mcp/.gitignore`. The
 marker contains a checkout-local UUID and scanning configuration. It is not intended to be
 committed. Markers created by earlier releases under `.incode` remain readable, but all new

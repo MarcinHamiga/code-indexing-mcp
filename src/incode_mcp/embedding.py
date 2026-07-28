@@ -162,6 +162,8 @@ def embed_windows[Vector](
         vectors = embed([texts[position] for position in batch])
         for position, vector in zip(batch, vectors, strict=True):
             results[owners[position]].append((windows[position], vector))
+    for candidate_results in results:
+        candidate_results.sort(key=lambda item: (item[0].start_char, item[0].end_char))
     return results
 
 
