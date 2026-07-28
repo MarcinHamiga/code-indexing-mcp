@@ -12,20 +12,24 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 import psutil
 from fastembed import TextEmbedding
 
+from .backends import CPU_PROVIDER, Accelerator
 from .embedding import (
     DEFAULT_MODEL,
+    PROBE_TEXTS,
     EmbeddedSegment,
     PassageCandidate,
     SegmentPlan,
     embed_windows,
     plan_passages,
+    resolve_session_providers,
     resolve_tokenizer,
+    validate_probe_vectors,
 )
 from .errors import ErrorCode, IncodeError
 
@@ -48,6 +52,46 @@ class WorkerConfig:
     enable_cpu_mem_arena: bool
     dimension: int
     model_id: str = DEFAULT_MODEL
+    # The execution providers to request, most specific first. Empty means "let
+    # the runtime pick", which is the historical CPU behaviour and is kept
+    # byte-identical by never passing a providers argument in that case.
+    providers: tuple[str, ...] = ()
+    accelerator: str = Accelerator.CPU.value
+
+    @property
+    def is_cpu(self) -> bool:
+        return not self.providers or tuple(self.providers) == (CPU_PROVIDER,)
+
+
+@dataclass(frozen=True)
+class WorkerInfo:
+    """What a worker reports about the session it actually loaded."""
+
+    resolved_providers: tuple[str, ...]
+    dimension: int
+
+
+@dataclass(frozen=True)
+class SessionTelemetry:
+    """Per-run embedding facts an ``IndexReport`` carries back to the caller."""
+
+    backend: str
+    memory_budget_bytes: int
+    peak_memory_bytes: int
+    segment_count: int
+    token_count: int
+    retry_count: int
+    fallback_count: int
+    termination_reason: str | None
+    tokenizer_available: bool | None
+    fallback_reason: str | None = None
+
+
+@runtime_checkable
+class TelemetrySource(Protocol):
+    """Any passage session that can describe the run it just served."""
+
+    def telemetry(self) -> SessionTelemetry: ...
 
 
 WorkerTarget = Callable[[Connection, WorkerConfig], None]
@@ -71,16 +115,30 @@ def indexing_memory_bytes(
     return worker_bytes + max(0, parent_bytes - parent_baseline_bytes)
 
 
+def _load_model(config: WorkerConfig) -> TextEmbedding:
+    """Load the model for *config*, requesting its providers when non-default.
+
+    The CPU path deliberately passes no ``providers`` argument at all. Naming
+    the CPU provider explicitly would be equivalent in principle, but the CPU
+    result is the reference every accelerator is compared against, so its call
+    is left exactly as it was.
+    """
+    Path(config.cache_directory).mkdir(parents=True, exist_ok=True)
+    options: dict[str, Any] = {
+        "model_name": config.model_id,
+        "cache_dir": config.cache_directory,
+        "local_files_only": config.offline,
+        "threads": config.threads,
+        "enable_cpu_mem_arena": config.enable_cpu_mem_arena,
+    }
+    if not config.is_cpu:
+        options["providers"] = list(config.providers)
+    return TextEmbedding(**options)
+
+
 def _worker_main(connection: Connection, config: WorkerConfig) -> None:
     try:
-        Path(config.cache_directory).mkdir(parents=True, exist_ok=True)
-        model = TextEmbedding(
-            model_name=config.model_id,
-            cache_dir=config.cache_directory,
-            local_files_only=config.offline,
-            threads=config.threads,
-            enable_cpu_mem_arena=config.enable_cpu_mem_arena,
-        )
+        model = _load_model(config)
         tokenizer = resolve_tokenizer(model)
 
         def embed_packed(texts: list[str]) -> list[bytes]:
@@ -92,6 +150,20 @@ def _worker_main(connection: Connection, config: WorkerConfig) -> None:
             command, payload = connection.recv()
             if command == "stop":
                 return
+            if command == "initialize":
+                # Reaching here already proves the model loaded and, for an
+                # accelerator, that its provider initialised. Report what the
+                # session settled on rather than what was requested.
+                connection.send(
+                    ("initialized", (resolve_session_providers(model), config.dimension))
+                )
+                continue
+            if command == "memory":
+                connection.send(("memory", psutil.Process().memory_info().rss))
+                continue
+            if command == "probe":
+                connection.send(("probed", embed_packed(list(PROBE_TEXTS))))
+                continue
             if command == "embed":
                 connection.send(("packed", embed_packed(payload)))
                 continue
@@ -191,6 +263,63 @@ class EmbeddingWorkerSession:
         traceback: TracebackType | None,
     ) -> None:
         self.close()
+
+    def initialize(self) -> WorkerInfo:
+        """Spawn the worker and load its model, reporting what it resolved.
+
+        Separated from the first embed so a backend that cannot load, or whose
+        provider fails to initialise, is diagnosed before any real content is
+        handed to it -- and so the caller can terminate it and pick another.
+        """
+        status, payload = self._request("initialize", None)
+        if status != "initialized":
+            raise IncodeError(
+                ErrorCode.EMBEDDING_WORKER_FAILED,
+                f"Embedding worker answered initialize with {status!r}",
+            )
+        providers, dimension = payload
+        return WorkerInfo(
+            resolved_providers=tuple(str(name) for name in providers), dimension=int(dimension)
+        )
+
+    def probe(self) -> list[bytes]:
+        """Run a minimum-batch inference and validate the vectors it returns.
+
+        Raises ``IncodeError`` when the worker fails outright and ``ValueError``
+        when it answers with vectors an index could not use.
+        """
+        status, payload = self._request("probe", None)
+        if status != "probed":
+            raise IncodeError(
+                ErrorCode.EMBEDDING_WORKER_FAILED,
+                f"Embedding worker answered probe with {status!r}",
+            )
+        vectors = [bytes(vector) for vector in payload]
+        validate_probe_vectors(vectors, dimension=self.config.dimension, count=len(PROBE_TEXTS))
+        return vectors
+
+    def report_memory(self) -> int:
+        """Return the worker's own resident set size in bytes."""
+        status, payload = self._request("memory", None)
+        if status != "memory":
+            raise IncodeError(
+                ErrorCode.EMBEDDING_WORKER_FAILED,
+                f"Embedding worker answered memory with {status!r}",
+            )
+        return int(payload)
+
+    def telemetry(self) -> SessionTelemetry:
+        return SessionTelemetry(
+            backend=self.config.accelerator,
+            memory_budget_bytes=self.effective_ceiling_bytes,
+            peak_memory_bytes=self.peak_combined_rss,
+            segment_count=self.segment_count,
+            token_count=self.token_count,
+            retry_count=self.retry_count,
+            fallback_count=self.retry_count,
+            termination_reason=self.termination_reason,
+            tokenizer_available=self.tokenizer_available,
+        )
 
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
         status, payload = self._request("embed", texts)

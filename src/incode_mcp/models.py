@@ -229,6 +229,8 @@ class IndexReport(FrozenModel):
     # clients that adopted the earlier memory-hardening report.
     embedding_backend: str = "cpu"
     embedding_batch_size: int = 1
+    # Set when a run started on an accelerator and finished somewhere else.
+    embedding_fallback_reason: str | None = None
     scan_ms: int | None = None
     parse_ms: int | None = None
     embed_ms: int | None = None
@@ -247,6 +249,34 @@ class IndexReport(FrozenModel):
     embedding_retries: int | None = None
     worker_termination_reason: str | None = None
     token_windowing: bool | None = None
+
+
+class ModelStatus(FrozenModel):
+    """What the embedding stack resolved to on this machine, and why.
+
+    ``embedding_model`` rather than ``model_id`` because pydantic reserves the
+    ``model_`` field prefix; the value is the model identifier either way.
+    """
+
+    embedding_model: str
+    dimension: int
+    requested_accelerator: str
+    resolved_accelerator: str
+    device: str
+    execution_provider: str
+    available_providers: list[str]
+    stability: str
+    precision: str
+    runtime_version: str
+    batch_size: int
+    # "explicit" when configured, "calibrated" when a cached probe supplied it,
+    # "default" when neither applied.
+    batch_calibration: str
+    # "hit" or "miss" against the local probe cache; "not-applicable" on CPU,
+    # which needs no probe to be trusted.
+    probe_cache_state: str
+    strict: bool
+    fallback_reason: str | None = None
 
 
 class SearchHit(FrozenModel):

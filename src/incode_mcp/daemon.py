@@ -27,6 +27,7 @@ from .errors import ErrorCode, IncodeError
 from .models import (
     CodeChunk,
     IndexReport,
+    ModelStatus,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
@@ -321,6 +322,10 @@ class DaemonServer:
             return app.file_outline(roots=roots, **params)
         if method == "get_chunk":
             return app.get_chunk(**params)
+        if method == "model_status":
+            # Answered by the daemon rather than the caller, because the daemon
+            # is the process that will actually run indexing.
+            return app.model_status()
         raise IncodeError(ErrorCode.PROTOCOL_ERROR, f"Unknown daemon method: {method}")
 
     def _load_or_create_token(self) -> str:
@@ -487,6 +492,9 @@ class BrokerApplication:
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         return CodeChunk.model_validate(self._call("get_chunk", chunk_id=chunk_id))
+
+    def model_status(self) -> ModelStatus:
+        return ModelStatus.model_validate(self._call("model_status"))
 
 
 def daemon_status(paths: RuntimePaths) -> dict[str, Any]:

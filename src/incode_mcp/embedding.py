@@ -104,6 +104,66 @@ def resolve_tokenizer(model: object) -> Any | None:
     return None
 
 
+def resolve_session_providers(model: object) -> tuple[str, ...]:
+    """Return the execution providers the loaded ONNX session actually uses.
+
+    Requesting a provider is not the same as getting one: ONNX Runtime silently
+    drops a provider it cannot initialise and runs on the next one. The probe
+    reports what the session settled on so a "CUDA" run that quietly became a
+    CPU run is visible rather than merely slow.
+
+    Like ``resolve_tokenizer`` this walks a private layout, so an empty tuple
+    means "unknown", never "none".
+    """
+    for path in (("model", "model"), ("model",)):
+        probe: Any = model
+        for attribute in path:
+            probe = getattr(probe, attribute, None)
+            if probe is None:
+                break
+        getter = getattr(probe, "get_providers", None)
+        if callable(getter):
+            try:
+                return tuple(str(name) for name in getter())
+            except Exception:  # pragma: no cover - defensive against runtime quirks
+                return ()
+    return ()
+
+
+# Two texts, because a single-row batch can hide a provider that only fails
+# once a graph is given a real batch dimension.
+PROBE_TEXTS: tuple[str, ...] = ("def probe() -> int:\n    return 0\n", "class Probe:\n    pass\n")
+
+
+def validate_probe_vectors(vectors: Sequence[bytes], *, dimension: int, count: int) -> None:
+    """Reject a probe whose vectors could not be used to search an index.
+
+    A backend that returns the wrong width, a NaN, or an unnormalised row would
+    corrupt retrieval rather than fail loudly, so this runs before any real
+    passage is sent to it.
+
+    Raises ``ValueError``; the caller decides whether that means fall back to
+    CPU or, under strict mode, fail the run.
+    """
+    if len(vectors) != count:
+        raise ValueError(f"probe returned {len(vectors)} vectors for {count} inputs")
+    expected_bytes = dimension * 4
+    for index, packed in enumerate(vectors):
+        if len(packed) != expected_bytes:
+            raise ValueError(
+                f"probe vector {index} is {len(packed) // 4} wide, expected {dimension}"
+            )
+        row = np.frombuffer(packed, dtype="<f4", count=dimension)
+        if not np.all(np.isfinite(row)):
+            raise ValueError(f"probe vector {index} contains non-finite values")
+        norm = float(np.linalg.norm(row))
+        # The model normalises its output, and every stored vector is compared
+        # by cosine similarity, so a row far off the unit sphere means pooling
+        # or normalisation did not run on this provider.
+        if not 0.9 <= norm <= 1.1:
+            raise ValueError(f"probe vector {index} has norm {norm:.4f}, expected ~1.0")
+
+
 def plan_passages(
     encode: Callable[[str], Any] | None,
     candidates: Sequence[PassageCandidate],
@@ -179,8 +239,32 @@ def embed_planned_segments[Vector](
     return embed_windows(embed, candidates, plan_passages(encode, candidates, plan), plan)
 
 
+class ModelIdentity(Protocol):
+    """The identity every role of one embedding model shares.
+
+    Query and passage embedding may run in different processes on different
+    devices, but they must remain the same model producing the same vector
+    space -- otherwise a query could never retrieve the passages it indexed.
+    """
+
+    model_id: str
+    dimension: int
+
+
 class PassageEmbedder(Protocol):
+    """The indexing-side role: many passages, throughput-bound, offloadable."""
+
     def embed_passages(self, texts: list[str]) -> list[list[float]]: ...
+
+
+class QueryEmbedder(ModelIdentity, Protocol):
+    """The search-side role: one short query, latency-bound, stays on CPU.
+
+    Deliberately separate from ``PassageEmbedder``: a query must not wait on an
+    accelerator worker spawning or a model loading onto a device.
+    """
+
+    def embed_query(self, text: str) -> list[float]: ...
 
 
 @runtime_checkable
@@ -192,11 +276,8 @@ class SegmentingEmbedder(Protocol):
     ) -> list[list[EmbeddedSegment]]: ...
 
 
-class Embedder(PassageEmbedder, Protocol):
-    model_id: str
-    dimension: int
-
-    def embed_query(self, text: str) -> list[float]: ...
+class Embedder(QueryEmbedder, PassageEmbedder, Protocol):
+    """Both roles served by one in-process model, which is the CPU default."""
 
 
 class FastEmbedder:

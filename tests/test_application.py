@@ -1,11 +1,14 @@
 import shutil
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from incode_mcp.application import Application, RuntimePaths
+from incode_mcp.backends import Accelerator
 from incode_mcp.errors import ErrorCode, IncodeError
+from incode_mcp.settings import IndexSettings
 
 
 class TinyEmbedder:
@@ -245,3 +248,41 @@ def test_reregistering_a_known_project_preserves_state_and_still_validates_compa
     with pytest.raises(IncodeError) as raised_discover:
         other_app.discover_project(root)
     assert raised_discover.value.code is ErrorCode.INDEX_INCOMPATIBLE
+
+
+def test_the_application_resolves_a_backend_and_reports_it(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(IndexSettings.from_environment({}), embedding_accelerator=Accelerator.CPU)
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+
+    status = app.model_status()
+    assert app.backend_selection.accelerator is Accelerator.CPU
+    assert status.embedding_model == "test/tiny"
+    assert status.batch_calibration == "default"
+    assert status.probe_cache_state == "not-applicable"
+
+
+def test_an_explicit_batch_size_is_not_overridden_by_calibration(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(
+        IndexSettings.from_environment({}),
+        embedding_batch_size=12,
+        embedding_batch_auto=False,
+    )
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+
+    assert app.model_status().batch_size == 12
+    assert app.model_status().batch_calibration == "explicit"
+
+
+def test_the_query_model_stays_in_process_regardless_of_the_backend(tmp_path: Path) -> None:
+    """Acceleration targets passage indexing; a query must never wait on it."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    embedder = TinyEmbedder()
+
+    app = Application(paths, embedder=embedder, cwd=tmp_path)
+
+    assert app.search.embedder is embedder
+    assert app.embedder is embedder

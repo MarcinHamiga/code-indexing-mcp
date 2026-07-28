@@ -100,3 +100,36 @@ def test_serve_refuses_an_explicit_broker_opt_in_without_local_sockets(
 
     assert cli.main(["serve"]) == 2
     assert "INCODE_BROKER=off" in capsys.readouterr().err
+
+
+def test_cli_reports_the_resolved_embedding_backend(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("INCODE_EMBED_ACCELERATOR", "cpu")
+
+    assert main(["model", "status"]) == 0
+
+    status = json.loads(capsys.readouterr().out)
+    assert status["requested_accelerator"] == "cpu"
+    assert status["resolved_accelerator"] == "cpu"
+    assert status["execution_provider"] == "CPUExecutionProvider"
+    assert status["probe_cache_state"] == "not-applicable"
+    assert status["fallback_reason"] is None
+    assert status["strict"] is False
+
+
+def test_model_status_explains_an_accelerator_it_cannot_honour(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("INCODE_EMBED_ACCELERATOR", "cuda")
+
+    assert main(["model", "status"]) == 0
+
+    status = json.loads(capsys.readouterr().out)
+    # This machine has no CUDA provider, so status reports the CPU it will
+    # really use and names the reason rather than claiming CUDA.
+    if "CUDAExecutionProvider" not in status["available_providers"]:
+        assert status["resolved_accelerator"] == "cpu"
+        assert "CUDAExecutionProvider" in status["fallback_reason"]
