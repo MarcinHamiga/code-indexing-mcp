@@ -21,6 +21,45 @@ def test_cli_initializes_and_lists_projects(tmp_path: Path, monkeypatch, capsys)
     assert [project["id"] for project in projects] == [init_result["id"]]
 
 
+def test_cli_runs_the_index_benchmark_with_machine_readable_output(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
+    received: dict[str, object] = {}
+
+    def fake_benchmark(**kwargs: object) -> dict[str, object]:
+        received.update(kwargs)
+        return {"schema_version": 1, "scenarios": {"cold_start": {}}}
+
+    monkeypatch.setattr(cli, "run_index_benchmark_command", fake_benchmark)
+    work_dir = tmp_path / "benchmark"
+
+    assert (
+        main(
+            [
+                "benchmark",
+                "index",
+                "--files",
+                "3",
+                "--functions-per-file",
+                "2",
+                "--batch-size",
+                "8",
+                "--work-dir",
+                str(work_dir),
+            ]
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out)["schema_version"] == 1
+    assert received["files"] == 3
+    assert received["functions_per_file"] == 2
+    assert received["batch_size"] == 8
+    assert received["work_dir"] == work_dir
+
+
 def test_serve_falls_back_to_direct_when_local_sockets_are_unavailable(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

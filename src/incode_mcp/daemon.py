@@ -352,7 +352,7 @@ class BrokerApplication:
     def from_environment(cls, *, cwd: Path | None = None) -> BrokerApplication:
         return cls(RuntimePaths.from_environment(), cwd=cwd)
 
-    def _call(self, method: str, **params: Any) -> Any:
+    def _call_once(self, method: str, **params: Any) -> Any:
         token = self.token_path.read_text().strip()
         with _local_socket() as connection:
             connection.settimeout(5)
@@ -377,6 +377,21 @@ class BrokerApplication:
                 code = ErrorCode.PROTOCOL_ERROR
             raise IncodeError(code, str(error["message"]), **error.get("details", {}))
         return response.get("result")
+
+    def _call(self, method: str, **params: Any) -> Any:
+        try:
+            return self._call_once(method, **params)
+        except (FileNotFoundError, ConnectionRefusedError):
+            # The daemon intentionally exits after an idle timeout, but an MCP
+            # server can retain this broker for much longer. Restart only when
+            # no request could have been sent; retrying broader socket failures
+            # could duplicate a completed non-idempotent operation.
+            ensure_daemon(self.paths)
+            return self._call_once(method, **params)
+
+    def _ping_once(self) -> dict[str, Any]:
+        """Probe the daemon without starting it when the endpoint is absent."""
+        return dict(self._call_once("ping"))
 
     def ping(self) -> dict[str, Any]:
         return dict(self._call("ping"))
@@ -476,7 +491,7 @@ class BrokerApplication:
 
 def daemon_status(paths: RuntimePaths) -> dict[str, Any]:
     try:
-        return {"running": True, **BrokerApplication(paths).ping()}
+        return {"running": True, **BrokerApplication(paths)._ping_once()}
     except (OSError, IncodeError):
         return {"running": False}
 
@@ -506,7 +521,7 @@ def ensure_daemon(paths: RuntimePaths, *, timeout_seconds: float = 10) -> Broker
         while time.monotonic() < deadline:
             broker = BrokerApplication(paths)
             try:
-                broker.ping()
+                broker._ping_once()
                 return broker
             except (OSError, IncodeError):
                 time.sleep(0.05)

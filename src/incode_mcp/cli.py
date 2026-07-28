@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from .application import Application, RuntimePaths
+from .benchmark import run_index_benchmark_command
 from .daemon import (
     BrokerApplication,
     DaemonServer,
@@ -48,6 +49,15 @@ def _parser() -> argparse.ArgumentParser:
     model = commands.add_parser("model", help="Manage the local embedding model")
     model_commands = model.add_subparsers(dest="model_command", required=True)
     model_commands.add_parser("pull")
+    benchmark = commands.add_parser("benchmark", help="Run reproducible local benchmarks")
+    benchmark_commands = benchmark.add_subparsers(dest="benchmark_command", required=True)
+    benchmark_index = benchmark_commands.add_parser(
+        "index", help="Measure cold, warm, incremental, and forced indexing"
+    )
+    benchmark_index.add_argument("--files", type=int, default=128)
+    benchmark_index.add_argument("--functions-per-file", type=int, default=2)
+    benchmark_index.add_argument("--batch-size", type=int, default=8)
+    benchmark_index.add_argument("--work-dir", type=Path, default=None)
     daemon = commands.add_parser("daemon", help="Manage the shared indexing daemon")
     daemon_commands = daemon.add_subparsers(dest="daemon_command", required=True)
     daemon_commands.add_parser("run", help=argparse.SUPPRESS)
@@ -95,6 +105,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 broker = ensure_daemon(paths)
                 print(_json({"restarted": True, **broker.ping()}))
                 return 0
+        if args.command == "benchmark" and args.benchmark_command == "index":
+            benchmark_result = run_index_benchmark_command(
+                paths=paths,
+                files=args.files,
+                functions_per_file=args.functions_per_file,
+                batch_size=args.batch_size,
+                work_dir=args.work_dir,
+            )
+            print(_json(benchmark_result))
+            return 0
         settings = IndexSettings.from_environment()
         if args.command == "serve":
             use_daemon = not args.direct and settings.broker_mode != "off"

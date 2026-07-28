@@ -77,6 +77,34 @@ def test_broker_application_calls_one_daemon_backend(tmp_path: Path) -> None:
 
 
 @requires_local_sockets
+def test_broker_restarts_daemon_after_idle_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    monkeypatch.setenv("INCODE_DATA_DIR", str(paths.data))
+    monkeypatch.setenv("INCODE_CACHE_DIR", str(paths.cache))
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    first = DaemonServer(paths, application=application, idle_timeout_seconds=0.1)
+    first_thread = threading.Thread(target=first.serve, daemon=True)
+    first_thread.start()
+    assert first.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+    assert broker.ping()["pid"] > 0
+    first_thread.join(timeout=2)
+    assert not first_thread.is_alive()
+
+    assert broker.list_projects() == []
+    assert daemon.daemon_status(paths)["running"] is True
+
+    broker.stop()
+    for _ in range(40):
+        if not daemon.daemon_status(paths)["running"]:
+            break
+        time.sleep(0.05)
+    assert daemon.daemon_status(paths)["running"] is False
+
+
+@requires_local_sockets
 def test_daemon_does_not_idle_exit_while_request_is_active(tmp_path: Path) -> None:
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)

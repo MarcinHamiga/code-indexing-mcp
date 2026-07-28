@@ -147,19 +147,27 @@ def plan_microbatches(
     max_items: int = 1,
     max_token_product: int = DEFAULT_MAX_TOKEN_PRODUCT,
 ) -> list[list[int]]:
-    """Group segment indices so each batch stays within both packing limits.
+    """Bucket segment indices by length, then stay within both packing limits.
 
     A batch pads to its longest member, so ``item_count * longest`` — not the
     sum — is what the model materializes. A single segment always forms a batch
     even when it exceeds the product on its own; there is nothing smaller to
-    fall back to.
+    fall back to. Power-of-two buckets keep similarly sized segments together
+    without making exact token counts part of the ordering contract.
     """
     if max_items < 1:
         raise ValueError("max_items must be at least 1")
+    ordered = sorted(
+        enumerate(token_counts),
+        key=lambda item: (
+            -1 if item[1] > max_token_product else max(0, item[1]).bit_length(),
+            item[0],
+        ),
+    )
     batches: list[list[int]] = []
     current: list[int] = []
     longest = 0
-    for index, count in enumerate(token_counts):
+    for index, count in ordered:
         widened = max(longest, count)
         if current and (
             len(current) + 1 > max_items or (len(current) + 1) * widened > max_token_product
