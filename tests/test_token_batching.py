@@ -205,6 +205,12 @@ def test_microbatches_respect_the_padded_token_product() -> None:
     assert batches == [[0, 1, 2, 3], [4, 5]]
 
 
+def test_microbatches_bucket_similar_lengths_before_padding() -> None:
+    batches = plan_microbatches([10, 1_000, 12, 900], max_items=2, max_token_product=2_000)
+
+    assert batches == [[0, 2], [1, 3]]
+
+
 def test_a_segment_wider_than_the_product_still_forms_its_own_batch() -> None:
     batches = plan_microbatches([9_000, 10], max_items=4, max_token_product=4_096)
 

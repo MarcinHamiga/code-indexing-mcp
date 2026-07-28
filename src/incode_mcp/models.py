@@ -225,6 +225,15 @@ class IndexReport(FrozenModel):
     parse_duration_ms: int | None = None
     embed_duration_ms: int | None = None
     commit_duration_ms: int | None = None
+    # Stable Phase 1 telemetry names. Keep the *_duration_ms fields above for
+    # clients that adopted the earlier memory-hardening report.
+    embedding_backend: str = "cpu"
+    embedding_batch_size: int = 1
+    scan_ms: int | None = None
+    parse_ms: int | None = None
+    embed_ms: int | None = None
+    commit_ms: int | None = None
+    fallback_count: int = 0
     memory_budget_bytes: int | None = None
     peak_memory_bytes: int | None = None
     worker_used: bool = False

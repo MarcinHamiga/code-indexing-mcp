@@ -51,7 +51,9 @@ class SessionEmbedder(RecordingEmbedder):
         return None
 
 
-def make_indexer(tmp_path: Path, embedder: RecordingEmbedder) -> tuple[Indexer, LanceStore]:
+def make_indexer(
+    tmp_path: Path, embedder: RecordingEmbedder, *, batch_size: int = 1
+) -> tuple[Indexer, LanceStore]:
     store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
     return (
         Indexer(
@@ -60,6 +62,7 @@ def make_indexer(tmp_path: Path, embedder: RecordingEmbedder) -> tuple[Indexer, 
             extractor=TreeSitterExtractor(),
             embedder=embedder,
             lock_directory=tmp_path / "locks",
+            batch_size=batch_size,
         ),
         store,
     )
@@ -118,6 +121,15 @@ def test_index_report_splits_duration_into_phases(tmp_path: Path) -> None:
 
     assert report.embed_duration_ms is not None
     assert report.embed_duration_ms >= 45
+    assert report.embedding_backend == "cpu"
+    assert report.embedding_batch_size == 1
+    assert report.scan_ms == report.scan_duration_ms
+    assert report.parse_ms == report.parse_duration_ms
+    assert report.embed_ms == report.embed_duration_ms
+    assert report.commit_ms == report.commit_duration_ms
+    assert report.fallback_count == 0
+    assert report.peak_memory_bytes is not None
+    assert report.peak_memory_bytes > 0
     phases = [
         report.scan_duration_ms,
         report.parse_duration_ms,
@@ -128,6 +140,55 @@ def test_index_report_splits_duration_into_phases(tmp_path: Path) -> None:
     # The phases partition the indexing work, so together they cannot exceed the
     # total, which also covers lock acquisition and project bookkeeping.
     assert sum(phase or 0 for phase in phases) <= report.duration_ms
+
+
+def test_indexer_batches_chunks_across_changed_files(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("def alpha():\n    return 1\n")
+    (root / "b.py").write_text("def beta():\n    return 2\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder, batch_size=8)
+
+    report = indexer.index(project)
+
+    assert report.errors == []
+    assert len(embedder.passage_batches) == 1
+    assert len(embedder.passage_batches[0]) == 2
+    tables = store._existing_tables(project.id)
+    assert tables is not None
+    rows = tables.chunks.search().select(["path", "embedding_text", "vector"]).to_list()
+    assert {row["path"] for row in rows} == {"a.py", "b.py"}
+    assert all(row["vector"][0] == float(len(row["embedding_text"]) % 7) for row in rows)
+
+
+def test_cross_file_batch_failure_only_rejects_its_own_file(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    good = root / "good.py"
+    bad = root / "bad.py"
+    good.write_text("def old_good():\n    return 1\n")
+    bad.write_text("def old_bad():\n    return 2\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder, batch_size=8)
+    indexer.index(project)
+    old_bad_ids = {
+        chunk.chunk_id for chunk in store.list_chunks([project.id]) if chunk.path == "bad.py"
+    }
+
+    good.write_text("def new_good():\n    return 3\n")
+    bad.write_text("def RAISE_EMBEDDING():\n    return 4\n")
+    report = indexer.index(project)
+
+    chunks = store.list_chunks([project.id])
+    assert [issue.path for issue in report.errors] == ["bad.py"]
+    assert report.indexed_files == 1
+    assert report.fallback_count >= 1
+    assert {chunk.path for chunk in chunks} == {"good.py", "bad.py"}
+    assert any(chunk.symbol == "new_good" for chunk in chunks)
+    assert {chunk.chunk_id for chunk in chunks if chunk.path == "bad.py"} == old_bad_ids
 
 
 def test_indexer_replaces_changed_files_and_removes_deleted_files(tmp_path: Path) -> None:
