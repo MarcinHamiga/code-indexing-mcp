@@ -77,9 +77,12 @@ def _memory_bytes(environment: Mapping[str, str], default_megabytes: int) -> int
     ``INCODE_EMBED_MEMORY_MB`` is the documented name. ``INCODE_INDEX_MEMORY_MB``
     predates it and keeps working; the newer name wins when both are set.
     """
+    # Truthiness, not membership: an exported-but-empty variable is how a shell
+    # says "unset", and letting it win would both fail on int("") and shadow a
+    # perfectly good value under the legacy name.
     name = (
         "INCODE_EMBED_MEMORY_MB"
-        if "INCODE_EMBED_MEMORY_MB" in environment
+        if environment.get("INCODE_EMBED_MEMORY_MB")
         else "INCODE_INDEX_MEMORY_MB"
     )
     return _integer(environment, name, default_megabytes, 1024, 1024 * 1024) * 1024 * 1024

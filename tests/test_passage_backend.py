@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from multiprocessing.connection import Connection
 from pathlib import Path
 
@@ -176,6 +177,9 @@ def _backend(
     selection: BackendSelection | None = None,
     probe_cache: ProbeCache | None = None,
     probe_key: ProbeKey | None = None,
+    calibrated_batch_size: int = 8,
+    accelerator_factory: Callable[[], EmbeddingWorkerSession] | None = None,
+    on_degrade: Callable[[BackendSelection], None] | None = None,
 ) -> PassageBackendSession:
     cpu_started: list[int] = []
 
@@ -185,15 +189,19 @@ def _backend(
 
     session = PassageBackendSession(
         selection or _accelerator_selection(),
-        accelerator_factory=lambda: _session(
-            accelerator_target, _config(Accelerator.CUDA.value, CUDA_BACKEND.providers)
+        accelerator_factory=accelerator_factory
+        or (
+            lambda: _session(
+                accelerator_target, _config(Accelerator.CUDA.value, CUDA_BACKEND.providers)
+            )
         ),
         cpu_factory=cpu_factory,
         strict=strict,
         probe_cache=probe_cache,
         probe_key=probe_key,
-        batch_size=8,
+        calibrated_batch_size=calibrated_batch_size,
         dimension=DIMENSION,
+        on_degrade=on_degrade,
     )
     session.cpu_starts = cpu_started  # type: ignore[attr-defined]
     return session
@@ -482,3 +490,147 @@ def test_an_ordinary_cpu_run_reports_no_fallback_reason() -> None:
 
     assert backend.telemetry().fallback_reason is None
     assert backend.telemetry().fallback_count == 0
+
+
+# -- a terminated accelerator still reports what it measured ---------------
+
+
+def _starved_accelerator() -> EmbeddingWorkerSession:
+    """An accelerator whose model load alone overruns the memory ceiling."""
+    session = _session(_healthy_worker, _config(Accelerator.CUDA.value, CUDA_BACKEND.providers))
+    # Sampled, not allocated, so the gate is exercised without the test itself
+    # needing gigabytes.
+    session._sample_rss = lambda: (0, 8 * 1024**3)  # type: ignore[method-assign]
+    return session
+
+
+def test_an_accelerator_killed_while_verifying_still_reports_its_measurements() -> None:
+    """The evidence for a fallback must survive the backend that caused it.
+
+    A run that fell back because its accelerator blew the ceiling has to say
+    so with numbers. Discarding the terminated session would leave a report
+    naming a memory failure beside a peak that never came close to one.
+    """
+    backend = _backend(_healthy_worker, accelerator_factory=_starved_accelerator)
+
+    with backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+
+    report = backend.telemetry()
+    assert report.backend == "cpu"
+    assert report.termination_reason == "memory_ceiling"
+    assert report.peak_memory_bytes >= 8 * 1024**3
+    # for_client() rather than str(): the ceiling and the overrun are details
+    # on the error, and the reason field is the only place they can travel.
+    assert "indexing_memory_bytes=" in (report.fallback_reason or "")
+
+
+def test_a_degraded_backend_tells_its_owner_so_the_next_run_can_skip_it() -> None:
+    remembered: list[BackendSelection] = []
+
+    with _backend(_dead_on_initialize_worker, on_degrade=remembered.append) as backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+
+    assert [selection.accelerator for selection in remembered] == [Accelerator.CPU]
+    assert remembered[0].requested is Accelerator.CUDA
+    assert remembered[0].fallback_reason
+
+
+def test_strict_mode_reports_no_degradation_because_it_permits_none() -> None:
+    """Strict mode raises instead of degrading, so there is nothing to memoize."""
+    remembered: list[BackendSelection] = []
+
+    with (
+        pytest.raises(IncodeError),
+        _backend(_dead_on_initialize_worker, strict=True, on_degrade=remembered.append) as backend,
+    ):
+        backend.plan_and_embed(_candidates(1), PLAN)
+
+    assert remembered == []
+
+
+def test_an_uncalibrated_probe_records_no_batch_size(tmp_path: Path) -> None:
+    """Nothing measures a batch size yet, and the cache must not imply one."""
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _probe_key()
+
+    with _backend(
+        _healthy_worker, probe_cache=cache, probe_key=key, calibrated_batch_size=0
+    ) as backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+
+    record = cache.load(key)
+    assert record is not None
+    assert record.batch_size == 0
+
+
+# -- a respawned worker is not trusted on its predecessor's verification ---
+
+
+def _flaky_then_healthy_worker(connection: Connection, config: WorkerConfig) -> None:
+    """Dies on the first real batch of its first process, serves after that.
+
+    Spawn identity lives on disk because each respawn is a fresh process with
+    no memory of the last one -- which is precisely the condition that makes
+    re-verification necessary.
+    """
+    scratch = Path(config.cache_directory)
+    spawn = len(list(scratch.glob("spawn-*")))
+    (scratch / f"spawn-{spawn}").write_text("")
+    while True:
+        command, payload = connection.recv()
+        if command == "stop":
+            return
+        if command == "initialize":
+            (scratch / f"initialized-{spawn}").write_text("")
+            connection.send(("initialized", (tuple(config.providers), config.dimension)))
+            continue
+        if command == "probe":
+            connection.send(("probed", [_unit_vector(1.0) for _ in PROBE_TEXTS]))
+            continue
+        if spawn == 0:
+            os._exit(1)
+        candidates, _plan = payload
+        connection.send(("planned", (_packed_segments(len(candidates)), True)))
+
+
+def test_a_worker_respawned_by_a_batch_retry_is_verified_before_more_content(
+    tmp_path: Path,
+) -> None:
+    """A batch retry replaces the process; the successor has proven nothing.
+
+    The retry itself still runs on the fresh worker -- that is what a retry
+    is -- but every group after it goes through verification first.
+    """
+    config = WorkerConfig(
+        cache_directory=str(tmp_path),
+        offline=True,
+        threads=1,
+        enable_cpu_mem_arena=False,
+        dimension=DIMENSION,
+        providers=CUDA_BACKEND.providers,
+        accelerator=Accelerator.CUDA.value,
+    )
+    # max_items above 1 so the in-worker retry loop is reachable at all; it
+    # short-circuits at 1, which is the shipped default.
+    plan = SegmentPlan(max_tokens=8, max_items=4)
+    backend = _backend(
+        _healthy_worker,
+        accelerator_factory=lambda: EmbeddingWorkerSession(
+            config, effective_ceiling_bytes=2 * 1024**3, target=_flaky_then_healthy_worker
+        ),
+    )
+
+    with backend:
+        backend.plan_and_embed(_candidates(4), plan)
+        assert len(list(tmp_path.glob("spawn-*"))) == 2, "the retry should have respawned"
+        backend.plan_and_embed(_candidates(4), plan)
+
+    # Both processes were verified: the original before its first batch, the
+    # successor before it was given a second group.
+    assert sorted(p.name for p in tmp_path.glob("initialized-*")) == [
+        "initialized-0",
+        "initialized-1",
+    ]
+    assert backend.selection.accelerator is Accelerator.CUDA
+    assert backend.fallback_count == 0

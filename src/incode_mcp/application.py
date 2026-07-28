@@ -135,6 +135,11 @@ class Application:
         )
         self.probe_cache = ProbeCache(paths.cache / "backend-probes.json")
         self._probe_key: ProbeKey | None = None
+        # Set when a run actually tried the selected accelerator and it failed.
+        # Only successful probes are cached, so without this memo every index
+        # run in a long-lived daemon would re-spawn a known-dead backend and
+        # reload its model onto the device before giving up again.
+        self._runtime_fallback: BackendSelection | None = None
         self.embedding_batch_size = self.settings.embedding_batch_size
         self.batch_calibration = "explicit"
         if self.settings.embedding_batch_auto:
@@ -166,6 +171,23 @@ class Application:
         )
         self.search = SearchService(self.store, embedder)
 
+    @property
+    def effective_backend_selection(self) -> BackendSelection:
+        """The backend the next run will attempt, after any runtime fallback.
+
+        ``backend_selection`` records what selection resolved to from static
+        capability alone. Once a run has tried it and been degraded, that
+        verdict stands for the life of this process.
+        """
+        return self._runtime_fallback or self.backend_selection
+
+    def _remember_fallback(self, degraded: BackendSelection) -> None:
+        logger.warning(
+            "Pinning passage embedding to CPU for the rest of this process: %s",
+            degraded.fallback_reason,
+        )
+        self._runtime_fallback = degraded
+
     def _build_probe_key(self, embedder: Embedder) -> ProbeKey:
         descriptor = self.backend_selection.descriptor
         cache_directory = getattr(embedder, "cache_directory", self.paths.cache / "models")
@@ -189,11 +211,9 @@ class Application:
         until indexing asks for one, and the accelerator's is only started if
         the selection actually chose it.
         """
-        selection = self.backend_selection
         ceiling_bytes = self.settings.index_memory_bytes
         strict = self.settings.embedding_strict
         probe_key = self._probe_key
-        batch_size = self.embedding_batch_size
 
         def worker_config(providers: tuple[str, ...], accelerator: str) -> WorkerConfig:
             return WorkerConfig(
@@ -207,7 +227,7 @@ class Application:
                 accelerator=accelerator,
             )
 
-        descriptor = selection.descriptor
+        descriptor = self.backend_selection.descriptor
         accelerator_config = worker_config(descriptor.providers, descriptor.accelerator.value)
         cpu_config = worker_config(CPU_BACKEND.providers, CPU_BACKEND.accelerator.value)
 
@@ -216,21 +236,28 @@ class Application:
 
         def new_passage_session() -> PassageBackendSession:
             return PassageBackendSession(
-                selection,
+                # Read per run, not captured: a fallback recorded by an earlier
+                # run keeps this one from paying for the same dead backend.
+                self.effective_backend_selection,
                 accelerator_factory=lambda: session(accelerator_config),
                 cpu_factory=lambda: session(cpu_config),
                 strict=strict,
                 probe_cache=self.probe_cache,
                 probe_key=probe_key,
-                batch_size=batch_size,
+                # Phase 5 measures a batch size per backend and stores it here.
+                # Until then nothing has been calibrated, and saying otherwise
+                # would make ``model status`` report the configured default as
+                # though it were a measurement.
+                calibrated_batch_size=0,
                 dimension=embedder.dimension,
+                on_degrade=self._remember_fallback,
             )
 
         return new_passage_session
 
     def model_status(self) -> ModelStatus:
         """Report the resolved embedding stack without loading or probing it."""
-        selection: BackendSelection = self.backend_selection
+        selection: BackendSelection = self.effective_backend_selection
         descriptor = describe_environment(selection.descriptor)
         if not selection.uses_accelerator:
             # CPU is the reference backend; it needs no probe to be trusted.

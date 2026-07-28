@@ -57,6 +57,9 @@ class BackendDescriptor:
     stability: Stability
     precision: Precision
     runtime_version: str = ""
+    # Populated in Phase 3, alongside the NVIDIA driver/runtime detection the
+    # locked CUDA installation needs. It reaches the probe cache key already,
+    # so filling it in there is all that promotion requires.
     driver_version: str = ""
 
     @property
@@ -116,11 +119,13 @@ ACCELERATOR_BACKENDS: tuple[BackendDescriptor, ...] = (
     BackendDescriptor(
         accelerator=Accelerator.COREML,
         provider="CoreMLExecutionProvider",
-        # Manual-only by decision, not by maturity: on the default Jina model
-        # Core ML offloaded only part of the graph and lost to CPU.
-        stability=Stability.EXPERIMENTAL,
-        precision=Precision.FLOAT32,
         device="ane",
+        # Manual-only by decision, not by maturity: on the default Jina model
+        # Core ML offloaded only part of the graph and lost to CPU. MANUAL
+        # rather than EXPERIMENTAL says it works and was measured, and was
+        # kept off automatic selection because of what the measurement said.
+        stability=Stability.MANUAL,
+        precision=Precision.FLOAT32,
     ),
 )
 

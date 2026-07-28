@@ -165,3 +165,12 @@ def test_the_newer_memory_variable_wins_over_the_legacy_one() -> None:
     )
 
     assert settings.index_memory_bytes == 2048 * 1024 * 1024
+
+
+def test_an_exported_but_empty_memory_variable_does_not_shadow_the_legacy_name() -> None:
+    """An empty export is a shell saying "unset", not a value of zero length."""
+    settings = IndexSettings.from_environment(
+        {"INCODE_EMBED_MEMORY_MB": "", "INCODE_INDEX_MEMORY_MB": "1536"}
+    )
+
+    assert settings.index_memory_bytes == 1536 * 1024 * 1024

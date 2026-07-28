@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from incode_mcp import cli, daemon
 from incode_mcp.application import Application
 from incode_mcp.cli import main
@@ -128,8 +130,11 @@ def test_model_status_explains_an_accelerator_it_cannot_honour(
     assert main(["model", "status"]) == 0
 
     status = json.loads(capsys.readouterr().out)
-    # This machine has no CUDA provider, so status reports the CPU it will
-    # really use and names the reason rather than claiming CUDA.
-    if "CUDAExecutionProvider" not in status["available_providers"]:
-        assert status["resolved_accelerator"] == "cpu"
-        assert "CUDAExecutionProvider" in status["fallback_reason"]
+    if "CUDAExecutionProvider" in status["available_providers"]:
+        # Skipped rather than passed vacuously: on a CUDA host the request is
+        # honoured and there is no unhonourable request left to explain.
+        pytest.skip("this host offers CUDA, so the request is honoured")
+    # Status reports the CPU it will really use and names the reason rather
+    # than claiming the CUDA it cannot deliver.
+    assert status["resolved_accelerator"] == "cpu"
+    assert "CUDAExecutionProvider" in status["fallback_reason"]

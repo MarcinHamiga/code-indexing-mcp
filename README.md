@@ -273,15 +273,25 @@ returns unusable vectors, overruns the memory ceiling, or dies mid-run is termin
 chunks it had not committed are re-embedded on CPU. Chunks are committed per file only after they
 are fully embedded, so a worker crash can neither fail the run nor corrupt an existing index.
 
+The ceiling is measured as host resident memory, which on unified memory covers the accelerator too.
+A discrete GPU's VRAM is not visible to it, so exhausting a graphics card surfaces as a worker that
+died rather than as a budget that was exceeded — both fall back to CPU, but only one names a number.
+
 `INCODE_EMBED_STRICT=1` refuses that fallback and raises `BACKEND_UNAVAILABLE` instead, for callers
 who would rather fail than index at CPU speed without noticing. An `auto` selection that settles on
 CPU is not a fallback and is unaffected.
 
 Successful probes are cached under the cache directory, keyed by model artifact, execution
-provider, ONNX Runtime version, OS/architecture, device, and driver — so any of those moving
-invalidates the record rather than vouching for a backend that no longer works. A cached probe
-skips the inference but never the model load, which is what proves the provider still initialises
-on this boot.
+provider, ONNX Runtime version, OS/architecture, and device — so any of those moving invalidates
+the record rather than vouching for a backend that no longer works. The key reserves a driver
+version too, but nothing populates it yet: driver detection ships with the locked accelerator
+installations, alongside the first backend promoted to automatic selection. A cached probe skips
+the inference but never the model load, which is what proves the provider still initialises on this
+boot — so a driver change that breaks a provider outright still surfaces as a failed load.
+
+A backend that fails is not retried for the life of the process. Only successes are cached, so
+without that a long-lived daemon would reload a dead accelerator onto the device before every
+index run.
 
 `code-indexing-mcp model status` reports the whole resolution without loading or probing anything:
 

@@ -390,8 +390,15 @@ def _environment(
     environment["INCODE_CACHE_DIR"] = str(cache_directory)
     environment["INCODE_EMBED_BATCH_SIZE"] = str(batch_size)
     environment["INCODE_BROKER"] = "off"
+    # The ceiling this run reports must be the ceiling it ran under. Both names
+    # are cleared before the requested one is set, because the shell running
+    # this script is exactly the one the README tells developers to export
+    # INCODE_EMBED_MEMORY_MB into, and an inherited value outranks the legacy
+    # name -- which would silently override --memory-mb.
+    for inherited in ("INCODE_EMBED_MEMORY_MB", "INCODE_INDEX_MEMORY_MB"):
+        environment.pop(inherited, None)
     if memory_mb is not None:
-        environment["INCODE_INDEX_MEMORY_MB"] = str(memory_mb)
+        environment["INCODE_EMBED_MEMORY_MB"] = str(memory_mb)
     if offline:
         environment["INCODE_OFFLINE"] = "1"
     else:
@@ -549,6 +556,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "shapes": shapes,
             "batch_size": args.batch_size,
             "memory_mb": args.memory_mb,
+            # Recorded rather than pinned: benchmarking a specific backend is
+            # how one earns its promotion evidence, so the accelerator stays
+            # overridable from the environment. What must not happen is a run
+            # that measured one backend while the document implied another --
+            # the resolved backend is in run.report.embedding_backend.
+            "accelerator": os.environ.get("INCODE_EMBED_ACCELERATOR", "auto"),
             "offline": offline,
             "sample_interval": args.sample_interval,
             "workspace": str(workspace),

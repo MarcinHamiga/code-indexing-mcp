@@ -44,6 +44,17 @@ BACKEND_FAILURE_CODES = frozenset(
 SessionFactory = Callable[[], EmbeddingWorkerSession]
 
 
+def _reason(exc: BaseException) -> str:
+    """Render a failure for the fallback reason an ``IndexReport`` carries.
+
+    ``IncodeError.__str__`` deliberately omits details because it is used where
+    details travel as their own field. ``embedding_fallback_reason`` has no such
+    channel, so rendering with ``str`` here would throw away exactly the numbers
+    that explain the fallback -- the ceiling a backend overran and by how much.
+    """
+    return exc.for_client() if isinstance(exc, IncodeError) else str(exc)
+
+
 class PassageBackendSession:
     """A passage embedder that degrades from its accelerator to CPU in place."""
 
@@ -56,8 +67,9 @@ class PassageBackendSession:
         strict: bool = False,
         probe_cache: ProbeCache | None = None,
         probe_key: ProbeKey | None = None,
-        batch_size: int = 1,
+        calibrated_batch_size: int = 0,
         dimension: int = 0,
+        on_degrade: Callable[[BackendSelection], None] | None = None,
     ) -> None:
         self.selection = selection
         self.strict = strict
@@ -65,10 +77,19 @@ class PassageBackendSession:
         self._cpu_factory = cpu_factory
         self._probe_cache = probe_cache
         self._probe_key = probe_key
-        self._batch_size = batch_size
+        # 0 means "nothing measured a batch size for this backend". Calibration
+        # is Phase 5's job; recording the configured default as though it were
+        # a measurement would let ``model status`` claim a calibration that
+        # never ran.
+        self._calibrated_batch_size = calibrated_batch_size
         self._dimension = dimension
+        self._on_degrade = on_degrade
         self._session: EmbeddingWorkerSession | None = None
         self._on_cpu = not selection.uses_accelerator
+        # The worker generation verification was last established for. The
+        # in-worker batch retry replaces the process without asking, so this is
+        # what notices that the survivor has proven nothing yet.
+        self._verified_spawn = 0
         self.fallback_count = 0
         # Only a denied request carries a reason into the run. ``auto`` settling
         # on CPU is the correct outcome, not a degradation, and reporting it as
@@ -129,26 +150,37 @@ class PassageBackendSession:
         except IncodeError as exc:
             if self._on_cpu or exc.code not in BACKEND_FAILURE_CODES:
                 raise
-            # str(IncodeError) already leads with the code, so it is not
-            # prefixed again here.
-            self._degrade(str(exc))
+            # _reason already leads with the code, so it is not prefixed again.
+            self._degrade(_reason(exc))
         return call(self._active())
 
     def _active(self) -> EmbeddingWorkerSession:
-        if self._session is not None:
-            return self._session
         if self._on_cpu:
-            self._session = self._cpu_factory()
+            if self._session is None:
+                self._session = self._cpu_factory()
             return self._session
-        session = self._accelerator_factory()
+        session = self._session
+        if session is not None and session.spawn_count == self._verified_spawn:
+            return session
+        # Either nothing is running yet, or a batch retry closed the worker and
+        # the successor is an unproven fresh load on the same device. Both need
+        # verification before more content reaches them. (The group whose retry
+        # forced the respawn is embedded by that unverified process; only the
+        # groups after it are covered here.)
+        if session is None:
+            session = self._accelerator_factory()
         try:
             self._verify(session)
         except (IncodeError, ValueError) as exc:
             # Nothing this backend produced can be trusted, and it may still be
-            # holding device memory. Kill it before anything else is attempted.
-            session.close()
+            # holding device memory. Adopting it first means _degrade's close()
+            # both kills it and keeps what it measured -- the ceiling it overran
+            # and the reason it was terminated are the evidence for the fallback
+            # being reported. Under strict mode _degrade raises before that, and
+            # __exit__ reaps it on the way out instead.
+            self._session = session
             self.probe_state = "failed"
-            self._degrade(str(exc))
+            self._degrade(_reason(exc))
             self._session = self._cpu_factory()
             return self._session
         self._session = session
@@ -183,9 +215,11 @@ class PassageBackendSession:
         cached = self._cached_probe()
         if cached is not None:
             self.probe_state = "cached"
+            self._verified_spawn = session.spawn_count
             return
         session.probe()
         self.probe_state = "verified"
+        self._verified_spawn = session.spawn_count
         self._record_probe()
 
     def _cached_probe(self) -> ProbeRecord | None:
@@ -198,7 +232,7 @@ class PassageBackendSession:
             return
         self._probe_cache.store(
             self._probe_key,
-            batch_size=self._batch_size,
+            batch_size=self._calibrated_batch_size,
             dimension=self._dimension,
             detail=self.selection.descriptor.provider,
         )
@@ -224,6 +258,12 @@ class PassageBackendSession:
         self.fallback_reason = reason
         self.fallback_count += 1
         self._on_cpu = True
+        self._verified_spawn = 0
+        if self._on_degrade is not None:
+            # Lets the owner stop paying for this backend again. A device model
+            # load is seconds, and without this a long-lived daemon would spawn,
+            # load, and terminate the same dead accelerator on every index run.
+            self._on_degrade(self.selection)
 
     # -- telemetry ---------------------------------------------------------
 

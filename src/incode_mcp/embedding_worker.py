@@ -235,6 +235,11 @@ class EmbeddingWorkerSession:
         self._target = target
         self._process: BaseProcess | None = None
         self._connection: Connection | None = None
+        # How many worker processes this session has started. A batch retry
+        # closes the worker and the next request silently spawns another, so a
+        # caller that verified a backend needs this to notice that the process
+        # it verified is not the process now serving it.
+        self.spawn_count = 0
         self.peak_combined_rss = 0
         # Telemetry surfaced on IndexReport so a run's shape is diagnosable
         # without re-running it under a profiler.
@@ -472,6 +477,7 @@ class EmbeddingWorkerSession:
         process.start()
         child.close()
         self._process = process
+        self.spawn_count += 1
         # Pipe() yields PipeConnection on Windows and Connection elsewhere, and
         # typeshed does not relate the two even though both carry the send/recv/
         # poll/close surface used here. Widening on this one line keeps the

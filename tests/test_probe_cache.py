@@ -165,3 +165,62 @@ def test_the_artifact_fingerprint_is_stable_across_calls(tmp_path: Path) -> None
 
 def test_the_artifact_fingerprint_survives_a_missing_cache_directory(tmp_path: Path) -> None:
     assert model_artifact_fingerprint(tmp_path / "absent", "jina")
+
+
+def _fastembed_layout(cache: Path, model_id: str) -> Path:
+    artifact = cache / f"models--{model_id.replace('/', '--')}" / "blobs" / "model.onnx"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"x" * 128)
+    return artifact
+
+
+def test_the_fingerprint_ignores_the_rest_of_a_shared_model_cache(tmp_path: Path) -> None:
+    """A probe is about one model; nothing else in the cache should void it.
+
+    FastEmbed keeps a sibling ``.locks`` directory and a scratch ``models``
+    directory that churn on their own, and a second model may be pulled at any
+    time. Charging any of that to this model's key would re-probe every backend
+    for reasons that have nothing to do with the artifact being probed.
+    """
+    cache = tmp_path / "models"
+    _fastembed_layout(cache, "jinaai/jina-embeddings-v2-base-code")
+    before = model_artifact_fingerprint(cache, "jinaai/jina-embeddings-v2-base-code")
+
+    (cache / ".locks" / "models--jinaai--jina-embeddings-v2-base-code").mkdir(parents=True)
+    (cache / ".locks" / "models--jinaai--jina-embeddings-v2-base-code" / "a.lock").write_text("1")
+    _fastembed_layout(cache, "someone/another-model")
+    (cache / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172")
+
+    assert model_artifact_fingerprint(cache, "jinaai/jina-embeddings-v2-base-code") == before
+
+
+def test_the_fingerprint_still_notices_the_models_own_artifact_changing(tmp_path: Path) -> None:
+    cache = tmp_path / "models"
+    artifact = _fastembed_layout(cache, "jinaai/jina-embeddings-v2-base-code")
+    before = model_artifact_fingerprint(cache, "jinaai/jina-embeddings-v2-base-code")
+
+    artifact.write_bytes(b"x" * 256)
+
+    assert model_artifact_fingerprint(cache, "jinaai/jina-embeddings-v2-base-code") != before
+
+
+def test_two_models_in_one_cache_do_not_share_a_fingerprint(tmp_path: Path) -> None:
+    cache = tmp_path / "models"
+    _fastembed_layout(cache, "jinaai/jina-embeddings-v2-base-code")
+    _fastembed_layout(cache, "someone/another-model")
+
+    assert model_artifact_fingerprint(
+        cache, "jinaai/jina-embeddings-v2-base-code"
+    ) != model_artifact_fingerprint(cache, "someone/another-model")
+
+
+def test_an_unrecognised_layout_falls_back_to_the_whole_cache(tmp_path: Path) -> None:
+    """Over-invalidating costs a re-probe; under-invalidating vouches for a lie."""
+    cache = tmp_path / "models"
+    cache.mkdir()
+    (cache / "model.onnx").write_bytes(b"x" * 64)
+    before = model_artifact_fingerprint(cache, "jina")
+
+    (cache / "model.onnx").write_bytes(b"x" * 65)
+
+    assert model_artifact_fingerprint(cache, "jina") != before

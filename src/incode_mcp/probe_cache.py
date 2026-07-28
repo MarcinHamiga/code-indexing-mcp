@@ -19,10 +19,13 @@ import json
 import logging
 import os
 import time
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+
+from filelock import FileLock, Timeout
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,9 @@ CACHE_SCHEMA_VERSION = 1
 # A cache that grows without bound would keep every configuration a machine has
 # ever had. Records are small, but the file is read on every start.
 MAX_RECORDS = 32
+# Long enough to outlast a competing write, short enough that a stale lock
+# never delays indexing noticeably.
+LOCK_TIMEOUT_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -42,6 +48,13 @@ class ProbeKey:
     different model artifact may partition differently, a different runtime or
     driver may support different operators, and a different device may not
     exist at all.
+
+    ``driver_version`` is honoured by the key but is not yet populated by
+    anything: driver detection arrives with the locked accelerator
+    installations in Phase 3, and until then no backend reaches automatic
+    selection. A cached probe never skips the model load, so a driver change
+    that breaks a provider outright still surfaces as a failed load rather
+    than as a trusted stale record.
     """
 
     model_id: str
@@ -99,6 +112,20 @@ class ProbeRecord:
             return None
 
 
+def model_directory(cache_directory: Path, model_id: str) -> Path:
+    """Return the subtree under *cache_directory* holding *model_id*.
+
+    FastEmbed stores models in the HuggingFace layout, so ``org/name`` lives in
+    ``models--org--name``. Scoping to it keeps the rest of a shared cache --
+    a second model, the sibling ``.locks`` directory, a partial download -- from
+    invalidating a probe none of them had anything to do with. An unrecognised
+    layout falls back to the whole directory, which over-invalidates rather
+    than vouching for a model that moved.
+    """
+    candidate = cache_directory / f"models--{model_id.replace('/', '--')}"
+    return candidate if candidate.is_dir() else cache_directory
+
+
 def model_artifact_fingerprint(cache_directory: Path, model_id: str) -> str:
     """Fingerprint the on-disk model artifact behind *model_id*.
 
@@ -106,13 +133,14 @@ def model_artifact_fingerprint(cache_directory: Path, model_id: str) -> str:
     cache, or a switch between model revisions, and unlike hashing contents it
     stays cheap on a multi-hundred-megabyte ONNX graph.
     """
+    root = model_directory(cache_directory, model_id)
     entries: list[str] = []
     try:
-        for path in sorted(cache_directory.rglob("*")):
+        for path in sorted(root.rglob("*")):
             if not path.is_file():
                 continue
             try:
-                relative = path.relative_to(cache_directory).as_posix()
+                relative = path.relative_to(root).as_posix()
                 entries.append(f"{relative}:{path.stat().st_size}")
             except OSError:
                 continue
@@ -143,7 +171,12 @@ class ProbeCache:
         return None
 
     def store(self, key: ProbeKey, *, batch_size: int, dimension: int, detail: str = "") -> None:
-        """Record a successful probe, replacing any earlier one for *key*."""
+        """Record a successful probe, replacing any earlier one for *key*.
+
+        Read-modify-write, so a daemon and a CLI probing different backends at
+        once are serialised: ``os.replace`` alone would make each write atomic
+        while still letting the later one drop the earlier one's record.
+        """
         record = ProbeRecord(
             fingerprint=key.fingerprint(),
             batch_size=batch_size,
@@ -151,14 +184,35 @@ class ProbeCache:
             recorded_at_ns=time.time_ns(),
             detail=detail,
         )
-        kept = [
-            existing for existing in self._records() if existing.fingerprint != record.fingerprint
-        ]
-        kept.append(record)
-        # Newest wins when the cache is trimmed: an old configuration's verdict
-        # is the one least likely to be needed again.
-        kept.sort(key=lambda item: item.recorded_at_ns)
-        self._write(kept[-MAX_RECORDS:])
+        with self._guard():
+            kept = [
+                existing
+                for existing in self._records()
+                if existing.fingerprint != record.fingerprint
+            ]
+            kept.append(record)
+            # Newest wins when the cache is trimmed: an old configuration's
+            # verdict is the one least likely to be needed again.
+            kept.sort(key=lambda item: item.recorded_at_ns)
+            self._write(kept[-MAX_RECORDS:])
+
+    @contextlib.contextmanager
+    def _guard(self) -> Iterator[None]:
+        """Hold the cache lock, or proceed without it rather than fail a run."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            lock = FileLock(self.path.with_name(f"{self.path.name}.lock"))
+        except OSError:
+            yield
+            return
+        try:
+            with lock.acquire(timeout=LOCK_TIMEOUT_SECONDS):
+                yield
+        except Timeout:
+            # Another process is mid-write. Losing this record costs one
+            # re-probe; blocking an index run on a diagnostics cache would
+            # cost far more.
+            logger.debug("Could not lock the probe cache at %s", self.path)
 
     def state(self, key: ProbeKey) -> str:
         """Return ``"hit"`` or ``"miss"`` for diagnostics such as model status."""

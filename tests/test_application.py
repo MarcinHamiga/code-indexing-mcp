@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from incode_mcp.application import Application, RuntimePaths
-from incode_mcp.backends import Accelerator
+from incode_mcp.backends import CPU_BACKEND, Accelerator
 from incode_mcp.errors import ErrorCode, IncodeError
 from incode_mcp.settings import IndexSettings
 
@@ -286,3 +286,39 @@ def test_the_query_model_stays_in_process_regardless_of_the_backend(tmp_path: Pa
 
     assert app.search.embedder is embedder
     assert app.embedder is embedder
+
+
+def test_a_backend_that_failed_once_is_not_attempted_again(tmp_path: Path) -> None:
+    """Only successful probes are cached, so the failure has to be remembered.
+
+    Without this the daemon would spawn a worker, load the model onto a dead
+    device, and terminate it again before every single index run.
+    """
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(IndexSettings.from_environment({}), embedding_accelerator=Accelerator.CPU)
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+    resolved = app.backend_selection
+    assert app.effective_backend_selection is resolved
+
+    app._remember_fallback(resolved.fell_back_to(CPU_BACKEND, "the device fell off the bus"))
+
+    assert app.effective_backend_selection is not resolved
+    assert app.effective_backend_selection.accelerator is Accelerator.CPU
+    # backend_selection still records what capability alone resolved to; only
+    # the effective selection carries the verdict a real run reached.
+    assert app.backend_selection is resolved
+
+
+def test_model_status_reports_a_runtime_fallback_rather_than_the_original_choice(
+    tmp_path: Path,
+) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    app._remember_fallback(
+        app.backend_selection.fell_back_to(CPU_BACKEND, "the accelerator died on load")
+    )
+
+    status = app.model_status()
+    assert status.resolved_accelerator == "cpu"
+    assert status.fallback_reason == "the accelerator died on load"

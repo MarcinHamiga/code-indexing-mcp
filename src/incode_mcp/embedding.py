@@ -126,7 +126,11 @@ def resolve_session_providers(model: object) -> tuple[str, ...]:
             try:
                 return tuple(str(name) for name in getter())
             except Exception:  # pragma: no cover - defensive against runtime quirks
+                logger.debug("The ONNX session refused to report its providers")
                 return ()
+    # Leaves the caller unable to notice a silently dropped provider, so say so
+    # rather than letting the check quietly become a no-op if the layout moves.
+    logger.debug("No ONNX session reachable on %s; cannot confirm its providers", type(model))
     return ()
 
 
