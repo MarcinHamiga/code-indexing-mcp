@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import time
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
-from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol, runtime_checkable
@@ -32,6 +30,7 @@ from .embedding import (
     validate_probe_vectors,
 )
 from .errors import ErrorCode, IncodeError
+from .worker_launcher import SpawnLauncher, WorkerLauncher, WorkerProcess
 
 SYSTEM_RESERVE_BYTES = 512 * 1024**2
 MINIMUM_WORKER_BYTES = 1024**3
@@ -95,6 +94,15 @@ class TelemetrySource(Protocol):
 
 
 WorkerTarget = Callable[[Connection, WorkerConfig], None]
+
+
+def default_launcher() -> WorkerLauncher:
+    """Return the launcher that runs a worker in this interpreter's environment.
+
+    This is the CPU path and the fallback path, so it deliberately depends on
+    nothing an installer had to prepare.
+    """
+    return SpawnLauncher(_worker_main)
 
 
 def effective_memory_ceiling(*, configured_bytes: int, available_bytes: int) -> int:
@@ -214,6 +222,7 @@ class EmbeddingWorkerSession:
         configured_ceiling_bytes: int | None = None,
         effective_ceiling_bytes: int | None = None,
         target: WorkerTarget = _worker_main,
+        launcher: WorkerLauncher | None = None,
     ) -> None:
         self.config = config
         configured = configured_ceiling_bytes or 2 * 1024**3
@@ -232,8 +241,11 @@ class EmbeddingWorkerSession:
                 effective_memory_bytes=self.effective_ceiling_bytes,
                 minimum_memory_bytes=MINIMUM_WORKER_BYTES,
             )
-        self._target = target
-        self._process: BaseProcess | None = None
+        # A launcher decides which environment the worker's code runs in;
+        # ``target`` names the body it runs there. The default pair is the
+        # historical behaviour: this interpreter, this module's worker loop.
+        self._launcher = launcher if launcher is not None else SpawnLauncher(target)
+        self._process: WorkerProcess | None = None
         self._connection: Connection | None = None
         # How many worker processes this session has started. A batch retry
         # closes the worker and the next request silently spawns another, so a
@@ -396,9 +408,17 @@ class EmbeddingWorkerSession:
         self._start()
         assert self._connection is not None
         assert self._process is not None
-        self._connection.send((command, payload))
+        try:
+            self._connection.send((command, payload))
+        except (EOFError, OSError) as exc:
+            raise self._channel_failed() from exc
         consecutive_over = 0
-        while not self._connection.poll(0.1):
+        while True:
+            try:
+                if self._connection.poll(0.1):
+                    break
+            except (EOFError, OSError) as exc:
+                raise self._channel_failed() from exc
             if not self._process.is_alive():
                 self.close()
                 self.termination_reason = "worker_exited"
@@ -432,18 +452,34 @@ class EmbeddingWorkerSession:
                 )
         try:
             status, payload = self._connection.recv()
-        except EOFError as exc:
-            self.close()
-            self.termination_reason = "channel_closed"
-            raise IncodeError(
-                ErrorCode.EMBEDDING_WORKER_FAILED,
-                "Embedding worker closed its result channel",
-            ) from exc
+        except (EOFError, OSError) as exc:
+            raise self._channel_failed() from exc
         if status == "error":
             self.close()
             self.termination_reason = "worker_error"
             raise IncodeError(ErrorCode.EMBEDDING_WORKER_FAILED, str(payload))
         return status, payload
+
+    def _channel_failed(self) -> IncodeError:
+        """Report a broken command channel as this session's own failure.
+
+        A worker that stops cleanly closes the channel, which reads as
+        ``EOFError``. One that dies mid-request breaks it instead, and how that
+        breakage surfaces depends on the platform and on which operation first
+        touched the dead end: a spawned worker's pipe raises ``BrokenPipeError``
+        from the wait, an external worker's socket raises
+        ``ConnectionResetError`` from the read, and the send can raise either.
+        Every one of them says the same thing -- no result is coming -- so none
+        of them may reach a caller as a raw channel error. Callers degrade to
+        CPU on EMBEDDING_WORKER_FAILED and can do nothing with an OSError
+        escaping from inside the indexing pipeline.
+        """
+        self.close()
+        self.termination_reason = "channel_closed"
+        return IncodeError(
+            ErrorCode.EMBEDDING_WORKER_FAILED,
+            "Embedding worker closed its result channel",
+        )
 
     def close(self) -> None:
         process = self._process
@@ -457,6 +493,12 @@ class EmbeddingWorkerSession:
         if process.is_alive():
             process.terminate()
             process.join(timeout=2)
+        if process.is_alive():
+            # A worker in another environment is not this process's child to be
+            # reaped at exit, and one that ignored SIGTERM may still be holding
+            # device memory the next backend needs.
+            process.kill()
+            process.join(timeout=2)
         if connection is not None:
             connection.close()
         self._process = None
@@ -466,24 +508,10 @@ class EmbeddingWorkerSession:
         if self._process is not None:
             return
         self._parent_baseline_bytes = psutil.Process().memory_info().rss
-        context = mp.get_context("spawn")
-        parent, child = context.Pipe()
-        process = context.Process(
-            target=self._target,
-            args=(child, self.config),
-            name="incode-embedding-worker",
-            daemon=True,
-        )
-        process.start()
-        child.close()
-        self._process = process
+        launched = self._launcher.launch(self.config)
+        self._process = launched.process
         self.spawn_count += 1
-        # Pipe() yields PipeConnection on Windows and Connection elsewhere, and
-        # typeshed does not relate the two even though both carry the send/recv/
-        # poll/close surface used here. Widening on this one line keeps the
-        # attribute itself typed, and keeps a cast from being redundant on POSIX.
-        connection: Any = parent
-        self._connection = connection
+        self._connection = launched.connection
 
     def _sample_rss(self) -> tuple[int, int]:
         """Return the current (parent, worker) resident set sizes in bytes."""

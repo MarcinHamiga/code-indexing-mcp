@@ -178,20 +178,28 @@ def test_accelerator_names_are_parsed_leniently(value: str) -> None:
     assert parse_accelerator(value) in set(Accelerator)
 
 
-def test_the_shipped_registry_promotes_nothing_to_automatic_yet() -> None:
-    """Phase 2 ships the contract, not a promoted accelerator.
+def test_cuda_is_the_only_accelerator_eligible_for_automatic_selection() -> None:
+    """CUDA is promoted; everything else still needs an explicit override.
 
-    Promotion is what Phase 3 does for CUDA once its correctness and throughput
-    gates pass on real hardware. Until then ``auto`` must resolve to CPU even on
-    a machine that has every provider installed.
+    The rest of the registry is reached only through INCODE_EMBED_ACCELERATOR,
+    which is how a backend earns the measurements its own promotion needs.
     """
     automatic = [
-        backend
+        backend.accelerator
         for backend in KNOWN_BACKENDS
         if not backend.is_cpu and backend.stability is Stability.AUTOMATIC
     ]
 
-    assert automatic == []
+    assert automatic == [Accelerator.CUDA]
+
+
+def test_auto_stays_on_cpu_where_no_accelerator_was_prepared() -> None:
+    """Promotion makes CUDA eligible, not present: an unprepared machine is CPU."""
+    selection = select_backend(Accelerator.AUTO, available_providers=[CPU_PROVIDER])
+
+    assert selection.accelerator is Accelerator.CPU
+    assert selection.honored is True
+    assert "reinstall with --accelerator" in (selection.fallback_reason or "")
 
 
 def test_available_providers_always_include_cpu() -> None:

@@ -313,6 +313,76 @@ def test_retries_stop_and_the_error_surfaces_once_the_batch_cannot_shrink() -> N
     assert session.termination_reason in {"worker_exited", "channel_closed"}
 
 
+class _BreaksAt:
+    """A worker that died mid-request, noticed at *stage* as *error*."""
+
+    def __init__(self, stage: str, error: BaseException) -> None:
+        self._stage = stage
+        self._error = error
+
+    def send(self, _payload: object) -> None:
+        if self._stage == "send":
+            raise self._error
+
+    def poll(self, _timeout: float = 0.0) -> bool:
+        if self._stage == "poll":
+            raise self._error
+        return True
+
+    def recv(self) -> tuple[str, object]:
+        raise self._error
+
+    def close(self) -> None:
+        return None
+
+
+class _NeverExits:
+    """Reports itself alive, so only the channel can reveal the death."""
+
+    pid = 4321
+
+    def is_alive(self) -> bool:
+        return True
+
+    def join(self, timeout: float | None = None) -> None:
+        return None
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("stage", "error"),
+    [
+        ("send", BrokenPipeError(32, "Broken pipe")),
+        ("poll", BrokenPipeError(109, "The pipe has been ended")),
+        ("recv", ConnectionResetError(104, "Connection reset by peer")),
+        ("recv", EOFError()),
+    ],
+)
+def test_a_broken_channel_is_reported_however_it_breaks(stage: str, error: BaseException) -> None:
+    """No way of losing the worker escapes as a raw channel error.
+
+    Which exception a dead worker produces depends on the platform and on
+    whether the channel is a pipe or a socket, so the cases that never occur on
+    the machine running this are injected rather than left to a race: a leak
+    here reaches indexing, which can only degrade to CPU on an IncodeError.
+    """
+    session = _session(_fake_worker, 2 * 1024**3)
+    session._process = _NeverExits()  # type: ignore[assignment]
+    session._connection = _BreaksAt(stage, error)  # type: ignore[assignment]
+
+    with pytest.raises(IncodeError) as caught:
+        session.initialize()
+
+    assert caught.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
+    assert caught.value.__cause__ is error
+    assert session.termination_reason == "channel_closed"
+
+
 def _protocol_worker(connection: Connection, config: WorkerConfig) -> None:
     """Answers the lifecycle commands the backend contract added."""
     while True:

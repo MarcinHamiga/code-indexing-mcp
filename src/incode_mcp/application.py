@@ -12,17 +12,20 @@ from pathlib import Path
 from filelock import FileLock, Timeout
 from platformdirs import user_cache_path, user_data_path
 
+from .accelerator_env import apply_environment, load_environment
 from .backends import (
     CPU_BACKEND,
+    BackendDescriptor,
     BackendSelection,
     available_execution_providers,
+    backend_for,
     describe_environment,
     platform_fingerprint,
     runtime_version,
     select_backend,
 )
 from .embedding import Embedder, FastEmbedder, SegmentPlan
-from .embedding_worker import EmbeddingWorkerSession, WorkerConfig
+from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
 from .errors import ErrorCode, IncodeError
 from .extractor import TreeSitterExtractor
 from .indexing import Indexer
@@ -46,6 +49,7 @@ from .search import SearchService
 from .settings import IndexSettings
 from .staging import recover_staged_commits
 from .storage import LanceStore
+from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
 logger = logging.getLogger(__name__)
 
@@ -129,10 +133,14 @@ class Application:
         # Passage embedding is the only role acceleration targets. The query
         # model stays in this process on CPU so a search never waits on a
         # worker spawning or a model loading onto a device.
-        self.backend_selection = select_backend(
-            self.settings.embedding_accelerator,
-            available_providers=available_execution_providers(),
-        )
+        #
+        # An accelerator usually lives in a second environment the installer
+        # prepared, so what this process can execute is not the whole story:
+        # the providers that environment reported are candidates too, and a
+        # backend chosen from them runs in its interpreter rather than ours.
+        self.serving_providers = available_execution_providers()
+        self.accelerator_environment = load_environment(paths.data)
+        self.backend_selection = self._select_backend()
         self.probe_cache = ProbeCache(paths.cache / "backend-probes.json")
         self._probe_key: ProbeKey | None = None
         # Set when a run actually tried the selected accelerator and it failed.
@@ -170,6 +178,52 @@ class Application:
             staging_directory=paths.data / "staging",
         )
         self.search = SearchService(self.store, embedder)
+
+    def _select_backend(self) -> BackendSelection:
+        """Choose a backend from everything this machine can actually execute."""
+        record = self.accelerator_environment.environment
+        providers = list(self.serving_providers)
+        if record is not None:
+            # The prepared environment vouches for the one accelerator it was
+            # probed for, not for every provider its runtime happens to ship.
+            # Widening any further would offer a backend on the strength of a
+            # record that never exercised it -- and would let selection land on
+            # an accelerator whose device and driver this record cannot describe.
+            prepared = backend_for(record.accelerator)
+            if prepared is not None and prepared.provider in record.providers:
+                providers.append(prepared.provider)
+        selection = select_backend(
+            self.settings.embedding_accelerator, available_providers=providers
+        )
+        if record is not None and selection.uses_accelerator:
+            selection = selection.described_as(apply_environment(selection.descriptor, record))
+        rejection = self.accelerator_environment.reason
+        if rejection is not None and not selection.uses_accelerator:
+            # A record that was found and refused explains the CPU outcome far
+            # better than "no accelerator is prepared" does.
+            selection = selection.diagnosed(rejection)
+        return selection
+
+    def _runs_externally(self, descriptor: BackendDescriptor) -> bool:
+        """Whether a worker for *descriptor* needs the prepared environment.
+
+        A provider this interpreter already exposes needs no second environment
+        -- an explicitly requested Core ML on macOS runs in the serving
+        environment's own runtime. Anything offered only by the prepared
+        accelerator environment runs in that environment's interpreter.
+        """
+        record = self.accelerator_environment.environment
+        return record is not None and descriptor.provider not in self.serving_providers
+
+    def _accelerator_launcher(self, descriptor: BackendDescriptor) -> WorkerLauncher:
+        """Return where a worker for *descriptor* has to be started."""
+        record = self.accelerator_environment.environment
+        if record is None or not self._runs_externally(descriptor):
+            return default_launcher()
+        return ExternalInterpreterLauncher(
+            record.interpreter,
+            environment_name=f"{record.accelerator.value} environment",
+        )
 
     @property
     def effective_backend_selection(self) -> BackendSelection:
@@ -230,17 +284,22 @@ class Application:
         descriptor = self.backend_selection.descriptor
         accelerator_config = worker_config(descriptor.providers, descriptor.accelerator.value)
         cpu_config = worker_config(CPU_BACKEND.providers, CPU_BACKEND.accelerator.value)
+        accelerator_launcher = self._accelerator_launcher(descriptor)
 
-        def session(config: WorkerConfig) -> EmbeddingWorkerSession:
-            return EmbeddingWorkerSession(config, configured_ceiling_bytes=ceiling_bytes)
+        def session(config: WorkerConfig, launcher: WorkerLauncher) -> EmbeddingWorkerSession:
+            return EmbeddingWorkerSession(
+                config, configured_ceiling_bytes=ceiling_bytes, launcher=launcher
+            )
 
         def new_passage_session() -> PassageBackendSession:
             return PassageBackendSession(
                 # Read per run, not captured: a fallback recorded by an earlier
                 # run keeps this one from paying for the same dead backend.
                 self.effective_backend_selection,
-                accelerator_factory=lambda: session(accelerator_config),
-                cpu_factory=lambda: session(cpu_config),
+                accelerator_factory=lambda: session(accelerator_config, accelerator_launcher),
+                # The fallback never depends on a prepared environment: it is
+                # what a failed accelerator falls back *to*.
+                cpu_factory=lambda: session(cpu_config, default_launcher()),
                 strict=strict,
                 probe_cache=self.probe_cache,
                 probe_key=probe_key,
@@ -265,6 +324,8 @@ class Application:
         else:
             key = self._probe_key or self._build_probe_key(self.embedder)
             probe_state = self.probe_cache.state(key)
+        record = self.accelerator_environment.environment
+        external = selection.uses_accelerator and self._runs_externally(descriptor)
         return ModelStatus(
             embedding_model=self.embedder.model_id,
             dimension=self.embedder.dimension,
@@ -276,6 +337,11 @@ class Application:
             stability=descriptor.stability.value,
             precision=descriptor.precision.value,
             runtime_version=descriptor.runtime_version,
+            driver_version=descriptor.driver_version,
+            # Where passage embedding will run. None means this process's own
+            # environment, which is always the answer for CPU.
+            accelerator_environment=str(record.interpreter) if external and record else None,
+            accelerator_prepared=None if record is None else record.accelerator.value,
             batch_size=self.embedding_batch_size,
             batch_calibration=self.batch_calibration,
             probe_cache_state=probe_state,

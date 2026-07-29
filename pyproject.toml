@@ -10,7 +10,6 @@ license = "MIT"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "fastembed>=0.7,<1",
     "filelock>=3.18,<4",
     "lancedb>=0.25,<1",
     "mcp>=1.27,<2",
@@ -27,8 +26,32 @@ dependencies = [
     "tree-sitter-typescript>=0.23,<0.24",
 ]
 
+[project.optional-dependencies]
+# Exactly one runtime extra belongs in any one environment. `fastembed` and
+# `fastembed-gpu` install the same `fastembed` module over two different ONNX
+# Runtime distributions that both own the `onnxruntime` import, so an
+# environment holding both runs whichever landed last -- which is why uv is
+# told below that they conflict, and why the accelerator gets an environment of
+# its own rather than being added to the serving one.
+cpu = ["fastembed>=0.7,<1"]
+# The pinned CUDA support window for this release: ONNX Runtime 1.22-1.23,
+# which builds against CUDA 12.x and cuDNN 9. onnxruntime-gpu is named
+# explicitly rather than left to fastembed-gpu's much wider range so that the
+# combination the installer probes is the combination this release was tested
+# against. Wheels exist only for 64-bit Linux and Windows; every other platform
+# resolves the extra to nothing and stays on CPU.
+cuda = [
+    "fastembed-gpu>=0.7,<1; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "onnxruntime-gpu>=1.22,<1.24; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+]
+
 [project.scripts]
 code-indexing-mcp = "incode_mcp.cli:main"
+
+[tool.uv]
+# One lockfile, two mutually exclusive resolutions. Without this uv would try
+# to resolve both ONNX Runtime distributions into the same environment.
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }]]
 
 [dependency-groups]
 dev = [
