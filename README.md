@@ -1,8 +1,8 @@
 # Code Indexing MCP
 
 Code Indexing MCP is a local-only codebase indexer for MCP clients. It uses Tree-sitter to extract
-syntax-aware chunks, FastEmbed to create embeddings on the local machine, and LanceDB for
-persistent vector and full-text search.
+syntax-aware chunks, FastEmbed for CPU embeddings, a direct ONNX path for selected passage
+accelerators, and LanceDB for persistent vector and full-text search.
 
 It does not require a hosted database, embedding API, or network service. A private per-user
 daemon is started on demand so all connected MCP clients share one scheduler and model. The only
@@ -48,11 +48,13 @@ Run the same command later to update an existing clean checkout with a fast-forw
 refresh its environment. The installer refuses to overwrite a different repository or a checkout
 with local changes.
 
-By default it also detects whether this machine can be given a GPU accelerator for indexing, and
-prepares one when it can:
+By default it also detects whether this machine can be given an automatic GPU accelerator for
+indexing and prepares one when it can. Experimental backends must be named explicitly:
 
 ```bash
-python3 install.py --accelerator auto   # auto (default), cpu, cuda, webgpu, migraphx, coreml
+python3 install.py --accelerator auto      # CPU or a supported CUDA installation
+python3 install.py --accelerator webgpu   # experimental Metal, Vulkan, or D3D12 path
+python3 install.py --accelerator migraphx # experimental pinned AMD/ROCm path
 ```
 
 Detection that finds nothing, an environment that cannot be built, and a probe that does not pass
@@ -61,10 +63,10 @@ package is ever installed while the server is running. See
 [Embedding backends](#embedding-backends).
 
 Preparing an accelerator downloads the embedding model, because the probe that confirms it embeds
-a real passage on the device. A later run reuses an environment whose accelerator, driver, and
-Python all still match its record, so only the first install — and one that finds something moved —
-pays for the build and the probe. Reinstalling as `--accelerator cpu` removes the environment
-again.
+a real passage on the device. A later run reuses an environment whose accelerator, driver, Python,
+and runtime-lock fingerprint all still match its record, so only the first install — and one that
+finds something moved — pays for the build and the probe. Reinstalling as `--accelerator cpu`
+removes the environment again.
 
 For a noninteractive installation, pass comma-separated harness slugs or `all`:
 
@@ -94,8 +96,8 @@ uv sync --locked --extra cpu
 uv run code-indexing-mcp model pull
 ```
 
-`--extra cpu` is required: the embedding runtime is an extra rather than a plain dependency, because
-the CPU and CUDA runtimes conflict and cannot share one environment. See
+`--extra cpu` is required: the embedding runtime is an extra rather than a plain dependency,
+because the CPU, CUDA, WebGPU, and MIGraphX runtimes conflict and cannot share one environment. See
 [Embedding backends](#embedding-backends).
 
 The model preparation step is optional; the first index operation downloads the model when it
@@ -292,14 +294,29 @@ the benchmark evidence its own promotion needs.
 Promotion makes CUDA *eligible*, not present. `auto` still resolves to CPU on a machine where the
 installer never prepared it, which is every machine without a supported NVIDIA driver.
 
+The locked installation matrix is:
+
+| Backend | Installer support | Pinned runtime | Low-level route | Selection |
+| --- | --- | --- | --- | --- |
+| CPU | Python 3.12/3.13 on every supported OS | `fastembed` | CPU | automatic fallback |
+| CUDA | Linux x86-64 or Windows x86-64; NVIDIA driver 525.60+ or 527.41+ | ONNX Runtime GPU 1.22–1.23, CUDA 12, cuDNN 9 | CUDA | automatic |
+| WebGPU | macOS 14+ Apple Silicon, Linux x86-64 with glibc 2.27+, or Windows x86-64 | ONNX Runtime 1.24.4 + WebGPU plugin 0.1.0 | Metal, Vulkan, or D3D12/Vulkan | experimental, explicit only |
+| MIGraphX | Linux x86-64, Python 3.12, ROCm 7.2.1 | AMD ONNX Runtime/MIGraphX 1.23.2 | ROCm/MIGraphX | experimental, explicit only |
+| Core ML | macOS, when the serving runtime exposes it | serving CPU environment | Core ML | manual only |
+
+An unsupported explicit MIGraphX request tries the locked WebGPU path when that platform has the
+complete plugin/core wheel pair, then falls back to CPU. WebGPU and MIGraphX are not considered by
+`auto` while experimental.
+
 #### The accelerator environment
 
 `fastembed` and `fastembed-gpu` install the same module over two different ONNX Runtime
-distributions that both own the `onnxruntime` import, so they cannot share an environment. The
-serving environment is therefore pinned to the `cpu` extra — it embeds queries in-process and is
-what every accelerator falls back to — and an accelerator gets a second locked environment of its
-own under the install directory, sharing the same model cache. Both are resolved from one lockfile
-that declares the extras mutually exclusive.
+distributions that both own the `onnxruntime` import. The direct WebGPU and MIGraphX runtimes own
+that import too, so none can share an environment. The serving environment is therefore pinned to
+the `cpu` extra — it embeds queries in-process and is what every accelerator falls back to — and an
+accelerator gets a second locked environment of its own under the install directory, sharing the
+same model cache. All four runtime extras are resolved from one lockfile that declares them
+mutually exclusive.
 
 The installer prepares that environment and records it at `accelerator.json` in the runtime data
 directory. It is written only after a real inference passes in the environment it describes:
@@ -308,9 +325,11 @@ start — a missing interpreter or a server upgraded past the Python the environ
 retires it with a reason rather than being repaired, since repairing it would mean installing
 something while serving.
 
-This release pins CUDA to ONNX Runtime 1.22-1.23, which builds against CUDA 12.x and cuDNN 9, and
-requires NVIDIA driver 525.60+ on Linux or 527.41+ on Windows. Wheels are published for 64-bit
-Linux and Windows only. An unsupported combination is reported and left alone.
+CUDA continues through FastEmbed. WebGPU and MIGraphX instead use the project-owned direct ONNX
+passage model because FastEmbed cannot configure those providers. It resolves the same
+`jinaai/jina-embeddings-v2-base-code` snapshot and ONNX artifact as CPU, applies the same tokenizer
+configuration, attention-mask mean pooling, float32 normalization, and 768-vector shape, and
+reports the providers the session actually resolved.
 
 A passage worker for an accelerator runs from that environment's own interpreter, dialling back to
 the serving process over an authenticated local socket. `multiprocessing` cannot cross that
@@ -381,6 +400,12 @@ $ code-indexing-mcp model status
 `accelerator_environment` names the interpreter passage embedding will run in when that is not
 this process's own, and `accelerator_prepared` names what the installer prepared, whether or not
 selection chose it.
+
+If installation reports a fallback, rerun the explicit installer command to see the build/probe
+reason, then use `code-indexing-mcp model status` to distinguish the requested backend, prepared
+environment, resolved provider, probe state, and fallback reason. Native provider failures never
+trigger a package install or driver change in the server; the installer removes a failed
+environment before CPU is reported.
 
 `IndexReport` carries `embedding_backend`, `embedding_fallback_reason`, and `fallback_count`, so a
 run that started on an accelerator and finished on CPU says so rather than merely being slow.
@@ -500,6 +525,20 @@ To exercise the real model integration, provide a persistent cache directory and
 ```bash
 INCODE_MODEL_TEST_CACHE=/path/to/cache uv run pytest -m model
 ```
+
+Dedicated WebGPU/MIGraphX runners can exercise the correctness and ≥1,000-chunk performance gates
+against an installer-created accelerator record:
+
+```bash
+INCODE_MODEL_TEST_CACHE=/path/to/cache \
+INCODE_ACCEL_ENV=/path/to/accelerator.json \
+INCODE_TEST_ACCELERATOR=webgpu \
+  uv run pytest -m accelerator
+```
+
+The gate requires row cosine similarity of at least 0.999, search top-k overlap of at least 99%,
+and an end-to-end forced-index speedup of at least 1.25× before an experimental backend can be
+considered for automatic promotion.
 
 The project intentionally excludes filesystem watching, HTTP transports, dependency/call graphs,
 cross-reference resolution, and custom embedding profiles.

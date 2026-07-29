@@ -2,16 +2,17 @@
 
 ## Scope
 
-Phase 4 makes the existing `webgpu` and `migraphx` backend descriptors executable without
+This Phase 4 direct-ONNX slice makes the existing `webgpu` and `migraphx` backend descriptors executable without
 putting a conflicting ONNX Runtime distribution in the serving environment. It preserves the
 Phase 2/3 architecture: query embeddings stay on CPU in the MCP process, passage embeddings run
 in a disposable worker from a locked accelerator environment, and any failure either degrades to
 CPU or raises the existing strict backend error.
 
-This phase does not promote WebGPU or MIGraphX to automatic selection. Both remain experimental
+This slice does not promote WebGPU or MIGraphX to automatic selection. Both remain experimental
 until their correctness and performance gates pass on dedicated hardware. Core ML remains
-manual-only, and MLX is not added because the plan makes it contingent on a failed Apple Silicon
-WebGPU promotion gate.
+manual-only. The conditional MLX implementation is explicitly outside this slice: these acceptance
+gates decide whether that follow-up is required, and the long-term Phase 4 cannot be marked fully
+complete until the contingency is either implemented or superseded by passing WebGPU evidence.
 
 ## Chosen approach
 
