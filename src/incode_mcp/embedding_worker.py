@@ -408,9 +408,17 @@ class EmbeddingWorkerSession:
         self._start()
         assert self._connection is not None
         assert self._process is not None
-        self._connection.send((command, payload))
+        try:
+            self._connection.send((command, payload))
+        except (EOFError, OSError) as exc:
+            raise self._channel_failed() from exc
         consecutive_over = 0
-        while not self._connection.poll(0.1):
+        while True:
+            try:
+                if self._connection.poll(0.1):
+                    break
+            except (EOFError, OSError) as exc:
+                raise self._channel_failed() from exc
             if not self._process.is_alive():
                 self.close()
                 self.termination_reason = "worker_exited"
@@ -445,23 +453,33 @@ class EmbeddingWorkerSession:
         try:
             status, payload = self._connection.recv()
         except (EOFError, OSError) as exc:
-            # A worker that closes cleanly ends the channel with ``EOFError``,
-            # but one that dies mid-request drops its end of a socket-backed
-            # connection instead, which surfaces as ``ConnectionResetError``.
-            # Both mean the same thing to a caller -- there is no result coming
-            # -- so both leave as this session's own failure rather than as a
-            # raw socket error from inside the indexing pipeline.
-            self.close()
-            self.termination_reason = "channel_closed"
-            raise IncodeError(
-                ErrorCode.EMBEDDING_WORKER_FAILED,
-                "Embedding worker closed its result channel",
-            ) from exc
+            raise self._channel_failed() from exc
         if status == "error":
             self.close()
             self.termination_reason = "worker_error"
             raise IncodeError(ErrorCode.EMBEDDING_WORKER_FAILED, str(payload))
         return status, payload
+
+    def _channel_failed(self) -> IncodeError:
+        """Report a broken command channel as this session's own failure.
+
+        A worker that stops cleanly closes the channel, which reads as
+        ``EOFError``. One that dies mid-request breaks it instead, and how that
+        breakage surfaces depends on the platform and on which operation first
+        touched the dead end: a spawned worker's pipe raises ``BrokenPipeError``
+        from the wait, an external worker's socket raises
+        ``ConnectionResetError`` from the read, and the send can raise either.
+        Every one of them says the same thing -- no result is coming -- so none
+        of them may reach a caller as a raw channel error. Callers degrade to
+        CPU on EMBEDDING_WORKER_FAILED and can do nothing with an OSError
+        escaping from inside the indexing pipeline.
+        """
+        self.close()
+        self.termination_reason = "channel_closed"
+        return IncodeError(
+            ErrorCode.EMBEDDING_WORKER_FAILED,
+            "Embedding worker closed its result channel",
+        )
 
     def close(self) -> None:
         process = self._process
