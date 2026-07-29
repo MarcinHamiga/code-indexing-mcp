@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from multiprocessing.connection import Connection
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -21,6 +22,7 @@ from incode_mcp.embedding_worker import (
     EmbeddingWorkerSession,
     WorkerConfig,
     WorkerTarget,
+    _load_model,
     effective_memory_ceiling,
     indexing_memory_bytes,
 )
@@ -492,6 +494,57 @@ def test_the_default_worker_config_requests_no_providers() -> None:
 
     assert config.is_cpu is True
     assert config.providers == ()
+
+
+@pytest.mark.parametrize("accelerator", ["webgpu", "migraphx"])
+def test_direct_accelerators_do_not_load_fastembed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    accelerator: str,
+) -> None:
+    from incode_mcp import direct_onnx, embedding_worker
+
+    direct_model = object()
+    direct_options: list[dict[str, object]] = []
+
+    def direct(**options: object) -> object:
+        direct_options.append(options)
+        return direct_model
+
+    monkeypatch.setattr(direct_onnx, "DirectOnnxEmbedding", direct)
+    monkeypatch.setattr(
+        embedding_worker,
+        "TextEmbedding",
+        lambda **options: pytest.fail(f"FastEmbed was loaded with {options}"),
+        raising=False,
+    )
+    config = WorkerConfig(
+        cache_directory=str(tmp_path),
+        offline=True,
+        threads=2,
+        enable_cpu_mem_arena=False,
+        dimension=768,
+        providers=(
+            "WebGpuExecutionProvider"
+            if accelerator == "webgpu"
+            else "MIGraphXExecutionProvider",
+            "CPUExecutionProvider",
+        ),
+        accelerator=accelerator,
+    )
+
+    assert _load_model(config) is direct_model
+    assert direct_options == [
+        {
+            "cache_directory": tmp_path,
+            "offline": True,
+            "threads": 2,
+            "enable_cpu_mem_arena": False,
+            "providers": config.providers,
+            "model_id": config.model_id,
+            "accelerator": accelerator,
+        }
+    ]
 
 
 def test_telemetry_names_the_backend_the_worker_ran_on() -> None:

@@ -12,6 +12,7 @@ import pytest
 from incode_mcp.direct_onnx import (
     DEFAULT_MODEL_ARTIFACT,
     DirectOnnxEmbedding,
+    create_webgpu_session,
     load_tokenizer,
     mean_pool_and_normalize,
     resolve_model_snapshot,
@@ -250,3 +251,78 @@ def test_direct_model_builds_exact_onnx_inputs_and_reports_resolved_providers(
         "MIGraphXExecutionProvider",
         "CPUExecutionProvider",
     )
+
+
+def test_webgpu_session_registers_the_plugin_and_attaches_its_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[str, object]] = []
+    webgpu_device = SimpleNamespace(ep_name="WebGpuExecutionProvider")
+    cpu_device = SimpleNamespace(ep_name="CPUExecutionProvider")
+    session = _Session()
+
+    class SessionOptions:
+        graph_optimization_level: object | None = None
+        enable_cpu_mem_arena = True
+        intra_op_num_threads = 0
+        inter_op_num_threads = 0
+
+        def add_provider_for_devices(
+            self, devices: list[object], options: dict[str, str]
+        ) -> None:
+            events.append(("devices", (devices, options)))
+
+    fake_ort = SimpleNamespace(
+        GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_ALL="all"),
+        SessionOptions=SessionOptions,
+        register_execution_provider_library=lambda name, path: events.append(
+            ("register", (name, path))
+        ),
+        get_ep_devices=lambda: [cpu_device, webgpu_device],
+        InferenceSession=lambda path, *, sess_options: (
+            events.append(("session", (path, sess_options))) or session
+        ),
+    )
+    fake_plugin = SimpleNamespace(
+        get_library_path=lambda: "/runtime/webgpu.dylib",
+        get_ep_name=lambda: "WebGpuExecutionProvider",
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+    monkeypatch.setitem(sys.modules, "onnxruntime_ep_webgpu", fake_plugin)
+
+    resolved_session, provider = create_webgpu_session(
+        tmp_path / "model.onnx",
+        threads=2,
+        enable_cpu_mem_arena=False,
+    )
+
+    assert resolved_session is session
+    assert provider == "WebGpuExecutionProvider"
+    assert events[0] == (
+        "register",
+        ("incode_webgpu_ep", "/runtime/webgpu.dylib"),
+    )
+    assert events[1] == ("devices", ([webgpu_device], {}))
+    assert events[2][0] == "session"
+
+
+def test_webgpu_session_refuses_a_registered_plugin_with_no_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_ort = SimpleNamespace(
+        register_execution_provider_library=lambda name, path: None,
+        get_ep_devices=lambda: [SimpleNamespace(ep_name="CPUExecutionProvider")],
+    )
+    fake_plugin = SimpleNamespace(
+        get_library_path=lambda: "/runtime/webgpu.dylib",
+        get_ep_name=lambda: "WebGpuExecutionProvider",
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+    monkeypatch.setitem(sys.modules, "onnxruntime_ep_webgpu", fake_plugin)
+
+    with pytest.raises(RuntimeError, match="no WebGPU device"):
+        create_webgpu_session(
+            tmp_path / "model.onnx",
+            threads=2,
+            enable_cpu_mem_arena=False,
+        )

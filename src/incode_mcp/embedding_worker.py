@@ -14,7 +14,6 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 import psutil
-from fastembed import TextEmbedding
 
 from .backends import CPU_PROVIDER, Accelerator
 from .embedding import (
@@ -123,7 +122,7 @@ def indexing_memory_bytes(
     return worker_bytes + max(0, parent_bytes - parent_baseline_bytes)
 
 
-def _load_model(config: WorkerConfig) -> TextEmbedding:
+def _load_model(config: WorkerConfig) -> Any:
     """Load the model for *config*, requesting its providers when non-default.
 
     The CPU path deliberately passes no ``providers`` argument at all. Naming
@@ -132,6 +131,23 @@ def _load_model(config: WorkerConfig) -> TextEmbedding:
     is left exactly as it was.
     """
     Path(config.cache_directory).mkdir(parents=True, exist_ok=True)
+    if config.accelerator in {
+        Accelerator.WEBGPU.value,
+        Accelerator.MIGRAPHX.value,
+    }:
+        from .direct_onnx import DirectOnnxEmbedding
+
+        return DirectOnnxEmbedding(
+            cache_directory=Path(config.cache_directory),
+            offline=config.offline,
+            threads=config.threads,
+            enable_cpu_mem_arena=config.enable_cpu_mem_arena,
+            providers=config.providers,
+            model_id=config.model_id,
+            accelerator=config.accelerator,
+        )
+    from fastembed import TextEmbedding
+
     options: dict[str, Any] = {
         "model_name": config.model_id,
         "cache_dir": config.cache_directory,
@@ -415,11 +431,10 @@ class EmbeddingWorkerSession:
         consecutive_over = 0
         while True:
             try:
-                if self._connection.poll(0.1):
-                    break
+                reply_ready = self._connection.poll(0.1)
             except (EOFError, OSError) as exc:
                 raise self._channel_failed() from exc
-            if not self._process.is_alive():
+            if not reply_ready and not self._process.is_alive():
                 self.close()
                 self.termination_reason = "worker_exited"
                 raise IncodeError(
@@ -450,6 +465,8 @@ class EmbeddingWorkerSession:
                     peak_memory_bytes=self.peak_combined_rss,
                     parent_baseline_bytes=self._parent_baseline_bytes,
                 )
+            if reply_ready:
+                break
         try:
             status, payload = self._connection.recv()
         except (EOFError, OSError) as exc:

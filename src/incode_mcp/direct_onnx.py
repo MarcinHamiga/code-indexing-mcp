@@ -163,6 +163,36 @@ def create_session(
     )
 
 
+def create_webgpu_session(
+    model_path: Path,
+    *,
+    threads: int | None,
+    enable_cpu_mem_arena: bool,
+) -> tuple[_Session, str]:
+    """Register the native WebGPU plugin and attach its discovered device."""
+
+    import onnxruntime as ort
+    import onnxruntime_ep_webgpu as webgpu_ep  # type: ignore[import-not-found]
+
+    provider = str(webgpu_ep.get_ep_name())
+    ort.register_execution_provider_library(
+        "incode_webgpu_ep", webgpu_ep.get_library_path()
+    )
+    devices = [device for device in ort.get_ep_devices() if str(device.ep_name) == provider]
+    if not devices:
+        raise RuntimeError("The WebGPU plugin registered but exposed no WebGPU device")
+
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.enable_cpu_mem_arena = enable_cpu_mem_arena
+    if threads is not None:
+        options.intra_op_num_threads = threads
+        options.inter_op_num_threads = threads
+    options.add_provider_for_devices(devices, {})
+    session = ort.InferenceSession(str(model_path), sess_options=options)
+    return cast(_Session, session), provider
+
+
 class DirectOnnxEmbedding:
     """The index-compatible Jina passage model executed directly by ONNX Runtime."""
 
@@ -175,6 +205,7 @@ class DirectOnnxEmbedding:
         enable_cpu_mem_arena: bool,
         providers: tuple[str, ...],
         model_id: str = DEFAULT_MODEL,
+        accelerator: str = "",
     ) -> None:
         model_directory = resolve_model_snapshot(
             cache_directory, model_id=model_id, offline=offline
@@ -183,13 +214,30 @@ class DirectOnnxEmbedding:
         if not model_path.is_file():
             raise ValueError(f"The model snapshot has no ONNX artifact at {model_path}")
         self.tokenizer = load_tokenizer(model_directory)
-        self.model = create_session(
-            model_path,
-            providers=providers,
-            threads=threads,
-            enable_cpu_mem_arena=enable_cpu_mem_arena,
+        plugin_provider: str | None = None
+        if accelerator == "webgpu":
+            self.model, plugin_provider = create_webgpu_session(
+                model_path,
+                threads=threads,
+                enable_cpu_mem_arena=enable_cpu_mem_arena,
+            )
+            if providers and plugin_provider != providers[0]:
+                raise RuntimeError(
+                    f"The WebGPU plugin registered {plugin_provider}, expected {providers[0]}"
+                )
+        else:
+            self.model = create_session(
+                model_path,
+                providers=providers,
+                threads=threads,
+                enable_cpu_mem_arena=enable_cpu_mem_arena,
+            )
+        reported = tuple(str(name) for name in self.model.get_providers())
+        self.resolved_providers = tuple(
+            dict.fromkeys(
+                (plugin_provider, *reported) if plugin_provider is not None else reported
+            )
         )
-        self.resolved_providers = tuple(str(name) for name in self.model.get_providers())
 
     def passage_embed(self, documents: str | Iterable[str]) -> Iterable[FloatArray]:
         texts = [documents] if isinstance(documents, str) else list(documents)
