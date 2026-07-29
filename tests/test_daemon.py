@@ -104,6 +104,40 @@ def test_broker_restarts_daemon_after_idle_exit(
     assert daemon.daemon_status(paths)["running"] is False
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        EOFError("Local daemon connection closed"),
+        ConnectionResetError(104, "Connection reset by peer"),
+        ConnectionRefusedError(111, "Connection refused"),
+        FileNotFoundError(2, "No such file or directory"),
+        IncodeError(ErrorCode.PROTOCOL_ERROR, "Local daemon frame exceeds the maximum size"),
+    ],
+)
+def test_daemon_status_answers_the_question_however_the_ping_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    """Asking whether the daemon is up has no failure answer, only False.
+
+    The interesting case is EOFError, which is what a daemon shutting down
+    between the send and the reply produces and which is not an OSError -- the
+    test above polls this in a loop precisely while a daemon is going down, so a
+    gap here surfaces as an unrelated-looking flake rather than as itself.
+    """
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+
+    class _PingFails:
+        def __init__(self, _paths: RuntimePaths, **_kwargs: object) -> None:
+            pass
+
+        def _ping_once(self) -> dict[str, object]:
+            raise failure
+
+    monkeypatch.setattr(daemon, "BrokerApplication", _PingFails)
+
+    assert daemon.daemon_status(paths) == {"running": False}
+
+
 @requires_local_sockets
 def test_daemon_does_not_idle_exit_while_request_is_active(tmp_path: Path) -> None:
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")

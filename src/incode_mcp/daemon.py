@@ -500,7 +500,12 @@ class BrokerApplication:
 def daemon_status(paths: RuntimePaths) -> dict[str, Any]:
     try:
         return {"running": True, **BrokerApplication(paths)._ping_once()}
-    except (OSError, IncodeError):
+    except (EOFError, OSError, IncodeError):
+        # EOFError is what a daemon shutting down mid-ping looks like: the
+        # connect and the send both succeed, and the socket closes before the
+        # reply arrives. It is not an OSError, so it used to escape a question
+        # that has no failure answer -- every caller here is only asking whether
+        # the daemon is up, and one that closed the connection is not.
         return {"running": False}
 
 

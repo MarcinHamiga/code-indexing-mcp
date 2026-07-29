@@ -1258,6 +1258,35 @@ def test_an_unchanged_machine_reuses_its_environment_instead_of_rebuilding_it(
     assert record.read_text(encoding="utf-8") == before
 
 
+def test_an_unremovable_accelerator_environment_stops_the_build_not_the_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A locked .venv-accel degrades to CPU rather than taking the installer down.
+
+    Windows locks directories that antivirus or a live process still holds, and
+    the caller degrades on InstallerError alone -- a raw OSError here would
+    abort an installation that had every reason to finish on CPU.
+    """
+    installer = load_installer()
+    stale = tmp_path / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY
+    stale.mkdir(parents=True)
+
+    def locked(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(13, "The process cannot access the file")
+
+    monkeypatch.setattr(installer.shutil, "rmtree", locked)
+
+    with pytest.raises(installer.InstallerError) as caught:
+        installer.sync_accelerator_environment(
+            tmp_path, "cuda", python_version="3.12", uv_executable="uv"
+        )
+
+    # Rebuilding over the leftovers is what the removal exists to prevent, so a
+    # failed removal must not be swallowed into a build that then proceeds.
+    assert "Could not remove the existing accelerator environment" in str(caught.value)
+    assert stale.is_dir()
+
+
 @pytest.mark.parametrize(
     ("driver", "python_version"),
     [("560.35.03", "3.12"), ("550.54.14", "3.13")],

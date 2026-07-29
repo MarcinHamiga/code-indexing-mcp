@@ -946,7 +946,18 @@ def sync_accelerator_environment(
     uv = _uv_executable(uv_executable)
     directory = install_directory / ACCELERATOR_ENVIRONMENT_DIRECTORY
     if directory.exists():
-        shutil.rmtree(directory)
+        try:
+            shutil.rmtree(directory)
+        except OSError as exc:
+            # Not ignore_errors: building over a half-removed environment is the
+            # ONNX Runtime collision this function exists to prevent, so the
+            # removal has to succeed or the build has to stop. Stopping is said
+            # in the installer's own vocabulary, though -- the caller degrades to
+            # CPU on an InstallerError, and a raw OSError from a file the machine
+            # merely had locked would take the whole installation down instead.
+            raise InstallerError(
+                f"Could not remove the existing accelerator environment at {directory}: {exc}"
+            ) from exc
     _run_command(
         [
             uv,
