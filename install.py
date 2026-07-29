@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -802,6 +803,9 @@ class AcceleratorPlan(NamedTuple):
     # finding no GPU is just what the machine is, and Core ML needs nothing
     # prepared at all.
     honored: bool = True
+    # Hash of the lockfile and selected extra. A record without this exact
+    # fingerprint describes an older resolved runtime and must be rebuilt.
+    lock_fingerprint: str = ""
 
     @property
     def prepares_environment(self) -> bool:
@@ -1034,6 +1038,29 @@ def interpreter_version(python: Path) -> str:
     return result.stdout.strip()
 
 
+def accelerator_lock_fingerprint(install_directory: Path, accelerator: str) -> str:
+    """Hash the selected extra and the lockfile that resolved its environment."""
+
+    lockfile = install_directory / "uv.lock"
+    if not lockfile.is_file():
+        # Unit tests and direct module use can point at a synthetic checkout;
+        # the installer itself always prefers the cloned checkout's lock.
+        adjacent = Path(__file__).resolve().with_name("uv.lock")
+        if adjacent.is_file():
+            lockfile = adjacent
+    try:
+        locked = lockfile.read_bytes()
+    except OSError as exc:
+        raise InstallerError(
+            f"The accelerator lockfile cannot be read at {lockfile}: {exc}"
+        ) from exc
+    digest = hashlib.sha256()
+    digest.update(accelerator.encode())
+    digest.update(b"\0")
+    digest.update(locked)
+    return digest.hexdigest()
+
+
 def runtime_record_path(python: Path) -> Path:
     """Ask the installed package where the server reads its accelerator record.
 
@@ -1165,6 +1192,7 @@ def write_accelerator_record(path: Path, plan: AcceleratorPlan, probe: Mapping[s
         "interpreter": str(probe["interpreter"]),
         "providers": list(probe["providers"]),
         "runtime_version": str(probe.get("runtime_version", "")),
+        "lock_fingerprint": plan.lock_fingerprint,
         "driver_version": plan.driver_version,
         "device": str(probe.get("device", "")),
         "python_version": str(probe.get("python_version", "")),
@@ -1210,6 +1238,7 @@ def reusable_accelerator_environment(
     matches = (
         record.get("schema_version") == ACCELERATOR_RECORD_SCHEMA_VERSION
         and record.get("accelerator") == plan.accelerator
+        and str(record.get("lock_fingerprint", "")) == plan.lock_fingerprint
         and str(record.get("driver_version", "")) == plan.driver_version
         and str(record.get("python_version", "")) == python_version
         and interpreter.is_file()
@@ -1237,15 +1266,33 @@ def configure_accelerator(
     probe costs speed, and refusing to install over it would cost the server.
     """
 
-    plan = plan_accelerator(
-        requested,
-        platform_name=platform_name,
-        machine=machine,
-        nvidia_report=nvidia_report,
-        rocm_report=rocm_report,
-        python_version=python_version,
-        platform_version=platform_version,
-    )
+    serving_python = environment_python(install_directory / ".venv", platform_name=platform_name)
+    detected_python_version: str | None = None
+    planning_python_version = python_version
+    planning_error: InstallerError | None = None
+    if requested.strip().lower() == "migraphx" and planning_python_version is None:
+        try:
+            detected_python_version = interpreter_version(serving_python)
+            planning_python_version = detected_python_version
+        except InstallerError as exc:
+            planning_error = exc
+    if planning_error is None:
+        plan = plan_accelerator(
+            requested,
+            platform_name=platform_name,
+            machine=machine,
+            nvidia_report=nvidia_report,
+            rocm_report=rocm_report,
+            python_version=planning_python_version,
+            platform_version=platform_version,
+        )
+    else:
+        plan = AcceleratorPlan(
+            "cpu",
+            f"MIGraphX was requested but the serving Python version could not be resolved: "
+            f"{planning_error}",
+            honored=False,
+        )
     try:
         record = accelerator_record_path(install_directory, platform_name=platform_name)
     except InstallerError as exc:
@@ -1266,9 +1313,14 @@ def configure_accelerator(
         shutil.rmtree(install_directory / ACCELERATOR_ENVIRONMENT_DIRECTORY, ignore_errors=True)
         return plan
 
-    serving_python = environment_python(install_directory / ".venv", platform_name=platform_name)
     try:
-        serving_python_version = interpreter_version(serving_python)
+        serving_python_version = detected_python_version or interpreter_version(serving_python)
+        plan = plan._replace(
+            lock_fingerprint=accelerator_lock_fingerprint(
+                install_directory,
+                ACCELERATOR_EXTRAS[plan.accelerator],
+            )
+        )
         reused = reusable_accelerator_environment(
             record,
             plan,

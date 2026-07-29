@@ -75,9 +75,7 @@ def probe(
         # the next one, so a session that quietly became a CPU session must not
         # be recorded as a working accelerator.
         actual = ", ".join(resolved) if resolved else "an unknown provider"
-        raise RuntimeError(
-            f"{descriptor.provider} was requested but the session runs on {actual}"
-        )
+        raise RuntimeError(f"{descriptor.provider} was requested but the session runs on {actual}")
     providers = tuple(dict.fromkeys((*providers, *resolved)))
     vectors = [
         np.asarray(vector, dtype="<f4").tobytes()

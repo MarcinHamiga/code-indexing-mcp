@@ -525,9 +525,7 @@ def test_direct_accelerators_do_not_load_fastembed(
         enable_cpu_mem_arena=False,
         dimension=768,
         providers=(
-            "WebGpuExecutionProvider"
-            if accelerator == "webgpu"
-            else "MIGraphXExecutionProvider",
+            "WebGpuExecutionProvider" if accelerator == "webgpu" else "MIGraphXExecutionProvider",
             "CPUExecutionProvider",
         ),
         accelerator=accelerator,

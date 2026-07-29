@@ -267,9 +267,7 @@ def test_webgpu_session_registers_the_plugin_and_attaches_its_device(
         intra_op_num_threads = 0
         inter_op_num_threads = 0
 
-        def add_provider_for_devices(
-            self, devices: list[object], options: dict[str, str]
-        ) -> None:
+        def add_provider_for_devices(self, devices: list[object], options: dict[str, str]) -> None:
             events.append(("devices", (devices, options)))
 
     fake_ort = SimpleNamespace(
@@ -326,3 +324,36 @@ def test_webgpu_session_refuses_a_registered_plugin_with_no_device(
             threads=2,
             enable_cpu_mem_arena=False,
         )
+
+
+def test_webgpu_model_reports_only_providers_the_session_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_directory = tmp_path / "snapshot"
+    (model_directory / "onnx").mkdir(parents=True)
+    (model_directory / DEFAULT_MODEL_ARTIFACT).write_bytes(b"onnx")
+    session = _Session()
+    monkeypatch.setattr(session, "get_providers", lambda: ["CPUExecutionProvider"])
+    monkeypatch.setattr(
+        "incode_mcp.direct_onnx.resolve_model_snapshot",
+        lambda *args, **kwargs: model_directory,
+    )
+    monkeypatch.setattr(
+        "incode_mcp.direct_onnx.load_tokenizer",
+        lambda path: _Tokenizer(),
+    )
+    monkeypatch.setattr(
+        "incode_mcp.direct_onnx.create_webgpu_session",
+        lambda *args, **kwargs: (session, "WebGpuExecutionProvider"),
+    )
+
+    model = DirectOnnxEmbedding(
+        cache_directory=tmp_path / "models",
+        offline=True,
+        threads=1,
+        enable_cpu_mem_arena=False,
+        providers=("WebGpuExecutionProvider", "CPUExecutionProvider"),
+        accelerator="webgpu",
+    )
+
+    assert model.resolved_providers == ("CPUExecutionProvider",)

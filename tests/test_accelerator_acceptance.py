@@ -127,12 +127,17 @@ def test_accelerator_forced_index_is_faster_on_at_least_one_thousand_chunks(
         broker_mode="off",
     )
     cpu = Application(
-        RuntimePaths(data=tmp_path / "cpu-data", cache=cache.parent),
+        RuntimePaths(data=tmp_path / "cpu-data", cache=tmp_path / "cpu-cache"),
+        embedder=FastEmbedder(cache, offline=True, threads=base.embedding_threads),
         cwd=cpu_root,
         settings=replace(base, embedding_accelerator=Accelerator.CPU),
     )
     accelerated = Application(
-        RuntimePaths(data=tmp_path / "accelerator-data", cache=cache.parent),
+        RuntimePaths(
+            data=tmp_path / "accelerator-data",
+            cache=tmp_path / "accelerator-cache",
+        ),
+        embedder=FastEmbedder(cache, offline=True, threads=base.embedding_threads),
         cwd=accelerator_root,
         settings=replace(base, embedding_accelerator=accelerator),
     )

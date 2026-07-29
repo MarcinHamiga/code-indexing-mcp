@@ -175,9 +175,7 @@ def create_webgpu_session(
     import onnxruntime_ep_webgpu as webgpu_ep  # type: ignore[import-not-found]
 
     provider = str(webgpu_ep.get_ep_name())
-    ort.register_execution_provider_library(
-        "incode_webgpu_ep", webgpu_ep.get_library_path()
-    )
+    ort.register_execution_provider_library("incode_webgpu_ep", webgpu_ep.get_library_path())
     devices = [device for device in ort.get_ep_devices() if str(device.ep_name) == provider]
     if not devices:
         raise RuntimeError("The WebGPU plugin registered but exposed no WebGPU device")
@@ -232,11 +230,12 @@ class DirectOnnxEmbedding:
                 threads=threads,
                 enable_cpu_mem_arena=enable_cpu_mem_arena,
             )
-        reported = tuple(str(name) for name in self.model.get_providers())
+        # Plugin registration and device discovery only prove that a provider
+        # was available to request. The created session is authoritative: ONNX
+        # Runtime may still omit a provider it could not initialize, and the
+        # caller must see that omission so it can reject a silent CPU fallback.
         self.resolved_providers = tuple(
-            dict.fromkeys(
-                (plugin_provider, *reported) if plugin_provider is not None else reported
-            )
+            dict.fromkeys(str(name) for name in self.model.get_providers())
         )
 
     def passage_embed(self, documents: str | Iterable[str]) -> Iterable[FloatArray]:

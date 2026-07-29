@@ -1176,6 +1176,7 @@ def test_a_prepared_accelerator_is_recorded_only_after_its_probe_passes(
     assert written["accelerator"] == "cuda"
     assert written["driver_version"] == "550.54.14"
     assert written["providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    assert written["lock_fingerprint"]
 
 
 @pytest.mark.parametrize(
@@ -1355,6 +1356,8 @@ def _prepared_checkout(
     module every call: patching one instance leaves every other one untouched.
     """
     checkout = tmp_path / "checkout"
+    (checkout / "uv.lock").parent.mkdir(parents=True)
+    (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     accelerator_env = checkout / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY
     accelerator_env.mkdir(parents=True)
     interpreter = accelerator_env / "python"
@@ -1362,7 +1365,12 @@ def _prepared_checkout(
     record = tmp_path / "data" / "accelerator.json"
     installer.write_accelerator_record(
         record,
-        installer.AcceleratorPlan("cuda", "detected", driver_version="550.54.14"),
+        installer.AcceleratorPlan(
+            "cuda",
+            "detected",
+            driver_version="550.54.14",
+            lock_fingerprint=installer.accelerator_lock_fingerprint(checkout, "cuda"),
+        ),
         {
             "interpreter": str(interpreter),
             "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
@@ -1472,6 +1480,72 @@ def test_a_driver_or_python_that_moved_forces_the_rebuild(
 
     assert plan.accelerator == "cuda"
     assert rebuilt == ["sync"]
+
+
+def test_a_changed_lockfile_forces_the_accelerator_environment_to_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    checkout, _, _ = _prepared_checkout(installer, tmp_path, monkeypatch)
+    (checkout / "uv.lock").write_text("version = 2\n", encoding="utf-8")
+    rebuilt: list[str] = []
+
+    def fake_sync(*_args: object, **_kwargs: object) -> Path:
+        rebuilt.append("sync")
+        return checkout / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY / "python"
+
+    monkeypatch.setattr(installer, "sync_accelerator_environment", fake_sync)
+    monkeypatch.setattr(
+        installer,
+        "probe_accelerator",
+        lambda python, accelerator, *, offline=False: {
+            "ok": True,
+            "interpreter": str(python),
+            "providers": ["CUDAExecutionProvider"],
+            "runtime_version": "1.23.2",
+            "python_version": "3.12",
+        },
+    )
+
+    plan = installer.configure_accelerator(
+        checkout,
+        "cuda",
+        nvidia_report=lambda: "550.54.14, NVIDIA A100",
+        platform_name=CUDA_PLATFORM,
+        machine=CUDA_MACHINE,
+    )
+
+    assert plan.accelerator == "cuda"
+    assert rebuilt == ["sync"]
+
+
+def test_migraphx_detection_uses_the_serving_interpreter_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    checkout = tmp_path / "checkout"
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(installer, "interpreter_version", lambda python: "3.13")
+    monkeypatch.setattr(
+        installer,
+        "accelerator_record_path",
+        lambda *args, **kwargs: tmp_path / "accelerator.json",
+    )
+
+    def capture_plan(requested: str, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return installer.AcceleratorPlan("cpu", "test plan")
+
+    monkeypatch.setattr(installer, "plan_accelerator", capture_plan)
+
+    installer.configure_accelerator(
+        checkout,
+        "migraphx",
+        platform_name="linux",
+        machine="x86_64",
+    )
+
+    assert captured["python_version"] == "3.13"
 
 
 def test_a_cpu_installation_reclaims_the_environment_it_no_longer_points_at(
