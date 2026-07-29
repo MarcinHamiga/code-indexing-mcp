@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import socket
 import sys
+import threading
+from multiprocessing.connection import Connection, answer_challenge, deliver_challenge
 from pathlib import Path
 
 import pytest
 
 from incode_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig
 from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.worker_launcher import ExternalInterpreterLauncher
+from incode_mcp.worker_launcher import ExternalInterpreterLauncher, _authenticated
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BODY = "external_worker_body:echo"
@@ -132,3 +135,66 @@ def test_a_child_that_never_connects_gives_up_at_the_timeout(tmp_path: Path) -> 
 
     assert failure.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
     assert "did not connect" in str(failure.value)
+
+
+def _peer(sock: socket.socket, authkey: bytes) -> None:
+    """Answer the handshake the way ``Client`` does, with *authkey*."""
+    connection = Connection(sock.dup().detach())
+    try:
+        answer_challenge(connection, authkey)
+        deliver_challenge(connection, authkey)
+    except BaseException:
+        pass
+    finally:
+        connection.close()
+
+
+def test_a_peer_with_the_right_key_is_accepted() -> None:
+    ours, theirs = socket.socketpair()
+    key = b"a" * 32
+    peer = threading.Thread(target=_peer, args=(theirs, key), daemon=True)
+    peer.start()
+
+    connection = _authenticated(ours, key, timeout_seconds=10.0)
+
+    assert connection is not None
+    connection.close()
+    theirs.close()
+
+
+def test_a_peer_with_the_wrong_key_is_dropped_rather_than_raised() -> None:
+    """A stranger on the channel costs one connection, not the whole launch."""
+    ours, theirs = socket.socketpair()
+    peer = threading.Thread(target=_peer, args=(theirs, b"b" * 32), daemon=True)
+    peer.start()
+
+    # multiprocessing raises AuthenticationError here, which is neither an
+    # OSError nor a ValueError; letting it escape would skip the CPU fallback.
+    assert _authenticated(ours, b"a" * 32, timeout_seconds=10.0) is None
+    theirs.close()
+
+
+def test_a_peer_that_connects_and_goes_quiet_is_dropped_at_the_timeout() -> None:
+    """Nothing may block here: the connection is read with os.read, which no
+    socket timeout reaches, so only the watchdog ends this."""
+    ours, theirs = socket.socketpair()
+
+    assert _authenticated(ours, b"a" * 32, timeout_seconds=0.5) is None
+    theirs.close()
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="needs a POSIX shell script")
+def test_a_stranger_on_the_channel_cannot_hold_the_launch_open(tmp_path: Path) -> None:
+    """The DoS shape: connect first, never authenticate, outlive the deadline."""
+    rogue = tmp_path / "rogue-python"
+    rogue.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "{FIXTURES / "rogue_peer.py"}"\n', encoding="utf-8"
+    )
+    rogue.chmod(0o755)
+    launcher = _launcher(executable=rogue, timeout_seconds=1.5)
+
+    with pytest.raises(IncodeError) as failure:
+        launcher.launch(_config(tmp_path))
+
+    assert failure.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
+    assert "failed the handshake" in str(failure.value)

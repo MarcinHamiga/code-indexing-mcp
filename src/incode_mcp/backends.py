@@ -135,6 +135,16 @@ ACCELERATOR_BACKENDS: tuple[BackendDescriptor, ...] = (
 KNOWN_BACKENDS: tuple[BackendDescriptor, ...] = (CPU_BACKEND, *ACCELERATOR_BACKENDS)
 
 
+def backend_for(
+    accelerator: Accelerator, registry: Sequence[BackendDescriptor] = KNOWN_BACKENDS
+) -> BackendDescriptor | None:
+    """Return the descriptor registered for *accelerator*, if there is one."""
+    for backend in registry:
+        if backend.accelerator is accelerator:
+            return backend
+    return None
+
+
 @dataclass(frozen=True)
 class BackendSelection:
     """The backend a run will attempt, and the diagnosis behind that choice."""

@@ -413,3 +413,29 @@ def test_a_refused_record_explains_the_cpu_outcome(tmp_path: Path) -> None:
     assert "built for Python 3.7" in (status.fallback_reason or "")
     assert status.accelerator_environment is None
     assert status.accelerator_prepared is None
+
+
+def test_a_record_offers_only_the_accelerator_it_was_probed_for(tmp_path: Path) -> None:
+    """A provider the prepared runtime happens to ship is not evidence of anything.
+
+    A CUDA environment's ONNX Runtime lists more providers than CUDA. Offering
+    all of them would select a backend no probe ever exercised there, and then
+    describe it with a record that cannot say which device or driver it ran on.
+    """
+    _prepared_cuda_environment(
+        tmp_path, providers=("CUDAExecutionProvider", "MIGraphXExecutionProvider")
+    )
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(
+        IndexSettings.from_environment({}), embedding_accelerator=Accelerator.MIGRAPHX
+    )
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+
+    assert app.backend_selection.accelerator is Accelerator.CPU
+    assert app.backend_selection.honored is False
+    assert "not among the execution providers" in (app.model_status().fallback_reason or "")
+    # The record's own accelerator is still reachable; only the rest is not.
+    assert Application(
+        paths, embedder=TinyEmbedder(), cwd=tmp_path
+    ).backend_selection.accelerator is (Accelerator.CUDA)

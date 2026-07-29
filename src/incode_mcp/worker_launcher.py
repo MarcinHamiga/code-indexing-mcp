@@ -19,6 +19,12 @@ Windows, which has no filesystem permissions to lean on. Both ends authenticate
 with the same challenge-response ``multiprocessing`` uses for its own
 connections, and the key travels on the child's stdin rather than its argv,
 where every other process on the machine could read it.
+
+Because that loopback port is reachable by every local process, the wait for the
+worker treats an unauthenticated peer as noise rather than as the answer: one
+deadline covers connecting *and* authenticating, a peer that fails either is
+dropped, and the wait resumes. Nothing a stranger does can take the slot the
+real worker needs, or hold this process open past the deadline.
 """
 
 from __future__ import annotations
@@ -32,10 +38,12 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import asdict, dataclass
+from multiprocessing import AuthenticationError
 from multiprocessing.connection import Client, Connection, answer_challenge, deliver_challenge
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -192,7 +200,6 @@ class ExternalInterpreterLauncher:
             # depends on neither it nor the directory holding its path.
             channel.close()
         try:
-            self._authenticate(connection, channel.authkey)
             connection.send(("configure", asdict(config)))
         except BaseException:
             connection.close()
@@ -234,16 +241,68 @@ class ExternalInterpreterLauncher:
             ) from exc
         return popen
 
-    def _authenticate(self, connection: Any, authkey: bytes) -> None:
-        """Prove both ends to each other, exactly as ``Listener.accept`` does."""
-        try:
-            deliver_challenge(connection, authkey)
-            answer_challenge(connection, authkey)
-        except (OSError, EOFError, ValueError) as exc:
-            raise IncodeError(
-                ErrorCode.EMBEDDING_WORKER_FAILED,
-                f"The accelerator worker failed the connection handshake: {exc}",
-            ) from exc
+
+def _authenticated(client: socket.socket, authkey: bytes, *, timeout_seconds: float) -> Any | None:
+    """Return an authenticated connection, or ``None`` when this peer is not ours.
+
+    Both ends prove themselves with the same challenge-response ``Listener``
+    uses for its own connections. Failing it is not fatal to the launch: on
+    Windows the channel is a loopback port every local process can reach, so a
+    stranger arriving first must cost this attempt one dropped connection
+    rather than the worker it was waiting for.
+
+    The exchange is bounded, because a peer that connects and then goes quiet
+    would otherwise block here forever -- the socket is handed to a ``Connection``
+    that reads it with ``os.read``, which no socket-level timeout reaches. A
+    watchdog shuts the socket down instead, which turns that blocked read into
+    an EOF this reports like any other failed handshake.
+    """
+    client.setblocking(True)
+    # The duplicate is what the connection owns and reads; *client* stays behind
+    # solely so the watchdog has a socket to shut down under it.
+    connection = Connection(client.dup().detach())
+    watchdog = threading.Timer(timeout_seconds, _shutdown, args=(client,))
+    watchdog.start()
+    try:
+        deliver_challenge(connection, authkey)
+        answer_challenge(connection, authkey)
+    except (OSError, EOFError, ValueError, AuthenticationError) as exc:
+        logger.warning("Dropping a connection that failed the worker handshake: %s", exc)
+        with suppress(OSError):
+            connection.close()
+        return None
+    finally:
+        watchdog.cancel()
+        with suppress(OSError):
+            client.close()
+    return connection
+
+
+def _shutdown(client: socket.socket) -> None:
+    with suppress(OSError):
+        client.shutdown(socket.SHUT_RDWR)
+
+
+def _still_expected(
+    popen: subprocess.Popen[bytes], deadline: float, timeout_seconds: float, rejected: int
+) -> None:
+    """Raise unless the worker can still be expected to arrive."""
+    exit_code = popen.poll()
+    if exit_code is not None:
+        raise IncodeError(
+            ErrorCode.BACKEND_UNAVAILABLE,
+            f"The accelerator worker exited with status {exit_code} before it "
+            "could be reached; its environment is most likely incomplete",
+            exit_code=exit_code,
+        )
+    if time.monotonic() >= deadline:
+        # A handshake nobody could complete is a different fault from silence,
+        # and on a shared loopback port it is the one worth naming.
+        detail = f"; {rejected} connection(s) failed the handshake" if rejected else ""
+        raise IncodeError(
+            ErrorCode.EMBEDDING_WORKER_FAILED,
+            f"The accelerator worker did not connect within {timeout_seconds:.0f}s{detail}",
+        )
 
 
 def _reap(popen: subprocess.Popen[bytes]) -> None:
@@ -305,36 +364,34 @@ class _Channel:
         )
 
     def accept(self, popen: subprocess.Popen[bytes], *, timeout_seconds: float) -> Any:
-        """Wait for the worker to dial back, or fail with why it never did."""
+        """Wait for the worker to dial back and prove itself, or say why it never did.
+
+        Authentication happens here rather than after, so that one deadline
+        covers the whole handshake: a peer that connects but cannot finish is
+        indistinguishable, from the outside, from one that never connected.
+        """
         deadline = time.monotonic() + timeout_seconds
         self.server.settimeout(HANDSHAKE_POLL_SECONDS)
+        rejected = 0
         while True:
             try:
                 client, _ = self.server.accept()
             except TimeoutError:
-                exit_code = popen.poll()
-                if exit_code is not None:
-                    raise IncodeError(
-                        ErrorCode.BACKEND_UNAVAILABLE,
-                        f"The accelerator worker exited with status {exit_code} before it "
-                        "could be reached; its environment is most likely incomplete",
-                        exit_code=exit_code,
-                    ) from None
-                if time.monotonic() >= deadline:
-                    raise IncodeError(
-                        ErrorCode.EMBEDDING_WORKER_FAILED,
-                        f"The accelerator worker did not connect within {timeout_seconds:.0f}s",
-                    ) from None
+                _still_expected(popen, deadline, timeout_seconds, rejected)
                 continue
             except OSError as exc:
                 raise IncodeError(
                     ErrorCode.EMBEDDING_WORKER_FAILED,
                     f"Could not accept the accelerator worker connection: {exc}",
                 ) from exc
-            client.setblocking(True)
             # Connection is multiprocessing's socket-backed connection on every
             # platform, so the command protocol above it is identical either way.
-            return Connection(client.detach())
+            remaining = max(deadline - time.monotonic(), HANDSHAKE_POLL_SECONDS)
+            connection = _authenticated(client, self.authkey, timeout_seconds=remaining)
+            if connection is not None:
+                return connection
+            rejected += 1
+            _still_expected(popen, deadline, timeout_seconds, rejected)
 
     def handshake_payload(self, target: str) -> str:
         address = list(self.address) if isinstance(self.address, tuple) else self.address

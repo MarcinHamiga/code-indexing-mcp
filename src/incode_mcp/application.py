@@ -18,6 +18,7 @@ from .backends import (
     BackendDescriptor,
     BackendSelection,
     available_execution_providers,
+    backend_for,
     describe_environment,
     platform_fingerprint,
     runtime_version,
@@ -182,9 +183,15 @@ class Application:
         """Choose a backend from everything this machine can actually execute."""
         record = self.accelerator_environment.environment
         providers = list(self.serving_providers)
-        providers.extend(
-            name for name in self.accelerator_environment.providers if name not in providers
-        )
+        if record is not None:
+            # The prepared environment vouches for the one accelerator it was
+            # probed for, not for every provider its runtime happens to ship.
+            # Widening any further would offer a backend on the strength of a
+            # record that never exercised it -- and would let selection land on
+            # an accelerator whose device and driver this record cannot describe.
+            prepared = backend_for(record.accelerator)
+            if prepared is not None and prepared.provider in record.providers:
+                providers.append(prepared.provider)
         selection = select_backend(
             self.settings.embedding_accelerator, available_providers=providers
         )
@@ -197,8 +204,8 @@ class Application:
             selection = selection.diagnosed(rejection)
         return selection
 
-    def _accelerator_launcher(self, descriptor: BackendDescriptor) -> WorkerLauncher:
-        """Return where a worker for *descriptor* has to be started.
+    def _runs_externally(self, descriptor: BackendDescriptor) -> bool:
+        """Whether a worker for *descriptor* needs the prepared environment.
 
         A provider this interpreter already exposes needs no second environment
         -- an explicitly requested Core ML on macOS runs in the serving
@@ -206,7 +213,12 @@ class Application:
         accelerator environment runs in that environment's interpreter.
         """
         record = self.accelerator_environment.environment
-        if descriptor.provider in self.serving_providers or record is None:
+        return record is not None and descriptor.provider not in self.serving_providers
+
+    def _accelerator_launcher(self, descriptor: BackendDescriptor) -> WorkerLauncher:
+        """Return where a worker for *descriptor* has to be started."""
+        record = self.accelerator_environment.environment
+        if record is None or not self._runs_externally(descriptor):
             return default_launcher()
         return ExternalInterpreterLauncher(
             record.interpreter,
@@ -313,11 +325,7 @@ class Application:
             key = self._probe_key or self._build_probe_key(self.embedder)
             probe_state = self.probe_cache.state(key)
         record = self.accelerator_environment.environment
-        external = (
-            record is not None
-            and selection.uses_accelerator
-            and descriptor.provider not in self.serving_providers
-        )
+        external = selection.uses_accelerator and self._runs_externally(descriptor)
         return ModelStatus(
             embedding_model=self.embedder.model_id,
             dimension=self.embedder.dimension,

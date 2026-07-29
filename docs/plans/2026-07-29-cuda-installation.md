@@ -37,12 +37,18 @@ anything at request time.
 - The child dials back *before* importing anything heavy, so the handshake timeout measures an
   interpreter starting rather than a model loading onto a device. A child that exits first is
   reported with its exit status instead of being waited out.
+- One deadline covers connecting *and* authenticating, and a peer that fails either is dropped so
+  the wait can resume. On Windows the channel is a loopback port every local process can reach, so a
+  stranger must cost the attempt one connection rather than the worker it was waiting for — and must
+  not be able to hold the server open by connecting and then going quiet. The connection is read
+  with `os.read`, which no socket timeout reaches, so a watchdog shuts the socket down instead.
 - `accelerator_env.py` reads the installer's record and re-verifies every claim in it: a vanished
   interpreter or a server upgraded past the Python the environment was built for retires the record
   with a reason rather than repairing it, since repairing it would mean installing something.
-- Selection now considers the providers the prepared environment reported, not just the ones this
-  process can execute. A backend the serving environment already offers — an explicit Core ML on
-  macOS — still runs in-process; only what the prepared environment adds needs its interpreter.
+- Selection now considers what the prepared environment reported, not just what this process can
+  execute — but only for the one accelerator that environment was probed for, not for every provider
+  its runtime happens to ship. A backend the serving environment already offers — an explicit Core
+  ML on macOS — still runs in-process; only what the prepared environment adds needs its interpreter.
 - CUDA is promoted to `AUTOMATIC`. Promotion makes it eligible, not present: `auto` still resolves
   to CPU wherever no record was prepared.
 
@@ -51,15 +57,24 @@ anything at request time.
 - `--accelerator auto|cpu|cuda|webgpu|migraphx|coreml`, defaulting to `auto`.
 - Detection is OS/architecture, then `nvidia-smi`, then a pinned driver floor (525.60 on Linux,
   527.41 on Windows, the CUDA 12.x minimum). A driver below it is reported and left alone.
-- The accelerator environment is rebuilt from empty each run through
-  `UV_PROJECT_ENVIRONMENT` + `uv sync --locked --extra cuda`, with `--python` matched to the serving
-  interpreter, because both ends of the worker channel speak one Python's connection protocol.
+- The accelerator environment is built from empty through `UV_PROJECT_ENVIRONMENT` +
+  `uv sync --locked --extra cuda`, with `--python` matched to the serving interpreter, because both
+  ends of the worker channel speak one Python's connection protocol. Building over an existing
+  environment is never done: leftovers from another extra would resolve ONNX Runtime to whichever
+  distribution landed last.
+- A later run reuses what is there when the record still describes this exact combination —
+  accelerator, driver, and the server's Python — and its interpreter is still present. Anything that
+  moved puts the full build and probe back. Re-downloading CUDA and re-probing the device on every
+  update would be a lot of work to arrive back where the last run already was.
 - `incode_mcp.accelerator_probe` runs a real inference *in that environment* through the same
   `_load_model` path the worker uses, and validates the vectors the same way. Only then is the
-  record written. Detection nominates; the probe confirms.
+  record written. Detection nominates; the probe confirms. It is bounded: a cold probe downloads the
+  model first, but a device that wedges initialising wedges forever, and the output is captured, so
+  an unbounded wait would be indistinguishable from an installer that had hung.
 - Every failure — detection, build, probe, even an unresolvable data directory — falls back to CPU
   with the reason attached and leaves nothing behind that the server could pick up. An installation
-  never fails because acceleration was unavailable.
+  never fails because acceleration was unavailable. Falling back to CPU also reclaims the
+  environment: once no record points at it, it is gigabytes of dead weight.
 
 ## Deviations from the plan text
 

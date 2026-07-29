@@ -1,5 +1,9 @@
 .worktrees/
+# The serving environment, and the accelerator's own environment beside it.
+# Both are build output; an untracked .venv-accel would also make the installer
+# refuse to update the checkout it sits in.
 .venv/
+.venv-accel/
 __pycache__/
 .pytest_cache/
 .mypy_cache/

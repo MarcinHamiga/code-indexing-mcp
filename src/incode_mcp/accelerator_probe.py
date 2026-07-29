@@ -20,9 +20,9 @@ import sys
 from typing import Any
 
 from .backends import (
-    KNOWN_BACKENDS,
     Accelerator,
     available_execution_providers,
+    backend_for,
     parse_accelerator,
     platform_fingerprint,
     runtime_version,
@@ -34,13 +34,6 @@ from .embedding import (
     resolve_session_providers,
     validate_probe_vectors,
 )
-
-
-def _descriptor(accelerator: Accelerator) -> Any:
-    for backend in KNOWN_BACKENDS:
-        if backend.accelerator is accelerator:
-            return backend
-    raise ValueError(f"no backend is registered for {accelerator.value}")
 
 
 def probe(
@@ -55,7 +48,9 @@ def probe(
     from .application import RuntimePaths
     from .embedding_worker import WorkerConfig, _load_model
 
-    descriptor = _descriptor(accelerator)
+    descriptor = backend_for(accelerator)
+    if descriptor is None:
+        raise ValueError(f"no backend is registered for {accelerator.value}")
     providers = available_execution_providers()
     if descriptor.provider not in providers:
         raise RuntimeError(

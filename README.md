@@ -60,6 +60,12 @@ all leave the installation on CPU and report why. Nothing here changes system dr
 package is ever installed while the server is running. See
 [Embedding backends](#embedding-backends).
 
+Preparing an accelerator downloads the embedding model, because the probe that confirms it embeds
+a real passage on the device. A later run reuses an environment whose accelerator, driver, and
+Python all still match its record, so only the first install — and one that finds something moved —
+pays for the build and the probe. Reinstalling as `--accelerator cpu` removes the environment
+again.
+
 For a noninteractive installation, pass comma-separated harness slugs or `all`:
 
 ```bash
@@ -312,6 +318,11 @@ boundary: `spawn` hands the child the parent's `sys.path`, so the accelerator in
 start up and then import the serving environment's CPU runtime. Everything above the handshake —
 the command protocol, the memory ceiling, the batch retries, the CPU fallback — is the same for
 both kinds of worker.
+
+That socket is a Unix socket in a private directory, or a loopback port on Windows, which has no
+filesystem permissions to lean on. One deadline covers connecting *and* authenticating, and a peer
+that fails either is dropped so the wait can go on — so no other local process can take the slot
+the worker needs, or hold a start-up open by connecting and going quiet.
 
 Passage embedding runs in a disposable worker that is torn down after indexing, releasing VRAM or
 unified memory. Before any real content reaches an accelerator, the worker loads the model and runs

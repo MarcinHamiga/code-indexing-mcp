@@ -31,13 +31,23 @@ SERVING_EXTRA = "cpu"
 ACCELERATOR_EXTRAS = {"cuda": "cuda"}
 ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "webgpu", "migraphx", "coreml")
 ACCELERATOR_ENVIRONMENT_DIRECTORY = ".venv-accel"
+# Bumped in lockstep with incode_mcp.accelerator_env.RECORD_SCHEMA_VERSION.
+ACCELERATOR_RECORD_SCHEMA_VERSION = 1
+# A cold probe downloads the embedding model before it can run an inference, so
+# this has to cover a slow link as well as a slow device.
+PROBE_TIMEOUT_SECONDS = 900
 
 # The pinned CUDA support window for this release. onnxruntime-gpu 1.22-1.23
 # builds against CUDA 12.x and cuDNN 9, and NVIDIA's minor-version compatibility
 # makes the driver below the floor for every 12.x runtime. A driver under it is
 # reported and left alone: the installer never touches system drivers.
 MINIMUM_NVIDIA_DRIVER = {"linux": (525, 60), "win32": (527, 41)}
-CUDA_PLATFORMS = {"linux": {"x86_64", "amd64"}, "win32": {"amd64", "x86_64"}}
+# Lower-cased `platform.machine()` values, matching the `platform_machine`
+# markers on the cuda extra exactly. A machine name the markers would miss must
+# be refused here rather than nominated: `uv sync --extra cuda` would resolve
+# that extra to nothing and build an environment with no embedding runtime in
+# it at all, which fails the probe for a reason that explains nothing.
+CUDA_PLATFORMS = {"linux": {"x86_64"}, "win32": {"amd64"}}
 
 
 class HarnessChoice(NamedTuple):
@@ -768,6 +778,12 @@ class AcceleratorPlan(NamedTuple):
     reason: str
     driver_version: str = ""
     device_name: str = ""
+    # False when the request could not be honoured, which is what decides
+    # whether the outcome is reported as a problem. A CPU result is not by
+    # itself a denial: ``--accelerator cpu`` asked for exactly this, ``auto``
+    # finding no GPU is just what the machine is, and Core ML needs nothing
+    # prepared at all.
+    honored: bool = True
 
     @property
     def prepares_environment(self) -> bool:
@@ -823,6 +839,8 @@ def plan_accelerator(
     if requested == "cpu":
         return AcceleratorPlan("cpu", "CPU was requested")
     if requested == "coreml":
+        # Not a denial: Core ML runs in the serving environment's own runtime,
+        # so there is genuinely nothing for this installer to prepare.
         return AcceleratorPlan(
             "cpu",
             "Core ML needs no separate environment and stays manual-only: it lost to "
@@ -833,20 +851,25 @@ def plan_accelerator(
             "cpu",
             f"{requested} has no locked installation in this release; it ships with the "
             "direct ONNX backend that can configure it",
+            honored=False,
         )
 
     supported = CUDA_PLATFORMS.get("win32" if platform_name.startswith("win") else platform_name)
+    # `auto` finding no CUDA is what most machines are, not a request denied.
     explicit = "CUDA was requested but " if requested == "cuda" else ""
+    honored = not explicit
     if supported is None or machine not in supported:
         return AcceleratorPlan(
             "cpu",
             f"{explicit}no CUDA wheels are published for {platform_name}/{machine}",
+            honored=honored,
         )
     report = nvidia_report()
     if not report or not report.strip():
         return AcceleratorPlan(
             "cpu",
             f"{explicit}no usable NVIDIA driver was detected (nvidia-smi reported nothing)",
+            honored=honored,
         )
     first = report.strip().splitlines()[0]
     driver_version, _, device_name = (part.strip() for part in first.partition(","))
@@ -860,6 +883,7 @@ def plan_accelerator(
             "needs; the installer does not change drivers",
             driver_version=driver_version,
             device_name=device_name,
+            honored=honored,
         )
     return AcceleratorPlan(
         "cuda",
@@ -877,15 +901,21 @@ def interpreter_version(python: Path) -> str:
     return result.stdout.strip()
 
 
-def runtime_data_directory(python: Path) -> Path:
-    """Ask the installed package where the server reads its runtime state."""
+def runtime_record_path(python: Path) -> Path:
+    """Ask the installed package where the server reads its accelerator record.
+
+    The package is asked rather than told: it owns the filename, and it honours
+    an ``INCODE_ACCEL_ENV`` override that a path assembled here would write
+    straight past, leaving the record somewhere the server never looks.
+    """
 
     result = _run_command(
         [
             str(python),
             "-c",
+            "from incode_mcp.accelerator_env import record_path;"
             "from incode_mcp.application import RuntimePaths;"
-            "print(RuntimePaths.from_environment().data)",
+            "print(record_path(RuntimePaths.from_environment().data))",
         ]
     )
     return Path(result.stdout.strip())
@@ -893,7 +923,7 @@ def runtime_data_directory(python: Path) -> Path:
 
 def accelerator_record_path(install_directory: Path, *, platform_name: str | None = None) -> Path:
     python = environment_python(install_directory / ".venv", platform_name=platform_name)
-    return runtime_data_directory(python) / "accelerator.json"
+    return runtime_record_path(python)
 
 
 def sync_accelerator_environment(
@@ -906,9 +936,11 @@ def sync_accelerator_environment(
 ) -> Path:
     """Build the accelerator's own locked environment and return its interpreter.
 
-    It is rebuilt from empty every time. An environment carrying leftovers from
-    an earlier extra would resolve its ONNX Runtime to whichever distribution
-    landed last, which is the exact failure the extras are separated to avoid.
+    Whenever this runs it builds from empty, never over what is already there:
+    an environment carrying leftovers from an earlier extra would resolve its
+    ONNX Runtime to whichever distribution landed last, which is the exact
+    failure the extras are separated to avoid. Deciding whether it needs to run
+    at all is the caller's job -- see ``reusable_accelerator_environment``.
     """
 
     uv = _uv_executable(uv_executable)
@@ -944,7 +976,17 @@ def probe_accelerator(python: Path, accelerator: str, *, offline: bool = False) 
     if offline:
         arguments.append("--offline")
     try:
-        result = subprocess.run(arguments, capture_output=True, text=True)
+        result = subprocess.run(
+            arguments, capture_output=True, text=True, timeout=PROBE_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Generous, because a cold probe downloads the model before it can embed
+        # anything -- but bounded, because a driver that wedges initialising a
+        # device wedges there forever, and the output is captured, so an
+        # unbounded wait would look exactly like an installer that had hung.
+        raise InstallerError(
+            f"The accelerator probe did not finish within {PROBE_TIMEOUT_SECONDS // 60} minutes"
+        ) from exc
     except OSError as exc:
         raise InstallerError(f"Could not run the accelerator probe: {exc}") from exc
     payload: Any = None
@@ -974,7 +1016,7 @@ def write_accelerator_record(path: Path, plan: AcceleratorPlan, probe: Mapping[s
     """
 
     record = {
-        "schema_version": 1,
+        "schema_version": ACCELERATOR_RECORD_SCHEMA_VERSION,
         "accelerator": plan.accelerator,
         "interpreter": str(probe["interpreter"]),
         "providers": list(probe["providers"]),
@@ -1000,6 +1042,35 @@ def clear_accelerator_record(path: Path) -> bool:
             f"Could not remove the stale accelerator record: {path}: {exc}"
         ) from exc
     return True
+
+
+def reusable_accelerator_environment(
+    path: Path, plan: AcceleratorPlan, *, python_version: str
+) -> Path | None:
+    """Return the interpreter an existing record still vouches for, if any.
+
+    Rebuilding a multi-gigabyte environment and re-probing a device on every
+    update is a lot of work to arrive back where the last run already was. The
+    record is reused only when it describes this exact plan running on this
+    exact interpreter; anything that moved -- the driver, the server's Python,
+    the environment itself -- puts the full build and probe back.
+    """
+
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    interpreter = Path(str(record.get("interpreter", "")))
+    matches = (
+        record.get("schema_version") == ACCELERATOR_RECORD_SCHEMA_VERSION
+        and record.get("accelerator") == plan.accelerator
+        and str(record.get("driver_version", "")) == plan.driver_version
+        and str(record.get("python_version", "")) == python_version
+        and interpreter.is_file()
+    )
+    return interpreter if matches else None
 
 
 def configure_accelerator(
@@ -1033,18 +1104,28 @@ def configure_accelerator(
         # either. Reporting that is the whole of what can be done about it; the
         # installation itself is fine and indexes on CPU.
         return AcceleratorPlan(
-            "cpu", f"the server's runtime data directory could not be resolved: {exc}"
+            "cpu",
+            f"the server's runtime data directory could not be resolved: {exc}",
+            honored=False,
         )
     if not plan.prepares_environment:
         clear_accelerator_record(record)
+        # Once no record points at it, the environment is several gigabytes of
+        # dead weight. A machine reinstalled as CPU-only should not keep paying
+        # the disk for the GPU it used to have.
+        shutil.rmtree(install_directory / ACCELERATOR_ENVIRONMENT_DIRECTORY, ignore_errors=True)
         return plan
 
     serving_python = environment_python(install_directory / ".venv", platform_name=platform_name)
     try:
+        python_version = interpreter_version(serving_python)
+        reused = reusable_accelerator_environment(record, plan, python_version=python_version)
+        if reused is not None:
+            return plan._replace(reason=f"{plan.reason}; reusing the environment at {reused}")
         python = sync_accelerator_environment(
             install_directory,
             ACCELERATOR_EXTRAS[plan.accelerator],
-            python_version=interpreter_version(serving_python),
+            python_version=python_version,
             uv_executable=uv_executable,
             platform_name=platform_name,
         )
@@ -1059,6 +1140,9 @@ def configure_accelerator(
             f"{plan.accelerator} was detected but could not be prepared: {exc}",
             driver_version=plan.driver_version,
             device_name=plan.device_name,
+            # Detection said this machine has the hardware and it still did not
+            # come up. That is worth reporting however it was requested.
+            honored=False,
         )
     write_accelerator_record(record, plan, probe)
     return plan._replace(reason=f"{plan.reason}; {probe.get('detail', 'probe passed')}")
@@ -1291,12 +1375,12 @@ def main(
         )
         report = f"Passage embedding accelerator: {accelerator.accelerator} ({accelerator.reason})"
         # A request that could not be honoured is reported as a problem even
-        # though the installation succeeded on CPU; an automatic choice landing
-        # on CPU is just what this machine is.
-        if accelerator.accelerator == "cpu" and arguments.accelerator not in {"auto", "cpu"}:
-            error_fn(report)
-        else:
+        # though the installation succeeded on CPU. The plan decides which is
+        # which: landing on CPU is not by itself a denial.
+        if accelerator.honored:
             output_fn(report)
+        else:
+            error_fn(report)
 
         if arguments.harnesses is None:
             output_fn("Select the harnesses to configure:")
