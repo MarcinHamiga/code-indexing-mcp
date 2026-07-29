@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -18,6 +20,24 @@ from typing import Any, NamedTuple
 
 SERVER_NAME = "code-indexing-mcp"
 DEFAULT_REPOSITORY_URL = "https://github.com/MarcinHamiga/code-indexing-mcp.git"
+
+# The extra the serving environment always gets. It embeds queries in-process
+# and is the fallback every accelerator degrades to, so it is never optional.
+SERVING_EXTRA = "cpu"
+# Accelerators this release can prepare, and the runtime extra each installs
+# into an environment of its own. Everything else the runtime can name is
+# either reached by explicit override inside the serving environment (Core ML)
+# or has no locked installation yet; both are reported rather than attempted.
+ACCELERATOR_EXTRAS = {"cuda": "cuda"}
+ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "webgpu", "migraphx", "coreml")
+ACCELERATOR_ENVIRONMENT_DIRECTORY = ".venv-accel"
+
+# The pinned CUDA support window for this release. onnxruntime-gpu 1.22-1.23
+# builds against CUDA 12.x and cuDNN 9, and NVIDIA's minor-version compatibility
+# makes the driver below the floor for every 12.x runtime. A driver under it is
+# reported and left alone: the installer never touches system drivers.
+MINIMUM_NVIDIA_DRIVER = {"linux": (525, 60), "win32": (527, 41)}
+CUDA_PLATFORMS = {"linux": {"x86_64", "amd64"}, "win32": {"amd64", "x86_64"}}
 
 
 class HarnessChoice(NamedTuple):
@@ -609,7 +629,10 @@ def configure_harness(
 
 
 def _run_command(
-    arguments: list[str], *, cwd: Path | None = None
+    arguments: list[str],
+    *,
+    cwd: Path | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -618,6 +641,7 @@ def _run_command(
             check=True,
             capture_output=True,
             text=True,
+            env=None if environment is None else {**os.environ, **environment},
         )
     except FileNotFoundError as exc:
         raise InstallerError(f"Required command was not found: {arguments[0]}") from exc
@@ -696,6 +720,24 @@ def server_executable(
     return install_directory / ".venv" / "bin" / "code-indexing-mcp"
 
 
+def environment_python(directory: Path, *, platform_name: str | None = None) -> Path:
+    """Return the interpreter inside a virtual environment directory."""
+
+    platform_name = platform_name or sys.platform
+    if platform_name.startswith("win"):
+        return directory / "Scripts" / "python.exe"
+    return directory / "bin" / "python"
+
+
+def _uv_executable(uv_executable: str | None) -> str:
+    uv = uv_executable or shutil.which("uv")
+    if uv is None:
+        raise InstallerError(
+            "uv is required but was not found in PATH. Install it from https://docs.astral.sh/uv/"
+        )
+    return uv
+
+
 def sync_environment(
     install_directory: Path,
     *,
@@ -704,16 +746,322 @@ def sync_environment(
 ) -> Path:
     """Create or refresh the locked virtual environment and return its server command."""
 
-    uv = uv_executable or shutil.which("uv")
-    if uv is None:
-        raise InstallerError(
-            "uv is required but was not found in PATH. Install it from https://docs.astral.sh/uv/"
-        )
-    _run_command([uv, "sync", "--locked"], cwd=install_directory)
+    uv = _uv_executable(uv_executable)
+    # The serving environment is pinned to the CPU extra. It is where queries
+    # are embedded and where every accelerator failure lands, so it must never
+    # depend on an accelerator runtime resolving.
+    _run_command([uv, "sync", "--locked", "--extra", SERVING_EXTRA], cwd=install_directory)
     command = server_executable(install_directory, platform_name=platform_name)
     if not command.is_file():
         raise InstallerError(f"uv sync completed but the MCP executable is missing: {command}")
     return command
+
+
+class AcceleratorPlan(NamedTuple):
+    """What the installer will prepare, and the reason it settled on that.
+
+    ``accelerator`` is ``"cpu"`` when nothing will be prepared, which is an
+    outcome rather than an error: every machine indexes on CPU.
+    """
+
+    accelerator: str
+    reason: str
+    driver_version: str = ""
+    device_name: str = ""
+
+    @property
+    def prepares_environment(self) -> bool:
+        return self.accelerator in ACCELERATOR_EXTRAS
+
+
+def _nvidia_smi_report() -> str | None:
+    """Return nvidia-smi's driver/name line, or None when there is no driver."""
+
+    executable = shutil.which("nvidia-smi")
+    if executable is None:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "--query-gpu=driver_version,name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # A driver too broken to answer is a driver this installer will not
+        # build on top of, and not a reason to fail the whole installation.
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _driver_components(version: str) -> tuple[int, ...]:
+    components: list[int] = []
+    for part in version.strip().split("."):
+        if not part.isdigit():
+            break
+        components.append(int(part))
+    return tuple(components)
+
+
+def plan_accelerator(
+    requested: str,
+    *,
+    platform_name: str | None = None,
+    machine: str | None = None,
+    nvidia_report: Callable[[], str | None] = _nvidia_smi_report,
+) -> AcceleratorPlan:
+    """Decide which accelerator, if any, this machine should have prepared.
+
+    Detection only nominates: the environment still has to build and pass a real
+    inference probe before anything offers the backend to the server.
+    """
+
+    platform_name = (platform_name or sys.platform).lower()
+    machine = (machine or platform.machine()).lower()
+    requested = requested.strip().lower()
+
+    if requested == "cpu":
+        return AcceleratorPlan("cpu", "CPU was requested")
+    if requested == "coreml":
+        return AcceleratorPlan(
+            "cpu",
+            "Core ML needs no separate environment and stays manual-only: it lost to "
+            "CPU on this model. Set INCODE_EMBED_ACCELERATOR=coreml to measure it",
+        )
+    if requested in {"webgpu", "migraphx"}:
+        return AcceleratorPlan(
+            "cpu",
+            f"{requested} has no locked installation in this release; it ships with the "
+            "direct ONNX backend that can configure it",
+        )
+
+    supported = CUDA_PLATFORMS.get("win32" if platform_name.startswith("win") else platform_name)
+    explicit = "CUDA was requested but " if requested == "cuda" else ""
+    if supported is None or machine not in supported:
+        return AcceleratorPlan(
+            "cpu",
+            f"{explicit}no CUDA wheels are published for {platform_name}/{machine}",
+        )
+    report = nvidia_report()
+    if not report or not report.strip():
+        return AcceleratorPlan(
+            "cpu",
+            f"{explicit}no usable NVIDIA driver was detected (nvidia-smi reported nothing)",
+        )
+    first = report.strip().splitlines()[0]
+    driver_version, _, device_name = (part.strip() for part in first.partition(","))
+    floor = MINIMUM_NVIDIA_DRIVER["win32" if platform_name.startswith("win") else platform_name]
+    components = _driver_components(driver_version)
+    if not components or components < floor:
+        return AcceleratorPlan(
+            "cpu",
+            f"{explicit}NVIDIA driver {driver_version or 'unknown'} is below the "
+            f"{'.'.join(str(part) for part in floor)} this release's CUDA 12 runtime "
+            "needs; the installer does not change drivers",
+            driver_version=driver_version,
+            device_name=device_name,
+        )
+    return AcceleratorPlan(
+        "cuda",
+        f"NVIDIA driver {driver_version} on {device_name or 'an NVIDIA device'} "
+        "satisfies the pinned CUDA 12 runtime",
+        driver_version=driver_version,
+        device_name=device_name,
+    )
+
+
+def interpreter_version(python: Path) -> str:
+    """Return the ``major.minor`` version of an interpreter."""
+
+    result = _run_command([str(python), "-c", "import sys;print('%d.%d'%sys.version_info[:2])"])
+    return result.stdout.strip()
+
+
+def runtime_data_directory(python: Path) -> Path:
+    """Ask the installed package where the server reads its runtime state."""
+
+    result = _run_command(
+        [
+            str(python),
+            "-c",
+            "from incode_mcp.application import RuntimePaths;"
+            "print(RuntimePaths.from_environment().data)",
+        ]
+    )
+    return Path(result.stdout.strip())
+
+
+def accelerator_record_path(install_directory: Path, *, platform_name: str | None = None) -> Path:
+    python = environment_python(install_directory / ".venv", platform_name=platform_name)
+    return runtime_data_directory(python) / "accelerator.json"
+
+
+def sync_accelerator_environment(
+    install_directory: Path,
+    extra: str,
+    *,
+    python_version: str,
+    uv_executable: str | None = None,
+    platform_name: str | None = None,
+) -> Path:
+    """Build the accelerator's own locked environment and return its interpreter.
+
+    It is rebuilt from empty every time. An environment carrying leftovers from
+    an earlier extra would resolve its ONNX Runtime to whichever distribution
+    landed last, which is the exact failure the extras are separated to avoid.
+    """
+
+    uv = _uv_executable(uv_executable)
+    directory = install_directory / ACCELERATOR_ENVIRONMENT_DIRECTORY
+    if directory.exists():
+        shutil.rmtree(directory)
+    _run_command(
+        [
+            uv,
+            "sync",
+            "--locked",
+            "--no-default-groups",
+            "--extra",
+            extra,
+            # Both ends of the worker channel speak multiprocessing's connection
+            # protocol, so the accelerator interpreter has to match the server's.
+            "--python",
+            python_version,
+        ],
+        cwd=install_directory,
+        environment={"UV_PROJECT_ENVIRONMENT": str(directory)},
+    )
+    python = environment_python(directory, platform_name=platform_name)
+    if not python.is_file():
+        raise InstallerError(f"The accelerator environment has no interpreter at {python}")
+    return python
+
+
+def probe_accelerator(python: Path, accelerator: str, *, offline: bool = False) -> dict[str, Any]:
+    """Run a real inference in the accelerator environment and return its report."""
+
+    arguments = [str(python), "-m", "incode_mcp.accelerator_probe", "--accelerator", accelerator]
+    if offline:
+        arguments.append("--offline")
+    try:
+        result = subprocess.run(arguments, capture_output=True, text=True)
+    except OSError as exc:
+        raise InstallerError(f"Could not run the accelerator probe: {exc}") from exc
+    payload: Any = None
+    for line in reversed(result.stdout.splitlines()):
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        break
+    if not isinstance(payload, dict):
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise InstallerError(
+            "The accelerator probe returned no report"
+            + (f": {detail[-1]}" if detail else f" (exit status {result.returncode})")
+        )
+    if not payload.get("ok"):
+        raise InstallerError(f"The accelerator probe failed: {payload.get('error', 'unknown')}")
+    return payload
+
+
+def write_accelerator_record(path: Path, plan: AcceleratorPlan, probe: Mapping[str, Any]) -> None:
+    """Record the verified environment where the server looks for one.
+
+    The shape is read back by ``incode_mcp.accelerator_env``; the schema version
+    is what keeps a record written here from being misread by a server that
+    changed its mind about what these fields mean.
+    """
+
+    record = {
+        "schema_version": 1,
+        "accelerator": plan.accelerator,
+        "interpreter": str(probe["interpreter"]),
+        "providers": list(probe["providers"]),
+        "runtime_version": str(probe.get("runtime_version", "")),
+        "driver_version": plan.driver_version,
+        "device": str(probe.get("device", "")),
+        "python_version": str(probe.get("python_version", "")),
+        "recorded_at_ns": time.time_ns(),
+        "detail": str(probe.get("detail", "")),
+    }
+    _atomic_write(path, json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+
+def clear_accelerator_record(path: Path) -> bool:
+    """Drop any record, so an installation that fell back stops offering more."""
+
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise InstallerError(
+            f"Could not remove the stale accelerator record: {path}: {exc}"
+        ) from exc
+    return True
+
+
+def configure_accelerator(
+    install_directory: Path,
+    requested: str,
+    *,
+    uv_executable: str | None = None,
+    platform_name: str | None = None,
+    machine: str | None = None,
+    nvidia_report: Callable[[], str | None] = _nvidia_smi_report,
+    offline: bool = False,
+) -> AcceleratorPlan:
+    """Prepare the planned accelerator, or leave the installation on CPU.
+
+    Every failure below is a fall back to CPU with the reason attached, not an
+    installation failure: an accelerator that cannot be built or cannot pass its
+    probe costs speed, and refusing to install over it would cost the server.
+    """
+
+    plan = plan_accelerator(
+        requested,
+        platform_name=platform_name,
+        machine=machine,
+        nvidia_report=nvidia_report,
+    )
+    try:
+        record = accelerator_record_path(install_directory, platform_name=platform_name)
+    except InstallerError as exc:
+        # Without the server's data directory there is nowhere to offer an
+        # accelerator from, and nowhere a stale offer could be retracted from
+        # either. Reporting that is the whole of what can be done about it; the
+        # installation itself is fine and indexes on CPU.
+        return AcceleratorPlan(
+            "cpu", f"the server's runtime data directory could not be resolved: {exc}"
+        )
+    if not plan.prepares_environment:
+        clear_accelerator_record(record)
+        return plan
+
+    serving_python = environment_python(install_directory / ".venv", platform_name=platform_name)
+    try:
+        python = sync_accelerator_environment(
+            install_directory,
+            ACCELERATOR_EXTRAS[plan.accelerator],
+            python_version=interpreter_version(serving_python),
+            uv_executable=uv_executable,
+            platform_name=platform_name,
+        )
+        probe = probe_accelerator(python, plan.accelerator, offline=offline)
+    except InstallerError as exc:
+        # Nothing half-built may be left where the server could find it: the
+        # record is what makes an environment reachable at all.
+        clear_accelerator_record(record)
+        shutil.rmtree(install_directory / ACCELERATOR_ENVIRONMENT_DIRECTORY, ignore_errors=True)
+        return AcceleratorPlan(
+            "cpu",
+            f"{plan.accelerator} was detected but could not be prepared: {exc}",
+            driver_version=plan.driver_version,
+            device_name=plan.device_name,
+        )
+    write_accelerator_record(record, plan, probe)
+    return plan._replace(reason=f"{plan.reason}; {probe.get('detail', 'probe passed')}")
 
 
 def configure_selected_harnesses(
@@ -892,6 +1240,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Git repository to clone or update (default: %(default)s)",
     )
     parser.add_argument(
+        "--accelerator",
+        choices=ACCELERATOR_CHOICES,
+        default=os.environ.get("CODE_INDEXING_MCP_ACCELERATOR", "auto"),
+        help=(
+            "which accelerator to prepare for passage indexing (default: %(default)s). "
+            "auto detects one; anything that cannot be detected, built, or probed "
+            "falls back to CPU with the reason reported"
+        ),
+    )
+    parser.add_argument(
         "--harnesses",
         help=(
             "comma-separated harness numbers/slugs or 'all'; omit for the interactive menu "
@@ -925,6 +1283,20 @@ def main(
         output_fn(f"{action.title()} repository: {install_directory}")
         command = sync_environment(install_directory)
         output_fn(f"Prepared MCP executable: {command}")
+
+        accelerator = configure_accelerator(
+            install_directory,
+            arguments.accelerator,
+            offline=os.environ.get("INCODE_OFFLINE", "").lower() in {"1", "true", "yes"},
+        )
+        report = f"Passage embedding accelerator: {accelerator.accelerator} ({accelerator.reason})"
+        # A request that could not be honoured is reported as a problem even
+        # though the installation succeeded on CPU; an automatic choice landing
+        # on CPU is just what this machine is.
+        if accelerator.accelerator == "cpu" and arguments.accelerator not in {"auto", "cpu"}:
+            error_fn(report)
+        else:
+            output_fn(report)
 
         if arguments.harnesses is None:
             output_fn("Select the harnesses to configure:")

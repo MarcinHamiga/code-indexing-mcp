@@ -48,6 +48,18 @@ Run the same command later to update an existing clean checkout with a fast-forw
 refresh its environment. The installer refuses to overwrite a different repository or a checkout
 with local changes.
 
+By default it also detects whether this machine can be given a GPU accelerator for indexing, and
+prepares one when it can:
+
+```bash
+python3 install.py --accelerator auto   # auto (default), cpu, cuda, webgpu, migraphx, coreml
+```
+
+Detection that finds nothing, an environment that cannot be built, and a probe that does not pass
+all leave the installation on CPU and report why. Nothing here changes system drivers, and no
+package is ever installed while the server is running. See
+[Embedding backends](#embedding-backends).
+
 For a noninteractive installation, pass comma-separated harness slugs or `all`:
 
 ```bash
@@ -72,9 +84,13 @@ change). Harnesses without skill support are skipped.
 ```bash
 git clone https://github.com/MarcinHamiga/code-indexing-mcp.git
 cd code-indexing-mcp
-uv sync --locked
+uv sync --locked --extra cpu
 uv run code-indexing-mcp model pull
 ```
+
+`--extra cpu` is required: the embedding runtime is an extra rather than a plain dependency, because
+the CPU and CUDA runtimes conflict and cannot share one environment. See
+[Embedding backends](#embedding-backends).
 
 The model preparation step is optional; the first index operation downloads the model when it
 is not already cached.
@@ -261,9 +277,41 @@ export INCODE_EMBED_ACCELERATOR=auto  # auto, cpu, cuda, webgpu, migraphx, corem
 export INCODE_EMBED_STRICT=0          # 1 disables the CPU fallback
 ```
 
-`auto` selects the best backend that has passed its promotion gates *and* whose execution provider
-this installation actually offers. No accelerator has been promoted yet, so `auto` resolves to CPU
-everywhere; naming one explicitly overrides that and is how a backend earns its benchmark evidence.
+`auto` selects the best backend that has passed its promotion gates *and* that this installation
+actually offers. CUDA is the first backend promoted to automatic selection; WebGPU and MIGraphX are
+still experimental and Core ML stays manual-only, because on this model it offloaded only part of
+the graph and lost to CPU. Naming a backend explicitly overrides its stability, and is how one earns
+the benchmark evidence its own promotion needs.
+
+Promotion makes CUDA *eligible*, not present. `auto` still resolves to CPU on a machine where the
+installer never prepared it, which is every machine without a supported NVIDIA driver.
+
+#### The accelerator environment
+
+`fastembed` and `fastembed-gpu` install the same module over two different ONNX Runtime
+distributions that both own the `onnxruntime` import, so they cannot share an environment. The
+serving environment is therefore pinned to the `cpu` extra — it embeds queries in-process and is
+what every accelerator falls back to — and an accelerator gets a second locked environment of its
+own under the install directory, sharing the same model cache. Both are resolved from one lockfile
+that declares the extras mutually exclusive.
+
+The installer prepares that environment and records it at `accelerator.json` in the runtime data
+directory. It is written only after a real inference passes in the environment it describes:
+detection nominates a backend, and only the probe confirms one. The record is re-checked on every
+start — a missing interpreter or a server upgraded past the Python the environment was built for
+retires it with a reason rather than being repaired, since repairing it would mean installing
+something while serving.
+
+This release pins CUDA to ONNX Runtime 1.22-1.23, which builds against CUDA 12.x and cuDNN 9, and
+requires NVIDIA driver 525.60+ on Linux or 527.41+ on Windows. Wheels are published for 64-bit
+Linux and Windows only. An unsupported combination is reported and left alone.
+
+A passage worker for an accelerator runs from that environment's own interpreter, dialling back to
+the serving process over an authenticated local socket. `multiprocessing` cannot cross that
+boundary: `spawn` hands the child the parent's `sys.path`, so the accelerator interpreter would
+start up and then import the serving environment's CPU runtime. Everything above the handshake —
+the command protocol, the memory ceiling, the batch retries, the CPU fallback — is the same for
+both kinds of worker.
 
 Passage embedding runs in a disposable worker that is torn down after indexing, releasing VRAM or
 unified memory. Before any real content reaches an accelerator, the worker loads the model and runs
@@ -283,11 +331,11 @@ CPU is not a fallback and is unaffected.
 
 Successful probes are cached under the cache directory, keyed by model artifact, execution
 provider, ONNX Runtime version, OS/architecture, and device — so any of those moving invalidates
-the record rather than vouching for a backend that no longer works. The key reserves a driver
-version too, but nothing populates it yet: driver detection ships with the locked accelerator
-installations, alongside the first backend promoted to automatic selection. A cached probe skips
-the inference but never the model load, which is what proves the provider still initialises on this
-boot — so a driver change that breaks a provider outright still surfaces as a failed load.
+the record rather than vouching for a backend that no longer works. The driver version comes from
+the installer's record, so a driver upgrade retires the verdict recorded under the old one. A cached
+probe skips the inference but never the model load, which is what proves the provider still
+initialises on this boot — so a driver change that breaks a provider outright still surfaces as a
+failed load.
 
 A backend that fails is not retried for the life of the process. Only successes are cached, so
 without that a long-lived daemon would reload a dead accelerator onto the device before every
@@ -298,14 +346,17 @@ index run.
 ```console
 $ code-indexing-mcp model status
 {
+  "accelerator_environment": null,
+  "accelerator_prepared": null,
   "available_providers": ["CoreMLExecutionProvider", "AzureExecutionProvider", "CPUExecutionProvider"],
   "batch_calibration": "default",
   "batch_size": 1,
   "device": "cpu",
   "dimension": 768,
+  "driver_version": "",
   "embedding_model": "jinaai/jina-embeddings-v2-base-code",
   "execution_provider": "CPUExecutionProvider",
-  "fallback_reason": "no accelerator has reached automatic selection on this machine; set INCODE_EMBED_ACCELERATOR to override",
+  "fallback_reason": "no accelerator is prepared and eligible on this machine; reinstall with --accelerator to prepare one, or set INCODE_EMBED_ACCELERATOR to force a backend this installation already offers",
   "precision": "float32",
   "probe_cache_state": "not-applicable",
   "requested_accelerator": "auto",
@@ -315,6 +366,10 @@ $ code-indexing-mcp model status
   "strict": false
 }
 ```
+
+`accelerator_environment` names the interpreter passage embedding will run in when that is not
+this process's own, and `accelerator_prepared` names what the installer prepared, whether or not
+selection chose it.
 
 `IndexReport` carries `embedding_backend`, `embedding_fallback_reason`, and `fallback_count`, so a
 run that started on an accelerator and finished on CPU says so rather than merely being slow.
@@ -421,6 +476,7 @@ no telemetry.
 ## Development
 
 ```bash
+uv sync --all-groups --extra cpu --locked
 uv run pytest
 uv run pytest --cov=incode_mcp
 uv run ruff check .

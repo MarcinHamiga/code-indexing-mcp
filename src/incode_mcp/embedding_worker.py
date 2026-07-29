@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import time
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
-from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol, runtime_checkable
@@ -32,6 +30,7 @@ from .embedding import (
     validate_probe_vectors,
 )
 from .errors import ErrorCode, IncodeError
+from .worker_launcher import SpawnLauncher, WorkerLauncher, WorkerProcess
 
 SYSTEM_RESERVE_BYTES = 512 * 1024**2
 MINIMUM_WORKER_BYTES = 1024**3
@@ -95,6 +94,15 @@ class TelemetrySource(Protocol):
 
 
 WorkerTarget = Callable[[Connection, WorkerConfig], None]
+
+
+def default_launcher() -> WorkerLauncher:
+    """Return the launcher that runs a worker in this interpreter's environment.
+
+    This is the CPU path and the fallback path, so it deliberately depends on
+    nothing an installer had to prepare.
+    """
+    return SpawnLauncher(_worker_main)
 
 
 def effective_memory_ceiling(*, configured_bytes: int, available_bytes: int) -> int:
@@ -214,6 +222,7 @@ class EmbeddingWorkerSession:
         configured_ceiling_bytes: int | None = None,
         effective_ceiling_bytes: int | None = None,
         target: WorkerTarget = _worker_main,
+        launcher: WorkerLauncher | None = None,
     ) -> None:
         self.config = config
         configured = configured_ceiling_bytes or 2 * 1024**3
@@ -232,8 +241,11 @@ class EmbeddingWorkerSession:
                 effective_memory_bytes=self.effective_ceiling_bytes,
                 minimum_memory_bytes=MINIMUM_WORKER_BYTES,
             )
-        self._target = target
-        self._process: BaseProcess | None = None
+        # A launcher decides which environment the worker's code runs in;
+        # ``target`` names the body it runs there. The default pair is the
+        # historical behaviour: this interpreter, this module's worker loop.
+        self._launcher = launcher if launcher is not None else SpawnLauncher(target)
+        self._process: WorkerProcess | None = None
         self._connection: Connection | None = None
         # How many worker processes this session has started. A batch retry
         # closes the worker and the next request silently spawns another, so a
@@ -457,6 +469,12 @@ class EmbeddingWorkerSession:
         if process.is_alive():
             process.terminate()
             process.join(timeout=2)
+        if process.is_alive():
+            # A worker in another environment is not this process's child to be
+            # reaped at exit, and one that ignored SIGTERM may still be holding
+            # device memory the next backend needs.
+            process.kill()
+            process.join(timeout=2)
         if connection is not None:
             connection.close()
         self._process = None
@@ -466,24 +484,10 @@ class EmbeddingWorkerSession:
         if self._process is not None:
             return
         self._parent_baseline_bytes = psutil.Process().memory_info().rss
-        context = mp.get_context("spawn")
-        parent, child = context.Pipe()
-        process = context.Process(
-            target=self._target,
-            args=(child, self.config),
-            name="incode-embedding-worker",
-            daemon=True,
-        )
-        process.start()
-        child.close()
-        self._process = process
+        launched = self._launcher.launch(self.config)
+        self._process = launched.process
         self.spawn_count += 1
-        # Pipe() yields PipeConnection on Windows and Connection elsewhere, and
-        # typeshed does not relate the two even though both carry the send/recv/
-        # poll/close surface used here. Widening on this one line keeps the
-        # attribute itself typed, and keeps a cast from being redundant on POSIX.
-        connection: Any = parent
-        self._connection = connection
+        self._connection = launched.connection
 
     def _sample_rss(self) -> tuple[int, int]:
         """Return the current (parent, worker) resident set sizes in bytes."""

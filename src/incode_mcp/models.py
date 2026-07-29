@@ -276,6 +276,13 @@ class ModelStatus(FrozenModel):
     # which needs no probe to be trusted.
     probe_cache_state: str
     strict: bool
+    # The GPU driver the accelerator environment was probed against, when one
+    # was prepared. Empty on CPU, where no driver is in the picture.
+    driver_version: str = ""
+    # The interpreter passage embedding runs in when that is not this one, and
+    # the accelerator the installer prepared, whether or not it was selected.
+    accelerator_environment: str | None = None
+    accelerator_prepared: str | None = None
     fallback_reason: str | None = None
 
 

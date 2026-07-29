@@ -5,10 +5,18 @@ from pathlib import Path
 
 import pytest
 
+from incode_mcp.accelerator_env import (
+    RECORD_FILENAME,
+    AcceleratorEnvironment,
+    running_python_version,
+    write_environment,
+)
 from incode_mcp.application import Application, RuntimePaths
 from incode_mcp.backends import CPU_BACKEND, Accelerator
+from incode_mcp.embedding_worker import default_launcher
 from incode_mcp.errors import ErrorCode, IncodeError
 from incode_mcp.settings import IndexSettings
+from incode_mcp.worker_launcher import ExternalInterpreterLauncher
 
 
 class TinyEmbedder:
@@ -322,3 +330,86 @@ def test_model_status_reports_a_runtime_fallback_rather_than_the_original_choice
     status = app.model_status()
     assert status.resolved_accelerator == "cpu"
     assert status.fallback_reason == "the accelerator died on load"
+
+
+def _prepared_cuda_environment(tmp_path: Path, **overrides: object) -> Path:
+    """Write the record an installer leaves behind for a prepared CUDA machine."""
+    interpreter = tmp_path / "venv-accel" / "python"
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    interpreter.write_text("", encoding="utf-8")
+    settings: dict[str, object] = {
+        "accelerator": Accelerator.CUDA,
+        "interpreter": interpreter,
+        "providers": ("CUDAExecutionProvider", "CPUExecutionProvider"),
+        "runtime_version": "1.23.2",
+        "driver_version": "550.54.14",
+        "device": "cuda:0",
+        "python_version": running_python_version(),
+    }
+    settings.update(overrides)
+    write_environment(
+        tmp_path / "data" / RECORD_FILENAME,
+        AcceleratorEnvironment(**settings),  # type: ignore[arg-type]
+    )
+    return interpreter
+
+
+def test_auto_selects_a_prepared_accelerator_this_process_cannot_execute_itself(
+    tmp_path: Path,
+) -> None:
+    """The serving environment is CPU-only; the record is what makes CUDA reachable."""
+    interpreter = _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    assert app.backend_selection.accelerator is Accelerator.CUDA
+    status = app.model_status()
+    assert status.resolved_accelerator == "cuda"
+    assert status.accelerator_environment == str(interpreter)
+    assert status.accelerator_prepared == "cuda"
+    # Diagnostics the probe cache is keyed on come from the environment that was
+    # probed, not from this process's own CPU runtime.
+    assert status.driver_version == "550.54.14"
+    assert status.runtime_version == "1.23.2"
+    assert status.device == "cuda:0"
+
+
+def test_a_prepared_accelerator_runs_in_its_own_interpreter(tmp_path: Path) -> None:
+    interpreter = _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    launcher = app._accelerator_launcher(app.backend_selection.descriptor)
+
+    assert isinstance(launcher, ExternalInterpreterLauncher)
+    assert launcher.executable == interpreter
+    # The fallback is what a failed accelerator falls back *to*, so it must not
+    # depend on the environment that just failed.
+    assert not isinstance(default_launcher(), ExternalInterpreterLauncher)
+
+
+def test_a_backend_this_process_already_offers_needs_no_second_environment(
+    tmp_path: Path,
+) -> None:
+    """An explicit Core ML override runs in the serving environment's own runtime."""
+    _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    in_process = replace(app.backend_selection.descriptor, provider=app.serving_providers[0])
+
+    assert not isinstance(app._accelerator_launcher(in_process), ExternalInterpreterLauncher)
+
+
+def test_a_refused_record_explains_the_cpu_outcome(tmp_path: Path) -> None:
+    """ "No accelerator is prepared" is the wrong diagnosis when one nearly was."""
+    _prepared_cuda_environment(tmp_path, python_version="3.7")
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    assert app.backend_selection.accelerator is Accelerator.CPU
+    status = app.model_status()
+    assert "built for Python 3.7" in (status.fallback_reason or "")
+    assert status.accelerator_environment is None
+    assert status.accelerator_prepared is None

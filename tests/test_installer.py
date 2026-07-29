@@ -517,6 +517,7 @@ def test_repository_update_rejects_non_repo_dirty_and_mismatched_targets(
 
 
 def test_sync_environment_runs_locked_sync_and_finds_server(tmp_path: Path) -> None:
+    """The serving environment is pinned to the CPU extra, which is not optional."""
     installer = load_installer()
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -527,6 +528,8 @@ def test_sync_environment_runs_locked_sync_and_finds_server(tmp_path: Path) -> N
             "@echo off\r\n"
             'if not "%~1"=="sync" exit /b 1\r\n'
             'if not "%~2"=="--locked" exit /b 1\r\n'
+            'if not "%~3"=="--extra" exit /b 1\r\n'
+            'if not "%~4"=="cpu" exit /b 1\r\n'
             "md .venv\\Scripts\r\n"
             "type nul > .venv\\Scripts\\code-indexing-mcp.exe\r\n",
             newline="",
@@ -537,6 +540,8 @@ def test_sync_environment_runs_locked_sync_and_finds_server(tmp_path: Path) -> N
             "#!/bin/sh\n"
             'test "$1" = "sync"\n'
             'test "$2" = "--locked"\n'
+            'test "$3" = "--extra"\n'
+            'test "$4" = "cpu"\n'
             "mkdir -p .venv/bin\n"
             "touch .venv/bin/code-indexing-mcp\n"
         )
@@ -920,3 +925,237 @@ def test_install_skills_leaves_existing_skills_in_place_when_symlinks_fail(
     assert (mine / "SKILL.md").read_text(encoding="utf-8") == "mine"
     assert not (tmp_path / ".agents" / "skills" / "alpha.bak").exists()
     assert not (tmp_path / ".agents" / "skills" / "alpha.incoming").exists()
+
+
+# A platform CUDA wheels are published for, so detection reaches the steps
+# these tests are about rather than stopping at "no wheels for this machine".
+CUDA_PLATFORM = "win32" if sys.platform == "win32" else "linux"
+CUDA_MACHINE = "AMD64" if sys.platform == "win32" else "x86_64"
+
+
+def _fake_uv(tmp_path: Path) -> Path:
+    """A uv stand-in that creates the environment layout a real sync would."""
+    if sys.platform == "win32":
+        fake_uv = tmp_path / "uv.bat"
+        fake_uv.write_text(
+            "@echo off\r\n"
+            'if not "%~1"=="sync" exit /b 1\r\n'
+            "md %UV_PROJECT_ENVIRONMENT%\\Scripts\r\n"
+            "type nul > %UV_PROJECT_ENVIRONMENT%\\Scripts\\python.exe\r\n",
+            newline="",
+        )
+    else:
+        fake_uv = tmp_path / "uv"
+        fake_uv.write_text(
+            "#!/bin/sh\n"
+            'test "$1" = "sync"\n'
+            'mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"\n'
+            'printf "" > "$UV_PROJECT_ENVIRONMENT/bin/python"\n'
+        )
+        fake_uv.chmod(0o755)
+    return fake_uv
+
+
+@pytest.mark.parametrize(
+    ("requested", "platform_name", "machine", "report", "expected", "reason"),
+    [
+        ("cpu", "linux", "x86_64", "550.54.14, A100", "cpu", "CPU was requested"),
+        ("auto", "darwin", "arm64", None, "cpu", "no CUDA wheels are published"),
+        ("auto", "linux", "x86_64", None, "cpu", "no usable NVIDIA driver"),
+        ("auto", "linux", "x86_64", "", "cpu", "no usable NVIDIA driver"),
+        ("auto", "linux", "x86_64", "470.10, Tesla T4", "cpu", "is below the 525.60"),
+        ("auto", "linux", "x86_64", "550.54.14, A100", "cuda", "satisfies the pinned"),
+        ("auto", "win32", "AMD64", "560.1, RTX 4090", "cuda", "satisfies the pinned"),
+        ("auto", "win32", "AMD64", "527.40, RTX 4090", "cpu", "is below the 527.41"),
+        ("cuda", "darwin", "arm64", None, "cpu", "CUDA was requested but"),
+        ("coreml", "darwin", "arm64", None, "cpu", "INCODE_EMBED_ACCELERATOR=coreml"),
+        ("webgpu", "linux", "x86_64", None, "cpu", "no locked installation"),
+        ("migraphx", "linux", "x86_64", None, "cpu", "no locked installation"),
+    ],
+)
+def test_accelerator_detection_nominates_only_a_supported_pinned_combination(
+    requested: str,
+    platform_name: str,
+    machine: str,
+    report: str | None,
+    expected: str,
+    reason: str,
+) -> None:
+    installer = load_installer()
+
+    plan = installer.plan_accelerator(
+        requested,
+        platform_name=platform_name,
+        machine=machine,
+        nvidia_report=lambda: report,
+    )
+
+    assert plan.accelerator == expected
+    assert reason in plan.reason
+
+
+def test_a_cpu_installation_retracts_an_earlier_accelerator_offer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A machine reinstalled as CPU-only must stop advertising a GPU it had."""
+    installer = load_installer()
+    data = tmp_path / "data"
+    data.mkdir()
+    record = data / "accelerator.json"
+    record.write_text('{"schema_version": 1}', encoding="utf-8")
+    monkeypatch.setattr(installer, "runtime_data_directory", lambda python: data)
+
+    plan = installer.configure_accelerator(tmp_path / "checkout", "cpu")
+
+    assert plan.accelerator == "cpu"
+    assert not record.exists()
+
+
+def test_a_prepared_accelerator_is_recorded_only_after_its_probe_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    data = tmp_path / "data"
+    probed: list[tuple[Path, str]] = []
+    monkeypatch.setattr(installer, "runtime_data_directory", lambda python: data)
+    monkeypatch.setattr(installer, "interpreter_version", lambda python: "3.12")
+
+    def fake_probe(python: Path, accelerator: str, *, offline: bool = False) -> dict[str, object]:
+        probed.append((python, accelerator))
+        return {
+            "ok": True,
+            "interpreter": str(python),
+            "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+            "runtime_version": "1.23.2",
+            "python_version": "3.12",
+            "device": "cuda:0",
+            "detail": "probed 2 passages on CUDAExecutionProvider",
+        }
+
+    monkeypatch.setattr(installer, "probe_accelerator", fake_probe)
+
+    plan = installer.configure_accelerator(
+        checkout,
+        "cuda",
+        uv_executable=str(_fake_uv(tmp_path)),
+        nvidia_report=lambda: "550.54.14, NVIDIA A100",
+        platform_name=CUDA_PLATFORM,
+        machine=CUDA_MACHINE,
+    )
+
+    assert plan.accelerator == "cuda"
+    assert plan.driver_version == "550.54.14"
+    assert len(probed) == 1
+    assert probed[0][1] == "cuda"
+    written = json.loads((data / "accelerator.json").read_text())
+    assert written["accelerator"] == "cuda"
+    assert written["driver_version"] == "550.54.14"
+    assert written["providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+
+def test_the_installer_record_is_the_shape_the_runtime_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """install.py is stdlib-only, so the schema it writes is pinned by this test."""
+    from incode_mcp.accelerator_env import load_environment
+
+    installer = load_installer()
+    interpreter = tmp_path / "python"
+    interpreter.write_text("", encoding="utf-8")
+    data = tmp_path / "data"
+    plan = installer.AcceleratorPlan("cuda", "detected", driver_version="550.54.14")
+
+    installer.write_accelerator_record(
+        data / "accelerator.json",
+        plan,
+        {
+            "interpreter": str(interpreter),
+            "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+            "runtime_version": "1.23.2",
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "device": "cuda:0",
+            "detail": "probed 2 passages",
+        },
+    )
+
+    status = load_environment(data)
+    assert status.reason is None
+    assert status.environment is not None
+    assert status.environment.accelerator.value == "cuda"
+    assert status.environment.interpreter == interpreter
+    assert status.environment.driver_version == "550.54.14"
+
+
+def test_a_failed_probe_rolls_the_installation_back_to_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half-built environment must leave nothing the server could pick up."""
+    installer = load_installer()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    stale = data / "accelerator.json"
+    stale.write_text('{"schema_version": 1}', encoding="utf-8")
+    monkeypatch.setattr(installer, "runtime_data_directory", lambda python: data)
+    monkeypatch.setattr(installer, "interpreter_version", lambda python: "3.12")
+
+    def failing_probe(
+        python: Path, accelerator: str, *, offline: bool = False
+    ) -> dict[str, object]:
+        raise installer.InstallerError("The accelerator probe failed: no CUDA-capable device")
+
+    monkeypatch.setattr(installer, "probe_accelerator", failing_probe)
+
+    plan = installer.configure_accelerator(
+        checkout,
+        "cuda",
+        uv_executable=str(_fake_uv(tmp_path)),
+        nvidia_report=lambda: "550.54.14, NVIDIA A100",
+        platform_name=CUDA_PLATFORM,
+        machine=CUDA_MACHINE,
+    )
+
+    assert plan.accelerator == "cpu"
+    assert "could not be prepared" in plan.reason
+    assert "no CUDA-capable device" in plan.reason
+    assert not stale.exists()
+    assert not (checkout / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY).exists()
+
+
+def test_an_unresolvable_data_directory_never_fails_the_installation(tmp_path: Path) -> None:
+    installer = load_installer()
+
+    plan = installer.configure_accelerator(tmp_path / "checkout", "auto")
+
+    assert plan.accelerator == "cpu"
+    assert "data directory could not be resolved" in plan.reason
+
+
+def test_the_probe_refuses_an_environment_that_does_not_offer_the_provider() -> None:
+    """Run the real probe in this CPU environment: it must refuse CUDA, and say so.
+
+    This is the pairing that matters -- the probe's report format and the
+    installer's reading of it -- exercised end to end without a GPU.
+    """
+    installer = load_installer()
+
+    with pytest.raises(installer.InstallerError) as failure:
+        installer.probe_accelerator(Path(sys.executable), "cuda")
+
+    message = str(failure.value)
+    assert "The accelerator probe failed" in message
+    assert "CUDAExecutionProvider is not offered" in message
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs a POSIX shell script")
+def test_a_probe_that_reports_nothing_is_a_failure_not_a_pass(tmp_path: Path) -> None:
+    installer = load_installer()
+    silent = tmp_path / "silent-python"
+    silent.write_text("#!/bin/sh\nexit 5\n", encoding="utf-8")
+    silent.chmod(0o755)
+
+    with pytest.raises(installer.InstallerError, match="returned no report"):
+        installer.probe_accelerator(silent, "cuda")

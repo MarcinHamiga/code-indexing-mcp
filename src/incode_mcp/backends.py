@@ -57,9 +57,9 @@ class BackendDescriptor:
     stability: Stability
     precision: Precision
     runtime_version: str = ""
-    # Populated in Phase 3, alongside the NVIDIA driver/runtime detection the
-    # locked CUDA installation needs. It reaches the probe cache key already,
-    # so filling it in there is all that promotion requires.
+    # Read from the installer's accelerator record, where a probe wrote down the
+    # driver it verified against. It is part of the probe cache key, so a driver
+    # upgrade retires the verdict recorded under the old one.
     driver_version: str = ""
 
     @property
@@ -97,9 +97,12 @@ ACCELERATOR_BACKENDS: tuple[BackendDescriptor, ...] = (
         accelerator=Accelerator.CUDA,
         provider="CUDAExecutionProvider",
         device="cuda:0",
-        # Promoted to AUTOMATIC in Phase 3, once the locked CUDA installation
-        # and the cosine-similarity and throughput gates land with it.
-        stability=Stability.MANUAL,
+        # The first accelerator to reach automatic selection: it is installed
+        # from a pinned CUDA/cuDNN/ONNX Runtime window into an environment of
+        # its own, and probed there before the record that offers it is written.
+        # Reaching AUTOMATIC only makes it *eligible* -- ``auto`` still passes
+        # over it on a machine whose installation never prepared it.
+        stability=Stability.AUTOMATIC,
         precision=Precision.FLOAT32,
     ),
     BackendDescriptor(
@@ -155,6 +158,19 @@ class BackendSelection:
     def fell_back_to(self, descriptor: BackendDescriptor, reason: str) -> BackendSelection:
         """Return this selection re-pointed at *descriptor* after a failure."""
         return replace(self, descriptor=descriptor, honored=False, fallback_reason=reason)
+
+    def described_as(self, descriptor: BackendDescriptor) -> BackendSelection:
+        """Return this selection with the same choice described more fully."""
+        return replace(self, descriptor=descriptor)
+
+    def diagnosed(self, reason: str) -> BackendSelection:
+        """Return this selection carrying an additional reason for its outcome.
+
+        Whether the request was honoured is not re-decided here: this only adds
+        what the caller knows about *why* selection landed where it did.
+        """
+        combined = f"{self.fallback_reason}; {reason}" if self.fallback_reason else reason
+        return replace(self, fallback_reason=combined)
 
     def require_honored(self) -> None:
         """Raise when strict mode forbids the fallback this selection records."""
@@ -265,8 +281,9 @@ def select_backend(
             # honored: automatic selection asked for the best qualifying
             # backend and CPU is the correct answer when none qualifies.
             fallback_reason=(
-                "no accelerator has reached automatic selection on this machine; "
-                "set INCODE_EMBED_ACCELERATOR to override"
+                "no accelerator is prepared and eligible on this machine; reinstall "
+                "with --accelerator to prepare one, or set INCODE_EMBED_ACCELERATOR "
+                "to force a backend this installation already offers"
             ),
         )
 
@@ -287,7 +304,8 @@ def select_backend(
             honored=False,
             fallback_reason=(
                 f"{explicit.provider} is not among the execution providers this "
-                f"installation offers ({', '.join(providers)})"
+                f"installation offers ({', '.join(providers)}); reinstall with "
+                f"--accelerator {explicit.accelerator.value} to prepare it"
             ),
         )
     if explicit.stability is not Stability.AUTOMATIC:
