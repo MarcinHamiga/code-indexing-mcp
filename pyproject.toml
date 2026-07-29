@@ -102,6 +102,7 @@ addopts = "-ra"
 testpaths = ["tests"]
 pythonpath = ["scripts"]
 markers = [
+    "accelerator: runs correctness and performance gates on a prepared accelerator runner",
     "model: downloads and exercises the real embedding model",
     "memory: runs the real-model indexing memory gate",
 ]
