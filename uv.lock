@@ -177,11 +177,11 @@ migraphx = [
     { name = "tokenizers", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 webgpu = [
-    { name = "huggingface-hub", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "numpy", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "onnxruntime", version = "1.24.4", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "onnxruntime-ep-webgpu", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "tokenizers", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "huggingface-hub", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "numpy", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "onnxruntime", version = "1.24.4", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "onnxruntime-ep-webgpu", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "tokenizers", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
 ]
 
 [package.dev-dependencies]
@@ -199,14 +199,14 @@ requires-dist = [
     { name = "fastembed", marker = "extra == 'cpu'", specifier = ">=0.7,<1" },
     { name = "fastembed-gpu", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'cuda')", specifier = ">=0.7,<1" },
     { name = "filelock", specifier = ">=3.18,<4" },
-    { name = "huggingface-hub", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = ">=1,<2" },
+    { name = "huggingface-hub", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = ">=1,<2" },
     { name = "huggingface-hub", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'migraphx'", specifier = ">=1,<2" },
     { name = "lancedb", specifier = ">=0.25,<1" },
     { name = "mcp", specifier = ">=1.27,<2" },
-    { name = "numpy", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = ">=2,<3" },
+    { name = "numpy", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = ">=2,<3" },
     { name = "numpy", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'migraphx'", specifier = ">=2,<3" },
-    { name = "onnxruntime", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = "==1.24.4" },
-    { name = "onnxruntime-ep-webgpu", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = "==0.1.0" },
+    { name = "onnxruntime", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = "==1.24.4" },
+    { name = "onnxruntime-ep-webgpu", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = "==0.1.0" },
     { name = "onnxruntime-gpu", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'cuda')", specifier = ">=1.22,<1.24" },
     { name = "onnxruntime-migraphx", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'migraphx'", url = "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" },
     { name = "pathspec", specifier = ">=0.12,<1" },
@@ -214,7 +214,7 @@ requires-dist = [
     { name = "psutil", specifier = ">=7,<8" },
     { name = "pyarrow", specifier = ">=20,<24" },
     { name = "pydantic", specifier = ">=2.11,<3" },
-    { name = "tokenizers", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = ">=0.22,<1" },
+    { name = "tokenizers", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = ">=0.22,<1" },
     { name = "tokenizers", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'migraphx'", specifier = ">=0.22,<1" },
     { name = "tomli-w", specifier = ">=1.2,<2" },
     { name = "tree-sitter", specifier = ">=0.25,<0.27" },
@@ -249,7 +249,7 @@ name = "coloredlogs"
 version = "15.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "humanfriendly", marker = "extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or (extra == 'extra-17-code-indexing-mcp-cpu' and extra == 'extra-17-code-indexing-mcp-webgpu')" },
+    { name = "humanfriendly" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cc/c7/eed8f27100517e8c0e6b923d5f0845d0cb99763da6fdee00478f91db7325/coloredlogs-15.0.1.tar.gz", hash = "sha256:7c991aa71a4577af2f82600d8f8f3a89f936baeaf9b50a9c197da014e5bf16b0", size = 278520, upload-time = "2021-06-11T10:22:45.202Z" }
 wheels = [
@@ -479,15 +479,15 @@ name = "huggingface-hub"
 version = "1.24.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", marker = "extra == 'extra-17-code-indexing-mcp-cpu' or extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or extra == 'extra-17-code-indexing-mcp-webgpu'" },
-    { name = "filelock", marker = "extra == 'extra-17-code-indexing-mcp-cpu' or extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or extra == 'extra-17-code-indexing-mcp-webgpu'" },
-    { name = "fsspec", marker = "extra == 'extra-17-code-indexing-mcp-cpu' or extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or extra == 'extra-17-code-indexing-mcp-webgpu'" },
-    { name = "hf-xet", marker = "(platform_machine == 'AMD64' and extra == 'extra-17-code-indexing-mcp-cpu') or (platform_machine == 'AMD64' and extra == 'extra-17-code-indexing-mcp-cuda') or (platform_machine == 'AMD64' and extra == 'extra-17-code-indexing-mcp-migraphx') or (platform_machine == 'AMD64' and extra == 'extra-17-code-indexing-mcp-webgpu') or (platform_machine == 'aarch64' and extra == 'extra-17-code-indexing-mcp-cpu') or (platform_machine == 'aarch64' and extra == 'extra-17-code-indexing-mcp-cuda') or (platform_machine == 'aarch64' and extra == 'extra-17-code-indexing-mcp-migraphx') or (platform_machine == 'aarch64' and extra == 'extra-17-code-indexing-mcp-webgpu') or (platform_machine == 'amd64' and extra == 'extra-17-code-indexing-mcp-cpu') or (platform_machine == 'amd64' and extra == 'extra-17-code-indexing-mcp-cuda') or (platform_machine == 'amd64' and extra == 'extra-17-code-indexing-mcp-migraphx') or (platform_machine == 'amd64' and extra == 'extra-17-code-indexing-mcp-webgpu') or (platform_machine == 'arm64' and extra == 'extra-17-code-indexing-mcp-cpu') or (platform_machine == 'arm64' and extra == 'extra-17-code-indexing-mcp-cuda') or (platform_machine == 'arm64' and extra == 'extra-17-code-indexing-mcp-migraphx') or (platform_machine == 'arm64' and extra == 'extra-17-code-indexing-mcp-webgpu') or (platform_machine == 'x86_64' and extra == 'extra-17-code-indexing-mcp-cpu') or (platform_machine == 'x86_64' and extra == 'extra-17-code-indexing-mcp-cuda') or (platform_machine == 'x86_64' and extra == 'extra-17-code-indexing-mcp-migraphx') or (platform_machine == 'x86_64' and extra == 'extra-17-code-indexing-mcp-webgpu') or (extra == 'extra-17-code-indexing-mcp-cpu' and extra == 'extra-17-code-indexing-mcp-cuda') or (extra == 'extra-17-code-indexing-mcp-cpu' and extra == 'extra-17-code-indexing-mcp-migraphx') or (extra == 'extra-17-code-indexing-mcp-cpu' and extra == 'extra-17-code-indexing-mcp-webgpu') or (extra == 'extra-17-code-indexing-mcp-cuda' and extra == 'extra-17-code-indexing-mcp-migraphx') or (extra == 'extra-17-code-indexing-mcp-cuda' and extra == 'extra-17-code-indexing-mcp-webgpu') or (extra == 'extra-17-code-indexing-mcp-migraphx' and extra == 'extra-17-code-indexing-mcp-webgpu')" },
-    { name = "httpx", marker = "extra == 'extra-17-code-indexing-mcp-cpu' or extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or extra == 'extra-17-code-indexing-mcp-webgpu'" },
-    { name = "packaging", marker = "extra == 'extra-17-code-indexing-mcp-cpu' or extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or extra == 'extra-17-code-indexing-mcp-webgpu'" },
-    { name = "pyyaml", marker = "extra == 'extra-17-code-indexing-mcp-cpu' or extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or extra == 'extra-17-code-indexing-mcp-webgpu'" },
-    { name = "tqdm", marker = "extra == 'extra-17-code-indexing-mcp-cpu' or extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or extra == 'extra-17-code-indexing-mcp-webgpu'" },
-    { name = "typing-extensions", marker = "extra == 'extra-17-code-indexing-mcp-cpu' or extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or extra == 'extra-17-code-indexing-mcp-webgpu'" },
+    { name = "click" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
+    { name = "httpx" },
+    { name = "packaging" },
+    { name = "pyyaml" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/df/9b/d3bb4e7d792835daf34dd7091bbc7d7b4e0437d9388f1ea7239cce49f478/huggingface_hub-1.24.0.tar.gz", hash = "sha256:18431ff4daae0749aa9ba102fc952e314c98e1d30ebdec5319d85ca0a83e1ae5", size = 921848, upload-time = "2026-07-17T09:54:01.022Z" }
 wheels = [
@@ -499,7 +499,7 @@ name = "humanfriendly"
 version = "10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyreadline3", marker = "(sys_platform == 'win32' and extra == 'extra-17-code-indexing-mcp-cuda') or (sys_platform == 'win32' and extra == 'extra-17-code-indexing-mcp-migraphx') or (extra == 'extra-17-code-indexing-mcp-cuda' and extra == 'extra-17-code-indexing-mcp-migraphx') or (extra == 'extra-17-code-indexing-mcp-cuda' and extra == 'extra-17-code-indexing-mcp-webgpu') or (extra == 'extra-17-code-indexing-mcp-migraphx' and extra == 'extra-17-code-indexing-mcp-webgpu') or (extra == 'extra-17-code-indexing-mcp-cpu' and extra == 'extra-17-code-indexing-mcp-cuda') or (extra == 'extra-17-code-indexing-mcp-cpu' and extra == 'extra-17-code-indexing-mcp-migraphx') or (extra == 'extra-17-code-indexing-mcp-cpu' and extra == 'extra-17-code-indexing-mcp-webgpu')" },
+    { name = "pyreadline3", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cc/3f/2c29224acb2e2df4d2046e4c73ee2662023c58ff5b113c4c1adac0886c43/humanfriendly-10.0.tar.gz", hash = "sha256:6b0b831ce8f15f7300721aa49829fc4e83921a9a301cc7f606be6686a2288ddc", size = 360702, upload-time = "2021-09-17T21:40:43.31Z" }
 wheels = [
@@ -1422,7 +1422,7 @@ name = "sympy"
 version = "1.14.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "mpmath", marker = "extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or extra == 'extra-17-code-indexing-mcp-webgpu'" },
+    { name = "mpmath" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/83/d3/803453b36afefb7c2bb238361cd4ae6125a569b4db67cd9e79846ba2d68c/sympy-1.14.0.tar.gz", hash = "sha256:d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517", size = 7793921, upload-time = "2025-04-27T18:05:01.611Z" }
 wheels = [
@@ -1434,7 +1434,7 @@ name = "tokenizers"
 version = "0.23.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "huggingface-hub", marker = "extra == 'extra-17-code-indexing-mcp-cpu' or extra == 'extra-17-code-indexing-mcp-cuda' or extra == 'extra-17-code-indexing-mcp-migraphx' or extra == 'extra-17-code-indexing-mcp-webgpu'" },
+    { name = "huggingface-hub" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c1/60/21f715d9faba5f5407ff759472ade058ec4a507ad62bcea47cb847239a73/tokenizers-0.23.1.tar.gz", hash = "sha256:1feeeadf865a7915adc25445dea30e9933e593c31bb96c277cee36de227c8bfa", size = 365748, upload-time = "2026-04-27T14:43:25.606Z" }
 wheels = [

@@ -1013,7 +1013,7 @@ def test_accelerator_detection_nominates_only_a_supported_pinned_combination(
     ("platform_name", "machine", "platform_version", "expected"),
     [
         ("darwin", "arm64", "14.0", "webgpu"),
-        ("darwin", "x86_64", "14.6", "webgpu"),
+        ("darwin", "x86_64", "14.6", "cpu"),
         ("darwin", "arm64", "13.6", "cpu"),
         ("linux", "x86_64", "", "webgpu"),
         ("win32", "AMD64", "", "webgpu"),

@@ -51,10 +51,11 @@ MINIMUM_NVIDIA_DRIVER = {"linux": (525, 60), "win32": (527, 41)}
 # that extra to nothing and build an environment with no embedding runtime in
 # it at all, which fails the probe for a reason that explains nothing.
 CUDA_PLATFORMS = {"linux": {"x86_64"}, "win32": {"amd64"}}
-# The native WebGPU plugin's published 0.1.0 wheels. The macOS wheel has a
-# deployment target of 14.0; Linux and Windows publish x86-64 wheels only.
+# The native WebGPU plugin/core pair's published wheels. The plugin's macOS
+# wheel is universal2, but ONNX Runtime 1.24.4 itself is arm64-only there and
+# has a deployment target of 14.0. Linux and Windows publish x86-64 wheels.
 WEBGPU_PLATFORMS = {
-    "darwin": {"arm64", "x86_64"},
+    "darwin": {"arm64"},
     "linux": {"x86_64"},
     "win32": {"amd64"},
 }
