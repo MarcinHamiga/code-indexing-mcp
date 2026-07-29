@@ -444,7 +444,13 @@ class EmbeddingWorkerSession:
                 )
         try:
             status, payload = self._connection.recv()
-        except EOFError as exc:
+        except (EOFError, OSError) as exc:
+            # A worker that closes cleanly ends the channel with ``EOFError``,
+            # but one that dies mid-request drops its end of a socket-backed
+            # connection instead, which surfaces as ``ConnectionResetError``.
+            # Both mean the same thing to a caller -- there is no result coming
+            # -- so both leave as this session's own failure rather than as a
+            # raw socket error from inside the indexing pipeline.
             self.close()
             self.termination_reason = "channel_closed"
             raise IncodeError(

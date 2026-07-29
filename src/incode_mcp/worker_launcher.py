@@ -341,7 +341,11 @@ class _Channel:
     @classmethod
     def open(cls) -> _Channel:
         directory: Path | None = None
-        if os.name == "nt":
+        # Spelled as ``sys.platform`` rather than ``os.name`` so a type checker
+        # reads it as the platform guard it is: on Windows ``socket.AF_UNIX``
+        # does not exist, and only this form tells mypy the branch below is
+        # unreachable there instead of an attribute error.
+        if sys.platform == "win32":
             # Windows has no AF_UNIX story worth relying on here, so the channel
             # is a loopback socket on an ephemeral port. It is reachable by any
             # process on the machine, which is what the challenge-response is
