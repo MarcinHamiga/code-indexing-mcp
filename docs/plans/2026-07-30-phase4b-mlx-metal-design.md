@@ -19,9 +19,12 @@ built, and records what the measurement said.
 - Worker routing, probe verification, and acceptance gates for a backend whose runtime is not ONNX
   Runtime at all.
 
-Out of scope: automatic selection of MLX (it stays `EXPERIMENTAL` until its gates pass), any change
-to the default model, tokenizer, pooling, normalization, vector dimension, or stored text, and any
-PyTorch/MPS work — which the long-term plan only allows if MLX fails model parity.
+MLX entered the registry as `EXPERIMENTAL` and was promoted to `AUTOMATIC` within this slice once
+its gates were measured and passed; see "Testing and promotion" below.
+
+Out of scope: any change to the default model, tokenizer, pooling, normalization, vector dimension,
+or stored text, and any PyTorch/MPS work — which the long-term plan only allows if MLX fails model
+parity, and it did not.
 
 ## Chosen approach
 
@@ -118,7 +121,9 @@ installer nominates `mlx` only on macOS 14+ arm64. MLX also publishes CPU-only L
 wheels; nominating those would install a "Metal" backend with no Metal in it, so the marker excludes
 them. An unsupported `--accelerator mlx` request reports why and installs CPU — unlike MIGraphX,
 which falls through to WebGPU, because a request for Metal on a machine that has no Metal is not a
-request for Vulkan. `auto` still considers only CUDA.
+request for Vulkan. Since promotion, `auto` prepares MLX on a supported Mac and falls through to the
+existing CUDA detection everywhere else; an explicit `--accelerator cuda` is never answered with
+MLX, because an override names a backend rather than whatever the machine has.
 
 The macOS version is recorded as the environment's `driver_version`, which puts it in the probe
 cache key: an OS upgrade under a prepared environment retires the verdict recorded before it.
@@ -148,5 +153,9 @@ extra and therefore no MLX. Coverage is split accordingly:
 - Across environments, opt-in on real hardware (`-m accelerator`): vector and ranking parity against
   the CPU model and a forced 1,000-chunk index against the 1.25× gate.
 
-Promotion to `automatic` requires the same gates CUDA passed. This slice measures them and records
-the result; it does not decide the outcome in advance.
+Promotion to `automatic` requires the same gates CUDA passed. They were measured on an Apple M4 Pro
+running macOS 26.5.2, against the corpus Phase 4A used, and passed: cosine 1.0 per row with
+identical top-5 rankings, and 1.52–1.56× on a forced 1,000-chunk index against a 1.25× threshold, at
+lower peak memory than CPU. MLX is promoted on that evidence, which is one machine rather than a
+matrix of Apple Silicon runners — a `--accelerator cpu` reinstall or
+`INCODE_EMBED_ACCELERATOR=cpu` is the way back for a Mac where it does not hold.
