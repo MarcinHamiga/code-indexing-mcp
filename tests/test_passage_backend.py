@@ -180,30 +180,43 @@ def _backend(
     calibrated_batch_size: int = 8,
     accelerator_factory: Callable[[], EmbeddingWorkerSession] | None = None,
     on_degrade: Callable[[BackendSelection], None] | None = None,
+    crossover_characters: int = 0,
+    calibration_plan: SegmentPlan | None = None,
+    cpu_probe_key: ProbeKey | None = None,
 ) -> PassageBackendSession:
     cpu_started: list[int] = []
+    accelerator_started: list[int] = []
 
     def cpu_factory() -> EmbeddingWorkerSession:
         cpu_started.append(1)
         return _session(cpu_target, _config(Accelerator.CPU.value, CPU_BACKEND.providers))
 
+    build_accelerator = accelerator_factory or (
+        lambda: _session(
+            accelerator_target, _config(Accelerator.CUDA.value, CUDA_BACKEND.providers)
+        )
+    )
+
+    def counted_accelerator_factory() -> EmbeddingWorkerSession:
+        accelerator_started.append(1)
+        return build_accelerator()
+
     session = PassageBackendSession(
         selection or _accelerator_selection(),
-        accelerator_factory=accelerator_factory
-        or (
-            lambda: _session(
-                accelerator_target, _config(Accelerator.CUDA.value, CUDA_BACKEND.providers)
-            )
-        ),
+        accelerator_factory=counted_accelerator_factory,
         cpu_factory=cpu_factory,
         strict=strict,
         probe_cache=probe_cache,
         probe_key=probe_key,
+        cpu_probe_key=cpu_probe_key,
         calibrated_batch_size=calibrated_batch_size,
         dimension=DIMENSION,
         on_degrade=on_degrade,
+        crossover_characters=crossover_characters,
+        calibration_plan=calibration_plan,
     )
     session.cpu_starts = cpu_started  # type: ignore[attr-defined]
+    session.accelerator_starts = accelerator_started  # type: ignore[attr-defined]
     return session
 
 
@@ -550,7 +563,8 @@ def test_strict_mode_reports_no_degradation_because_it_permits_none() -> None:
 
 
 def test_an_uncalibrated_probe_records_no_batch_size(tmp_path: Path) -> None:
-    """Nothing measures a batch size yet, and the cache must not imply one."""
+    """A session given no calibration plan measures nothing, and the cache must
+    not imply a size that a later run would then start its batches at."""
     cache = ProbeCache(tmp_path / "probes.json")
     key = _probe_key()
 
@@ -562,6 +576,172 @@ def test_an_uncalibrated_probe_records_no_batch_size(tmp_path: Path) -> None:
     record = cache.load(key)
     assert record is not None
     assert record.batch_size == 0
+
+
+# -- the workload crossover ------------------------------------------------
+
+
+def _sized_candidates(count: int, characters: int) -> list[PassageCandidate]:
+    return [PassageCandidate("", "x" * characters) for _ in range(count)]
+
+
+def test_a_run_below_the_crossover_never_starts_the_accelerator() -> None:
+    """Starting it costs a spawn and a model load this run cannot repay."""
+    with _backend(_healthy_worker, crossover_characters=10_000) as backend:
+        backend.plan_and_embed(_sized_candidates(2, 100), PLAN)
+
+        assert backend.accelerator_starts == []  # type: ignore[attr-defined]
+        assert backend.cpu_starts == [1]  # type: ignore[attr-defined]
+
+    assert backend.telemetry().backend == "cpu"
+
+
+def test_a_run_that_crosses_the_threshold_finishes_on_the_accelerator() -> None:
+    with _backend(_healthy_worker, crossover_characters=1_000) as backend:
+        backend.plan_and_embed(_sized_candidates(2, 100), PLAN)
+        assert backend.accelerator_starts == []  # type: ignore[attr-defined]
+
+        backend.plan_and_embed(_sized_candidates(4, 500), PLAN)
+
+        assert backend.accelerator_starts == [1]  # type: ignore[attr-defined]
+        # The CPU worker it started on is not left resident beside it.
+        assert backend.cpu_starts == [1]  # type: ignore[attr-defined]
+
+    assert backend.telemetry().backend == "cuda"
+
+
+def test_a_group_large_enough_on_its_own_crosses_before_embedding_it() -> None:
+    """The request in hand counts towards the threshold. Charging only what is
+    already embedded would send the one group big enough to justify the
+    accelerator to CPU, and start the accelerator for whatever came after."""
+    with _backend(_healthy_worker, crossover_characters=1_000) as backend:
+        backend.plan_and_embed(_sized_candidates(4, 500), PLAN)
+
+        assert backend.accelerator_starts == [1]  # type: ignore[attr-defined]
+        assert backend.cpu_starts == []  # type: ignore[attr-defined]
+
+
+def test_a_deferred_start_is_not_a_fallback() -> None:
+    """A run that was never meant to leave CPU has not degraded, and reporting
+    it as a fallback would make the field mean "small" as well as "broken"."""
+    with _backend(_healthy_worker, crossover_characters=10_000) as backend:
+        backend.plan_and_embed(_sized_candidates(1, 10), PLAN)
+
+    telemetry = backend.telemetry()
+    assert backend.fallback_count == 0
+    assert telemetry.fallback_reason is None
+    assert backend.selection.accelerator is Accelerator.CUDA
+
+
+def test_a_deferred_run_that_cannot_embed_on_cpu_does_not_try_the_accelerator() -> None:
+    """CPU is what everything falls back to. A CPU failure below the threshold
+    is the machine failing, not a reason to reach for the device."""
+    with (
+        _backend(
+            _healthy_worker, cpu_target=_dead_on_initialize_worker, crossover_characters=10_000
+        ) as backend,
+        pytest.raises(IncodeError),
+    ):
+        backend.plan_and_embed(_sized_candidates(1, 10), PLAN)
+
+    assert backend.accelerator_starts == []  # type: ignore[attr-defined]
+
+
+# -- calibration -----------------------------------------------------------
+
+
+def _cpu_probe_key() -> ProbeKey:
+    return ProbeKey(**{**_probe_key().__dict__, "accelerator": "cpu", "provider": CPU_PROVIDER})
+
+
+def test_calibration_measures_the_backend_and_records_what_it_found(tmp_path: Path) -> None:
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _probe_key()
+
+    with _backend(
+        _healthy_worker, probe_cache=cache, probe_key=key, calibration_plan=PLAN
+    ) as backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+
+    record = cache.load(key)
+    assert record is not None
+    assert record.batch_size > 0
+    assert record.characters_per_second > 0
+    assert record.load_ns > 0
+    assert backend.calibration is not None
+
+
+def test_the_reference_backend_is_measured_alongside_the_accelerator(
+    tmp_path: Path,
+) -> None:
+    """A crossover needs both rates, and CPU only ever runs here as a fallback,
+    so nothing else would ever measure it."""
+    cache = ProbeCache(tmp_path / "probes.json")
+
+    with _backend(
+        _healthy_worker,
+        probe_cache=cache,
+        probe_key=_probe_key(),
+        cpu_probe_key=_cpu_probe_key(),
+        calibration_plan=PLAN,
+    ) as backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+
+    record = cache.load(_cpu_probe_key())
+    assert record is not None
+    assert record.characters_per_second > 0
+
+
+def test_a_cached_calibration_is_not_measured_again(tmp_path: Path) -> None:
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _probe_key()
+    cache.store(key, batch_size=4, dimension=DIMENSION, characters_per_second=999.0, load_ns=7)
+
+    with _backend(
+        _healthy_worker, probe_cache=cache, probe_key=key, calibration_plan=PLAN
+    ) as backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+
+    assert backend.probe_state == "cached"
+    assert backend.calibration is not None
+    assert backend.calibration.characters_per_second == 999.0
+    assert backend.calibration.max_items == 4
+
+
+def _shrinking_worker(connection: Connection, config: WorkerConfig) -> None:
+    """Healthy, except that any microbatch above one item overruns the ceiling."""
+    while True:
+        command, payload = connection.recv()
+        if command == "stop":
+            return
+        if command == "initialize":
+            connection.send(("initialized", (tuple(config.providers), config.dimension)))
+            continue
+        if command == "probe":
+            connection.send(("probed", [_unit_vector(1.0) for _ in PROBE_TEXTS]))
+            continue
+        candidates, plan = payload
+        if plan.max_items > 1:
+            connection.send(("error", "INDEX_RESOURCE_LIMIT: exceeded its memory ceiling"))
+            continue
+        connection.send(("planned", (_packed_segments(len(candidates)), True)))
+
+
+def test_a_batch_size_an_overrun_reduced_replaces_the_calibrated_one(
+    tmp_path: Path,
+) -> None:
+    """Otherwise the next run rediscovers the same ceiling by overrunning it."""
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _probe_key()
+    cache.store(key, batch_size=8, dimension=DIMENSION, characters_per_second=100.0, load_ns=1)
+
+    with _backend(_shrinking_worker, probe_cache=cache, probe_key=key) as backend:
+        backend.plan_and_embed(_candidates(2), SegmentPlan(max_tokens=8, max_items=4))
+
+    record = cache.load(key)
+    assert record is not None
+    assert record.batch_size == 1
+    assert record.limited_by == "memory"
 
 
 # -- a respawned worker is not trusted on its predecessor's verification ---
