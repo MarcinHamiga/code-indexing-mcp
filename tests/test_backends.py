@@ -218,8 +218,23 @@ def test_mlx_is_registered_as_a_promoted_metal_backend() -> None:
     assert mlx.stability is Stability.AUTOMATIC
     assert mlx.uses_direct_model is True
     # MLX is not ONNX Runtime, so its target is never in a provider list the
-    # runtime published before anything was loaded.
+    # runtime published before anything was loaded -- and its environment has no
+    # provider list to publish at all.
     assert mlx.provider_is_preregistered is False
+    assert mlx.runs_on_onnx is False
+    assert mlx.publishes_execution_providers is False
+
+
+def test_a_plugin_provider_is_still_an_onnx_runtime_backend() -> None:
+    """Only the runtime is non-ONNX for MLX. WebGPU's provider merely arrives
+    late, so its environment still has an ONNX provider list to report."""
+    webgpu = backend_for(Accelerator.WEBGPU)
+
+    assert webgpu is not None
+    assert webgpu.runtime is Runtime.ONNX_PLUGIN
+    assert webgpu.provider_is_preregistered is False
+    assert webgpu.runs_on_onnx is True
+    assert webgpu.publishes_execution_providers is True
 
 
 def test_an_mlx_backend_has_no_onnx_cpu_provider_behind_it() -> None:

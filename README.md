@@ -53,7 +53,7 @@ indexing and prepares one when it can. Experimental backends must be named expli
 
 ```bash
 python3 install.py --accelerator auto      # CPU, a supported CUDA installation, or Metal via MLX
-python3 install.py --accelerator mlx      # Metal on Apple Silicon through MLX
+python3 install.py --accelerator mlx       # Metal on Apple Silicon through MLX
 python3 install.py --accelerator webgpu   # experimental Metal, Vulkan, or D3D12 path
 python3 install.py --accelerator migraphx # experimental pinned AMD/ROCm path
 ```
@@ -276,14 +276,35 @@ indexing runs. Memory the host already held when the worker started — the daem
 open Lance datasets — is not charged to the budget, so a warm daemon can still index. `IndexReport`
 reports both the budget and the true combined peak, plus a scan/parse/embed/commit duration split.
 
+Microbatches are bounded by three things at once: the item count above, the token budget per window,
+and the padded matrix `item_count × longest_padded_tokens`, which is what a batch actually
+materializes. That last budget scales with `INCODE_EMBED_MEMORY_MB` — it is memory charged to the
+same ceiling — floored so a single longest window always forms a batch and capped at eight times the
+2 GiB reference, because padding cost is quadratic in the widest member and nothing has been
+measured past that.
+
+A batch that overruns the ceiling is halved and retried, and the size that survived is adopted for
+the rest of that run — otherwise every group after it asks for the size that just overran and pays
+the same retries again — and written to the probe cache so the next run starts there rather than
+rediscovering the same limit. `model status` reports that size as `"reduced"` rather than
+`"measured"`, so a machine pinned low by one bad run says so. An explicit `INCODE_EMBED_BATCH_SIZE`
+overrides it outright.
+
+The same applies to a batch that takes the worker down with it rather than tripping the ceiling,
+which is what a device allocation failure usually looks like: the sizes measured below it still
+stand, so the backend is calibrated rather than left unmeasured. Only the memory ceiling has a
+setting behind it, so only that case recommends one.
+
 ### Embedding backends
 
 Acceleration targets passage indexing only. The query model stays in the serving process on CPU, so
 a search never waits on a worker spawning or a model loading onto a device.
 
 ```bash
-export INCODE_EMBED_ACCELERATOR=auto  # auto, cpu, cuda, webgpu, migraphx, coreml
-export INCODE_EMBED_STRICT=0          # 1 disables the CPU fallback
+export INCODE_EMBED_ACCELERATOR=auto  # auto, cpu, cuda, mlx, webgpu, migraphx, coreml
+export INCODE_EMBED_STRICT=0          # 1 disables the CPU fallback and the crossover
+export INCODE_EMBED_CROSSOVER=auto    # auto, off, or a character count
+export INCODE_EMBED_CALIBRATE=1       # 0 declines the one-time measurement
 ```
 
 `auto` selects the best backend that has passed its promotion gates *and* that this installation
@@ -388,16 +409,77 @@ A backend that fails is not retried for the life of the process. Only successes 
 without that a long-lived daemon would reload a dead accelerator onto the device before every
 index run.
 
+#### When the accelerator is worth starting
+
+A prepared accelerator is not worth using for every run. Starting one means spawning an interpreter,
+loading the model onto a device, and verifying it — which a re-index of a single edited file cannot
+repay. So the first run that verifies a backend also measures it, through the ordinary embedding
+path, at a ladder of batch sizes against a synthetic code-shaped corpus. It measures CPU the same
+way at the same time, because the decision is a comparison and a comparison needs both sides. Both
+results go in the probe cache, under the same key as the probe: model artifact, accelerator,
+provider, runtime version, platform, device, and driver. Anything moving re-measures.
+
+Two policies then have a cost each — `L_cpu + n/R_cpu` for staying on CPU and `L_accel + n/R_accel`
+for using the accelerator — and they meet at
+
+```text
+crossover = (L_accel - L_cpu) / (1/R_cpu - 1/R_accel)
+```
+
+characters of candidate text. What the accelerator has to earn back is the difference between the
+two loads, not its whole load: staying on CPU spawns a worker and loads a model too. On unified
+memory the accelerator often loads *faster* — an M4 Pro maps the converted MLX weights in 370 ms
+against 655 ms for the CPU ONNX graph — so the crossover is zero and it starts immediately.
+
+Where there is a crossover, the run begins on CPU and switches to the accelerator on the request
+that carries it past the threshold, counting the request in hand so the one group large enough to
+justify the device is not itself sent to CPU. Deciding this late costs at most one model load on a
+run that turns out to be large, and saves the same load on one that turns out to be small; the
+pipeline streams, so the size of a run is not known until it is over. The run that does the
+measuring also embeds at the size it just measured, rather than at the one its plan was built with
+before the sweep existed.
+
+An accelerator measured no faster than CPU has no crossover at all and is never started. That is
+reported as no threshold rather than as a very large one — `crossover_characters` is `null` in both
+`model status` and `IndexReport`, and the run says the backend measured no faster than CPU instead
+of naming a size it stayed below.
+
+A deferral is not a fallback. `fallback_count` stays at zero, no `embedding_fallback_reason` is set,
+and the process is not pinned to CPU the way a real degradation pins it — the next run decides again
+from its own size. `IndexReport` carries `embedded_characters`, `embedding_crossover_characters`, and
+`embedding_selection_reason`, so a run that stayed on CPU because it was small reads differently from
+one that fell back because something broke.
+
+`INCODE_EMBED_CROSSOVER=off` starts the accelerator on the first chunk, which is what every release
+before this one did; a character count pins the threshold. `INCODE_EMBED_CALIBRATE=0` declines the
+measurement, leaving both the batch size and the crossover unmeasured.
+
+`INCODE_EMBED_STRICT=1` turns the crossover off too. Strict mode is for a caller who would rather
+fail than quietly index at CPU speed, and a deferral is exactly that — quiet CPU indexing that no
+degradation reports and that strict mode could not refuse, because nothing failed.
+
+Measurement never installs, downloads, or changes anything: it embeds through a worker that is
+already running and writes one JSON file under the cache directory. The sweep runs on the worker
+the run will go on to use, so what it embedded, the retries it provoked, and the ceiling it walked
+up to are put back afterwards: they are measurement, not work the run did, and an `IndexReport` that
+counted them would describe a failure that never happened. The CPU reference is measured last of
+all, once the accelerator's worker has been retired, so the two models are never resident against
+the same ceiling at the same time.
+
 `code-indexing-mcp model status` reports the whole resolution without loading or probing anything:
 
 ```console
 $ code-indexing-mcp model status
 {
+  "accelerator_characters_per_second": null,
   "accelerator_environment": null,
+  "accelerator_load_ms": null,
   "accelerator_prepared": null,
   "available_providers": ["CoreMLExecutionProvider", "AzureExecutionProvider", "CPUExecutionProvider"],
   "batch_calibration": "default",
   "batch_size": 1,
+  "cpu_characters_per_second": null,
+  "crossover_characters": null,
   "device": "cpu",
   "dimension": 768,
   "driver_version": "",
@@ -406,6 +488,7 @@ $ code-indexing-mcp model status
   "fallback_reason": "no accelerator is prepared and eligible on this machine; reinstall with --accelerator to prepare one, or set INCODE_EMBED_ACCELERATOR to force a backend this installation already offers",
   "precision": "float32",
   "probe_cache_state": "not-applicable",
+  "recommended_override": null,
   "requested_accelerator": "auto",
   "resolved_accelerator": "cpu",
   "runtime_version": "1.27.0",
@@ -418,6 +501,14 @@ $ code-indexing-mcp model status
 this process's own, and `accelerator_prepared` names what the installer prepared, whether or not
 selection chose it.
 
+The measured fields are null until a run has verified and measured an accelerator on this machine.
+`crossover_characters` is null both before measurement and when the accelerator never overtakes CPU
+at any size — the two are distinguished by `accelerator_characters_per_second` being present.
+`recommended_override` names the one setting change the measurements argue for, when they argue for
+one: `INCODE_EMBED_ACCELERATOR=cpu` for an accelerator that lost, or `INCODE_EMBED_MEMORY_MB` for a
+batch size a ceiling overrun pinned down. It stays null the rest of the time rather than offering
+advice nothing measured.
+
 If installation reports a fallback, rerun the explicit installer command to see the build/probe
 reason, then use `code-indexing-mcp model status` to distinguish the requested backend, prepared
 environment, resolved provider, probe state, and fallback reason. Native provider failures never
@@ -426,6 +517,8 @@ environment before CPU is reported.
 
 `IndexReport` carries `embedding_backend`, `embedding_fallback_reason`, and `fallback_count`, so a
 run that started on an accelerator and finished on CPU says so rather than merely being slow.
+`embedding_backend` is where the work actually happened, which is not always what selection named: a
+run below the crossover reports `cpu` with an `embedding_selection_reason` and no fallback.
 
 The embedding model, tokenizer, pooling, normalisation, and vector dimension are the same on every
 backend, and execution provider and precision are diagnostic metadata rather than part of index

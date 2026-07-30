@@ -294,6 +294,21 @@ def test_a_failed_batch_is_retried_at_a_halved_microbatch_size() -> None:
     # 4 -> 2 -> 1, so two retries, and the run survives.
     assert session.retry_count == 2
     assert len(segments[0]) == 1
+    # The size that survived is remembered, so the next run starts there rather
+    # than rediscovering this limit by overrunning it again.
+    assert session.safe_max_items == 1
+
+
+def test_a_batch_that_never_had_to_shrink_reports_no_reduced_limit() -> None:
+    """Only a retry discovers a limit. Recording the requested size here would
+    pin every later run to whatever the first one happened to ask for."""
+    session = _session(_batch_size_sensitive_worker, 2 * 1024**3)
+
+    with session:
+        session.plan_and_embed([PassageCandidate("", "x")], SegmentPlan(max_tokens=8, max_items=1))
+
+    assert session.retry_count == 0
+    assert session.safe_max_items == 0
 
 
 def _always_failing_worker(connection: Connection, _: WorkerConfig) -> None:
@@ -432,6 +447,9 @@ def test_initialize_reports_the_providers_the_session_resolved() -> None:
 
     assert info.resolved_providers == ("CUDAExecutionProvider", "CPUExecutionProvider")
     assert info.dimension == 4
+    # Spawning the interpreter and loading the model is the cost a small run
+    # cannot repay, so it is measured rather than assumed.
+    assert session.load_duration_ns > 0
 
 
 def test_a_probe_that_returns_usable_vectors_is_accepted() -> None:

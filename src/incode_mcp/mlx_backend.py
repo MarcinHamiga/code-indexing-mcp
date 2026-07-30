@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 # existing conversion is rebuilt rather than read under new expectations.
 WEIGHT_LAYOUT_VERSION = 1
 
+# What a conversion in flight is called. It stays ``.safetensors`` because MLX
+# appends that to a name that lacks it, and would write somewhere this never
+# moves or cleans up.
+_TEMPORARY_SUFFIX = ".tmp.safetensors"
+
 # What the export adds to a masked score is -3.4028235e38; adding a negative
 # ALiBi bias to that overflows to -inf, which can leave a fused attention kernel
 # subtracting -inf from -inf. This underflows to exactly zero through exp in
@@ -173,10 +178,14 @@ def extract_weights(model_path: Path, config: ModelConfig) -> dict[str, FloatArr
 
     Each initializer's payload is released as it is converted, so the peak stays
     near one copy of the weights rather than holding the parsed protobuf and the
-    converted arrays at full size at the same time.
+    converted arrays at full size at the same time. How much that saves depends
+    on the protobuf implementation: under the C one, reading ``raw_data``
+    materialises a separate ``bytes`` and clearing the field frees the arena's
+    copy, while under the pure-Python one the two are the same object.
     """
     import onnx
     from onnx import numpy_helper
+    from onnx.external_data_helper import uses_external_data
 
     try:
         model = onnx.load(str(model_path), load_external_data=False)
@@ -195,6 +204,15 @@ def extract_weights(model_path: Path, config: ModelConfig) -> dict[str, FloatArr
             data_type = onnx.TensorProto.DataType.Name(tensor.data_type)
             raise ValueError(
                 f"The {described_as} tensor {name!r} has ONNX data type {data_type}, expected FLOAT"
+            )
+        if uses_external_data(tensor):
+            # The artifact is loaded without its external data and the snapshot
+            # this backend downloads carries no sidecar to load it from, so
+            # reading one here would resolve a path relative to the working
+            # directory and fail somewhere that could not explain itself.
+            raise ValueError(
+                f"The {described_as} tensor {name!r} is stored outside {model_path.name}; "
+                "this backend reads a self-contained artifact"
             )
         array = np.asarray(numpy_helper.to_array(tensor), dtype=np.float32)
         # Frees the protobuf's own copy; nothing reads this tensor twice.
@@ -230,7 +248,7 @@ def extract_weights(model_path: Path, config: ModelConfig) -> dict[str, FloatArr
         "embeddings.norm.bias": take(
             "embeddings.LayerNorm.bias", (config.hidden_size,), "embedding normalization"
         ),
-        "alibi_slopes": _alibi_slopes(by_output, numpy_helper, config),
+        "alibi_slopes": _alibi_slopes(by_name, by_output, numpy_helper, config),
     }
     for index in range(config.num_hidden_layers):
         for converted, (node_name, shape) in _layer_matmuls(index, config).items():
@@ -257,17 +275,17 @@ def _token_type_count(initializers: Mapping[str, Any]) -> int:
 
 
 def _alibi_slopes(
-    by_output: Mapping[str, Any], numpy_helper: Any, config: ModelConfig
+    by_name: Mapping[str, Any],
+    by_output: Mapping[str, Any],
+    numpy_helper: Any,
+    config: ModelConfig,
 ) -> FloatArray:
     """Read the per-head ALiBi slopes the export baked into the graph.
 
     Recomputing them from the head count would silently replace the slopes of a
     model that did not use the textbook powers of two.
     """
-    consumer = next(
-        (node for node in by_output.values() if node.name == _ALIBI_SLOPE_NODE),
-        None,
-    )
+    consumer = by_name.get(_ALIBI_SLOPE_NODE)
     if consumer is None or not consumer.input:
         raise ValueError(f"The ONNX artifact has no ALiBi bias node named {_ALIBI_SLOPE_NODE!r}")
     producer = by_output.get(consumer.input[0])
@@ -326,16 +344,43 @@ def ensure_converted_weights(
     for name in list(extracted):
         weights[name] = mx.array(extracted.pop(name))
     # Written aside and moved into place: a conversion interrupted halfway must
-    # not leave a truncated file that later loads read as complete. The suffix
-    # stays ``.safetensors`` because MLX appends it to a name that lacks one, and
-    # would write somewhere this never moves or cleans up.
-    temporary = target.with_name(f"{target.stem}.{os.getpid()}.tmp{target.suffix}")
+    # not leave a truncated file that later loads read as complete.
+    temporary = target.with_name(f"{target.stem}.{os.getpid()}{_TEMPORARY_SUFFIX}")
     try:
         mx.save_safetensors(str(temporary), weights)
+        # Flushed before the rename, so a machine that loses power mid-conversion
+        # cannot leave a renamed file holding whatever reached the disk. This
+        # file is read back as weights, and half-written weights would embed
+        # rather than fail.
+        descriptor = os.open(temporary, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+    _discard_superseded_conversions(target)
     return target
+
+
+def _discard_superseded_conversions(target: Path) -> None:
+    """Remove conversions of other revisions or layouts left beside *target*.
+
+    Each of these is 600 MB of a model this installation no longer resolves to,
+    and nothing else ever revisits them. A file another process is reading stays
+    readable through its open handle, and one still being written is skipped by
+    its suffix.
+    """
+    for path in target.parent.glob(f"*{target.suffix}"):
+        if path == target or path.name.endswith(_TEMPORARY_SUFFIX):
+            continue
+        try:
+            path.unlink()
+        except OSError:  # pragma: no cover - a cache this cannot prune still works
+            logger.debug("Could not remove the superseded MLX conversion %s", path)
+        else:
+            logger.info("Removed the superseded MLX conversion %s", path.name)
 
 
 def mask_mean_normalize(hidden: mx.array, attention_mask: mx.array) -> mx.array:
@@ -391,6 +436,13 @@ class JinaBertMlx:
         # Masked keys are pushed far below any score so they contribute nothing,
         # which is what keeps a passage's vector independent of the padding its
         # batch happened to need.
+        #
+        # ALiBi makes this dense: the bias differs per head and per position
+        # pair, so it cannot be expressed as the boolean mask a memory-efficient
+        # attention kernel would keep implicit. It costs one
+        # ``batch x heads x sequence^2`` float32 array, built once here rather
+        # than per layer, and it grows quadratically with the longest passage in
+        # the batch -- which is where MLX's advantage over CPU will run out.
         keys_masked = (1.0 - attention_mask.astype(mx.float32))[:, None, None, :] * MASK_FILL
         bias = weights["alibi_slopes"] * distance + keys_masked
 
@@ -462,9 +514,10 @@ class MlxEmbedding:
         # Constructing the model does not touch the device, so one real forward
         # pass over the smallest possible input is what proves Metal is there to
         # be used -- and it makes the report below a statement rather than a
-        # claim about an installed package.
-        self.model(mx.zeros((1, 2), dtype=mx.int64), mx.ones((1, 2), dtype=mx.int64))
-        mx.eval(self.model.weights)
+        # claim about an installed package. MLX is lazy, so the result has to be
+        # evaluated: discarding it unevaluated would dispatch nothing and prove
+        # nothing.
+        mx.eval(self.model(mx.zeros((1, 2), dtype=mx.int64), mx.ones((1, 2), dtype=mx.int64)))
         self.resolved_providers: tuple[str, ...] = (MLX_PROVIDER,)
 
     def passage_embed(self, documents: str | Iterable[str]) -> Iterable[FloatArray]:

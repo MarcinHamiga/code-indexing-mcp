@@ -24,6 +24,7 @@ from .backends import (
     runtime_version,
     select_backend,
 )
+from .calibration import LIMITED_BY_MEMORY, crossover_characters
 from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
 from .errors import ErrorCode, IncodeError
@@ -42,13 +43,14 @@ from .models import (
     SymbolResponse,
 )
 from .passage_backend import PassageBackendSession
-from .probe_cache import ProbeCache, ProbeKey, model_artifact_fingerprint
+from .probe_cache import ProbeCache, ProbeKey, ProbeRecord, model_artifact_fingerprint
 from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
 from .staging import recover_staged_commits
 from .storage import LanceStore
+from .token_batching import max_token_product_for
 from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,17 @@ logger = logging.getLogger(__name__)
 # whole of an index run. Wait only long enough to lose a race against a commit
 # that is about to finish; a run genuinely in flight is left to a later start.
 RECOVERY_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+def _rate(record: ProbeRecord | None) -> float | None:
+    """Return a measured rate, or None for one that was never measured.
+
+    A stored zero means the record predates its measurement, and reporting it
+    as zero characters per second would describe a backend that never finishes.
+    """
+    if record is None or record.characters_per_second <= 0:
+        return None
+    return record.characters_per_second
 
 
 @dataclass(frozen=True)
@@ -157,7 +170,11 @@ class Application:
                 cached = self.probe_cache.load(self._probe_key)
                 if cached is not None and cached.batch_size > 0:
                     self.embedding_batch_size = cached.batch_size
-                    self.batch_calibration = "calibrated"
+                    # A size something forced down is not the size calibration
+                    # chose, and a machine pinned low by one bad run has to be
+                    # able to say so. Which kind of ceiling stopped it is a
+                    # question for the recommendation, not for this label.
+                    self.batch_calibration = "reduced" if cached.limited_by else "measured"
 
         passage_session_factory: Callable[[], PassageBackendSession] | None = None
         if isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker":
@@ -173,6 +190,14 @@ class Application:
                 max_tokens=self.settings.embedding_max_tokens,
                 overlap_tokens=self.settings.embedding_overlap_tokens,
                 max_items=self.embedding_batch_size,
+                # The padded matrix a microbatch materializes is charged to the
+                # same ceiling as everything else the worker holds, so it is
+                # budgeted from that ceiling rather than from the constant it
+                # was measured at.
+                max_token_product=max_token_product_for(
+                    self.settings.index_memory_bytes,
+                    max_tokens=self.settings.embedding_max_tokens,
+                ),
             ),
             passage_session_factory=passage_session_factory,
             staging_directory=paths.data / "staging",
@@ -258,6 +283,121 @@ class Application:
             driver_version=descriptor.driver_version,
         )
 
+    def _cpu_probe_key(self) -> ProbeKey:
+        """The key CPU's own calibration is stored under.
+
+        CPU needs no probe to be trusted, but the crossover is a comparison and
+        a comparison needs both sides measured -- under a key that moves when
+        the model, the platform, or this process's runtime does, for the same
+        reasons the accelerator's does.
+        """
+        cache_directory = getattr(self.embedder, "cache_directory", self.paths.cache / "models")
+        return ProbeKey(
+            model_id=self.embedder.model_id,
+            model_artifact=model_artifact_fingerprint(
+                Path(cache_directory), self.embedder.model_id
+            ),
+            accelerator=CPU_BACKEND.accelerator.value,
+            provider=CPU_BACKEND.provider,
+            runtime_version=runtime_version(CPU_BACKEND.runtime),
+            platform=platform_fingerprint(),
+            device=CPU_BACKEND.device,
+        )
+
+    def _cpu_max_items(self) -> int:
+        """Return the microbatch size measured for CPU, if one was.
+
+        0 means CPU keeps whatever the indexer planned, which is correct both
+        when nothing has been measured and when the operator set a size
+        explicitly -- an explicit size is a size for the whole installation.
+        """
+        if not self.settings.embedding_batch_auto:
+            return 0
+        record = self.probe_cache.load(self._cpu_probe_key())
+        return 0 if record is None else record.batch_size
+
+    def _measurements(self) -> tuple[ProbeRecord | None, ProbeRecord | None]:
+        """Return what calibration recorded for CPU and for the accelerator."""
+        selection = self.effective_backend_selection
+        if not selection.uses_accelerator:
+            return self.probe_cache.load(self._cpu_probe_key()), None
+        key = self._probe_key or self._build_probe_key(self.embedder)
+        return self.probe_cache.load(self._cpu_probe_key()), self.probe_cache.load(key)
+
+    def crossover_characters(self) -> int | None:
+        """Return the run size below which this machine should stay on CPU.
+
+        0 means "start the accelerator immediately", which is the answer when
+        the operator turned deferral off and also when nothing has been measured
+        yet -- the first run on a machine is what does the measuring, and it
+        cannot defer on numbers it is in the middle of producing.
+
+        ``None`` means the accelerator never overtakes CPU, so no run is large
+        enough to be worth starting it for. That is not the same statement as a
+        very large threshold, and reporting it as one would name a size some run
+        could conceivably pass -- and would collide with an operator who pinned
+        that size deliberately.
+
+        Strict mode is a third such answer. It exists for a caller who would
+        rather fail than quietly index at CPU speed, and a deferral is quiet
+        CPU indexing that no degradation reports -- so under strict mode the
+        accelerator that was asked for is the one that runs, whatever the run
+        turns out to cost.
+        """
+        if self.settings.embedding_strict:
+            return 0
+        if not self.settings.embedding_crossover_auto:
+            return self.settings.embedding_crossover_characters
+        cpu, accelerator = self._measurements()
+        if cpu is None or accelerator is None:
+            return 0
+        return self._measured_crossover()
+
+    def _measured_crossover(self) -> int | None:
+        """Return the crossover the recorded measurements imply, if both exist.
+
+        What the machine measured, with no policy applied. ``model status``
+        reports this, so an explicit threshold or strict mode changes which runs
+        defer without changing what this machine was found to be.
+        """
+        cpu, accelerator = self._measurements()
+        if cpu is None or accelerator is None:
+            return None
+        return crossover_characters(
+            accelerator_load_ns=accelerator.load_ns,
+            cpu_load_ns=cpu.load_ns,
+            cpu_characters_per_second=cpu.characters_per_second,
+            accelerator_characters_per_second=accelerator.characters_per_second,
+        )
+
+    def _recommended_override(
+        self, cpu: ProbeRecord | None, accelerator: ProbeRecord | None
+    ) -> str | None:
+        """Return the one setting change the measurements argue for, if any.
+
+        Only a memory ceiling has a setting behind it. A batch that took the
+        worker down with it was reduced just the same, but raising the ceiling
+        is not what answers a device that could not make the allocation, so
+        that case is reported without advice attached.
+        """
+        if accelerator is not None and accelerator.limited_by == LIMITED_BY_MEMORY:
+            return (
+                "INCODE_EMBED_MEMORY_MB (a batch overran the ceiling and was reduced to "
+                f"{accelerator.batch_size})"
+            )
+        if (
+            cpu is not None
+            and accelerator is not None
+            and cpu.characters_per_second > 0
+            and accelerator.characters_per_second > 0
+            and accelerator.characters_per_second <= cpu.characters_per_second
+        ):
+            return (
+                "INCODE_EMBED_ACCELERATOR=cpu (the accelerator measured no faster than CPU "
+                "on this machine)"
+            )
+        return None
+
     def _passage_session_factory(
         self, embedder: FastEmbedder
     ) -> Callable[[], PassageBackendSession]:
@@ -305,13 +445,24 @@ class Application:
                 strict=strict,
                 probe_cache=self.probe_cache,
                 probe_key=probe_key,
-                # Phase 5 measures a batch size per backend and stores it here.
-                # Until then nothing has been calibrated, and saying otherwise
-                # would make ``model status`` report the configured default as
-                # though it were a measurement.
+                cpu_probe_key=self._cpu_probe_key(),
+                # Only calibration establishes one. A configured default
+                # recorded here would make ``model status`` report it as a
+                # measurement that never ran.
                 calibrated_batch_size=0,
                 dimension=embedder.dimension,
                 on_degrade=self._remember_fallback,
+                # Read per run: the first run on a machine writes the numbers
+                # every later run defers on, and a daemon must not have to be
+                # restarted to start using them.
+                crossover_characters=self.crossover_characters(),
+                calibration_plan=(
+                    self.indexer.segment_plan if self.settings.embedding_calibrate else None
+                ),
+                # The plan the indexer builds is packed for the accelerator,
+                # because that is whose batch size calibration adopted. A run
+                # that defers or degrades to CPU is packed for CPU instead.
+                cpu_max_items=self._cpu_max_items(),
             )
 
         return new_passage_session
@@ -328,6 +479,11 @@ class Application:
             probe_state = self.probe_cache.state(key)
         record = self.accelerator_environment.environment
         external = selection.uses_accelerator and self._runs_externally(descriptor)
+        cpu, accelerator = self._measurements()
+        # What was measured, not what policy does with it: an explicit setting
+        # or strict mode changes which runs defer, and neither changes what this
+        # machine turned out to be.
+        measured_crossover = self._measured_crossover()
         return ModelStatus(
             embedding_model=self.embedder.model_id,
             dimension=self.embedder.dimension,
@@ -349,6 +505,11 @@ class Application:
             probe_cache_state=probe_state,
             strict=self.settings.embedding_strict,
             fallback_reason=selection.fallback_reason,
+            cpu_characters_per_second=_rate(cpu),
+            accelerator_characters_per_second=_rate(accelerator),
+            accelerator_load_ms=None if accelerator is None else accelerator.load_ns // 1_000_000,
+            crossover_characters=measured_crossover,
+            recommended_override=self._recommended_override(cpu, accelerator),
         )
 
     @classmethod

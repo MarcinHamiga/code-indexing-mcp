@@ -23,6 +23,16 @@ DEFAULT_OVERLAP_TOKENS = 64
 # Microbatch packing budget: item_count * longest_padded_tokens. Padding is to
 # the longest member, so this bounds the padded matrix a batch materializes.
 DEFAULT_MAX_TOKEN_PRODUCT = 4096
+# The indexing ceiling ``DEFAULT_MAX_TOKEN_PRODUCT`` was measured against. The
+# product bounds the padded matrix a microbatch materializes, so it is a memory
+# budget expressed in tokens; leaving it fixed while the configured ceiling
+# moves either wastes the memory the operator granted or overruns the memory
+# they withheld.
+REFERENCE_MEMORY_BYTES = 2 * 1024**3
+# Padding cost is quadratic in the widest member, and nothing has measured a
+# matrix beyond this multiple of the reference. A ceiling larger than that buys
+# no further width rather than extrapolating past the evidence.
+MAX_TOKEN_PRODUCT_MULTIPLE = 8
 # A candidate never exceeds the extractor's character ceiling, so a window
 # fan-out above this implies a pathological tokenization rather than dense code.
 # It is a tripwire, not a working limit: 4,096 characters cannot tokenize to
@@ -37,6 +47,18 @@ class TokenWindow:
     start_char: int
     end_char: int
     token_count: int
+
+
+def max_token_product_for(memory_bytes: int, *, max_tokens: int = DEFAULT_MAX_TOKENS) -> int:
+    """Return the padded-token budget a *memory_bytes* indexing ceiling supports.
+
+    The floor is one longest window: a product below that would not admit even a
+    single max-length sequence as a batch of one, and would drop every shorter
+    segment to one item per batch on the way there.
+    """
+    scaled = DEFAULT_MAX_TOKEN_PRODUCT * max(0, memory_bytes) // REFERENCE_MEMORY_BYTES
+    ceiling = DEFAULT_MAX_TOKEN_PRODUCT * MAX_TOKEN_PRODUCT_MULTIPLE
+    return max(max_tokens, min(scaled, ceiling))
 
 
 def content_token_offsets(encoding: Any) -> list[tuple[int, int]]:

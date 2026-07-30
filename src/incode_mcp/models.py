@@ -249,6 +249,13 @@ class IndexReport(FrozenModel):
     embedding_retries: int | None = None
     worker_termination_reason: str | None = None
     token_windowing: bool | None = None
+    # Why this run embedded where it did, when the workload crossover was what
+    # decided it -- so a run that stayed on CPU because it was small is
+    # distinguishable from one that fell back to CPU because something broke.
+    # embedded_characters is what the decision was measured against.
+    embedded_characters: int | None = None
+    embedding_crossover_characters: int | None = None
+    embedding_selection_reason: str | None = None
 
 
 class ModelStatus(FrozenModel):
@@ -269,8 +276,9 @@ class ModelStatus(FrozenModel):
     precision: str
     runtime_version: str
     batch_size: int
-    # "explicit" when configured, "calibrated" when a cached probe supplied it,
-    # "default" when neither applied.
+    # "explicit" when configured, "measured" when calibration settled on it,
+    # "reduced" when a memory-ceiling overrun forced it down from what was
+    # measured, "default" when none of those applied.
     batch_calibration: str
     # "hit" or "miss" against the local probe cache; "not-applicable" on CPU,
     # which needs no probe to be trusted.
@@ -284,6 +292,17 @@ class ModelStatus(FrozenModel):
     accelerator_environment: str | None = None
     accelerator_prepared: str | None = None
     fallback_reason: str | None = None
+    # What calibration measured on this machine, and the run size above which
+    # starting the accelerator repays its model load. None means unmeasured --
+    # or, for the crossover, that the accelerator never overtakes CPU at any
+    # size, which is a different statement from "the threshold is large".
+    cpu_characters_per_second: float | None = None
+    accelerator_characters_per_second: float | None = None
+    accelerator_load_ms: int | None = None
+    crossover_characters: int | None = None
+    # The one setting change these numbers actually argue for, when they argue
+    # for one. Not advice in general -- only what the measurements support.
+    recommended_override: str | None = None
 
 
 class SearchHit(FrozenModel):

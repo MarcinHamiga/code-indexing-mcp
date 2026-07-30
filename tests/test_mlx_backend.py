@@ -279,6 +279,28 @@ def test_a_non_float32_weight_is_refused(tmp_path: Path) -> None:
         extract_weights(model_path, CONFIG)
 
 
+def test_a_weight_stored_outside_the_artifact_is_refused(tmp_path: Path) -> None:
+    """The artifact is parsed without its external data and the snapshot carries
+    no sidecar, so an initializer pointing outside it has to say so here rather
+    than resolve a path against whatever the working directory happens to be."""
+    directory = _snapshot(tmp_path / "snapshot")
+    model_path = directory / "onnx" / "model.onnx"
+    model = onnx.load(str(model_path))
+    tensor = next(
+        tensor
+        for tensor in model.graph.initializer
+        if tensor.name == "embeddings.word_embeddings.weight"
+    )
+    tensor.ClearField("raw_data")
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    entry = tensor.external_data.add()
+    entry.key, entry.value = "location", "model.onnx_data"
+    onnx.save(model, str(model_path))
+
+    with pytest.raises(ValueError, match=r"word embedding.*stored outside model.onnx"):
+        extract_weights(model_path, CONFIG)
+
+
 # -- conversion cache ------------------------------------------------------
 
 
@@ -302,6 +324,24 @@ def test_conversion_runs_once_and_is_reused_by_revision(tmp_path: Path) -> None:
     # moves is converted again instead of being read from a stale file.
     assert "0a1b2c3" in first.name
     assert list(cache.rglob("*.tmp*")) == []
+
+
+def test_a_conversion_of_another_revision_is_discarded(tmp_path: Path) -> None:
+    """Each conversion is 600 MB, and nothing else ever revisits the one this
+    installation stopped resolving to."""
+    cache = tmp_path / "cache"
+    superseded = converted_weights_path(cache, tmp_path / "0a1b2c3")
+    superseded.parent.mkdir(parents=True, exist_ok=True)
+    superseded.write_bytes(b"an earlier revision")
+    in_flight = superseded.with_name("4d5e6f7-jina-v1-f32.999999.tmp.safetensors")
+    in_flight.write_bytes(b"another process, mid-conversion")
+
+    path = ensure_converted_weights(_snapshot(tmp_path / "4d5e6f7"), cache, CONFIG)
+
+    assert path.is_file()
+    assert not superseded.exists()
+    # Another process's unfinished write is not this one's to remove.
+    assert in_flight.is_file()
 
 
 def test_a_converted_file_holds_every_extracted_tensor(tmp_path: Path) -> None:

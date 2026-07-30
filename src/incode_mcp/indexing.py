@@ -207,6 +207,9 @@ class Indexer:
                         "worker_termination_reason": measured.termination_reason,
                         "token_windowing": measured.tokenizer_available,
                         "embedding_fallback_reason": measured.fallback_reason,
+                        "embedded_characters": measured.character_count,
+                        "embedding_crossover_characters": measured.crossover_characters or None,
+                        "embedding_selection_reason": measured.selection_reason,
                     }
                 )
             return report
