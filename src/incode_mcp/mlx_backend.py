@@ -177,6 +177,7 @@ def extract_weights(model_path: Path, config: ModelConfig) -> dict[str, FloatArr
     """
     import onnx
     from onnx import numpy_helper
+    from onnx.external_data_helper import uses_external_data
 
     try:
         model = onnx.load(str(model_path), load_external_data=False)
@@ -195,6 +196,15 @@ def extract_weights(model_path: Path, config: ModelConfig) -> dict[str, FloatArr
             data_type = onnx.TensorProto.DataType.Name(tensor.data_type)
             raise ValueError(
                 f"The {described_as} tensor {name!r} has ONNX data type {data_type}, expected FLOAT"
+            )
+        if uses_external_data(tensor):
+            # The artifact is loaded without its external data and the snapshot
+            # this backend downloads carries no sidecar to load it from, so
+            # reading one here would resolve a path relative to the working
+            # directory and fail somewhere that could not explain itself.
+            raise ValueError(
+                f"The {described_as} tensor {name!r} is stored outside {model_path.name}; "
+                "this backend reads a self-contained artifact"
             )
         array = np.asarray(numpy_helper.to_array(tensor), dtype=np.float32)
         # Frees the protobuf's own copy; nothing reads this tensor twice.

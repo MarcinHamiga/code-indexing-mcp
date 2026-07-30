@@ -279,6 +279,28 @@ def test_a_non_float32_weight_is_refused(tmp_path: Path) -> None:
         extract_weights(model_path, CONFIG)
 
 
+def test_a_weight_stored_outside_the_artifact_is_refused(tmp_path: Path) -> None:
+    """The artifact is parsed without its external data and the snapshot carries
+    no sidecar, so an initializer pointing outside it has to say so here rather
+    than resolve a path against whatever the working directory happens to be."""
+    directory = _snapshot(tmp_path / "snapshot")
+    model_path = directory / "onnx" / "model.onnx"
+    model = onnx.load(str(model_path))
+    tensor = next(
+        tensor
+        for tensor in model.graph.initializer
+        if tensor.name == "embeddings.word_embeddings.weight"
+    )
+    tensor.ClearField("raw_data")
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    entry = tensor.external_data.add()
+    entry.key, entry.value = "location", "model.onnx_data"
+    onnx.save(model, str(model_path))
+
+    with pytest.raises(ValueError, match=r"word embedding.*stored outside model.onnx"):
+        extract_weights(model_path, CONFIG)
+
+
 # -- conversion cache ------------------------------------------------------
 
 
