@@ -282,6 +282,12 @@ class EmbeddingWorkerSession:
         # Telemetry surfaced on IndexReport so a run's shape is diagnosable
         # without re-running it under a profiler.
         self.retry_count = 0
+        # How long spawning the worker and loading its model took, and the
+        # microbatch size a retry found to be survivable. Together they are what
+        # tells a later run whether starting this backend repays the wait and
+        # where to start its batches; 0 means neither has been established.
+        self.load_duration_ns = 0
+        self.safe_max_items = 0
         self.segment_count = 0
         self.token_count = 0
         self.termination_reason: str | None = None
@@ -314,7 +320,12 @@ class EmbeddingWorkerSession:
         provider fails to initialise, is diagnosed before any real content is
         handed to it -- and so the caller can terminate it and pick another.
         """
+        # Measured around the request rather than around the spawn alone: the
+        # spawn returns as soon as the process exists, and what a run actually
+        # waits for is the model being on the device and answering.
+        started = time.monotonic_ns()
         status, payload = self._request("initialize", None)
+        self.load_duration_ns = time.monotonic_ns() - started
         if status != "initialized":
             raise IncodeError(
                 ErrorCode.EMBEDDING_WORKER_FAILED,
@@ -388,6 +399,11 @@ class EmbeddingWorkerSession:
                 status, payload = self._request("plan_and_embed", (request, attempt))
                 if status == "plan_error":
                     raise ValueError(str(payload))
+                if retry:
+                    # This size survived what the requested one did not. Kept so
+                    # the limit is carried into the cache rather than being
+                    # rediscovered by overrunning the ceiling on the next run.
+                    self.safe_max_items = attempt.max_items
                 break
             except IncodeError as exc:
                 if (
