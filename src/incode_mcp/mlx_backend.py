@@ -178,7 +178,10 @@ def extract_weights(model_path: Path, config: ModelConfig) -> dict[str, FloatArr
 
     Each initializer's payload is released as it is converted, so the peak stays
     near one copy of the weights rather than holding the parsed protobuf and the
-    converted arrays at full size at the same time.
+    converted arrays at full size at the same time. How much that saves depends
+    on the protobuf implementation: under the C one, reading ``raw_data``
+    materialises a separate ``bytes`` and clearing the field frees the arena's
+    copy, while under the pure-Python one the two are the same object.
     """
     import onnx
     from onnx import numpy_helper
@@ -433,6 +436,13 @@ class JinaBertMlx:
         # Masked keys are pushed far below any score so they contribute nothing,
         # which is what keeps a passage's vector independent of the padding its
         # batch happened to need.
+        #
+        # ALiBi makes this dense: the bias differs per head and per position
+        # pair, so it cannot be expressed as the boolean mask a memory-efficient
+        # attention kernel would keep implicit. It costs one
+        # ``batch x heads x sequence^2`` float32 array, built once here rather
+        # than per layer, and it grows quadratically with the longest passage in
+        # the batch -- which is where MLX's advantage over CPU will run out.
         keys_masked = (1.0 - attention_mask.astype(mx.float32))[:, None, None, :] * MASK_FILL
         bias = weights["alibi_slopes"] * distance + keys_masked
 
