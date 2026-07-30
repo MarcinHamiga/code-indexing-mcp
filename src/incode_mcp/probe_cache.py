@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Bumped whenever a stored record's meaning changes. Records written by another
 # version are treated as absent rather than reinterpreted.
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 # A cache that grows without bound would keep every configuration a machine has
 # ever had. Records are small, but the file is read on every start.
 MAX_RECORDS = 32
@@ -82,13 +82,24 @@ class ProbeKey:
 
 @dataclass(frozen=True)
 class ProbeRecord:
-    """A backend that ran a real inference, and the batch size it settled on."""
+    """A backend that ran a real inference, and what measuring it found.
+
+    ``characters_per_second`` and ``load_ns`` are what the workload crossover is
+    computed from, and a zero rate means "never measured" rather than "measured
+    as nothing" -- which is why a record from before calibration existed is
+    rejected by the schema version rather than read as a slow backend.
+    """
 
     fingerprint: str
     batch_size: int
     dimension: int
     recorded_at_ns: int
     detail: str = ""
+    characters_per_second: float = 0.0
+    load_ns: int = 0
+    # "memory" when the batch size above is the last one that fit rather than
+    # the fastest one measured.
+    limited_by: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -104,6 +115,9 @@ class ProbeRecord:
                 dimension=int(value["dimension"]),
                 recorded_at_ns=int(value["recorded_at_ns"]),
                 detail=str(value.get("detail", "")),
+                characters_per_second=float(value.get("characters_per_second", 0.0)),
+                load_ns=int(value.get("load_ns", 0)),
+                limited_by=str(value.get("limited_by", "")),
             )
         except (KeyError, TypeError, ValueError):
             # A record we cannot read is a record we cannot trust. Dropping it
@@ -170,7 +184,17 @@ class ProbeCache:
                 return record
         return None
 
-    def store(self, key: ProbeKey, *, batch_size: int, dimension: int, detail: str = "") -> None:
+    def store(
+        self,
+        key: ProbeKey,
+        *,
+        batch_size: int,
+        dimension: int,
+        detail: str = "",
+        characters_per_second: float = 0.0,
+        load_ns: int = 0,
+        limited_by: str = "",
+    ) -> None:
         """Record a successful probe, replacing any earlier one for *key*.
 
         Read-modify-write, so a daemon and a CLI probing different backends at
@@ -183,6 +207,9 @@ class ProbeCache:
             dimension=dimension,
             recorded_at_ns=time.time_ns(),
             detail=detail,
+            characters_per_second=characters_per_second,
+            load_ns=load_ns,
+            limited_by=limited_by,
         )
         with self._guard():
             kept = [

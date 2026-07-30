@@ -43,6 +43,54 @@ def test_a_stored_probe_is_found_again(tmp_path: Path) -> None:
     assert cache.state(key) == "hit"
 
 
+def test_a_stored_calibration_survives_the_round_trip(tmp_path: Path) -> None:
+    """The measurement is the whole point of storing anything beyond "it works":
+    a rate that came back as zero would put the crossover at CPU forever."""
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _key()
+
+    cache.store(
+        key,
+        batch_size=8,
+        dimension=768,
+        characters_per_second=12_345.5,
+        load_ns=2_500_000_000,
+        limited_by="memory",
+    )
+
+    record = cache.load(key)
+    assert record is not None
+    assert record.characters_per_second == 12_345.5
+    assert record.load_ns == 2_500_000_000
+    assert record.limited_by == "memory"
+
+
+def test_a_record_written_before_calibration_is_not_read_as_uncalibrated(
+    tmp_path: Path,
+) -> None:
+    """A version-1 record has no rate at all. Reading its absence as a measured
+    zero would mean an accelerator that never crosses over."""
+    path = tmp_path / "probes.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    {
+                        "fingerprint": _key().fingerprint(),
+                        "batch_size": 8,
+                        "dimension": 768,
+                        "recorded_at_ns": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert ProbeCache(path).load(_key()) is None
+
+
 @pytest.mark.parametrize(
     "field",
     [
