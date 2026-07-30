@@ -504,9 +504,10 @@ class MlxEmbedding:
         # Constructing the model does not touch the device, so one real forward
         # pass over the smallest possible input is what proves Metal is there to
         # be used -- and it makes the report below a statement rather than a
-        # claim about an installed package.
-        self.model(mx.zeros((1, 2), dtype=mx.int64), mx.ones((1, 2), dtype=mx.int64))
-        mx.eval(self.model.weights)
+        # claim about an installed package. MLX is lazy, so the result has to be
+        # evaluated: discarding it unevaluated would dispatch nothing and prove
+        # nothing.
+        mx.eval(self.model(mx.zeros((1, 2), dtype=mx.int64), mx.ones((1, 2), dtype=mx.int64)))
         self.resolved_providers: tuple[str, ...] = (MLX_PROVIDER,)
 
     def passage_embed(self, documents: str | Iterable[str]) -> Iterable[FloatArray]:
