@@ -136,6 +136,31 @@ def test_a_session_that_fails_outright_is_not_calibrated() -> None:
     assert calibrate(BrokenSession({}), PLAN, load_ns=0, clock=lambda: 0) is None
 
 
+def test_a_batch_that_kills_the_worker_keeps_what_smaller_ones_measured() -> None:
+    """A device allocation that dies rather than tripping the ceiling arrives as
+    a worker failure, but says the same thing about the size that provoked it.
+    Verification already made this backend embed, and every size below returned
+    vectors -- discarding them leaves the machine uncalibrated forever."""
+
+    class DyingSession(FakeSession):
+        def plan_and_embed(
+            self, candidates: Sequence[PassageCandidate], plan: SegmentPlan
+        ) -> list[list[EmbeddedSegment]]:
+            if plan.max_items > 4:
+                raise IncodeError(ErrorCode.EMBEDDING_WORKER_FAILED, "the worker died")
+            return super().plan_and_embed(candidates, plan)
+
+    session = DyingSession(_halving(1_000_000_000))
+
+    result = calibrate(session, PLAN, load_ns=0, clock=session.clock)
+
+    assert result is not None
+    assert result.max_items == 4
+    # Not "memory": raising the ceiling is not what answers an allocation the
+    # device could not make, so no override is recommended for it.
+    assert result.limited_by == "failure"
+
+
 def test_the_measured_rate_counts_the_same_characters_the_crossover_does() -> None:
     """Prefix included: a request is charged its prefixes against the threshold,
     so a rate denominated in content alone would cross fractionally early."""

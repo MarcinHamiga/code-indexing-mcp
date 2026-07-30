@@ -51,6 +51,22 @@ fallback always has, which is what the parity gates cover.
 - `INCODE_EMBED_STRICT=1` turning the crossover off. Strict mode exists for a caller who would rather
   fail than index quietly on CPU, and a deferral is quiet CPU indexing that no degradation reports
   and that strict mode could not have refused, because nothing failed.
+- The CPU reference measured from teardown rather than mid-run, after the accelerator's worker has
+  been retired. Two models resident at once is twice the ceiling the operator granted, and the run
+  gains nothing by waiting for the second: the crossover is read when a session is built, so the
+  number is for the next run either way.
+- A measured size applied to the run that measured it, and a reduced size to the rest of the run
+  that was forced down to it. Both were previously written to the cache for the next run while the
+  run that established them carried on at the size its plan was built with -- which for a reduction
+  meant re-requesting the size that had just overrun, for every group after it.
+- A batch that kills the worker treated like one that overruns the ceiling: the sizes measured below
+  it stand, so a device whose allocations die rather than trip the ceiling is calibrated instead of
+  being left permanently unmeasured. Recorded as `"failure"` rather than `"memory"`, because raising
+  a ceiling is not what answers an allocation the device could not make.
+- "The accelerator never overtakes CPU" reported as no crossover rather than as the largest
+  admissible run. `crossover_characters` is `null` on both `model status` and `IndexReport`, the run
+  says so in words, and an operator who pins that size deliberately is no longer indistinguishable
+  from the sentinel.
 
 ## Acceptance evidence
 

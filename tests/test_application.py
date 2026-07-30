@@ -486,6 +486,10 @@ def test_an_accelerator_that_lost_to_cpu_recommends_the_override(tmp_path: Path)
     assert status.crossover_characters is None
     assert status.recommended_override is not None
     assert "INCODE_EMBED_ACCELERATOR=cpu" in status.recommended_override
+    # The same None reaches the session, which is what stops it starting a
+    # backend no run is large enough to justify. Reporting the largest
+    # admissible run instead would name a threshold and defer against it.
+    assert app.crossover_characters() is None
 
 
 def test_a_batch_size_a_ceiling_overrun_reduced_is_reported_as_reduced(

@@ -24,7 +24,7 @@ from .backends import (
     runtime_version,
     select_backend,
 )
-from .calibration import crossover_characters
+from .calibration import LIMITED_BY_MEMORY, crossover_characters
 from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
 from .errors import ErrorCode, IncodeError
@@ -47,7 +47,7 @@ from .probe_cache import ProbeCache, ProbeKey, ProbeRecord, model_artifact_finge
 from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
 from .scanner import SourceScanner
 from .search import SearchService
-from .settings import MAX_CROSSOVER_CHARACTERS, IndexSettings
+from .settings import IndexSettings
 from .staging import recover_staged_commits
 from .storage import LanceStore
 from .token_batching import max_token_product_for
@@ -170,12 +170,11 @@ class Application:
                 cached = self.probe_cache.load(self._probe_key)
                 if cached is not None and cached.batch_size > 0:
                     self.embedding_batch_size = cached.batch_size
-                    # A size a ceiling overrun forced down is not the size
-                    # calibration chose, and a machine pinned low by one bad run
-                    # has to be able to say so.
-                    self.batch_calibration = (
-                        "reduced" if cached.limited_by == "memory" else "measured"
-                    )
+                    # A size something forced down is not the size calibration
+                    # chose, and a machine pinned low by one bad run has to be
+                    # able to say so. Which kind of ceiling stopped it is a
+                    # question for the recommendation, not for this label.
+                    self.batch_calibration = "reduced" if cached.limited_by else "measured"
 
         passage_session_factory: Callable[[], PassageBackendSession] | None = None
         if isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker":
@@ -325,13 +324,19 @@ class Application:
         key = self._probe_key or self._build_probe_key(self.embedder)
         return self.probe_cache.load(self._cpu_probe_key()), self.probe_cache.load(key)
 
-    def crossover_characters(self) -> int:
+    def crossover_characters(self) -> int | None:
         """Return the run size below which this machine should stay on CPU.
 
         0 means "start the accelerator immediately", which is the answer when
         the operator turned deferral off and also when nothing has been measured
         yet -- the first run on a machine is what does the measuring, and it
         cannot defer on numbers it is in the middle of producing.
+
+        ``None`` means the accelerator never overtakes CPU, so no run is large
+        enough to be worth starting it for. That is not the same statement as a
+        very large threshold, and reporting it as one would name a size some run
+        could conceivably pass -- and would collide with an operator who pinned
+        that size deliberately.
 
         Strict mode is a third such answer. It exists for a caller who would
         rather fail than quietly index at CPU speed, and a deferral is quiet
@@ -346,22 +351,36 @@ class Application:
         cpu, accelerator = self._measurements()
         if cpu is None or accelerator is None:
             return 0
-        measured = crossover_characters(
+        return self._measured_crossover()
+
+    def _measured_crossover(self) -> int | None:
+        """Return the crossover the recorded measurements imply, if both exist.
+
+        What the machine measured, with no policy applied. ``model status``
+        reports this, so an explicit threshold or strict mode changes which runs
+        defer without changing what this machine was found to be.
+        """
+        cpu, accelerator = self._measurements()
+        if cpu is None or accelerator is None:
+            return None
+        return crossover_characters(
             accelerator_load_ns=accelerator.load_ns,
             cpu_load_ns=cpu.load_ns,
             cpu_characters_per_second=cpu.characters_per_second,
             accelerator_characters_per_second=accelerator.characters_per_second,
         )
-        # No crossover means the accelerator never overtakes CPU. Deferring
-        # every run is then exactly right, and MAX_CROSSOVER_CHARACTERS is the
-        # largest run the configuration admits.
-        return MAX_CROSSOVER_CHARACTERS if measured is None else measured
 
     def _recommended_override(
         self, cpu: ProbeRecord | None, accelerator: ProbeRecord | None
     ) -> str | None:
-        """Return the one setting change the measurements argue for, if any."""
-        if accelerator is not None and accelerator.limited_by == "memory":
+        """Return the one setting change the measurements argue for, if any.
+
+        Only a memory ceiling has a setting behind it. A batch that took the
+        worker down with it was reduced just the same, but raising the ceiling
+        is not what answers a device that could not make the allocation, so
+        that case is reported without advice attached.
+        """
+        if accelerator is not None and accelerator.limited_by == LIMITED_BY_MEMORY:
             return (
                 "INCODE_EMBED_MEMORY_MB (a batch overran the ceiling and was reduced to "
                 f"{accelerator.batch_size})"
@@ -461,17 +480,10 @@ class Application:
         record = self.accelerator_environment.environment
         external = selection.uses_accelerator and self._runs_externally(descriptor)
         cpu, accelerator = self._measurements()
-        # Reported as a number only when there is one. An accelerator that never
-        # overtakes CPU has no crossover, and printing the largest admissible run
-        # would read as a threshold some run could pass.
-        measured_crossover: int | None = None
-        if cpu is not None and accelerator is not None:
-            measured_crossover = crossover_characters(
-                accelerator_load_ns=accelerator.load_ns,
-                cpu_load_ns=cpu.load_ns,
-                cpu_characters_per_second=cpu.characters_per_second,
-                accelerator_characters_per_second=accelerator.characters_per_second,
-            )
+        # What was measured, not what policy does with it: an explicit setting
+        # or strict mode changes which runs defer, and neither changes what this
+        # machine turned out to be.
+        measured_crossover = self._measured_crossover()
         return ModelStatus(
             embedding_model=self.embedder.model_id,
             dimension=self.embedder.dimension,

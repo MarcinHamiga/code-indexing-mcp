@@ -283,10 +283,17 @@ same ceiling — floored so a single longest window always forms a batch and cap
 2 GiB reference, because padding cost is quadratic in the widest member and nothing has been
 measured past that.
 
-A batch that overruns the ceiling is halved and retried, and the size that survived is written to
-the probe cache so the next run starts there instead of rediscovering the same limit by overrunning
-it again. `model status` reports that size as `"reduced"` rather than `"measured"`, so a machine
-pinned low by one bad run says so. An explicit `INCODE_EMBED_BATCH_SIZE` overrides it outright.
+A batch that overruns the ceiling is halved and retried, and the size that survived is adopted for
+the rest of that run — otherwise every group after it asks for the size that just overran and pays
+the same retries again — and written to the probe cache so the next run starts there rather than
+rediscovering the same limit. `model status` reports that size as `"reduced"` rather than
+`"measured"`, so a machine pinned low by one bad run says so. An explicit `INCODE_EMBED_BATCH_SIZE`
+overrides it outright.
+
+The same applies to a batch that takes the worker down with it rather than tripping the ceiling,
+which is what a device allocation failure usually looks like: the sizes measured below it still
+stand, so the backend is calibrated rather than left unmeasured. Only the memory ceiling has a
+setting behind it, so only that case recommends one.
 
 ### Embedding backends
 
@@ -428,8 +435,14 @@ Where there is a crossover, the run begins on CPU and switches to the accelerato
 that carries it past the threshold, counting the request in hand so the one group large enough to
 justify the device is not itself sent to CPU. Deciding this late costs at most one model load on a
 run that turns out to be large, and saves the same load on one that turns out to be small; the
-pipeline streams, so the size of a run is not known until it is over. An accelerator measured no
-faster than CPU has no crossover at all and is never started.
+pipeline streams, so the size of a run is not known until it is over. The run that does the
+measuring also embeds at the size it just measured, rather than at the one its plan was built with
+before the sweep existed.
+
+An accelerator measured no faster than CPU has no crossover at all and is never started. That is
+reported as no threshold rather than as a very large one — `crossover_characters` is `null` in both
+`model status` and `IndexReport`, and the run says the backend measured no faster than CPU instead
+of naming a size it stayed below.
 
 A deferral is not a fallback. `fallback_count` stays at zero, no `embedding_fallback_reason` is set,
 and the process is not pinned to CPU the way a real degradation pins it — the next run decides again
@@ -449,7 +462,9 @@ Measurement never installs, downloads, or changes anything: it embeds through a 
 already running and writes one JSON file under the cache directory. The sweep runs on the worker
 the run will go on to use, so what it embedded, the retries it provoked, and the ceiling it walked
 up to are put back afterwards: they are measurement, not work the run did, and an `IndexReport` that
-counted them would describe a failure that never happened.
+counted them would describe a failure that never happened. The CPU reference is measured last of
+all, once the accelerator's worker has been retired, so the two models are never resident against
+the same ceiling at the same time.
 
 `code-indexing-mcp model status` reports the whole resolution without loading or probing anything:
 

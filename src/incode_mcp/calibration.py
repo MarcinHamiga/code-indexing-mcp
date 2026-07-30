@@ -51,9 +51,14 @@ REPRESENTATIVE_CHARACTERS = (384, 1536)
 # A larger batch has to beat the best rate by this much to justify the memory it
 # holds. Anything smaller is noise being paid for in resident bytes.
 IMPROVEMENT_RATIO = 1.05
-# Overrunning the ceiling says this size is unsafe, not that the backend is
-# broken. Anything else is the backend failing, which belongs to verification.
+# Overrunning the ceiling is the ceiling being reported; a device allocation
+# that kills the worker outright is not, and arrives as a worker failure. Both
+# say the same thing about the size that provoked them, so they are told apart
+# only in what they are recorded as -- a memory ceiling has a setting behind it
+# to recommend, and a crash does not.
 RESOURCE_CODES = frozenset({ErrorCode.INDEX_RESOURCE_LIMIT})
+LIMITED_BY_MEMORY = "memory"
+LIMITED_BY_FAILURE = "failure"
 
 
 class MeasurableSession(Protocol):
@@ -71,8 +76,10 @@ class CalibrationResult:
     max_items: int
     characters_per_second: float
     load_ns: int
-    # "memory" when a larger batch overran the ceiling, so a reader can tell a
-    # size that won on speed from one that won by being the last that fit.
+    # "memory" when a larger batch overran the ceiling and "failure" when one
+    # took the worker down with it, so a reader can tell a size that won on
+    # speed from one that won by being the last that survived -- and so a
+    # recommendation is only made where there is a setting behind it.
     limited_by: str = ""
 
     @property
@@ -135,14 +142,21 @@ def calibrate(
         try:
             session.plan_and_embed(corpus, replace(plan, max_items=size))
         except IncodeError as exc:
-            if exc.code in RESOURCE_CODES and best is not None:
-                logger.debug("Calibration stopped at max_items=%d: %s", size, exc.code.value)
-                return replace(best, limited_by="memory")
-            logger.debug("Calibration abandoned at max_items=%d: %s", size, exc)
-            return None
+            if best is None:
+                logger.debug("Calibration abandoned at max_items=%d: %s", size, exc)
+                return None
+            # Verification already loaded this backend and made it embed, so a
+            # failure that appears only once the batch grows is the size failing
+            # rather than the backend -- and every smaller size measured here
+            # returned vectors before it. Keeping them is the difference between
+            # a calibrated backend and none at all on a machine whose device
+            # allocations die rather than trip the ceiling.
+            logger.debug("Calibration stopped at max_items=%d: %s", size, exc.code.value)
+            limited_by = LIMITED_BY_MEMORY if exc.code in RESOURCE_CODES else LIMITED_BY_FAILURE
+            return replace(best, limited_by=limited_by)
         except Exception as exc:  # pragma: no cover - defensive, see module docstring
             logger.debug("Calibration abandoned at max_items=%d: %s", size, exc)
-            return None
+            return None if best is None else replace(best, limited_by=LIMITED_BY_FAILURE)
         # A clock with any granularity at all can report a zero interval for a
         # fast enough backend, and dividing by it would report infinite speed.
         elapsed = max(1, clock() - started)
