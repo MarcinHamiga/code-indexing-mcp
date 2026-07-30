@@ -326,6 +326,24 @@ def test_conversion_runs_once_and_is_reused_by_revision(tmp_path: Path) -> None:
     assert list(cache.rglob("*.tmp*")) == []
 
 
+def test_a_conversion_of_another_revision_is_discarded(tmp_path: Path) -> None:
+    """Each conversion is 600 MB, and nothing else ever revisits the one this
+    installation stopped resolving to."""
+    cache = tmp_path / "cache"
+    superseded = converted_weights_path(cache, tmp_path / "0a1b2c3")
+    superseded.parent.mkdir(parents=True, exist_ok=True)
+    superseded.write_bytes(b"an earlier revision")
+    in_flight = superseded.with_name("4d5e6f7-jina-v1-f32.999999.tmp.safetensors")
+    in_flight.write_bytes(b"another process, mid-conversion")
+
+    path = ensure_converted_weights(_snapshot(tmp_path / "4d5e6f7"), cache, CONFIG)
+
+    assert path.is_file()
+    assert not superseded.exists()
+    # Another process's unfinished write is not this one's to remove.
+    assert in_flight.is_file()
+
+
 def test_a_converted_file_holds_every_extracted_tensor(tmp_path: Path) -> None:
     directory = _snapshot(tmp_path / "snapshot")
 

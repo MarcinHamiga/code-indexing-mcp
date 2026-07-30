@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 # existing conversion is rebuilt rather than read under new expectations.
 WEIGHT_LAYOUT_VERSION = 1
 
+# What a conversion in flight is called. It stays ``.safetensors`` because MLX
+# appends that to a name that lacks it, and would write somewhere this never
+# moves or cleans up.
+_TEMPORARY_SUFFIX = ".tmp.safetensors"
+
 # What the export adds to a masked score is -3.4028235e38; adding a negative
 # ALiBi bias to that overflows to -inf, which can leave a fused attention kernel
 # subtracting -inf from -inf. This underflows to exactly zero through exp in
@@ -336,10 +341,8 @@ def ensure_converted_weights(
     for name in list(extracted):
         weights[name] = mx.array(extracted.pop(name))
     # Written aside and moved into place: a conversion interrupted halfway must
-    # not leave a truncated file that later loads read as complete. The suffix
-    # stays ``.safetensors`` because MLX appends it to a name that lacks one, and
-    # would write somewhere this never moves or cleans up.
-    temporary = target.with_name(f"{target.stem}.{os.getpid()}.tmp{target.suffix}")
+    # not leave a truncated file that later loads read as complete.
+    temporary = target.with_name(f"{target.stem}.{os.getpid()}{_TEMPORARY_SUFFIX}")
     try:
         mx.save_safetensors(str(temporary), weights)
         # Flushed before the rename, so a machine that loses power mid-conversion
@@ -354,7 +357,27 @@ def ensure_converted_weights(
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+    _discard_superseded_conversions(target)
     return target
+
+
+def _discard_superseded_conversions(target: Path) -> None:
+    """Remove conversions of other revisions or layouts left beside *target*.
+
+    Each of these is 600 MB of a model this installation no longer resolves to,
+    and nothing else ever revisits them. A file another process is reading stays
+    readable through its open handle, and one still being written is skipped by
+    its suffix.
+    """
+    for path in target.parent.glob(f"*{target.suffix}"):
+        if path == target or path.name.endswith(_TEMPORARY_SUFFIX):
+            continue
+        try:
+            path.unlink()
+        except OSError:  # pragma: no cover - a cache this cannot prune still works
+            logger.debug("Could not remove the superseded MLX conversion %s", path)
+        else:
+            logger.info("Removed the superseded MLX conversion %s", path.name)
 
 
 def mask_mean_normalize(hidden: mx.array, attention_mask: mx.array) -> mx.array:
