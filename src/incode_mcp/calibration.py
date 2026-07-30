@@ -157,21 +157,32 @@ def calibrate(
 
 def crossover_characters(
     *,
-    load_ns: int,
+    accelerator_load_ns: int,
+    cpu_load_ns: int,
     cpu_characters_per_second: float,
     accelerator_characters_per_second: float,
 ) -> int | None:
     """Return the run size above which starting the accelerator pays for itself.
 
-    CPU costs ``n / R_cpu``; the accelerator costs ``L + n / R_accel``. They meet
-    at ``L / (1/R_cpu - 1/R_accel)``. ``None`` means they never meet -- an
-    accelerator no faster than CPU has no size at which starting it wins, and
-    must not be reported as a threshold a large enough run would eventually
-    pass.
+    Both policies pay for a worker: staying on CPU costs ``L_cpu + n / R_cpu``
+    and using the accelerator costs ``L_accel + n / R_accel``, so what the
+    accelerator has to earn back is the *difference* between the two loads, not
+    its whole load. Charging it the whole load would defer runs on a machine
+    where the accelerator loads faster than CPU -- which is the ordinary case on
+    unified memory, where the device model is memory-mapped and the CPU one is
+    an ONNX graph being read and prepared.
+
+    ``0`` means the accelerator is worth starting immediately. ``None`` means the
+    two never meet: an accelerator no faster than CPU has no size at which
+    starting it wins, and must not be reported as a threshold a large enough run
+    would eventually pass.
     """
     if cpu_characters_per_second <= 0 or accelerator_characters_per_second <= 0:
         return None
     if accelerator_characters_per_second <= cpu_characters_per_second:
         return None
+    extra_load_ns = accelerator_load_ns - cpu_load_ns
+    if extra_load_ns <= 0:
+        return 0
     saved_per_character = 1 / cpu_characters_per_second - 1 / accelerator_characters_per_second
-    return int(load_ns / 1_000_000_000 / saved_per_character)
+    return int(extra_load_ns / 1_000_000_000 / saved_per_character)

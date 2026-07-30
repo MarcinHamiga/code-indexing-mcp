@@ -327,7 +327,8 @@ class Application:
         if cpu is None or accelerator is None:
             return 0
         measured = crossover_characters(
-            load_ns=accelerator.load_ns,
+            accelerator_load_ns=accelerator.load_ns,
+            cpu_load_ns=cpu.load_ns,
             cpu_characters_per_second=cpu.characters_per_second,
             accelerator_characters_per_second=accelerator.characters_per_second,
         )
@@ -442,7 +443,8 @@ class Application:
         measured_crossover: int | None = None
         if cpu is not None and accelerator is not None:
             measured_crossover = crossover_characters(
-                load_ns=accelerator.load_ns,
+                accelerator_load_ns=accelerator.load_ns,
+                cpu_load_ns=cpu.load_ns,
                 cpu_characters_per_second=cpu.characters_per_second,
                 accelerator_characters_per_second=accelerator.characters_per_second,
             )

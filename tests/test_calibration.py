@@ -162,15 +162,44 @@ def test_the_calibrated_size_never_exceeds_the_configured_maximum() -> None:
 
 
 def test_the_crossover_is_where_startup_stops_costing_more_than_it_saves() -> None:
-    # 2 s of startup, and the accelerator embeds twice as fast: 1,000 chars/s
-    # against 2,000. Below 4,000 characters CPU finishes first.
+    # 2 s more startup than CPU costs, and the accelerator embeds twice as fast:
+    # 1,000 chars/s against 2,000. Below 4,000 characters CPU finishes first.
     assert (
         crossover_characters(
-            load_ns=2_000_000_000,
+            accelerator_load_ns=2_000_000_000,
+            cpu_load_ns=0,
             cpu_characters_per_second=1_000.0,
             accelerator_characters_per_second=2_000.0,
         )
         == 4_000
+    )
+
+
+def test_only_the_startup_the_accelerator_costs_beyond_cpu_has_to_be_earned_back() -> None:
+    """Staying on CPU also spawns a worker and loads a model. Charging the
+    accelerator for that shared cost would defer runs that were never slower."""
+    assert (
+        crossover_characters(
+            accelerator_load_ns=3_000_000_000,
+            cpu_load_ns=1_000_000_000,
+            cpu_characters_per_second=1_000.0,
+            accelerator_characters_per_second=2_000.0,
+        )
+        == 4_000
+    )
+
+
+def test_an_accelerator_that_loads_faster_than_cpu_is_worth_starting_at_once() -> None:
+    """A memory-mapped device model against an ONNX graph being prepared: there
+    is nothing to earn back, so there is nothing to defer."""
+    assert (
+        crossover_characters(
+            accelerator_load_ns=370_000_000,
+            cpu_load_ns=655_000_000,
+            cpu_characters_per_second=14_030.0,
+            accelerator_characters_per_second=46_783.0,
+        )
+        == 0
     )
 
 
@@ -179,7 +208,8 @@ def test_an_accelerator_no_faster_than_cpu_has_no_crossover() -> None:
     a threshold that a large enough run would eventually pass."""
     assert (
         crossover_characters(
-            load_ns=2_000_000_000,
+            accelerator_load_ns=2_000_000_000,
+            cpu_load_ns=0,
             cpu_characters_per_second=2_000.0,
             accelerator_characters_per_second=2_000.0,
         )
@@ -190,7 +220,8 @@ def test_an_accelerator_no_faster_than_cpu_has_no_crossover() -> None:
 def test_a_free_start_crosses_over_immediately() -> None:
     assert (
         crossover_characters(
-            load_ns=0,
+            accelerator_load_ns=0,
+            cpu_load_ns=0,
             cpu_characters_per_second=1_000.0,
             accelerator_characters_per_second=2_000.0,
         )
@@ -201,7 +232,8 @@ def test_a_free_start_crosses_over_immediately() -> None:
 def test_an_unmeasured_rate_has_no_crossover() -> None:
     assert (
         crossover_characters(
-            load_ns=1_000_000_000,
+            accelerator_load_ns=1_000_000_000,
+            cpu_load_ns=0,
             cpu_characters_per_second=0.0,
             accelerator_characters_per_second=2_000.0,
         )
