@@ -230,7 +230,7 @@ def extract_weights(model_path: Path, config: ModelConfig) -> dict[str, FloatArr
         "embeddings.norm.bias": take(
             "embeddings.LayerNorm.bias", (config.hidden_size,), "embedding normalization"
         ),
-        "alibi_slopes": _alibi_slopes(by_output, numpy_helper, config),
+        "alibi_slopes": _alibi_slopes(by_name, by_output, numpy_helper, config),
     }
     for index in range(config.num_hidden_layers):
         for converted, (node_name, shape) in _layer_matmuls(index, config).items():
@@ -257,17 +257,17 @@ def _token_type_count(initializers: Mapping[str, Any]) -> int:
 
 
 def _alibi_slopes(
-    by_output: Mapping[str, Any], numpy_helper: Any, config: ModelConfig
+    by_name: Mapping[str, Any],
+    by_output: Mapping[str, Any],
+    numpy_helper: Any,
+    config: ModelConfig,
 ) -> FloatArray:
     """Read the per-head ALiBi slopes the export baked into the graph.
 
     Recomputing them from the head count would silently replace the slopes of a
     model that did not use the textbook powers of two.
     """
-    consumer = next(
-        (node for node in by_output.values() if node.name == _ALIBI_SLOPE_NODE),
-        None,
-    )
+    consumer = by_name.get(_ALIBI_SLOPE_NODE)
     if consumer is None or not consumer.input:
         raise ValueError(f"The ONNX artifact has no ALiBi bias node named {_ALIBI_SLOPE_NODE!r}")
     producer = by_output.get(consumer.input[0])
