@@ -265,6 +265,20 @@ def test_a_weight_of_the_wrong_shape_is_refused(tmp_path: Path) -> None:
         extract_weights(directory / "onnx" / "model.onnx", CONFIG)
 
 
+def test_a_non_float32_weight_is_refused(tmp_path: Path) -> None:
+    directory = _snapshot(tmp_path / "snapshot")
+    model_path = directory / "onnx" / "model.onnx"
+    model = onnx.load(str(model_path))
+    name = "embeddings.LayerNorm.weight"
+    tensor = next(tensor for tensor in model.graph.initializer if tensor.name == name)
+    values = numpy_helper.to_array(tensor).astype(np.float16)
+    tensor.CopyFrom(numpy_helper.from_array(values, name))
+    onnx.save(model, str(model_path))
+
+    with pytest.raises(ValueError, match=r"embedding normalization.*FLOAT16.*expected FLOAT"):
+        extract_weights(model_path, CONFIG)
+
+
 # -- conversion cache ------------------------------------------------------
 
 

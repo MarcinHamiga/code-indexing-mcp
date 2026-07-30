@@ -191,6 +191,11 @@ def extract_weights(model_path: Path, config: ModelConfig) -> dict[str, FloatArr
         tensor = initializers.get(name)
         if tensor is None:
             raise ValueError(f"The ONNX artifact has no {described_as} tensor named {name!r}")
+        if tensor.data_type != onnx.TensorProto.FLOAT:
+            data_type = onnx.TensorProto.DataType.Name(tensor.data_type)
+            raise ValueError(
+                f"The {described_as} tensor {name!r} has ONNX data type {data_type}, expected FLOAT"
+            )
         array = np.asarray(numpy_helper.to_array(tensor), dtype=np.float32)
         # Frees the protobuf's own copy; nothing reads this tensor twice.
         tensor.ClearField("raw_data")
