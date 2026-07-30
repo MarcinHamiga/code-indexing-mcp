@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -25,10 +26,13 @@ DEFAULT_REPOSITORY_URL = "https://github.com/MarcinHamiga/code-indexing-mcp.git"
 # and is the fallback every accelerator degrades to, so it is never optional.
 SERVING_EXTRA = "cpu"
 # Accelerators this release can prepare, and the runtime extra each installs
-# into an environment of its own. Everything else the runtime can name is
-# either reached by explicit override inside the serving environment (Core ML)
-# or has no locked installation yet; both are reported rather than attempted.
-ACCELERATOR_EXTRAS = {"cuda": "cuda"}
+# into an environment of its own. Core ML is still reached by explicit override
+# inside the serving environment, so it needs no separate locked installation.
+ACCELERATOR_EXTRAS = {
+    "cuda": "cuda",
+    "webgpu": "webgpu",
+    "migraphx": "migraphx",
+}
 ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "webgpu", "migraphx", "coreml")
 ACCELERATOR_ENVIRONMENT_DIRECTORY = ".venv-accel"
 # Bumped in lockstep with incode_mcp.accelerator_env.RECORD_SCHEMA_VERSION.
@@ -48,6 +52,21 @@ MINIMUM_NVIDIA_DRIVER = {"linux": (525, 60), "win32": (527, 41)}
 # that extra to nothing and build an environment with no embedding runtime in
 # it at all, which fails the probe for a reason that explains nothing.
 CUDA_PLATFORMS = {"linux": {"x86_64"}, "win32": {"amd64"}}
+# The native WebGPU plugin/core pair's published wheels. The plugin's macOS
+# wheel is universal2, but ONNX Runtime 1.24.4 itself is arm64-only there and
+# has a deployment target of 14.0. Linux and Windows publish x86-64 wheels.
+WEBGPU_PLATFORMS = {
+    "darwin": {"arm64"},
+    "linux": {"x86_64"},
+    "win32": {"amd64"},
+}
+MINIMUM_WEBGPU_MACOS = (14, 0)
+# AMD publishes this ONNX Runtime/MIGraphX combination as a single wheel rather
+# than on PyPI. Nomination stays exact so the installer never assembles an
+# untested Python/ROCm pair around it.
+MIGRAPHX_PLATFORM = ("linux", "x86_64")
+MIGRAPHX_PYTHON_VERSION = "3.12"
+MIGRAPHX_ROCM_VERSION = "7.2.1"
 
 
 class HarnessChoice(NamedTuple):
@@ -784,6 +803,9 @@ class AcceleratorPlan(NamedTuple):
     # finding no GPU is just what the machine is, and Core ML needs nothing
     # prepared at all.
     honored: bool = True
+    # Hash of the lockfile and selected extra. A record without this exact
+    # fingerprint describes an older resolved runtime and must be rebuilt.
+    lock_fingerprint: str = ""
 
     @property
     def prepares_environment(self) -> bool:
@@ -810,6 +832,41 @@ def _nvidia_smi_report() -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
+def _rocm_report() -> str | None:
+    """Return the installed ROCm version and, when available, an AMD device."""
+
+    version = ""
+    for path in (Path("/opt/rocm/.info/version"), Path("/opt/rocm/.info/version-dev")):
+        try:
+            contents = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        match = re.search(r"\d+\.\d+(?:\.\d+)?", contents)
+        if match is not None:
+            version = match.group()
+            break
+    if not version:
+        return None
+
+    device = ""
+    executable = shutil.which("rocminfo")
+    if executable is not None:
+        try:
+            result = subprocess.run(
+                [executable],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None and result.returncode == 0:
+            match = re.search(r"(?m)^\s*Marketing Name:\s*(.+?)\s*$", result.stdout)
+            if match is not None and match.group(1).strip().lower() != "unknown":
+                device = match.group(1).strip()
+    return f"{version}, {device or 'AMD GPU'}"
+
+
 def _driver_components(version: str) -> tuple[int, ...]:
     components: list[int] = []
     for part in version.strip().split("."):
@@ -819,12 +876,49 @@ def _driver_components(version: str) -> tuple[int, ...]:
     return tuple(components)
 
 
+def _normalized_platform(platform_name: str) -> str:
+    return "win32" if platform_name.startswith("win") else platform_name
+
+
+def _webgpu_plan(
+    *,
+    platform_name: str,
+    machine: str,
+    platform_version: str,
+    reason_prefix: str = "",
+) -> AcceleratorPlan:
+    supported = WEBGPU_PLATFORMS.get(platform_name)
+    problem = ""
+    if supported is None or machine not in supported:
+        problem = f"no native WebGPU plugin wheel is published for {platform_name}/{machine}"
+    elif platform_name == "darwin":
+        components = _driver_components(platform_version)
+        if not components or components < MINIMUM_WEBGPU_MACOS:
+            problem = (
+                f"the locked WebGPU plugin requires macOS "
+                f"{'.'.join(str(part) for part in MINIMUM_WEBGPU_MACOS)} or newer"
+            )
+
+    if problem:
+        prefix = f"{reason_prefix}; " if reason_prefix else "WebGPU was requested but "
+        return AcceleratorPlan("cpu", f"{prefix}{problem}", honored=False)
+    reason = (
+        f"the locked WebGPU plugin is available for {platform_name}/{machine}"
+        if not reason_prefix
+        else f"{reason_prefix}; falling back to WebGPU with the locked plugin"
+    )
+    return AcceleratorPlan("webgpu", reason, honored=not reason_prefix)
+
+
 def plan_accelerator(
     requested: str,
     *,
     platform_name: str | None = None,
     machine: str | None = None,
     nvidia_report: Callable[[], str | None] = _nvidia_smi_report,
+    rocm_report: Callable[[], str | None] = _rocm_report,
+    python_version: str | None = None,
+    platform_version: str | None = None,
 ) -> AcceleratorPlan:
     """Decide which accelerator, if any, this machine should have prepared.
 
@@ -832,8 +926,11 @@ def plan_accelerator(
     inference probe before anything offers the backend to the server.
     """
 
-    platform_name = (platform_name or sys.platform).lower()
+    platform_name = _normalized_platform((platform_name or sys.platform).lower())
     machine = (machine or platform.machine()).lower()
+    python_version = python_version or f"{sys.version_info.major}.{sys.version_info.minor}"
+    if platform_version is None:
+        platform_version = platform.mac_ver()[0] if platform_name == "darwin" else ""
     requested = requested.strip().lower()
 
     if requested == "cpu":
@@ -846,15 +943,52 @@ def plan_accelerator(
             "Core ML needs no separate environment and stays manual-only: it lost to "
             "CPU on this model. Set INCODE_EMBED_ACCELERATOR=coreml to measure it",
         )
-    if requested in {"webgpu", "migraphx"}:
-        return AcceleratorPlan(
-            "cpu",
-            f"{requested} has no locked installation in this release; it ships with the "
-            "direct ONNX backend that can configure it",
-            honored=False,
+    if requested == "webgpu":
+        return _webgpu_plan(
+            platform_name=platform_name,
+            machine=machine,
+            platform_version=platform_version,
+        )
+    if requested == "migraphx":
+        problem = ""
+        if (platform_name, machine) != MIGRAPHX_PLATFORM:
+            problem = (
+                f"the pinned MIGraphX wheel is published only for "
+                f"{MIGRAPHX_PLATFORM[0]}/{MIGRAPHX_PLATFORM[1]}"
+            )
+        elif python_version != MIGRAPHX_PYTHON_VERSION:
+            problem = (
+                f"the pinned MIGraphX wheel requires Python {MIGRAPHX_PYTHON_VERSION}, "
+                f"not {python_version}"
+            )
+        else:
+            report = rocm_report()
+            if not report or not report.strip():
+                problem = "ROCm was not detected"
+            else:
+                first = report.strip().splitlines()[0]
+                rocm_version, _, device_name = (part.strip() for part in first.partition(","))
+                if rocm_version != MIGRAPHX_ROCM_VERSION:
+                    problem = (
+                        f"ROCm {rocm_version or 'unknown'} does not match the pinned "
+                        f"{MIGRAPHX_ROCM_VERSION} runtime"
+                    )
+                else:
+                    return AcceleratorPlan(
+                        "migraphx",
+                        f"ROCm {rocm_version} on {device_name or 'an AMD device'} matches "
+                        "the pinned MIGraphX runtime",
+                        driver_version=rocm_version,
+                        device_name=device_name,
+                    )
+        return _webgpu_plan(
+            platform_name=platform_name,
+            machine=machine,
+            platform_version=platform_version,
+            reason_prefix=f"MIGraphX was requested but {problem}",
         )
 
-    supported = CUDA_PLATFORMS.get("win32" if platform_name.startswith("win") else platform_name)
+    supported = CUDA_PLATFORMS.get(platform_name)
     # `auto` finding no CUDA is what most machines are, not a request denied.
     explicit = "CUDA was requested but " if requested == "cuda" else ""
     honored = not explicit
@@ -873,7 +1007,7 @@ def plan_accelerator(
         )
     first = report.strip().splitlines()[0]
     driver_version, _, device_name = (part.strip() for part in first.partition(","))
-    floor = MINIMUM_NVIDIA_DRIVER["win32" if platform_name.startswith("win") else platform_name]
+    floor = MINIMUM_NVIDIA_DRIVER[platform_name]
     components = _driver_components(driver_version)
     if not components or components < floor:
         return AcceleratorPlan(
@@ -899,6 +1033,23 @@ def interpreter_version(python: Path) -> str:
 
     result = _run_command([str(python), "-c", "import sys;print('%d.%d'%sys.version_info[:2])"])
     return result.stdout.strip()
+
+
+def accelerator_lock_fingerprint(install_directory: Path, accelerator: str) -> str:
+    """Hash the selected extra and the lockfile that resolved its environment."""
+
+    lockfile = install_directory / "uv.lock"
+    try:
+        locked = lockfile.read_bytes()
+    except OSError as exc:
+        raise InstallerError(
+            f"The accelerator lockfile cannot be read at {lockfile}: {exc}"
+        ) from exc
+    digest = hashlib.sha256()
+    digest.update(accelerator.encode())
+    digest.update(b"\0")
+    digest.update(locked)
+    return digest.hexdigest()
 
 
 def runtime_record_path(python: Path) -> Path:
@@ -1032,6 +1183,7 @@ def write_accelerator_record(path: Path, plan: AcceleratorPlan, probe: Mapping[s
         "interpreter": str(probe["interpreter"]),
         "providers": list(probe["providers"]),
         "runtime_version": str(probe.get("runtime_version", "")),
+        "lock_fingerprint": plan.lock_fingerprint,
         "driver_version": plan.driver_version,
         "device": str(probe.get("device", "")),
         "python_version": str(probe.get("python_version", "")),
@@ -1077,6 +1229,7 @@ def reusable_accelerator_environment(
     matches = (
         record.get("schema_version") == ACCELERATOR_RECORD_SCHEMA_VERSION
         and record.get("accelerator") == plan.accelerator
+        and str(record.get("lock_fingerprint", "")) == plan.lock_fingerprint
         and str(record.get("driver_version", "")) == plan.driver_version
         and str(record.get("python_version", "")) == python_version
         and interpreter.is_file()
@@ -1092,6 +1245,9 @@ def configure_accelerator(
     platform_name: str | None = None,
     machine: str | None = None,
     nvidia_report: Callable[[], str | None] = _nvidia_smi_report,
+    rocm_report: Callable[[], str | None] = _rocm_report,
+    python_version: str | None = None,
+    platform_version: str | None = None,
     offline: bool = False,
 ) -> AcceleratorPlan:
     """Prepare the planned accelerator, or leave the installation on CPU.
@@ -1101,12 +1257,33 @@ def configure_accelerator(
     probe costs speed, and refusing to install over it would cost the server.
     """
 
-    plan = plan_accelerator(
-        requested,
-        platform_name=platform_name,
-        machine=machine,
-        nvidia_report=nvidia_report,
-    )
+    serving_python = environment_python(install_directory / ".venv", platform_name=platform_name)
+    detected_python_version: str | None = None
+    planning_python_version = python_version
+    planning_error: InstallerError | None = None
+    if requested.strip().lower() == "migraphx" and planning_python_version is None:
+        try:
+            detected_python_version = interpreter_version(serving_python)
+            planning_python_version = detected_python_version
+        except InstallerError as exc:
+            planning_error = exc
+    if planning_error is None:
+        plan = plan_accelerator(
+            requested,
+            platform_name=platform_name,
+            machine=machine,
+            nvidia_report=nvidia_report,
+            rocm_report=rocm_report,
+            python_version=planning_python_version,
+            platform_version=platform_version,
+        )
+    else:
+        plan = AcceleratorPlan(
+            "cpu",
+            f"MIGraphX was requested but the serving Python version could not be resolved: "
+            f"{planning_error}",
+            honored=False,
+        )
     try:
         record = accelerator_record_path(install_directory, platform_name=platform_name)
     except InstallerError as exc:
@@ -1127,16 +1304,25 @@ def configure_accelerator(
         shutil.rmtree(install_directory / ACCELERATOR_ENVIRONMENT_DIRECTORY, ignore_errors=True)
         return plan
 
-    serving_python = environment_python(install_directory / ".venv", platform_name=platform_name)
     try:
-        python_version = interpreter_version(serving_python)
-        reused = reusable_accelerator_environment(record, plan, python_version=python_version)
+        serving_python_version = detected_python_version or interpreter_version(serving_python)
+        plan = plan._replace(
+            lock_fingerprint=accelerator_lock_fingerprint(
+                install_directory,
+                ACCELERATOR_EXTRAS[plan.accelerator],
+            )
+        )
+        reused = reusable_accelerator_environment(
+            record,
+            plan,
+            python_version=serving_python_version,
+        )
         if reused is not None:
             return plan._replace(reason=f"{plan.reason}; reusing the environment at {reused}")
         python = sync_accelerator_environment(
             install_directory,
             ACCELERATOR_EXTRAS[plan.accelerator],
-            python_version=python_version,
+            python_version=serving_python_version,
             uv_executable=uv_executable,
             platform_name=platform_name,
         )

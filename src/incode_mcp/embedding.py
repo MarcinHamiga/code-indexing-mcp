@@ -7,10 +7,12 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import numpy as np
-from fastembed import TextEmbedding
+
+if TYPE_CHECKING:
+    from fastembed import TextEmbedding as _TextEmbedding
 
 from .errors import ErrorCode, IncodeError
 from .token_batching import (
@@ -22,6 +24,11 @@ from .token_batching import (
     plan_candidate_windows,
     plan_microbatches,
 )
+
+# Kept as a patchable module attribute for the in-process model tests, but
+# loaded only when CPU query embedding is actually requested. Direct accelerator
+# environments intentionally do not install FastEmbed.
+TextEmbedding: Any = None
 
 DEFAULT_MODEL = "jinaai/jina-embeddings-v2-base-code"
 DEFAULT_DIMENSION = 768
@@ -115,6 +122,9 @@ def resolve_session_providers(model: object) -> tuple[str, ...]:
     Like ``resolve_tokenizer`` this walks a private layout, so an empty tuple
     means "unknown", never "none".
     """
+    direct = getattr(model, "resolved_providers", None)
+    if direct is not None:
+        return tuple(str(name) for name in direct)
     for path in (("model", "model"), ("model",)):
         probe: Any = model
         for attribute in path:
@@ -300,7 +310,7 @@ class FastEmbedder:
         self.offline = offline
         self.threads = threads
         self.enable_cpu_mem_arena = enable_cpu_mem_arena
-        self._model: TextEmbedding | None = None
+        self._model: _TextEmbedding | None = None
         # The daemon serves each client connection on its own thread, so the
         # lazy load must not be able to build two ONNX sessions concurrently.
         self._model_lock = threading.Lock()
@@ -345,7 +355,7 @@ class FastEmbedder:
         vectors = self._vectors(self._get_model().query_embed(text))
         return vectors[0]
 
-    def _get_model(self) -> TextEmbedding:
+    def _get_model(self) -> _TextEmbedding:
         if self._model is not None:
             return self._model
         with self._model_lock:
@@ -353,6 +363,11 @@ class FastEmbedder:
                 return self._model
             self.cache_directory.mkdir(parents=True, exist_ok=True)
             try:
+                global TextEmbedding
+                if TextEmbedding is None:
+                    from fastembed import TextEmbedding as implementation
+
+                    TextEmbedding = implementation
                 self._model = TextEmbedding(
                     model_name=self.model_id,
                     cache_dir=str(self.cache_directory),

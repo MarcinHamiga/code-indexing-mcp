@@ -44,14 +44,45 @@ cuda = [
     "fastembed-gpu>=0.7,<1; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     "onnxruntime-gpu>=1.22,<1.24; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
 ]
+# ONNX Runtime's native WebGPU execution-provider plugin uses Metal on macOS,
+# Vulkan on Linux, and Direct3D 12/Vulkan on Windows. Keep its runtime and
+# plugin versions exact: this is the pair the installer probes before recording
+# the environment as usable.
+webgpu = [
+    "huggingface-hub>=1,<2; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "numpy>=2,<3; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "onnxruntime==1.24.4; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "onnxruntime-ep-webgpu==0.1.0; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "tokenizers>=0.22,<1; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+]
+# AMD publishes the tested MIGraphX build from its ROCm repository rather than
+# PyPI. The installer nominates it only for this exact Python/ROCm matrix.
+migraphx = [
+    "huggingface-hub>=1,<2; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+    "numpy>=2,<3; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+    "onnxruntime-migraphx @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+    "tokenizers>=0.22,<1; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+]
 
 [project.scripts]
 code-indexing-mcp = "incode_mcp.cli:main"
 
+[tool.hatch.metadata]
+# MIGraphX is distributed as a versioned ROCm wheel URL rather than through a
+# package index. The URL and its platform marker are locked above.
+allow-direct-references = true
+
 [tool.uv]
-# One lockfile, two mutually exclusive resolutions. Without this uv would try
-# to resolve both ONNX Runtime distributions into the same environment.
-conflicts = [[{ extra = "cpu" }, { extra = "cuda" }]]
+# One lockfile, four mutually exclusive resolutions. Each runtime distribution
+# owns the same `onnxruntime` import, so no environment may combine them.
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cuda" },
+        { extra = "webgpu" },
+        { extra = "migraphx" },
+    ],
+]
 
 [dependency-groups]
 dev = [
@@ -71,6 +102,7 @@ addopts = "-ra"
 testpaths = ["tests"]
 pythonpath = ["scripts"]
 markers = [
+    "accelerator: runs correctness and performance gates on a prepared accelerator runner",
     "model: downloads and exercises the real embedding model",
     "memory: runs the real-model indexing memory gate",
 ]

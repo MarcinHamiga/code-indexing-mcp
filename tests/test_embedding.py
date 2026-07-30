@@ -15,6 +15,7 @@ from incode_mcp.embedding import (
     compose_passage,
     embed_planned_segments,
     plan_passages,
+    resolve_session_providers,
     resolve_tokenizer,
 )
 
@@ -78,6 +79,21 @@ def test_resolve_tokenizer_returns_none_when_the_layout_moved() -> None:
         pass
 
     assert resolve_tokenizer(Model()) is None
+
+
+def test_direct_model_reports_the_provider_attached_through_the_plugin_api() -> None:
+    class CpuLookingSession:
+        def get_providers(self) -> list[str]:
+            return ["CPUExecutionProvider"]
+
+    class DirectModel:
+        resolved_providers = ("WebGpuExecutionProvider", "CPUExecutionProvider")
+        model = CpuLookingSession()
+
+    assert resolve_session_providers(DirectModel()) == (
+        "WebGpuExecutionProvider",
+        "CPUExecutionProvider",
+    )
 
 
 def test_planning_without_a_tokenizer_leaves_candidates_whole() -> None:
