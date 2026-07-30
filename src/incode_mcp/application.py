@@ -305,6 +305,18 @@ class Application:
             device=CPU_BACKEND.device,
         )
 
+    def _cpu_max_items(self) -> int:
+        """Return the microbatch size measured for CPU, if one was.
+
+        0 means CPU keeps whatever the indexer planned, which is correct both
+        when nothing has been measured and when the operator set a size
+        explicitly -- an explicit size is a size for the whole installation.
+        """
+        if not self.settings.embedding_batch_auto:
+            return 0
+        record = self.probe_cache.load(self._cpu_probe_key())
+        return 0 if record is None else record.batch_size
+
     def _measurements(self) -> tuple[ProbeRecord | None, ProbeRecord | None]:
         """Return what calibration recorded for CPU and for the accelerator."""
         selection = self.effective_backend_selection
@@ -420,6 +432,10 @@ class Application:
                 calibration_plan=(
                     self.indexer.segment_plan if self.settings.embedding_calibrate else None
                 ),
+                # The plan the indexer builds is packed for the accelerator,
+                # because that is whose batch size calibration adopted. A run
+                # that defers or degrades to CPU is packed for CPU instead.
+                cpu_max_items=self._cpu_max_items(),
             )
 
         return new_passage_session

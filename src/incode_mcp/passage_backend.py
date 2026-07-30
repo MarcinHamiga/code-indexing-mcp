@@ -99,6 +99,7 @@ class PassageBackendSession:
         on_degrade: Callable[[BackendSelection], None] | None = None,
         crossover_characters: int = 0,
         calibration_plan: SegmentPlan | None = None,
+        cpu_max_items: int = 0,
     ) -> None:
         self.selection = selection
         self.strict = strict
@@ -117,6 +118,12 @@ class PassageBackendSession:
         # has to know the token budgets that path would apply.
         self._calibration_plan = calibration_plan
         self.calibration: CalibrationResult | None = None
+        # The microbatch size measured for CPU, which is not the one measured
+        # for the accelerator. A run that defers to CPU, or degrades to it, must
+        # not be handed the accelerator's: on a device that packs four items to
+        # CPU's one, that is a run retrying its way through the whole corpus.
+        # 0 leaves whatever the caller planned alone.
+        self._cpu_max_items = cpu_max_items
         # Characters this run has embedded, and the size above which starting
         # the accelerator repays its model load. 0 means no measured crossover,
         # which is the pre-calibration behaviour: use the accelerator at once.
@@ -181,7 +188,16 @@ class PassageBackendSession:
         self, candidates: Sequence[PassageCandidate], plan: SegmentPlan
     ) -> list[list[EmbeddedSegment]]:
         pending = sum(len(candidate.prefix) + len(candidate.content) for candidate in candidates)
-        return self._attempt(lambda session: session.plan_and_embed(candidates, plan), pending)
+        return self._attempt(
+            lambda session: session.plan_and_embed(candidates, self._plan_for(session, plan)),
+            pending,
+        )
+
+    def _plan_for(self, session: EmbeddingWorkerSession, plan: SegmentPlan) -> SegmentPlan:
+        """Return *plan* packed for the backend that is about to run it."""
+        if not self._cpu_max_items or session.config.accelerator != CPU_BACKEND.accelerator.value:
+            return plan
+        return replace(plan, max_items=self._cpu_max_items)
 
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
         return self._attempt(

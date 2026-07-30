@@ -183,6 +183,7 @@ def _backend(
     crossover_characters: int = 0,
     calibration_plan: SegmentPlan | None = None,
     cpu_probe_key: ProbeKey | None = None,
+    cpu_max_items: int = 0,
 ) -> PassageBackendSession:
     cpu_started: list[int] = []
     accelerator_started: list[int] = []
@@ -214,6 +215,7 @@ def _backend(
         on_degrade=on_degrade,
         crossover_characters=crossover_characters,
         calibration_plan=calibration_plan,
+        cpu_max_items=cpu_max_items,
     )
     session.cpu_starts = cpu_started  # type: ignore[attr-defined]
     session.accelerator_starts = accelerator_started  # type: ignore[attr-defined]
@@ -645,6 +647,47 @@ def test_a_deferred_run_that_cannot_embed_on_cpu_does_not_try_the_accelerator() 
         backend.plan_and_embed(_sized_candidates(1, 10), PLAN)
 
     assert backend.accelerator_starts == []  # type: ignore[attr-defined]
+
+
+def _plan_recording_worker(connection: Connection, config: WorkerConfig) -> None:
+    """Healthy, and echoes the microbatch size it was asked for as a token count."""
+    while True:
+        command, payload = connection.recv()
+        if command == "stop":
+            return
+        if command == "initialize":
+            connection.send(("initialized", (tuple(config.providers), config.dimension)))
+            continue
+        if command == "probe":
+            connection.send(("probed", [_unit_vector(1.0) for _ in PROBE_TEXTS]))
+            continue
+        candidates, plan = payload
+        connection.send(
+            (
+                "planned",
+                (
+                    [[(0, 1, plan.max_items, _unit_vector(1.0))] for _ in candidates],
+                    True,
+                ),
+            )
+        )
+
+
+def test_each_backend_is_given_the_batch_size_measured_for_it() -> None:
+    """The calibrated size belongs to the backend it was measured on. Handing
+    CPU the accelerator's size makes a deferred run overrun and retry its way
+    through the whole corpus."""
+    with _backend(
+        _plan_recording_worker,
+        cpu_target=_plan_recording_worker,
+        crossover_characters=1_000,
+        cpu_max_items=1,
+    ) as backend:
+        below = backend.plan_and_embed(_sized_candidates(1, 100), SegmentPlan(max_items=8))
+        above = backend.plan_and_embed(_sized_candidates(4, 500), SegmentPlan(max_items=8))
+
+    assert below[0][0].token_count == 1
+    assert above[0][0].token_count == 8
 
 
 # -- calibration -----------------------------------------------------------
