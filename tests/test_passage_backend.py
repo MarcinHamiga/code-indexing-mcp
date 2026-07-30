@@ -787,6 +787,90 @@ def test_a_batch_size_an_overrun_reduced_replaces_the_calibrated_one(
     assert record.limited_by == "memory"
 
 
+# -- the sweep is measurement, not work the run did ------------------------
+
+
+def test_the_sweep_is_not_counted_as_content_the_run_embedded() -> None:
+    """Otherwise the first run against a new backend reports the calibration
+    corpus as chunks of the project, and disagrees with its own character
+    count while doing it."""
+    with _backend(_healthy_worker, calibration_plan=PLAN) as backend:
+        backend.plan_and_embed(_candidates(3), PLAN)
+
+    measured = backend.telemetry()
+    assert backend.calibration is not None, "the sweep must actually have run"
+    assert measured.segment_count == 3
+    assert measured.token_count == 3
+
+
+def test_the_sweeps_own_overrun_is_not_reported_as_a_run_failure() -> None:
+    """The sweep walks batch sizes up until they stop paying, and on a machine
+    with little memory that means overrunning the ceiling on purpose. Reported,
+    it would be a retry and a fallback on a run where nothing went wrong."""
+    with _backend(_shrinking_worker, calibration_plan=PLAN) as backend:
+        backend.plan_and_embed(_candidates(2), PLAN)
+
+    measured = backend.telemetry()
+    assert measured.retry_count == 0
+    assert measured.fallback_count == 0
+    assert measured.termination_reason is None
+    assert backend.fallback_reason is None
+
+
+def test_a_sweep_that_respawned_the_worker_does_not_reload_the_model(
+    tmp_path: Path,
+) -> None:
+    """The successor of a sweep's own overrun is the process verification just
+    covered. Treating it as unproven costs a second model load -- the cost the
+    crossover exists to spend only when it repays itself."""
+    config = WorkerConfig(
+        cache_directory=str(tmp_path),
+        offline=True,
+        threads=1,
+        enable_cpu_mem_arena=False,
+        dimension=DIMENSION,
+        providers=CUDA_BACKEND.providers,
+        accelerator=Accelerator.CUDA.value,
+    )
+    backend = _backend(
+        _healthy_worker,
+        accelerator_factory=lambda: EmbeddingWorkerSession(
+            config, effective_ceiling_bytes=2 * 1024**3, target=_load_counting_worker
+        ),
+        calibration_plan=PLAN,
+    )
+
+    with backend:
+        backend.plan_and_embed(_candidates(2), PLAN)
+        assert len(list(tmp_path.glob("spawn-*"))) > 1, "the sweep should have respawned"
+        backend.plan_and_embed(_candidates(2), PLAN)
+
+    assert len(list(tmp_path.glob("loaded-*"))) == 1
+
+
+def _load_counting_worker(connection: Connection, config: WorkerConfig) -> None:
+    """Overruns above one item, and leaves a mark for every model load."""
+    scratch = Path(config.cache_directory)
+    spawn = len(list(scratch.glob("spawn-*")))
+    (scratch / f"spawn-{spawn}").write_text("")
+    while True:
+        command, payload = connection.recv()
+        if command == "stop":
+            return
+        if command == "initialize":
+            (scratch / f"loaded-{spawn}").write_text("")
+            connection.send(("initialized", (tuple(config.providers), config.dimension)))
+            continue
+        if command == "probe":
+            connection.send(("probed", [_unit_vector(1.0) for _ in PROBE_TEXTS]))
+            continue
+        candidates, plan = payload
+        if plan.max_items > 1:
+            connection.send(("error", "INDEX_RESOURCE_LIMIT: exceeded its memory ceiling"))
+            continue
+        connection.send(("planned", (_packed_segments(len(candidates)), True)))
+
+
 # -- a respawned worker is not trusted on its predecessor's verification ---
 
 
