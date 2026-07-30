@@ -136,6 +136,10 @@ cache key: an OS upgrade under a prepared environment retires the verdict record
   removes the half-built environment.
 - A missing weight conversion is rebuilt from the snapshot already on disk. That is local file work,
   not a package installation, so it stays permitted in a worker; it is logged because it is slow.
+  It peaks around 1.9 GB — parsing a 640 MB protobuf and holding the converted tensors cannot share
+  pages, and streaming the write instead measured identically, so the library call was kept. That
+  fits under the 2 GB default indexing ceiling, and normally happens during installation where no
+  ceiling applies. A worker that does hit the ceiling reports it and finishes the run on CPU.
 - Anything that fails later follows the existing run-level CPU fallback, and strict mode forbids it.
 
 ## Testing and promotion

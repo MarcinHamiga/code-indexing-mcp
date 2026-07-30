@@ -299,6 +299,13 @@ def ensure_converted_weights(
     Building them is local file work over a snapshot already on disk, not a
     package installation, so it stays allowed in a worker -- but it reads and
     rewrites 600 MB, so it is logged rather than done quietly.
+
+    It also peaks around 1.9 GB, because parsing the artifact and holding the
+    converted tensors cannot share pages. That fits under the default indexing
+    ceiling and normally happens during installation, where no ceiling applies.
+    A worker that does hit the ceiling here reports it and the run finishes on
+    CPU, leaving the conversion for a reinstall or a larger
+    ``INCODE_EMBED_MEMORY_MB``.
     """
     import mlx.core as mx
 
@@ -307,14 +314,16 @@ def ensure_converted_weights(
         return target
     logger.info("Converting the ONNX weights of %s for MLX once", model_directory.name)
     target.parent.mkdir(parents=True, exist_ok=True)
-    weights = {
-        name: mx.array(value)
-        for name, value in convert(model_directory / DEFAULT_MODEL_ARTIFACT, config).items()
-    }
+    extracted = convert(model_directory / DEFAULT_MODEL_ARTIFACT, config)
+    # Handed over one at a time so the NumPy copy is released as it goes rather
+    # than kept alongside a second complete set of MLX arrays.
+    weights = {}
+    for name in list(extracted):
+        weights[name] = mx.array(extracted.pop(name))
     # Written aside and moved into place: a conversion interrupted halfway must
-    # not leave a truncated file that later loads look complete. The suffix stays
-    # ``.safetensors`` because MLX appends it to a name that lacks it, and would
-    # write somewhere this never moves or cleans up.
+    # not leave a truncated file that later loads read as complete. The suffix
+    # stays ``.safetensors`` because MLX appends it to a name that lacks one, and
+    # would write somewhere this never moves or cleans up.
     temporary = target.with_name(f"{target.stem}.{os.getpid()}.tmp{target.suffix}")
     try:
         mx.save_safetensors(str(temporary), weights)
