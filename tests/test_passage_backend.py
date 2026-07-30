@@ -17,6 +17,7 @@ from incode_mcp.backends import (
     Precision,
     Stability,
 )
+from incode_mcp.calibration import CalibrationResult
 from incode_mcp.embedding import PROBE_TEXTS, PassageCandidate, SegmentPlan
 from incode_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig, WorkerTarget
 from incode_mcp.errors import ErrorCode, IncodeError
@@ -598,6 +599,22 @@ def test_a_run_below_the_crossover_never_starts_the_accelerator() -> None:
     assert backend.telemetry().backend == "cpu"
 
 
+def test_an_accelerator_that_never_overtakes_cpu_is_never_started() -> None:
+    """None is not a very large threshold. There is no run size at which this
+    backend would be worth starting, and the report has to say that rather than
+    quote a number some run could conceivably pass."""
+    with _backend(_healthy_worker, crossover_characters=None) as backend:
+        backend.plan_and_embed(_sized_candidates(400, 4_000), PLAN)
+
+        assert backend.accelerator_starts == []  # type: ignore[attr-defined]
+
+    measured = backend.telemetry()
+    assert measured.backend == "cpu"
+    assert measured.crossover_characters is None
+    assert measured.selection_reason == "cuda measured no faster than CPU on this machine"
+    assert measured.fallback_count == 0
+
+
 def test_a_run_that_crosses_the_threshold_finishes_on_the_accelerator() -> None:
     with _backend(_healthy_worker, crossover_characters=1_000) as backend:
         backend.plan_and_embed(_sized_candidates(2, 100), PLAN)
@@ -690,6 +707,62 @@ def test_each_backend_is_given_the_batch_size_measured_for_it() -> None:
     assert above[0][0].token_count == 8
 
 
+def _fragile_recording_worker(connection: Connection, config: WorkerConfig) -> None:
+    """Overruns above one item, and echoes the size it actually served."""
+    while True:
+        command, payload = connection.recv()
+        if command == "stop":
+            return
+        if command == "initialize":
+            connection.send(("initialized", (tuple(config.providers), config.dimension)))
+            continue
+        if command == "probe":
+            connection.send(("probed", [_unit_vector(1.0) for _ in PROBE_TEXTS]))
+            continue
+        candidates, plan = payload
+        if plan.max_items > 1:
+            connection.send(("error", "INDEX_RESOURCE_LIMIT: exceeded its memory ceiling"))
+            continue
+        connection.send(
+            ("planned", ([[(0, 1, plan.max_items, _unit_vector(1.0))] for _ in candidates], True))
+        )
+
+
+def test_a_size_an_overrun_forced_down_is_used_for_the_rest_of_the_run() -> None:
+    """The reduction was already recorded for the next run. Not applying it to
+    this one leaves every group after it asking for the size that just overran,
+    overrunning, halving, and paying the same retries again."""
+    plan = SegmentPlan(max_tokens=8, max_items=4)
+
+    with _backend(_fragile_recording_worker) as backend:
+        first = backend.plan_and_embed(_candidates(2), plan)
+        retries_from_finding_the_ceiling = backend.telemetry().retry_count
+        second = backend.plan_and_embed(_candidates(2), plan)
+        third = backend.plan_and_embed(_candidates(2), plan)
+
+    assert first[0][0].token_count == 1, "the first group retried its way down to one"
+    assert retries_from_finding_the_ceiling > 0
+    # Asked for directly, so nothing overran and nothing was retried.
+    assert second[0][0].token_count == 1
+    assert third[0][0].token_count == 1
+    assert backend.telemetry().retry_count == retries_from_finding_the_ceiling
+
+
+def test_the_run_that_measured_a_size_embeds_at_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Otherwise the sweep is paid for by a run that cannot benefit from it."""
+    monkeypatch.setattr(
+        "incode_mcp.passage_backend.calibrate",
+        lambda *args, **kwargs: CalibrationResult(
+            max_items=4, characters_per_second=1_000.0, load_ns=1
+        ),
+    )
+
+    with _backend(_plan_recording_worker, calibration_plan=PLAN) as backend:
+        embedded = backend.plan_and_embed(_candidates(2), SegmentPlan(max_tokens=8, max_items=1))
+
+    assert embedded[0][0].token_count == 4
+
+
 # -- calibration -----------------------------------------------------------
 
 
@@ -733,6 +806,51 @@ def test_the_reference_backend_is_measured_alongside_the_accelerator(
     record = cache.load(_cpu_probe_key())
     assert record is not None
     assert record.characters_per_second > 0
+
+
+def test_the_reference_is_measured_after_the_accelerator_has_been_retired(
+    tmp_path: Path,
+) -> None:
+    """Two models resident at once is twice the ceiling the operator granted,
+    and the run gains nothing by waiting for the second: the crossover is read
+    when a session is built, so this number is for the next run either way."""
+    cache = ProbeCache(tmp_path / "probes.json")
+
+    with _backend(
+        _healthy_worker,
+        probe_cache=cache,
+        probe_key=_probe_key(),
+        cpu_probe_key=_cpu_probe_key(),
+        calibration_plan=PLAN,
+    ) as backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+        assert cache.load(_cpu_probe_key()) is None, "not while the accelerator is loaded"
+
+    assert cache.load(_cpu_probe_key()) is not None
+
+
+def test_a_cpu_only_run_does_not_measure_a_reference_it_has_nothing_to_compare(
+    tmp_path: Path,
+) -> None:
+    """Teardown is reached by every run, including the ones with no accelerator
+    to compare against -- which must not each pay for a worker and a sweep."""
+    cache = ProbeCache(tmp_path / "probes.json")
+    cpu_only = BackendSelection(
+        requested=Accelerator.CPU,
+        descriptor=CPU_BACKEND,
+        available_providers=(CPU_PROVIDER,),
+    )
+
+    with _backend(
+        _healthy_worker,
+        selection=cpu_only,
+        probe_cache=cache,
+        cpu_probe_key=_cpu_probe_key(),
+        calibration_plan=PLAN,
+    ) as backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+
+    assert cache.load(_cpu_probe_key()) is None
 
 
 def test_a_cached_calibration_is_not_measured_again(tmp_path: Path) -> None:

@@ -27,7 +27,7 @@ from dataclasses import dataclass, replace
 from types import TracebackType
 
 from .backends import CPU_BACKEND, BackendSelection
-from .calibration import CalibrationResult, calibrate
+from .calibration import LIMITED_BY_MEMORY, CalibrationResult, calibrate
 from .embedding import EmbeddedSegment, PassageCandidate, SegmentPlan
 from .embedding_worker import (
     EmbeddingWorkerSession,
@@ -135,7 +135,7 @@ class PassageBackendSession:
         calibrated_batch_size: int = 0,
         dimension: int = 0,
         on_degrade: Callable[[BackendSelection], None] | None = None,
-        crossover_characters: int = 0,
+        crossover_characters: int | None = 0,
         calibration_plan: SegmentPlan | None = None,
         cpu_max_items: int = 0,
     ) -> None:
@@ -151,6 +151,11 @@ class PassageBackendSession:
         # configured default as though it were a measurement would let
         # ``model status`` claim a calibration that never ran.
         self._calibrated_batch_size = calibrated_batch_size
+        # A size this session established for itself, as against one handed to
+        # it. Only the former may rewrite a plan mid-run: the caller's plan
+        # already carries whatever was known when it was built, and overriding
+        # it with the same number again would just be a longer way to agree.
+        self._session_max_items = 0
         # None disables measurement outright. The plan is needed because
         # calibration embeds through the same request path indexing uses, so it
         # has to know the token budgets that path would apply.
@@ -165,6 +170,8 @@ class PassageBackendSession:
         # Characters this run has embedded, and the size above which starting
         # the accelerator repays its model load. 0 means no measured crossover,
         # which is the pre-calibration behaviour: use the accelerator at once.
+        # None means it never repays it at any size, so the accelerator this
+        # session selected is never actually started.
         self.characters_embedded = 0
         self.crossover_characters = crossover_characters
         self._on_provisional_cpu = False
@@ -210,6 +217,15 @@ class PassageBackendSession:
         traceback: TracebackType | None,
     ) -> None:
         self.close()
+        # On the way out, and only after close() has retired the accelerator's
+        # worker, so the reference measurement never holds a second model
+        # against the same ceiling as the backend it is measured against. It
+        # costs the run nothing to wait until here: the crossover is read when
+        # a session is built, so no run has ever used the number it produces.
+        # Skipped on the way out of a failure -- nothing here is worth delaying
+        # an error the caller is already handling.
+        if exc_type is None:
+            self._measure_reference()
 
     def close(self) -> None:
         """Terminate the active worker, releasing VRAM or unified memory."""
@@ -232,10 +248,20 @@ class PassageBackendSession:
         )
 
     def _plan_for(self, session: EmbeddingWorkerSession, plan: SegmentPlan) -> SegmentPlan:
-        """Return *plan* packed for the backend that is about to run it."""
-        if not self._cpu_max_items or session.config.accelerator != CPU_BACKEND.accelerator.value:
-            return plan
-        return replace(plan, max_items=self._cpu_max_items)
+        """Return *plan* packed for the backend that is about to run it.
+
+        The caller's plan was built before this session measured anything, and
+        before any group overran the ceiling. Both are known here and neither is
+        known there, so the size is settled at the last moment rather than at
+        the first: otherwise the run that pays for the sweep spends the rest of
+        itself at a size the sweep superseded, and a run whose batch was forced
+        down re-requests the size that overran for every group after it.
+        """
+        if session.config.accelerator == CPU_BACKEND.accelerator.value:
+            return replace(plan, max_items=self._cpu_max_items) if self._cpu_max_items else plan
+        if self._session_max_items and self._session_max_items != plan.max_items:
+            return replace(plan, max_items=self._session_max_items)
+        return plan
 
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
         return self._attempt(
@@ -270,7 +296,7 @@ class PassageBackendSession:
             self._degrade(_reason(exc))
             result = call(self._active(pending))
         self.characters_embedded += pending
-        self._record_reduced_batch_size()
+        self._adopt_reduced_batch_size()
         return result
 
     def _active(self, pending: int = 0) -> EmbeddingWorkerSession:
@@ -278,9 +304,11 @@ class PassageBackendSession:
             if self._session is None:
                 self._session = self._start_cpu()
             return self._session
-        if self.crossover_characters > self.characters_embedded + pending:
-            # Too little work to repay a model load. Start on CPU without
-            # committing the run to it: the next request may well cross.
+        crossover = self.crossover_characters
+        if crossover is None or crossover > self.characters_embedded + pending:
+            # Too little work to repay a model load, or -- for None -- no amount
+            # of work that would. Start on CPU without committing the run to it:
+            # the next request may well cross.
             if self._session is None:
                 self._on_provisional_cpu = True
                 self._session = self._start_cpu()
@@ -360,7 +388,6 @@ class PassageBackendSession:
         self._verified_spawn = session.spawn_count
         self._measure(session)
         self._record_probe()
-        self._measure_reference()
 
     def _measure(self, session: EmbeddingWorkerSession) -> None:
         """Measure the backend that has just proven it works.
@@ -393,6 +420,7 @@ class PassageBackendSession:
             self._verified_spawn = session.spawn_count
         if self.calibration is not None:
             self._calibrated_batch_size = self.calibration.max_items
+            self._session_max_items = self.calibration.max_items
 
     def _measure_reference(self) -> None:
         """Measure CPU too, so the crossover has both of the rates it needs.
@@ -402,7 +430,13 @@ class PassageBackendSession:
         is made against. This costs one CPU worker and one model load, once per
         configuration -- paid on the run that first verified an accelerator, and
         never on a machine that has none.
+
+        That last part is what ``probe_state`` guards: this runs from teardown
+        now, which every run reaches, including the CPU-only ones that have no
+        accelerator to compare against and nothing to gain from the comparison.
         """
+        if self.probe_state != "verified":
+            return
         if self._calibration_plan is None or self._probe_cache is None:
             return
         key = self._cpu_probe_key
@@ -432,29 +466,34 @@ class PassageBackendSession:
             limited_by=measured.limited_by,
         )
 
-    def _record_reduced_batch_size(self) -> None:
-        """Persist a microbatch size a ceiling overrun forced down.
+    def _adopt_reduced_batch_size(self) -> None:
+        """Adopt a microbatch size a ceiling overrun forced down, and persist it.
 
-        Without this the next run asks for the size that overran, overruns
-        again, and pays the same retries to arrive back here.
+        Adopting it is what stops every group after this one from asking for the
+        size that just overran and paying the same retries to arrive back here.
+        Persisting it is what stops the next run from doing the same. The first
+        needs nothing but this session; only the second needs a probe cache, so
+        a session without one still stops overrunning.
         """
         session = self._session
         if (
             session is None
             or self._on_cpu
             or self._on_provisional_cpu
-            or self._probe_cache is None
-            or self._probe_key is None
             or not session.safe_max_items
             or session.safe_max_items == self._calibrated_batch_size
         ):
             return
         self._calibrated_batch_size = session.safe_max_items
+        self._session_max_items = session.safe_max_items
         if self.calibration is not None:
             self.calibration = replace(
-                self.calibration, max_items=session.safe_max_items, limited_by="memory"
+                self.calibration,
+                max_items=session.safe_max_items,
+                limited_by=LIMITED_BY_MEMORY,
             )
-        self._record_probe(limited_by="memory")
+        # Returns on its own when there is no cache to write to.
+        self._record_probe(limited_by=LIMITED_BY_MEMORY)
 
     def _cached_probe(self) -> ProbeRecord | None:
         if self._probe_cache is None or self._probe_key is None:
@@ -543,18 +582,22 @@ class PassageBackendSession:
         itself through ``fallback_reason``, and a run that simply used what was
         selected needs no explanation at all.
         """
-        if not self.crossover_characters or self._on_cpu:
+        accelerator = self.selection.accelerator.value
+        if self._on_cpu:
+            return None
+        if self.crossover_characters is None:
+            # No threshold to quote: there is no size at which this backend
+            # would have been worth starting, which is a different thing to say
+            # than that this run was too small.
+            return f"{accelerator} measured no faster than CPU on this machine"
+        if not self.crossover_characters:
             return None
         if self._on_provisional_cpu or self.backend_used == CPU_BACKEND.accelerator.value:
             return (
                 f"embedded {self.characters_embedded} characters, below the "
-                f"{self.crossover_characters}-character crossover for "
-                f"{self.selection.accelerator.value}"
+                f"{self.crossover_characters}-character crossover for {accelerator}"
             )
-        return (
-            f"passed the {self.crossover_characters}-character crossover for "
-            f"{self.selection.accelerator.value}"
-        )
+        return f"passed the {self.crossover_characters}-character crossover for {accelerator}"
 
     def _all_telemetry(self) -> list[SessionTelemetry]:
         live = [self._session.telemetry()] if self._session is not None else []
