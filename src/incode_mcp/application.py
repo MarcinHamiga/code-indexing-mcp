@@ -49,6 +49,7 @@ from .search import SearchService
 from .settings import IndexSettings
 from .staging import recover_staged_commits
 from .storage import LanceStore
+from .token_batching import max_token_product_for
 from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
 logger = logging.getLogger(__name__)
@@ -173,6 +174,14 @@ class Application:
                 max_tokens=self.settings.embedding_max_tokens,
                 overlap_tokens=self.settings.embedding_overlap_tokens,
                 max_items=self.embedding_batch_size,
+                # The padded matrix a microbatch materializes is charged to the
+                # same ceiling as everything else the worker holds, so it is
+                # budgeted from that ceiling rather than from the constant it
+                # was measured at.
+                max_token_product=max_token_product_for(
+                    self.settings.index_memory_bytes,
+                    max_tokens=self.settings.embedding_max_tokens,
+                ),
             ),
             passage_session_factory=passage_session_factory,
             staging_directory=paths.data / "staging",

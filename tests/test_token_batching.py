@@ -9,9 +9,12 @@ from dataclasses import dataclass
 import pytest
 
 from incode_mcp.token_batching import (
+    DEFAULT_MAX_TOKEN_PRODUCT,
     DEFAULT_MAX_TOKENS,
     DEFAULT_OVERLAP_TOKENS,
+    REFERENCE_MEMORY_BYTES,
     content_token_offsets,
+    max_token_product_for,
     plan_candidate_windows,
     plan_microbatches,
     plan_token_windows,
@@ -215,6 +218,30 @@ def test_a_segment_wider_than_the_product_still_forms_its_own_batch() -> None:
     batches = plan_microbatches([9_000, 10], max_items=4, max_token_product=4_096)
 
     assert batches == [[0], [1]]
+
+
+def test_the_default_ceiling_reproduces_the_measured_token_product() -> None:
+    """The constant was measured at this ceiling, so this ceiling must keep it."""
+    assert max_token_product_for(REFERENCE_MEMORY_BYTES) == DEFAULT_MAX_TOKEN_PRODUCT
+
+
+def test_the_token_product_follows_the_configured_ceiling() -> None:
+    assert max_token_product_for(REFERENCE_MEMORY_BYTES * 2) == DEFAULT_MAX_TOKEN_PRODUCT * 2
+    assert max_token_product_for(REFERENCE_MEMORY_BYTES // 2) == DEFAULT_MAX_TOKEN_PRODUCT // 2
+
+
+def test_the_smallest_ceiling_still_admits_one_longest_sequence() -> None:
+    """A product below one window would batch a max-length segment alone anyway,
+    but it would also drop every shorter segment to one item per batch."""
+    assert max_token_product_for(1024**3) >= DEFAULT_MAX_TOKENS
+
+
+def test_a_large_ceiling_does_not_widen_the_batch_without_evidence() -> None:
+    """Padding is quadratic in the widest member and nothing measured a matrix
+    this size, so the ceiling stops buying width past a fixed multiple."""
+    assert max_token_product_for(REFERENCE_MEMORY_BYTES * 64) == max_token_product_for(
+        REFERENCE_MEMORY_BYTES * 1024
+    )
 
 
 def test_microbatching_an_empty_plan_produces_no_batches() -> None:

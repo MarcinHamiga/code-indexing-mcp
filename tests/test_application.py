@@ -16,6 +16,7 @@ from incode_mcp.backends import CPU_BACKEND, Accelerator
 from incode_mcp.embedding_worker import default_launcher
 from incode_mcp.errors import ErrorCode, IncodeError
 from incode_mcp.settings import IndexSettings
+from incode_mcp.token_batching import DEFAULT_MAX_TOKEN_PRODUCT, REFERENCE_MEMORY_BYTES
 from incode_mcp.worker_launcher import ExternalInterpreterLauncher
 
 
@@ -283,6 +284,19 @@ def test_an_explicit_batch_size_is_not_overridden_by_calibration(tmp_path: Path)
 
     assert app.model_status().batch_size == 12
     assert app.model_status().batch_calibration == "explicit"
+
+
+def test_the_microbatch_token_budget_follows_the_memory_ceiling(tmp_path: Path) -> None:
+    """The padded matrix a microbatch materializes is charged to the same
+    ceiling the operator configured, so it has to move with it."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(
+        IndexSettings.from_environment({}), index_memory_bytes=REFERENCE_MEMORY_BYTES * 2
+    )
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+
+    assert app.indexer.segment_plan.max_token_product == DEFAULT_MAX_TOKEN_PRODUCT * 2
 
 
 def test_the_query_model_stays_in_process_regardless_of_the_backend(tmp_path: Path) -> None:
