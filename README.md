@@ -52,7 +52,8 @@ By default it also detects whether this machine can be given an automatic GPU ac
 indexing and prepares one when it can. Experimental backends must be named explicitly:
 
 ```bash
-python3 install.py --accelerator auto      # CPU or a supported CUDA installation
+python3 install.py --accelerator auto      # CPU, a supported CUDA installation, or Metal via MLX
+python3 install.py --accelerator mlx      # Metal on Apple Silicon through MLX
 python3 install.py --accelerator webgpu   # experimental Metal, Vulkan, or D3D12 path
 python3 install.py --accelerator migraphx # experimental pinned AMD/ROCm path
 ```
@@ -300,13 +301,20 @@ The locked installation matrix is:
 | --- | --- | --- | --- | --- |
 | CPU | Python 3.12/3.13 on every supported OS | `fastembed` | CPU | automatic fallback |
 | CUDA | Linux x86-64 or Windows x86-64; NVIDIA driver 525.60+ or 527.41+ | ONNX Runtime GPU 1.22–1.23, CUDA 12, cuDNN 9 | CUDA | automatic |
+| MLX | macOS 14+ Apple Silicon | MLX 0.32.0 | Metal | automatic |
 | WebGPU | macOS 14+ Apple Silicon, Linux x86-64 with glibc 2.27+, or Windows x86-64 | ONNX Runtime 1.24.4 + WebGPU plugin 0.1.0 | Metal, Vulkan, or D3D12/Vulkan | experimental, explicit only |
 | MIGraphX | Linux x86-64, Python 3.12, ROCm 7.2.1 | AMD ONNX Runtime/MIGraphX 1.23.2 | ROCm/MIGraphX | experimental, explicit only |
 | Core ML | macOS, when the serving runtime exposes it | serving CPU environment | Core ML | manual only |
 
 An unsupported explicit MIGraphX request tries the locked WebGPU path when that platform has the
-complete plugin/core wheel pair, then falls back to CPU. WebGPU and MIGraphX are not considered by
-`auto` while experimental.
+complete plugin/core wheel pair, then falls back to CPU. An unsupported explicit MLX request does
+not: a request for Metal on a machine with no Metal is not a request for Vulkan, so it reports CPU
+and says why. WebGPU and MIGraphX are not considered by `auto` while experimental.
+
+MLX is the Metal path because WebGPU lost on Apple Silicon. On an M4 Pro, WebGPU indexed 1,000
+chunks at 1.11× of CPU against a 1.25× promotion threshold; MLX reached 1.52–1.56× on the same
+corpus, with vectors matching CPU to cosine 1.0 and identical top-5 rankings, so `auto` prepares it
+there.
 
 #### The accelerator environment
 
@@ -315,7 +323,7 @@ distributions that both own the `onnxruntime` import. The direct WebGPU and MIGr
 that import too, so none can share an environment. The serving environment is therefore pinned to
 the `cpu` extra — it embeds queries in-process and is what every accelerator falls back to — and an
 accelerator gets a second locked environment of its own under the install directory, sharing the
-same model cache. All four runtime extras are resolved from one lockfile that declares them
+same model cache. All five runtime extras are resolved from one lockfile that declares them
 mutually exclusive.
 
 The installer prepares that environment and records it at `accelerator.json` in the runtime data
@@ -330,6 +338,15 @@ passage model because FastEmbed cannot configure those providers. It resolves th
 `jinaai/jina-embeddings-v2-base-code` snapshot and ONNX artifact as CPU, applies the same tokenizer
 configuration, attention-mask mean pooling, float32 normalization, and 768-vector shape, and
 reports the providers the session actually resolved.
+
+MLX cannot execute ONNX at all, so it reproduces that model instead of running it: the float32
+initializers are lifted out of the same ONNX artifact and the JinaBERT v2 graph they belong to —
+ALiBi, post-norm query and key projections, a GEGLU feed-forward — is written out again in MLX. The
+tokenizer, pooling, normalization, and vector shape are shared with the direct ONNX model, and the
+configuration and every tensor name and shape are checked on load, so an artifact whose graph moved
+fails rather than returning vectors that no longer retrieve. The one-time conversion is written to
+`<cache>/models/mlx/<revision>-jina-v1-f32.safetensors` and memory-mapped afterwards; it is keyed by
+model revision, so a model that moves is converted again rather than read from a stale file.
 
 A passage worker for an accelerator runs from that environment's own interpreter, dialling back to
 the serving process over an authenticated local socket. `multiprocessing` cannot cross that
@@ -526,19 +543,27 @@ To exercise the real model integration, provide a persistent cache directory and
 INCODE_MODEL_TEST_CACHE=/path/to/cache uv run pytest -m model
 ```
 
-Dedicated WebGPU/MIGraphX runners can exercise the correctness and ≥1,000-chunk performance gates
-against an installer-created accelerator record:
+Dedicated MLX/WebGPU/MIGraphX runners can exercise the correctness and ≥1,000-chunk performance
+gates against an installer-created accelerator record:
 
 ```bash
 INCODE_MODEL_TEST_CACHE=/path/to/cache \
 INCODE_ACCEL_ENV=/path/to/accelerator.json \
-INCODE_TEST_ACCELERATOR=webgpu \
+INCODE_TEST_ACCELERATOR=mlx \
   uv run pytest -m accelerator
 ```
 
 The gate requires row cosine similarity of at least 0.999, search top-k overlap of at least 99%,
-and an end-to-end forced-index speedup of at least 1.25× before an experimental backend can be
-considered for automatic promotion.
+and an end-to-end forced-index speedup of at least 1.25× before a backend can be considered for
+automatic promotion.
+
+MLX's own unit tests need MLX, which the serving environment does not have. They run in the `mlx`
+extra's environment, and check the forward pass against an independent NumPy implementation of the
+same graph:
+
+```bash
+uv run --extra mlx pytest tests/test_mlx_backend.py
+```
 
 The project intentionally excludes filesystem watching, HTTP transports, dependency/call graphs,
 cross-reference resolution, and custom embedding profiles.

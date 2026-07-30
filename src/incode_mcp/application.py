@@ -250,7 +250,9 @@ class Application:
             model_artifact=model_artifact_fingerprint(Path(cache_directory), embedder.model_id),
             accelerator=descriptor.accelerator.value,
             provider=descriptor.provider,
-            runtime_version=runtime_version(),
+            # The record's version describes the environment that will run the
+            # backend; this process's own runtime is only the fallback answer.
+            runtime_version=descriptor.runtime_version or runtime_version(descriptor.runtime),
             platform=platform_fingerprint(),
             device=descriptor.device,
             driver_version=descriptor.driver_version,

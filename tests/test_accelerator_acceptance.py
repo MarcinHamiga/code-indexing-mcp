@@ -21,17 +21,20 @@ from incode_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig
 from incode_mcp.settings import IndexSettings
 from incode_mcp.worker_launcher import ExternalInterpreterLauncher
 
+GATED_ACCELERATORS = (Accelerator.MLX, Accelerator.WEBGPU, Accelerator.MIGRAPHX)
+_NAMES = ", ".join(accelerator.value for accelerator in GATED_ACCELERATORS)
+
 
 def _accelerator() -> Accelerator:
     configured = os.environ.get("INCODE_TEST_ACCELERATOR")
     if not configured:
-        pytest.skip("set INCODE_TEST_ACCELERATOR to webgpu or migraphx on a prepared runner")
+        pytest.skip(f"set INCODE_TEST_ACCELERATOR to one of {_NAMES} on a prepared runner")
     try:
         accelerator = Accelerator(configured.lower())
     except ValueError:
         pytest.fail(f"INCODE_TEST_ACCELERATOR names unknown backend {configured!r}")
-    if accelerator not in {Accelerator.WEBGPU, Accelerator.MIGRAPHX}:
-        pytest.fail("INCODE_TEST_ACCELERATOR must be webgpu or migraphx")
+    if accelerator not in GATED_ACCELERATORS:
+        pytest.fail(f"INCODE_TEST_ACCELERATOR must be one of {_NAMES}")
     return accelerator
 
 

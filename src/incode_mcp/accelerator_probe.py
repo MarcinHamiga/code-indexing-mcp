@@ -51,9 +51,8 @@ def probe(
     descriptor = backend_for(accelerator)
     if descriptor is None:
         raise ValueError(f"no backend is registered for {accelerator.value}")
-    providers = available_execution_providers()
-    plugin_provider = accelerator is Accelerator.WEBGPU
-    if not plugin_provider and descriptor.provider not in providers:
+    providers = available_execution_providers() if descriptor.publishes_execution_providers else ()
+    if descriptor.provider_is_preregistered and descriptor.provider not in providers:
         raise RuntimeError(
             f"{descriptor.provider} is not offered by this environment's ONNX Runtime "
             f"({', '.join(providers)})"
@@ -78,8 +77,8 @@ def probe(
             raise RuntimeError(
                 f"{descriptor.provider} was requested but the session runs on {', '.join(resolved)}"
             )
-    elif accelerator in {Accelerator.WEBGPU, Accelerator.MIGRAPHX}:
-        # The direct model reports the providers its own session resolved, so
+    elif descriptor.uses_direct_model:
+        # The direct model reports the target its own session resolved, so
         # nothing at all means the session is broken. FastEmbed models are
         # different: resolution walks a private layout there, so an empty tuple
         # means "unknown" and stays tolerated rather than letting a FastEmbed
@@ -99,7 +98,7 @@ def probe(
         "interpreter": sys.executable,
         "providers": list(providers),
         "resolved_providers": list(resolved),
-        "runtime_version": runtime_version(),
+        "runtime_version": runtime_version(descriptor.runtime),
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
         "platform": platform_fingerprint(),
         "device": descriptor.device,
