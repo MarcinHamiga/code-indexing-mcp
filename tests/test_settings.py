@@ -144,6 +144,43 @@ def test_an_explicit_batch_size_is_marked_as_not_calibratable() -> None:
     assert settings.embedding_batch_auto is False
 
 
+def test_the_crossover_is_measured_by_default() -> None:
+    settings = IndexSettings.from_environment({})
+
+    assert settings.embedding_crossover_auto is True
+    assert settings.embedding_crossover_characters == 0
+    assert settings.embedding_calibrate is True
+
+
+def test_the_crossover_can_be_turned_off_entirely() -> None:
+    """ "off" means the accelerator starts on the first chunk, which is what
+    every run did before anything measured whether that paid."""
+    settings = IndexSettings.from_environment({"INCODE_EMBED_CROSSOVER": "off"})
+
+    assert settings.embedding_crossover_auto is False
+    assert settings.embedding_crossover_characters == 0
+
+
+def test_an_explicit_crossover_overrides_the_measured_one() -> None:
+    settings = IndexSettings.from_environment({"INCODE_EMBED_CROSSOVER": "250000"})
+
+    assert settings.embedding_crossover_auto is False
+    assert settings.embedding_crossover_characters == 250_000
+
+
+def test_a_crossover_that_is_neither_a_mode_nor_a_size_is_rejected() -> None:
+    with pytest.raises(IncodeError) as caught:
+        IndexSettings.from_environment({"INCODE_EMBED_CROSSOVER": "sometimes"})
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+
+
+def test_calibration_can_be_declined() -> None:
+    assert (
+        IndexSettings.from_environment({"INCODE_EMBED_CALIBRATE": "0"}).embedding_calibrate is False
+    )
+
+
 def test_the_batch_size_range_reaches_the_documented_maximum() -> None:
     assert IndexSettings.from_environment({"INCODE_EMBED_BATCH_SIZE": "256"}).embedding_batch_size
 

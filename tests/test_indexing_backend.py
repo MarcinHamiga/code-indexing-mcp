@@ -153,6 +153,7 @@ def _session_factory(
     *,
     strict: bool = False,
     starve_accelerator: bool = False,
+    crossover_characters: int = 0,
 ) -> Callable[[], PassageBackendSession]:
     def accelerator_session() -> EmbeddingWorkerSession:
         session = EmbeddingWorkerSession(
@@ -181,6 +182,7 @@ def _session_factory(
             cpu_factory=cpu_session,
             strict=strict,
             dimension=DIMENSION,
+            crossover_characters=crossover_characters,
         )
 
     return factory
@@ -229,6 +231,28 @@ def test_a_working_accelerator_indexes_and_is_named_in_the_report(tmp_path: Path
     assert report.embedding_backend == "cuda"
     assert report.embedding_fallback_reason is None
     assert report.worker_used is True
+    assert len(store.list_chunks([project.id])) == report.embedded_chunks
+
+
+def test_a_run_too_small_to_repay_the_accelerator_says_so_rather_than_failing_over(
+    tmp_path: Path,
+) -> None:
+    """A report has to distinguish CPU by design from CPU after a failure."""
+    project = initialize_project(_repository(tmp_path))
+    indexer, store = _indexer(
+        tmp_path, _session_factory(_healthy_worker, crossover_characters=10**6)
+    )
+
+    report = indexer.index(project)
+
+    assert report.errors == []
+    assert report.embedding_backend == "cpu"
+    assert report.embedding_fallback_reason is None
+    assert report.fallback_count == 0
+    assert report.embedded_characters and report.embedded_characters > 0
+    assert report.embedding_crossover_characters == 10**6
+    assert report.embedding_selection_reason
+    assert "crossover" in report.embedding_selection_reason
     assert len(store.list_chunks([project.id])) == report.embedded_chunks
 
 

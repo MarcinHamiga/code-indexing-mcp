@@ -24,6 +24,7 @@ from .backends import (
     runtime_version,
     select_backend,
 )
+from .calibration import crossover_characters
 from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
 from .errors import ErrorCode, IncodeError
@@ -42,11 +43,11 @@ from .models import (
     SymbolResponse,
 )
 from .passage_backend import PassageBackendSession
-from .probe_cache import ProbeCache, ProbeKey, model_artifact_fingerprint
+from .probe_cache import ProbeCache, ProbeKey, ProbeRecord, model_artifact_fingerprint
 from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
 from .scanner import SourceScanner
 from .search import SearchService
-from .settings import IndexSettings
+from .settings import MAX_CROSSOVER_CHARACTERS, IndexSettings
 from .staging import recover_staged_commits
 from .storage import LanceStore
 from .token_batching import max_token_product_for
@@ -58,6 +59,17 @@ logger = logging.getLogger(__name__)
 # whole of an index run. Wait only long enough to lose a race against a commit
 # that is about to finish; a run genuinely in flight is left to a later start.
 RECOVERY_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+def _rate(record: ProbeRecord | None) -> float | None:
+    """Return a measured rate, or None for one that was never measured.
+
+    A stored zero means the record predates its measurement, and reporting it
+    as zero characters per second would describe a backend that never finishes.
+    """
+    if record is None or record.characters_per_second <= 0:
+        return None
+    return record.characters_per_second
 
 
 @dataclass(frozen=True)
@@ -158,7 +170,12 @@ class Application:
                 cached = self.probe_cache.load(self._probe_key)
                 if cached is not None and cached.batch_size > 0:
                     self.embedding_batch_size = cached.batch_size
-                    self.batch_calibration = "calibrated"
+                    # A size a ceiling overrun forced down is not the size
+                    # calibration chose, and a machine pinned low by one bad run
+                    # has to be able to say so.
+                    self.batch_calibration = (
+                        "reduced" if cached.limited_by == "memory" else "measured"
+                    )
 
         passage_session_factory: Callable[[], PassageBackendSession] | None = None
         if isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker":
@@ -267,6 +284,80 @@ class Application:
             driver_version=descriptor.driver_version,
         )
 
+    def _cpu_probe_key(self) -> ProbeKey:
+        """The key CPU's own calibration is stored under.
+
+        CPU needs no probe to be trusted, but the crossover is a comparison and
+        a comparison needs both sides measured -- under a key that moves when
+        the model, the platform, or this process's runtime does, for the same
+        reasons the accelerator's does.
+        """
+        cache_directory = getattr(self.embedder, "cache_directory", self.paths.cache / "models")
+        return ProbeKey(
+            model_id=self.embedder.model_id,
+            model_artifact=model_artifact_fingerprint(
+                Path(cache_directory), self.embedder.model_id
+            ),
+            accelerator=CPU_BACKEND.accelerator.value,
+            provider=CPU_BACKEND.provider,
+            runtime_version=runtime_version(CPU_BACKEND.runtime),
+            platform=platform_fingerprint(),
+            device=CPU_BACKEND.device,
+        )
+
+    def _measurements(self) -> tuple[ProbeRecord | None, ProbeRecord | None]:
+        """Return what calibration recorded for CPU and for the accelerator."""
+        selection = self.effective_backend_selection
+        if not selection.uses_accelerator:
+            return self.probe_cache.load(self._cpu_probe_key()), None
+        key = self._probe_key or self._build_probe_key(self.embedder)
+        return self.probe_cache.load(self._cpu_probe_key()), self.probe_cache.load(key)
+
+    def crossover_characters(self) -> int:
+        """Return the run size below which this machine should stay on CPU.
+
+        0 means "start the accelerator immediately", which is the answer when
+        the operator turned deferral off and also when nothing has been measured
+        yet -- the first run on a machine is what does the measuring, and it
+        cannot defer on numbers it is in the middle of producing.
+        """
+        if not self.settings.embedding_crossover_auto:
+            return self.settings.embedding_crossover_characters
+        cpu, accelerator = self._measurements()
+        if cpu is None or accelerator is None:
+            return 0
+        measured = crossover_characters(
+            load_ns=accelerator.load_ns,
+            cpu_characters_per_second=cpu.characters_per_second,
+            accelerator_characters_per_second=accelerator.characters_per_second,
+        )
+        # No crossover means the accelerator never overtakes CPU. Deferring
+        # every run is then exactly right, and MAX_CROSSOVER_CHARACTERS is the
+        # largest run the configuration admits.
+        return MAX_CROSSOVER_CHARACTERS if measured is None else measured
+
+    def _recommended_override(
+        self, cpu: ProbeRecord | None, accelerator: ProbeRecord | None
+    ) -> str | None:
+        """Return the one setting change the measurements argue for, if any."""
+        if accelerator is not None and accelerator.limited_by == "memory":
+            return (
+                "INCODE_EMBED_MEMORY_MB (a batch overran the ceiling and was reduced to "
+                f"{accelerator.batch_size})"
+            )
+        if (
+            cpu is not None
+            and accelerator is not None
+            and cpu.characters_per_second > 0
+            and accelerator.characters_per_second > 0
+            and accelerator.characters_per_second <= cpu.characters_per_second
+        ):
+            return (
+                "INCODE_EMBED_ACCELERATOR=cpu (the accelerator measured no faster than CPU "
+                "on this machine)"
+            )
+        return None
+
     def _passage_session_factory(
         self, embedder: FastEmbedder
     ) -> Callable[[], PassageBackendSession]:
@@ -314,13 +405,20 @@ class Application:
                 strict=strict,
                 probe_cache=self.probe_cache,
                 probe_key=probe_key,
-                # Phase 5 measures a batch size per backend and stores it here.
-                # Until then nothing has been calibrated, and saying otherwise
-                # would make ``model status`` report the configured default as
-                # though it were a measurement.
+                cpu_probe_key=self._cpu_probe_key(),
+                # Only calibration establishes one. A configured default
+                # recorded here would make ``model status`` report it as a
+                # measurement that never ran.
                 calibrated_batch_size=0,
                 dimension=embedder.dimension,
                 on_degrade=self._remember_fallback,
+                # Read per run: the first run on a machine writes the numbers
+                # every later run defers on, and a daemon must not have to be
+                # restarted to start using them.
+                crossover_characters=self.crossover_characters(),
+                calibration_plan=(
+                    self.indexer.segment_plan if self.settings.embedding_calibrate else None
+                ),
             )
 
         return new_passage_session
@@ -337,6 +435,17 @@ class Application:
             probe_state = self.probe_cache.state(key)
         record = self.accelerator_environment.environment
         external = selection.uses_accelerator and self._runs_externally(descriptor)
+        cpu, accelerator = self._measurements()
+        # Reported as a number only when there is one. An accelerator that never
+        # overtakes CPU has no crossover, and printing the largest admissible run
+        # would read as a threshold some run could pass.
+        measured_crossover: int | None = None
+        if cpu is not None and accelerator is not None:
+            measured_crossover = crossover_characters(
+                load_ns=accelerator.load_ns,
+                cpu_characters_per_second=cpu.characters_per_second,
+                accelerator_characters_per_second=accelerator.characters_per_second,
+            )
         return ModelStatus(
             embedding_model=self.embedder.model_id,
             dimension=self.embedder.dimension,
@@ -358,6 +467,11 @@ class Application:
             probe_cache_state=probe_state,
             strict=self.settings.embedding_strict,
             fallback_reason=selection.fallback_reason,
+            cpu_characters_per_second=_rate(cpu),
+            accelerator_characters_per_second=_rate(accelerator),
+            accelerator_load_ms=None if accelerator is None else accelerator.load_ns // 1_000_000,
+            crossover_characters=measured_crossover,
+            recommended_override=self._recommended_override(cpu, accelerator),
         )
 
     @classmethod

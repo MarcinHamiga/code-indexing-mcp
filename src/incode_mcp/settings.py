@@ -19,6 +19,9 @@ from .token_batching import DEFAULT_MAX_TOKENS, DEFAULT_OVERLAP_TOKENS
 # earned it through calibration.
 DEFAULT_AUTO_BATCH_SIZE = 1
 MAX_BATCH_SIZE = 256
+# A gigabyte of source in one run is already far past any measured crossover, so
+# a larger figure is a mistyped setting rather than a policy.
+MAX_CROSSOVER_CHARACTERS = 1024**3
 
 
 class IndexMode(StrEnum):
@@ -71,6 +74,31 @@ def _batch_size(environment: Mapping[str, str]) -> tuple[int, bool]:
     return _integer(environment, "INCODE_EMBED_BATCH_SIZE", 1, 1, MAX_BATCH_SIZE), False
 
 
+def _crossover(environment: Mapping[str, str]) -> tuple[int, bool]:
+    """Return the configured crossover in characters and whether it is measured.
+
+    ``off`` is a size of zero, which reads correctly everywhere downstream: no
+    run is smaller than the threshold, so the accelerator starts on the first
+    chunk, exactly as it did before anything measured whether that paid.
+    """
+    raw = environment.get("INCODE_EMBED_CROSSOVER")
+    if raw is None or raw.strip().lower() == "auto":
+        return 0, True
+    if raw.strip().lower() == "off":
+        return 0, False
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise _configuration_error(
+            "INCODE_EMBED_CROSSOVER", raw, "auto, off, or a character count"
+        ) from exc
+    if not 0 <= value <= MAX_CROSSOVER_CHARACTERS:
+        raise _configuration_error(
+            "INCODE_EMBED_CROSSOVER", raw, f"a character count up to {MAX_CROSSOVER_CHARACTERS}"
+        )
+    return value, False
+
+
 def _memory_bytes(environment: Mapping[str, str], default_megabytes: int) -> int:
     """Resolve the indexing memory ceiling from either accepted variable.
 
@@ -105,6 +133,15 @@ class IndexSettings:
     # True when the batch size was left to the runtime, which lets calibration
     # raise it for a backend that was measured to handle more.
     embedding_batch_auto: bool = True
+    # The run size, in candidate characters, above which starting an accelerator
+    # repays its model load. 0 with ``_auto`` set means nothing has measured one
+    # yet; 0 with it clear means the operator turned deferral off.
+    embedding_crossover_characters: int = 0
+    embedding_crossover_auto: bool = True
+    # Measuring a backend costs one sweep per configuration. Declining it leaves
+    # the batch size and the crossover unmeasured, which is the behaviour every
+    # release before this one had.
+    embedding_calibrate: bool = True
     # Strict mode refuses the CPU fallback. A run that cannot reach the
     # requested accelerator fails with BACKEND_UNAVAILABLE instead of quietly
     # indexing more slowly than the caller asked for.
@@ -146,6 +183,7 @@ class IndexSettings:
             min(2048, int(psutil.virtual_memory().total * 0.25) // (1024 * 1024)),
         )
         batch_size, batch_auto = _batch_size(environment)
+        crossover, crossover_auto = _crossover(environment)
         accelerator = parse_accelerator(environment.get("INCODE_EMBED_ACCELERATOR", "auto"))
 
         return cls(
@@ -158,6 +196,9 @@ class IndexSettings:
             ),
             embedding_batch_size=batch_size,
             embedding_batch_auto=batch_auto,
+            embedding_crossover_characters=crossover,
+            embedding_crossover_auto=crossover_auto,
+            embedding_calibrate=_boolean(environment, "INCODE_EMBED_CALIBRATE", True),
             embedding_accelerator=accelerator,
             embedding_strict=_boolean(environment, "INCODE_EMBED_STRICT", False),
             # Sequence length, not character count, drives embedding memory:

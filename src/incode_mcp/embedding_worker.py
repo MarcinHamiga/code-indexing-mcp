@@ -83,6 +83,12 @@ class SessionTelemetry:
     termination_reason: str | None
     tokenizer_available: bool | None
     fallback_reason: str | None = None
+    # Candidate characters this run embedded, the crossover it was decided
+    # against, and why it ran where it ran. Populated by the passage session,
+    # which is what makes that decision; a worker on its own has no say in it.
+    character_count: int = 0
+    crossover_characters: int = 0
+    selection_reason: str | None = None
 
 
 @runtime_checkable

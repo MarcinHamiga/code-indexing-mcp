@@ -389,6 +389,113 @@ def test_auto_selects_a_prepared_accelerator_this_process_cannot_execute_itself(
     assert status.device == "cuda:0"
 
 
+def _measure(app: Application, *, cpu: float, accelerator: float, load_ns: int) -> None:
+    """Record the calibration a first run would have left behind."""
+    app.probe_cache.store(
+        app._build_probe_key(app.embedder),
+        batch_size=8,
+        dimension=app.embedder.dimension,
+        characters_per_second=accelerator,
+        load_ns=load_ns,
+    )
+    app.probe_cache.store(
+        app._cpu_probe_key(),
+        batch_size=1,
+        dimension=app.embedder.dimension,
+        characters_per_second=cpu,
+        load_ns=0,
+    )
+
+
+def test_the_crossover_is_computed_from_both_measured_backends(tmp_path: Path) -> None:
+    _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    _measure(app, cpu=1_000.0, accelerator=2_000.0, load_ns=2_000_000_000)
+
+    status = app.model_status()
+    assert app.crossover_characters() == 4_000
+    assert status.crossover_characters == 4_000
+    assert status.accelerator_characters_per_second == 2_000.0
+    assert status.cpu_characters_per_second == 1_000.0
+    assert status.accelerator_load_ms == 2_000
+    # The measured batch size is adopted by the next process to start, which is
+    # where the segment plan for a run is built.
+    assert (
+        Application(paths, embedder=TinyEmbedder(), cwd=tmp_path).model_status().batch_calibration
+        == "measured"
+    )
+
+
+def test_an_unmeasured_accelerator_has_no_crossover_and_starts_at_once(
+    tmp_path: Path,
+) -> None:
+    """Nothing has been measured, so there is no size to defer below and the
+    accelerator is used exactly as it was before any of this existed."""
+    _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    assert app.crossover_characters() == 0
+    assert app.model_status().crossover_characters is None
+
+
+def test_an_explicit_crossover_wins_over_the_measured_one(tmp_path: Path) -> None:
+    _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(
+        IndexSettings.from_environment({}),
+        embedding_crossover_characters=99,
+        embedding_crossover_auto=False,
+    )
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+
+    _measure(app, cpu=1_000.0, accelerator=2_000.0, load_ns=2_000_000_000)
+
+    assert app.crossover_characters() == 99
+
+
+def test_an_accelerator_that_lost_to_cpu_recommends_the_override(tmp_path: Path) -> None:
+    """There is no run size at which it wins, so the useful thing to report is
+    not a threshold but that this machine should stop preparing it."""
+    _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    _measure(app, cpu=2_000.0, accelerator=1_000.0, load_ns=2_000_000_000)
+
+    status = app.model_status()
+    assert status.crossover_characters is None
+    assert status.recommended_override is not None
+    assert "INCODE_EMBED_ACCELERATOR=cpu" in status.recommended_override
+
+
+def test_a_batch_size_a_ceiling_overrun_reduced_is_reported_as_reduced(
+    tmp_path: Path,
+) -> None:
+    _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    app.probe_cache.store(
+        app._build_probe_key(app.embedder),
+        batch_size=1,
+        dimension=app.embedder.dimension,
+        characters_per_second=500.0,
+        load_ns=1,
+        limited_by="memory",
+    )
+
+    rebuilt = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    status = rebuilt.model_status()
+    assert status.batch_size == 1
+    assert status.batch_calibration == "reduced"
+    assert status.recommended_override is not None
+    assert "INCODE_EMBED_MEMORY_MB" in status.recommended_override
+
+
 def test_a_prepared_accelerator_runs_in_its_own_interpreter(tmp_path: Path) -> None:
     interpreter = _prepared_cuda_environment(tmp_path)
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")

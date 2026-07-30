@@ -461,6 +461,29 @@ class PassageBackendSession:
             termination_reason=termination,
             tokenizer_available=tokenizer,
             fallback_reason=self.fallback_reason,
+            character_count=self.characters_embedded,
+            crossover_characters=self.crossover_characters,
+            selection_reason=self._selection_reason(),
+        )
+
+    def _selection_reason(self) -> str | None:
+        """Say why the run embedded where it did, when a crossover decided it.
+
+        Only the crossover is explained here. A degradation already reports
+        itself through ``fallback_reason``, and a run that simply used what was
+        selected needs no explanation at all.
+        """
+        if not self.crossover_characters or self._on_cpu:
+            return None
+        if self._on_provisional_cpu or self.backend_used == CPU_BACKEND.accelerator.value:
+            return (
+                f"embedded {self.characters_embedded} characters, below the "
+                f"{self.crossover_characters}-character crossover for "
+                f"{self.selection.accelerator.value}"
+            )
+        return (
+            f"passed the {self.crossover_characters}-character crossover for "
+            f"{self.selection.accelerator.value}"
         )
 
     def _all_telemetry(self) -> list[SessionTelemetry]:
