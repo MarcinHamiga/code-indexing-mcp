@@ -181,8 +181,8 @@ def test_accelerator_names_are_parsed_leniently(value: str) -> None:
     assert parse_accelerator(value) in set(Accelerator)
 
 
-def test_cuda_is_the_only_accelerator_eligible_for_automatic_selection() -> None:
-    """CUDA is promoted; everything else still needs an explicit override.
+def test_only_backends_that_passed_their_gates_are_eligible_automatically() -> None:
+    """CUDA and MLX are promoted; the rest still need an explicit override.
 
     The rest of the registry is reached only through INCODE_EMBED_ACCELERATOR,
     which is how a backend earns the measurements its own promotion needs.
@@ -193,7 +193,7 @@ def test_cuda_is_the_only_accelerator_eligible_for_automatic_selection() -> None
         if not backend.is_cpu and backend.stability is Stability.AUTOMATIC
     ]
 
-    assert automatic == [Accelerator.CUDA]
+    assert automatic == [Accelerator.CUDA, Accelerator.MLX]
 
 
 def test_auto_stays_on_cpu_where_no_accelerator_was_prepared() -> None:
@@ -209,13 +209,13 @@ def test_available_providers_always_include_cpu() -> None:
     assert CPU_PROVIDER in available_execution_providers()
 
 
-def test_mlx_is_registered_as_an_experimental_metal_backend() -> None:
+def test_mlx_is_registered_as_a_promoted_metal_backend() -> None:
     mlx = backend_for(Accelerator.MLX)
 
     assert mlx is not None
     assert mlx.runtime is Runtime.MLX
     assert mlx.provider == MLX_PROVIDER
-    assert mlx.stability is Stability.EXPERIMENTAL
+    assert mlx.stability is Stability.AUTOMATIC
     assert mlx.uses_direct_model is True
     # MLX is not ONNX Runtime, so its target is never in a provider list the
     # runtime published before anything was loaded.
@@ -242,7 +242,9 @@ def test_an_explicit_mlx_request_is_honoured_against_a_prepared_record() -> None
     assert selection.uses_accelerator is True
 
 
-def test_auto_never_prefers_mlx_over_cpu_before_its_gates_pass() -> None:
+def test_auto_selects_a_prepared_mlx_environment() -> None:
     selection = select_backend(Accelerator.AUTO, available_providers=[CPU_PROVIDER, MLX_PROVIDER])
 
-    assert selection.accelerator is Accelerator.CPU
+    assert selection.accelerator is Accelerator.MLX
+    assert selection.honored is True
+    assert selection.fallback_reason is None

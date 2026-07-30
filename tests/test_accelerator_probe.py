@@ -151,6 +151,9 @@ def test_a_non_onnx_backend_is_probed_without_an_onnx_provider_list(
     assert report["accelerator"] == "mlx"
     assert report["resolved_providers"] == [MLX_PROVIDER]
     assert report["device"] == "metal"
+    # No ONNX Runtime in this environment means no ONNX providers to record,
+    # not a CPU execution provider nothing there could run.
+    assert report["providers"] == [MLX_PROVIDER]
     # The version recorded has to be the runtime that will do the work.
     assert report["runtime_version"] == "0.32.0"
 

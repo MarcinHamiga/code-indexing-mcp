@@ -917,6 +917,17 @@ def _webgpu_plan(
     return AcceleratorPlan("webgpu", reason, honored=not reason_prefix)
 
 
+def _mlx_is_supported(*, platform_name: str, machine: str, platform_version: str) -> bool:
+    supported = MLX_PLATFORMS.get(platform_name)
+    components = _driver_components(platform_version)
+    return bool(
+        supported is not None
+        and machine in supported
+        and components
+        and components >= MINIMUM_MLX_MACOS
+    )
+
+
 def _mlx_plan(*, platform_name: str, machine: str, platform_version: str) -> AcceleratorPlan:
     supported = MLX_PLATFORMS.get(platform_name)
     components = _driver_components(platform_version)
@@ -1024,6 +1035,19 @@ def plan_accelerator(
             machine=machine,
             platform_version=platform_version,
             reason_prefix=f"MIGraphX was requested but {problem}",
+        )
+
+    if requested != "cuda" and _mlx_is_supported(
+        platform_name=platform_name, machine=machine, platform_version=platform_version
+    ):
+        # `auto` on Apple Silicon: MLX passed the same correctness and 1.25x
+        # performance gates CUDA did, so it is prepared without being asked for.
+        # An unsupported Mac falls through to the CUDA path below, which reports
+        # what every machine without a GPU this release can use reports.
+        return _mlx_plan(
+            platform_name=platform_name,
+            machine=machine,
+            platform_version=platform_version,
         )
 
     supported = CUDA_PLATFORMS.get(platform_name)

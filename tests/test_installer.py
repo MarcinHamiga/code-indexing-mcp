@@ -968,7 +968,8 @@ def _fake_uv(tmp_path: Path) -> Path:
     ("requested", "platform_name", "machine", "report", "expected", "reason"),
     [
         ("cpu", "linux", "x86_64", "550.54.14, A100", "cpu", "CPU was requested"),
-        ("auto", "darwin", "arm64", None, "cpu", "no CUDA wheels are published"),
+        # Apple Silicon on macOS 14+, which is what platform_version says below.
+        ("auto", "darwin", "arm64", None, "mlx", "the locked MLX build is available"),
         ("auto", "linux", "x86_64", None, "cpu", "no usable NVIDIA driver"),
         ("auto", "linux", "x86_64", "", "cpu", "no usable NVIDIA driver"),
         ("auto", "linux", "x86_64", "470.10, Tesla T4", "cpu", "is below the 525.60"),
@@ -1146,7 +1147,8 @@ def test_an_unsupported_mlx_request_does_not_fall_through_to_webgpu() -> None:
     assert "WebGPU" not in plan.reason
 
 
-def test_auto_does_not_prepare_mlx_before_its_gates_pass() -> None:
+def test_auto_prepares_mlx_on_apple_silicon() -> None:
+    """MLX passed the gates CUDA passed, so `auto` prepares it unasked."""
     installer = load_installer()
 
     plan = installer.plan_accelerator(
@@ -1159,8 +1161,45 @@ def test_auto_does_not_prepare_mlx_before_its_gates_pass() -> None:
         rocm_report=lambda: None,
     )
 
+    assert plan.accelerator == "mlx"
+    assert plan.honored is True
+    assert plan.driver_version == "26.5.2"
+
+
+def test_auto_on_an_unsupported_mac_reports_the_same_reason_it_always_did() -> None:
+    installer = load_installer()
+
+    plan = installer.plan_accelerator(
+        "auto",
+        platform_name="darwin",
+        machine="x86_64",
+        platform_version="15.1",
+        python_version="3.12",
+        nvidia_report=lambda: None,
+        rocm_report=lambda: None,
+    )
+
     assert plan.accelerator == "cpu"
     assert plan.honored is True
+    assert "no CUDA wheels" in plan.reason
+
+
+def test_an_explicit_cuda_request_is_never_answered_with_mlx() -> None:
+    """An override names a backend, not "whatever this machine has"."""
+    installer = load_installer()
+
+    plan = installer.plan_accelerator(
+        "cuda",
+        platform_name="darwin",
+        machine="arm64",
+        platform_version="26.5.2",
+        python_version="3.12",
+        nvidia_report=lambda: None,
+        rocm_report=lambda: None,
+    )
+
+    assert plan.accelerator == "cpu"
+    assert plan.honored is False
 
 
 def test_all_accelerator_environments_have_a_locked_extra() -> None:
@@ -1194,7 +1233,14 @@ def test_only_a_denied_request_is_reported_as_a_problem(
     installer = load_installer()
 
     plan = installer.plan_accelerator(
-        requested, platform_name=platform_name, machine="arm64", nvidia_report=lambda: None
+        requested,
+        platform_name=platform_name,
+        machine="arm64",
+        # Old enough that MLX has no wheel for it, so every case here still
+        # lands on CPU and the question stays whether that is reported as a
+        # problem -- rather than depending on the macOS this test runs on.
+        platform_version="13.0",
+        nvidia_report=lambda: None,
     )
 
     assert plan.accelerator == "cpu"

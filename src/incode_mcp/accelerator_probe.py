@@ -51,7 +51,7 @@ def probe(
     descriptor = backend_for(accelerator)
     if descriptor is None:
         raise ValueError(f"no backend is registered for {accelerator.value}")
-    providers = available_execution_providers()
+    providers = available_execution_providers() if descriptor.publishes_execution_providers else ()
     if descriptor.provider_is_preregistered and descriptor.provider not in providers:
         raise RuntimeError(
             f"{descriptor.provider} is not offered by this environment's ONNX Runtime "

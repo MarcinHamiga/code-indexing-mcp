@@ -118,6 +118,18 @@ class BackendDescriptor:
         return self.runtime is Runtime.ONNX
 
     @property
+    def publishes_execution_providers(self) -> bool:
+        """Whether this backend's runtime has execution providers at all.
+
+        Only ONNX Runtime does. ``available_execution_providers`` answers with
+        the CPU provider when it cannot import a runtime, which is right for an
+        ONNX environment and wrong for one that has no ONNX Runtime in it: it
+        would put a provider nothing there can execute into the record the
+        installer writes.
+        """
+        return self.runtime is not Runtime.MLX
+
+    @property
     def uses_direct_model(self) -> bool:
         """Whether this project loads the passage model itself for this backend.
 
@@ -168,12 +180,13 @@ ACCELERATOR_BACKENDS: tuple[BackendDescriptor, ...] = (
         accelerator=Accelerator.MLX,
         provider=MLX_PROVIDER,
         device="metal",
-        # The designated Apple Silicon path, ahead of the cross-platform one in
-        # the order ``auto`` would consider -- which changes nothing until one of
-        # them is promoted, and says which is preferred when one is. It is
-        # experimental because WebGPU's failed Apple Silicon performance gate is
-        # what called for it, and that gate has still to be measured here.
-        stability=Stability.EXPERIMENTAL,
+        # The designated Apple Silicon path, ahead of the cross-platform one:
+        # WebGPU reached 1.11x of CPU there against a 1.25x gate, and MLX
+        # reached 1.52-1.56x on the same corpus with vectors matching CPU to
+        # cosine 1.0 and identical top-5 rankings. Promoted on that evidence,
+        # which only makes it eligible -- ``auto`` still passes over it on a
+        # machine whose installation never prepared it.
+        stability=Stability.AUTOMATIC,
         precision=Precision.FLOAT32,
         runtime=Runtime.MLX,
     ),
