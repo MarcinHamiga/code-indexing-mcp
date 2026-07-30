@@ -24,9 +24,30 @@ class Accelerator(StrEnum):
     AUTO = "auto"
     CPU = "cpu"
     CUDA = "cuda"
+    MLX = "mlx"
     WEBGPU = "webgpu"
     MIGRAPHX = "migraphx"
     COREML = "coreml"
+
+
+class Runtime(StrEnum):
+    """Which inference runtime executes a backend's passage model.
+
+    Most backends are ONNX Runtime execution providers, and the machinery around
+    them was shaped by that: providers are published before anything loads, an
+    accelerator keeps CPU behind it, and a session may silently drop the
+    provider it was given. ``MLX`` is none of those things, so the differences
+    are named here once rather than special-cased by accelerator at each site.
+    """
+
+    # A provider built into the installed ONNX Runtime distribution.
+    ONNX = "onnxruntime"
+    # A provider that only exists once its plugin library has been registered,
+    # so it is absent from the provider list until the model is being loaded.
+    ONNX_PLUGIN = "onnxruntime-plugin"
+    # Apple's array framework. No ONNX session, no execution providers, and no
+    # graph partitioning: the model is this project's own MLX implementation.
+    MLX = "mlx"
 
 
 class Stability(StrEnum):
@@ -52,6 +73,9 @@ class BackendDescriptor:
     """One candidate execution target for passage embedding."""
 
     accelerator: Accelerator
+    # What the loaded model reports as the target it settled on. Usually an ONNX
+    # execution provider; for a non-ONNX runtime it is that runtime's own name,
+    # which is what selection, the installer's record, and diagnostics carry.
     provider: str
     device: str
     stability: Stability
@@ -61,6 +85,7 @@ class BackendDescriptor:
     # driver it verified against. It is part of the probe cache key, so a driver
     # upgrade retires the verdict recorded under the old one.
     driver_version: str = ""
+    runtime: Runtime = Runtime.ONNX
 
     @property
     def is_cpu(self) -> bool:
@@ -70,15 +95,51 @@ class BackendDescriptor:
     def providers(self) -> tuple[str, ...]:
         """Providers to hand the runtime, most specific first.
 
-        Every accelerator keeps CPU behind it so a graph the provider cannot
-        partition still executes rather than failing the session outright.
+        Every ONNX accelerator keeps CPU behind it so a graph the provider
+        cannot partition still executes rather than failing the session
+        outright. A non-ONNX runtime has no such fallback to name: it either
+        runs the model it was given or fails to load it.
         """
         if self.is_cpu:
             return (CPU_PROVIDER,)
+        if self.runtime is Runtime.MLX:
+            return (self.provider,)
         return (self.provider, CPU_PROVIDER)
+
+    @property
+    def provider_is_preregistered(self) -> bool:
+        """Whether this target appears in the runtime's provider list up front.
+
+        Only built-in ONNX providers do. A plugin provider exists once its
+        library is registered, and a non-ONNX runtime never appears there at
+        all, so requiring either one to be listed would refuse a working
+        backend before its model was loaded.
+        """
+        return self.runtime is Runtime.ONNX
+
+    @property
+    def uses_direct_model(self) -> bool:
+        """Whether this project loads the passage model itself for this backend.
+
+        A direct model reports the target its own session resolved, so an empty
+        report from one means the session is broken. FastEmbed models are read
+        through a private layout where empty means "unknown" instead.
+        """
+        return self.accelerator in DIRECT_MODEL_ACCELERATORS
 
 
 CPU_PROVIDER = "CPUExecutionProvider"
+# MLX has no execution providers; this names the runtime itself so the record
+# the installer writes, selection, and ``model status`` all keep describing one
+# resolved target per backend.
+MLX_PROVIDER = "MlxMetalBackend"
+
+# The accelerators whose passage model this project loads and executes itself,
+# rather than through FastEmbed. FastEmbed cannot configure these runtimes, and
+# for two of them its ONNX Runtime distribution would conflict with theirs.
+DIRECT_MODEL_ACCELERATORS = frozenset(
+    {Accelerator.WEBGPU, Accelerator.MIGRAPHX, Accelerator.MLX}
+)
 
 CPU_BACKEND = BackendDescriptor(
     accelerator=Accelerator.CPU,
@@ -106,11 +167,25 @@ ACCELERATOR_BACKENDS: tuple[BackendDescriptor, ...] = (
         precision=Precision.FLOAT32,
     ),
     BackendDescriptor(
+        accelerator=Accelerator.MLX,
+        provider=MLX_PROVIDER,
+        device="metal",
+        # The designated Apple Silicon path, ahead of the cross-platform one in
+        # the order ``auto`` would consider -- which changes nothing until one of
+        # them is promoted, and says which is preferred when one is. It is
+        # experimental because WebGPU's failed Apple Silicon performance gate is
+        # what called for it, and that gate has still to be measured here.
+        stability=Stability.EXPERIMENTAL,
+        precision=Precision.FLOAT32,
+        runtime=Runtime.MLX,
+    ),
+    BackendDescriptor(
         accelerator=Accelerator.WEBGPU,
         provider="WebGpuExecutionProvider",
         device="gpu",
         stability=Stability.EXPERIMENTAL,
         precision=Precision.FLOAT32,
+        runtime=Runtime.ONNX_PLUGIN,
     ),
     BackendDescriptor(
         accelerator=Accelerator.MIGRAPHX,
@@ -230,9 +305,18 @@ def available_execution_providers() -> tuple[str, ...]:
     return providers if CPU_PROVIDER in providers else (*providers, CPU_PROVIDER)
 
 
-def runtime_version() -> str:
-    """Return the ONNX Runtime version, or an empty string when unknown."""
+def runtime_version(runtime: Runtime = Runtime.ONNX) -> str:
+    """Return the version of *runtime*, or an empty string when unknown.
+
+    The version identifies what will actually execute the model, so it has to
+    follow the backend rather than the import this process happens to have: an
+    MLX environment has no ONNX Runtime to report a version for.
+    """
     try:
+        if runtime is Runtime.MLX:
+            import mlx.core
+
+            return str(mlx.core.__version__)
         import onnxruntime
 
         return str(onnxruntime.__version__)
@@ -329,5 +413,12 @@ def select_backend(
 
 
 def describe_environment(descriptor: BackendDescriptor) -> BackendDescriptor:
-    """Stamp *descriptor* with the runtime version this process is running."""
-    return replace(descriptor, runtime_version=descriptor.runtime_version or runtime_version())
+    """Stamp *descriptor* with the runtime version this process is running.
+
+    A version the installer's record already supplied is kept: it came from the
+    environment that will run the backend, which this process may not be.
+    """
+    return replace(
+        descriptor,
+        runtime_version=descriptor.runtime_version or runtime_version(descriptor.runtime),
+    )

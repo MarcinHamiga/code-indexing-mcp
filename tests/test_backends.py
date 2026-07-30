@@ -6,11 +6,14 @@ from incode_mcp.backends import (
     CPU_BACKEND,
     CPU_PROVIDER,
     KNOWN_BACKENDS,
+    MLX_PROVIDER,
     Accelerator,
     BackendDescriptor,
     Precision,
+    Runtime,
     Stability,
     available_execution_providers,
+    backend_for,
     parse_accelerator,
     select_backend,
 )
@@ -204,3 +207,44 @@ def test_auto_stays_on_cpu_where_no_accelerator_was_prepared() -> None:
 
 def test_available_providers_always_include_cpu() -> None:
     assert CPU_PROVIDER in available_execution_providers()
+
+
+def test_mlx_is_registered_as_an_experimental_metal_backend() -> None:
+    mlx = backend_for(Accelerator.MLX)
+
+    assert mlx is not None
+    assert mlx.runtime is Runtime.MLX
+    assert mlx.provider == MLX_PROVIDER
+    assert mlx.stability is Stability.EXPERIMENTAL
+    assert mlx.uses_direct_model is True
+    # MLX is not ONNX Runtime, so its target is never in a provider list the
+    # runtime published before anything was loaded.
+    assert mlx.provider_is_preregistered is False
+
+
+def test_an_mlx_backend_has_no_onnx_cpu_provider_behind_it() -> None:
+    """CPU sits behind an ONNX accelerator so an unpartitionable graph still runs.
+
+    MLX has no graph partitioning and no ONNX session, so naming the ONNX CPU
+    provider there would describe a fallback that does not exist.
+    """
+    mlx = backend_for(Accelerator.MLX)
+    assert mlx is not None
+
+    assert mlx.providers == (MLX_PROVIDER,)
+
+
+def test_an_explicit_mlx_request_is_honoured_against_a_prepared_record() -> None:
+    selection = select_backend(
+        Accelerator.MLX, available_providers=[CPU_PROVIDER, MLX_PROVIDER]
+    )
+
+    assert selection.accelerator is Accelerator.MLX
+    assert selection.honored is True
+    assert selection.uses_accelerator is True
+
+
+def test_auto_never_prefers_mlx_over_cpu_before_its_gates_pass() -> None:
+    selection = select_backend(Accelerator.AUTO, available_providers=[CPU_PROVIDER, MLX_PROVIDER])
+
+    assert selection.accelerator is Accelerator.CPU

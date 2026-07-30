@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from incode_mcp import accelerator_probe, embedding_worker
-from incode_mcp.backends import CPU_PROVIDER, Accelerator
+from incode_mcp.backends import CPU_PROVIDER, MLX_PROVIDER, Accelerator, Runtime
 from incode_mcp.embedding import DEFAULT_DIMENSION, DEFAULT_MODEL, PROBE_TEXTS
 
 
@@ -115,6 +115,58 @@ def test_a_direct_session_that_dropped_its_provider_fails_the_probe(
     with pytest.raises(RuntimeError, match="session runs on"):
         accelerator_probe.probe(
             Accelerator.WEBGPU,
+            offline=True,
+            model_id=DEFAULT_MODEL,
+            dimension=DEFAULT_DIMENSION,
+        )
+
+
+class _MlxModel(_WebGpuModel):
+    resolved_providers = (MLX_PROVIDER,)
+
+
+def test_a_non_onnx_backend_is_probed_without_an_onnx_provider_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An MLX environment has no ONNX Runtime, so it publishes no providers.
+
+    Requiring the backend's target to appear in that list would refuse every
+    runtime that is not ONNX Runtime before its model was ever loaded.
+    """
+    monkeypatch.setattr(accelerator_probe, "available_execution_providers", lambda: (CPU_PROVIDER,))
+    monkeypatch.setattr(embedding_worker, "_load_model", lambda config: _MlxModel())
+    monkeypatch.setattr(
+        accelerator_probe,
+        "runtime_version",
+        lambda runtime=Runtime.ONNX: "0.32.0" if runtime is Runtime.MLX else "1.24.4",
+    )
+
+    report = accelerator_probe.probe(
+        Accelerator.MLX,
+        offline=True,
+        model_id=DEFAULT_MODEL,
+        dimension=DEFAULT_DIMENSION,
+    )
+
+    assert report["accelerator"] == "mlx"
+    assert report["resolved_providers"] == [MLX_PROVIDER]
+    assert report["device"] == "metal"
+    # The version recorded has to be the runtime that will do the work.
+    assert report["runtime_version"] == "0.32.0"
+
+
+def test_an_mlx_session_reporting_no_backend_fails_the_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BrokenMlxModel(_MlxModel):
+        resolved_providers = ()
+
+    monkeypatch.setattr(accelerator_probe, "available_execution_providers", lambda: (CPU_PROVIDER,))
+    monkeypatch.setattr(embedding_worker, "_load_model", lambda config: _BrokenMlxModel())
+
+    with pytest.raises(RuntimeError, match="cannot be verified"):
+        accelerator_probe.probe(
+            Accelerator.MLX,
             offline=True,
             model_id=DEFAULT_MODEL,
             dimension=DEFAULT_DIMENSION,
