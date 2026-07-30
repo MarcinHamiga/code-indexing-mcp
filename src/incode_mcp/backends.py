@@ -102,7 +102,7 @@ class BackendDescriptor:
         """
         if self.is_cpu:
             return (CPU_PROVIDER,)
-        if self.runtime is Runtime.MLX:
+        if not self.runs_on_onnx:
             return (self.provider,)
         return (self.provider, CPU_PROVIDER)
 
@@ -118,6 +118,16 @@ class BackendDescriptor:
         return self.runtime is Runtime.ONNX
 
     @property
+    def runs_on_onnx(self) -> bool:
+        """Whether ONNX Runtime executes this backend at all.
+
+        Named positively so a runtime added later has to say that it is an ONNX
+        one, rather than inheriting the ONNX answer from every predicate that
+        happened to be written as "not MLX".
+        """
+        return self.runtime in {Runtime.ONNX, Runtime.ONNX_PLUGIN}
+
+    @property
     def publishes_execution_providers(self) -> bool:
         """Whether this backend's runtime has execution providers at all.
 
@@ -127,7 +137,7 @@ class BackendDescriptor:
         would put a provider nothing there can execute into the record the
         installer writes.
         """
-        return self.runtime is not Runtime.MLX
+        return self.runs_on_onnx
 
     @property
     def uses_direct_model(self) -> bool:
