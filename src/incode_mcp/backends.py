@@ -137,9 +137,7 @@ MLX_PROVIDER = "MlxMetalBackend"
 # The accelerators whose passage model this project loads and executes itself,
 # rather than through FastEmbed. FastEmbed cannot configure these runtimes, and
 # for two of them its ONNX Runtime distribution would conflict with theirs.
-DIRECT_MODEL_ACCELERATORS = frozenset(
-    {Accelerator.WEBGPU, Accelerator.MIGRAPHX, Accelerator.MLX}
-)
+DIRECT_MODEL_ACCELERATORS = frozenset({Accelerator.WEBGPU, Accelerator.MIGRAPHX, Accelerator.MLX})
 
 CPU_BACKEND = BackendDescriptor(
     accelerator=Accelerator.CPU,

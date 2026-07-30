@@ -55,6 +55,19 @@ webgpu = [
     "onnxruntime-ep-webgpu==0.1.0; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     "tokenizers>=0.22,<1; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
 ]
+# Apple's array framework, for the Metal path WebGPU failed to win on Apple
+# Silicon. `mlx` pulls `mlx-metal` on Darwin; its published wheels start at
+# macOS 14 arm64. MLX also ships CPU-only Linux and Windows wheels, which are
+# excluded here because installing them would prepare a "Metal" backend with no
+# Metal in it. `onnx` is here to read the float32 initializers out of the same
+# ONNX artifact the CPU model uses, once, and is unused after that conversion.
+mlx = [
+    "huggingface-hub>=1,<2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx==0.32.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "numpy>=2,<3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "onnx>=1.22,<2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "tokenizers>=0.22,<1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 # AMD publishes the tested MIGraphX build from its ROCm repository rather than
 # PyPI. The installer nominates it only for this exact Python/ROCm matrix.
 migraphx = [
@@ -81,6 +94,7 @@ conflicts = [
         { extra = "cuda" },
         { extra = "webgpu" },
         { extra = "migraphx" },
+        { extra = "mlx" },
     ],
 ]
 

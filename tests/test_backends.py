@@ -235,9 +235,7 @@ def test_an_mlx_backend_has_no_onnx_cpu_provider_behind_it() -> None:
 
 
 def test_an_explicit_mlx_request_is_honoured_against_a_prepared_record() -> None:
-    selection = select_backend(
-        Accelerator.MLX, available_providers=[CPU_PROVIDER, MLX_PROVIDER]
-    )
+    selection = select_backend(Accelerator.MLX, available_providers=[CPU_PROVIDER, MLX_PROVIDER])
 
     assert selection.accelerator is Accelerator.MLX
     assert selection.honored is True
