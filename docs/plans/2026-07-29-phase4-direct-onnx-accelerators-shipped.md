@@ -69,21 +69,21 @@ hardware matrix.
 
 ```bash
 uv lock --check
-uv run pytest
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src
-uv run mypy scripts/benchmark_index_memory.py
+uv run --extra cpu pytest
+uv run --extra cpu ruff check .
+uv run --extra cpu ruff format --check .
+uv run --extra cpu mypy src
+uv run --extra cpu mypy scripts/benchmark_index_memory.py
 git diff --check
 ```
 
 Real-model and hardware gates:
 
 ```bash
-INCODE_MODEL_TEST_CACHE=/path/to/cache uv run pytest -m model
+INCODE_MODEL_TEST_CACHE=/path/to/cache uv run --extra cpu pytest -m model
 
 INCODE_MODEL_TEST_CACHE=/path/to/cache \
 INCODE_ACCEL_ENV=/path/to/accelerator.json \
 INCODE_TEST_ACCELERATOR=webgpu \
-  uv run pytest -m accelerator
+  uv run --extra cpu pytest -m accelerator
 ```

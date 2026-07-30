@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from multiprocessing.connection import Connection
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -502,7 +504,7 @@ def test_direct_accelerators_do_not_load_fastembed(
     monkeypatch: pytest.MonkeyPatch,
     accelerator: str,
 ) -> None:
-    from incode_mcp import direct_onnx, embedding_worker
+    from incode_mcp import direct_onnx
 
     direct_model = object()
     direct_options: list[dict[str, object]] = []
@@ -512,11 +514,14 @@ def test_direct_accelerators_do_not_load_fastembed(
         return direct_model
 
     monkeypatch.setattr(direct_onnx, "DirectOnnxEmbedding", direct)
-    monkeypatch.setattr(
-        embedding_worker,
-        "TextEmbedding",
-        lambda **options: pytest.fail(f"FastEmbed was loaded with {options}"),
-        raising=False,
+    # _load_model imports FastEmbed locally, so the tripwire has to be the
+    # module itself: a module attribute would never be consulted.
+    monkeypatch.setitem(
+        sys.modules,
+        "fastembed",
+        SimpleNamespace(
+            TextEmbedding=lambda **options: pytest.fail(f"FastEmbed was loaded with {options}")
+        ),
     )
     config = WorkerConfig(
         cache_directory=str(tmp_path),
@@ -543,6 +548,125 @@ def test_direct_accelerators_do_not_load_fastembed(
             "accelerator": accelerator,
         }
     ]
+
+
+class _WiredConnection:
+    """A connection whose reply state the test controls directly."""
+
+    def __init__(self, *, ready: bool, reply: tuple[str, object]) -> None:
+        self._ready = ready
+        self._reply = reply
+        self.sent: list[tuple[str, object]] = []
+
+    def send(self, message: tuple[str, object]) -> None:
+        self.sent.append(message)
+
+    def poll(self, _timeout: float) -> bool:
+        return self._ready
+
+    def recv(self) -> tuple[str, object]:
+        return self._reply
+
+    def close(self) -> None:
+        self._ready = False
+
+
+class _WiredProcess:
+    def __init__(self, *, alive: bool) -> None:
+        self._alive = alive
+        self.pid = 4242
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def terminate(self) -> None:
+        self._alive = False
+
+    def kill(self) -> None:
+        self._alive = False
+
+    def join(self, timeout: float | None = None) -> None:
+        return None
+
+
+def _wired_session(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    connection: _WiredConnection,
+    process: _WiredProcess,
+    rss_bytes: int,
+) -> EmbeddingWorkerSession:
+    session = EmbeddingWorkerSession(
+        WorkerConfig(
+            cache_directory="unused",
+            offline=True,
+            threads=1,
+            enable_cpu_mem_arena=False,
+            dimension=4,
+        ),
+        effective_ceiling_bytes=2 * 1024**3,
+    )
+    session._process = process  # type: ignore[assignment]
+    session._connection = connection  # type: ignore[assignment]
+    monkeypatch.setattr(session, "_sample_rss", lambda: (rss_bytes, rss_bytes))
+    return session
+
+
+def test_a_buffered_reply_wins_over_a_worker_that_exited_after_sending_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker that answered and then exited delivered, and must be read as such."""
+    connection = _WiredConnection(ready=True, reply=("ok", "vectors"))
+    process = _WiredProcess(alive=False)
+    session = _wired_session(monkeypatch, connection=connection, process=process, rss_bytes=1024)
+
+    status, payload = session._request("embed", ["text"])
+
+    assert (status, payload) == ("ok", "vectors")
+    assert session.peak_combined_rss == 2048
+    assert session.termination_reason is None
+
+
+def test_the_ceiling_terminates_a_worker_even_when_its_reply_already_arrived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt reply is not immunity from the memory ceiling.
+
+    Lazy imports made worker startup fast enough that a prompt worker can
+    answer inside the first poll every time, so a ceiling enforced only while
+    waiting would never apply to it at all. The discarded result is re-embedded
+    by the run-level fallback; the measurements survive on the session.
+    """
+    connection = _WiredConnection(ready=True, reply=("ok", "unread"))
+    process = _WiredProcess(alive=True)
+    session = _wired_session(
+        monkeypatch, connection=connection, process=process, rss_bytes=100 * 1024**3
+    )
+
+    with pytest.raises(IncodeError) as caught:
+        session._request("embed", ["text"])
+
+    assert caught.value.code is ErrorCode.INDEX_RESOURCE_LIMIT
+    assert session.termination_reason == "memory_ceiling"
+    assert session.peak_combined_rss == 200 * 1024**3
+    assert not process.is_alive()
+
+
+def test_the_memory_ceiling_still_terminates_a_worker_that_is_not_replying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _WiredConnection(ready=False, reply=("ok", "unreached"))
+    process = _WiredProcess(alive=True)
+    session = _wired_session(
+        monkeypatch, connection=connection, process=process, rss_bytes=100 * 1024**3
+    )
+
+    with pytest.raises(IncodeError) as caught:
+        session._request("embed", ["text"])
+
+    assert caught.value.code is ErrorCode.INDEX_RESOURCE_LIMIT
+    assert session.termination_reason == "memory_ceiling"
+    assert not process.is_alive()
 
 
 def test_telemetry_names_the_backend_the_worker_ran_on() -> None:

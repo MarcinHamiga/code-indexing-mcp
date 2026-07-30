@@ -441,6 +441,12 @@ class EmbeddingWorkerSession:
                     ErrorCode.EMBEDDING_WORKER_FAILED,
                     "Embedding worker exited without returning a result",
                 )
+            # Sampled and enforced on every pass, including the one that found
+            # the reply ready. Lazy worker imports made startup fast enough
+            # that a prompt worker can answer inside the first poll every time,
+            # so waiting-only enforcement would never sample it and the ceiling
+            # would not exist for exactly the workers most likely to blow it.
+            # A result this discards is re-embedded by the run-level fallback.
             parent_rss, worker_rss = self._sample_rss()
             self.peak_combined_rss = max(self.peak_combined_rss, parent_rss + worker_rss)
             budgeted = indexing_memory_bytes(

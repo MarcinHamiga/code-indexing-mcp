@@ -1140,6 +1140,7 @@ def test_a_prepared_accelerator_is_recorded_only_after_its_probe_passes(
     installer = load_installer()
     checkout = tmp_path / "checkout"
     checkout.mkdir()
+    (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     data = tmp_path / "data"
     probed: list[tuple[Path, str]] = []
     monkeypatch.setattr(installer, "runtime_record_path", lambda python: data / "accelerator.json")
@@ -1196,6 +1197,7 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
     installer = load_installer()
     checkout = tmp_path / "checkout"
     checkout.mkdir()
+    (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     record = tmp_path / "data" / "accelerator.json"
     interpreter = checkout / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY / "bin" / "python"
     interpreter.parent.mkdir(parents=True)
@@ -1281,6 +1283,7 @@ def test_a_failed_probe_rolls_the_installation_back_to_cpu(
     installer = load_installer()
     checkout = tmp_path / "checkout"
     checkout.mkdir()
+    (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     data = tmp_path / "data"
     data.mkdir()
     stale = data / "accelerator.json"
@@ -1517,6 +1520,16 @@ def test_a_changed_lockfile_forces_the_accelerator_environment_to_rebuild(
 
     assert plan.accelerator == "cuda"
     assert rebuilt == ["sync"]
+
+
+def test_a_checkout_without_a_lockfile_cannot_fingerprint_an_accelerator(
+    tmp_path: Path,
+) -> None:
+    """A missing lock is a broken checkout, never silently some other lockfile."""
+    installer = load_installer()
+
+    with pytest.raises(installer.InstallerError, match="lockfile cannot be read"):
+        installer.accelerator_lock_fingerprint(tmp_path, "cuda")
 
 
 def test_migraphx_detection_uses_the_serving_interpreter_version(

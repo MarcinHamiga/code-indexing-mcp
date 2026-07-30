@@ -136,6 +136,18 @@ def mean_pool_and_normalize(model_output: NDArray[Any], attention_mask: IntArray
     return np.asarray(normalized, dtype=np.float32)
 
 
+def _session_options(threads: int | None, enable_cpu_mem_arena: bool) -> Any:
+    import onnxruntime as ort
+
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.enable_cpu_mem_arena = enable_cpu_mem_arena
+    if threads is not None:
+        options.intra_op_num_threads = threads
+        options.inter_op_num_threads = threads
+    return options
+
+
 def create_session(
     model_path: Path,
     *,
@@ -147,18 +159,12 @@ def create_session(
 
     import onnxruntime as ort
 
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    options.enable_cpu_mem_arena = enable_cpu_mem_arena
-    if threads is not None:
-        options.intra_op_num_threads = threads
-        options.inter_op_num_threads = threads
     return cast(
         _Session,
         ort.InferenceSession(
             str(model_path),
             providers=list(providers),
-            sess_options=options,
+            sess_options=_session_options(threads, enable_cpu_mem_arena),
         ),
     )
 
@@ -180,12 +186,7 @@ def create_webgpu_session(
     if not devices:
         raise RuntimeError("The WebGPU plugin registered but exposed no WebGPU device")
 
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    options.enable_cpu_mem_arena = enable_cpu_mem_arena
-    if threads is not None:
-        options.intra_op_num_threads = threads
-        options.inter_op_num_threads = threads
+    options = _session_options(threads, enable_cpu_mem_arena)
     options.add_provider_for_devices(devices, {})
     session = ort.InferenceSession(str(model_path), sess_options=options)
     return cast(_Session, session), provider

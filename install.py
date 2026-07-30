@@ -929,11 +929,8 @@ def plan_accelerator(
     platform_name = _normalized_platform((platform_name or sys.platform).lower())
     machine = (machine or platform.machine()).lower()
     python_version = python_version or f"{sys.version_info.major}.{sys.version_info.minor}"
-    platform_version = (
-        (platform.mac_ver()[0] if platform_version is None and platform_name == "darwin" else "")
-        if platform_version is None
-        else platform_version
-    )
+    if platform_version is None:
+        platform_version = platform.mac_ver()[0] if platform_name == "darwin" else ""
     requested = requested.strip().lower()
 
     if requested == "cpu":
@@ -1042,12 +1039,6 @@ def accelerator_lock_fingerprint(install_directory: Path, accelerator: str) -> s
     """Hash the selected extra and the lockfile that resolved its environment."""
 
     lockfile = install_directory / "uv.lock"
-    if not lockfile.is_file():
-        # Unit tests and direct module use can point at a synthetic checkout;
-        # the installer itself always prefers the cloned checkout's lock.
-        adjacent = Path(__file__).resolve().with_name("uv.lock")
-        if adjacent.is_file():
-            lockfile = adjacent
     try:
         locked = lockfile.read_bytes()
     except OSError as exc:

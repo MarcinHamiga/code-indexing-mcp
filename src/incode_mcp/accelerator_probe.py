@@ -70,12 +70,23 @@ def probe(
     )
     model = _load_model(config)
     resolved = resolve_session_providers(model)
-    if descriptor.provider not in resolved:
-        # ONNX Runtime drops a provider it cannot initialise and carries on with
-        # the next one, so a session that quietly became a CPU session must not
-        # be recorded as a working accelerator.
-        actual = ", ".join(resolved) if resolved else "an unknown provider"
-        raise RuntimeError(f"{descriptor.provider} was requested but the session runs on {actual}")
+    if resolved:
+        if descriptor.provider not in resolved:
+            # ONNX Runtime drops a provider it cannot initialise and carries on
+            # with the next one, so a session that quietly became a CPU session
+            # must not be recorded as a working accelerator.
+            raise RuntimeError(
+                f"{descriptor.provider} was requested but the session runs on {', '.join(resolved)}"
+            )
+    elif accelerator in {Accelerator.WEBGPU, Accelerator.MIGRAPHX}:
+        # The direct model reports the providers its own session resolved, so
+        # nothing at all means the session is broken. FastEmbed models are
+        # different: resolution walks a private layout there, so an empty tuple
+        # means "unknown" and stays tolerated rather than letting a FastEmbed
+        # refactor fail the probe on a working CUDA environment.
+        raise RuntimeError(
+            f"the direct session reported no providers, so {descriptor.provider} cannot be verified"
+        )
     providers = tuple(dict.fromkeys((*providers, *resolved)))
     vectors = [
         np.asarray(vector, dtype="<f4").tobytes()
