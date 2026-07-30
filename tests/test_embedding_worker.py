@@ -498,6 +498,48 @@ def test_the_default_worker_config_requests_no_providers() -> None:
     assert config.providers == ()
 
 
+def test_mlx_loads_its_own_model_and_not_fastembed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MLX takes none of the ONNX arguments: it has no session to configure."""
+    from incode_mcp import mlx_backend
+
+    mlx_model = object()
+    options: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        mlx_backend,
+        "MlxEmbedding",
+        lambda **received: (options.append(received), mlx_model)[1],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "fastembed",
+        SimpleNamespace(
+            TextEmbedding=lambda **received: pytest.fail(f"FastEmbed was loaded with {received}")
+        ),
+    )
+    config = WorkerConfig(
+        cache_directory=str(tmp_path),
+        offline=True,
+        threads=2,
+        enable_cpu_mem_arena=False,
+        dimension=768,
+        providers=("MlxMetalBackend",),
+        accelerator="mlx",
+    )
+
+    assert _load_model(config) is mlx_model
+    assert options == [
+        {
+            "cache_directory": tmp_path,
+            "offline": True,
+            "model_id": config.model_id,
+        }
+    ]
+
+
 @pytest.mark.parametrize("accelerator", ["webgpu", "migraphx"])
 def test_direct_accelerators_do_not_load_fastembed(
     tmp_path: Path,

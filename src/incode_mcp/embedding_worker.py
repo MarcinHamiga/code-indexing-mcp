@@ -131,6 +131,16 @@ def _load_model(config: WorkerConfig) -> Any:
     is left exactly as it was.
     """
     Path(config.cache_directory).mkdir(parents=True, exist_ok=True)
+    if config.accelerator == Accelerator.MLX.value:
+        from .mlx_backend import MlxEmbedding
+
+        # No providers, threads, or arena: MLX has no ONNX session to configure,
+        # and passing settings it ignores would imply they were honoured.
+        return MlxEmbedding(
+            cache_directory=Path(config.cache_directory),
+            offline=config.offline,
+            model_id=config.model_id,
+        )
     if config.accelerator in {
         Accelerator.WEBGPU.value,
         Accelerator.MIGRAPHX.value,

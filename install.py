@@ -30,10 +30,11 @@ SERVING_EXTRA = "cpu"
 # inside the serving environment, so it needs no separate locked installation.
 ACCELERATOR_EXTRAS = {
     "cuda": "cuda",
+    "mlx": "mlx",
     "webgpu": "webgpu",
     "migraphx": "migraphx",
 }
-ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "webgpu", "migraphx", "coreml")
+ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml")
 ACCELERATOR_ENVIRONMENT_DIRECTORY = ".venv-accel"
 # Bumped in lockstep with incode_mcp.accelerator_env.RECORD_SCHEMA_VERSION.
 ACCELERATOR_RECORD_SCHEMA_VERSION = 1
@@ -61,6 +62,12 @@ WEBGPU_PLATFORMS = {
     "win32": {"amd64"},
 }
 MINIMUM_WEBGPU_MACOS = (14, 0)
+# MLX's Metal backend needs Apple Silicon, and its published wheels start at
+# macOS 14. It also ships CPU-only Linux and Windows wheels, which are excluded
+# here: preparing a "Metal" environment with no Metal in it would pass its own
+# probe and then lose to the CPU it really is.
+MLX_PLATFORMS = {"darwin": {"arm64"}}
+MINIMUM_MLX_MACOS = (14, 0)
 # AMD publishes this ONNX Runtime/MIGraphX combination as a single wheel rather
 # than on PyPI. Nomination stays exact so the installer never assembles an
 # untested Python/ROCm pair around it.
@@ -910,6 +917,31 @@ def _webgpu_plan(
     return AcceleratorPlan("webgpu", reason, honored=not reason_prefix)
 
 
+def _mlx_plan(*, platform_name: str, machine: str, platform_version: str) -> AcceleratorPlan:
+    supported = MLX_PLATFORMS.get(platform_name)
+    components = _driver_components(platform_version)
+    if supported is None or machine not in supported:
+        problem = f"MLX runs on Metal, and there is no Metal on {platform_name}/{machine}"
+    elif not components or components < MINIMUM_MLX_MACOS:
+        problem = (
+            f"the locked MLX build requires macOS "
+            f"{'.'.join(str(part) for part in MINIMUM_MLX_MACOS)} or newer"
+        )
+    else:
+        return AcceleratorPlan(
+            "mlx",
+            f"the locked MLX build is available for macOS {platform_version} on {machine}",
+            # Recorded as the driver version because it is what the probe result
+            # is only valid for: Metal comes with the OS.
+            driver_version=platform_version,
+            device_name="Apple Silicon GPU",
+        )
+    # MIGraphX degrades to WebGPU because both are cross-vendor GPU paths on the
+    # same machine. A request for Metal where there is no Metal is not a request
+    # for Vulkan or D3D12, so this reports CPU rather than substituting one.
+    return AcceleratorPlan("cpu", f"MLX was requested but {problem}", honored=False)
+
+
 def plan_accelerator(
     requested: str,
     *,
@@ -942,6 +974,12 @@ def plan_accelerator(
             "cpu",
             "Core ML needs no separate environment and stays manual-only: it lost to "
             "CPU on this model. Set INCODE_EMBED_ACCELERATOR=coreml to measure it",
+        )
+    if requested == "mlx":
+        return _mlx_plan(
+            platform_name=platform_name,
+            machine=machine,
+            platform_version=platform_version,
         )
     if requested == "webgpu":
         return _webgpu_plan(

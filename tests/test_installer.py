@@ -1080,11 +1080,95 @@ def test_migraphx_uses_only_the_pinned_rocm_python_matrix_then_falls_back(
         assert "MIGraphX was requested but" in plan.reason
 
 
+@pytest.mark.parametrize(
+    ("platform_name", "machine", "platform_version", "expected"),
+    [
+        ("darwin", "arm64", "14.0", "mlx"),
+        ("darwin", "arm64", "26.5.2", "mlx"),
+        ("darwin", "arm64", "13.6", "cpu"),
+        ("darwin", "x86_64", "15.1", "cpu"),
+        ("linux", "x86_64", "", "cpu"),
+        ("win32", "AMD64", "", "cpu"),
+    ],
+)
+def test_mlx_is_prepared_only_on_apple_silicon_with_a_published_wheel(
+    platform_name: str,
+    machine: str,
+    platform_version: str,
+    expected: str,
+) -> None:
+    """MLX also ships CPU-only Linux and Windows wheels.
+
+    Nominating one of those would prepare a "Metal" environment with no Metal in
+    it, which would pass its own probe and then lose to the CPU it really is.
+    """
+    installer = load_installer()
+
+    plan = installer.plan_accelerator(
+        "mlx",
+        platform_name=platform_name,
+        machine=machine,
+        platform_version=platform_version,
+        python_version="3.12",
+        nvidia_report=lambda: None,
+        rocm_report=lambda: None,
+    )
+
+    assert plan.accelerator == expected
+    assert plan.honored is (expected == "mlx")
+    if expected == "mlx":
+        # The OS version is part of the probe cache key, so an upgrade under a
+        # prepared environment retires the verdict recorded before it.
+        assert plan.driver_version == platform_version
+    else:
+        assert "MLX was requested but" in plan.reason
+
+
+def test_an_unsupported_mlx_request_does_not_fall_through_to_webgpu() -> None:
+    """MIGraphX degrades to WebGPU because both are cross-vendor GPU paths.
+
+    A request for Metal on a machine with no Metal is not a request for Vulkan,
+    so this reports CPU and says why instead.
+    """
+    installer = load_installer()
+
+    plan = installer.plan_accelerator(
+        "mlx",
+        platform_name="linux",
+        machine="x86_64",
+        platform_version="",
+        python_version="3.12",
+        nvidia_report=lambda: None,
+        rocm_report=lambda: None,
+    )
+
+    assert plan.accelerator == "cpu"
+    assert "WebGPU" not in plan.reason
+
+
+def test_auto_does_not_prepare_mlx_before_its_gates_pass() -> None:
+    installer = load_installer()
+
+    plan = installer.plan_accelerator(
+        "auto",
+        platform_name="darwin",
+        machine="arm64",
+        platform_version="26.5.2",
+        python_version="3.12",
+        nvidia_report=lambda: None,
+        rocm_report=lambda: None,
+    )
+
+    assert plan.accelerator == "cpu"
+    assert plan.honored is True
+
+
 def test_all_accelerator_environments_have_a_locked_extra() -> None:
     installer = load_installer()
 
     assert installer.ACCELERATOR_EXTRAS == {
         "cuda": "cuda",
+        "mlx": "mlx",
         "webgpu": "webgpu",
         "migraphx": "migraphx",
     }
@@ -1181,10 +1265,11 @@ def test_a_prepared_accelerator_is_recorded_only_after_its_probe_passes(
 
 
 @pytest.mark.parametrize(
-    ("requested", "rocm", "expected"),
+    ("requested", "rocm", "expected", "platform_name", "machine"),
     [
-        ("webgpu", None, "webgpu"),
-        ("migraphx", "7.2.1, AMD Radeon PRO W7900", "migraphx"),
+        ("webgpu", None, "webgpu", "linux", "x86_64"),
+        ("migraphx", "7.2.1, AMD Radeon PRO W7900", "migraphx", "linux", "x86_64"),
+        ("mlx", None, "mlx", "darwin", "arm64"),
     ],
 )
 def test_experimental_accelerators_sync_their_own_locked_extra(
@@ -1193,6 +1278,8 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
     requested: str,
     rocm: str | None,
     expected: str,
+    platform_name: str,
+    machine: str,
 ) -> None:
     installer = load_installer()
     checkout = tmp_path / "checkout"
@@ -1232,9 +1319,10 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
     plan = installer.configure_accelerator(
         checkout,
         requested,
-        platform_name="linux",
-        machine="x86_64",
+        platform_name=platform_name,
+        machine=machine,
         python_version="3.12",
+        platform_version="14.0",
         rocm_report=lambda: rocm,
     )
 
