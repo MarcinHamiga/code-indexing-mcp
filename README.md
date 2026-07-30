@@ -53,7 +53,7 @@ indexing and prepares one when it can. Experimental backends must be named expli
 
 ```bash
 python3 install.py --accelerator auto      # CPU, a supported CUDA installation, or Metal via MLX
-python3 install.py --accelerator mlx      # Metal on Apple Silicon through MLX
+python3 install.py --accelerator mlx       # Metal on Apple Silicon through MLX
 python3 install.py --accelerator webgpu   # experimental Metal, Vulkan, or D3D12 path
 python3 install.py --accelerator migraphx # experimental pinned AMD/ROCm path
 ```
@@ -294,8 +294,8 @@ Acceleration targets passage indexing only. The query model stays in the serving
 a search never waits on a worker spawning or a model loading onto a device.
 
 ```bash
-export INCODE_EMBED_ACCELERATOR=auto  # auto, cpu, cuda, webgpu, migraphx, coreml
-export INCODE_EMBED_STRICT=0          # 1 disables the CPU fallback
+export INCODE_EMBED_ACCELERATOR=auto  # auto, cpu, cuda, mlx, webgpu, migraphx, coreml
+export INCODE_EMBED_STRICT=0          # 1 disables the CPU fallback and the crossover
 export INCODE_EMBED_CROSSOVER=auto    # auto, off, or a character count
 export INCODE_EMBED_CALIBRATE=1       # 0 declines the one-time measurement
 ```
@@ -441,8 +441,15 @@ one that fell back because something broke.
 before this one did; a character count pins the threshold. `INCODE_EMBED_CALIBRATE=0` declines the
 measurement, leaving both the batch size and the crossover unmeasured.
 
+`INCODE_EMBED_STRICT=1` turns the crossover off too. Strict mode is for a caller who would rather
+fail than quietly index at CPU speed, and a deferral is exactly that — quiet CPU indexing that no
+degradation reports and that strict mode could not refuse, because nothing failed.
+
 Measurement never installs, downloads, or changes anything: it embeds through a worker that is
-already running and writes one JSON file under the cache directory.
+already running and writes one JSON file under the cache directory. The sweep runs on the worker
+the run will go on to use, so what it embedded, the retries it provoked, and the ceiling it walked
+up to are put back afterwards: they are measurement, not work the run did, and an `IndexReport` that
+counted them would describe a failure that never happened.
 
 `code-indexing-mcp model status` reports the whole resolution without loading or probing anything:
 

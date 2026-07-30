@@ -40,6 +40,17 @@ fallback always has, which is what the parity gates cover.
 - `model status` reporting both rates, the cold-load cost, the crossover, and a recommended override
   when the numbers argue for one; `IndexReport` reporting `embedded_characters`,
   `embedding_crossover_characters`, and `embedding_selection_reason`.
+- The sweep isolated from the run it measures on. It shares the run's worker — that is the point of
+  measuring through the ordinary request — so what it embedded, the retries it provoked, the ceiling
+  it walked up to, and the peak it reached are restored afterwards. Reported, they would make the
+  first run against a new backend describe a failure that never happened, and its segment count
+  disagree with its own character count.
+- The verified spawn re-anchored after the sweep. A sweep that overran respawned the worker, and the
+  successor is the process that verification covered; treating it as unproven cost a second model
+  load on every first run — the cost the crossover exists to spend only when it repays itself.
+- `INCODE_EMBED_STRICT=1` turning the crossover off. Strict mode exists for a caller who would rather
+  fail than index quietly on CPU, and a deferral is quiet CPU indexing that no degradation reports
+  and that strict mode could not have refused, because nothing failed.
 
 ## Acceptance evidence
 
