@@ -136,10 +136,13 @@ def test_a_session_that_fails_outright_is_not_calibrated() -> None:
     assert calibrate(BrokenSession({}), PLAN, load_ns=0, clock=lambda: 0) is None
 
 
-def test_the_measured_rate_is_characters_over_elapsed_time() -> None:
+def test_the_measured_rate_counts_the_same_characters_the_crossover_does() -> None:
+    """Prefix included: a request is charged its prefixes against the threshold,
+    so a rate denominated in content alone would cross fractionally early."""
     session = FakeSession(dict.fromkeys(CANDIDATE_BATCH_SIZES, 2_000_000_000))
     candidates = calibration_candidates()
-    characters = sum(len(candidate.content) for candidate in candidates)
+    characters = sum(len(candidate.prefix) + len(candidate.content) for candidate in candidates)
+    assert characters > sum(len(candidate.content) for candidate in candidates)
 
     result = calibrate(session, PLAN, load_ns=0, clock=session.clock)
 

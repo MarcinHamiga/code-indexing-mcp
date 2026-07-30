@@ -123,7 +123,10 @@ def calibrate(
     the batch that did.
     """
     corpus = list(calibration_candidates()) if candidates is None else list(candidates)
-    characters = sum(len(candidate.content) for candidate in corpus)
+    # Prefix included, because the crossover charges a request its prefixes too:
+    # a rate denominated in content alone would be compared against a size
+    # counted in content plus prefix, and cross fractionally early.
+    characters = sum(len(candidate.prefix) + len(candidate.content) for candidate in corpus)
     best: CalibrationResult | None = None
     for size in CANDIDATE_BATCH_SIZES:
         if size > max_items:
