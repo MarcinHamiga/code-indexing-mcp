@@ -342,6 +342,15 @@ def ensure_converted_weights(
     temporary = target.with_name(f"{target.stem}.{os.getpid()}.tmp{target.suffix}")
     try:
         mx.save_safetensors(str(temporary), weights)
+        # Flushed before the rename, so a machine that loses power mid-conversion
+        # cannot leave a renamed file holding whatever reached the disk. This
+        # file is read back as weights, and half-written weights would embed
+        # rather than fail.
+        descriptor = os.open(temporary, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
