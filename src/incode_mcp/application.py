@@ -332,7 +332,15 @@ class Application:
         the operator turned deferral off and also when nothing has been measured
         yet -- the first run on a machine is what does the measuring, and it
         cannot defer on numbers it is in the middle of producing.
+
+        Strict mode is a third such answer. It exists for a caller who would
+        rather fail than quietly index at CPU speed, and a deferral is quiet
+        CPU indexing that no degradation reports -- so under strict mode the
+        accelerator that was asked for is the one that runs, whatever the run
+        turns out to cost.
         """
+        if self.settings.embedding_strict:
+            return 0
         if not self.settings.embedding_crossover_auto:
             return self.settings.embedding_crossover_characters
         cpu, accelerator = self._measurements()

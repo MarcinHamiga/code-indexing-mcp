@@ -457,6 +457,22 @@ def test_an_explicit_crossover_wins_over_the_measured_one(tmp_path: Path) -> Non
     assert app.crossover_characters() == 99
 
 
+def test_strict_mode_refuses_to_defer_to_cpu_at_all(tmp_path: Path) -> None:
+    """Strict mode is for a caller who would rather fail than index quietly on
+    CPU, and a deferral is quiet CPU indexing no degradation reports."""
+    _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(IndexSettings.from_environment({}), embedding_strict=True)
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+
+    _measure(app, cpu=1_000.0, accelerator=2_000.0, load_ns=2_000_000_000)
+
+    # The measurement still stands and is still reported; only the deferral it
+    # would otherwise drive is refused.
+    assert app.model_status().crossover_characters == 4_000
+    assert app.crossover_characters() == 0
+
+
 def test_an_accelerator_that_lost_to_cpu_recommends_the_override(tmp_path: Path) -> None:
     """There is no run size at which it wins, so the useful thing to report is
     not a threshold but that this machine should stop preparing it."""
