@@ -917,40 +917,39 @@ def _webgpu_plan(
     return AcceleratorPlan("webgpu", reason, honored=not reason_prefix)
 
 
-def _mlx_is_supported(*, platform_name: str, machine: str, platform_version: str) -> bool:
-    supported = MLX_PLATFORMS.get(platform_name)
-    components = _driver_components(platform_version)
-    return bool(
-        supported is not None
-        and machine in supported
-        and components
-        and components >= MINIMUM_MLX_MACOS
-    )
+def _mlx_problem(*, platform_name: str, machine: str, platform_version: str) -> str:
+    """Return why MLX cannot be prepared here, or an empty string when it can."""
 
-
-def _mlx_plan(*, platform_name: str, machine: str, platform_version: str) -> AcceleratorPlan:
     supported = MLX_PLATFORMS.get(platform_name)
-    components = _driver_components(platform_version)
     if supported is None or machine not in supported:
-        problem = f"MLX runs on Metal, and there is no Metal on {platform_name}/{machine}"
-    elif not components or components < MINIMUM_MLX_MACOS:
-        problem = (
+        return f"MLX runs on Metal, and there is no Metal on {platform_name}/{machine}"
+    components = _driver_components(platform_version)
+    if not components or components < MINIMUM_MLX_MACOS:
+        return (
             f"the locked MLX build requires macOS "
             f"{'.'.join(str(part) for part in MINIMUM_MLX_MACOS)} or newer"
         )
-    else:
-        return AcceleratorPlan(
-            "mlx",
-            f"the locked MLX build is available for macOS {platform_version} on {machine}",
-            # Recorded as the driver version because it is what the probe result
-            # is only valid for: Metal comes with the OS.
-            driver_version=platform_version,
-            device_name="Apple Silicon GPU",
-        )
-    # MIGraphX degrades to WebGPU because both are cross-vendor GPU paths on the
-    # same machine. A request for Metal where there is no Metal is not a request
-    # for Vulkan or D3D12, so this reports CPU rather than substituting one.
-    return AcceleratorPlan("cpu", f"MLX was requested but {problem}", honored=False)
+    return ""
+
+
+def _mlx_plan(*, platform_name: str, machine: str, platform_version: str) -> AcceleratorPlan:
+    problem = _mlx_problem(
+        platform_name=platform_name, machine=machine, platform_version=platform_version
+    )
+    if problem:
+        # MIGraphX degrades to WebGPU because both are cross-vendor GPU paths on
+        # the same machine. A request for Metal where there is no Metal is not a
+        # request for Vulkan or D3D12, so this reports CPU rather than
+        # substituting one.
+        return AcceleratorPlan("cpu", f"MLX was requested but {problem}", honored=False)
+    return AcceleratorPlan(
+        "mlx",
+        f"the locked MLX build is available for macOS {platform_version} on {machine}",
+        # Recorded as the driver version because it is what the probe result is
+        # only valid for: Metal comes with the OS.
+        driver_version=platform_version,
+        device_name="Apple Silicon GPU",
+    )
 
 
 def plan_accelerator(
@@ -1037,7 +1036,7 @@ def plan_accelerator(
             reason_prefix=f"MIGraphX was requested but {problem}",
         )
 
-    if requested != "cuda" and _mlx_is_supported(
+    if requested != "cuda" and not _mlx_problem(
         platform_name=platform_name, machine=machine, platform_version=platform_version
     ):
         # `auto` on Apple Silicon: MLX passed the same correctness and 1.25x
