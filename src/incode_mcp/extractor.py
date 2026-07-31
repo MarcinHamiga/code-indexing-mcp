@@ -11,11 +11,16 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Final
 
+import tree_sitter_c_sharp
 import tree_sitter_java
 import tree_sitter_javascript
+import tree_sitter_json
 import tree_sitter_python
+import tree_sitter_sql
 import tree_sitter_typescript
+import tree_sitter_yaml
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
+from tree_sitter_language_pack import get_language
 
 from .models import ExtractedChunk, ExtractionResult
 
@@ -23,7 +28,17 @@ _CAMEL_BOUNDARY_1: Final = re.compile(r"([a-z0-9])([A-Z])")
 _CAMEL_BOUNDARY_2: Final = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _NON_WORD: Final = re.compile(r"[^A-Za-z0-9]+")
 _CONTAINER_KINDS: Final = frozenset(
-    {"annotation", "class", "constant", "enum", "interface", "record"}
+    {
+        "annotation",
+        "array",
+        "class",
+        "constant",
+        "enum",
+        "interface",
+        "object",
+        "record",
+        "struct",
+    }
 )
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 
@@ -41,6 +56,14 @@ def _languages() -> dict[str, Language]:
         "javascript": Language(tree_sitter_javascript.language()),
         "typescript": Language(tree_sitter_typescript.language_typescript()),
         "tsx": Language(tree_sitter_typescript.language_tsx()),
+        "csharp": Language(tree_sitter_c_sharp.language()),
+        "sql": Language(tree_sitter_sql.language()),
+        # No standalone GDScript grammar is published to PyPI; the language pack
+        # is the only packaged source. It already returns a Language, not a
+        # PyCapsule, so it is not wrapped like the others.
+        "gdscript": get_language("gdscript"),
+        "yaml": Language(tree_sitter_yaml.language()),
+        "json": Language(tree_sitter_json.language()),
     }
 
 

@@ -69,7 +69,7 @@ def corpus_fingerprints() -> dict[str, object]:
 def test_corpus_is_present_and_covers_every_language() -> None:
     languages = {LANGUAGES[path.suffix.lower()] for path in CORPUS_DIRECTORY.iterdir()}
 
-    assert languages == {"python", "java", "javascript", "typescript", "tsx"}
+    assert languages == set(LANGUAGES.values())
 
 
 def test_extractor_output_matches_the_committed_snapshot() -> None:

@@ -30,16 +30,34 @@ def test_scanner_honors_languages_gitignore_and_hard_exclusions(tmp_path: Path) 
     assert {skip.reason for skip in result.skipped} >= {"unsupported", "ignored"}
 
 
-def test_scanner_discovers_java_files_by_default(tmp_path: Path) -> None:
+def test_scanner_discovers_every_default_language(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
     project = initialize_project(root)
-    (root / "Service.java").write_text("class Service {}\n")
+    written = {
+        "Service.java": "class Service {}\n",
+        "Catalog.cs": "class Catalog {}\n",
+        "build.csx": "var x = 1;\n",
+        "player.gd": "func _ready():\n\tpass\n",
+        "schema.sql": "CREATE TABLE t (id INT);\n",
+        "compose.yaml": "services: {}\n",
+        "ci.yml": "jobs: {}\n",
+        "package.json": '{"name": "demo"}\n',
+    }
+    for name, text in written.items():
+        (root / name).write_text(text)
 
     result = SourceScanner().scan(project)
 
     assert [(item.path.as_posix(), item.language) for item in result.files] == [
+        ("Catalog.cs", "csharp"),
         ("Service.java", "java"),
+        ("build.csx", "csharp"),
+        ("ci.yml", "yaml"),
+        ("compose.yaml", "yaml"),
+        ("package.json", "json"),
+        ("player.gd", "gdscript"),
+        ("schema.sql", "sql"),
     ]
 
 

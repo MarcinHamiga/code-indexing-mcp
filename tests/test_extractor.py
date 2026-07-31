@@ -125,6 +125,169 @@ class Outer {
     assert "String value()" not in record_chunk.content
 
 
+def test_extracts_csharp_symbols_with_precise_kinds_and_nested_qualification() -> None:
+    source = b"""namespace Demo;
+
+public delegate int Transform(int value);
+
+public enum State { On, Off }
+
+public interface IService
+{
+    void Run();
+    string Name { get; }
+}
+
+public record User(string Name);
+
+public struct Point
+{
+    public Point(int x) => X = x;
+    public int X { get; }
+}
+
+public class Outer
+{
+    public Outer() { }
+
+    public void Run()
+    {
+        void Local() { }
+        Local();
+    }
+
+    public class Inner
+    {
+        public void Work() { }
+    }
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("src/Catalog.cs"), "csharp", source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert {
+        ("type", "Transform"),
+        ("enum", "State"),
+        ("constant", "State.On"),
+        ("interface", "IService"),
+        ("method", "IService.Run"),
+        ("property", "IService.Name"),
+        ("record", "User"),
+        ("struct", "Point"),
+        ("constructor", "Point.Point"),
+        ("property", "Point.X"),
+        ("class", "Outer"),
+        ("constructor", "Outer.Outer"),
+        ("method", "Outer.Run"),
+        ("function", "Outer.Run.Local"),
+        ("class", "Outer.Inner"),
+        ("method", "Outer.Inner.Work"),
+    } <= symbols
+
+
+def test_extracts_sql_data_definitions() -> None:
+    source = b"""CREATE TABLE public.users (
+  id BIGSERIAL PRIMARY KEY,
+  email TEXT NOT NULL
+);
+
+CREATE INDEX idx_users_email ON users (email);
+
+CREATE VIEW active_users AS SELECT id FROM users;
+
+CREATE FUNCTION normalize_email(address TEXT) RETURNS TEXT AS $$
+  SELECT lower(address);
+$$ LANGUAGE SQL;
+
+CREATE TRIGGER users_audit AFTER INSERT ON users
+  FOR EACH ROW EXECUTE FUNCTION audit_users();
+
+CREATE TYPE mood AS ENUM ('sad', 'ok');
+"""
+
+    result = TreeSitterExtractor().extract(Path("db/schema.sql"), "sql", source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert {
+        ("table", "users"),
+        ("index", "idx_users_email"),
+        ("view", "active_users"),
+        ("function", "normalize_email"),
+        # A trigger names its table and its handler as well as itself; the first
+        # object reference is the one that names the trigger.
+        ("trigger", "users_audit"),
+        ("type", "mood"),
+    } <= symbols
+
+
+def test_extracts_gdscript_symbols_including_signals_and_inner_classes() -> None:
+    source = b"""class_name Player
+extends CharacterBody2D
+
+signal health_changed(amount: int)
+
+enum State { IDLE, RUN }
+
+const MAX_SPEED := 300.0
+
+class Inventory:
+\tfunc add(item) -> void:
+\t\tpass
+
+func _ready() -> void:
+\tpass
+"""
+
+    result = TreeSitterExtractor().extract(Path("game/player.gd"), "gdscript", source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert {
+        ("class", "Player"),
+        ("signal", "health_changed"),
+        ("enum", "State"),
+        ("constant", "MAX_SPEED"),
+        ("class", "Inventory"),
+        ("method", "Inventory.add"),
+        ("function", "_ready"),
+    } <= symbols
+
+
+@pytest.mark.parametrize(
+    ("language", "path", "source"),
+    [
+        (
+            "yaml",
+            "compose.yaml",
+            b'version: "3.9"\nservices:\n  web:\n    ports:\n      - "80:80"\n',
+        ),
+        (
+            "json",
+            "package.json",
+            b'{"version": "3.9", "services": {"web": {"ports": ["80:80"]}}}\n',
+        ),
+    ],
+)
+def test_extracts_collection_valued_config_keys_with_nested_qualification(
+    language: str, path: str, source: bytes
+) -> None:
+    """Only collection-valued keys become symbols.
+
+    Capturing scalar leaves too would turn a large config file into thousands of
+    one-line chunks; the scalars still reach the index as part of the enclosing
+    key's chunk or as module text.
+    """
+    result = TreeSitterExtractor().extract(Path(path), language, source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert {
+        ("object", "services"),
+        ("object", "services.web"),
+        ("array", "services.web.ports"),
+    } <= symbols
+    assert not any(chunk.qualified_symbol == "version" for chunk in result.chunks)
+
+
 def test_splits_oversized_function_into_bounded_parts() -> None:
     body = "\n".join(f"    value_{index} = {index}" for index in range(20))
     source = f"def large():\n{body}\n".encode()
@@ -372,15 +535,34 @@ class Old {
     assert old_chunk.content.startswith("@Deprecated")
 
 
+def test_every_scanned_language_has_a_grammar_and_a_query() -> None:
+    """A language the scanner classifies but the extractor cannot load fails per file.
+
+    The extension map, the grammar table, and the packaged .scm files are three
+    separate places; adding a language to only one of them is the easy mistake.
+    """
+    from importlib.resources import files
+
+    from incode_mcp.extractor import _languages
+    from incode_mcp.scanner import LANGUAGES
+
+    scanned = set(LANGUAGES.values())
+
+    assert set(_languages()) == scanned
+    for language in sorted(scanned):
+        assert files("incode_mcp.queries").joinpath(f"{language}.scm").is_file()
+
+
 def test_chunk_kind_literal_covers_every_kind_the_queries_capture() -> None:
     from importlib.resources import files
     from typing import get_args
 
     from incode_mcp.models import ChunkKind
+    from incode_mcp.scanner import LANGUAGES
 
     declared = set(get_args(ChunkKind))
     captured = set()
-    for language in ("python", "java", "javascript", "typescript", "tsx"):
+    for language in sorted(set(LANGUAGES.values())):
         text = files("incode_mcp.queries").joinpath(f"{language}.scm").read_text()
         captured |= {
             line.split("@definition.", 1)[1].split()[0].strip(")")

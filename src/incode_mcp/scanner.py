@@ -22,6 +22,13 @@ LANGUAGES = {
     ".mts": "typescript",
     ".cts": "typescript",
     ".tsx": "tsx",
+    ".cs": "csharp",
+    ".csx": "csharp",
+    ".gd": "gdscript",
+    ".sql": "sql",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".json": "json",
 }
 
 HARD_EXCLUDED_DIRECTORIES = {
