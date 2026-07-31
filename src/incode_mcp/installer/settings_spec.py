@@ -273,9 +273,15 @@ def normalize(setting: Setting, raw: str) -> str:
     if setting.type == "bool":
         return "1" if value.lower() in _TRUE else "0"
     if setting.type == "path":
-        # The server reads this straight out of the environment, where no shell
-        # is left to expand a tilde the user typed into a form.
-        return str(Path(value).expanduser()) if value else value
+        # A leading tilde is the one thing worth rewriting: no shell is left to
+        # expand it. Everything else is stored exactly as typed, separators
+        # included, so a POSIX path does not come back Windows-flavoured.
+        if value.startswith("~"):
+            try:
+                return str(Path(value).expanduser())
+            except RuntimeError:  # no home directory to expand ~user against
+                return value
+        return value
     if setting.type in {"choice", "auto_int", "auto_off_int"} and not value.lstrip("-").isdigit():
         return value.lower()
     return value

@@ -89,7 +89,10 @@ def test_validate_unknown_names_are_rejected_by_lookup() -> None:
         ("INCODE_INDEX_MODE", "EAGER", "eager"),
         ("INCODE_EMBED_BATCH_SIZE", "AUTO", "auto"),
         ("INCODE_EMBED_BATCH_SIZE", "8", "8"),
+        # Paths are stored as typed on every platform: rewriting separators
+        # would hand the server a path its own OS never asked for.
         ("INCODE_DATA_DIR", "/data", "/data"),
+        ("INCODE_DATA_DIR", r"C:\data", r"C:\data"),
     ],
 )
 def test_normalize(name: str, raw: str, stored: str) -> None:
