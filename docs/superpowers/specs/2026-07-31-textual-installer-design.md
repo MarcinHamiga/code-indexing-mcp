@@ -126,7 +126,7 @@ exactly how to get it (`uv sync --extra tui`).
 
 ### Dependency changes
 
-- New optional extra in `pyproject.toml`: `tui = ["textual>=3,<4"]`. The exact version is
+- New optional extra in `pyproject.toml`: `tui = ["textual>=8.2,<9"]`. The exact version is
   pinned by the regenerated `uv.lock`, which is committed. The extra is **not** added to
   the `[tool.uv]` conflicts list — it must combine with `cpu`.
 - Bootstrap sync becomes `uv sync --locked --extra cpu --extra tui`. The serving environment
