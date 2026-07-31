@@ -39,6 +39,11 @@ def test_scanner_discovers_every_default_language(tmp_path: Path) -> None:
         "Catalog.cs": "class Catalog {}\n",
         "build.csx": "var x = 1;\n",
         "player.gd": "func _ready():\n\tpass\n",
+        "water.gdshader": "shader_type spatial;\n",
+        "ease.gdshaderinc": "const float TAU = 6.28;\n",
+        "level.tscn": '[node name="Player" type="Node2D"]\n',
+        "env.tres": "[resource]\nbackground_mode = 2\n",
+        "project.godot": 'config_version=5\n\n[application]\n\nconfig/name="Game"\n',
         "schema.sql": "CREATE TABLE t (id INT);\n",
         "compose.yaml": "services: {}\n",
         "ci.yml": "jobs: {}\n",
@@ -55,9 +60,14 @@ def test_scanner_discovers_every_default_language(tmp_path: Path) -> None:
         ("build.csx", "csharp"),
         ("ci.yml", "yaml"),
         ("compose.yaml", "yaml"),
+        ("ease.gdshaderinc", "gdshader"),
+        ("env.tres", "godot_resource"),
+        ("level.tscn", "godot_resource"),
         ("package.json", "json"),
         ("player.gd", "gdscript"),
+        ("project.godot", "godot_resource"),
         ("schema.sql", "sql"),
+        ("water.gdshader", "gdshader"),
     ]
 
 

@@ -242,6 +242,8 @@ no JDK, Maven, Gradle, .NET SDK, Godot, or database connection:
 | TypeScript | `.ts`, `.mts`, `.cts`, `.tsx`             | classes, interfaces, type aliases, enums, functions, methods                              |
 | C#         | `.cs`, `.csx`                             | classes, interfaces, structs, records, enums, enum members, delegates, methods, local functions, constructors, destructors, properties |
 | GDScript   | `.gd`                                     | classes (including `class_name` and inner classes), functions, methods, signals, enums, constants |
+| Godot shaders | `.gdshader`, `.gdshaderinc`            | functions, structs, uniforms (as properties), constants                                   |
+| Godot scenes and resources | `.tscn`, `.tres`, `.godot` | scene nodes by `name`, resource references by `id`                                        |
 | SQL        | `.sql`                                    | tables, views, materialized views, indexes, functions, triggers, types                    |
 | YAML       | `.yaml`, `.yml`                           | collection-valued keys, qualified by their path                                           |
 | JSON       | `.json`                                   | collection-valued keys, qualified by their path                                           |
@@ -254,6 +256,10 @@ sequence/array. Making a symbol of every scalar leaf would turn one large config
 thousands of one-line chunks; scalars still reach the index inside the enclosing key's chunk.
 SQL `CREATE PROCEDURE` is not extracted, because the bundled SQL grammar does not parse it.
 
+Godot scene and resource files name only some of their sections: `[gd_scene]`, `[gd_resource]`,
+`[resource]`, `[connection]`, and the sections of a `project.godot` carry neither a `name` nor an
+`id`, so they reach the index as searchable text rather than as symbols.
+
 The scanner respects root and nested `.gitignore` files and excludes symlinks, binary files, files
 over 1 MiB, build outputs, virtual environments, and dependency directories. That 1 MiB cap is what
 usually keeps a large generated `package-lock.json` or similar out of the index; exclude it through
@@ -262,7 +268,8 @@ usually keeps a large generated `package-lock.json` or similar out of the index;
 Existing project markers whose `scan.include` still holds an older default list are upgraded to the
 current one at runtime, so a project created before a language was supported picks it up without
 being re-initialized. A customized `scan.include` list is never rewritten — add the patterns you
-want (`**/*.cs`, `**/*.gd`, `**/*.sql`, `**/*.yaml`, `**/*.yml`, `**/*.json`) explicitly.
+want (`**/*.cs`, `**/*.gd`, `**/*.gdshader`, `**/*.tscn`, `**/*.tres`, `**/*.sql`, `**/*.yaml`,
+`**/*.yml`, `**/*.json`) explicitly.
 
 ## Multi-project search
 

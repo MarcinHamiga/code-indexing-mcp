@@ -41,6 +41,23 @@ _CONTAINER_KINDS: Final = frozenset(
     }
 )
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
+_QUOTE_CHARACTERS: Final = ("'", '"')
+
+
+def _capture_name(source: bytes, node: Node) -> str:
+    """Return the symbol text of a ``@name`` capture, without surrounding quotes.
+
+    Most grammars name a definition with an identifier token and this is a plain
+    decode. A few have no node for the inside of a quoted name -- Godot's
+    resource format hands back `"Player"` including the quotes, and a quoted YAML
+    key does the same -- which would otherwise index the quotes as part of the
+    symbol. Only a matched leading/trailing pair is stripped, so an identifier
+    that merely contains a quote is left alone.
+    """
+    name = source[node.start_byte : node.end_byte].decode("utf-8")
+    if len(name) >= 2 and name[0] == name[-1] and name[0] in _QUOTE_CHARACTERS:
+        return name[1:-1]
+    return name
 
 
 def normalize_identifier(value: str) -> str:
@@ -60,8 +77,11 @@ def _languages() -> dict[str, Language]:
         "sql": Language(tree_sitter_sql.language()),
         # No standalone GDScript grammar is published to PyPI; the language pack
         # is the only packaged source. It already returns a Language, not a
-        # PyCapsule, so it is not wrapped like the others.
+        # PyCapsule, so it is not wrapped like the others. The two sibling Godot
+        # formats come from the same pack for the same reason.
         "gdscript": get_language("gdscript"),
+        "gdshader": get_language("gdshader"),
+        "godot_resource": get_language("godot_resource"),
         "yaml": Language(tree_sitter_yaml.language()),
         "json": Language(tree_sitter_json.language()),
     }
@@ -201,8 +221,7 @@ class TreeSitterExtractor:
             name_nodes = captures.get("name", [])
             if not name_nodes:
                 continue
-            name_node = name_nodes[0]
-            name = source[name_node.start_byte : name_node.end_byte].decode("utf-8")
+            name = _capture_name(source, name_nodes[0])
             for capture, nodes in captures.items():
                 if not capture.startswith("definition."):
                     continue

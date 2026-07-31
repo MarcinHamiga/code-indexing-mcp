@@ -288,6 +288,115 @@ def test_extracts_collection_valued_config_keys_with_nested_qualification(
     assert not any(chunk.qualified_symbol == "version" for chunk in result.chunks)
 
 
+def test_extracts_gdshader_uniforms_functions_structs_and_constants() -> None:
+    source = b"""shader_type spatial;
+
+uniform vec4 albedo : source_color = vec4(1.0);
+uniform sampler2D noise_tex;
+
+const float PI2 = 6.28318;
+
+varying vec3 world_pos;
+
+struct Ray {
+\tvec3 origin;
+};
+
+float wave(float x) {
+\treturn sin(x);
+}
+
+void fragment() {
+\tALBEDO = albedo.rgb;
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("shaders/water.gdshader"), "gdshader", source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert {
+        # A uniform is the shader's exposed parameter, so it indexes as a property.
+        ("property", "albedo"),
+        ("property", "noise_tex"),
+        ("constant", "PI2"),
+        ("struct", "Ray"),
+        ("function", "wave"),
+        ("function", "fragment"),
+    } <= symbols
+    # A type hint holds an identifier of its own; it must not become the name.
+    assert not any(chunk.qualified_symbol == "source_color" for chunk in result.chunks)
+
+
+def test_extracts_godot_scene_nodes_and_resource_ids_without_quotes() -> None:
+    source = b"""[gd_scene load_steps=3 format=3 uid="uid://scene1"]
+
+[ext_resource type="Script" path="res://player.gd" id="1_script"]
+
+[sub_resource type="RectangleShape2D" id="Rect_1"]
+size = Vector2(32, 64)
+
+[node name="Player" type="CharacterBody2D"]
+script = ExtResource("1_script")
+
+[connection signal="died" from="Player" to="." method="_on_died"]
+"""
+
+    result = TreeSitterExtractor().extract(Path("scenes/level.tscn"), "godot_resource", source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert {("object", "1_script"), ("object", "Rect_1"), ("object", "Player")} <= symbols
+    # The grammar has no node for the inside of a quoted string, so the name
+    # capture arrives with its quotes attached.
+    assert not any((chunk.qualified_symbol or "").startswith('"') for chunk in result.chunks)
+    # A section is named by `name` or by `id` depending on its heading; a type or
+    # a connection endpoint is neither.
+    assert not any(
+        chunk.qualified_symbol in {"CharacterBody2D", "Script", "died", "Player.gd"}
+        for chunk in result.chunks
+    )
+
+
+def test_a_section_carrying_both_name_and_id_is_named_once_and_by_its_heading() -> None:
+    """Matches arrive in source order, not pattern order.
+
+    Two unanchored patterns would both match such a section and which one won
+    would depend on attribute order in the file, so each pattern is anchored to
+    its own section heading.
+    """
+    source = b'[node name="Player" id="N_1"]\nscript = 1\n'
+
+    result = TreeSitterExtractor().extract(Path("odd.tscn"), "godot_resource", source)
+
+    named = [chunk for chunk in result.chunks if chunk.qualified_symbol is not None]
+    assert [(chunk.kind, chunk.qualified_symbol) for chunk in named] == [("object", "Player")]
+
+
+def test_query_predicates_are_applied_when_matching() -> None:
+    """The Godot resource query relies on `#eq?`/`#any-of?` filtering matches.
+
+    py-tree-sitter applies these inside `QueryCursor.matches`, and nothing else
+    in this codebase depends on it. Were an upgrade to stop applying them, every
+    attribute in a scene file would become a symbol rather than just its name,
+    so fail here rather than silently flooding the index.
+    """
+    source = b'[node name="Player" type="CharacterBody2D" parent="."]\nscript = 1\n'
+
+    result = TreeSitterExtractor().extract(Path("scene.tscn"), "godot_resource", source)
+
+    names = {chunk.qualified_symbol for chunk in result.chunks if chunk.qualified_symbol}
+    assert names == {"Player"}, f"predicates were not applied; got {sorted(names)}"
+
+
+def test_a_quoted_name_capture_is_indexed_without_its_quotes() -> None:
+    """Quoted YAML keys share the Godot problem of quotes inside the name node."""
+    source = b'"quoted key":\n  nested: 1\nplain:\n  nested: 2\n'
+
+    result = TreeSitterExtractor().extract(Path("config.yaml"), "yaml", source)
+
+    symbols = {chunk.qualified_symbol for chunk in result.chunks if chunk.qualified_symbol}
+    assert symbols == {"quoted key", "plain"}
+
+
 def test_splits_oversized_function_into_bounded_parts() -> None:
     body = "\n".join(f"    value_{index} = {index}" for index in range(20))
     source = f"def large():\n{body}\n".encode()
