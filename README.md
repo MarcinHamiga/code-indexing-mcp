@@ -51,6 +51,45 @@ pull and refresh its environment. To change settings or harnesses without updati
 current configuration. Naming what to change applies it directly instead:
 `code-indexing-mcp configure --set CODE_INDEXING_BROKER=off --unset CODE_INDEXING_INDEX_MODE`.
 
+### The `code-indexing-mcp` command
+
+Your MCP clients launch the server by absolute path and never need it on PATH, so the
+installer adds a launcher for you: a symlink at `~/.local/bin/code-indexing-mcp` (a `.cmd`
+shim on Windows) pointing at the executable inside the installation's virtual environment.
+That is what makes `configure`, `index`, `status`, `projects`, `model`, and `daemon` work
+from any shell.
+
+If that directory is not already on your `PATH`, the wizard offers — checked by default — to
+add it to your shell profile (`~/.zshrc`, `~/.bashrc` and `~/.bash_profile` on macOS,
+`~/.config/fish/config.fish`, or `~/.profile`) as a marked block:
+
+```sh
+# >>> code-indexing-mcp >>>
+export PATH="$HOME/.local/bin:$PATH"
+# <<< code-indexing-mcp <<<
+```
+
+The block is written once — a second install finds it and leaves the file alone, as does a
+profile where you already put that directory on PATH yourself — and the original is backed up
+with a `.bak` suffix first. The entry only reaches shells started afterwards; the installer
+prints the `exec` line that makes it live in the session you are sitting in. Windows profiles
+are not edited; add the directory yourself.
+
+An existing file at the launcher's name that the installer did not create is moved aside to
+`code-indexing-mcp.bak` rather than overwritten. If some *other* `code-indexing-mcp` sits
+earlier on your PATH, the wizard says so instead of quietly losing the name.
+
+Three flags control all of this, on both `install.py` and `configure`:
+
+```bash
+python3 install.py --bin-dir ~/bin      # put the launcher somewhere else
+python3 install.py --no-modify-path     # create the launcher, never touch a shell profile
+python3 install.py --no-launcher        # do not create a launcher at all
+```
+
+`CODE_INDEXING_MCP_BIN_DIR` and `XDG_BIN_HOME` set the directory too, in that order of
+preference. None of these count as "scripted" flags, so passing them still opens the wizard.
+
 On a terminal that cannot host the wizard (or with `--no-tui`), the installer falls back to
 a plain text interface with the numbered harness menu. Flags that already say what to
 install — `--harnesses`, `--set`, `--unset`, `--no-prompt` — skip the wizard too, so a
@@ -86,6 +125,33 @@ Reinstalling as `--accelerator cpu` removes the environment again.
 
 Use `--install-dir /custom/path` or `CODE_INDEXING_MCP_INSTALL_DIR` to change the checkout
 location. Run `python3 install.py --help` for all installer options.
+
+### Repair and uninstall
+
+`code-indexing-mcp configure --repair` re-applies the cheap steps — the launcher, the client
+entries, and the skill links — for the harnesses already configured, keeping the prepared
+accelerator and every setting exactly as they are. It changes no choice; it puts back what
+went missing.
+
+`code-indexing-mcp uninstall` removes what the installer added: the `code-indexing-mcp` entry
+from each configured client, the bundled skill links, the launcher, and the PATH block. It
+prints what it will do and asks before doing any of it (`--yes` skips the prompt).
+
+Removal is evidence-based, not name-based. A file at the launcher's path that is not one of
+our symlinks stays; a skill directory entry that does not point into this checkout stays; a
+PATH block whose end marker was edited away stays, because removing to end-of-file would take
+your edits with it. Client configs are restored to what they were before the install —
+comments, formatting, and neighbouring servers included.
+
+Indexes and caches are **kept** by default; they cost minutes of CPU to rebuild and an
+uninstall that discards them silently is not one you can undo. The checkout is kept too:
+
+```bash
+code-indexing-mcp uninstall                    # entries, skills, launcher, PATH block
+code-indexing-mcp uninstall --purge            # also delete the index and cache directories
+code-indexing-mcp uninstall --remove-checkout  # also delete ~/.local/share/code-indexing-mcp
+code-indexing-mcp uninstall --keep-launcher --keep-path   # leave the command in place
+```
 
 ### Bundled skills
 

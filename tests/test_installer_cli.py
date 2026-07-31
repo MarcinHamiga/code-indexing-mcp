@@ -226,6 +226,159 @@ def test_main_reports_harness_failures_instead_of_claiming_success(
     assert "1 failed harness" in captured.err
 
 
+def test_main_threads_the_launcher_flags_into_the_plan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    recorded: list = []
+    _stub_pipeline(monkeypatch, recorded)
+
+    code = main(
+        [
+            "--install-dir",
+            str(tmp_path),
+            "--bin-dir",
+            str(tmp_path / "bin"),
+            "--no-modify-path",
+            "--no-prompt",
+        ]
+    )
+
+    assert code == 0
+    (plan,) = recorded
+    assert plan.bin_directory == tmp_path / "bin"
+    assert plan.install_launcher is True
+    assert plan.modify_shell_profiles is False
+
+
+def test_main_no_launcher_turns_the_step_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    recorded: list = []
+    _stub_pipeline(monkeypatch, recorded)
+
+    main(["--install-dir", str(tmp_path), "--no-launcher", "--no-prompt"])
+
+    (plan,) = recorded
+    assert plan.install_launcher is False
+    assert plan.bin_directory is None  # resolved at run time
+
+
+def test_main_reports_the_shell_profiles_it_edited(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import code_indexing_mcp.installer.cli as cli
+
+    profile = tmp_path / ".zshrc"
+    monkeypatch.setattr(
+        cli,
+        "run_install",
+        lambda plan, on_event=lambda event: None, should_continue=lambda: True: (
+            orchestrator.InstallResult(None, (), (), (), profiles_updated=(profile,))
+        ),
+    )
+
+    code = main(["--install-dir", str(tmp_path), "--no-prompt"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert str(profile) in out
+    assert "exec" in out
+
+
+def test_configure_forwards_the_launcher_flags_without_suppressing_the_wizard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """--bin-dir says where things go, not which steps to skip, so the wizard opens."""
+
+    from code_indexing_mcp.installer.cli import configure_main
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.accelerator.server_executable",
+        lambda directory: tmp_path / "server",
+    )
+    (tmp_path / "server").touch()
+    calls = _fake_tui_app(monkeypatch)
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.wizard.load_prefill", lambda **kwargs: Prefill({}, (), ())
+    )
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.wizard.accelerator.prepared_accelerator",
+        lambda directory: "cpu",
+    )
+
+    code = configure_main(
+        install_dir=str(tmp_path),
+        accelerator=None,
+        harnesses=None,
+        settings=[],
+        unsets=[],
+        no_tui=False,
+        bin_dir=str(tmp_path / "bin"),
+        no_modify_path=True,
+    )
+
+    assert code == 0
+    (state,) = calls
+    assert state.bin_directory == tmp_path / "bin"
+    assert state.modify_shell_profiles is False
+
+
+def test_repair_reapplies_the_current_configuration_without_rebuilding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    recorded: list = []
+    _stub_pipeline(monkeypatch, recorded)
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.cli.load_prefill",
+        lambda: Prefill({"CODE_INDEXING_BROKER": "off"}, ("kimi-code", "codex"), ()),
+    )
+
+    code = main(["--install-dir", str(tmp_path), "--repair"])
+
+    assert code == 0
+    (plan,) = recorded
+    # The harnesses already configured, their current settings written back, and
+    # explicitly no accelerator work.
+    assert plan.harness_slugs == ("kimi-code", "codex")
+    assert plan.env_updates == {"CODE_INDEXING_BROKER": "off"}
+    assert plan.accelerator is None
+    assert plan.install_launcher is True
+
+
+def test_repair_never_opens_the_wizard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from code_indexing_mcp.installer.cli import configure_main
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.accelerator.server_executable",
+        lambda directory: tmp_path / "server",
+    )
+    (tmp_path / "server").touch()
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.cli._run_tui",
+        lambda *args, **kwargs: pytest.fail("repair must not open the wizard"),
+    )
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.cli.load_prefill", lambda: Prefill({}, ("kimi-code",), ())
+    )
+    recorded: list = []
+    _stub_pipeline(monkeypatch, recorded)
+
+    code = configure_main(
+        install_dir=str(tmp_path),
+        accelerator=None,
+        harnesses=None,
+        settings=[],
+        unsets=[],
+        no_tui=False,
+        repair=True,
+    )
+
+    assert code == 0
+    assert recorded[0].accelerator is None
+
+
 def test_main_tui_without_textual_reports_the_fix(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

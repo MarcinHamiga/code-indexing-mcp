@@ -10,7 +10,7 @@ import tempfile
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 SERVER_NAME = "code-indexing-mcp"
 
@@ -98,7 +98,17 @@ def _scan_jsonc_value(text: str, position: int) -> int:
     return position + len(text[position:end].rstrip())
 
 
-JsonMember = tuple[str, int, int]
+class JsonMember(NamedTuple):
+    """One object member's key and the byte span of its value.
+
+    ``key_start`` is what removal needs and merging does not: to take a member
+    out, the quote that opens its key is the left edge of the span to cut.
+    """
+
+    key: str
+    key_start: int
+    value_start: int
+    value_end: int
 
 
 def _jsonc_object_members(text: str, object_start: int) -> tuple[list[JsonMember], int]:
@@ -112,13 +122,14 @@ def _jsonc_object_members(text: str, object_start: int) -> tuple[list[JsonMember
             raise ValueError("unterminated object")
         if text[position] == "}":
             return members, position
+        key_start = position
         key, position = _parse_json_string(text, position)
         position = _skip_jsonc_trivia(text, position)
         if position >= len(text) or text[position] != ":":
             raise ValueError(f"missing colon after {key!r}")
         value_start = _skip_jsonc_trivia(text, position + 1)
         value_end = _scan_jsonc_value(text, value_start)
-        members.append((key, value_start, value_end))
+        members.append(JsonMember(key, key_start, value_start, value_end))
         position = _skip_jsonc_trivia(text, value_end)
         if position >= len(text):
             raise ValueError("unterminated object")
@@ -206,7 +217,7 @@ def _insert_jsonc_member(
     value: Any,
 ) -> str:
     if members:
-        _, _, last_value_end = members[-1]
+        last_value_end = members[-1].value_end
         after_value = _skip_jsonc_trivia(text, last_value_end)
         if after_value >= len(text) or text[after_value] != ",":
             text = text[:last_value_end] + "," + text[last_value_end:]
@@ -238,7 +249,7 @@ def _merge_jsonc_text(text: str, object_key: str, entry_key: str, entry_value: A
     if _skip_jsonc_trivia(text, root_end + 1) != len(text):
         raise ValueError("unexpected content after the root object")
 
-    root_member = next((member for member in root_members if member[0] == object_key), None)
+    root_member = next((member for member in root_members if member.key == object_key), None)
     if root_member is None:
         return _insert_jsonc_member(
             text,
@@ -249,13 +260,13 @@ def _merge_jsonc_text(text: str, object_key: str, entry_key: str, entry_value: A
             {entry_key: entry_value},
         )
 
-    _, object_start, object_value_end = root_member
+    object_start, object_value_end = root_member.value_start, root_member.value_end
     if text[object_start] != "{":
         raise ValueError(f"{object_key!r} must contain an object")
     entries, object_end = _jsonc_object_members(text, object_start)
     if object_end + 1 != object_value_end:
         raise ValueError(f"{object_key!r} has an invalid object value")
-    entry = next((member for member in entries if member[0] == entry_key), None)
+    entry = next((member for member in entries if member.key == entry_key), None)
     if entry is None:
         return _insert_jsonc_member(
             text,
@@ -266,9 +277,77 @@ def _merge_jsonc_text(text: str, object_key: str, entry_key: str, entry_value: A
             entry_value,
         )
 
-    _, value_start, value_end = entry
-    replacement = _format_json_value(entry_value, _line_indent(text, value_start))
-    return text[:value_start] + replacement + text[value_end:]
+    replacement = _format_json_value(entry_value, _line_indent(text, entry.value_start))
+    return text[: entry.value_start] + replacement + text[entry.value_end :]
+
+
+def _remove_jsonc_member(text: str, members: list[JsonMember], index: int) -> str:
+    """Cut one member out along with the comma that joined it to its neighbours.
+
+    Deleting the span alone would leave either a double comma or a dangling one,
+    so exactly one separator has to go with it: the comma that follows, or -- for
+    the last member -- the comma that precedes it.
+    """
+
+    member = members[index]
+    start, end = member.key_start, member.value_end
+    after = _skip_jsonc_trivia(text, end)
+    if after < len(text) and text[after] == ",":
+        end = after + 1
+    elif index > 0:
+        previous_end = members[index - 1].value_end
+        comma = _skip_jsonc_trivia(text, previous_end)
+        if comma < len(text) and text[comma] == ",":
+            start = comma
+
+    # Take the whole line when the member had one to itself, so removal does not
+    # leave a blank line where an entry used to be. A comment sharing either end
+    # of the line is left exactly where the user put it.
+    line_start = text.rfind("\n", 0, start) + 1
+    if not text[line_start:start].strip():
+        line_end = text.find("\n", end)
+        if line_end != -1 and not text[end:line_end].strip():
+            start, end = line_start, line_end + 1
+    return text[:start] + text[end:]
+
+
+def _remove_jsonc_entry(text: str, object_key: str, entry_key: str) -> str | None:
+    """Return the text without the named entry, or None when it was not there."""
+
+    root_start = _skip_jsonc_trivia(text, 0)
+    if root_start >= len(text) or text[root_start] != "{":
+        raise ValueError("configuration root must be an object")
+    root_members, _ = _jsonc_object_members(text, root_start)
+    root_member = next((member for member in root_members if member.key == object_key), None)
+    if root_member is None:
+        return None
+    if text[root_member.value_start] != "{":
+        raise ValueError(f"{object_key!r} must contain an object")
+    entries, _ = _jsonc_object_members(text, root_member.value_start)
+    index = next(
+        (position for position, member in enumerate(entries) if member.key == entry_key),
+        None,
+    )
+    if index is None:
+        return None
+    updated = _remove_jsonc_member(text, entries, index)
+    if len(entries) > 1:
+        return updated
+    # That was the only server, so the container is now empty. Take it too: the
+    # merge is what created it, and putting the file back exactly as it was is
+    # worth more than preserving a `"mcpServers": {}` that means nothing.
+    root_start = _skip_jsonc_trivia(updated, 0)
+    root_members, _ = _jsonc_object_members(updated, root_start)
+    container = next(
+        (position for position, member in enumerate(root_members) if member.key == object_key),
+        None,
+    )
+    if container is None:  # pragma: no cover - it was there a moment ago
+        return updated
+    remaining, _ = _jsonc_object_members(updated, root_members[container].value_start)
+    if remaining:
+        return updated
+    return _remove_jsonc_member(updated, root_members, container)
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -316,6 +395,23 @@ def merge_json_object_entry(
     try:
         _validate_jsonc(source)
         updated = _merge_jsonc_text(source, object_key, entry_key, entry_value)
+        _validate_jsonc(updated)
+    except ValueError as exc:
+        raise InstallerError(f"Invalid JSON/JSONC configuration in {path}: {exc}") from exc
+    return _write_changed_configuration(path, original, updated)
+
+
+def remove_json_object_entry(path: Path, object_key: str, entry_key: str) -> bool:
+    """Remove one entry from a top-level JSON/JSONC object. False if it was absent."""
+
+    original = _read_configuration(path)
+    if original is None or not original.strip():
+        return False
+    try:
+        _validate_jsonc(original)
+        updated = _remove_jsonc_entry(original, object_key, entry_key)
+        if updated is None:
+            return False
         _validate_jsonc(updated)
     except ValueError as exc:
         raise InstallerError(f"Invalid JSON/JSONC configuration in {path}: {exc}") from exc
@@ -389,6 +485,78 @@ def _trailing_toml_trivia(text: str) -> str:
     return text
 
 
+TomlHeading = tuple["re.Match[str]", list[str], bool]
+
+
+def _codex_headings(source: str, path: Path) -> list[TomlHeading]:
+    headings: list[TomlHeading] = []
+    for match in _TOML_TABLE.finditer(source):
+        try:
+            array_name = match.group("array_name")
+            name = array_name or match.group("table_name")
+            headings.append((match, _split_toml_dotted_key(name), array_name is not None))
+        except ValueError as exc:
+            raise InstallerError(f"Invalid TOML table in {path}: {exc}") from exc
+    return headings
+
+
+def _codex_target_span(source: str, headings: list[TomlHeading], index: int) -> tuple[int, int]:
+    """The byte span of the server table and every subtable beneath it."""
+
+    target = ["mcp_servers", SERVER_NAME]
+    start = headings[index][0].start()
+    end = len(source)
+    for match, components, _ in headings[index + 1 :]:
+        if components[: len(target)] != target:
+            end = match.start()
+            break
+    return start, end
+
+
+def _codex_target_index(headings: list[TomlHeading]) -> int | None:
+    target = ["mcp_servers", SERVER_NAME]
+    return next(
+        (
+            index
+            for index, (_, components, is_array) in enumerate(headings)
+            if components == target and not is_array
+        ),
+        None,
+    )
+
+
+def remove_codex_server(path: Path) -> bool:
+    """Remove the Code Indexing MCP table from a Codex config. False if absent."""
+
+    original = _read_configuration(path)
+    if original is None or not original.strip():
+        return False
+    try:
+        tomllib.loads(original)
+    except tomllib.TOMLDecodeError as exc:
+        raise InstallerError(f"Invalid TOML configuration in {path}: {exc}") from exc
+    headings = _codex_headings(original, path)
+    index = _codex_target_index(headings)
+    if index is None:
+        return False
+    start, end = _codex_target_span(original, headings, index)
+    # Comments trailing the table were not written by the installer, so they stay.
+    trailing_trivia = _trailing_toml_trivia(original[start:end])
+    prefix = original[:start]
+    # The merge separated the table from what came before it with a blank line.
+    # Collapsing the run back to one newline is what puts the file where it was.
+    stripped = prefix.rstrip("\n")
+    prefix = f"{stripped}\n" if stripped else ""
+    updated = prefix + trailing_trivia + original[end:]
+    try:
+        tomllib.loads(updated)
+    except tomllib.TOMLDecodeError as exc:
+        raise InstallerError(
+            f"Refusing to write invalid TOML configuration to {path}: {exc}"
+        ) from exc
+    return _write_changed_configuration(path, original, updated)
+
+
 def merge_codex_server(path: Path, command: Path, *, env: Mapping[str, str] | None = None) -> bool:
     """Create or replace only the Code Indexing MCP table in a Codex config."""
 
@@ -401,24 +569,8 @@ def merge_codex_server(path: Path, command: Path, *, env: Mapping[str, str] | No
         except tomllib.TOMLDecodeError as exc:
             raise InstallerError(f"Invalid TOML configuration in {path}: {exc}") from exc
 
-    headings: list[tuple[re.Match[str], list[str], bool]] = []
-    for match in _TOML_TABLE.finditer(source):
-        try:
-            array_name = match.group("array_name")
-            name = array_name or match.group("table_name")
-            headings.append((match, _split_toml_dotted_key(name), array_name is not None))
-        except ValueError as exc:
-            raise InstallerError(f"Invalid TOML table in {path}: {exc}") from exc
-
-    target = ["mcp_servers", SERVER_NAME]
-    target_index = next(
-        (
-            index
-            for index, (_, components, is_array) in enumerate(headings)
-            if components == target and not is_array
-        ),
-        None,
-    )
+    headings = _codex_headings(source, path)
+    target_index = _codex_target_index(headings)
     block = _codex_server_block(command, env)
     if target_index is None:
         mcp_servers = parsed.get("mcp_servers")
@@ -430,12 +582,7 @@ def merge_codex_server(path: Path, command: Path, *, env: Mapping[str, str] | No
         prefix = f"{source.rstrip()}\n\n" if source.strip() else ""
         updated = prefix + block
     else:
-        start = headings[target_index][0].start()
-        end = len(source)
-        for match, components, _ in headings[target_index + 1 :]:
-            if components[: len(target)] != target:
-                end = match.start()
-                break
+        start, end = _codex_target_span(source, headings, target_index)
         trailing_trivia = _trailing_toml_trivia(source[start:end])
         updated = source[:start] + block + trailing_trivia + source[end:]
 

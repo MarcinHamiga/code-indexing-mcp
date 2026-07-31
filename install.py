@@ -213,6 +213,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="remove a managed CODE_INDEXING_* value from harness configs; repeatable",
     )
+    parser.add_argument(
+        "--bin-dir",
+        default=os.environ.get("CODE_INDEXING_MCP_BIN_DIR"),
+        help=(
+            "directory for the code-indexing-mcp launcher, so the command works from any "
+            "shell (default: $XDG_BIN_HOME or ~/.local/bin)"
+        ),
+    )
+    parser.add_argument(
+        "--no-launcher",
+        action="store_true",
+        help="do not create the code-indexing-mcp launcher",
+    )
+    parser.add_argument(
+        "--no-modify-path",
+        action="store_true",
+        help="never edit a shell profile to put the launcher directory on PATH",
+    )
     parser.add_argument("--tui", action="store_true", help="force the interactive wizard")
     parser.add_argument("--no-tui", action="store_true", help="force the plain text interface")
     parser.add_argument(
@@ -273,6 +291,12 @@ def main(argv: list[str] | None = None) -> int:
         tail += ["--set", pair]
     for name in arguments.unsets:
         tail += ["--unset", name]
+    if arguments.bin_dir:
+        tail += ["--bin-dir", arguments.bin_dir]
+    if arguments.no_launcher:
+        tail.append("--no-launcher")
+    if arguments.no_modify_path:
+        tail.append("--no-modify-path")
     if arguments.offline:
         tail.append("--offline")
     if arguments.no_prompt:

@@ -92,7 +92,50 @@ def _parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="remove a managed CODE_INDEXING_* value from harness configs; repeatable",
     )
+    configure.add_argument(
+        "--bin-dir",
+        help="directory for the code-indexing-mcp launcher (default: ~/.local/bin)",
+    )
+    configure.add_argument(
+        "--no-launcher",
+        action="store_true",
+        help="do not create or refresh the code-indexing-mcp launcher",
+    )
+    configure.add_argument(
+        "--no-modify-path",
+        action="store_true",
+        help="never edit a shell profile to put the launcher directory on PATH",
+    )
     configure.add_argument("--no-tui", action="store_true", help="apply without opening the wizard")
+    configure.add_argument(
+        "--repair",
+        action="store_true",
+        help="re-apply the launcher, client entries, and skills without changing any choice",
+    )
+    uninstall = commands.add_parser(
+        "uninstall", help="Remove this installation's client entries, skills, and launcher"
+    )
+    uninstall.add_argument("--install-dir", help="checkout location of the installation")
+    uninstall.add_argument(
+        "--harnesses",
+        help="comma-separated harness slugs or 'all'; omit to clear every configured one",
+    )
+    uninstall.add_argument("--bin-dir", help="directory holding the code-indexing-mcp launcher")
+    uninstall.add_argument("--keep-launcher", action="store_true", help="leave the launcher alone")
+    uninstall.add_argument(
+        "--keep-path", action="store_true", help="leave the shell profile PATH block alone"
+    )
+    uninstall.add_argument(
+        "--purge",
+        action="store_true",
+        help="also delete the index and cache directories (not recoverable)",
+    )
+    uninstall.add_argument(
+        "--remove-checkout",
+        action="store_true",
+        help="also delete the installation checkout and its virtual environments",
+    )
+    uninstall.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     return parser
 
 
@@ -156,6 +199,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 settings=args.settings,
                 unsets=args.unsets,
                 no_tui=args.no_tui,
+                bin_dir=args.bin_dir,
+                no_launcher=args.no_launcher,
+                no_modify_path=args.no_modify_path,
+                repair=args.repair,
+            )
+        if args.command == "uninstall":
+            # Lazy for the same reason as configure: never on the serve path.
+            from .installer.uninstall import uninstall_main
+
+            return uninstall_main(
+                install_dir=args.install_dir,
+                harnesses_selection=args.harnesses,
+                bin_dir=args.bin_dir,
+                keep_launcher=args.keep_launcher,
+                keep_path=args.keep_path,
+                purge=args.purge,
+                remove_checkout=args.remove_checkout,
+                assume_yes=args.yes,
+                error_output=lambda line: print(line, file=sys.stderr),
             )
         settings = IndexSettings.from_environment()
         if args.command == "serve":

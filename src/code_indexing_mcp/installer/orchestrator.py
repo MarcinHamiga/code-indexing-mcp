@@ -7,8 +7,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import accelerator, harnesses
+from . import accelerator, harnesses, shell_path, verify
 from .config_files import InstallerError
+from .shell_path import LauncherResult
 
 
 def default_install_directory() -> Path:
@@ -27,11 +28,16 @@ class InstallPlan:
     harness_slugs: tuple[str, ...] = ()
     env_updates: Mapping[str, str | None] = field(default_factory=dict)
     offline: bool = False
+    # None resolves to the default bin directory at run time, so a plan built
+    # before the environment was inspected still lands in the right place.
+    bin_directory: Path | None = None
+    install_launcher: bool = True
+    modify_shell_profiles: bool = True
 
 
 @dataclass(frozen=True)
 class StepEvent:
-    step: str  # "accelerator" | "harnesses" | "skills"
+    step: str  # "accelerator" | "path" | "harnesses" | "skills"
     status: str  # "started" | "finished" | "warning" | "failed" | "skipped"
     detail: str = ""
 
@@ -42,6 +48,13 @@ class InstallResult:
     configured: tuple[tuple[str, Path], ...]
     failures: tuple[tuple[str, str], ...]
     skills: tuple[tuple[str, str], ...]
+    launcher: LauncherResult | None = None
+    profiles_updated: tuple[Path, ...] = ()
+    checks: tuple[verify.Check, ...] = ()
+
+    @property
+    def warnings(self) -> tuple[verify.Check, ...]:
+        return tuple(check for check in self.checks if not check.ok)
 
 
 def run_install(
@@ -66,6 +79,13 @@ def run_install(
         status = "finished" if accelerator_plan.honored else "warning"
         detail = f"{accelerator_plan.accelerator} ({accelerator_plan.reason})"
         on_event(StepEvent("accelerator", status, detail))
+
+    launcher: LauncherResult | None = None
+    profiles_updated: tuple[Path, ...] = ()
+    if not plan.install_launcher:
+        on_event(StepEvent("path", "skipped", "launcher not requested"))
+    elif should_continue():
+        launcher, profiles_updated = _install_launcher(plan, on_event)
 
     configured: list[tuple[str, Path]] = []
     failures: list[tuple[str, str]] = []
@@ -95,4 +115,74 @@ def run_install(
         skills = harnesses.install_skills(list(plan.harness_slugs), plan.install_directory)
         for slug, message in skills:
             on_event(StepEvent("skills", "finished", f"{slug}: {message}"))
-    return InstallResult(accelerator_plan, tuple(configured), tuple(failures), tuple(skills))
+
+    checks: tuple[verify.Check, ...] = ()
+    if should_continue():
+        on_event(StepEvent("verify", "started"))
+        checks = verify.run_checks(
+            plan.install_directory,
+            tuple(configured),
+            launcher=launcher,
+            profiles_updated=profiles_updated,
+            accelerator_was_prepared=plan.accelerator is not None,
+        )
+        for check in checks:
+            # A check never fails the install: everything above it already
+            # happened, and a warning is the honest way to say "and yet".
+            on_event(
+                StepEvent(
+                    "verify",
+                    "finished" if check.ok else "warning",
+                    f"{check.name}: {check.detail}",
+                )
+            )
+    return InstallResult(
+        accelerator_plan,
+        tuple(configured),
+        tuple(failures),
+        tuple(skills),
+        launcher=launcher,
+        profiles_updated=profiles_updated,
+        checks=checks,
+    )
+
+
+def _install_launcher(
+    plan: InstallPlan,
+    on_event: Callable[[StepEvent], None],
+) -> tuple[LauncherResult, tuple[Path, ...]]:
+    """Create the launcher and, if asked, put its directory on PATH.
+
+    Nothing here raises. A missing launcher costs the user a convenience; a
+    raise would cost them the harness configuration that comes after it.
+    """
+
+    bin_directory = plan.bin_directory or shell_path.default_bin_directory()
+    on_event(StepEvent("path", "started", str(bin_directory)))
+    launcher = shell_path.install_launcher(plan.install_directory, bin_directory)
+    on_event(
+        StepEvent(
+            "path",
+            "finished" if launcher.ok else "warning",
+            f"{launcher.path}: {launcher.status} ({launcher.detail})",
+        )
+    )
+    if not plan.modify_shell_profiles:
+        return launcher, ()
+    if shell_path.is_on_path(bin_directory):
+        on_event(StepEvent("path", "skipped", f"{bin_directory} is already on PATH"))
+        return launcher, ()
+    profiles = shell_path.shell_profiles()
+    if not profiles:
+        on_event(
+            StepEvent("path", "warning", f"add {bin_directory} to PATH yourself on this platform")
+        )
+        return launcher, ()
+    written, profile_failures = shell_path.update_profiles(bin_directory, profiles)
+    for profile in written:
+        on_event(StepEvent("path", "finished", f"added {bin_directory} to PATH in {profile}"))
+    for profile, message in profile_failures:
+        on_event(StepEvent("path", "warning", f"{profile}: {message}"))
+    if not written and not profile_failures:
+        on_event(StepEvent("path", "skipped", "the shell profiles already set PATH"))
+    return launcher, tuple(written)
