@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.widgets import Checkbox, Input, Label, Select, Static
 
-from ..settings_spec import Setting
+from ..settings_spec import SETTINGS, Setting, default_value, validate
 from ..wizard import WizardState
 
 
 class SettingField(Vertical):
-    """One labelled input for a catalog setting."""
+    """One labelled input for a catalog setting, generated from its spec."""
 
     def __init__(self, setting: Setting, value: str = "") -> None:
         super().__init__(classes="field")
@@ -18,7 +19,47 @@ class SettingField(Vertical):
         self.initial = value
 
     def compose(self) -> ComposeResult:
-        yield from ()
+        widget_id = f"f-{self.setting.name}"
+        if self.setting.type == "bool":
+            yield Checkbox(
+                self.setting.label,
+                value=(self.initial or self.setting.default) == "1",
+                id=widget_id,
+            )
+        elif self.setting.type == "choice":
+            options = [(choice, choice) for choice in self.setting.choices]
+            yield Select(
+                options,
+                value=self.initial or self.setting.default,
+                id=widget_id,
+                allow_blank=False,
+            )
+        else:
+            yield Label(self.setting.label)
+            yield Input(
+                value=self.initial,
+                placeholder=default_value(self.setting),
+                id=widget_id,
+            )
+        yield Static(self.setting.help, classes="help")
+
+    def value(self) -> str:
+        widget = self.query_one(f"#f-{self.setting.name}")
+        if isinstance(widget, Checkbox):
+            return "1" if widget.value else "0"
+        if isinstance(widget, Select):
+            return str(widget.value)
+        if isinstance(widget, Input):
+            return widget.value.strip() or default_value(self.setting)
+        raise AssertionError(f"unexpected widget for {self.setting.name}")
+
+    def raw_input(self) -> str:
+        """The typed text for Input fields ("" means 'use the default')."""
+
+        widget = self.query_one(f"#f-{self.setting.name}")
+        if isinstance(widget, Input):
+            return widget.value.strip()
+        return self.value()
 
 
 class SettingsPanel(Vertical):
@@ -30,7 +71,25 @@ class SettingsPanel(Vertical):
         self.group = group
 
     def compose(self) -> ComposeResult:
-        yield from ()
+        yield Label(f"{self.group} settings")
+        yield Static(
+            "Fields left empty keep their default and are not written to any config.",
+            classes="help",
+        )
+        for setting in SETTINGS:
+            if setting.group == self.group:
+                yield SettingField(setting, self.state.field_value(setting.name))
+        yield Label("", id=f"{self.group.lower()}-error", classes="error")
 
     def commit(self) -> bool:
+        error_label = self.query_one(f"#{self.group.lower()}-error", Label)
+        for field in self.query(SettingField):
+            raw = field.raw_input()
+            if raw:  # empty means default; defaults are valid by construction
+                error = validate(field.setting, raw)
+                if error is not None:
+                    error_label.update(error)
+                    return False
+            self.state.set_field(field.setting.name, raw)
+        error_label.update("")
         return True

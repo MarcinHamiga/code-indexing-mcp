@@ -137,3 +137,55 @@ async def test_harnesses_panel_commits_checked_slugs(tmp_path: Path) -> None:
         app.query_one("#harness-codex", Checkbox).toggle()
         await click(pilot, "#next")
         assert state.harness_slugs == ["codex", "kimi-code"]
+
+
+@pytest.mark.asyncio
+async def test_settings_panels_validate_and_commit(tmp_path: Path) -> None:
+    from textual.widgets import Input
+
+    state = _install_state(tmp_path)
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        for _ in range(4):
+            await click(pilot, "#next")
+        assert app.current == "indexing"
+        field = app.query_one("#f-INCODE_INDEX_WAIT_SECONDS", Input)
+        field.value = "99999999"
+        await click(pilot, "#next")
+        assert app.current == "indexing"  # blocked by validation
+        field.value = "60"
+        await click(pilot, "#next")
+        assert app.current == "embedding"
+        assert state.values["INCODE_INDEX_WAIT_SECONDS"] == "60"
+
+
+@pytest.mark.asyncio
+async def test_summary_lists_updates_and_target_files(tmp_path: Path) -> None:
+    from textual.widgets import Static
+
+    state = _install_state(tmp_path)
+    state.values["INCODE_OFFLINE"] = "1"
+    state.harness_slugs = ["kimi-code"]
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        for _ in range(6):
+            await click(pilot, "#next")
+        assert app.current == "summary"
+        text = str(app.query_one("#summary-body", Static).render())
+        assert "INCODE_OFFLINE" in text
+        assert "mcp.json" in text
+        assert "auto" in text  # accelerator choice
+
+
+@pytest.mark.asyncio
+async def test_summary_warns_about_accelerator_disk_cost(tmp_path: Path) -> None:
+    from textual.widgets import Static
+
+    state = _install_state(tmp_path)
+    state.accelerator = "mlx"
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        for _ in range(6):
+            await click(pilot, "#next")
+        text = str(app.query_one("#summary-body", Static).render())
+        assert "gigabytes" in text

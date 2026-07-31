@@ -184,6 +184,41 @@ class SummaryPanel(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Label("Summary")
+        yield Static("", id="summary-body")
+        yield Static("Confirm to run the installation.", classes="help")
+
+    def on_became_visible(self) -> None:
+        lines = [f"Install directory: {self.state.install_directory}"]
+        if self.state.accelerator is None:
+            prepared = self.state.prepared_accelerator or "none"
+            lines.append(f"Accelerator: keep the prepared backend ({prepared})")
+        else:
+            lines.append(f"Accelerator: {self.state.accelerator}")
+            if self.state.accelerator in accelerator_module.ACCELERATOR_EXTRAS:
+                lines.append(
+                    "  Building this environment downloads several gigabytes and runs "
+                    "a real inference probe."
+                )
+        lines.append("Harnesses: " + (", ".join(self.state.harness_slugs) or "none"))
+        updates = self.state.env_updates()
+        if updates:
+            lines.append("Settings:")
+            for name, value in sorted(updates.items()):
+                lines.append(f"  {name} = {value if value is not None else '(removed)'}")
+        else:
+            lines.append("Settings: all defaults (nothing written to env blocks)")
+        if self.state.harness_slugs:
+            lines.append("Files that will be written:")
+            for slug in self.state.harness_slugs:
+                lines.append(f"  {harnesses.configuration_path(slug)}")
+            if self.state.accelerator is not None:
+                lines.append("  the accelerator record in the server's data directory")
+        if self.state.disagreements:
+            lines.append(
+                "Harnesses that disagreed (" + ", ".join(self.state.disagreements) + ") "
+                "will be unified on the values above."
+            )
+        self.query_one("#summary-body", Static).update("\n".join(lines))
 
 
 class ProgressPanel(Vertical):
