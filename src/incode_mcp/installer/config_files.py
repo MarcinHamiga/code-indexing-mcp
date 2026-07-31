@@ -8,6 +8,7 @@ import re
 import shutil
 import tempfile
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -362,9 +363,19 @@ def _split_toml_dotted_key(value: str) -> list[str]:
     raise ValueError("empty table component")
 
 
-def _codex_server_block(command: Path) -> str:
+def _codex_server_block(command: Path, env: Mapping[str, str] | None = None) -> str:
     encoded_command = json.dumps(str(command), ensure_ascii=False)
-    return f'[mcp_servers.{SERVER_NAME}]\ncommand = {encoded_command}\nargs = ["serve"]\n'
+    lines = [
+        f"[mcp_servers.{SERVER_NAME}]",
+        f"command = {encoded_command}",
+        'args = ["serve"]',
+    ]
+    if env:
+        pairs = ", ".join(
+            f"{key} = {json.dumps(value, ensure_ascii=False)}" for key, value in sorted(env.items())
+        )
+        lines.append(f"env = {{ {pairs} }}")
+    return "\n".join(lines) + "\n"
 
 
 def _trailing_toml_trivia(text: str) -> str:
@@ -376,7 +387,7 @@ def _trailing_toml_trivia(text: str) -> str:
     return text
 
 
-def merge_codex_server(path: Path, command: Path) -> bool:
+def merge_codex_server(path: Path, command: Path, *, env: Mapping[str, str] | None = None) -> bool:
     """Create or replace only the Code Indexing MCP table in a Codex config."""
 
     original = _read_configuration(path)
@@ -406,7 +417,7 @@ def merge_codex_server(path: Path, command: Path) -> bool:
         ),
         None,
     )
-    block = _codex_server_block(command)
+    block = _codex_server_block(command, env)
     if target_index is None:
         mcp_servers = parsed.get("mcp_servers")
         if isinstance(mcp_servers, dict) and SERVER_NAME in mcp_servers:

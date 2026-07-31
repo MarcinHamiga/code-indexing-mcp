@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from .config_files import SERVER_NAME, InstallerError, merge_codex_server, merge_json_object_entry
+from .env_blocks import entry_from_text, env_from_entry, merge_env
 
 
 class HarnessChoice(NamedTuple):
@@ -130,15 +131,14 @@ def configuration_path(
     raise InstallerError(f"Unknown harness {slug!r}")
 
 
-def configure_harness(
+def read_server_entry(
     slug: str,
-    command: Path,
     *,
     home: Path | None = None,
     environment: Mapping[str, str] | None = None,
     platform_name: str | None = None,
-) -> Path:
-    """Merge the Code Indexing MCP entry into one user-wide harness config."""
+) -> dict[str, Any] | None:
+    """Return the current server entry in a harness config, or None."""
 
     path = configuration_path(
         slug,
@@ -146,8 +146,46 @@ def configure_harness(
         environment=environment,
         platform_name=platform_name,
     )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return entry_from_text(slug, text)
+
+
+def configure_harness(
+    slug: str,
+    command: Path,
+    *,
+    env: Mapping[str, str | None] | None = None,
+    home: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    platform_name: str | None = None,
+) -> Path:
+    """Merge the Code Indexing MCP entry into one user-wide harness config.
+
+    ``env`` maps managed setting names to values, or to None to delete a key;
+    unrelated keys already in the entry's env block are preserved. When ``env``
+    is None the legacy entries are written exactly as before.
+    """
+
+    path = configuration_path(
+        slug,
+        home=home,
+        environment=environment,
+        platform_name=platform_name,
+    )
+    merged_env: dict[str, str] = {}
+    if env is not None:
+        existing = read_server_entry(
+            slug,
+            home=home,
+            environment=environment,
+            platform_name=platform_name,
+        )
+        merged_env = merge_env(env_from_entry(slug, existing) if existing else {}, env)
     if slug == "codex":
-        merge_codex_server(path, command)
+        merge_codex_server(path, command, env=merged_env if env is not None else None)
         return path
 
     if slug == "claude-code":
@@ -156,11 +194,13 @@ def configure_harness(
             "type": "stdio",
             "command": str(command),
             "args": ["serve"],
-            "env": {},
+            "env": merged_env if env is not None else {},
         }
     elif slug in {"kimi-code", "claude-desktop"}:
         object_key = "mcpServers"
         entry = {"command": str(command), "args": ["serve"]}
+        if merged_env:
+            entry["env"] = merged_env
     elif slug in {"opencode", "kilocode"}:
         object_key = "mcp"
         entry = {
@@ -168,16 +208,20 @@ def configure_harness(
             "command": [str(command), "serve"],
             "enabled": True,
         }
+        if merged_env:
+            entry["environment"] = merged_env
     else:
         raise InstallerError(f"Unknown harness {slug!r}")
 
     merge_json_object_entry(path, object_key, SERVER_NAME, entry)
     return path
 
+
 def configure_selected_harnesses(
     slugs: list[str],
     command: Path,
     *,
+    env: Mapping[str, str | None] | None = None,
     home: Path | None = None,
     environment: Mapping[str, str] | None = None,
     platform_name: str | None = None,
@@ -191,6 +235,7 @@ def configure_selected_harnesses(
             path = configure_harness(
                 slug,
                 command,
+                env=env,
                 home=home,
                 environment=environment,
                 platform_name=platform_name,
