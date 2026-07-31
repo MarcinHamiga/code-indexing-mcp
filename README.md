@@ -42,17 +42,20 @@ The supported clients are Codex (CLI + Desktop, one shared configuration), Claud
 Kimi Code, Claude Desktop, OpenCode, and KiloCode. Configuration changes are limited to the
 `code-indexing-mcp` entry; an existing configuration is backed up alongside the original
 with a `.bak` suffix before it changes, and unrelated keys in the entry's env block are
-preserved.
+preserved. For Codex the whole `[mcp_servers.code-indexing-mcp]` table is rewritten, so any
+other key you added inside that one table is replaced rather than merged.
 
 Re-run the same command later to update an existing clean checkout with a fast-forward-only
 pull and refresh its environment. To change settings or harnesses without updating, run
 `code-indexing-mcp configure` — it opens the same wizard offline, prefilled from your
-current configuration. Scripted changes work too:
+current configuration. Naming what to change applies it directly instead:
 `code-indexing-mcp configure --set INCODE_BROKER=off --unset INCODE_INDEX_MODE`.
 
 On a terminal that cannot host the wizard (or with `--no-tui`), the installer falls back to
-a plain text interface with the numbered harness menu. For a fully noninteractive
-installation, pass harness slugs and any settings:
+a plain text interface with the numbered harness menu. Flags that already say what to
+install — `--harnesses`, `--set`, `--unset`, `--no-prompt` — skip the wizard too, so a
+scripted run never waits for a keypress; pass `--tui` to open it over them anyway. For a
+fully noninteractive installation, pass harness slugs and any settings:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MarcinHamiga/code-indexing-mcp/main/install.sh |
