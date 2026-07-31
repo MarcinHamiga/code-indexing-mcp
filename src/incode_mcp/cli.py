@@ -65,6 +65,34 @@ def _parser() -> argparse.ArgumentParser:
     daemon_commands.add_parser("status")
     daemon_commands.add_parser("stop")
     daemon_commands.add_parser("restart")
+    configure = commands.add_parser(
+        "configure", help="Reconfigure this installation (wizard, or scripted with --set)"
+    )
+    configure.add_argument("--install-dir", help="checkout location of the installation")
+    configure.add_argument(
+        "--accelerator",
+        choices=["auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml"],
+        default=None,
+        help="prepare a different accelerator; omit to keep the prepared backend",
+    )
+    configure.add_argument("--harnesses", help="comma-separated harness slugs or 'all'")
+    configure.add_argument(
+        "--set",
+        dest="settings",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="set a managed INCODE_* value; repeatable",
+    )
+    configure.add_argument(
+        "--unset",
+        dest="unsets",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="remove a managed INCODE_* value from harness configs; repeatable",
+    )
+    configure.add_argument("--no-tui", action="store_true", help="apply without opening the wizard")
     return parser
 
 
@@ -116,6 +144,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(_json(benchmark_result))
             return 0
+        if args.command == "configure":
+            # Lazy import: the installer package is never on the serve path, and
+            # Textual is only imported when the wizard actually opens.
+            from .installer.cli import configure_main
+
+            return configure_main(
+                install_dir=args.install_dir,
+                accelerator=args.accelerator,
+                harnesses=args.harnesses,
+                settings=args.settings,
+                unsets=args.unsets,
+                no_tui=args.no_tui,
+            )
         settings = IndexSettings.from_environment()
         if args.command == "serve":
             use_daemon = not args.direct and settings.broker_mode != "off"

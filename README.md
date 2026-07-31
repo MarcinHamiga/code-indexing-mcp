@@ -31,25 +31,40 @@ py -3 $installer
 ```
 
 The installer clones the repository to `~/.local/share/code-indexing-mcp`, creates its locked
-virtual environment, and displays this multi-select menu:
+virtual environment, and opens an interactive wizard. The wizard walks through accelerator
+selection (with live hardware detection), the MCP clients to configure, and the server's
+settings — indexing, embedding, memory, storage, and offline behavior — before a summary
+screen runs everything. Settings you change are written into each client's MCP configuration
+(an `env` block, or `environment` for OpenCode and KiloCode); anything you leave at its
+default is not written anywhere.
 
-1. Codex (CLI + Desktop)
-2. Claude Code
-3. Kimi Code
-4. Claude Desktop
-5. OpenCode
-6. KiloCode
+The supported clients are Codex (CLI + Desktop, one shared configuration), Claude Code,
+Kimi Code, Claude Desktop, OpenCode, and KiloCode. Configuration changes are limited to the
+`code-indexing-mcp` entry; an existing configuration is backed up alongside the original
+with a `.bak` suffix before it changes, and unrelated keys in the entry's env block are
+preserved. For Codex the whole `[mcp_servers.code-indexing-mcp]` table is rewritten, so any
+other key you added inside that one table is replaced rather than merged.
 
-Codex CLI and Codex Desktop share one configuration and therefore use one menu choice.
-Configuration changes are limited to the `code-indexing-mcp` entry. An existing configuration is
-backed up alongside the original with a `.bak` suffix before it changes.
+Re-run the same command later to update an existing clean checkout with a fast-forward-only
+pull and refresh its environment. To change settings or harnesses without updating, run
+`code-indexing-mcp configure` — it opens the same wizard offline, prefilled from your
+current configuration. Naming what to change applies it directly instead:
+`code-indexing-mcp configure --set INCODE_BROKER=off --unset INCODE_INDEX_MODE`.
 
-Run the same command later to update an existing clean checkout with a fast-forward-only pull and
-refresh its environment. The installer refuses to overwrite a different repository or a checkout
-with local changes.
+On a terminal that cannot host the wizard (or with `--no-tui`), the installer falls back to
+a plain text interface with the numbered harness menu. Flags that already say what to
+install — `--harnesses`, `--set`, `--unset`, `--no-prompt` — skip the wizard too, so a
+scripted run never waits for a keypress; pass `--tui` to open it over them anyway. For a
+fully noninteractive installation, pass harness slugs and any settings:
 
-By default it also detects whether this machine can be given an automatic GPU accelerator for
-indexing and prepares one when it can. Experimental backends must be named explicitly:
+```bash
+curl -fsSL https://raw.githubusercontent.com/MarcinHamiga/code-indexing-mcp/main/install.sh |
+  sh -s -- --harnesses codex,claude-code,opencode --set INCODE_INDEX_MODE=eager
+```
+
+By default the installer detects whether this machine can be given an automatic GPU
+accelerator for indexing and prepares one when it can. Experimental backends must be named
+explicitly:
 
 ```bash
 python3 install.py --accelerator auto      # CPU, a supported CUDA installation, or Metal via MLX
@@ -58,23 +73,16 @@ python3 install.py --accelerator webgpu   # experimental Metal, Vulkan, or D3D12
 python3 install.py --accelerator migraphx # experimental pinned AMD/ROCm path
 ```
 
-Detection that finds nothing, an environment that cannot be built, and a probe that does not pass
-all leave the installation on CPU and report why. Nothing here changes system drivers, and no
-package is ever installed while the server is running. See
+Detection that finds nothing, an environment that cannot be built, and a probe that does not
+pass all leave the installation on CPU and report why. Nothing here changes system drivers,
+and no package is ever installed while the server is running. See
 [Embedding backends](#embedding-backends).
 
-Preparing an accelerator downloads the embedding model, because the probe that confirms it embeds
-a real passage on the device. A later run reuses an environment whose accelerator, driver, Python,
-and runtime-lock fingerprint all still match its record, so only the first install — and one that
-finds something moved — pays for the build and the probe. Reinstalling as `--accelerator cpu`
-removes the environment again.
-
-For a noninteractive installation, pass comma-separated harness slugs or `all`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MarcinHamiga/code-indexing-mcp/main/install.sh |
-  sh -s -- --harnesses codex,claude-code,opencode
-```
+Preparing an accelerator downloads the embedding model, because the probe that confirms it
+embeds a real passage on the device. A later run reuses an environment whose accelerator,
+driver, Python, and runtime-lock fingerprint all still match its record, so only the first
+install — and one that finds something moved — pays for the build and the probe.
+Reinstalling as `--accelerator cpu` removes the environment again.
 
 Use `--install-dir /custom/path` or `CODE_INDEXING_MCP_INSTALL_DIR` to change the checkout
 location. Run `python3 install.py --help` for all installer options.
@@ -99,7 +107,8 @@ uv run code-indexing-mcp model pull
 
 `--extra cpu` is required: the embedding runtime is an extra rather than a plain dependency,
 because the CPU, CUDA, WebGPU, and MIGraphX runtimes conflict and cannot share one environment. See
-[Embedding backends](#embedding-backends).
+[Embedding backends](#embedding-backends). Add `--extra tui` as well if you want the
+`code-indexing-mcp configure` wizard; without it, scripted `configure --set` still works.
 
 The model preparation step is optional; the first index operation downloads the model when it
 is not already cached.

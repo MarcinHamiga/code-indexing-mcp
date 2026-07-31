@@ -76,6 +76,10 @@ migraphx = [
     "onnxruntime-migraphx @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "tokenizers>=0.22,<1; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
 ]
+# The interactive installer's only dependency. It is not part of the conflicts
+# list: it combines with the serving environment's cpu extra and is lazily
+# imported, so the serve path never pays for it.
+tui = ["textual>=8.2,<9"]
 
 [project.scripts]
 code-indexing-mcp = "incode_mcp.cli:main"

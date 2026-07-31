@@ -24,7 +24,10 @@ jobs:
           python-version: ${{ matrix.python }}
           enable-cache: true
       - id: sync
-        run: uv sync --all-groups --extra cpu --locked
+        # The tui extra is what the installer wizard is written against, so the
+        # checks need it too: without it the wizard's tests cannot import and
+        # mypy cannot see the widgets they subclass.
+        run: uv sync --all-groups --extra cpu --extra tui --locked
       - name: Test
         run: uv run pytest
       # Lint and type checks are independent of the tests, so a failing test
@@ -56,7 +59,7 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - run: uv sync --all-groups --extra cpu --locked
+      - run: uv sync --all-groups --extra cpu --extra tui --locked
       - name: Restore the embedding model cache
         uses: actions/cache@v4
         with:
