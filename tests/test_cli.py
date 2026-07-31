@@ -138,3 +138,39 @@ def test_model_status_explains_an_accelerator_it_cannot_honour(
     # than claiming the CUDA it cannot deliver.
     assert status["resolved_accelerator"] == "cpu"
     assert "CUDAExecutionProvider" in status["fallback_reason"]
+
+
+def test_configure_delegates_to_the_installer(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    calls = []
+
+    def fake_configure_main(**kwargs):  # type: ignore[no-untyped-def]
+        calls.append(kwargs)
+        return 0
+
+    import incode_mcp.installer.cli as installer_cli
+
+    monkeypatch.setattr(installer_cli, "configure_main", fake_configure_main)
+    code = main(["configure", "--install-dir", "/opt/ci-mcp", "--set", "INCODE_OFFLINE=1"])
+    assert code == 0
+    assert calls == [
+        {
+            "install_dir": "/opt/ci-mcp",
+            "accelerator": None,
+            "harnesses": None,
+            "settings": ["INCODE_OFFLINE=1"],
+            "unsets": [],
+            "no_tui": False,
+        }
+    ]
+
+
+def test_serve_path_does_not_import_textual() -> None:
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import incode_mcp.cli, sys; print('textual' in sys.modules)"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "False"
