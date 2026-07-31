@@ -8,8 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import accelerator, harnesses
-
-DEFAULT_REPOSITORY_URL = "https://github.com/MarcinHamiga/code-indexing-mcp.git"
+from .config_files import InstallerError
 
 
 def default_install_directory() -> Path:
@@ -73,6 +72,14 @@ def run_install(
     skills: list[tuple[str, str]] = []
     if should_continue():
         command = accelerator.server_executable(plan.install_directory)
+        if plan.harness_slugs and not command.is_file():
+            # This path is what every configured client will try to launch. A
+            # directory without a prepared environment would leave each of them
+            # pointing at nothing, which fails silently at the client end.
+            raise InstallerError(
+                f"No prepared installation at {plan.install_directory}: "
+                f"expected the server executable at {command}"
+            )
         on_event(
             StepEvent("harnesses", "started", ", ".join(plan.harness_slugs) or "none selected")
         )

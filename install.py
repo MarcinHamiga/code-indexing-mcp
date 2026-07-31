@@ -223,7 +223,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--offline",
         action="store_true",
-        default=os.environ.get("INCODE_OFFLINE", "").lower() in {"1", "true", "yes"},
+        default=os.environ.get("INCODE_OFFLINE", "").strip().lower() in {"1", "true", "yes", "on"},
         help="never download the embedding model",
     )
     return parser
@@ -276,7 +276,16 @@ def main(argv: list[str] | None = None) -> int:
         tail.append("--offline")
     if arguments.no_prompt:
         tail.append("--no-prompt")
-    use_tui = arguments.tui or (not arguments.no_tui and tui_available())
+    # Flags that already say what to install are an instruction to install it.
+    # Opening the wizard over them would make a scripted run wait for a keypress
+    # on any real terminal; --tui still asks for it explicitly.
+    scripted = bool(
+        arguments.harnesses is not None
+        or arguments.settings
+        or arguments.unsets
+        or arguments.no_prompt
+    )
+    use_tui = arguments.tui or (not arguments.no_tui and not scripted and tui_available())
     if use_tui:
         tail.append("--tui")
 

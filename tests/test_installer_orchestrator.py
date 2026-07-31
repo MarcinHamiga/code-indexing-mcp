@@ -5,12 +5,21 @@ from pathlib import Path
 import pytest
 
 from incode_mcp.installer import accelerator, harnesses
+from incode_mcp.installer.config_files import InstallerError
 from incode_mcp.installer.orchestrator import (
     InstallPlan,
     StepEvent,
     default_install_directory,
     run_install,
 )
+
+
+def _server(tmp_path: Path) -> Path:
+    """A stand-in for the built server command, which run_install requires to exist."""
+
+    command = tmp_path / "server"
+    command.touch()
+    return command
 
 
 def _plan(**overrides: object) -> InstallPlan:
@@ -31,10 +40,12 @@ def test_run_install_emits_step_events_in_order(
     monkeypatch.setattr(
         accelerator,
         "configure_accelerator",
-        lambda directory, requested, *, offline=False: calls.append(("accel", requested))
-        or accelerator.AcceleratorPlan("cpu", "CPU was requested"),
+        lambda directory, requested, *, offline=False: (
+            calls.append(("accel", requested))
+            or accelerator.AcceleratorPlan("cpu", "CPU was requested")
+        ),
     )
-    monkeypatch.setattr(accelerator, "server_executable", lambda directory: tmp_path / "server")
+    monkeypatch.setattr(accelerator, "server_executable", lambda directory: _server(tmp_path))
 
     def fake_configure(slugs, command, *, env=None, **kwargs):
         calls.append(("harnesses", tuple(slugs), dict(env or {})))
@@ -44,8 +55,10 @@ def test_run_install_emits_step_events_in_order(
     monkeypatch.setattr(
         harnesses,
         "install_skills",
-        lambda slugs, directory: calls.append(("skills", tuple(slugs)))
-        or [("kimi-code", "1 linked, 3 already installed")],
+        lambda slugs, directory: (
+            calls.append(("skills", tuple(slugs)))
+            or [("kimi-code", "1 linked, 3 already installed")]
+        ),
     )
     events: list[StepEvent] = []
 
@@ -80,10 +93,8 @@ def test_run_install_reports_unhonored_accelerator_as_warning(
             "cpu", "CUDA was requested but no driver", honored=False
         ),
     )
-    monkeypatch.setattr(accelerator, "server_executable", lambda directory: tmp_path / "server")
-    monkeypatch.setattr(
-        harnesses, "configure_selected_harnesses", lambda *args, **kwargs: ([], [])
-    )
+    monkeypatch.setattr(accelerator, "server_executable", lambda directory: _server(tmp_path))
+    monkeypatch.setattr(harnesses, "configure_selected_harnesses", lambda *args, **kwargs: ([], []))
     monkeypatch.setattr(harnesses, "install_skills", lambda *args: [])
     events: list[StepEvent] = []
 
@@ -102,10 +113,8 @@ def test_run_install_skips_accelerator_when_plan_keeps_backend(
         "configure_accelerator",
         lambda *args, **kwargs: pytest.fail("accelerator step must not run"),
     )
-    monkeypatch.setattr(accelerator, "server_executable", lambda directory: tmp_path / "server")
-    monkeypatch.setattr(
-        harnesses, "configure_selected_harnesses", lambda *args, **kwargs: ([], [])
-    )
+    monkeypatch.setattr(accelerator, "server_executable", lambda directory: _server(tmp_path))
+    monkeypatch.setattr(harnesses, "configure_selected_harnesses", lambda *args, **kwargs: ([], []))
     monkeypatch.setattr(harnesses, "install_skills", lambda *args: [])
     events: list[StepEvent] = []
 
@@ -138,6 +147,40 @@ def test_run_install_stops_between_steps_when_cancelled(
 
     assert result.accelerator_plan is None
     assert result.configured == () and result.skills == ()
+
+
+def test_run_install_refuses_to_configure_from_a_directory_without_an_installation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        accelerator,
+        "configure_accelerator",
+        lambda directory, requested, *, offline=False: accelerator.AcceleratorPlan("cpu", "ok"),
+    )
+    monkeypatch.setattr(
+        harnesses,
+        "configure_selected_harnesses",
+        lambda *args, **kwargs: pytest.fail("must not write a nonexistent command path"),
+    )
+
+    with pytest.raises(InstallerError, match="No prepared installation"):
+        run_install(_plan(install_directory=tmp_path / "missing"))
+
+
+def test_run_install_allows_a_missing_command_when_nothing_is_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        accelerator,
+        "configure_accelerator",
+        lambda directory, requested, *, offline=False: accelerator.AcceleratorPlan("cpu", "ok"),
+    )
+    monkeypatch.setattr(harnesses, "configure_selected_harnesses", lambda *args, **kwargs: ([], []))
+    monkeypatch.setattr(harnesses, "install_skills", lambda *args: [])
+
+    result = run_install(_plan(install_directory=tmp_path / "missing", harness_slugs=()))
+
+    assert result.configured == ()
 
 
 def test_default_install_directory_honours_env_override(

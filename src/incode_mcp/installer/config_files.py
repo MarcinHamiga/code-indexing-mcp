@@ -14,8 +14,10 @@ from typing import Any
 
 SERVER_NAME = "code-indexing-mcp"
 
+
 class InstallerError(RuntimeError):
     """An actionable installer failure."""
+
 
 def _skip_jsonc_trivia(text: str, position: int) -> int:
     while position < len(text):

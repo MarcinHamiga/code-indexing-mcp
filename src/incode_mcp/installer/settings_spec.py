@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import psutil
@@ -223,6 +224,16 @@ def default_value(setting: Setting) -> str:
     return setting.default
 
 
+def as_bool(raw: str) -> bool:
+    """Read a boolean the way ``incode_mcp.settings`` does.
+
+    The wizard prefills from configurations a user may have written by hand, so
+    every spelling the server accepts has to render as the same checkbox state.
+    """
+
+    return raw.strip().lower() in _TRUE
+
+
 def validate(setting: Setting, raw: str) -> str | None:
     """Return an error message, or None when ``raw`` is acceptable."""
     value = raw.strip()
@@ -249,15 +260,11 @@ def validate(setting: Setting, raw: str) -> str | None:
         number = int(value)
     except ValueError:
         return (
-            f"{setting.name} expects {prefix}an integer "
-            f"from {setting.minimum} to {setting.maximum}"
+            f"{setting.name} expects {prefix}an integer from {setting.minimum} to {setting.maximum}"
         )
     if setting.minimum <= number <= setting.maximum:
         return None
-    return (
-        f"{setting.name} expects {prefix}an integer "
-        f"from {setting.minimum} to {setting.maximum}"
-    )
+    return f"{setting.name} expects {prefix}an integer from {setting.minimum} to {setting.maximum}"
 
 
 def normalize(setting: Setting, raw: str) -> str:
@@ -265,6 +272,10 @@ def normalize(setting: Setting, raw: str) -> str:
     value = raw.strip()
     if setting.type == "bool":
         return "1" if value.lower() in _TRUE else "0"
+    if setting.type == "path":
+        # The server reads this straight out of the environment, where no shell
+        # is left to expand a tilde the user typed into a form.
+        return str(Path(value).expanduser()) if value else value
     if setting.type in {"choice", "auto_int", "auto_off_int"} and not value.lstrip("-").isdigit():
         return value.lower()
     return value

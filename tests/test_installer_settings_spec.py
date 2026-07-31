@@ -1,10 +1,13 @@
 """Tests for the installer's declarative settings catalog."""
 
+from pathlib import Path
+
 import pytest
 
 from incode_mcp.installer.settings_spec import (
     BY_NAME,
     SETTINGS,
+    as_bool,
     default_value,
     normalize,
     validate,
@@ -91,6 +94,18 @@ def test_validate_unknown_names_are_rejected_by_lookup() -> None:
 )
 def test_normalize(name: str, raw: str, stored: str) -> None:
     assert normalize(BY_NAME[name], raw) == stored
+
+
+def test_normalize_expands_a_tilde_no_shell_is_left_to_expand() -> None:
+    assert normalize(BY_NAME["INCODE_DATA_DIR"], "~/indexes") == str(Path.home() / "indexes")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("1", True), ("true", True), ("YES", True), ("on", True), ("0", False), ("", False)],
+)
+def test_as_bool_reads_every_spelling_the_server_accepts(raw: str, expected: bool) -> None:
+    assert as_bool(raw) is expected
 
 
 def test_dynamic_defaults_resolve_to_valid_values() -> None:

@@ -21,8 +21,19 @@ async def click(pilot: Pilot, selector: str) -> None:
     await pilot.pause(0.4)
 
 
+def _prepare_checkout(directory: Path) -> Path:
+    """Create the server command the Location panel requires to exist."""
+
+    from incode_mcp.installer.accelerator import server_executable
+
+    command = server_executable(directory)
+    command.parent.mkdir(parents=True, exist_ok=True)
+    command.touch()
+    return directory
+
+
 def _install_state(tmp_path: Path) -> WizardState:
-    return WizardState.for_install(tmp_path, "https://example.invalid/repo.git", home=tmp_path)
+    return WizardState.for_install(_prepare_checkout(tmp_path), home=tmp_path)
 
 
 def _reconfigure_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WizardState:
@@ -69,10 +80,10 @@ async def test_location_commit_updates_state(tmp_path: Path) -> None:
     from textual.widgets import Input
 
     state = _install_state(tmp_path)
+    target = _prepare_checkout(tmp_path / "custom")
     app = InstallerApp(state)
     async with app.run_test() as pilot:
         await click(pilot, "#next")
-        target = tmp_path / "custom"
         app.query_one("#install-dir", Input).value = str(target)
         await click(pilot, "#next")
         assert state.install_directory == target
@@ -89,6 +100,21 @@ async def test_location_rejects_an_empty_directory(tmp_path: Path) -> None:
         app.query_one("#install-dir", Input).value = "   "
         await click(pilot, "#next")
         assert app.current == "location"  # blocked
+
+
+@pytest.mark.asyncio
+async def test_location_rejects_a_directory_without_an_installation(tmp_path: Path) -> None:
+    from textual.widgets import Input, Label
+
+    state = _install_state(tmp_path)
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        await click(pilot, "#next")
+        app.query_one("#install-dir", Input).value = str(tmp_path / "not-an-install")
+        await click(pilot, "#next")
+        assert app.current == "location"  # blocked
+        assert "No prepared installation" in str(app.query_one("#location-error", Label).render())
+        assert state.install_directory == tmp_path  # unchanged
 
 
 @pytest.mark.asyncio
@@ -158,6 +184,30 @@ async def test_settings_panels_validate_and_commit(tmp_path: Path) -> None:
         await click(pilot, "#next")
         assert app.current == "embedding"
         assert state.values["INCODE_INDEX_WAIT_SECONDS"] == "60"
+
+
+@pytest.mark.asyncio
+async def test_settings_widgets_render_hand_written_values(tmp_path: Path) -> None:
+    """Select raises on a value outside its options, so nothing may reach it raw."""
+
+    from textual.widgets import Checkbox, Select
+
+    state = _install_state(tmp_path)
+    state.values["INCODE_OFFLINE"] = "true"
+    state.values["INCODE_INDEX_MODE"] = "EAGER"
+    state.values["INCODE_BROKER"] = "nonsense"
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        for _ in range(4):
+            await click(pilot, "#next")
+        assert app.current == "indexing"
+        assert app.query_one("#f-INCODE_OFFLINE", Checkbox).value is True
+        assert app.query_one("#f-INCODE_INDEX_MODE", Select).value == "eager"
+        assert app.query_one("#f-INCODE_BROKER", Select).value == "auto"  # fell back
+        await click(pilot, "#next")
+        assert app.current == "embedding"
+        assert state.values["INCODE_OFFLINE"] == "1"
+        assert state.values["INCODE_INDEX_MODE"] == "eager"
 
 
 @pytest.mark.asyncio

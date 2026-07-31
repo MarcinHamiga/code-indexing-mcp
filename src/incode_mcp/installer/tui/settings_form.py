@@ -6,7 +6,7 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Checkbox, Input, Label, Select, Static
 
-from ..settings_spec import SETTINGS, Setting, default_value, validate
+from ..settings_spec import SETTINGS, Setting, as_bool, default_value, validate
 from ..wizard import WizardState
 
 
@@ -20,17 +20,22 @@ class SettingField(Vertical):
 
     def compose(self) -> ComposeResult:
         widget_id = f"f-{self.setting.name}"
+        # A prefilled value comes from a configuration file a user may have
+        # written by hand, so neither widget may assume a canonical spelling:
+        # Select raises on a value outside its options, and a bool has more
+        # spellings than "1".
         if self.setting.type == "bool":
             yield Checkbox(
                 self.setting.label,
-                value=(self.initial or self.setting.default) == "1",
+                value=as_bool(self.initial or self.setting.default),
                 id=widget_id,
             )
         elif self.setting.type == "choice":
             options = [(choice, choice) for choice in self.setting.choices]
+            chosen = self.initial.strip().lower()
             yield Select(
                 options,
-                value=self.initial or self.setting.default,
+                value=chosen if chosen in self.setting.choices else self.setting.default,
                 id=widget_id,
                 allow_blank=False,
             )

@@ -12,13 +12,12 @@ from .accelerator import ACCELERATOR_CHOICES
 from .config_files import InstallerError
 from .harnesses import HARNESS_CHOICES, parse_harness_selection
 from .orchestrator import (
-    DEFAULT_REPOSITORY_URL,
     InstallPlan,
     StepEvent,
     default_install_directory,
     run_install,
 )
-from .settings_spec import BY_NAME, normalize, validate
+from .settings_spec import BY_NAME, as_bool, normalize, validate
 from .wizard import load_prefill
 
 
@@ -54,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--offline",
         action="store_true",
-        default=os.environ.get("INCODE_OFFLINE", "").lower() in {"1", "true", "yes"},
+        default=as_bool(os.environ.get("INCODE_OFFLINE", "")),
     )
     parser.add_argument("--tui", action="store_true", help="open the interactive wizard")
     parser.add_argument(
@@ -128,13 +127,21 @@ def _run_tui(
     if args.reconfigure:
         state = WizardState.for_reconfigure(install_directory)
         state.values.update(preset)
+        if args.accelerator is not None:
+            state.accelerator = args.accelerator
     else:
         state = WizardState.for_install(
             install_directory,
-            os.environ.get("CODE_INDEXING_MCP_REPO_URL", DEFAULT_REPOSITORY_URL),
             preset_values=preset,
             preset_accelerator=args.accelerator,
         )
+    # An explicit --unset clears the field, which the wizard then reads as
+    # "reset to default" and turns back into a deletion on confirmation.
+    for name, value in env_updates.items():
+        if value is None:
+            state.values.pop(name, None)
+    if args.harnesses is not None:
+        state.harness_slugs = parse_harness_selection(args.harnesses)
     state.offline = args.offline
     app = InstallerApp(state)
     app.run()
@@ -175,8 +182,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
     if not result.configured and not result.failures and not result.skills:
         print("No harness configuration selected.")
+    if result.failures:
+        print(
+            f"Installation finished with {len(result.failures)} failed harness "
+            "configuration(s); see the errors above.",
+            file=sys.stderr,
+        )
+        return 1
     print("Installation complete. Restart configured clients to load the MCP server.")
-    return 1 if result.failures else 0
+    return 0
 
 
 def configure_main(
@@ -209,8 +223,10 @@ def configure_main(
         argv += ["--set", pair]
     for name in unsets:
         argv += ["--unset", name]
-    interactive = not no_tui and not settings and not unsets and sys.stdin.isatty()
-    if interactive:
+    # Any flag that already says what to do is an instruction to apply it, not an
+    # invitation to open a wizard over the top of it.
+    scripted = bool(settings or unsets or harnesses is not None or accelerator is not None)
+    if not no_tui and not scripted and sys.stdin.isatty():
         argv.remove("--no-prompt")
         argv.append("--tui")
     return main(argv)

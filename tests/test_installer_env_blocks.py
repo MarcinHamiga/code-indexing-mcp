@@ -37,6 +37,15 @@ def test_entry_from_text_returns_none_for_missing_or_invalid() -> None:
     assert entry_from_text("codex", "not = = toml") is None
 
 
+def test_read_server_entry_survives_a_non_utf8_configuration(tmp_path: Path) -> None:
+    """An unreadable config is worth nothing to prefill, but must not raise."""
+
+    directory = tmp_path / ".kimi-code"
+    directory.mkdir()
+    (directory / "mcp.json").write_bytes(b'{"mcpServers": {"code-indexing-mcp": "\xff\xfe"}}')
+    assert read_server_entry("kimi-code", home=tmp_path, environment={}) is None
+
+
 def test_env_from_entry_uses_the_per_harness_key() -> None:
     assert env_from_entry("opencode", {"environment": {"A": "1"}, "env": {"B": "2"}}) == {"A": "1"}
     assert env_from_entry("kimi-code", {"env": {"B": "2"}}) == {"B": "2"}

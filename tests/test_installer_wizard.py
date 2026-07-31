@@ -79,18 +79,46 @@ def test_env_updates_omit_defaults_and_delete_reset_prefills(tmp_path: Path) -> 
     assert state.env_updates() == {"INCODE_INDEX_MODE": None, "INCODE_BROKER": "on"}
 
 
-def test_install_mode_never_deletes(tmp_path: Path) -> None:
-    state = WizardState.for_install(
-        Path("/opt/ci-mcp"), "https://example.invalid/repo.git", home=tmp_path
-    )
+def test_install_mode_deletes_reset_prefills_too(tmp_path: Path) -> None:
+    _write_kimi_config(tmp_path, {"INCODE_INDEX_MODE": "eager"})
+    state = WizardState.for_install(Path("/opt/ci-mcp"), home=tmp_path)
+    state.set_field("INCODE_INDEX_MODE", "lazy")  # back to default -> delete
+    assert state.env_updates() == {"INCODE_INDEX_MODE": None}
+
+
+def test_env_updates_leave_settings_the_wizard_never_prefilled_alone(tmp_path: Path) -> None:
+    state = WizardState.for_install(Path("/opt/ci-mcp"), home=tmp_path)
     state.set_field("INCODE_INDEX_MODE", "lazy")
     assert state.env_updates() == {}
 
 
-def test_to_plan_carries_everything(tmp_path: Path) -> None:
-    state = WizardState.for_install(
-        Path("/opt/ci-mcp"), "https://example.invalid/repo.git", home=tmp_path
+def test_load_prefill_canonicalizes_hand_written_values(tmp_path: Path) -> None:
+    _write_kimi_config(tmp_path, {"INCODE_OFFLINE": "true", "INCODE_INDEX_MODE": "EAGER"})
+    prefill = load_prefill(home=tmp_path)
+    assert prefill.values == {"INCODE_OFFLINE": "1", "INCODE_INDEX_MODE": "eager"}
+
+
+def test_load_prefill_ignores_values_the_catalog_cannot_read(tmp_path: Path) -> None:
+    _write_kimi_config(tmp_path, {"INCODE_INDEX_MODE": "whenever", "INCODE_BROKER": "off"})
+    prefill = load_prefill(home=tmp_path)
+    assert prefill.values == {"INCODE_BROKER": "off"}
+
+
+def test_load_prefill_does_not_call_spellings_of_one_value_a_disagreement(tmp_path: Path) -> None:
+    _write_kimi_config(tmp_path, {"INCODE_OFFLINE": "yes"})
+    codex = tmp_path / ".codex"
+    codex.mkdir()
+    (codex / "config.toml").write_text(
+        '[mcp_servers.code-indexing-mcp]\ncommand = "/opt/ci-mcp"\nargs = ["serve"]\n'
+        'env = { INCODE_OFFLINE = "1" }\n'
     )
+    prefill = load_prefill(home=tmp_path)
+    assert prefill.values == {"INCODE_OFFLINE": "1"}
+    assert prefill.disagreements == ()
+
+
+def test_to_plan_carries_everything(tmp_path: Path) -> None:
+    state = WizardState.for_install(Path("/opt/ci-mcp"), home=tmp_path)
     state.accelerator = "mlx"
     state.harness_slugs = ["kimi-code"]
     state.set_field("INCODE_OFFLINE", "1")

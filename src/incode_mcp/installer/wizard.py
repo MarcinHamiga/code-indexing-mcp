@@ -8,8 +8,8 @@ from pathlib import Path
 
 from . import accelerator, harnesses
 from .env_blocks import env_from_entry
-from .orchestrator import DEFAULT_REPOSITORY_URL, InstallPlan, default_install_directory
-from .settings_spec import BY_NAME, SETTINGS, default_value, normalize
+from .orchestrator import InstallPlan, default_install_directory
+from .settings_spec import BY_NAME, SETTINGS, default_value, normalize, validate
 
 
 @dataclass(frozen=True)
@@ -34,9 +34,18 @@ def load_prefill(
         if entry is None:
             continue
         configured.append(choice.slug)
-        for name, value in env_from_entry(choice.slug, entry).items():
-            if name not in BY_NAME:
+        for name, raw in env_from_entry(choice.slug, entry).items():
+            setting = BY_NAME.get(name)
+            if setting is None:
                 continue
+            if validate(setting, raw) is not None:
+                # A value the catalog cannot read is left exactly where it is:
+                # the wizard has no honest way to show it, and deleting what a
+                # user hand-wrote is worse than ignoring it.
+                continue
+            # Canonicalize before comparing, so "true" and "1" are one value and
+            # every widget receives a form it can render.
+            value = normalize(setting, raw)
             if name in values and values[name] != value:
                 if name not in disagreements:
                     disagreements.append(name)
@@ -49,7 +58,6 @@ def load_prefill(
 class WizardState:
     mode: str  # "install" | "reconfigure"
     install_directory: Path = field(default_factory=default_install_directory)
-    repo_url: str = DEFAULT_REPOSITORY_URL
     # None keeps the prepared backend (reconfigure default); install mode uses "auto".
     accelerator: str | None = "auto"
     prepared_accelerator: str | None = None
@@ -65,7 +73,6 @@ class WizardState:
     def for_install(
         cls,
         install_directory: Path,
-        repo_url: str,
         *,
         preset_values: Mapping[str, str] | None = None,
         preset_accelerator: str | None = None,
@@ -78,7 +85,6 @@ class WizardState:
         return cls(
             mode="install",
             install_directory=install_directory,
-            repo_url=repo_url,
             accelerator=preset_accelerator or "auto",
             harness_slugs=list(prefill.configured_slugs),
             configured_slugs=prefill.configured_slugs,
@@ -115,13 +121,18 @@ class WizardState:
         self.values[name] = raw
 
     def env_updates(self) -> dict[str, str | None]:
-        """Non-default values to write; prefilled values reset to default delete the key."""
+        """Non-default values to write; prefilled values reset to default delete the key.
+
+        Deletion follows the prefill, not the mode: both modes show the values
+        already in the harness configs, so clearing a field has to mean the same
+        thing in both. Anything the wizard never prefilled is left untouched.
+        """
 
         updates: dict[str, str | None] = {}
         for setting in SETTINGS:
             raw = self.values.get(setting.name, "").strip()
             if not raw or raw == default_value(setting):
-                if self.mode == "reconfigure" and setting.name in self.prefilled_names:
+                if setting.name in self.prefilled_names:
                     updates[setting.name] = None
                 continue
             updates[setting.name] = normalize(setting, raw)

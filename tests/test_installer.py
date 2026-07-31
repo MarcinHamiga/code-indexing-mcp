@@ -263,9 +263,7 @@ def test_harness_selection_accepts_numbers_slugs_duplicates_and_all() -> None:
         "kimi-code",
         "opencode",
     ]
-    assert parse_harness_selection("all") == [
-        choice.slug for choice in HARNESS_CHOICES
-    ]
+    assert parse_harness_selection("all") == [choice.slug for choice in HARNESS_CHOICES]
     assert parse_harness_selection("") == []
     with pytest.raises(InstallerError, match="Unknown harness"):
         parse_harness_selection("7")
@@ -281,9 +279,7 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
     }
 
     assert (
-        configuration_path(
-            "codex", home=tmp_path, environment=environment, platform_name="darwin"
-        )
+        configuration_path("codex", home=tmp_path, environment=environment, platform_name="darwin")
         == tmp_path / "codex-home" / "config.toml"
     )
     assert (
@@ -368,7 +364,6 @@ def test_kilocode_honors_config_directory_override(tmp_path: Path) -> None:
                 "type": "stdio",
                 "command": SERVER_COMMAND,
                 "args": ["serve"],
-                "env": {},
             },
         ),
         (
@@ -611,15 +606,11 @@ def test_main_delegates_to_the_module_cli_with_forwarded_flags(
 ) -> None:
     installer = load_installer()
     checkout = tmp_path / "checkout"
-    monkeypatch.setattr(
-        installer, "clone_or_update_repository", lambda url, directory: "installed"
-    )
+    monkeypatch.setattr(installer, "clone_or_update_repository", lambda url, directory: "installed")
     monkeypatch.setattr(installer, "sync_environment", lambda directory: checkout / "server")
     monkeypatch.setattr(installer, "tui_available", lambda: False)
     delegated: list[list[str]] = []
-    monkeypatch.setattr(
-        installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0
-    )
+    monkeypatch.setattr(installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0)
 
     code = installer.main(
         [
@@ -659,9 +650,7 @@ def test_main_adds_tui_flag_on_a_capable_terminal(
     monkeypatch.setattr(installer, "sync_environment", lambda directory: tmp_path / "server")
     monkeypatch.setattr(installer, "tui_available", lambda: True)
     delegated: list[list[str]] = []
-    monkeypatch.setattr(
-        installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0
-    )
+    monkeypatch.setattr(installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0)
 
     assert installer.main(["--install-dir", str(tmp_path / "checkout")]) == 0
     assert "--tui" in delegated[0]
@@ -675,12 +664,55 @@ def test_main_no_tui_flag_suppresses_the_wizard(
     monkeypatch.setattr(installer, "sync_environment", lambda directory: tmp_path / "server")
     monkeypatch.setattr(installer, "tui_available", lambda: True)
     delegated: list[list[str]] = []
-    monkeypatch.setattr(
-        installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0
-    )
+    monkeypatch.setattr(installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0)
 
     assert installer.main(["--install-dir", str(tmp_path / "checkout"), "--no-tui"]) == 0
     assert "--tui" not in delegated[0]
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--harnesses", "codex"],
+        ["--set", "INCODE_OFFLINE=1"],
+        ["--unset", "INCODE_BROKER"],
+        ["--no-prompt"],
+    ],
+)
+def test_main_does_not_open_the_wizard_over_scripted_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flags: list[str]
+) -> None:
+    """A run that already says what to do must not stop for a keypress."""
+
+    installer = load_installer()
+    monkeypatch.setattr(installer, "clone_or_update_repository", lambda url, directory: "updated")
+    monkeypatch.setattr(installer, "sync_environment", lambda directory: tmp_path / "server")
+    monkeypatch.setattr(installer, "tui_available", lambda: True)
+    delegated: list[list[str]] = []
+    monkeypatch.setattr(installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0)
+
+    assert installer.main(["--install-dir", str(tmp_path / "checkout"), *flags]) == 0
+    assert "--tui" not in delegated[0]
+
+
+def test_explicit_tui_flag_wins_over_scripted_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    monkeypatch.setattr(installer, "clone_or_update_repository", lambda url, directory: "updated")
+    monkeypatch.setattr(installer, "sync_environment", lambda directory: tmp_path / "server")
+    monkeypatch.setattr(installer, "tui_available", lambda: False)
+    delegated: list[list[str]] = []
+    monkeypatch.setattr(installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0)
+
+    assert (
+        installer.main(
+            ["--install-dir", str(tmp_path / "checkout"), "--tui", "--harnesses", "codex"]
+        )
+        == 0
+    )
+    assert "--tui" in delegated[0]
+    assert "codex" in delegated[0]
 
 
 def test_main_reports_actionable_installer_error(
@@ -753,8 +785,7 @@ def test_skill_directories_cover_supported_harnesses(tmp_path: Path) -> None:
         == tmp_path / ".claude" / "skills"
     )
     assert (
-        skill_directory("codex", home=tmp_path, environment={})
-        == tmp_path / ".agents" / "skills"
+        skill_directory("codex", home=tmp_path, environment={}) == tmp_path / ".agents" / "skills"
     )
     assert (
         skill_directory("kimi-code", home=tmp_path, environment={})
@@ -869,9 +900,7 @@ def test_install_skills_skips_unsupported_harness(tmp_path: Path) -> None:
 
 
 def test_install_skills_reports_missing_source(tmp_path: Path) -> None:
-    results = install_skills(
-        ["codex"], tmp_path / "empty-repo", home=tmp_path, environment={}
-    )
+    results = install_skills(["codex"], tmp_path / "empty-repo", home=tmp_path, environment={})
 
     _slug, message = results[0]
     assert "skipped" in message
@@ -1247,7 +1276,8 @@ def test_a_cpu_installation_retracts_an_earlier_accelerator_offer(
     record.write_text('{"schema_version": 1}', encoding="utf-8")
     monkeypatch.setattr(
         "incode_mcp.installer.accelerator.runtime_record_path",
-        lambda python: data / "accelerator.json")
+        lambda python: data / "accelerator.json",
+    )
 
     plan = configure_accelerator(tmp_path / "checkout", "cpu")
 
@@ -1265,10 +1295,11 @@ def test_a_prepared_accelerator_is_recorded_only_after_its_probe_passes(
     probed: list[tuple[Path, str]] = []
     monkeypatch.setattr(
         "incode_mcp.installer.accelerator.runtime_record_path",
-        lambda python: data / "accelerator.json")
+        lambda python: data / "accelerator.json",
+    )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version",
-        lambda python: "3.12")
+        "incode_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
+    )
 
     def fake_probe(python: Path, accelerator: str, *, offline: bool = False) -> dict[str, object]:
         probed.append((python, accelerator))
@@ -1330,11 +1361,11 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
     interpreter.write_text("", encoding="utf-8")
     synced: list[str] = []
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.runtime_record_path",
-        lambda python: record)
+        "incode_mcp.installer.accelerator.runtime_record_path", lambda python: record
+    )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version",
-        lambda python: "3.12")
+        "incode_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
+    )
 
     def fake_sync(
         install_directory: Path,
@@ -1345,7 +1376,8 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
         return interpreter
 
     monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", fake_sync)
-    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator",
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.probe_accelerator",
         lambda python, accelerator, *, offline=False: {
             "ok": True,
             "interpreter": str(python),
@@ -1417,10 +1449,11 @@ def test_a_failed_probe_rolls_the_installation_back_to_cpu(
     stale.write_text('{"schema_version": 1}', encoding="utf-8")
     monkeypatch.setattr(
         "incode_mcp.installer.accelerator.runtime_record_path",
-        lambda python: data / "accelerator.json")
+        lambda python: data / "accelerator.json",
+    )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version",
-        lambda python: "3.12")
+        "incode_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
+    )
 
     def failing_probe(
         python: Path, accelerator: str, *, offline: bool = False
@@ -1478,9 +1511,7 @@ def test_a_probe_that_reports_nothing_is_a_failure_not_a_pass(tmp_path: Path) ->
         probe_accelerator(silent, "cuda")
 
 
-def _prepared_checkout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, Path, Path]:
+def _prepared_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Path]:
     """A checkout whose accelerator environment an earlier run already built."""
     checkout = tmp_path / "checkout"
     (checkout / "uv.lock").parent.mkdir(parents=True)
@@ -1508,11 +1539,11 @@ def _prepared_checkout(
         },
     )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.runtime_record_path",
-        lambda python: record)
+        "incode_mcp.installer.accelerator.runtime_record_path", lambda python: record
+    )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version",
-        lambda python: "3.12")
+        "incode_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
+    )
     return checkout, record, accelerator_env
 
 
@@ -1560,9 +1591,7 @@ def test_an_unremovable_accelerator_environment_stops_the_build_not_the_install(
     monkeypatch.setattr(shutil, "rmtree", locked)
 
     with pytest.raises(InstallerError) as caught:
-        sync_accelerator_environment(
-            tmp_path, "cuda", python_version="3.12", uv_executable="uv"
-        )
+        sync_accelerator_environment(tmp_path, "cuda", python_version="3.12", uv_executable="uv")
 
     # Rebuilding over the leftovers is what the removal exists to prevent, so a
     # failed removal must not be swallowed into a build that then proceeds.
@@ -1580,8 +1609,8 @@ def test_a_driver_or_python_that_moved_forces_the_rebuild(
     """The record vouches for one combination; anything else has to be re-proven."""
     checkout, _, _ = _prepared_checkout(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version",
-        lambda python: python_version)
+        "incode_mcp.installer.accelerator.interpreter_version", lambda python: python_version
+    )
     rebuilt: list[str] = []
 
     def fake_sync(*_args: object, **_kwargs: object) -> Path:
@@ -1589,7 +1618,8 @@ def test_a_driver_or_python_that_moved_forces_the_rebuild(
         return checkout / ACCELERATOR_ENVIRONMENT_DIRECTORY / "python"
 
     monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", fake_sync)
-    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator",
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.probe_accelerator",
         lambda python, accelerator, *, offline=False: {
             "ok": True,
             "interpreter": str(python),
@@ -1622,7 +1652,8 @@ def test_a_changed_lockfile_forces_the_accelerator_environment_to_rebuild(
         return checkout / ACCELERATOR_ENVIRONMENT_DIRECTORY / "python"
 
     monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", fake_sync)
-    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator",
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.probe_accelerator",
         lambda python, accelerator, *, offline=False: {
             "ok": True,
             "interpreter": str(python),
@@ -1659,8 +1690,8 @@ def test_migraphx_detection_uses_the_serving_interpreter_version(
     checkout = tmp_path / "checkout"
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version",
-        lambda python: "3.13")
+        "incode_mcp.installer.accelerator.interpreter_version", lambda python: "3.13"
+    )
     monkeypatch.setattr(
         "incode_mcp.installer.accelerator.accelerator_record_path",
         lambda *args, **kwargs: tmp_path / "accelerator.json",

@@ -80,26 +80,33 @@ class LocationPanel(Vertical):
     def compose(self) -> ComposeResult:
         yield Label("Install location")
         yield Static(
-            "Where the repository is cloned. Changing this moves only the checkout; "
-            "indexes and caches live in the data directory (Indexing section).",
+            "The checkout this wizard configures. It has already been cloned and its "
+            "environment built; point this elsewhere only to configure a different "
+            "existing installation. Indexes and caches live in the data directory "
+            "(Indexing section).",
             classes="help",
         )
         with Collapsible(title="Advanced", collapsed=True):
             yield Label("Install directory")
             yield Input(value=str(self.state.install_directory), id="install-dir")
-            yield Label("Repository URL")
-            yield Input(value=self.state.repo_url, id="repo-url")
         yield Label("", id="location-error", classes="error")
 
     def commit(self) -> bool:
-        directory = self.query_one("#install-dir", Input).value.strip()
-        if not directory:
-            self.query_one("#location-error", Label).update(
-                "Install directory cannot be empty."
-            )
+        error = self.query_one("#location-error", Label)
+        value = self.query_one("#install-dir", Input).value.strip()
+        if not value:
+            error.update("Install directory cannot be empty.")
             return False
-        self.state.install_directory = Path(directory).expanduser()
-        self.state.repo_url = self.query_one("#repo-url", Input).value.strip()
+        directory = Path(value).expanduser()
+        # The path written into every harness config is derived from this
+        # directory, so a location without a built environment would configure
+        # each client to launch a command that does not exist.
+        executable = accelerator_module.server_executable(directory)
+        if not executable.is_file():
+            error.update(f"No prepared installation there; expected {executable}.")
+            return False
+        self.state.install_directory = directory
+        error.update("")
         return True
 
 

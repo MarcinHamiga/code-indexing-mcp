@@ -27,6 +27,7 @@ HARNESS_CHOICES = [
     HarnessChoice("kilocode", "KiloCode"),
 ]
 
+
 def parse_harness_selection(selection: str) -> list[str]:
     """Parse interactive menu numbers or stable harness slugs."""
 
@@ -49,6 +50,7 @@ def parse_harness_selection(selection: str) -> list[str]:
         if slug not in selected:
             selected.append(slug)
     return selected
+
 
 def _configured_directory(
     environment: Mapping[str, str],
@@ -148,7 +150,9 @@ def read_server_entry(
     )
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # An unreadable or non-UTF-8 config has nothing to tell us. Writing to it
+        # still fails loudly later; reading it must not take the wizard down.
         return None
     return entry_from_text(slug, text)
 
@@ -194,8 +198,9 @@ def configure_harness(
             "type": "stdio",
             "command": str(command),
             "args": ["serve"],
-            "env": merged_env if env is not None else {},
         }
+        if merged_env:
+            entry["env"] = merged_env
     elif slug in {"kimi-code", "claude-desktop"}:
         object_key = "mcpServers"
         entry = {"command": str(command), "args": ["serve"]}
@@ -245,6 +250,7 @@ def configure_selected_harnesses(
         else:
             successes.append((slug, path))
     return successes, failures
+
 
 def skill_directory(
     slug: str,
@@ -368,6 +374,7 @@ def install_skills(
             )
         )
     return results
+
 
 def harness_label(slug: str) -> str:
     return next((choice.label for choice in HARNESS_CHOICES if choice.slug == slug), slug)

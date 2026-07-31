@@ -67,6 +67,7 @@ MIGRAPHX_PLATFORM = ("linux", "x86_64")
 MIGRAPHX_PYTHON_VERSION = "3.12"
 MIGRAPHX_ROCM_VERSION = "7.2.1"
 
+
 def _run_command(
     arguments: list[str],
     *,
@@ -91,6 +92,7 @@ def _run_command(
         if detail:
             message = f"{message}\n{detail}"
         raise InstallerError(message) from exc
+
 
 def server_executable(
     install_directory: Path,
@@ -119,6 +121,7 @@ def _uv_executable(uv_executable: str | None) -> str:
             "uv is required but was not found in PATH. Install it from https://docs.astral.sh/uv/"
         )
     return uv
+
 
 class AcceleratorPlan(NamedTuple):
     """What the installer will prepare, and the reason it settled on that.
