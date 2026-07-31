@@ -61,3 +61,79 @@ async def test_cancel_exits_with_130(tmp_path: Path) -> None:
     async with app.run_test() as pilot:
         await click(pilot, "#cancel")
     assert app.return_code == 130
+
+
+@pytest.mark.asyncio
+async def test_location_commit_updates_state(tmp_path: Path) -> None:
+    from textual.widgets import Input
+
+    state = _install_state(tmp_path)
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        await click(pilot, "#next")
+        target = tmp_path / "custom"
+        app.query_one("#install-dir", Input).value = str(target)
+        await click(pilot, "#next")
+        assert state.install_directory == target
+
+
+@pytest.mark.asyncio
+async def test_location_rejects_an_empty_directory(tmp_path: Path) -> None:
+    from textual.widgets import Input
+
+    state = _install_state(tmp_path)
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        await click(pilot, "#next")
+        app.query_one("#install-dir", Input).value = "   "
+        await click(pilot, "#next")
+        assert app.current == "location"  # blocked
+
+
+@pytest.mark.asyncio
+async def test_accelerator_panel_shows_detection_and_commits_choice(tmp_path: Path) -> None:
+    from textual.widgets import RadioButton, Static
+
+    state = _install_state(tmp_path)
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        await click(pilot, "#next")
+        await click(pilot, "#next")
+        assert app.current == "accelerator"
+        text = str(app.query_one("#detection", Static).render())
+        assert "Platform:" in text
+        app.query_one("#accel-cpu", RadioButton).toggle()
+        await click(pilot, "#next")
+        assert state.accelerator == "cpu"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_offers_keep_prepared_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from textual.widgets import RadioButton
+
+    app = InstallerApp(_reconfigure_state(tmp_path, monkeypatch))
+    async with app.run_test() as pilot:
+        await click(pilot, "#next")
+        assert app.current == "accelerator"
+        assert app.query_one("#accel-keep", RadioButton).value is True
+        await click(pilot, "#next")
+        assert app.state.accelerator is None
+
+
+@pytest.mark.asyncio
+async def test_harnesses_panel_commits_checked_slugs(tmp_path: Path) -> None:
+    from textual.widgets import Checkbox
+
+    state = _install_state(tmp_path)
+    state.harness_slugs = []
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        for _ in range(3):
+            await click(pilot, "#next")
+        assert app.current == "harnesses"
+        app.query_one("#harness-kimi-code", Checkbox).toggle()
+        app.query_one("#harness-codex", Checkbox).toggle()
+        await click(pilot, "#next")
+        assert state.harness_slugs == ["codex", "kimi-code"]

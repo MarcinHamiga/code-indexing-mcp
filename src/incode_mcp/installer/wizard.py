@@ -54,6 +54,8 @@ class WizardState:
     accelerator: str | None = "auto"
     prepared_accelerator: str | None = None
     harness_slugs: list[str] = field(default_factory=list)
+    # Harnesses with an existing server entry at prefill time (display annotation).
+    configured_slugs: tuple[str, ...] = ()
     values: dict[str, str] = field(default_factory=dict)  # env name -> raw field value
     prefilled_names: set[str] = field(default_factory=set)  # names found in existing configs
     disagreements: list[str] = field(default_factory=list)
@@ -79,6 +81,7 @@ class WizardState:
             repo_url=repo_url,
             accelerator=preset_accelerator or "auto",
             harness_slugs=list(prefill.configured_slugs),
+            configured_slugs=prefill.configured_slugs,
             values=values,
             prefilled_names=set(prefill.values),
             disagreements=list(prefill.disagreements),
@@ -99,6 +102,7 @@ class WizardState:
             accelerator=None,
             prepared_accelerator=accelerator.prepared_accelerator(install_directory),
             harness_slugs=list(prefill.configured_slugs),
+            configured_slugs=prefill.configured_slugs,
             values=dict(prefill.values),
             prefilled_names=set(prefill.values),
             disagreements=list(prefill.disagreements),

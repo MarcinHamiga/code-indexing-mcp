@@ -2,10 +2,24 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from textual.app import ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Button, Label, RichLog
+from textual.widgets import (
+    Button,
+    Checkbox,
+    Collapsible,
+    Input,
+    Label,
+    RadioButton,
+    RadioSet,
+    RichLog,
+    Static,
+)
 
+from .. import accelerator as accelerator_module
+from .. import harnesses
 from ..orchestrator import InstallResult
 from ..wizard import WizardState
 from .settings_form import SettingsPanel
@@ -28,7 +42,29 @@ class WelcomePanel(Vertical):
         self.state = state
 
     def compose(self) -> ComposeResult:
-        yield Label("Welcome")
+        if self.state.mode == "reconfigure":
+            headline = "Reconfigure Code Indexing MCP"
+            detail = (
+                f"Installation: {self.state.install_directory}\n"
+                "Your current settings were read from the configured harnesses. "
+                "Walk through the sections and confirm on the summary screen."
+            )
+        else:
+            headline = "Install Code Indexing MCP"
+            detail = (
+                f"Installation: {self.state.install_directory}\n"
+                "This wizard prepares the accelerator, configures your MCP clients, "
+                "and lets you customize the server's settings."
+            )
+        yield Label(headline, id="welcome-headline")
+        yield Static(detail)
+        if self.state.disagreements:
+            names = ", ".join(self.state.disagreements)
+            yield Static(
+                f"Your harnesses disagree on: {names}. The value from the earliest "
+                "configured harness in the list is prefilled; confirming unifies them.",
+                classes="help",
+            )
 
 
 class LocationPanel(Vertical):
@@ -37,9 +73,28 @@ class LocationPanel(Vertical):
         self.state = state
 
     def compose(self) -> ComposeResult:
-        yield Label("Location")
+        yield Label("Install location")
+        yield Static(
+            "Where the repository is cloned. Changing this moves only the checkout; "
+            "indexes and caches live in the data directory (Indexing section).",
+            classes="help",
+        )
+        with Collapsible(title="Advanced", collapsed=True):
+            yield Label("Install directory")
+            yield Input(value=str(self.state.install_directory), id="install-dir")
+            yield Label("Repository URL")
+            yield Input(value=self.state.repo_url, id="repo-url")
+        yield Label("", id="location-error", classes="error")
 
     def commit(self) -> bool:
+        directory = self.query_one("#install-dir", Input).value.strip()
+        if not directory:
+            self.query_one("#location-error", Label).update(
+                "Install directory cannot be empty."
+            )
+            return False
+        self.state.install_directory = Path(directory).expanduser()
+        self.state.repo_url = self.query_one("#repo-url", Input).value.strip()
         return True
 
 
@@ -49,9 +104,40 @@ class AcceleratorPanel(Vertical):
         self.state = state
 
     def compose(self) -> ComposeResult:
-        yield Label("Accelerator")
+        yield Label("Passage embedding accelerator")
+        yield Static(
+            "auto detects a supported GPU and prepares it; anything that cannot be "
+            "detected, built, or probed leaves the installation on CPU and says why.",
+            classes="help",
+        )
+        yield Static("\n".join(accelerator_module.detection_report()), id="detection")
+        with RadioSet(id="accel-choices"):
+            if self.state.mode == "reconfigure":
+                prepared = self.state.prepared_accelerator or "none prepared"
+                yield RadioButton(
+                    f"Keep the prepared backend ({prepared})", id="accel-keep", value=True
+                )
+            for choice in accelerator_module.ACCELERATOR_CHOICES:
+                yield RadioButton(
+                    "auto (recommended)" if choice == "auto" else choice,
+                    id=f"accel-{choice}",
+                    value=self.state.accelerator == choice,
+                )
+        yield Static(
+            "Preparing an accelerator downloads the embedding model and can take several "
+            "minutes and a few gigabytes; a matching record is reused next time.",
+            classes="help",
+        )
 
     def commit(self) -> bool:
+        if self.state.mode == "reconfigure" and self.query_one("#accel-keep", RadioButton).value:
+            self.state.accelerator = None
+            return True
+        for choice in accelerator_module.ACCELERATOR_CHOICES:
+            if self.query_one(f"#accel-{choice}", RadioButton).value:
+                self.state.accelerator = choice
+                return True
+        self.state.accelerator = "auto"
         return True
 
 
@@ -61,9 +147,33 @@ class HarnessesPanel(Vertical):
         self.state = state
 
     def compose(self) -> ComposeResult:
-        yield Label("Harnesses")
+        yield Label("MCP clients to configure")
+        yield Static(
+            "The server entry is merged into each selected client's user-wide "
+            "configuration; existing files are backed up with a .bak suffix first.",
+            classes="help",
+        )
+        for choice in harnesses.HARNESS_CHOICES:
+            path = harnesses.configuration_path(choice.slug)
+            existing = choice.slug in self.state.configured_slugs
+            skills = harnesses.skill_directory(choice.slug) is not None
+            notes = [str(path)]
+            if existing:
+                notes.append("already configured")
+            if skills:
+                notes.append("skills supported")
+            yield Checkbox(
+                f"{choice.label} — {', '.join(notes)}",
+                value=choice.slug in self.state.harness_slugs,
+                id=f"harness-{choice.slug}",
+            )
 
     def commit(self) -> bool:
+        self.state.harness_slugs = [
+            choice.slug
+            for choice in harnesses.HARNESS_CHOICES
+            if self.query_one(f"#harness-{choice.slug}", Checkbox).value
+        ]
         return True
 
 
