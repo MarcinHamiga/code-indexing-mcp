@@ -231,14 +231,56 @@ Incremental refreshes:
   scan, so each changed file is read once. They count toward `skipped_files` and are not recorded as
   per-file errors.
 
-Python, Python stubs, Java, JavaScript, JSX, TypeScript, and TSX are supported. Java indexing
-extracts classes, interfaces, records, enums, annotation types, methods, constructors, and nested
-declarations without requiring a JDK, Maven, or Gradle. The scanner respects root and nested
-`.gitignore` files and excludes symlinks, binary files, files over 1 MiB, build outputs, virtual
-environments, and dependency directories.
+These languages are supported, all through bundled grammars that need no toolchain of their own —
+no JDK, Maven, Gradle, .NET SDK, Godot, or database connection:
 
-Existing project markers that use the exact pre-Java default include list automatically include
-`**/*.java` at runtime. If you use a customized `scan.include` list, add `**/*.java` explicitly.
+The `languages` column is the exact value `search_code`'s `languages` filter accepts, which is not
+always the lowercased language name — `.tsx` is classified as its own language rather than as
+TypeScript, and the two Godot data formats are one language.
+
+| Language   | Extensions                     | `languages` value | Extracted symbol kinds                                       |
+| ---------- | ------------------------------ | ----------------- | ------------------------------------------------------------ |
+| Python     | `.py`, `.pyi`                  | `python`          | classes, functions, methods                                  |
+| Java       | `.java`                        | `java`            | classes, interfaces, records, enums, annotation types, methods, constructors, enum constants |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs`  | `javascript`      | classes, functions, methods                                  |
+| TypeScript | `.ts`, `.mts`, `.cts`          | `typescript`      | classes, interfaces, type aliases, enums, functions, methods  |
+| TSX        | `.tsx`                         | `tsx`             | classes, interfaces, type aliases, enums, functions, methods  |
+| C#         | `.cs`, `.csx`                  | `csharp`          | classes, interfaces, structs, records, enums, enum members, delegates, methods, local functions, constructors, destructors, properties |
+| GDScript   | `.gd`                          | `gdscript`        | classes (including `class_name` and inner classes), functions, methods, signals, enums, constants |
+| Godot shaders | `.gdshader`, `.gdshaderinc` | `gdshader`        | functions, structs, uniforms (as properties), constants       |
+| Godot scenes and resources | `.tscn`, `.tres`, `.godot` | `godot_resource` | scene nodes by `name`, resource references by `id` |
+| SQL        | `.sql`                         | `sql`             | tables, views, materialized views, indexes, functions, triggers, types |
+| YAML       | `.yaml`, `.yml`                | `yaml`            | collection-valued keys, qualified by their path               |
+| JSON       | `.json`                        | `json`            | collection-valued keys, qualified by their path               |
+
+Nested declarations are qualified by their enclosing scope in every language, so a C# method
+indexes as `Outer.Inner.Work` and a Compose service port list as `services.web.ports`.
+
+The kinds above name what is extracted, not always the `kind` recorded against it. A C# destructor
+is recorded as a `method`, under the type's own name — `~Catalog` indexes as `Catalog.Catalog`,
+the same symbol as the constructor — because the grammar names it with the type identifier alone.
+Filter on `method` to reach either.
+
+YAML and JSON deliberately extract only keys whose value is a mapping/object or a
+sequence/array. Making a symbol of every scalar leaf would turn one large configuration file into
+thousands of one-line chunks; scalars still reach the index inside the enclosing key's chunk.
+SQL `CREATE PROCEDURE` is not extracted, because the bundled SQL grammar does not parse it.
+
+Godot scene and resource files name only some of their sections: `[gd_scene]`, `[gd_resource]`,
+`[resource]`, `[connection]`, and the sections of a `project.godot` carry neither a `name` nor an
+`id`, so they reach the index as searchable text rather than as symbols.
+
+The scanner respects root and nested `.gitignore` files and excludes symlinks, binary files, files
+over 1 MiB, build outputs, virtual environments, dependency directories, and Godot's own `.godot`
+asset cache — a `project.godot` file is still indexed. That 1 MiB cap is what
+usually keeps a large generated `package-lock.json` or similar out of the index; exclude it through
+`scan.exclude` if a smaller one is not worth indexing.
+
+Existing project markers whose `scan.include` still holds an older default list are upgraded to the
+current one at runtime, so a project created before a language was supported picks it up without
+being re-initialized. A customized `scan.include` list is never rewritten — add the patterns you
+want (`**/*.cs`, `**/*.gd`, `**/*.gdshader`, `**/*.tscn`, `**/*.tres`, `**/*.sql`, `**/*.yaml`,
+`**/*.yml`, `**/*.json`) explicitly.
 
 ## Multi-project search
 

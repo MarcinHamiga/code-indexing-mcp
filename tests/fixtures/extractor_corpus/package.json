@@ -1,0 +1,11 @@
+{
+  "name": "demo",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest",
+    "nested": { "deep": true }
+  },
+  "files": ["dist/a.js", "dist/b.js"],
+  "workspaces": [{ "packages": ["apps/*"] }]
+}

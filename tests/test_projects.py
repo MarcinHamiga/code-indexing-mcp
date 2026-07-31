@@ -4,6 +4,11 @@ import pytest
 import tomli_w
 
 from incode_mcp.errors import ErrorCode, IncodeError
+from incode_mcp.models import (
+    DEFAULT_INCLUDES,
+    LEGACY_DEFAULT_INCLUDES_V1,
+    LEGACY_DEFAULT_INCLUDES_V2,
+)
 from incode_mcp.projects import (
     ProjectResolver,
     find_project_root,
@@ -51,7 +56,14 @@ def test_initialize_project_is_idempotent_unless_forced(tmp_path: Path) -> None:
     assert replacement.id != first.id
 
 
-def test_legacy_default_marker_adds_java_without_rewriting_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "legacy_includes",
+    [LEGACY_DEFAULT_INCLUDES_V1, LEGACY_DEFAULT_INCLUDES_V2],
+    ids=["v1", "v2"],
+)
+def test_any_legacy_default_marker_gains_the_current_languages_without_rewriting_file(
+    tmp_path: Path, legacy_includes: list[str]
+) -> None:
     root = tmp_path / "demo"
     root.mkdir()
     marker = root / ".incode" / "project.toml"
@@ -62,18 +74,7 @@ def test_legacy_default_marker_adds_java_without_rewriting_file(tmp_path: Path) 
             "id": "00000000-0000-0000-0000-000000000001",
             "name": "demo",
             "scan": {
-                "include": [
-                    "**/*.py",
-                    "**/*.pyi",
-                    "**/*.js",
-                    "**/*.jsx",
-                    "**/*.mjs",
-                    "**/*.cjs",
-                    "**/*.ts",
-                    "**/*.tsx",
-                    "**/*.mts",
-                    "**/*.cts",
-                ],
+                "include": list(legacy_includes),
                 "exclude": [],
                 "max_file_bytes": 1_048_576,
             },
@@ -83,7 +84,7 @@ def test_legacy_default_marker_adds_java_without_rewriting_file(tmp_path: Path) 
 
     project = read_project_marker(root)
 
-    assert project.scan.include[-1] == "**/*.java"
+    assert project.scan.include == DEFAULT_INCLUDES
     assert marker.read_text() == contents
 
 

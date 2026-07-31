@@ -39,38 +39,85 @@ LEGACY_DEFAULT_INCLUDES_V1 = [
     "**/*.cts",
 ]
 
-DEFAULT_INCLUDES = [*LEGACY_DEFAULT_INCLUDES_V1, "**/*.java"]
+LEGACY_DEFAULT_INCLUDES_V2 = [*LEGACY_DEFAULT_INCLUDES_V1, "**/*.java"]
+
+DEFAULT_INCLUDES = [
+    *LEGACY_DEFAULT_INCLUDES_V2,
+    "**/*.cs",
+    "**/*.csx",
+    "**/*.gd",
+    "**/*.gdshader",
+    "**/*.gdshaderinc",
+    "**/*.tres",
+    "**/*.tscn",
+    "**/*.godot",
+    "**/*.sql",
+    "**/*.yaml",
+    "**/*.yml",
+    "**/*.json",
+]
 
 # The kinds TreeSitterExtractor emits, plus the "_part" variants it produces when a
 # definition is split across chunks. Closed so MCP clients get an enum instead of a
 # free-text field; extend both halves together when a query file gains a capture.
 ChunkKind = Literal[
     "annotation",
+    "array",
     "class",
     "constant",
     "constructor",
     "enum",
     "function",
+    "index",
     "interface",
     "method",
     "module",
+    "object",
+    "property",
     "record",
+    "signal",
+    "struct",
+    "table",
+    "trigger",
     "type",
+    "view",
     "annotation_part",
+    "array_part",
     "class_part",
     "constant_part",
     "constructor_part",
     "enum_part",
     "function_part",
+    "index_part",
     "interface_part",
     "method_part",
+    "object_part",
+    "property_part",
     "record_part",
+    "signal_part",
+    "struct_part",
+    "table_part",
+    "trigger_part",
     "type_part",
+    "view_part",
 ]
 
 # Mirrors scanner.LANGUAGES values. Kept here rather than imported from scanner so
 # models stays free of scanner imports.
-LanguageName = Literal["python", "java", "javascript", "typescript", "tsx"]
+LanguageName = Literal[
+    "python",
+    "java",
+    "javascript",
+    "typescript",
+    "tsx",
+    "csharp",
+    "sql",
+    "gdscript",
+    "gdshader",
+    "godot_resource",
+    "yaml",
+    "json",
+]
 
 
 class FrozenModel(BaseModel):

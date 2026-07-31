@@ -1,0 +1,16 @@
+version: "3.9"
+services:
+  web:
+    image: nginx
+    ports:
+      - "80:80"
+    environment:
+      LOG_LEVEL: debug
+  db:
+    image: postgres
+    volumes: []
+matrix:
+  - name: linux
+    runner: ubuntu-latest
+  - name: macos
+    runner: macos-14

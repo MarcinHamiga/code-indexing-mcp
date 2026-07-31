@@ -22,12 +22,29 @@ LANGUAGES = {
     ".mts": "typescript",
     ".cts": "typescript",
     ".tsx": "tsx",
+    ".cs": "csharp",
+    ".csx": "csharp",
+    ".gd": "gdscript",
+    ".gdshader": "gdshader",
+    ".gdshaderinc": "gdshader",
+    ".tres": "godot_resource",
+    ".tscn": "godot_resource",
+    ".godot": "godot_resource",
+    ".sql": "sql",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".json": "json",
 }
 
 HARD_EXCLUDED_DIRECTORIES = {
     ".git",
     ".ci-mcp",
     ".incode",
+    # `.godot` is both an extension this scanner indexes and the name of Godot's
+    # own cache directory, which holds a generated copy of every imported asset.
+    # Excluding the directory does not exclude a `project.godot` file: only
+    # directory names are matched here.
+    ".godot",
     ".venv",
     "venv",
     "node_modules",

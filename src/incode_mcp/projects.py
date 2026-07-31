@@ -11,7 +11,13 @@ import tomli_w
 from pydantic import ValidationError
 
 from .errors import ErrorCode, IncodeError
-from .models import DEFAULT_INCLUDES, LEGACY_DEFAULT_INCLUDES_V1, ProjectInfo, ScanConfig
+from .models import (
+    DEFAULT_INCLUDES,
+    LEGACY_DEFAULT_INCLUDES_V1,
+    LEGACY_DEFAULT_INCLUDES_V2,
+    ProjectInfo,
+    ScanConfig,
+)
 
 MARKER_DIRECTORY = ".ci-mcp"
 LEGACY_MARKER_DIRECTORY = ".incode"
@@ -69,7 +75,10 @@ def read_project_marker(root: Path) -> ProjectInfo:
             raise ValueError("unsupported marker version")
         UUID(str(raw["id"]))
         scan = ScanConfig.model_validate(raw.get("scan", {}))
-        if scan.include == LEGACY_DEFAULT_INCLUDES_V1:
+        # A marker still carrying an older default include list is upgraded to the
+        # current one, so a project written before a language was supported picks
+        # it up. An include list the user has edited is left exactly as written.
+        if scan.include in (LEGACY_DEFAULT_INCLUDES_V1, LEGACY_DEFAULT_INCLUDES_V2):
             scan = scan.model_copy(update={"include": list(DEFAULT_INCLUDES)})
         return ProjectInfo(
             version=raw["version"],

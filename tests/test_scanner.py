@@ -3,9 +3,9 @@ from unittest.mock import patch
 
 import pytest
 
-from incode_mcp.models import ScanConfig
+from incode_mcp.models import DEFAULT_INCLUDES, ScanConfig
 from incode_mcp.projects import initialize_project
-from incode_mcp.scanner import SourceScanner
+from incode_mcp.scanner import LANGUAGES, SourceScanner
 
 
 def test_scanner_honors_languages_gitignore_and_hard_exclusions(tmp_path: Path) -> None:
@@ -30,17 +30,58 @@ def test_scanner_honors_languages_gitignore_and_hard_exclusions(tmp_path: Path) 
     assert {skip.reason for skip in result.skipped} >= {"unsupported", "ignored"}
 
 
-def test_scanner_discovers_java_files_by_default(tmp_path: Path) -> None:
+def test_default_includes_and_the_extension_map_describe_the_same_languages() -> None:
+    """The two lists are edited separately, and either one alone is useless.
+
+    An extension the scanner can classify but no default pattern matches is
+    never offered a file; a default pattern with no extension entry matches
+    files the scanner then rejects as unsupported.
+    """
+    assert {pattern.removeprefix("**/*") for pattern in DEFAULT_INCLUDES} == set(LANGUAGES)
+
+
+def test_scanner_discovers_every_default_language(tmp_path: Path) -> None:
+    """Every extension in the map is discovered under the default include list.
+
+    Driven off `LANGUAGES` rather than a hand-written list so a newly mapped
+    extension cannot quietly go undiscovered: the file is written from the map,
+    so it is missing from the result until the default patterns cover it too.
+    """
     root = tmp_path / "repo"
     root.mkdir()
     project = initialize_project(root)
-    (root / "Service.java").write_text("class Service {}\n")
+    for extension in LANGUAGES:
+        (root / f"sample{extension}").write_text("sample\n")
 
     result = SourceScanner().scan(project)
 
-    assert [(item.path.as_posix(), item.language) for item in result.files] == [
-        ("Service.java", "java"),
-    ]
+    assert [(item.path.as_posix(), item.language) for item in result.files] == sorted(
+        (f"sample{extension}", language) for extension, language in LANGUAGES.items()
+    )
+
+
+def test_godot_cache_directory_is_excluded_without_excluding_the_project_file(
+    tmp_path: Path,
+) -> None:
+    """`.godot` names both an indexed extension and Godot's asset cache.
+
+    A Godot project that has been opened in the editor carries a `.godot`
+    directory holding a generated copy of every imported asset, including
+    scenes. Nothing there is source, and the project's own `project.godot` has
+    to survive the exclusion.
+    """
+    root = tmp_path / "game"
+    root.mkdir()
+    project = initialize_project(root)
+    (root / "project.godot").write_text("config_version=5\n")
+    (root / "level.tscn").write_text('[node name="Player" type="Node2D"]\n')
+    cache = root / ".godot" / "imported"
+    cache.mkdir(parents=True)
+    (cache / "level.tscn").write_text('[node name="Generated" type="Node2D"]\n')
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["level.tscn", "project.godot"]
 
 
 def test_scanner_applies_nested_gitignore_and_config_excludes(tmp_path: Path) -> None:
