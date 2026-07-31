@@ -731,3 +731,56 @@ def configure_accelerator(
         )
     write_accelerator_record(record, plan, probe)
     return plan._replace(reason=f"{plan.reason}; {probe.get('detail', 'probe passed')}")
+
+
+def prepared_accelerator(install_directory: Path) -> str | None:
+    """Return the accelerator the recorded environment provides, if any."""
+
+    try:
+        record = accelerator_record_path(install_directory)
+        payload = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, ValueError, InstallerError):
+        return None
+    value = payload.get("accelerator")
+    return value if isinstance(value, str) and value else None
+
+
+def detection_report() -> list[str]:
+    """Human-readable facts about this machine's accelerator options."""
+
+    platform_name = _normalized_platform(sys.platform.lower())
+    machine = platform.machine().lower()
+    facts = [f"Platform: {platform_name}/{machine}"]
+    nvidia = _nvidia_smi_report()
+    facts.append(
+        "NVIDIA: "
+        + (nvidia.strip().splitlines()[0] if nvidia and nvidia.strip() else "not detected")
+    )
+    rocm = _rocm_report()
+    facts.append(f"ROCm: {rocm or 'not detected'}")
+    if platform_name == "darwin":
+        version = platform.mac_ver()[0]
+        facts.append(f"macOS: {version}")
+        problem = _mlx_problem(
+            platform_name=platform_name, machine=machine, platform_version=version
+        )
+        facts.append(f"MLX: {'available' if not problem else f'unavailable — {problem}'}")
+    webgpu_supported = WEBGPU_PLATFORMS.get(platform_name)
+    facts.append(
+        "WebGPU plugin wheels: "
+        + (
+            "available"
+            if webgpu_supported and machine in webgpu_supported
+            else f"not published for {platform_name}/{machine}"
+        )
+    )
+    cuda_supported = CUDA_PLATFORMS.get(platform_name)
+    facts.append(
+        "CUDA wheels: "
+        + (
+            "published"
+            if cuda_supported and machine in cuda_supported
+            else f"not published for {platform_name}/{machine}"
+        )
+    )
+    return facts
