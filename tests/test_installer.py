@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -7,6 +8,32 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+from incode_mcp.installer.accelerator import (
+    ACCELERATOR_ENVIRONMENT_DIRECTORY,
+    ACCELERATOR_EXTRAS,
+    AcceleratorPlan,
+    accelerator_lock_fingerprint,
+    configure_accelerator,
+    plan_accelerator,
+    probe_accelerator,
+    sync_accelerator_environment,
+    write_accelerator_record,
+)
+from incode_mcp.installer.config_files import (
+    InstallerError,
+    merge_codex_server,
+    merge_json_object_entry,
+)
+from incode_mcp.installer.harnesses import (
+    HARNESS_CHOICES,
+    configuration_path,
+    configure_harness,
+    configure_selected_harnesses,
+    install_skills,
+    parse_harness_selection,
+    skill_directory,
+)
 
 INSTALLER_PATH = Path(__file__).parents[1] / "install.py"
 SHELL_INSTALLER_PATH = Path(__file__).parents[1] / "install.sh"
@@ -18,6 +45,7 @@ SERVER_COMMAND = str(SERVER_BINARY)
 
 
 def load_installer() -> ModuleType:
+    """Load the stdlib-only bootstrap by path; only its own surface is tested here."""
     assert INSTALLER_PATH.exists(), "install.py does not exist"
     spec = importlib.util.spec_from_file_location("code_indexing_mcp_installer", INSTALLER_PATH)
     assert spec is not None
@@ -27,14 +55,10 @@ def load_installer() -> ModuleType:
     return module
 
 
-installer = load_installer()
-
-
 def test_json_merge_creates_parent_and_top_level_object(tmp_path: Path) -> None:
-    installer = load_installer()
     path = tmp_path / "nested" / "config.json"
 
-    changed = installer.merge_json_object_entry(
+    changed = merge_json_object_entry(
         path,
         "mcpServers",
         "code-indexing-mcp",
@@ -56,7 +80,6 @@ def test_json_merge_creates_parent_and_top_level_object(tmp_path: Path) -> None:
 def test_jsonc_merge_preserves_comments_trailing_commas_and_unrelated_entries(
     tmp_path: Path,
 ) -> None:
-    installer = load_installer()
     path = tmp_path / "config.jsonc"
     original = """{
   // This setting belongs to the user.
@@ -71,7 +94,7 @@ def test_jsonc_merge_preserves_comments_trailing_commas_and_unrelated_entries(
 """
     path.write_text(original)
 
-    changed = installer.merge_json_object_entry(
+    changed = merge_json_object_entry(
         path,
         "mcp",
         "code-indexing-mcp",
@@ -94,48 +117,44 @@ def test_jsonc_merge_preserves_comments_trailing_commas_and_unrelated_entries(
 
 
 def test_jsonc_merge_is_idempotent(tmp_path: Path) -> None:
-    installer = load_installer()
     path = tmp_path / "config.jsonc"
     entry = {"command": "/opt/ci-mcp", "args": ["serve"]}
 
-    assert installer.merge_json_object_entry(path, "mcpServers", "server", entry) is True
+    assert merge_json_object_entry(path, "mcpServers", "server", entry) is True
     first = path.read_text()
-    assert installer.merge_json_object_entry(path, "mcpServers", "server", entry) is False
+    assert merge_json_object_entry(path, "mcpServers", "server", entry) is False
 
     assert path.read_text() == first
 
 
 def test_jsonc_merge_rejects_invalid_input_without_modifying_it(tmp_path: Path) -> None:
-    installer = load_installer()
     path = tmp_path / "config.jsonc"
     original = '{"mcp": [}'
     path.write_text(original)
 
-    with pytest.raises(installer.InstallerError, match="Invalid JSON"):
-        installer.merge_json_object_entry(path, "mcp", "server", {"enabled": True})
+    with pytest.raises(InstallerError, match="Invalid JSON"):
+        merge_json_object_entry(path, "mcp", "server", {"enabled": True})
 
     assert path.read_text() == original
     assert not path.with_name("config.jsonc.bak").exists()
 
 
 def test_jsonc_merge_validates_unrelated_nested_values(tmp_path: Path) -> None:
-    installer = load_installer()
     path = tmp_path / "config.jsonc"
     original = '{"unrelated": {"broken": nope}}\n'
     path.write_text(original)
 
-    with pytest.raises(installer.InstallerError, match="Invalid JSON"):
-        installer.merge_json_object_entry(path, "mcp", "server", {"enabled": True})
+    with pytest.raises(InstallerError, match="Invalid JSON"):
+        merge_json_object_entry(path, "mcp", "server", {"enabled": True})
 
     assert path.read_text() == original
     assert not path.with_name("config.jsonc.bak").exists()
 
 
 def test_codex_merge_creates_server_table(tmp_path: Path) -> None:
-    installer = load_installer()
     path = tmp_path / "config.toml"
 
-    changed = installer.merge_codex_server(path, SERVER_BINARY)
+    changed = merge_codex_server(path, SERVER_BINARY)
 
     encoded_command = json.dumps(SERVER_COMMAND, ensure_ascii=False)
     assert changed is True
@@ -145,7 +164,6 @@ def test_codex_merge_creates_server_table(tmp_path: Path) -> None:
 
 
 def test_codex_merge_replaces_only_target_table_and_subtables(tmp_path: Path) -> None:
-    installer = load_installer()
     path = tmp_path / "config.toml"
     original = """# Keep this comment.
 model = "gpt-5"
@@ -166,7 +184,7 @@ example = true
 """
     path.write_text(original)
 
-    changed = installer.merge_codex_server(path, Path("/new/ci-mcp"))
+    changed = merge_codex_server(path, Path("/new/ci-mcp"))
 
     updated = path.read_text()
     assert changed is True
@@ -182,7 +200,6 @@ example = true
 
 
 def test_codex_merge_preserves_following_array_tables(tmp_path: Path) -> None:
-    installer = load_installer()
     path = tmp_path / "config.toml"
     original = """[mcp_servers.code-indexing-mcp]
 command = "old"
@@ -193,7 +210,7 @@ enabled = false
 """
     path.write_text(original)
 
-    installer.merge_codex_server(path, Path("/new/ci-mcp"))
+    merge_codex_server(path, Path("/new/ci-mcp"))
 
     parsed = tomllib.loads(path.read_text())
     assert parsed["skills"]["config"] == [
@@ -206,33 +223,30 @@ enabled = false
 
 
 def test_codex_merge_is_idempotent(tmp_path: Path) -> None:
-    installer = load_installer()
     path = tmp_path / "config.toml"
 
-    assert installer.merge_codex_server(path, Path("/opt/ci-mcp")) is True
+    assert merge_codex_server(path, Path("/opt/ci-mcp")) is True
     first = path.read_text()
-    assert installer.merge_codex_server(path, Path("/opt/ci-mcp")) is False
+    assert merge_codex_server(path, Path("/opt/ci-mcp")) is False
 
     assert path.read_text() == first
 
 
 def test_codex_merge_rejects_inline_target_without_corrupting_config(tmp_path: Path) -> None:
-    installer = load_installer()
     path = tmp_path / "config.toml"
     original = '[mcp_servers]\ncode-indexing-mcp = { command = "old", args = ["old"] }\n'
     path.write_text(original)
 
-    with pytest.raises(installer.InstallerError, match="inline or dotted"):
-        installer.merge_codex_server(path, Path("/opt/ci-mcp"))
+    with pytest.raises(InstallerError, match="inline or dotted"):
+        merge_codex_server(path, Path("/opt/ci-mcp"))
 
     assert path.read_text() == original
     assert not path.with_name("config.toml.bak").exists()
 
 
 def test_harness_menu_combines_codex_cli_and_desktop() -> None:
-    installer = load_installer()
 
-    assert [(choice.slug, choice.label) for choice in installer.HARNESS_CHOICES] == [
+    assert [(choice.slug, choice.label) for choice in HARNESS_CHOICES] == [
         ("codex", "Codex (CLI + Desktop)"),
         ("claude-code", "Claude Code"),
         ("kimi-code", "Kimi Code"),
@@ -243,23 +257,21 @@ def test_harness_menu_combines_codex_cli_and_desktop() -> None:
 
 
 def test_harness_selection_accepts_numbers_slugs_duplicates_and_all() -> None:
-    installer = load_installer()
 
-    assert installer.parse_harness_selection("1, 3, codex, opencode") == [
+    assert parse_harness_selection("1, 3, codex, opencode") == [
         "codex",
         "kimi-code",
         "opencode",
     ]
-    assert installer.parse_harness_selection("all") == [
-        choice.slug for choice in installer.HARNESS_CHOICES
+    assert parse_harness_selection("all") == [
+        choice.slug for choice in HARNESS_CHOICES
     ]
-    assert installer.parse_harness_selection("") == []
-    with pytest.raises(installer.InstallerError, match="Unknown harness"):
-        installer.parse_harness_selection("7")
+    assert parse_harness_selection("") == []
+    with pytest.raises(InstallerError, match="Unknown harness"):
+        parse_harness_selection("7")
 
 
 def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None:
-    installer = load_installer()
     environment = {
         "CODEX_HOME": str(tmp_path / "codex-home"),
         "KIMI_CODE_HOME": str(tmp_path / "kimi-home"),
@@ -269,31 +281,31 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
     }
 
     assert (
-        installer.configuration_path(
+        configuration_path(
             "codex", home=tmp_path, environment=environment, platform_name="darwin"
         )
         == tmp_path / "codex-home" / "config.toml"
     )
     assert (
-        installer.configuration_path(
+        configuration_path(
             "kimi-code", home=tmp_path, environment=environment, platform_name="darwin"
         )
         == tmp_path / "kimi-home" / "mcp.json"
     )
     assert (
-        installer.configuration_path(
+        configuration_path(
             "opencode", home=tmp_path, environment=environment, platform_name="darwin"
         )
         == tmp_path / "custom-opencode.jsonc"
     )
     assert (
-        installer.configuration_path(
+        configuration_path(
             "kilocode", home=tmp_path, environment=environment, platform_name="darwin"
         )
         == tmp_path / "xdg" / "kilo" / "kilo.jsonc"
     )
     assert (
-        installer.configuration_path(
+        configuration_path(
             "claude-desktop", home=tmp_path, environment=environment, platform_name="win32"
         )
         == tmp_path / "appdata" / "Claude" / "claude_desktop_config.json"
@@ -301,11 +313,10 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
 
 
 def test_claude_code_honors_config_directory_override(tmp_path: Path) -> None:
-    installer = load_installer()
     config_directory = tmp_path / "claude-config"
 
     assert (
-        installer.configuration_path(
+        configuration_path(
             "claude-code",
             home=tmp_path,
             environment={"CLAUDE_CONFIG_DIR": str(config_directory)},
@@ -316,11 +327,10 @@ def test_claude_code_honors_config_directory_override(tmp_path: Path) -> None:
 
 
 def test_kilocode_honors_config_file_override(tmp_path: Path) -> None:
-    installer = load_installer()
     config_file = tmp_path / "custom-kilo.jsonc"
 
     assert (
-        installer.configuration_path(
+        configuration_path(
             "kilocode",
             home=tmp_path,
             environment={
@@ -334,11 +344,10 @@ def test_kilocode_honors_config_file_override(tmp_path: Path) -> None:
 
 
 def test_kilocode_honors_config_directory_override(tmp_path: Path) -> None:
-    installer = load_installer()
     config_directory = tmp_path / "kilo-config"
 
     assert (
-        installer.configuration_path(
+        configuration_path(
             "kilocode",
             home=tmp_path,
             environment={"KILO_CONFIG_DIR": str(config_directory)},
@@ -403,9 +412,8 @@ def test_configure_json_harnesses(
     relative_path: str,
     expected_entry: dict[str, object],
 ) -> None:
-    installer = load_installer()
 
-    path = installer.configure_harness(
+    path = configure_harness(
         slug,
         SERVER_BINARY,
         home=tmp_path,
@@ -419,9 +427,8 @@ def test_configure_json_harnesses(
 
 
 def test_configure_codex_uses_shared_toml(tmp_path: Path) -> None:
-    installer = load_installer()
 
-    path = installer.configure_harness(
+    path = configure_harness(
         "codex",
         SERVER_BINARY,
         home=tmp_path,
@@ -438,10 +445,9 @@ def test_configure_codex_uses_shared_toml(tmp_path: Path) -> None:
 
 
 def test_claude_desktop_uses_linux_config_directory(tmp_path: Path) -> None:
-    installer = load_installer()
 
     assert (
-        installer.configuration_path(
+        configuration_path(
             "claude-desktop",
             home=tmp_path,
             environment={},
@@ -555,18 +561,17 @@ def test_sync_environment_runs_locked_sync_and_finds_server(tmp_path: Path) -> N
 def test_configure_selected_harnesses_isolates_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    installer = load_installer()
     attempted: list[str] = []
 
     def fake_configure(slug: str, command: Path, **kwargs: object) -> Path:
         attempted.append(slug)
         if slug == "claude-code":
-            raise installer.InstallerError("broken config")
+            raise InstallerError("broken config")
         return tmp_path / f"{slug}.json"
 
-    monkeypatch.setattr(installer, "configure_harness", fake_configure)
+    monkeypatch.setattr("incode_mcp.installer.harnesses.configure_harness", fake_configure)
 
-    successes, failures = installer.configure_selected_harnesses(
+    successes, failures = configure_selected_harnesses(
         ["codex", "claude-code", "kimi-code"],
         Path("/opt/ci-mcp"),
         home=tmp_path,
@@ -580,10 +585,9 @@ def test_configure_selected_harnesses_isolates_failures(
 
 
 def test_configure_selected_harnesses_isolates_non_utf8_config(tmp_path: Path) -> None:
-    installer = load_installer()
     (tmp_path / ".claude.json").write_bytes(b"\xff")
 
-    successes, failures = installer.configure_selected_harnesses(
+    successes, failures = configure_selected_harnesses(
         ["claude-code", "kimi-code"],
         Path("/opt/ci-mcp"),
         home=tmp_path,
@@ -749,31 +753,31 @@ def _skills_source(tmp_path: Path, names: tuple[str, ...] = ("alpha", "beta")) -
 
 def test_skill_directories_cover_supported_harnesses(tmp_path: Path) -> None:
     assert (
-        installer.skill_directory("claude-code", home=tmp_path, environment={})
+        skill_directory("claude-code", home=tmp_path, environment={})
         == tmp_path / ".claude" / "skills"
     )
     assert (
-        installer.skill_directory("codex", home=tmp_path, environment={})
+        skill_directory("codex", home=tmp_path, environment={})
         == tmp_path / ".agents" / "skills"
     )
     assert (
-        installer.skill_directory("kimi-code", home=tmp_path, environment={})
+        skill_directory("kimi-code", home=tmp_path, environment={})
         == tmp_path / ".agents" / "skills"
     )
     assert (
-        installer.skill_directory(
+        skill_directory(
             "opencode", home=tmp_path, environment={"XDG_CONFIG_HOME": str(tmp_path / "xdg")}
         )
         == tmp_path / "xdg" / "opencode" / "skills"
     )
-    assert installer.skill_directory("claude-desktop", home=tmp_path, environment={}) is None
-    assert installer.skill_directory("kilocode", home=tmp_path, environment={}) is None
+    assert skill_directory("claude-desktop", home=tmp_path, environment={}) is None
+    assert skill_directory("kilocode", home=tmp_path, environment={}) is None
 
 
 def test_skill_directory_honors_claude_config_dir(tmp_path: Path) -> None:
     environment = {"CLAUDE_CONFIG_DIR": str(tmp_path / "custom-claude")}
     assert (
-        installer.skill_directory("claude-code", home=tmp_path, environment=environment)
+        skill_directory("claude-code", home=tmp_path, environment=environment)
         == tmp_path / "custom-claude" / "skills"
     )
 
@@ -781,7 +785,7 @@ def test_skill_directory_honors_claude_config_dir(tmp_path: Path) -> None:
 def test_install_skills_links_bundled_skills(tmp_path: Path) -> None:
     repo = _skills_source(tmp_path)
 
-    results = installer.install_skills(["claude-code"], repo, home=tmp_path, environment={})
+    results = install_skills(["claude-code"], repo, home=tmp_path, environment={})
 
     skills_dir = tmp_path / ".claude" / "skills"
     for name in ("alpha", "beta"):
@@ -796,9 +800,9 @@ def test_install_skills_links_bundled_skills(tmp_path: Path) -> None:
 
 def test_install_skills_is_idempotent(tmp_path: Path) -> None:
     repo = _skills_source(tmp_path)
-    installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+    install_skills(["codex"], repo, home=tmp_path, environment={})
 
-    results = installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+    results = install_skills(["codex"], repo, home=tmp_path, environment={})
 
     _slug, message = results[0]
     assert "0 linked" in message
@@ -815,9 +819,9 @@ def test_install_skills_is_idempotent_across_equivalent_source_paths(tmp_path: P
     repo = _skills_source(tmp_path, names=("alpha",))
     alias = tmp_path / "alias"
     alias.symlink_to(repo, target_is_directory=True)
-    installer.install_skills(["codex"], alias, home=tmp_path, environment={})
+    install_skills(["codex"], alias, home=tmp_path, environment={})
 
-    results = installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+    results = install_skills(["codex"], repo, home=tmp_path, environment={})
 
     _slug, message = results[0]
     assert "0 linked" in message
@@ -830,7 +834,7 @@ def test_install_skills_backs_up_clashing_directory(tmp_path: Path) -> None:
     clash.mkdir(parents=True)
     (clash / "SKILL.md").write_text("old", encoding="utf-8")
 
-    installer.install_skills(["kimi-code"], repo, home=tmp_path, environment={})
+    install_skills(["kimi-code"], repo, home=tmp_path, environment={})
 
     assert (tmp_path / ".agents" / "skills" / "alpha").is_symlink()
     backup = tmp_path / ".agents" / "skills" / "alpha.bak"
@@ -847,7 +851,7 @@ def test_install_skills_backs_up_clashing_symlink(tmp_path: Path) -> None:
     skills_dir.mkdir(parents=True)
     (skills_dir / "alpha").symlink_to(elsewhere, target_is_directory=True)
 
-    installer.install_skills(["kimi-code"], repo, home=tmp_path, environment={})
+    install_skills(["kimi-code"], repo, home=tmp_path, environment={})
 
     link = skills_dir / "alpha"
     assert link.is_symlink()
@@ -860,7 +864,7 @@ def test_install_skills_backs_up_clashing_symlink(tmp_path: Path) -> None:
 def test_install_skills_skips_unsupported_harness(tmp_path: Path) -> None:
     repo = _skills_source(tmp_path)
 
-    results = installer.install_skills(["claude-desktop"], repo, home=tmp_path, environment={})
+    results = install_skills(["claude-desktop"], repo, home=tmp_path, environment={})
 
     slug, message = results[0]
     assert slug == "claude-desktop"
@@ -869,7 +873,7 @@ def test_install_skills_skips_unsupported_harness(tmp_path: Path) -> None:
 
 
 def test_install_skills_reports_missing_source(tmp_path: Path) -> None:
-    results = installer.install_skills(
+    results = install_skills(
         ["codex"], tmp_path / "empty-repo", home=tmp_path, environment={}
     )
 
@@ -887,8 +891,8 @@ def test_reinstall_from_a_new_checkout_keeps_the_original_backup(tmp_path: Path)
     mine.mkdir(parents=True)
     (mine / "SKILL.md").write_text("mine", encoding="utf-8")
 
-    installer.install_skills(["codex"], first, home=tmp_path, environment={})
-    installer.install_skills(["codex"], second, home=tmp_path, environment={})
+    install_skills(["codex"], first, home=tmp_path, environment={})
+    install_skills(["codex"], second, home=tmp_path, environment={})
 
     assert (skills_dir / "alpha").resolve() == (
         second / "src" / "incode_mcp" / "skills" / "alpha"
@@ -905,7 +909,7 @@ def test_install_skills_never_overwrites_an_existing_backup(tmp_path: Path) -> N
         entry.mkdir(parents=True)
         (entry / "SKILL.md").write_text(content, encoding="utf-8")
 
-    installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+    install_skills(["codex"], repo, home=tmp_path, environment={})
 
     assert (skills_dir / "alpha").is_symlink()
     assert (skills_dir / "alpha.bak" / "SKILL.md").read_text(encoding="utf-8") == "older"
@@ -926,7 +930,7 @@ def test_install_skills_leaves_existing_skills_in_place_when_symlinks_fail(
 
     monkeypatch.setattr(Path, "symlink_to", refuse)
 
-    results = installer.install_skills(["codex"], repo, home=tmp_path, environment={})
+    results = install_skills(["codex"], repo, home=tmp_path, environment={})
 
     _slug, message = results[0]
     assert "skipped" in message
@@ -994,9 +998,8 @@ def test_accelerator_detection_nominates_only_a_supported_pinned_combination(
     expected: str,
     reason: str,
 ) -> None:
-    installer = load_installer()
 
-    plan = installer.plan_accelerator(
+    plan = plan_accelerator(
         requested,
         platform_name=platform_name,
         machine=machine,
@@ -1027,9 +1030,8 @@ def test_webgpu_is_prepared_only_where_the_locked_plugin_has_a_wheel(
     platform_version: str,
     expected: str,
 ) -> None:
-    installer = load_installer()
 
-    plan = installer.plan_accelerator(
+    plan = plan_accelerator(
         "webgpu",
         platform_name=platform_name,
         machine=machine,
@@ -1060,9 +1062,8 @@ def test_migraphx_uses_only_the_pinned_rocm_python_matrix_then_falls_back(
     expected: str,
     honored: bool,
 ) -> None:
-    installer = load_installer()
 
-    plan = installer.plan_accelerator(
+    plan = plan_accelerator(
         "migraphx",
         platform_name=platform_name,
         machine=machine,
@@ -1103,9 +1104,8 @@ def test_mlx_is_prepared_only_on_apple_silicon_with_a_published_wheel(
     Nominating one of those would prepare a "Metal" environment with no Metal in
     it, which would pass its own probe and then lose to the CPU it really is.
     """
-    installer = load_installer()
 
-    plan = installer.plan_accelerator(
+    plan = plan_accelerator(
         "mlx",
         platform_name=platform_name,
         machine=machine,
@@ -1131,9 +1131,8 @@ def test_an_unsupported_mlx_request_does_not_fall_through_to_webgpu() -> None:
     A request for Metal on a machine with no Metal is not a request for Vulkan,
     so this reports CPU and says why instead.
     """
-    installer = load_installer()
 
-    plan = installer.plan_accelerator(
+    plan = plan_accelerator(
         "mlx",
         platform_name="linux",
         machine="x86_64",
@@ -1149,9 +1148,8 @@ def test_an_unsupported_mlx_request_does_not_fall_through_to_webgpu() -> None:
 
 def test_auto_prepares_mlx_on_apple_silicon() -> None:
     """MLX passed the gates CUDA passed, so `auto` prepares it unasked."""
-    installer = load_installer()
 
-    plan = installer.plan_accelerator(
+    plan = plan_accelerator(
         "auto",
         platform_name="darwin",
         machine="arm64",
@@ -1167,9 +1165,8 @@ def test_auto_prepares_mlx_on_apple_silicon() -> None:
 
 
 def test_auto_on_an_unsupported_mac_reports_the_same_reason_it_always_did() -> None:
-    installer = load_installer()
 
-    plan = installer.plan_accelerator(
+    plan = plan_accelerator(
         "auto",
         platform_name="darwin",
         machine="x86_64",
@@ -1186,9 +1183,8 @@ def test_auto_on_an_unsupported_mac_reports_the_same_reason_it_always_did() -> N
 
 def test_an_explicit_cuda_request_is_never_answered_with_mlx() -> None:
     """An override names a backend, not "whatever this machine has"."""
-    installer = load_installer()
 
-    plan = installer.plan_accelerator(
+    plan = plan_accelerator(
         "cuda",
         platform_name="darwin",
         machine="arm64",
@@ -1203,9 +1199,8 @@ def test_an_explicit_cuda_request_is_never_answered_with_mlx() -> None:
 
 
 def test_all_accelerator_environments_have_a_locked_extra() -> None:
-    installer = load_installer()
 
-    assert installer.ACCELERATOR_EXTRAS == {
+    assert ACCELERATOR_EXTRAS == {
         "cuda": "cuda",
         "mlx": "mlx",
         "webgpu": "webgpu",
@@ -1230,9 +1225,8 @@ def test_all_accelerator_environments_have_a_locked_extra() -> None:
 def test_only_a_denied_request_is_reported_as_a_problem(
     requested: str, platform_name: str, honored: bool
 ) -> None:
-    installer = load_installer()
 
-    plan = installer.plan_accelerator(
+    plan = plan_accelerator(
         requested,
         platform_name=platform_name,
         machine="arm64",
@@ -1251,14 +1245,15 @@ def test_a_cpu_installation_retracts_an_earlier_accelerator_offer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A machine reinstalled as CPU-only must stop advertising a GPU it had."""
-    installer = load_installer()
     data = tmp_path / "data"
     data.mkdir()
     record = data / "accelerator.json"
     record.write_text('{"schema_version": 1}', encoding="utf-8")
-    monkeypatch.setattr(installer, "runtime_record_path", lambda python: data / "accelerator.json")
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.runtime_record_path",
+        lambda python: data / "accelerator.json")
 
-    plan = installer.configure_accelerator(tmp_path / "checkout", "cpu")
+    plan = configure_accelerator(tmp_path / "checkout", "cpu")
 
     assert plan.accelerator == "cpu"
     assert not record.exists()
@@ -1267,14 +1262,17 @@ def test_a_cpu_installation_retracts_an_earlier_accelerator_offer(
 def test_a_prepared_accelerator_is_recorded_only_after_its_probe_passes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    installer = load_installer()
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     data = tmp_path / "data"
     probed: list[tuple[Path, str]] = []
-    monkeypatch.setattr(installer, "runtime_record_path", lambda python: data / "accelerator.json")
-    monkeypatch.setattr(installer, "interpreter_version", lambda python: "3.12")
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.runtime_record_path",
+        lambda python: data / "accelerator.json")
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.interpreter_version",
+        lambda python: "3.12")
 
     def fake_probe(python: Path, accelerator: str, *, offline: bool = False) -> dict[str, object]:
         probed.append((python, accelerator))
@@ -1288,9 +1286,9 @@ def test_a_prepared_accelerator_is_recorded_only_after_its_probe_passes(
             "detail": "probed 2 passages on CUDAExecutionProvider",
         }
 
-    monkeypatch.setattr(installer, "probe_accelerator", fake_probe)
+    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator", fake_probe)
 
-    plan = installer.configure_accelerator(
+    plan = configure_accelerator(
         checkout,
         "cuda",
         uv_executable=str(_fake_uv(tmp_path)),
@@ -1327,17 +1325,20 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
     platform_name: str,
     machine: str,
 ) -> None:
-    installer = load_installer()
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     record = tmp_path / "data" / "accelerator.json"
-    interpreter = checkout / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY / "bin" / "python"
+    interpreter = checkout / ACCELERATOR_ENVIRONMENT_DIRECTORY / "bin" / "python"
     interpreter.parent.mkdir(parents=True)
     interpreter.write_text("", encoding="utf-8")
     synced: list[str] = []
-    monkeypatch.setattr(installer, "runtime_record_path", lambda python: record)
-    monkeypatch.setattr(installer, "interpreter_version", lambda python: "3.12")
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.runtime_record_path",
+        lambda python: record)
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.interpreter_version",
+        lambda python: "3.12")
 
     def fake_sync(
         install_directory: Path,
@@ -1347,10 +1348,8 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
         synced.append(extra)
         return interpreter
 
-    monkeypatch.setattr(installer, "sync_accelerator_environment", fake_sync)
-    monkeypatch.setattr(
-        installer,
-        "probe_accelerator",
+    monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", fake_sync)
+    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator",
         lambda python, accelerator, *, offline=False: {
             "ok": True,
             "interpreter": str(python),
@@ -1362,7 +1361,7 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
         },
     )
 
-    plan = installer.configure_accelerator(
+    plan = configure_accelerator(
         checkout,
         requested,
         platform_name=platform_name,
@@ -1383,13 +1382,12 @@ def test_the_installer_record_is_the_shape_the_runtime_reads(
     """install.py is stdlib-only, so the schema it writes is pinned by this test."""
     from incode_mcp.accelerator_env import load_environment
 
-    installer = load_installer()
     interpreter = tmp_path / "python"
     interpreter.write_text("", encoding="utf-8")
     data = tmp_path / "data"
-    plan = installer.AcceleratorPlan("cuda", "detected", driver_version="550.54.14")
+    plan = AcceleratorPlan("cuda", "detected", driver_version="550.54.14")
 
-    installer.write_accelerator_record(
+    write_accelerator_record(
         data / "accelerator.json",
         plan,
         {
@@ -1414,7 +1412,6 @@ def test_a_failed_probe_rolls_the_installation_back_to_cpu(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A half-built environment must leave nothing the server could pick up."""
-    installer = load_installer()
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
@@ -1422,17 +1419,21 @@ def test_a_failed_probe_rolls_the_installation_back_to_cpu(
     data.mkdir()
     stale = data / "accelerator.json"
     stale.write_text('{"schema_version": 1}', encoding="utf-8")
-    monkeypatch.setattr(installer, "runtime_record_path", lambda python: data / "accelerator.json")
-    monkeypatch.setattr(installer, "interpreter_version", lambda python: "3.12")
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.runtime_record_path",
+        lambda python: data / "accelerator.json")
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.interpreter_version",
+        lambda python: "3.12")
 
     def failing_probe(
         python: Path, accelerator: str, *, offline: bool = False
     ) -> dict[str, object]:
-        raise installer.InstallerError("The accelerator probe failed: no CUDA-capable device")
+        raise InstallerError("The accelerator probe failed: no CUDA-capable device")
 
-    monkeypatch.setattr(installer, "probe_accelerator", failing_probe)
+    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator", failing_probe)
 
-    plan = installer.configure_accelerator(
+    plan = configure_accelerator(
         checkout,
         "cuda",
         uv_executable=str(_fake_uv(tmp_path)),
@@ -1445,13 +1446,12 @@ def test_a_failed_probe_rolls_the_installation_back_to_cpu(
     assert "could not be prepared" in plan.reason
     assert "no CUDA-capable device" in plan.reason
     assert not stale.exists()
-    assert not (checkout / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY).exists()
+    assert not (checkout / ACCELERATOR_ENVIRONMENT_DIRECTORY).exists()
 
 
 def test_an_unresolvable_data_directory_never_fails_the_installation(tmp_path: Path) -> None:
-    installer = load_installer()
 
-    plan = installer.configure_accelerator(tmp_path / "checkout", "auto")
+    plan = configure_accelerator(tmp_path / "checkout", "auto")
 
     assert plan.accelerator == "cpu"
     assert "data directory could not be resolved" in plan.reason
@@ -1463,10 +1463,9 @@ def test_the_probe_refuses_an_environment_that_does_not_offer_the_provider() -> 
     This is the pairing that matters -- the probe's report format and the
     installer's reading of it -- exercised end to end without a GPU.
     """
-    installer = load_installer()
 
-    with pytest.raises(installer.InstallerError) as failure:
-        installer.probe_accelerator(Path(sys.executable), "cuda")
+    with pytest.raises(InstallerError) as failure:
+        probe_accelerator(Path(sys.executable), "cuda")
 
     message = str(failure.value)
     assert "The accelerator probe failed" in message
@@ -1475,38 +1474,33 @@ def test_the_probe_refuses_an_environment_that_does_not_offer_the_provider() -> 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs a POSIX shell script")
 def test_a_probe_that_reports_nothing_is_a_failure_not_a_pass(tmp_path: Path) -> None:
-    installer = load_installer()
     silent = tmp_path / "silent-python"
     silent.write_text("#!/bin/sh\nexit 5\n", encoding="utf-8")
     silent.chmod(0o755)
 
-    with pytest.raises(installer.InstallerError, match="returned no report"):
-        installer.probe_accelerator(silent, "cuda")
+    with pytest.raises(InstallerError, match="returned no report"):
+        probe_accelerator(silent, "cuda")
 
 
 def _prepared_checkout(
-    installer: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, Path, Path]:
-    """A checkout whose accelerator environment an earlier run already built.
-
-    *installer* is threaded through because ``load_installer`` builds a fresh
-    module every call: patching one instance leaves every other one untouched.
-    """
+    """A checkout whose accelerator environment an earlier run already built."""
     checkout = tmp_path / "checkout"
     (checkout / "uv.lock").parent.mkdir(parents=True)
     (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
-    accelerator_env = checkout / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY
+    accelerator_env = checkout / ACCELERATOR_ENVIRONMENT_DIRECTORY
     accelerator_env.mkdir(parents=True)
     interpreter = accelerator_env / "python"
     interpreter.write_text("", encoding="utf-8")
     record = tmp_path / "data" / "accelerator.json"
-    installer.write_accelerator_record(
+    write_accelerator_record(
         record,
-        installer.AcceleratorPlan(
+        AcceleratorPlan(
             "cuda",
             "detected",
             driver_version="550.54.14",
-            lock_fingerprint=installer.accelerator_lock_fingerprint(checkout, "cuda"),
+            lock_fingerprint=accelerator_lock_fingerprint(checkout, "cuda"),
         ),
         {
             "interpreter": str(interpreter),
@@ -1517,8 +1511,12 @@ def _prepared_checkout(
             "detail": "probed 2 passages",
         },
     )
-    monkeypatch.setattr(installer, "runtime_record_path", lambda python: record)
-    monkeypatch.setattr(installer, "interpreter_version", lambda python: "3.12")
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.runtime_record_path",
+        lambda python: record)
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.interpreter_version",
+        lambda python: "3.12")
     return checkout, record, accelerator_env
 
 
@@ -1526,17 +1524,16 @@ def test_an_unchanged_machine_reuses_its_environment_instead_of_rebuilding_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Re-running the installer must not re-download CUDA and re-probe the GPU."""
-    installer = load_installer()
-    checkout, record, _ = _prepared_checkout(installer, tmp_path, monkeypatch)
+    checkout, record, _ = _prepared_checkout(tmp_path, monkeypatch)
     before = record.read_text(encoding="utf-8")
 
     def refuse(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("the environment was rebuilt or re-probed")
 
-    monkeypatch.setattr(installer, "sync_accelerator_environment", refuse)
-    monkeypatch.setattr(installer, "probe_accelerator", refuse)
+    monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", refuse)
+    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator", refuse)
 
-    plan = installer.configure_accelerator(
+    plan = configure_accelerator(
         checkout,
         "cuda",
         nvidia_report=lambda: "550.54.14, NVIDIA A100",
@@ -1558,17 +1555,16 @@ def test_an_unremovable_accelerator_environment_stops_the_build_not_the_install(
     the caller degrades on InstallerError alone -- a raw OSError here would
     abort an installation that had every reason to finish on CPU.
     """
-    installer = load_installer()
-    stale = tmp_path / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY
+    stale = tmp_path / ACCELERATOR_ENVIRONMENT_DIRECTORY
     stale.mkdir(parents=True)
 
     def locked(*_args: object, **_kwargs: object) -> None:
         raise PermissionError(13, "The process cannot access the file")
 
-    monkeypatch.setattr(installer.shutil, "rmtree", locked)
+    monkeypatch.setattr(shutil, "rmtree", locked)
 
-    with pytest.raises(installer.InstallerError) as caught:
-        installer.sync_accelerator_environment(
+    with pytest.raises(InstallerError) as caught:
+        sync_accelerator_environment(
             tmp_path, "cuda", python_version="3.12", uv_executable="uv"
         )
 
@@ -1586,19 +1582,18 @@ def test_a_driver_or_python_that_moved_forces_the_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, driver: str, python_version: str
 ) -> None:
     """The record vouches for one combination; anything else has to be re-proven."""
-    installer = load_installer()
-    checkout, _, _ = _prepared_checkout(installer, tmp_path, monkeypatch)
-    monkeypatch.setattr(installer, "interpreter_version", lambda python: python_version)
+    checkout, _, _ = _prepared_checkout(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.interpreter_version",
+        lambda python: python_version)
     rebuilt: list[str] = []
 
     def fake_sync(*_args: object, **_kwargs: object) -> Path:
         rebuilt.append("sync")
-        return checkout / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY / "python"
+        return checkout / ACCELERATOR_ENVIRONMENT_DIRECTORY / "python"
 
-    monkeypatch.setattr(installer, "sync_accelerator_environment", fake_sync)
-    monkeypatch.setattr(
-        installer,
-        "probe_accelerator",
+    monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", fake_sync)
+    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator",
         lambda python, accelerator, *, offline=False: {
             "ok": True,
             "interpreter": str(python),
@@ -1607,7 +1602,7 @@ def test_a_driver_or_python_that_moved_forces_the_rebuild(
         },
     )
 
-    plan = installer.configure_accelerator(
+    plan = configure_accelerator(
         checkout,
         "cuda",
         nvidia_report=lambda: f"{driver}, NVIDIA A100",
@@ -1622,19 +1617,16 @@ def test_a_driver_or_python_that_moved_forces_the_rebuild(
 def test_a_changed_lockfile_forces_the_accelerator_environment_to_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    installer = load_installer()
-    checkout, _, _ = _prepared_checkout(installer, tmp_path, monkeypatch)
+    checkout, _, _ = _prepared_checkout(tmp_path, monkeypatch)
     (checkout / "uv.lock").write_text("version = 2\n", encoding="utf-8")
     rebuilt: list[str] = []
 
     def fake_sync(*_args: object, **_kwargs: object) -> Path:
         rebuilt.append("sync")
-        return checkout / installer.ACCELERATOR_ENVIRONMENT_DIRECTORY / "python"
+        return checkout / ACCELERATOR_ENVIRONMENT_DIRECTORY / "python"
 
-    monkeypatch.setattr(installer, "sync_accelerator_environment", fake_sync)
-    monkeypatch.setattr(
-        installer,
-        "probe_accelerator",
+    monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", fake_sync)
+    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator",
         lambda python, accelerator, *, offline=False: {
             "ok": True,
             "interpreter": str(python),
@@ -1644,7 +1636,7 @@ def test_a_changed_lockfile_forces_the_accelerator_environment_to_rebuild(
         },
     )
 
-    plan = installer.configure_accelerator(
+    plan = configure_accelerator(
         checkout,
         "cuda",
         nvidia_report=lambda: "550.54.14, NVIDIA A100",
@@ -1660,32 +1652,31 @@ def test_a_checkout_without_a_lockfile_cannot_fingerprint_an_accelerator(
     tmp_path: Path,
 ) -> None:
     """A missing lock is a broken checkout, never silently some other lockfile."""
-    installer = load_installer()
 
-    with pytest.raises(installer.InstallerError, match="lockfile cannot be read"):
-        installer.accelerator_lock_fingerprint(tmp_path, "cuda")
+    with pytest.raises(InstallerError, match="lockfile cannot be read"):
+        accelerator_lock_fingerprint(tmp_path, "cuda")
 
 
 def test_migraphx_detection_uses_the_serving_interpreter_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    installer = load_installer()
     checkout = tmp_path / "checkout"
     captured: dict[str, object] = {}
-    monkeypatch.setattr(installer, "interpreter_version", lambda python: "3.13")
     monkeypatch.setattr(
-        installer,
-        "accelerator_record_path",
+        "incode_mcp.installer.accelerator.interpreter_version",
+        lambda python: "3.13")
+    monkeypatch.setattr(
+        "incode_mcp.installer.accelerator.accelerator_record_path",
         lambda *args, **kwargs: tmp_path / "accelerator.json",
     )
 
     def capture_plan(requested: str, **kwargs: object) -> object:
         captured.update(kwargs)
-        return installer.AcceleratorPlan("cpu", "test plan")
+        return AcceleratorPlan("cpu", "test plan")
 
-    monkeypatch.setattr(installer, "plan_accelerator", capture_plan)
+    monkeypatch.setattr("incode_mcp.installer.accelerator.plan_accelerator", capture_plan)
 
-    installer.configure_accelerator(
+    configure_accelerator(
         checkout,
         "migraphx",
         platform_name="linux",
@@ -1699,10 +1690,9 @@ def test_a_cpu_installation_reclaims_the_environment_it_no_longer_points_at(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The record and the gigabytes behind it are retired together."""
-    installer = load_installer()
-    checkout, record, accelerator_env = _prepared_checkout(installer, tmp_path, monkeypatch)
+    checkout, record, accelerator_env = _prepared_checkout(tmp_path, monkeypatch)
 
-    plan = installer.configure_accelerator(checkout, "cpu")
+    plan = configure_accelerator(checkout, "cpu")
 
     assert plan.accelerator == "cpu"
     assert not record.exists()
@@ -1714,11 +1704,10 @@ def test_a_probe_that_never_finishes_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Output is captured, so an unbounded probe is indistinguishable from a hang."""
-    installer = load_installer()
-    monkeypatch.setattr(installer, "PROBE_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr("incode_mcp.installer.accelerator.PROBE_TIMEOUT_SECONDS", 1)
     stalled = tmp_path / "stalled-python"
     stalled.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
     stalled.chmod(0o755)
 
-    with pytest.raises(installer.InstallerError, match="did not finish within"):
-        installer.probe_accelerator(stalled, "cuda")
+    with pytest.raises(InstallerError, match="did not finish within"):
+        probe_accelerator(stalled, "cuda")
