@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import (
@@ -20,9 +22,12 @@ from textual.widgets import (
 
 from .. import accelerator as accelerator_module
 from .. import harnesses
-from ..orchestrator import InstallResult
+from ..orchestrator import InstallResult, run_install
 from ..wizard import WizardState
 from .settings_form import SettingsPanel
+
+if TYPE_CHECKING:
+    from .app import InstallerApp
 
 __all__ = [
     "AcceleratorPanel",
@@ -228,18 +233,52 @@ class ProgressPanel(Vertical):
         self.cancelled = False
 
     def compose(self) -> ComposeResult:
-        yield Label("Progress")
+        yield Label("Running the installation")
+        yield Static(
+            "The accelerator environment build and its probe can take several minutes.",
+            classes="help",
+        )
         yield RichLog(id="progress-log")
         yield Button("Cancel", id="progress-cancel", variant="error")
 
     def start(self) -> None:
-        raise NotImplementedError
+        self.cancelled = False
+        self.query_one("#progress-cancel", Button).disabled = False
+        self._run_pipeline()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "progress-cancel":
+            self.cancelled = True
+            event.button.disabled = True
+            self._log_line("cancel requested; stopping after the current step")
+            event.stop()
+
+    def _log_line(self, line: str) -> None:
+        self.query_one("#progress-log", RichLog).write(line)
+
+    @work(thread=True)
+    def _run_pipeline(self) -> None:
+        result: InstallResult | None = None
+        error: Exception | None = None
+        try:
+            result = run_install(
+                self.state.to_plan(),
+                on_event=lambda event: self.app.call_from_thread(
+                    self._log_line,
+                    f"[{event.step}] {event.status}: {event.detail}",
+                ),
+                should_continue=lambda: not self.cancelled,
+            )
+        except Exception as exc:  # surfaced on the Done screen
+            error = exc
+        app = cast("InstallerApp", self.app)
+        app.call_from_thread(app.finish, result, error=error, cancelled=self.cancelled)
 
 
 class DonePanel(Vertical):
     def compose(self) -> ComposeResult:
         yield Label(id="done-title")
-        yield Label("", id="done-body")
+        yield Static("", id="done-body")
         yield Button("Exit", id="exit", variant="primary")
 
     def show_result(
@@ -249,4 +288,32 @@ class DonePanel(Vertical):
         error: Exception | None = None,
         cancelled: bool = False,
     ) -> None:
-        raise NotImplementedError
+        lines: list[str] = []
+        if cancelled:
+            title = "Installation cancelled"
+            lines.append("Stopped between steps; anything already written above still applies.")
+        elif error is not None:
+            title = "Installation failed"
+            lines.append(str(error))
+        elif result is None:
+            title = "Installation failed"
+            lines.append("No result was produced.")
+        else:
+            title = "Installation complete"
+            if result.accelerator_plan is not None:
+                plan = result.accelerator_plan
+                marker = "" if plan.honored else " (fell back to CPU)"
+                lines.append(f"Accelerator: {plan.accelerator}{marker}\n  {plan.reason}")
+            for slug, path in result.configured:
+                lines.append(f"Configured {slug}: {path}")
+            for slug, message in result.failures:
+                lines.append(f"FAILED {slug}: {message}")
+            for slug, message in result.skills:
+                lines.append(f"Skills for {slug}: {message}")
+            if result.failures:
+                title = "Installation complete with failures"
+        lines.append("")
+        lines.append("Restart configured clients to load the MCP server.")
+        lines.append("Reconfigure later with: code-indexing-mcp configure")
+        self.query_one("#done-title", Label).update(title)
+        self.query_one("#done-body", Static).update("\n".join(lines))

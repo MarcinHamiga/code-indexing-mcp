@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from textual.pilot import Pilot
+from textual.widgets import Static
 
 from incode_mcp.installer.tui.app import InstallerApp
 from incode_mcp.installer.wizard import WizardState
@@ -189,3 +190,80 @@ async def test_summary_warns_about_accelerator_disk_cost(tmp_path: Path) -> None
             await click(pilot, "#next")
         text = str(app.query_one("#summary-body", Static).render())
         assert "gigabytes" in text
+
+
+def _fake_result(failures: tuple = ()):  # type: ignore[no-untyped-def]
+    from incode_mcp.installer.accelerator import AcceleratorPlan
+    from incode_mcp.installer.orchestrator import InstallResult
+
+    return InstallResult(
+        AcceleratorPlan("cpu", "CPU was requested"),
+        (("kimi-code", Path("/home/u/.kimi-code/mcp.json")),),
+        failures,
+        (("kimi-code", "2 linked, 2 already installed"),),
+    )
+
+
+@pytest.mark.asyncio
+async def test_progress_runs_pipeline_and_finishes_on_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import incode_mcp.installer.tui.panels as panels
+    from incode_mcp.installer.orchestrator import StepEvent
+
+    def fake_run_install(plan, on_event=lambda event: None, should_continue=lambda: True):  # type: ignore[no-untyped-def]
+        on_event(StepEvent("accelerator", "started", "auto"))
+        on_event(StepEvent("accelerator", "finished", "cpu (ok)"))
+        return _fake_result()
+
+    monkeypatch.setattr(panels, "run_install", fake_run_install)
+    state = _install_state(tmp_path)
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        for _ in range(7):
+            await click(pilot, "#next")
+        await pilot.pause()
+        assert app.current == "done"
+        assert app.done_code == 0
+        body = str(app.query_one("#done-body", Static).render())
+        assert "mcp.json" in body
+
+
+@pytest.mark.asyncio
+async def test_done_reports_failures_with_exit_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import incode_mcp.installer.tui.panels as panels
+
+    monkeypatch.setattr(
+        panels,
+        "run_install",
+        lambda plan, on_event=None, should_continue=None: _fake_result((("codex", "broken"),)),
+    )
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        for _ in range(7):
+            await click(pilot, "#next")
+        await pilot.pause()
+        assert app.done_code == 1
+        assert "codex" in str(app.query_one("#done-body", Static).render())
+
+
+@pytest.mark.asyncio
+async def test_pipeline_error_finishes_with_exit_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import incode_mcp.installer.tui.panels as panels
+    from incode_mcp.installer.config_files import InstallerError
+
+    def explode(plan, on_event=None, should_continue=None):  # type: ignore[no-untyped-def]
+        raise InstallerError("boom")
+
+    monkeypatch.setattr(panels, "run_install", explode)
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        for _ in range(7):
+            await click(pilot, "#next")
+        await pilot.pause()
+        assert app.done_code == 1
+        assert "boom" in str(app.query_one("#done-body", Static).render())
