@@ -234,22 +234,32 @@ Incremental refreshes:
 These languages are supported, all through bundled grammars that need no toolchain of their own —
 no JDK, Maven, Gradle, .NET SDK, Godot, or database connection:
 
-| Language   | Extensions                                | Extracted symbol kinds                                                                  |
-| ---------- | ----------------------------------------- | --------------------------------------------------------------------------------------- |
-| Python     | `.py`, `.pyi`                             | classes, functions, methods                                                              |
-| Java       | `.java`                                   | classes, interfaces, records, enums, annotation types, methods, constructors, enum constants |
-| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs`             | classes, functions, methods                                                              |
-| TypeScript | `.ts`, `.mts`, `.cts`, `.tsx`             | classes, interfaces, type aliases, enums, functions, methods                              |
-| C#         | `.cs`, `.csx`                             | classes, interfaces, structs, records, enums, enum members, delegates, methods, local functions, constructors, destructors, properties |
-| GDScript   | `.gd`                                     | classes (including `class_name` and inner classes), functions, methods, signals, enums, constants |
-| Godot shaders | `.gdshader`, `.gdshaderinc`            | functions, structs, uniforms (as properties), constants                                   |
-| Godot scenes and resources | `.tscn`, `.tres`, `.godot` | scene nodes by `name`, resource references by `id`                                        |
-| SQL        | `.sql`                                    | tables, views, materialized views, indexes, functions, triggers, types                    |
-| YAML       | `.yaml`, `.yml`                           | collection-valued keys, qualified by their path                                           |
-| JSON       | `.json`                                   | collection-valued keys, qualified by their path                                           |
+The `languages` column is the exact value `search_code`'s `languages` filter accepts, which is not
+always the lowercased language name — `.tsx` is classified as its own language rather than as
+TypeScript, and the two Godot data formats are one language.
+
+| Language   | Extensions                     | `languages` value | Extracted symbol kinds                                       |
+| ---------- | ------------------------------ | ----------------- | ------------------------------------------------------------ |
+| Python     | `.py`, `.pyi`                  | `python`          | classes, functions, methods                                  |
+| Java       | `.java`                        | `java`            | classes, interfaces, records, enums, annotation types, methods, constructors, enum constants |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs`  | `javascript`      | classes, functions, methods                                  |
+| TypeScript | `.ts`, `.mts`, `.cts`          | `typescript`      | classes, interfaces, type aliases, enums, functions, methods  |
+| TSX        | `.tsx`                         | `tsx`             | classes, interfaces, type aliases, enums, functions, methods  |
+| C#         | `.cs`, `.csx`                  | `csharp`          | classes, interfaces, structs, records, enums, enum members, delegates, methods, local functions, constructors, destructors, properties |
+| GDScript   | `.gd`                          | `gdscript`        | classes (including `class_name` and inner classes), functions, methods, signals, enums, constants |
+| Godot shaders | `.gdshader`, `.gdshaderinc` | `gdshader`        | functions, structs, uniforms (as properties), constants       |
+| Godot scenes and resources | `.tscn`, `.tres`, `.godot` | `godot_resource` | scene nodes by `name`, resource references by `id` |
+| SQL        | `.sql`                         | `sql`             | tables, views, materialized views, indexes, functions, triggers, types |
+| YAML       | `.yaml`, `.yml`                | `yaml`            | collection-valued keys, qualified by their path               |
+| JSON       | `.json`                        | `json`            | collection-valued keys, qualified by their path               |
 
 Nested declarations are qualified by their enclosing scope in every language, so a C# method
 indexes as `Outer.Inner.Work` and a Compose service port list as `services.web.ports`.
+
+The kinds above name what is extracted, not always the `kind` recorded against it. A C# destructor
+is recorded as a `method`, under the type's own name — `~Catalog` indexes as `Catalog.Catalog`,
+the same symbol as the constructor — because the grammar names it with the type identifier alone.
+Filter on `method` to reach either.
 
 YAML and JSON deliberately extract only keys whose value is a mapping/object or a
 sequence/array. Making a symbol of every scalar leaf would turn one large configuration file into
@@ -261,7 +271,8 @@ Godot scene and resource files name only some of their sections: `[gd_scene]`, `
 `id`, so they reach the index as searchable text rather than as symbols.
 
 The scanner respects root and nested `.gitignore` files and excludes symlinks, binary files, files
-over 1 MiB, build outputs, virtual environments, and dependency directories. That 1 MiB cap is what
+over 1 MiB, build outputs, virtual environments, dependency directories, and Godot's own `.godot`
+asset cache — a `project.godot` file is still indexed. That 1 MiB cap is what
 usually keeps a large generated `package-lock.json` or similar out of the index; exclude it through
 `scan.exclude` if a smaller one is not worth indexing.
 
