@@ -117,3 +117,21 @@ def test_main_tui_flag_delegates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 
     assert code == 0
     assert calls and calls[0].values.get("INCODE_OFFLINE") == "1"
+
+
+def test_main_tui_without_textual_reports_the_fix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if name.endswith("tui.app") or name == "textual" or name.startswith("textual."):
+            raise ImportError("No module named 'textual'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    code = main(["--install-dir", str(tmp_path), "--tui"])
+    assert code == 1
+    assert "uv sync --extra cpu --extra tui" in capsys.readouterr().err

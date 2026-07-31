@@ -112,7 +112,16 @@ def _run_tui(
     install_directory: Path,
     env_updates: dict[str, str | None],
 ) -> int:
-    from .tui.app import InstallerApp  # lazy: Textual is an optional dependency
+    try:
+        from .tui.app import InstallerApp  # lazy: Textual is an optional dependency
+    except ImportError:
+        print(
+            "Error: the interactive wizard needs the tui extra; run "
+            "`uv sync --extra cpu --extra tui` in the installation checkout, "
+            "or re-run with --no-tui.",
+            file=sys.stderr,
+        )
+        return 1
     from .wizard import WizardState
 
     preset = {name: value for name, value in env_updates.items() if value is not None}
