@@ -129,7 +129,7 @@ def _run_tui(
     state.offline = args.offline
     app = InstallerApp(state)
     app.run()
-    return app.return_code
+    return app.done_code if app.done_code is not None else 130
 
 
 def main(argv: Sequence[str] | None = None) -> int:

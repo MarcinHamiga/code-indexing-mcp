@@ -98,7 +98,7 @@ def test_main_tui_flag_delegates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     calls: list = []
 
     class FakeApp:
-        return_code = 0
+        done_code = 0
 
         def __init__(self, state):
             calls.append(state)
