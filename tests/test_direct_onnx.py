@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from incode_mcp.direct_onnx import (
+from code_indexing_mcp.direct_onnx import (
     DEFAULT_MODEL_ARTIFACT,
     DirectOnnxEmbedding,
     create_webgpu_session,
@@ -206,10 +206,10 @@ def test_direct_model_builds_exact_onnx_inputs_and_reports_resolved_providers(
     built: list[tuple[Path, tuple[str, ...], int | None, bool]] = []
 
     monkeypatch.setattr(
-        "incode_mcp.direct_onnx.resolve_model_snapshot",
+        "code_indexing_mcp.direct_onnx.resolve_model_snapshot",
         lambda *args, **kwargs: model_directory,
     )
-    monkeypatch.setattr("incode_mcp.direct_onnx.load_tokenizer", lambda path: tokenizer)
+    monkeypatch.setattr("code_indexing_mcp.direct_onnx.load_tokenizer", lambda path: tokenizer)
 
     def build_session(
         path: Path,
@@ -221,7 +221,7 @@ def test_direct_model_builds_exact_onnx_inputs_and_reports_resolved_providers(
         built.append((path, providers, threads, enable_cpu_mem_arena))
         return session
 
-    monkeypatch.setattr("incode_mcp.direct_onnx.create_session", build_session)
+    monkeypatch.setattr("code_indexing_mcp.direct_onnx.create_session", build_session)
 
     model = DirectOnnxEmbedding(
         cache_directory=tmp_path / "models",
@@ -298,7 +298,7 @@ def test_webgpu_session_registers_the_plugin_and_attaches_its_device(
     assert provider == "WebGpuExecutionProvider"
     assert events[0] == (
         "register",
-        ("incode_webgpu_ep", "/runtime/webgpu.dylib"),
+        ("code-indexing-mcp_webgpu_ep", "/runtime/webgpu.dylib"),
     )
     assert events[1] == ("devices", ([webgpu_device], {}))
     assert events[2][0] == "session"
@@ -335,15 +335,15 @@ def test_webgpu_model_reports_only_providers_the_session_resolved(
     session = _Session()
     monkeypatch.setattr(session, "get_providers", lambda: ["CPUExecutionProvider"])
     monkeypatch.setattr(
-        "incode_mcp.direct_onnx.resolve_model_snapshot",
+        "code_indexing_mcp.direct_onnx.resolve_model_snapshot",
         lambda *args, **kwargs: model_directory,
     )
     monkeypatch.setattr(
-        "incode_mcp.direct_onnx.load_tokenizer",
+        "code_indexing_mcp.direct_onnx.load_tokenizer",
         lambda path: _Tokenizer(),
     )
     monkeypatch.setattr(
-        "incode_mcp.direct_onnx.create_webgpu_session",
+        "code_indexing_mcp.direct_onnx.create_webgpu_session",
         lambda *args, **kwargs: (session, "WebGpuExecutionProvider"),
     )
 

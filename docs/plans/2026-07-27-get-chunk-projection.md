@@ -69,9 +69,9 @@ path that missed the pattern.
 
 | File | Responsibility after this plan |
 |---|---|
-| `src/incode_mcp/models.py` | `CodeChunk` becomes an explicit projection model, independent of `StoredChunk`. |
-| `src/incode_mcp/storage.py` | `get_chunk` selects only the projected columns and returns `CodeChunk`. |
-| `src/incode_mcp/search.py` | `get_chunk` returns the store's value directly instead of re-validating a full `model_dump`. |
+| `src/code_indexing_mcp/models.py` | `CodeChunk` becomes an explicit projection model, independent of `StoredChunk`. |
+| `src/code_indexing_mcp/storage.py` | `get_chunk` selects only the projected columns and returns `CodeChunk`. |
+| `src/code_indexing_mcp/search.py` | `get_chunk` returns the store's value directly instead of re-validating a full `model_dump`. |
 | `tests/test_search.py` | Gains a payload-shape contract test. |
 | `tests/test_storage.py` | Existing `get_chunk` returns-`None` test keeps passing; gains a projection assertion. |
 | `README.md` | Documents what `get_chunk` returns. |
@@ -81,9 +81,9 @@ path that missed the pattern.
 ### Task 1: Make `CodeChunk` an explicit projection
 
 **Files:**
-- Modify: `src/incode_mcp/models.py:240-241`
-- Modify: `src/incode_mcp/storage.py:183-196`
-- Modify: `src/incode_mcp/search.py:120-124`
+- Modify: `src/code_indexing_mcp/models.py:240-241`
+- Modify: `src/code_indexing_mcp/storage.py:183-196`
+- Modify: `src/code_indexing_mcp/search.py:120-124`
 - Test: `tests/test_search.py`, `tests/test_storage.py`
 
 **Interfaces:**
@@ -159,7 +159,7 @@ Append to `tests/test_storage.py`:
 
 ```python
 def test_get_chunk_does_not_read_the_vector_column(tmp_path: Path) -> None:
-    from incode_mcp.models import CodeChunk
+    from code_indexing_mcp.models import CodeChunk
 
     store, project, chunk_id = _store_with_one_chunk(tmp_path)
 
@@ -184,7 +184,7 @@ Expected: FAIL — `set(payload) == CHUNK_PAYLOAD_FIELDS` fails because the actu
 
 - [ ] **Step 3: Redefine `CodeChunk`**
 
-In `src/incode_mcp/models.py`, replace lines 240-241:
+In `src/code_indexing_mcp/models.py`, replace lines 240-241:
 
 ```python
 class CodeChunk(FrozenModel):
@@ -222,7 +222,7 @@ file.
 
 - [ ] **Step 4: Project the columns in storage**
 
-In `src/incode_mcp/storage.py`, add `CodeChunk` to the `from .models import (...)` block, add the
+In `src/code_indexing_mcp/storage.py`, add `CodeChunk` to the `from .models import (...)` block, add the
 projection constant next to `OVERFETCH_FACTOR`:
 
 ```python
@@ -276,13 +276,13 @@ and replace `get_chunk` (lines 183-196):
 
 - [ ] **Step 5: Simplify the search service**
 
-In `src/incode_mcp/search.py`, replace `get_chunk` (lines 120-124):
+In `src/code_indexing_mcp/search.py`, replace `get_chunk` (lines 120-124):
 
 ```python
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         chunk = self.store.get_chunk(chunk_id)
         if chunk is None:
-            raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown chunk: {chunk_id}")
+            raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown chunk: {chunk_id}")
         return chunk
 ```
 
@@ -294,7 +294,7 @@ projection.
 > return statement.
 
 Remove `StoredChunk` from `search.py`'s model imports if nothing else in the file uses it — check
-with `grep -n "StoredChunk" src/incode_mcp/search.py`. It is still referenced by `_hit`'s type
+with `grep -n "StoredChunk" src/code_indexing_mcp/search.py`. It is still referenced by `_hit`'s type
 union at `search.py:131`, so it most likely stays.
 
 - [ ] **Step 6: Run tests to verify they pass**
@@ -313,9 +313,9 @@ Run:
 .venv/bin/python - <<'PY'
 import json, os, random, shutil, tempfile
 from pathlib import Path
-os.environ["INCODE_OFFLINE"] = "1"
-os.environ["INCODE_INDEX_EXECUTION"] = "in-process"
-from incode_mcp.application import Application, RuntimePaths
+os.environ["CODE_INDEXING_OFFLINE"] = "1"
+os.environ["CODE_INDEXING_INDEX_EXECUTION"] = "in-process"
+from code_indexing_mcp.application import Application, RuntimePaths
 
 random.seed(0)
 class F:
@@ -324,7 +324,7 @@ class F:
     def embed_query(self, text): return [random.random() for _ in range(768)]
 
 tmp = Path(tempfile.mkdtemp()); proj = tmp / "proj"; proj.mkdir()
-shutil.copytree("src/incode_mcp", proj / "incode_mcp")
+shutil.copytree("src/code_indexing_mcp", proj / "code_indexing_mcp")
 (proj / "pyproject.toml").write_text("[project]\nname='x'\n")
 app = Application(RuntimePaths(data=tmp / "d", cache=tmp / "c"), embedder=F(), cwd=proj)
 info = app.init_project(proj); app.index_project(info.id)
@@ -366,7 +366,7 @@ content hash. It deliberately excludes the embedding vector and the derived `emb
 - [ ] **Step 10: Commit**
 
 ```bash
-git add src/incode_mcp/models.py src/incode_mcp/storage.py src/incode_mcp/search.py \
+git add src/code_indexing_mcp/models.py src/code_indexing_mcp/storage.py src/code_indexing_mcp/search.py \
         tests/test_search.py tests/test_storage.py README.md
 git commit -m "perf: return a projection from get_chunk instead of the whole storage row"
 ```

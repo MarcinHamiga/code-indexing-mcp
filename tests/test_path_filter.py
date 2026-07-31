@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 
 import pytest
 
-from incode_mcp.path_filter import glob_to_regex, path_condition
+from code_indexing_mcp.path_filter import glob_to_regex, path_condition
 
 # Every shape the translation must handle, including the two that make it subtle:
 # right-anchored relative matching, and ** behaving as a single segment in 3.12.

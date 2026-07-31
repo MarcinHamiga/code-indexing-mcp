@@ -14,7 +14,7 @@ import numpy as np
 if TYPE_CHECKING:
     from fastembed import TextEmbedding as _TextEmbedding
 
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .token_batching import (
     DEFAULT_MAX_TOKEN_PRODUCT,
     DEFAULT_MAX_TOKENS,
@@ -376,7 +376,7 @@ class FastEmbedder:
                     enable_cpu_mem_arena=self.enable_cpu_mem_arena,
                 )
             except Exception as exc:
-                raise IncodeError(
+                raise CodeIndexingError(
                     ErrorCode.MODEL_UNAVAILABLE,
                     f"Embedding model is unavailable: {self.model_id}",
                     model=self.model_id,

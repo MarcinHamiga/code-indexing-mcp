@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from incode_mcp.backends import (
+from code_indexing_mcp.backends import (
     CPU_BACKEND,
     CPU_PROVIDER,
     KNOWN_BACKENDS,
@@ -17,7 +17,7 @@ from incode_mcp.backends import (
     parse_accelerator,
     select_backend,
 )
-from incode_mcp.errors import ErrorCode, IncodeError
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 
 CUDA_PROVIDER = "CUDAExecutionProvider"
 WEBGPU_PROVIDER = "WebGpuExecutionProvider"
@@ -135,7 +135,7 @@ def test_strict_mode_turns_a_denied_request_into_a_backend_error() -> None:
         Accelerator.CUDA, available_providers=[CPU_PROVIDER], registry=registry
     )
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         selection.require_honored()
 
     assert caught.value.code is ErrorCode.BACKEND_UNAVAILABLE
@@ -170,7 +170,7 @@ def test_falling_back_records_the_new_backend_and_the_reason() -> None:
 
 
 def test_unknown_accelerator_names_are_a_configuration_error() -> None:
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         parse_accelerator("tpu")
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
@@ -184,7 +184,7 @@ def test_accelerator_names_are_parsed_leniently(value: str) -> None:
 def test_only_backends_that_passed_their_gates_are_eligible_automatically() -> None:
     """CUDA and MLX are promoted; the rest still need an explicit override.
 
-    The rest of the registry is reached only through INCODE_EMBED_ACCELERATOR,
+    The rest of the registry is reached only through CODE_INDEXING_EMBED_ACCELERATOR,
     which is how a backend earns the measurements its own promotion needs.
     """
     automatic = [

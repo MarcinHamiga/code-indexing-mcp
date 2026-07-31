@@ -80,10 +80,10 @@ git diff --check
 Real-model and hardware gates:
 
 ```bash
-INCODE_MODEL_TEST_CACHE=/path/to/cache uv run --extra cpu pytest -m model
+CODE_INDEXING_MODEL_TEST_CACHE=/path/to/cache uv run --extra cpu pytest -m model
 
-INCODE_MODEL_TEST_CACHE=/path/to/cache \
-INCODE_ACCEL_ENV=/path/to/accelerator.json \
-INCODE_TEST_ACCELERATOR=webgpu \
+CODE_INDEXING_MODEL_TEST_CACHE=/path/to/cache \
+CODE_INDEXING_ACCEL_ENV=/path/to/accelerator.json \
+CODE_INDEXING_TEST_ACCELERATOR=webgpu \
   uv run --extra cpu pytest -m accelerator
 ```

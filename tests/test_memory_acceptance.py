@@ -164,9 +164,9 @@ def test_corpus_includes_the_shapes_that_drive_the_peak(tmp_path: Path) -> None:
 
 
 def _real_model_run(tmp_path: Path, shapes: list[str]) -> BenchmarkRun:
-    cache = os.environ.get("INCODE_MODEL_TEST_CACHE")
+    cache = os.environ.get("CODE_INDEXING_MODEL_TEST_CACHE")
     if not cache:
-        pytest.skip("set INCODE_MODEL_TEST_CACHE to run the real-model memory gate")
+        pytest.skip("set CODE_INDEXING_MODEL_TEST_CACHE to run the real-model memory gate")
     root = tmp_path / "corpus"
     corpus_bytes = write_corpus(root, scale=1, shapes=shapes)
     return run_benchmark(
@@ -179,7 +179,7 @@ def _real_model_run(tmp_path: Path, shapes: list[str]) -> BenchmarkRun:
         memory_mb=2048,
         offline=True,
         sample_interval=0.1,
-        command_prefix=[sys.executable, "-m", "incode_mcp.cli"],
+        command_prefix=[sys.executable, "-m", "code_indexing_mcp.cli"],
     )
 
 

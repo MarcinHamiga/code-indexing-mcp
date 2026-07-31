@@ -6,8 +6,8 @@ import pytest
 from textual.pilot import Pilot
 from textual.widgets import Static
 
-from incode_mcp.installer.tui.app import InstallerApp
-from incode_mcp.installer.wizard import WizardState
+from code_indexing_mcp.installer.tui.app import InstallerApp
+from code_indexing_mcp.installer.wizard import WizardState
 
 
 async def click(pilot: Pilot, selector: str) -> None:
@@ -24,7 +24,7 @@ async def click(pilot: Pilot, selector: str) -> None:
 def _prepare_checkout(directory: Path) -> Path:
     """Create the server command the Location panel requires to exist."""
 
-    from incode_mcp.installer.accelerator import server_executable
+    from code_indexing_mcp.installer.accelerator import server_executable
 
     command = server_executable(directory)
     command.parent.mkdir(parents=True, exist_ok=True)
@@ -37,7 +37,7 @@ def _install_state(tmp_path: Path) -> WizardState:
 
 
 def _reconfigure_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WizardState:
-    import incode_mcp.installer.wizard as wizard
+    import code_indexing_mcp.installer.wizard as wizard
 
     monkeypatch.setattr(wizard.accelerator, "prepared_accelerator", lambda directory: None)
     return WizardState.for_reconfigure(tmp_path, home=tmp_path)
@@ -176,14 +176,14 @@ async def test_settings_panels_validate_and_commit(tmp_path: Path) -> None:
         for _ in range(4):
             await click(pilot, "#next")
         assert app.current == "indexing"
-        field = app.query_one("#f-INCODE_INDEX_WAIT_SECONDS", Input)
+        field = app.query_one("#f-CODE_INDEXING_INDEX_WAIT_SECONDS", Input)
         field.value = "99999999"
         await click(pilot, "#next")
         assert app.current == "indexing"  # blocked by validation
         field.value = "60"
         await click(pilot, "#next")
         assert app.current == "embedding"
-        assert state.values["INCODE_INDEX_WAIT_SECONDS"] == "60"
+        assert state.values["CODE_INDEXING_INDEX_WAIT_SECONDS"] == "60"
 
 
 @pytest.mark.asyncio
@@ -193,21 +193,21 @@ async def test_settings_widgets_render_hand_written_values(tmp_path: Path) -> No
     from textual.widgets import Checkbox, Select
 
     state = _install_state(tmp_path)
-    state.values["INCODE_OFFLINE"] = "true"
-    state.values["INCODE_INDEX_MODE"] = "EAGER"
-    state.values["INCODE_BROKER"] = "nonsense"
+    state.values["CODE_INDEXING_OFFLINE"] = "true"
+    state.values["CODE_INDEXING_INDEX_MODE"] = "EAGER"
+    state.values["CODE_INDEXING_BROKER"] = "nonsense"
     app = InstallerApp(state)
     async with app.run_test() as pilot:
         for _ in range(4):
             await click(pilot, "#next")
         assert app.current == "indexing"
-        assert app.query_one("#f-INCODE_OFFLINE", Checkbox).value is True
-        assert app.query_one("#f-INCODE_INDEX_MODE", Select).value == "eager"
-        assert app.query_one("#f-INCODE_BROKER", Select).value == "auto"  # fell back
+        assert app.query_one("#f-CODE_INDEXING_OFFLINE", Checkbox).value is True
+        assert app.query_one("#f-CODE_INDEXING_INDEX_MODE", Select).value == "eager"
+        assert app.query_one("#f-CODE_INDEXING_BROKER", Select).value == "auto"  # fell back
         await click(pilot, "#next")
         assert app.current == "embedding"
-        assert state.values["INCODE_OFFLINE"] == "1"
-        assert state.values["INCODE_INDEX_MODE"] == "eager"
+        assert state.values["CODE_INDEXING_OFFLINE"] == "1"
+        assert state.values["CODE_INDEXING_INDEX_MODE"] == "eager"
 
 
 @pytest.mark.asyncio
@@ -215,7 +215,7 @@ async def test_summary_lists_updates_and_target_files(tmp_path: Path) -> None:
     from textual.widgets import Static
 
     state = _install_state(tmp_path)
-    state.values["INCODE_OFFLINE"] = "1"
+    state.values["CODE_INDEXING_OFFLINE"] = "1"
     state.harness_slugs = ["kimi-code"]
     app = InstallerApp(state)
     async with app.run_test() as pilot:
@@ -223,7 +223,7 @@ async def test_summary_lists_updates_and_target_files(tmp_path: Path) -> None:
             await click(pilot, "#next")
         assert app.current == "summary"
         text = str(app.query_one("#summary-body", Static).render())
-        assert "INCODE_OFFLINE" in text
+        assert "CODE_INDEXING_OFFLINE" in text
         assert "mcp.json" in text
         assert "auto" in text  # accelerator choice
 
@@ -243,8 +243,8 @@ async def test_summary_warns_about_accelerator_disk_cost(tmp_path: Path) -> None
 
 
 def _fake_result(failures: tuple = ()):  # type: ignore[no-untyped-def]
-    from incode_mcp.installer.accelerator import AcceleratorPlan
-    from incode_mcp.installer.orchestrator import InstallResult
+    from code_indexing_mcp.installer.accelerator import AcceleratorPlan
+    from code_indexing_mcp.installer.orchestrator import InstallResult
 
     return InstallResult(
         AcceleratorPlan("cpu", "CPU was requested"),
@@ -258,8 +258,8 @@ def _fake_result(failures: tuple = ()):  # type: ignore[no-untyped-def]
 async def test_progress_runs_pipeline_and_finishes_on_done(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import incode_mcp.installer.tui.panels as panels
-    from incode_mcp.installer.orchestrator import StepEvent
+    import code_indexing_mcp.installer.tui.panels as panels
+    from code_indexing_mcp.installer.orchestrator import StepEvent
 
     def fake_run_install(plan, on_event=lambda event: None, should_continue=lambda: True):  # type: ignore[no-untyped-def]
         on_event(StepEvent("accelerator", "started", "auto"))
@@ -283,7 +283,7 @@ async def test_progress_runs_pipeline_and_finishes_on_done(
 async def test_done_reports_failures_with_exit_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import incode_mcp.installer.tui.panels as panels
+    import code_indexing_mcp.installer.tui.panels as panels
 
     monkeypatch.setattr(
         panels,
@@ -303,8 +303,8 @@ async def test_done_reports_failures_with_exit_1(
 async def test_pipeline_error_finishes_with_exit_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import incode_mcp.installer.tui.panels as panels
-    from incode_mcp.installer.config_files import InstallerError
+    import code_indexing_mcp.installer.tui.panels as panels
+    from code_indexing_mcp.installer.config_files import InstallerError
 
     def explode(plan, on_event=None, should_continue=None):  # type: ignore[no-untyped-def]
         raise InstallerError("boom")

@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig
-from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.worker_launcher import ExternalInterpreterLauncher, _authenticated
+from code_indexing_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher, _authenticated
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BODY = "external_worker_body:echo"
@@ -85,7 +85,7 @@ def test_a_session_drives_an_external_worker_through_the_usual_protocol(tmp_path
 def test_a_missing_interpreter_is_reported_as_an_unavailable_backend(tmp_path: Path) -> None:
     launcher = _launcher(executable=tmp_path / "no-such-python")
 
-    with pytest.raises(IncodeError) as failure:
+    with pytest.raises(CodeIndexingError) as failure:
         launcher.launch(_config(tmp_path))
 
     assert failure.value.code is ErrorCode.BACKEND_UNAVAILABLE
@@ -101,7 +101,7 @@ def test_an_environment_that_cannot_start_the_worker_is_reported_not_awaited(
     broken.chmod(0o755)
     launcher = _launcher(executable=broken, timeout_seconds=30.0)
 
-    with pytest.raises(IncodeError) as failure:
+    with pytest.raises(CodeIndexingError) as failure:
         launcher.launch(_config(tmp_path))
 
     assert failure.value.code is ErrorCode.BACKEND_UNAVAILABLE
@@ -116,7 +116,7 @@ def test_a_worker_that_dies_after_connecting_fails_its_request(tmp_path: Path) -
         launcher=_launcher(target="external_worker_body:missing_attribute"),
     )
 
-    with session, pytest.raises(IncodeError) as failure:
+    with session, pytest.raises(CodeIndexingError) as failure:
         session.initialize()
 
     assert failure.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
@@ -130,7 +130,7 @@ def test_a_child_that_never_connects_gives_up_at_the_timeout(tmp_path: Path) -> 
     stalled.chmod(0o755)
     launcher = _launcher(executable=stalled, timeout_seconds=0.5)
 
-    with pytest.raises(IncodeError) as failure:
+    with pytest.raises(CodeIndexingError) as failure:
         launcher.launch(_config(tmp_path))
 
     assert failure.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
@@ -193,7 +193,7 @@ def test_a_stranger_on_the_channel_cannot_hold_the_launch_open(tmp_path: Path) -
     rogue.chmod(0o755)
     launcher = _launcher(executable=rogue, timeout_seconds=1.5)
 
-    with pytest.raises(IncodeError) as failure:
+    with pytest.raises(CodeIndexingError) as failure:
         launcher.launch(_config(tmp_path))
 
     assert failure.value.code is ErrorCode.EMBEDDING_WORKER_FAILED

@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.installer import accelerator, harnesses
-from incode_mcp.installer.config_files import InstallerError
-from incode_mcp.installer.orchestrator import (
+from code_indexing_mcp.installer import accelerator, harnesses
+from code_indexing_mcp.installer.config_files import InstallerError
+from code_indexing_mcp.installer.orchestrator import (
     InstallPlan,
     StepEvent,
     default_install_directory,
@@ -27,7 +27,7 @@ def _plan(**overrides: object) -> InstallPlan:
         "install_directory": Path("/opt/ci-mcp"),
         "accelerator": "cpu",
         "harness_slugs": ("kimi-code",),
-        "env_updates": {"INCODE_OFFLINE": "1"},
+        "env_updates": {"CODE_INDEXING_OFFLINE": "1"},
     }
     values.update(overrides)
     return InstallPlan(**values)  # type: ignore[arg-type]
@@ -66,7 +66,7 @@ def test_run_install_emits_step_events_in_order(
 
     assert calls == [
         ("accel", "cpu"),
-        ("harnesses", ("kimi-code",), {"INCODE_OFFLINE": "1"}),
+        ("harnesses", ("kimi-code",), {"CODE_INDEXING_OFFLINE": "1"}),
         ("skills", ("kimi-code",)),
     ]
     assert [event.step for event in events] == [

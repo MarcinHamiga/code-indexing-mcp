@@ -181,7 +181,9 @@ def create_webgpu_session(
     import onnxruntime_ep_webgpu as webgpu_ep  # type: ignore[import-not-found]
 
     provider = str(webgpu_ep.get_ep_name())
-    ort.register_execution_provider_library("incode_webgpu_ep", webgpu_ep.get_library_path())
+    ort.register_execution_provider_library(
+        "code-indexing-mcp_webgpu_ep", webgpu_ep.get_library_path()
+    )
     devices = [device for device in ort.get_ep_devices() if str(device.ep_name) == provider]
     if not devices:
         raise RuntimeError("The WebGPU plugin registered but exposed no WebGPU device")

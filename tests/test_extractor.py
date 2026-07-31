@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.extractor import TreeSitterExtractor, normalize_identifier
+from code_indexing_mcp.extractor import TreeSitterExtractor, normalize_identifier
 
 
 def test_extracts_python_symbols_with_qualified_methods_and_module_code() -> None:
@@ -652,27 +652,27 @@ def test_every_scanned_language_has_a_grammar_and_a_query() -> None:
     """
     from importlib.resources import files
 
-    from incode_mcp.extractor import _languages
-    from incode_mcp.scanner import LANGUAGES
+    from code_indexing_mcp.extractor import _languages
+    from code_indexing_mcp.scanner import LANGUAGES
 
     scanned = set(LANGUAGES.values())
 
     assert set(_languages()) == scanned
     for language in sorted(scanned):
-        assert files("incode_mcp.queries").joinpath(f"{language}.scm").is_file()
+        assert files("code_indexing_mcp.queries").joinpath(f"{language}.scm").is_file()
 
 
 def test_chunk_kind_literal_covers_every_kind_the_queries_capture() -> None:
     from importlib.resources import files
     from typing import get_args
 
-    from incode_mcp.models import ChunkKind
-    from incode_mcp.scanner import LANGUAGES
+    from code_indexing_mcp.models import ChunkKind
+    from code_indexing_mcp.scanner import LANGUAGES
 
     declared = set(get_args(ChunkKind))
     captured = set()
     for language in sorted(set(LANGUAGES.values())):
-        text = files("incode_mcp.queries").joinpath(f"{language}.scm").read_text()
+        text = files("code_indexing_mcp.queries").joinpath(f"{language}.scm").read_text()
         captured |= {
             line.split("@definition.", 1)[1].split()[0].strip(")")
             for line in text.splitlines()
@@ -689,7 +689,7 @@ def test_compiled_query_is_built_once_per_language(monkeypatch: pytest.MonkeyPat
 
     Re-reading and recompiling per file cost 44% of extraction time over 35 files.
     """
-    import incode_mcp.extractor as extractor_module
+    import code_indexing_mcp.extractor as extractor_module
 
     compiled: list[str] = []
     original = extractor_module.Query
@@ -710,7 +710,7 @@ def test_compiled_query_is_built_once_per_language(monkeypatch: pytest.MonkeyPat
 
 
 def test_line_index_matches_a_naive_newline_count() -> None:
-    from incode_mcp.extractor import _LineIndex
+    from code_indexing_mcp.extractor import _LineIndex
 
     source = b"alpha\nbeta\n\ngamma\r\ndelta"
     index = _LineIndex(source)
@@ -720,7 +720,7 @@ def test_line_index_matches_a_naive_newline_count() -> None:
 
 
 def test_line_index_handles_empty_and_newline_only_sources() -> None:
-    from incode_mcp.extractor import _LineIndex
+    from code_indexing_mcp.extractor import _LineIndex
 
     assert _LineIndex(b"").line_at(0) == 1
     assert _LineIndex(b"\n\n\n").line_at(3) == 4

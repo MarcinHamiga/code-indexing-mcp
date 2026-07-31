@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.installer.settings_spec import (
+from code_indexing_mcp.installer.settings_spec import (
     BY_NAME,
     SETTINGS,
     as_bool,
@@ -16,24 +16,24 @@ from incode_mcp.installer.settings_spec import (
 
 def test_catalog_covers_exactly_the_documented_settings() -> None:
     assert {setting.name for setting in SETTINGS} == {
-        "INCODE_INDEX_MODE",
-        "INCODE_INDEX_WAIT_SECONDS",
-        "INCODE_EMBED_MEMORY_MB",
-        "INCODE_VECTOR_INDEX",
-        "INCODE_INDEX_EXECUTION",
-        "INCODE_BROKER",
-        "INCODE_DATA_DIR",
-        "INCODE_CACHE_DIR",
-        "INCODE_OFFLINE",
-        "INCODE_EMBED_BATCH_SIZE",
-        "INCODE_EMBED_MAX_TOKENS",
-        "INCODE_EMBED_OVERLAP_TOKENS",
-        "INCODE_EMBED_THREADS",
-        "INCODE_EMBED_CPU_ARENA",
-        "INCODE_EMBED_CROSSOVER",
-        "INCODE_EMBED_CALIBRATE",
-        "INCODE_EMBED_STRICT",
-        "INCODE_EMBED_ACCELERATOR",
+        "CODE_INDEXING_INDEX_MODE",
+        "CODE_INDEXING_INDEX_WAIT_SECONDS",
+        "CODE_INDEXING_EMBED_MEMORY_MB",
+        "CODE_INDEXING_VECTOR_INDEX",
+        "CODE_INDEXING_INDEX_EXECUTION",
+        "CODE_INDEXING_BROKER",
+        "CODE_INDEXING_DATA_DIR",
+        "CODE_INDEXING_CACHE_DIR",
+        "CODE_INDEXING_OFFLINE",
+        "CODE_INDEXING_EMBED_BATCH_SIZE",
+        "CODE_INDEXING_EMBED_MAX_TOKENS",
+        "CODE_INDEXING_EMBED_OVERLAP_TOKENS",
+        "CODE_INDEXING_EMBED_THREADS",
+        "CODE_INDEXING_EMBED_CPU_ARENA",
+        "CODE_INDEXING_EMBED_CROSSOVER",
+        "CODE_INDEXING_EMBED_CALIBRATE",
+        "CODE_INDEXING_EMBED_STRICT",
+        "CODE_INDEXING_EMBED_ACCELERATOR",
     }
 
 
@@ -46,31 +46,31 @@ def test_every_setting_has_display_metadata_and_a_group() -> None:
 @pytest.mark.parametrize(
     ("name", "raw", "ok"),
     [
-        ("INCODE_INDEX_MODE", "eager", True),
-        ("INCODE_INDEX_MODE", "sometimes", False),
-        ("INCODE_INDEX_WAIT_SECONDS", "300", True),
-        ("INCODE_INDEX_WAIT_SECONDS", "86401", False),
-        ("INCODE_INDEX_WAIT_SECONDS", "-1", False),
-        ("INCODE_EMBED_MEMORY_MB", "2048", True),
-        ("INCODE_EMBED_MEMORY_MB", "512", False),
-        ("INCODE_EMBED_BATCH_SIZE", "auto", True),
-        ("INCODE_EMBED_BATCH_SIZE", "256", True),
-        ("INCODE_EMBED_BATCH_SIZE", "0", False),
-        ("INCODE_EMBED_CROSSOVER", "off", True),
-        ("INCODE_EMBED_CROSSOVER", "auto", True),
-        ("INCODE_EMBED_CROSSOVER", "100000", True),
-        ("INCODE_EMBED_CROSSOVER", "banana", False),
-        ("INCODE_EMBED_MAX_TOKENS", "8192", True),
-        ("INCODE_EMBED_MAX_TOKENS", "63", False),
-        ("INCODE_EMBED_OVERLAP_TOKENS", "0", True),
-        ("INCODE_EMBED_THREADS", "64", True),
-        ("INCODE_EMBED_THREADS", "65", False),
-        ("INCODE_OFFLINE", "yes", True),
-        ("INCODE_OFFLINE", "maybe", False),
-        ("INCODE_DATA_DIR", "/tmp/data", True),
-        ("INCODE_DATA_DIR", "", False),
-        ("INCODE_EMBED_ACCELERATOR", "coreml", True),
-        ("INCODE_EMBED_ACCELERATOR", "tpu", False),
+        ("CODE_INDEXING_INDEX_MODE", "eager", True),
+        ("CODE_INDEXING_INDEX_MODE", "sometimes", False),
+        ("CODE_INDEXING_INDEX_WAIT_SECONDS", "300", True),
+        ("CODE_INDEXING_INDEX_WAIT_SECONDS", "86401", False),
+        ("CODE_INDEXING_INDEX_WAIT_SECONDS", "-1", False),
+        ("CODE_INDEXING_EMBED_MEMORY_MB", "2048", True),
+        ("CODE_INDEXING_EMBED_MEMORY_MB", "512", False),
+        ("CODE_INDEXING_EMBED_BATCH_SIZE", "auto", True),
+        ("CODE_INDEXING_EMBED_BATCH_SIZE", "256", True),
+        ("CODE_INDEXING_EMBED_BATCH_SIZE", "0", False),
+        ("CODE_INDEXING_EMBED_CROSSOVER", "off", True),
+        ("CODE_INDEXING_EMBED_CROSSOVER", "auto", True),
+        ("CODE_INDEXING_EMBED_CROSSOVER", "100000", True),
+        ("CODE_INDEXING_EMBED_CROSSOVER", "banana", False),
+        ("CODE_INDEXING_EMBED_MAX_TOKENS", "8192", True),
+        ("CODE_INDEXING_EMBED_MAX_TOKENS", "63", False),
+        ("CODE_INDEXING_EMBED_OVERLAP_TOKENS", "0", True),
+        ("CODE_INDEXING_EMBED_THREADS", "64", True),
+        ("CODE_INDEXING_EMBED_THREADS", "65", False),
+        ("CODE_INDEXING_OFFLINE", "yes", True),
+        ("CODE_INDEXING_OFFLINE", "maybe", False),
+        ("CODE_INDEXING_DATA_DIR", "/tmp/data", True),
+        ("CODE_INDEXING_DATA_DIR", "", False),
+        ("CODE_INDEXING_EMBED_ACCELERATOR", "coreml", True),
+        ("CODE_INDEXING_EMBED_ACCELERATOR", "tpu", False),
     ],
 )
 def test_validate(name: str, raw: str, ok: bool) -> None:
@@ -78,21 +78,21 @@ def test_validate(name: str, raw: str, ok: bool) -> None:
 
 
 def test_validate_unknown_names_are_rejected_by_lookup() -> None:
-    assert "INCODE_FROBNICATE" not in BY_NAME
+    assert "CODE_INDEXING_FROBNICATE" not in BY_NAME
 
 
 @pytest.mark.parametrize(
     ("name", "raw", "stored"),
     [
-        ("INCODE_OFFLINE", "YES", "1"),
-        ("INCODE_OFFLINE", "off", "0"),
-        ("INCODE_INDEX_MODE", "EAGER", "eager"),
-        ("INCODE_EMBED_BATCH_SIZE", "AUTO", "auto"),
-        ("INCODE_EMBED_BATCH_SIZE", "8", "8"),
+        ("CODE_INDEXING_OFFLINE", "YES", "1"),
+        ("CODE_INDEXING_OFFLINE", "off", "0"),
+        ("CODE_INDEXING_INDEX_MODE", "EAGER", "eager"),
+        ("CODE_INDEXING_EMBED_BATCH_SIZE", "AUTO", "auto"),
+        ("CODE_INDEXING_EMBED_BATCH_SIZE", "8", "8"),
         # Paths are stored as typed on every platform: rewriting separators
         # would hand the server a path its own OS never asked for.
-        ("INCODE_DATA_DIR", "/data", "/data"),
-        ("INCODE_DATA_DIR", r"C:\data", r"C:\data"),
+        ("CODE_INDEXING_DATA_DIR", "/data", "/data"),
+        ("CODE_INDEXING_DATA_DIR", r"C:\data", r"C:\data"),
     ],
 )
 def test_normalize(name: str, raw: str, stored: str) -> None:
@@ -100,7 +100,7 @@ def test_normalize(name: str, raw: str, stored: str) -> None:
 
 
 def test_normalize_expands_a_tilde_no_shell_is_left_to_expand() -> None:
-    assert normalize(BY_NAME["INCODE_DATA_DIR"], "~/indexes") == str(Path.home() / "indexes")
+    assert normalize(BY_NAME["CODE_INDEXING_DATA_DIR"], "~/indexes") == str(Path.home() / "indexes")
 
 
 @pytest.mark.parametrize(
@@ -112,8 +112,8 @@ def test_as_bool_reads_every_spelling_the_server_accepts(raw: str, expected: boo
 
 
 def test_dynamic_defaults_resolve_to_valid_values() -> None:
-    memory = BY_NAME["INCODE_EMBED_MEMORY_MB"]
-    threads = BY_NAME["INCODE_EMBED_THREADS"]
+    memory = BY_NAME["CODE_INDEXING_EMBED_MEMORY_MB"]
+    threads = BY_NAME["CODE_INDEXING_EMBED_THREADS"]
     assert validate(memory, default_value(memory)) is None
     assert validate(threads, default_value(threads)) is None
-    assert default_value(BY_NAME["INCODE_DATA_DIR"]).endswith("incode")
+    assert default_value(BY_NAME["CODE_INDEXING_DATA_DIR"]).endswith("code-indexing-mcp")

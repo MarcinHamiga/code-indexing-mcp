@@ -3,9 +3,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from incode_mcp import accelerator_probe, embedding_worker
-from incode_mcp.backends import CPU_PROVIDER, MLX_PROVIDER, Accelerator, Runtime
-from incode_mcp.embedding import DEFAULT_DIMENSION, DEFAULT_MODEL, PROBE_TEXTS
+from code_indexing_mcp import accelerator_probe, embedding_worker
+from code_indexing_mcp.backends import CPU_PROVIDER, MLX_PROVIDER, Accelerator, Runtime
+from code_indexing_mcp.embedding import DEFAULT_DIMENSION, DEFAULT_MODEL, PROBE_TEXTS
 
 
 class _WebGpuModel:

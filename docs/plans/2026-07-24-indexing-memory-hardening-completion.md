@@ -29,11 +29,11 @@ parts of this plan. It remains the post-merge roadmap; read these corrections fi
   > `tests/test_memory_acceptance.py::test_a_minified_file_stays_within_its_ceiling` is a plain
   > passing gate rather than a strict xfail.
 - **Task 3's retry design has no effect at the shipped default.** It specifies a `4 → 2 → 1`
-  microbatch backoff, but `INCODE_EMBED_BATCH_SIZE` defaulted to 1, so there was nothing to halve.
+  microbatch backoff, but `CODE_INDEXING_EMBED_BATCH_SIZE` defaulted to 1, so there was nothing to halve.
   Retry only becomes meaningful once the default is raised, which the 07-25 plan's Task 3 does.
 
   > **Done (2026-07-25), with the caveat intact.** The `4 → 2 → 1` backoff is implemented and
-  > covered, but `INCODE_EMBED_BATCH_SIZE` still defaults to 1 for the reasons in the 07-25 plan's
+  > covered, but `CODE_INDEXING_EMBED_BATCH_SIZE` still defaults to 1 for the reasons in the 07-25 plan's
   > Task 3, so it stays dormant unless an operator raises the batch size.
 - **Task 3 Step 3's duration fields are done.** The scan/parse/embed/commit durations were
   implemented as part of the 07-25 plan's Task 3.
@@ -48,7 +48,7 @@ parts of this plan. It remains the post-merge roadmap; read these corrections fi
 Both tasks landed, but the design deviates from the steps written below. The deviations are
 deliberate; the steps are left unedited as the original reasoning.
 
-**What shipped.** `src/incode_mcp/token_batching.py` holds pure window planning and microbatch
+**What shipped.** `src/code_indexing_mcp/token_batching.py` holds pure window planning and microbatch
 packing. The embedding worker resolves the tokenizer from the already-loaded FastEmbed model and
 serves a `plan_and_embed` command; `FastEmbedder` implements the same interface in-process. The
 indexer expands each returned window into its own stored chunk, deriving byte and line offsets from
@@ -178,11 +178,11 @@ git commit -m "test: add indexing memory acceptance harness"
 ### Task 2: Replace character chunking with tokenizer-aware bounded chunks
 
 **Files:**
-- Create: `src/incode_mcp/token_batching.py`
-- Modify: `src/incode_mcp/embedding_worker.py`
-- Modify: `src/incode_mcp/extractor.py`
-- Modify: `src/incode_mcp/indexing.py`
-- Modify: `src/incode_mcp/models.py`
+- Create: `src/code_indexing_mcp/token_batching.py`
+- Modify: `src/code_indexing_mcp/embedding_worker.py`
+- Modify: `src/code_indexing_mcp/extractor.py`
+- Modify: `src/code_indexing_mcp/indexing.py`
+- Modify: `src/code_indexing_mcp/models.py`
 - Modify: `tests/test_extractor.py`
 - Create: `tests/test_token_batching.py`
 - Modify: `tests/test_embedding_worker.py`
@@ -239,17 +239,17 @@ Run:
 Commit:
 
 ```bash
-git add src/incode_mcp tests/test_extractor.py tests/test_token_batching.py tests/test_embedding_worker.py tests/test_indexing.py
+git add src/code_indexing_mcp tests/test_extractor.py tests/test_token_batching.py tests/test_embedding_worker.py tests/test_indexing.py
 git commit -m "feat: add tokenizer-bounded chunk planning"
 ```
 
 ### Task 3: Add adaptive retries and complete memory telemetry
 
 **Files:**
-- Modify: `src/incode_mcp/embedding_worker.py`
-- Modify: `src/incode_mcp/indexing.py`
-- Modify: `src/incode_mcp/models.py`
-- Modify: `src/incode_mcp/errors.py`
+- Modify: `src/code_indexing_mcp/embedding_worker.py`
+- Modify: `src/code_indexing_mcp/indexing.py`
+- Modify: `src/code_indexing_mcp/models.py`
+- Modify: `src/code_indexing_mcp/errors.py`
 - Modify: `tests/test_embedding_worker.py`
 - Modify: `tests/test_indexing.py`
 
@@ -303,7 +303,7 @@ Run:
 Commit:
 
 ```bash
-git add src/incode_mcp/embedding_worker.py src/incode_mcp/indexing.py src/incode_mcp/models.py src/incode_mcp/errors.py tests/test_embedding_worker.py tests/test_indexing.py
+git add src/code_indexing_mcp/embedding_worker.py src/code_indexing_mcp/indexing.py src/code_indexing_mcp/models.py src/code_indexing_mcp/errors.py tests/test_embedding_worker.py tests/test_indexing.py
 git commit -m "feat: retry bounded embedding batches"
 ```
 
@@ -352,11 +352,11 @@ git commit -m "feat: retry bounded embedding batches"
 > batch size 1 and a 2,048 MiB ceiling.
 
 **Files:**
-- Create: `src/incode_mcp/staging.py`
-- Modify: `src/incode_mcp/scanner.py`
-- Modify: `src/incode_mcp/indexing.py`
-- Modify: `src/incode_mcp/storage.py`
-- Modify: `src/incode_mcp/application.py`
+- Create: `src/code_indexing_mcp/staging.py`
+- Modify: `src/code_indexing_mcp/scanner.py`
+- Modify: `src/code_indexing_mcp/indexing.py`
+- Modify: `src/code_indexing_mcp/storage.py`
+- Modify: `src/code_indexing_mcp/application.py`
 - Create: `tests/test_staging.py`
 - Modify: `tests/test_scanner.py`
 - Modify: `tests/test_indexing.py`
@@ -415,18 +415,18 @@ Run:
 Commit:
 
 ```bash
-git add src/incode_mcp/staging.py src/incode_mcp/scanner.py src/incode_mcp/indexing.py src/incode_mcp/storage.py src/incode_mcp/application.py tests/test_staging.py tests/test_scanner.py tests/test_indexing.py tests/test_storage.py
+git add src/code_indexing_mcp/staging.py src/code_indexing_mcp/scanner.py src/code_indexing_mcp/indexing.py src/code_indexing_mcp/storage.py src/code_indexing_mcp/application.py tests/test_staging.py tests/test_scanner.py tests/test_indexing.py tests/test_storage.py
 git commit -m "feat: stage index updates with rollback"
 ```
 
 ### Task 5: Make v1 migration continuously searchable and self-validating
 
 **Files:**
-- Create: `src/incode_mcp/migration.py`
-- Modify: `src/incode_mcp/storage.py`
-- Modify: `src/incode_mcp/search.py`
-- Modify: `src/incode_mcp/application.py`
-- Modify: `src/incode_mcp/cli.py`
+- Create: `src/code_indexing_mcp/migration.py`
+- Modify: `src/code_indexing_mcp/storage.py`
+- Modify: `src/code_indexing_mcp/search.py`
+- Modify: `src/code_indexing_mcp/application.py`
+- Modify: `src/code_indexing_mcp/cli.py`
 - Modify: `tests/test_storage.py`
 - Create: `tests/test_migration.py`
 - Modify: `tests/test_search.py`
@@ -492,17 +492,17 @@ Run:
 Commit:
 
 ```bash
-git add src/incode_mcp/migration.py src/incode_mcp/storage.py src/incode_mcp/search.py src/incode_mcp/application.py src/incode_mcp/cli.py tests/test_migration.py tests/test_storage.py tests/test_search.py tests/test_cli.py
+git add src/code_indexing_mcp/migration.py src/code_indexing_mcp/storage.py src/code_indexing_mcp/search.py src/code_indexing_mcp/application.py src/code_indexing_mcp/cli.py tests/test_migration.py tests/test_storage.py tests/test_search.py tests/test_cli.py
 git commit -m "feat: keep legacy indexes searchable during migration"
 ```
 
 ### Task 6: Add daemon protocol negotiation, idempotency, and job coalescing
 
 **Files:**
-- Create: `src/incode_mcp/scheduler.py`
-- Modify: `src/incode_mcp/daemon.py`
-- Modify: `src/incode_mcp/server.py`
-- Modify: `src/incode_mcp/application.py`
+- Create: `src/code_indexing_mcp/scheduler.py`
+- Modify: `src/code_indexing_mcp/daemon.py`
+- Modify: `src/code_indexing_mcp/server.py`
+- Modify: `src/code_indexing_mcp/application.py`
 - Create: `tests/test_scheduler.py`
 - Modify: `tests/test_daemon.py`
 - Modify: `tests/test_server.py`
@@ -555,16 +555,16 @@ Run:
 Commit:
 
 ```bash
-git add src/incode_mcp/scheduler.py src/incode_mcp/daemon.py src/incode_mcp/server.py src/incode_mcp/application.py tests/test_scheduler.py tests/test_daemon.py tests/test_server.py
+git add src/code_indexing_mcp/scheduler.py src/code_indexing_mcp/daemon.py src/code_indexing_mcp/server.py src/code_indexing_mcp/application.py tests/test_scheduler.py tests/test_daemon.py tests/test_server.py
 git commit -m "feat: coalesce indexing in the shared daemon"
 ```
 
 ### Task 7: Finish cross-platform IPC and installer lifecycle handling
 
 **Files:**
-- Create: `src/incode_mcp/ipc.py`
-- Modify: `src/incode_mcp/daemon.py`
-- Modify: `src/incode_mcp/cli.py`
+- Create: `src/code_indexing_mcp/ipc.py`
+- Modify: `src/code_indexing_mcp/daemon.py`
+- Modify: `src/code_indexing_mcp/cli.py`
 - Modify: `install.py`
 - Modify: `tests/test_daemon.py`
 - Create: `tests/test_ipc.py`
@@ -598,7 +598,7 @@ Do not edit any harness configuration; the existing `serve` command remains stab
 
 **Step 4: Add rollout switches**
 
-Keep `INCODE_BROKER=auto|on|off`. For one release:
+Keep `CODE_INDEXING_BROKER=auto|on|off`. For one release:
 
 - fresh installs default to `auto`;
 - upgrades preserve an explicit `off`;
@@ -616,7 +616,7 @@ Run:
 Commit:
 
 ```bash
-git add src/incode_mcp/ipc.py src/incode_mcp/daemon.py src/incode_mcp/cli.py install.py tests/test_ipc.py tests/test_daemon.py tests/test_installer.py
+git add src/code_indexing_mcp/ipc.py src/code_indexing_mcp/daemon.py src/code_indexing_mcp/cli.py install.py tests/test_ipc.py tests/test_daemon.py tests/test_installer.py
 git commit -m "feat: harden daemon lifecycle across platforms"
 ```
 
@@ -646,11 +646,11 @@ On Linux and macOS, run:
 
 ```bash
 .venv/bin/python scripts/benchmark_index_memory.py \
-  --model-cache "$INCODE_MODEL_TEST_CACHE" \
+  --model-cache "$CODE_INDEXING_MODEL_TEST_CACHE" \
   --corpus-scale 1 \
   --output memory-1x.json
 .venv/bin/python scripts/benchmark_index_memory.py \
-  --model-cache "$INCODE_MODEL_TEST_CACHE" \
+  --model-cache "$CODE_INDEXING_MODEL_TEST_CACHE" \
   --corpus-scale 10 \
   --output memory-10x.json
 ```
@@ -685,7 +685,7 @@ Document:
 - every environment variable and precedence rule;
 - interpreting memory telemetry;
 - daemon status/restart/stop;
-- `INCODE_BROKER=off` and `serve --direct`;
+- `CODE_INDEXING_BROKER=off` and `serve --direct`;
 - migration status/retry/cleanup;
 - locating and restoring the v1 backup;
 - collecting benchmark JSON for a bug report.

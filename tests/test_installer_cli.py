@@ -6,20 +6,26 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.installer import orchestrator
-from incode_mcp.installer.cli import main, parse_settings
-from incode_mcp.installer.config_files import InstallerError
-from incode_mcp.installer.wizard import Prefill
+from code_indexing_mcp.installer import orchestrator
+from code_indexing_mcp.installer.cli import main, parse_settings
+from code_indexing_mcp.installer.config_files import InstallerError
+from code_indexing_mcp.installer.wizard import Prefill
 
 
 def test_parse_settings_validates_and_normalizes() -> None:
-    updates = parse_settings(["INCODE_INDEX_MODE=EAGER", "INCODE_OFFLINE=yes"], ["INCODE_BROKER"])
-    assert updates == {"INCODE_INDEX_MODE": "eager", "INCODE_OFFLINE": "1", "INCODE_BROKER": None}
+    updates = parse_settings(
+        ["CODE_INDEXING_INDEX_MODE=EAGER", "CODE_INDEXING_OFFLINE=yes"], ["CODE_INDEXING_BROKER"]
+    )
+    assert updates == {
+        "CODE_INDEXING_INDEX_MODE": "eager",
+        "CODE_INDEXING_OFFLINE": "1",
+        "CODE_INDEXING_BROKER": None,
+    }
 
 
 @pytest.mark.parametrize(
     "pair",
-    ["INCODE_FROBNICATE=1", "INCODE_INDEX_MODE=sometimes", "INCODE_OFFLINE"],
+    ["CODE_INDEXING_FROBNICATE=1", "CODE_INDEXING_INDEX_MODE=sometimes", "CODE_INDEXING_OFFLINE"],
 )
 def test_parse_settings_rejects_bad_input(pair: str) -> None:
     with pytest.raises(InstallerError):
@@ -31,7 +37,7 @@ def _stub_pipeline(monkeypatch: pytest.MonkeyPatch, recorded: list) -> None:
         recorded.append(plan)
         return orchestrator.InstallResult(None, (), (), ())
 
-    import incode_mcp.installer.cli as cli
+    import code_indexing_mcp.installer.cli as cli
 
     monkeypatch.setattr(cli, "run_install", fake_run_install)
 
@@ -50,7 +56,7 @@ def test_main_runs_plan_without_prompting(
             "--harnesses",
             "kimi-code",
             "--set",
-            "INCODE_OFFLINE=1",
+            "CODE_INDEXING_OFFLINE=1",
             "--no-prompt",
         ]
     )
@@ -58,7 +64,7 @@ def test_main_runs_plan_without_prompting(
     (plan,) = recorded
     assert plan.accelerator == "cpu"
     assert plan.harness_slugs == ("kimi-code",)
-    assert plan.env_updates == {"INCODE_OFFLINE": "1"}
+    assert plan.env_updates == {"CODE_INDEXING_OFFLINE": "1"}
 
 
 def test_main_defaults_to_auto_accelerator_on_install(
@@ -77,7 +83,7 @@ def test_reconfigure_keeps_backend_and_prefills_harnesses(
     recorded: list = []
     _stub_pipeline(monkeypatch, recorded)
     monkeypatch.setattr(
-        "incode_mcp.installer.cli.load_prefill",
+        "code_indexing_mcp.installer.cli.load_prefill",
         lambda: Prefill({}, ("kimi-code",), ()),
     )
     assert main(["--install-dir", str(tmp_path), "--reconfigure", "--no-prompt"]) == 0
@@ -89,9 +95,9 @@ def test_main_reports_installer_errors(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _stub_pipeline(monkeypatch, [])
-    code = main(["--install-dir", str(tmp_path), "--set", "INCODE_NOPE=1", "--no-prompt"])
+    code = main(["--install-dir", str(tmp_path), "--set", "CODE_INDEXING_NOPE=1", "--no-prompt"])
     assert code == 1
-    assert "INCODE_NOPE" in capsys.readouterr().err
+    assert "CODE_INDEXING_NOPE" in capsys.readouterr().err
 
 
 def _fake_tui_app(monkeypatch: pytest.MonkeyPatch) -> list:
@@ -108,22 +114,22 @@ def _fake_tui_app(monkeypatch: pytest.MonkeyPatch) -> list:
         def run(self) -> None:
             return None
 
-    fake_package = types.ModuleType("incode_mcp.installer.tui")
-    fake_app_module = types.ModuleType("incode_mcp.installer.tui.app")
+    fake_package = types.ModuleType("code_indexing_mcp.installer.tui")
+    fake_app_module = types.ModuleType("code_indexing_mcp.installer.tui.app")
     fake_app_module.InstallerApp = FakeApp  # type: ignore[attr-defined]
     fake_package.app = fake_app_module  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "incode_mcp.installer.tui", fake_package)
-    monkeypatch.setitem(sys.modules, "incode_mcp.installer.tui.app", fake_app_module)
+    monkeypatch.setitem(sys.modules, "code_indexing_mcp.installer.tui", fake_package)
+    monkeypatch.setitem(sys.modules, "code_indexing_mcp.installer.tui.app", fake_app_module)
     return calls
 
 
 def test_main_tui_flag_delegates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     calls = _fake_tui_app(monkeypatch)
 
-    code = main(["--install-dir", str(tmp_path), "--tui", "--set", "INCODE_OFFLINE=1"])
+    code = main(["--install-dir", str(tmp_path), "--tui", "--set", "CODE_INDEXING_OFFLINE=1"])
 
     assert code == 0
-    assert calls and calls[0].values.get("INCODE_OFFLINE") == "1"
+    assert calls and calls[0].values.get("CODE_INDEXING_OFFLINE") == "1"
 
 
 def test_main_tui_honours_scripted_flags(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -131,15 +137,16 @@ def test_main_tui_honours_scripted_flags(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
     calls = _fake_tui_app(monkeypatch)
     monkeypatch.setattr(
-        "incode_mcp.installer.cli.load_prefill",
-        lambda: Prefill({"INCODE_BROKER": "off"}, ("kimi-code",), ()),
+        "code_indexing_mcp.installer.cli.load_prefill",
+        lambda: Prefill({"CODE_INDEXING_BROKER": "off"}, ("kimi-code",), ()),
     )
     monkeypatch.setattr(
-        "incode_mcp.installer.wizard.load_prefill",
-        lambda **kwargs: Prefill({"INCODE_BROKER": "off"}, ("kimi-code",), ()),
+        "code_indexing_mcp.installer.wizard.load_prefill",
+        lambda **kwargs: Prefill({"CODE_INDEXING_BROKER": "off"}, ("kimi-code",), ()),
     )
     monkeypatch.setattr(
-        "incode_mcp.installer.wizard.accelerator.prepared_accelerator", lambda directory: "cpu"
+        "code_indexing_mcp.installer.wizard.accelerator.prepared_accelerator",
+        lambda directory: "cpu",
     )
 
     code = main(
@@ -153,7 +160,7 @@ def test_main_tui_honours_scripted_flags(monkeypatch: pytest.MonkeyPatch, tmp_pa
             "--harnesses",
             "codex,claude-code",
             "--unset",
-            "INCODE_BROKER",
+            "CODE_INDEXING_BROKER",
         ]
     )
 
@@ -162,24 +169,25 @@ def test_main_tui_honours_scripted_flags(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert state.accelerator == "mlx"
     assert state.harness_slugs == ["codex", "claude-code"]
     # Cleared, but still remembered as prefilled, so confirming deletes the key.
-    assert "INCODE_BROKER" not in state.values
-    assert state.env_updates() == {"INCODE_BROKER": None}
+    assert "CODE_INDEXING_BROKER" not in state.values
+    assert state.env_updates() == {"CODE_INDEXING_BROKER": None}
 
 
 def test_configure_does_not_open_the_wizard_over_explicit_flags(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from incode_mcp.installer.cli import configure_main
+    from code_indexing_mcp.installer.cli import configure_main
 
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.server_executable", lambda directory: tmp_path / "server"
+        "code_indexing_mcp.installer.accelerator.server_executable",
+        lambda directory: tmp_path / "server",
     )
     (tmp_path / "server").touch()
     recorded: list = []
     _stub_pipeline(monkeypatch, recorded)
     monkeypatch.setattr(
-        "incode_mcp.installer.cli._run_tui",
+        "code_indexing_mcp.installer.cli._run_tui",
         lambda *args, **kwargs: pytest.fail("must not open the wizard"),
     )
 
@@ -200,7 +208,7 @@ def test_configure_does_not_open_the_wizard_over_explicit_flags(
 def test_main_reports_harness_failures_instead_of_claiming_success(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    import incode_mcp.installer.cli as cli
+    import code_indexing_mcp.installer.cli as cli
 
     monkeypatch.setattr(
         cli,

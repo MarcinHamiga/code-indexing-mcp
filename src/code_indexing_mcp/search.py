@@ -6,7 +6,7 @@ import logging
 from pathlib import PurePosixPath
 
 from .embedding import Embedder
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .models import (
     ChunkPreview,
     CodeChunk,
@@ -45,7 +45,7 @@ class SearchService:
     ) -> SearchResponse:
         query = query.strip()
         if not query or not project_ids:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.INVALID_FILTER, "Search requires a query and at least one project"
             )
         limit = max(1, min(limit, 50))
@@ -103,7 +103,7 @@ class SearchService:
         limit: int = 20,
     ) -> SymbolResponse:
         if match not in {"exact", "prefix", "contains"}:
-            raise IncodeError(ErrorCode.INVALID_FILTER, f"Invalid symbol match mode: {match}")
+            raise CodeIndexingError(ErrorCode.INVALID_FILTER, f"Invalid symbol match mode: {match}")
         limit = max(1, min(limit, 50))
         candidates = self.store.find_symbol_chunks(
             name, project_id, match=match, kinds=kinds, limit=limit
@@ -144,7 +144,7 @@ class SearchService:
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         chunk = self.store.get_chunk(chunk_id)
         if chunk is None:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.CHUNK_NOT_FOUND,
                 f"Unknown chunk: {chunk_id}; chunk ids come from search_code or find_symbol "
                 "results and change when the file is re-indexed",

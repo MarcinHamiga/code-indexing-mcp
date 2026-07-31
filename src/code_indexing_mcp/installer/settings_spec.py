@@ -1,7 +1,7 @@
 """Declarative catalog of the runtime settings the installer can manage.
 
 One source drives the Textual wizard's forms, ``--set`` validation, and the
-summary screen. Validation mirrors ``incode_mcp.settings`` exactly; the server
+summary screen. Validation mirrors ``code_indexing_mcp.settings`` exactly; the server
 keeps reading only real environment variables.
 """
 
@@ -47,7 +47,7 @@ def _default_threads() -> str:
 
 SETTINGS: tuple[Setting, ...] = (
     Setting(
-        "INCODE_INDEX_MODE",
+        "CODE_INDEXING_INDEX_MODE",
         "Indexing",
         "Index mode",
         "When projects get indexed: lazy on first use, eager at startup, manual only.",
@@ -56,7 +56,7 @@ SETTINGS: tuple[Setting, ...] = (
         choices=("lazy", "eager", "manual"),
     ),
     Setting(
-        "INCODE_INDEX_WAIT_SECONDS",
+        "CODE_INDEXING_INDEX_WAIT_SECONDS",
         "Indexing",
         "Index wait (seconds)",
         "How long a startup index waits out a competing job before failing; 0 disables waiting.",
@@ -66,7 +66,7 @@ SETTINGS: tuple[Setting, ...] = (
         maximum=24 * 60 * 60,
     ),
     Setting(
-        "INCODE_EMBED_MEMORY_MB",
+        "CODE_INDEXING_EMBED_MEMORY_MB",
         "Indexing",
         "Indexing memory (MB)",
         "Ceiling for the indexing worker. The default is 25% of RAM clamped to 1024-2048.",
@@ -77,7 +77,7 @@ SETTINGS: tuple[Setting, ...] = (
         dynamic_default=_default_memory_mb,
     ),
     Setting(
-        "INCODE_VECTOR_INDEX",
+        "CODE_INDEXING_VECTOR_INDEX",
         "Indexing",
         "Vector index",
         "exact search, or approximate HNSW indexing.",
@@ -86,7 +86,7 @@ SETTINGS: tuple[Setting, ...] = (
         choices=("exact", "hnsw"),
     ),
     Setting(
-        "INCODE_INDEX_EXECUTION",
+        "CODE_INDEXING_INDEX_EXECUTION",
         "Indexing",
         "Index execution",
         "worker enforces the memory ceiling; in-process is a diagnostic rollback.",
@@ -95,7 +95,7 @@ SETTINGS: tuple[Setting, ...] = (
         choices=("worker", "in-process"),
     ),
     Setting(
-        "INCODE_BROKER",
+        "CODE_INDEXING_BROKER",
         "Indexing",
         "Broker",
         "Share one indexing process between clients through the daemon.",
@@ -104,25 +104,25 @@ SETTINGS: tuple[Setting, ...] = (
         choices=("auto", "on", "off"),
     ),
     Setting(
-        "INCODE_DATA_DIR",
+        "CODE_INDEXING_DATA_DIR",
         "Indexing",
         "Data directory",
         "Where the indexes live.",
         "path",
         "",
-        dynamic_default=lambda: str(user_data_path("incode")),
+        dynamic_default=lambda: str(user_data_path("code-indexing-mcp")),
     ),
     Setting(
-        "INCODE_CACHE_DIR",
+        "CODE_INDEXING_CACHE_DIR",
         "Indexing",
         "Cache directory",
         "Where the embedding model is cached.",
         "path",
         "",
-        dynamic_default=lambda: str(user_cache_path("incode")),
+        dynamic_default=lambda: str(user_cache_path("code-indexing-mcp")),
     ),
     Setting(
-        "INCODE_OFFLINE",
+        "CODE_INDEXING_OFFLINE",
         "Indexing",
         "Offline mode",
         "Never download the model; fail if it is missing.",
@@ -130,7 +130,7 @@ SETTINGS: tuple[Setting, ...] = (
         "0",
     ),
     Setting(
-        "INCODE_EMBED_BATCH_SIZE",
+        "CODE_INDEXING_EMBED_BATCH_SIZE",
         "Embedding",
         "Batch size",
         "Embedding microbatch size; auto resolves to 1 unless calibration raised it.",
@@ -140,7 +140,7 @@ SETTINGS: tuple[Setting, ...] = (
         maximum=256,
     ),
     Setting(
-        "INCODE_EMBED_MAX_TOKENS",
+        "CODE_INDEXING_EMBED_MAX_TOKENS",
         "Embedding",
         "Max tokens",
         "Sequence window per chunk; attention memory is quadratic in tokens.",
@@ -150,7 +150,7 @@ SETTINGS: tuple[Setting, ...] = (
         maximum=8192,
     ),
     Setting(
-        "INCODE_EMBED_OVERLAP_TOKENS",
+        "CODE_INDEXING_EMBED_OVERLAP_TOKENS",
         "Embedding",
         "Overlap tokens",
         "Overlap between consecutive windows of a long chunk.",
@@ -160,7 +160,7 @@ SETTINGS: tuple[Setting, ...] = (
         maximum=4096,
     ),
     Setting(
-        "INCODE_EMBED_THREADS",
+        "CODE_INDEXING_EMBED_THREADS",
         "Embedding",
         "Threads",
         "CPU inference threads.",
@@ -171,7 +171,7 @@ SETTINGS: tuple[Setting, ...] = (
         dynamic_default=_default_threads,
     ),
     Setting(
-        "INCODE_EMBED_CPU_ARENA",
+        "CODE_INDEXING_EMBED_CPU_ARENA",
         "Embedding",
         "CPU arena",
         "Preallocate the CPU inference arena.",
@@ -179,7 +179,7 @@ SETTINGS: tuple[Setting, ...] = (
         "0",
     ),
     Setting(
-        "INCODE_EMBED_CROSSOVER",
+        "CODE_INDEXING_EMBED_CROSSOVER",
         "Embedding",
         "Accelerator crossover",
         "Run size in characters above which starting the accelerator repays its model load.",
@@ -189,7 +189,7 @@ SETTINGS: tuple[Setting, ...] = (
         maximum=1024**3,
     ),
     Setting(
-        "INCODE_EMBED_CALIBRATE",
+        "CODE_INDEXING_EMBED_CALIBRATE",
         "Embedding",
         "Calibrate",
         "Measure the backend once to set the batch size and crossover.",
@@ -197,7 +197,7 @@ SETTINGS: tuple[Setting, ...] = (
         "1",
     ),
     Setting(
-        "INCODE_EMBED_STRICT",
+        "CODE_INDEXING_EMBED_STRICT",
         "Embedding",
         "Strict accelerator",
         "Refuse the CPU fallback when the requested backend is unavailable.",
@@ -205,7 +205,7 @@ SETTINGS: tuple[Setting, ...] = (
         "0",
     ),
     Setting(
-        "INCODE_EMBED_ACCELERATOR",
+        "CODE_INDEXING_EMBED_ACCELERATOR",
         "Embedding",
         "Backend override",
         "Expert override; auto uses the backend the installer prepared.",
@@ -225,7 +225,7 @@ def default_value(setting: Setting) -> str:
 
 
 def as_bool(raw: str) -> bool:
-    """Read a boolean the way ``incode_mcp.settings`` does.
+    """Read a boolean the way ``code_indexing_mcp.settings`` does.
 
     The wizard prefills from configurations a user may have written by hand, so
     every spelling the server accepts has to render as the same checkbox state.

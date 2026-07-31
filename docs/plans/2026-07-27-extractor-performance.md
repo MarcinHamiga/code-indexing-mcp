@@ -74,7 +74,7 @@ models, and generated API clients have exactly this shape.
 `Query(language, query_text)` on **every** `extract()` call:
 
 ```python
-query_text = files("incode_mcp.queries").joinpath(f"{language_name}.scm").read_text()
+query_text = files("code_indexing_mcp.queries").joinpath(f"{language_name}.scm").read_text()
 matches = QueryCursor(Query(language, query_text)).matches(root)
 ```
 
@@ -115,7 +115,7 @@ run.
 | `tests/fixtures/extractor_corpus/` | **New.** Six committed source files covering the shapes the extractor treats specially. Stable input, so the snapshot never needs regenerating for unrelated code changes. |
 | `tests/fixtures/extractor_snapshot.json` | **New.** Committed fingerprint of the extractor's output over that corpus. |
 | `tests/test_extractor_equivalence.py` | **New.** Asserts output against the snapshot, plus the scaling guards. |
-| `src/incode_mcp/extractor.py` | Gains `_query()` with a lock-guarded cache, `_DefinitionIndex`, and `_LineIndex`. `_has_definition_ancestor`, `_symbol_context`, and `_content_range` take the index instead of the list. |
+| `src/code_indexing_mcp/extractor.py` | Gains `_query()` with a lock-guarded cache, `_DefinitionIndex`, and `_LineIndex`. `_has_definition_ancestor`, `_symbol_context`, and `_content_range` take the index instead of the list. |
 
 Task order matters: **Task 1 must land before Tasks 2–4.** It is the only thing standing between a
 performance refactor and silently corrupted chunk ids.
@@ -348,9 +348,9 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.extractor import TreeSitterExtractor
-from incode_mcp.models import ExtractionResult
-from incode_mcp.scanner import LANGUAGES
+from code_indexing_mcp.extractor import TreeSitterExtractor
+from code_indexing_mcp.models import ExtractionResult
+from code_indexing_mcp.scanner import LANGUAGES
 
 CORPUS_DIRECTORY = Path(__file__).parent / "fixtures" / "extractor_corpus"
 SNAPSHOT_PATH = Path(__file__).parent / "fixtures" / "extractor_snapshot.json"
@@ -465,7 +465,7 @@ if __name__ == "__main__":
 This must run **before** any change to `extractor.py`, so the snapshot records today's behaviour:
 
 ```bash
-git diff --stat src/incode_mcp/extractor.py   # must be empty
+git diff --stat src/code_indexing_mcp/extractor.py   # must be empty
 .venv/bin/python -m tests.test_extractor_equivalence
 ```
 
@@ -498,7 +498,7 @@ Commit with the timing test red, and note it in the commit body. Tasks 2–4 mak
 ### Task 2: Cache the compiled Tree-sitter query per language
 
 **Files:**
-- Modify: `src/incode_mcp/extractor.py:52-63` (constructor), `:97-116` (`_definitions`)
+- Modify: `src/code_indexing_mcp/extractor.py:52-63` (constructor), `:97-116` (`_definitions`)
 - Test: `tests/test_extractor.py`
 
 **Interfaces:**
@@ -517,7 +517,7 @@ def test_compiled_query_is_built_once_per_language(monkeypatch: pytest.MonkeyPat
 
     Re-reading and recompiling per file cost 44% of extraction time over 35 files.
     """
-    import incode_mcp.extractor as extractor_module
+    import code_indexing_mcp.extractor as extractor_module
 
     compiled: list[str] = []
     original = extractor_module.Query
@@ -545,7 +545,7 @@ Expected: FAIL — `compiled 6 times, expected one per language`.
 
 - [ ] **Step 3: Add the cache**
 
-In `src/incode_mcp/extractor.py`, add `import threading` and the cache to `__init__`:
+In `src/code_indexing_mcp/extractor.py`, add `import threading` and the cache to `__init__`:
 
 ```python
         self._languages = _languages()
@@ -573,7 +573,7 @@ Add the accessor:
             cached = self._queries.get(language_name)
             if cached is not None:
                 return cached
-            text = files("incode_mcp.queries").joinpath(f"{language_name}.scm").read_text()
+            text = files("code_indexing_mcp.queries").joinpath(f"{language_name}.scm").read_text()
             compiled = Query(self._languages[language_name], text)
             self._queries[language_name] = compiled
             return compiled
@@ -622,8 +622,8 @@ Expected: both PASS. The snapshot test passing is the proof that caching changed
 .venv/bin/python - <<'PY'
 import time
 from pathlib import Path
-from incode_mcp.extractor import TreeSitterExtractor
-files = sorted(Path("src/incode_mcp").glob("*.py")) + sorted(Path("tests").glob("*.py"))
+from code_indexing_mcp.extractor import TreeSitterExtractor
+files = sorted(Path("src/code_indexing_mcp").glob("*.py")) + sorted(Path("tests").glob("*.py"))
 data = [(p, p.read_bytes()) for p in files]
 ex = TreeSitterExtractor()
 for p, b in data: ex.extract(p, "python", b)
@@ -641,7 +641,7 @@ Expected: about **41 ms/pass**, down from 72.9.
 ```bash
 .venv/bin/python -m pytest -q tests/test_extractor.py
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy src tests
-git add src/incode_mcp/extractor.py tests/test_extractor.py
+git add src/code_indexing_mcp/extractor.py tests/test_extractor.py
 git commit -m "perf: compile each Tree-sitter query once instead of per file"
 ```
 
@@ -650,7 +650,7 @@ git commit -m "perf: compile each Tree-sitter query once instead of per file"
 ### Task 3: Build the definition index once per file
 
 **Files:**
-- Modify: `src/incode_mcp/extractor.py:45-50` (add `_DefinitionIndex`), `:65-95` (`extract`),
+- Modify: `src/code_indexing_mcp/extractor.py:45-50` (add `_DefinitionIndex`), `:65-95` (`extract`),
   `:132-140`, `:142-164`, `:166-180`
 - Test: `tests/test_extractor_equivalence.py` (no new test — the Task 1 timing gate turns green)
 
@@ -668,7 +668,7 @@ Expected: FAIL, `extraction took ~31s`. This is the test Task 3 fixes.
 
 - [ ] **Step 2: Add the index type**
 
-In `src/incode_mcp/extractor.py`, add `from bisect import bisect_right` and, after the `_Definition`
+In `src/code_indexing_mcp/extractor.py`, add `from bisect import bisect_right` and, after the `_Definition`
 dataclass:
 
 ```python
@@ -793,7 +793,7 @@ comprehension on the offending fixture before touching the snapshot.
 .venv/bin/python - <<'PY'
 import time
 from pathlib import Path
-from incode_mcp.extractor import TreeSitterExtractor
+from code_indexing_mcp.extractor import TreeSitterExtractor
 ex = TreeSitterExtractor()
 previous = None
 for count in (250, 500, 1000, 2000, 4000):
@@ -815,7 +815,7 @@ tens of milliseconds rather than 409 ms.
 ```bash
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy src tests
-git add src/incode_mcp/extractor.py
+git add src/code_indexing_mcp/extractor.py
 git commit -m "perf: build the definition index once per file instead of per definition"
 ```
 
@@ -824,7 +824,7 @@ git commit -m "perf: build the definition index once per file instead of per def
 ### Task 4: Index newline positions once per file
 
 **Files:**
-- Modify: `src/incode_mcp/extractor.py` (add `_LineIndex`, `:182-196`, `:305-340`)
+- Modify: `src/code_indexing_mcp/extractor.py` (add `_LineIndex`, `:182-196`, `:305-340`)
 - Test: `tests/test_extractor.py`
 
 **Interfaces:**
@@ -838,7 +838,7 @@ Append to `tests/test_extractor.py`:
 
 ```python
 def test_line_index_matches_a_naive_newline_count() -> None:
-    from incode_mcp.extractor import _LineIndex
+    from code_indexing_mcp.extractor import _LineIndex
 
     source = b"alpha\nbeta\n\ngamma\r\ndelta"
     index = _LineIndex(source)
@@ -848,7 +848,7 @@ def test_line_index_matches_a_naive_newline_count() -> None:
 
 
 def test_line_index_handles_empty_and_newline_only_sources() -> None:
-    from incode_mcp.extractor import _LineIndex
+    from code_indexing_mcp.extractor import _LineIndex
 
     assert _LineIndex(b"").line_at(0) == 1
     assert _LineIndex(b"\n\n\n").line_at(3) == 4
@@ -952,7 +952,7 @@ Expected: all pass. The snapshot test is the proof.
 .venv/bin/python - <<'PY'
 import time
 from pathlib import Path
-from incode_mcp.extractor import TreeSitterExtractor
+from code_indexing_mcp.extractor import TreeSitterExtractor
 ex = TreeSitterExtractor()
 src = "\n".join(f"def f{i}(a, b):\n    return a + b + {i}\n" for i in range(16_384)).encode()
 ex.extract(Path("warm.py"), "python", src)
@@ -969,7 +969,7 @@ Expected: well under a second, against 31.3 s on `main`.
 ```bash
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy src tests
-git add src/incode_mcp/extractor.py tests/test_extractor.py
+git add src/code_indexing_mcp/extractor.py tests/test_extractor.py
 git commit -m "perf: index newline offsets once per file instead of rescanning per chunk"
 ```
 

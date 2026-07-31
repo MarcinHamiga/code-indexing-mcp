@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from test_token_batching import fake_encode
 
-from incode_mcp.embedding import (
+from code_indexing_mcp.embedding import (
     PROBE_TEXTS,
     PassageCandidate,
     SegmentPlan,
@@ -19,7 +19,7 @@ from incode_mcp.embedding import (
     pack_vector,
     plan_passages,
 )
-from incode_mcp.embedding_worker import (
+from code_indexing_mcp.embedding_worker import (
     MINIMUM_WORKER_BYTES,
     EmbeddingWorkerSession,
     WorkerConfig,
@@ -28,7 +28,7 @@ from incode_mcp.embedding_worker import (
     effective_memory_ceiling,
     indexing_memory_bytes,
 )
-from incode_mcp.errors import ErrorCode, IncodeError
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 
 
 def _fake_worker(connection: Connection, _: WorkerConfig) -> None:
@@ -100,7 +100,7 @@ def test_embedding_worker_round_trips_vectors_and_stops() -> None:
 
 
 def test_embedding_worker_refuses_unsafe_effective_budget() -> None:
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         EmbeddingWorkerSession(
             WorkerConfig(
                 cache_directory="unused",
@@ -194,7 +194,7 @@ def test_worker_growth_still_trips_the_ceiling(monkeypatch: pytest.MonkeyPatch) 
     session = _session(_slow_worker, 1024**3)
     monkeypatch.setattr(session, "_sample_rss", lambda: (0, 8 * 1024**3))
 
-    with session, pytest.raises(IncodeError) as caught:
+    with session, pytest.raises(CodeIndexingError) as caught:
         session.embed_passages(["a"])
 
     assert caught.value.code is ErrorCode.INDEX_RESOURCE_LIMIT
@@ -266,7 +266,7 @@ def test_an_unplannable_candidate_raises_a_plain_error_the_file_absorbs() -> Non
             SegmentPlan(max_tokens=8, overlap_tokens=2, max_windows=2),
         )
 
-    # Deliberately not an IncodeError: the indexer's environment-error set would
+    # Deliberately not an CodeIndexingError: the indexer's environment-error set would
     # abort the whole run for what is one bad file.
     assert session.termination_reason is None
 
@@ -322,7 +322,7 @@ def _always_failing_worker(connection: Connection, _: WorkerConfig) -> None:
 def test_retries_stop_and_the_error_surfaces_once_the_batch_cannot_shrink() -> None:
     session = _session(_always_failing_worker, 2 * 1024**3)
 
-    with session, pytest.raises(IncodeError) as caught:
+    with session, pytest.raises(CodeIndexingError) as caught:
         session.plan_and_embed([PassageCandidate("", "x")], SegmentPlan(max_tokens=8, max_items=2))
 
     assert caught.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
@@ -388,13 +388,13 @@ def test_a_broken_channel_is_reported_however_it_breaks(stage: str, error: BaseE
     Which exception a dead worker produces depends on the platform and on
     whether the channel is a pipe or a socket, so the cases that never occur on
     the machine running this are injected rather than left to a race: a leak
-    here reaches indexing, which can only degrade to CPU on an IncodeError.
+    here reaches indexing, which can only degrade to CPU on an CodeIndexingError.
     """
     session = _session(_fake_worker, 2 * 1024**3)
     session._process = _NeverExits()  # type: ignore[assignment]
     session._connection = _BreaksAt(stage, error)  # type: ignore[assignment]
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         session.initialize()
 
     assert caught.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
@@ -494,7 +494,7 @@ def _unnormalized_worker(connection: Connection, _: WorkerConfig) -> None:
 def test_a_probe_whose_vectors_could_not_search_an_index_is_rejected(
     target: WorkerTarget, message: str
 ) -> None:
-    # Deliberately a ValueError rather than an IncodeError: the caller decides
+    # Deliberately a ValueError rather than an CodeIndexingError: the caller decides
     # whether an unusable backend means fall back or fail.
     session = _session(target, 2 * 1024**3)
 
@@ -521,7 +521,7 @@ def test_mlx_loads_its_own_model_and_not_fastembed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """MLX takes none of the ONNX arguments: it has no session to configure."""
-    from incode_mcp import mlx_backend
+    from code_indexing_mcp import mlx_backend
 
     mlx_model = object()
     options: list[dict[str, object]] = []
@@ -564,7 +564,7 @@ def test_direct_accelerators_do_not_load_fastembed(
     monkeypatch: pytest.MonkeyPatch,
     accelerator: str,
 ) -> None:
-    from incode_mcp import direct_onnx
+    from code_indexing_mcp import direct_onnx
 
     direct_model = object()
     direct_options: list[dict[str, object]] = []
@@ -703,7 +703,7 @@ def test_the_ceiling_terminates_a_worker_even_when_its_reply_already_arrived(
         monkeypatch, connection=connection, process=process, rss_bytes=100 * 1024**3
     )
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         session._request("embed", ["text"])
 
     assert caught.value.code is ErrorCode.INDEX_RESOURCE_LIMIT
@@ -721,7 +721,7 @@ def test_the_memory_ceiling_still_terminates_a_worker_that_is_not_replying(
         monkeypatch, connection=connection, process=process, rss_bytes=100 * 1024**3
     )
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         session._request("embed", ["text"])
 
     assert caught.value.code is ErrorCode.INDEX_RESOURCE_LIMIT

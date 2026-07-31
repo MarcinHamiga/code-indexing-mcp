@@ -16,7 +16,7 @@ slower.*
 Three other Phase 5 items are outstanding for the same reason — nothing has ever measured a backend
 beyond "it works":
 
-- Batch size is configured, never calibrated. `INCODE_EMBED_BATCH_SIZE=auto` resolves to 1, the
+- Batch size is configured, never calibrated. `CODE_INDEXING_EMBED_BATCH_SIZE=auto` resolves to 1, the
   value CPU indexing has always used, on every backend. `ProbeRecord.batch_size` exists and is
   written as 0, and `PassageBackendSession` carries a `calibrated_batch_size` parameter that
   `Application` explicitly passes 0 to with a comment naming this phase.
@@ -97,7 +97,7 @@ When a batch retry succeeds at a reduced `max_items`, that size is recorded as t
 calibrated batch size, marked as reduced rather than measured. The next run starts there instead of
 rediscovering the ceiling by overrunning it. Nothing raises the limit again on its own; a changed
 model, runtime, driver, platform, or device invalidates the key and re-calibrates, and an explicit
-`INCODE_EMBED_BATCH_SIZE` overrides it outright. `model status` reports which of the two it is
+`CODE_INDEXING_EMBED_BATCH_SIZE` overrides it outright. `model status` reports which of the two it is
 looking at, so a machine pinned low by one bad run says so.
 
 ### Report all of it

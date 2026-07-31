@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.probe_cache import (
+from code_indexing_mcp.probe_cache import (
     CACHE_SCHEMA_VERSION,
     MAX_RECORDS,
     ProbeCache,

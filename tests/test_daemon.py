@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp import daemon, embedding
-from incode_mcp.application import Application, RuntimePaths
-from incode_mcp.daemon import (
+from code_indexing_mcp import daemon, embedding
+from code_indexing_mcp.application import Application, RuntimePaths
+from code_indexing_mcp.daemon import (
     BrokerApplication,
     DaemonServer,
     daemon_endpoint,
@@ -19,10 +19,10 @@ from incode_mcp.daemon import (
     receive_frame,
     send_frame,
 )
-from incode_mcp.embedding import FastEmbedder
-from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.models import IndexReport
-from incode_mcp.settings import IndexSettings
+from code_indexing_mcp.embedding import FastEmbedder
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.models import IndexReport
+from code_indexing_mcp.settings import IndexSettings
 
 # Gate on the capability the code actually needs rather than on the platform, so
 # the guard keeps tracking reality if another platform loses (or gains) AF_UNIX.
@@ -81,8 +81,8 @@ def test_broker_restarts_daemon_after_idle_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
-    monkeypatch.setenv("INCODE_DATA_DIR", str(paths.data))
-    monkeypatch.setenv("INCODE_CACHE_DIR", str(paths.cache))
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(paths.data))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(paths.cache))
     application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
     first = DaemonServer(paths, application=application, idle_timeout_seconds=0.1)
     first_thread = threading.Thread(target=first.serve, daemon=True)
@@ -111,7 +111,7 @@ def test_broker_restarts_daemon_after_idle_exit(
         ConnectionResetError(104, "Connection reset by peer"),
         ConnectionRefusedError(111, "Connection refused"),
         FileNotFoundError(2, "No such file or directory"),
-        IncodeError(ErrorCode.PROTOCOL_ERROR, "Local daemon frame exceeds the maximum size"),
+        CodeIndexingError(ErrorCode.PROTOCOL_ERROR, "Local daemon frame exceeds the maximum size"),
     ],
 )
 def test_daemon_status_answers_the_question_however_the_ping_fails(
@@ -222,7 +222,7 @@ def test_concurrent_clients_share_one_model_and_one_indexing_job(
     # in-process execution keeps embedding on the daemon's own FastEmbedder,
     # which is where the shared model lives; the worker path would spawn a real
     # process and load the real model.
-    settings = IndexSettings.from_environment({"INCODE_INDEX_EXECUTION": "in-process"})
+    settings = IndexSettings.from_environment({"CODE_INDEXING_INDEX_EXECUTION": "in-process"})
     application = Application(
         paths,
         embedder=FastEmbedder(paths.cache / "models", offline=True),
@@ -236,7 +236,7 @@ def test_concurrent_clients_share_one_model_and_one_indexing_job(
 
     clients = 8
     barrier = threading.Barrier(clients)
-    outcomes: list[IndexReport | IncodeError] = []
+    outcomes: list[IndexReport | CodeIndexingError] = []
     outcomes_lock = threading.Lock()
 
     def drive() -> None:
@@ -244,8 +244,8 @@ def test_concurrent_clients_share_one_model_and_one_indexing_job(
         try:
             barrier.wait(timeout=10)
             project = broker.init_project(root)
-            outcome: IndexReport | IncodeError = broker.index_project(project.id)
-        except IncodeError as exc:
+            outcome: IndexReport | CodeIndexingError = broker.index_project(project.id)
+        except CodeIndexingError as exc:
             outcome = exc
         with outcomes_lock:
             outcomes.append(outcome)
@@ -263,7 +263,7 @@ def test_concurrent_clients_share_one_model_and_one_indexing_job(
     project_id = application.list_projects()[0].id
 
     reports = [outcome for outcome in outcomes if isinstance(outcome, IndexReport)]
-    errors = [outcome for outcome in outcomes if isinstance(outcome, IncodeError)]
+    errors = [outcome for outcome in outcomes if isinstance(outcome, CodeIndexingError)]
     assert reports
     assert all(error.code is ErrorCode.INDEX_BUSY for error in errors)
     assert all(report.project_id == project_id for report in reports)
@@ -291,11 +291,11 @@ def test_require_daemon_support_explains_unsupported_platforms(
 ) -> None:
     monkeypatch.setattr(daemon, "daemon_supported", lambda: False)
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         daemon.require_daemon_support()
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
-    assert "INCODE_BROKER=off" in str(caught.value)
+    assert "CODE_INDEXING_BROKER=off" in str(caught.value)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership semantics")
@@ -307,11 +307,11 @@ def test_endpoint_refuses_a_symlinked_runtime_directory(
     attacker.mkdir()
     runtime = tmp_path / "runtime"
     runtime.mkdir()
-    (runtime / f"incode-{os.getuid()}").symlink_to(attacker)
+    (runtime / f"code-indexing-mcp-{os.getuid()}").symlink_to(attacker)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         daemon_endpoint(paths)
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION

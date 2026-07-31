@@ -17,9 +17,9 @@ NumPy, uv, pytest.
 
 **Files:**
 
-- Modify: `src/incode_mcp/backends.py`
-- Modify: `src/incode_mcp/accelerator_probe.py`
-- Modify: `src/incode_mcp/application.py`
+- Modify: `src/code_indexing_mcp/backends.py`
+- Modify: `src/code_indexing_mcp/accelerator_probe.py`
+- Modify: `src/code_indexing_mcp/application.py`
 - Modify: `tests/test_backends.py`
 - Modify: `tests/test_accelerator_probe.py`
 
@@ -58,7 +58,7 @@ uv run --extra cpu mypy src
 
 **Files:**
 
-- Create: `src/incode_mcp/mlx_backend.py`
+- Create: `src/code_indexing_mcp/mlx_backend.py`
 - Create: `tests/test_mlx_backend.py`
 - Modify: `pyproject.toml`
 
@@ -95,7 +95,7 @@ uv run --extra cpu mypy src
 
 **Files:**
 
-- Modify: `src/incode_mcp/embedding_worker.py`
+- Modify: `src/code_indexing_mcp/embedding_worker.py`
 - Modify: `tests/test_embedding_worker.py`
 
 **Step 1: Write a failing routing test**
@@ -139,7 +139,7 @@ uv run --extra cpu pytest tests/test_installer.py tests/test_accelerator_env.py 
 
 **Step 1: Accept `mlx` in the gate suite**
 
-`INCODE_TEST_ACCELERATOR=mlx` must exercise the same parity and 1,000-chunk performance gates
+`CODE_INDEXING_TEST_ACCELERATOR=mlx` must exercise the same parity and 1,000-chunk performance gates
 through a prepared environment.
 
 **Step 2: Run them on Apple Silicon**

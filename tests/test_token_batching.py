@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from incode_mcp.token_batching import (
+from code_indexing_mcp.token_batching import (
     DEFAULT_MAX_TOKEN_PRODUCT,
     DEFAULT_MAX_TOKENS,
     DEFAULT_OVERLAP_TOKENS,

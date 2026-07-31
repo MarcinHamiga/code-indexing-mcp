@@ -5,9 +5,9 @@ from pathlib import Path
 
 import lancedb
 
-from incode_mcp.models import ProjectInfo, StoredChunk, StoredFile
-from incode_mcp.projects import initialize_project
-from incode_mcp.storage import LanceStore
+from code_indexing_mcp.models import ProjectInfo, StoredChunk, StoredFile
+from code_indexing_mcp.projects import initialize_project
+from code_indexing_mcp.storage import LanceStore
 
 
 def stored_file(project_id: str, *, file_id: str = "file-1") -> StoredFile:
@@ -157,7 +157,7 @@ def test_compaction_keeps_recent_versions_readable(tmp_path: Path) -> None:
 
 
 def test_get_chunk_does_not_read_the_vector_column(tmp_path: Path) -> None:
-    from incode_mcp.models import CodeChunk
+    from code_indexing_mcp.models import CodeChunk
 
     store, _project, chunk_id = _store_with_one_chunk(tmp_path)
 
@@ -174,7 +174,7 @@ def test_partition_cache_evicts_least_recently_used(tmp_path: Path) -> None:
     Without a bound, two open LanceTable handles per project accumulate for the life
     of the process.
     """
-    from incode_mcp import storage as storage_module
+    from code_indexing_mcp import storage as storage_module
 
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     projects = []
@@ -195,7 +195,7 @@ def test_partition_cache_evicts_least_recently_used(tmp_path: Path) -> None:
 
 
 def test_partition_cache_keeps_recently_used_entries(tmp_path: Path) -> None:
-    from incode_mcp import storage as storage_module
+    from code_indexing_mcp import storage as storage_module
 
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     ids = []
@@ -221,7 +221,7 @@ def test_partition_cache_keeps_recently_used_entries(tmp_path: Path) -> None:
 
 def test_evicted_partition_reopens_with_its_data(tmp_path: Path) -> None:
     """Eviction is a cache decision, never a data decision."""
-    from incode_mcp import storage as storage_module
+    from code_indexing_mcp import storage as storage_module
 
     store, project, chunk_id = _store_with_one_chunk(tmp_path)
     for index in range(storage_module.MAX_CACHED_PARTITIONS + 1):
@@ -238,7 +238,7 @@ def test_evicted_partition_reopens_with_its_data(tmp_path: Path) -> None:
 
 def test_list_chunks_does_not_materialize_vectors(tmp_path: Path) -> None:
     """Nothing in production calls list_chunks; the vectors were read for no one."""
-    from incode_mcp.models import IndexedChunk
+    from code_indexing_mcp.models import IndexedChunk
 
     store, project, _ = _store_with_one_chunk(tmp_path)
 
@@ -255,7 +255,7 @@ def test_list_chunks_does_not_materialize_vectors(tmp_path: Path) -> None:
 
 def test_stored_chunk_still_carries_its_vector(tmp_path: Path) -> None:
     """The write path is unaffected: StoredChunk keeps the vector it commits."""
-    from incode_mcp.models import IndexedChunk, StoredChunk
+    from code_indexing_mcp.models import IndexedChunk, StoredChunk
 
     assert issubclass(StoredChunk, IndexedChunk)
     assert "vector" in StoredChunk.model_fields

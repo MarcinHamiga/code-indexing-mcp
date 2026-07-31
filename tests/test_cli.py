@@ -3,16 +3,16 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp import cli, daemon
-from incode_mcp.application import Application
-from incode_mcp.cli import main
+from code_indexing_mcp import cli, daemon
+from code_indexing_mcp.application import Application
+from code_indexing_mcp.cli import main
 
 
 def test_cli_initializes_and_lists_projects(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
     root = tmp_path / "repo"
     root.mkdir()
-    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
 
     assert main(["init", str(root)]) == 0
     init_result = json.loads(capsys.readouterr().out)
@@ -26,8 +26,8 @@ def test_cli_initializes_and_lists_projects(tmp_path: Path, monkeypatch, capsys)
 def test_cli_runs_the_index_benchmark_with_machine_readable_output(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
     received: dict[str, object] = {}
 
     def fake_benchmark(**kwargs: object) -> dict[str, object]:
@@ -65,10 +65,10 @@ def test_cli_runs_the_index_benchmark_with_machine_readable_output(
 def test_serve_falls_back_to_direct_when_local_sockets_are_unavailable(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
-    """INCODE_BROKER=auto must not crash where AF_UNIX does not exist."""
-    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.delenv("INCODE_BROKER", raising=False)
+    """CODE_INDEXING_BROKER=auto must not crash where AF_UNIX does not exist."""
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.delenv("CODE_INDEXING_BROKER", raising=False)
     monkeypatch.setattr(daemon, "daemon_supported", lambda: False)
 
     def refuse(*_: object, **__: object) -> object:
@@ -95,19 +95,19 @@ def test_serve_falls_back_to_direct_when_local_sockets_are_unavailable(
 def test_serve_refuses_an_explicit_broker_opt_in_without_local_sockets(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("INCODE_BROKER", "on")
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("CODE_INDEXING_BROKER", "on")
     monkeypatch.setattr(daemon, "daemon_supported", lambda: False)
 
     assert cli.main(["serve"]) == 2
-    assert "INCODE_BROKER=off" in capsys.readouterr().err
+    assert "CODE_INDEXING_BROKER=off" in capsys.readouterr().err
 
 
 def test_cli_reports_the_resolved_embedding_backend(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("INCODE_EMBED_ACCELERATOR", "cpu")
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("CODE_INDEXING_EMBED_ACCELERATOR", "cpu")
 
     assert main(["model", "status"]) == 0
 
@@ -123,9 +123,9 @@ def test_cli_reports_the_resolved_embedding_backend(tmp_path: Path, monkeypatch,
 def test_model_status_explains_an_accelerator_it_cannot_honour(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("INCODE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("INCODE_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("INCODE_EMBED_ACCELERATOR", "cuda")
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("CODE_INDEXING_EMBED_ACCELERATOR", "cuda")
 
     assert main(["model", "status"]) == 0
 
@@ -147,17 +147,17 @@ def test_configure_delegates_to_the_installer(monkeypatch, capsys) -> None:  # t
         calls.append(kwargs)
         return 0
 
-    import incode_mcp.installer.cli as installer_cli
+    import code_indexing_mcp.installer.cli as installer_cli
 
     monkeypatch.setattr(installer_cli, "configure_main", fake_configure_main)
-    code = main(["configure", "--install-dir", "/opt/ci-mcp", "--set", "INCODE_OFFLINE=1"])
+    code = main(["configure", "--install-dir", "/opt/ci-mcp", "--set", "CODE_INDEXING_OFFLINE=1"])
     assert code == 0
     assert calls == [
         {
             "install_dir": "/opt/ci-mcp",
             "accelerator": None,
             "harnesses": None,
-            "settings": ["INCODE_OFFLINE=1"],
+            "settings": ["CODE_INDEXING_OFFLINE=1"],
             "unsets": [],
             "no_tui": False,
         }
@@ -169,7 +169,11 @@ def test_serve_path_does_not_import_textual() -> None:
     import sys
 
     result = subprocess.run(
-        [sys.executable, "-c", "import incode_mcp.cli, sys; print('textual' in sys.modules)"],
+        [
+            sys.executable,
+            "-c",
+            "import code_indexing_mcp.cli, sys; print('textual' in sys.modules)",
+        ],
         capture_output=True,
         text=True,
     )

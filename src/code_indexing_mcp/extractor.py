@@ -174,7 +174,7 @@ class TreeSitterExtractor:
             cached = self._queries.get(language_name)
             if cached is not None:
                 return cached
-            text = files("incode_mcp.queries").joinpath(f"{language_name}.scm").read_text()
+            text = files("code_indexing_mcp.queries").joinpath(f"{language_name}.scm").read_text()
             compiled = Query(self._languages[language_name], text)
             self._queries[language_name] = compiled
             return compiled

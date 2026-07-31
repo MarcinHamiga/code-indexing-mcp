@@ -27,7 +27,7 @@ from .backends import (
 from .calibration import LIMITED_BY_MEMORY, crossover_characters
 from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
 from .indexing import Indexer
 from .models import (
@@ -79,8 +79,10 @@ class RuntimePaths:
 
     @classmethod
     def from_environment(cls) -> RuntimePaths:
-        data = Path(os.environ.get("INCODE_DATA_DIR", user_data_path("incode")))
-        cache = Path(os.environ.get("INCODE_CACHE_DIR", user_cache_path("incode")))
+        data = Path(os.environ.get("CODE_INDEXING_DATA_DIR", user_data_path("code-indexing-mcp")))
+        cache = Path(
+            os.environ.get("CODE_INDEXING_CACHE_DIR", user_cache_path("code-indexing-mcp"))
+        )
         return cls(data=data.expanduser().resolve(), cache=cache.expanduser().resolve())
 
 
@@ -108,7 +110,7 @@ class Application:
         self.cwd = (cwd or Path.cwd()).resolve()
         self.settings = settings or IndexSettings.from_environment()
         if embedder is None:
-            offline = os.environ.get("INCODE_OFFLINE", "").lower() in {"1", "true", "yes"}
+            offline = os.environ.get("CODE_INDEXING_OFFLINE", "").lower() in {"1", "true", "yes"}
             embedder = FastEmbedder(
                 paths.cache / "models",
                 offline=offline,
@@ -382,7 +384,7 @@ class Application:
         """
         if accelerator is not None and accelerator.limited_by == LIMITED_BY_MEMORY:
             return (
-                "INCODE_EMBED_MEMORY_MB (a batch overran the ceiling and was reduced to "
+                "CODE_INDEXING_EMBED_MEMORY_MB (a batch overran the ceiling and was reduced to "
                 f"{accelerator.batch_size})"
             )
         if (
@@ -393,7 +395,7 @@ class Application:
             and accelerator.characters_per_second <= cpu.characters_per_second
         ):
             return (
-                "INCODE_EMBED_ACCELERATOR=cpu (the accelerator measured no faster than CPU "
+                "CODE_INDEXING_EMBED_ACCELERATOR=cpu (the accelerator measured no faster than CPU "
                 "on this machine)"
             )
         return None
@@ -526,7 +528,7 @@ class Application:
     ) -> ProjectInfo:
         if path is None and roots:
             if len(roots) > 1:
-                raise IncodeError(
+                raise CodeIndexingError(
                     ErrorCode.AMBIGUOUS_PROJECT,
                     "Multiple MCP roots are available; provide an explicit path",
                 )
@@ -691,7 +693,7 @@ class Application:
         roots: list[Path] | None,
     ) -> list[str]:
         if projects and all_projects:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.INVALID_FILTER,
                 "projects and all_projects cannot be used together",
             )
@@ -702,7 +704,7 @@ class Application:
         else:
             project_ids = [self._resolve(None, roots).id]
         if not project_ids:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.PROJECT_NOT_FOUND,
                 "No indexed projects are available; init_project registers one and "
                 "index_project builds its index",

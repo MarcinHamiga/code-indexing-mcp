@@ -110,7 +110,7 @@ def probe(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m incode_mcp.accelerator_probe",
+        prog="python -m code_indexing_mcp.accelerator_probe",
         description="Verify that this environment can embed on a given accelerator",
     )
     parser.add_argument("--accelerator", required=True)

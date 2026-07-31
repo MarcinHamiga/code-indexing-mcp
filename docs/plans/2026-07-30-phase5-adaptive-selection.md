@@ -12,7 +12,7 @@ that already keys by configuration, and decide mid-run because the indexing pipe
 
 ### Task 1: Memory-bounded microbatches
 
-**Files:** `src/incode_mcp/token_batching.py`, `src/incode_mcp/application.py`,
+**Files:** `src/code_indexing_mcp/token_batching.py`, `src/code_indexing_mcp/application.py`,
 `tests/test_token_batching.py`, `tests/test_application.py`
 
 Add `max_token_product_for(memory_bytes)`: the default product scaled by the ceiling it is measured
@@ -22,7 +22,7 @@ the product, and that a 1 GiB floor still admits a single max-length sequence.
 
 ### Task 2: Calibration measurement
 
-**Files:** create `src/incode_mcp/calibration.py`, create `tests/test_calibration.py`
+**Files:** create `src/code_indexing_mcp/calibration.py`, create `tests/test_calibration.py`
 
 - `CalibrationResult(max_items, characters_per_second, load_ns, limited_by)`.
 - `calibration_candidates(...)` — a deterministic, code-shaped synthetic corpus at two
@@ -41,7 +41,7 @@ formula matches hand-computed values including the no-crossover case.
 
 ### Task 3: Persisting calibration
 
-**Files:** `src/incode_mcp/probe_cache.py`, `tests/test_probe_cache.py`
+**Files:** `src/code_indexing_mcp/probe_cache.py`, `tests/test_probe_cache.py`
 
 Extend `ProbeRecord` with `characters_per_second`, `load_ns`, and `limited_by`; bump
 `CACHE_SCHEMA_VERSION` to 2. Assert a version-1 file is ignored, a round trip preserves the new
@@ -49,7 +49,7 @@ fields, and a record missing them is still readable within version 2 only if it 
 
 ### Task 4: Cold-load cost and the reduced safe limit
 
-**Files:** `src/incode_mcp/embedding_worker.py`, `tests/test_embedding_worker.py`
+**Files:** `src/code_indexing_mcp/embedding_worker.py`, `tests/test_embedding_worker.py`
 
 Record `load_duration_ns` across spawn plus `initialize`, and `safe_max_items` when a retry
 succeeds at a reduced size. Assert both, including that a first-attempt success leaves
@@ -57,7 +57,7 @@ succeeds at a reduced size. Assert both, including that a first-attempt success 
 
 ### Task 5: Calibrating and crossing over in the passage session
 
-**Files:** `src/incode_mcp/passage_backend.py`, `tests/test_passage_backend.py`
+**Files:** `src/code_indexing_mcp/passage_backend.py`, `tests/test_passage_backend.py`
 
 - Calibrate on a probe miss, store the result, and use a cached one on a hit.
 - Accept `crossover_characters`; embed on CPU below it, switch to the accelerator on the request
@@ -72,10 +72,10 @@ never used; a reduced batch size reaches the cache.
 
 ### Task 6: Settings, wiring, and diagnostics
 
-**Files:** `src/incode_mcp/settings.py`, `src/incode_mcp/application.py`,
-`src/incode_mcp/models.py`, `src/incode_mcp/indexing.py`, and their tests
+**Files:** `src/code_indexing_mcp/settings.py`, `src/code_indexing_mcp/application.py`,
+`src/code_indexing_mcp/models.py`, `src/code_indexing_mcp/indexing.py`, and their tests
 
-- `INCODE_EMBED_CROSSOVER=auto|off|<characters>` and `INCODE_EMBED_CALIBRATE=0|1`.
+- `CODE_INDEXING_EMBED_CROSSOVER=auto|off|<characters>` and `CODE_INDEXING_EMBED_CALIBRATE=0|1`.
 - `Application` computes the crossover from the CPU and accelerator records and passes it down.
 - `ModelStatus` gains the rates, cold-load milliseconds, crossover, and a recommended override;
   `batch_calibration` gains `measured` and `reduced`.

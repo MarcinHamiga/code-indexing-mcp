@@ -4,7 +4,7 @@ Five independent plans addressing the 2026-07-26 review of `main` (commit `961a7
 produces working, tested software on its own and can be executed and merged separately.
 
 Baseline at the time of review: **190 passed, 3 skipped** (`.venv/bin/python -m pytest -q`). The
-three skips are real-model gates requiring `INCODE_MODEL_TEST_CACHE`.
+three skips are real-model gates requiring `CODE_INDEXING_MODEL_TEST_CACHE`.
 
 ## The plans
 

@@ -5,12 +5,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from incode_mcp.acceptance import cosine_rows, top_k_overlap
-from incode_mcp.backends import CPU_BACKEND
-from incode_mcp.direct_onnx import DirectOnnxEmbedding
-from incode_mcp.embedding import DEFAULT_DIMENSION, FastEmbedder
-from incode_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig
-from incode_mcp.worker_launcher import ExternalInterpreterLauncher
+from code_indexing_mcp.acceptance import cosine_rows, top_k_overlap
+from code_indexing_mcp.backends import CPU_BACKEND
+from code_indexing_mcp.direct_onnx import DirectOnnxEmbedding
+from code_indexing_mcp.embedding import DEFAULT_DIMENSION, FastEmbedder
+from code_indexing_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig
+from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher
 
 GOLDEN_PASSAGES = (
     "def authorize(user, action):\n    return action in user.permissions",
@@ -45,9 +45,9 @@ GOLDEN_QUERIES = (
 
 
 def _model_cache() -> Path:
-    configured_cache = os.environ.get("INCODE_MODEL_TEST_CACHE")
+    configured_cache = os.environ.get("CODE_INDEXING_MODEL_TEST_CACHE")
     if not configured_cache:
-        pytest.skip("set INCODE_MODEL_TEST_CACHE to opt into the real model test")
+        pytest.skip("set CODE_INDEXING_MODEL_TEST_CACHE to opt into the real model test")
     return Path(configured_cache)
 
 

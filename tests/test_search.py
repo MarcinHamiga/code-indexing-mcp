@@ -2,12 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.extractor import TreeSitterExtractor
-from incode_mcp.indexing import Indexer
-from incode_mcp.projects import initialize_project
-from incode_mcp.scanner import SourceScanner
-from incode_mcp.search import SearchService
-from incode_mcp.storage import LanceStore
+from code_indexing_mcp.extractor import TreeSitterExtractor
+from code_indexing_mcp.indexing import Indexer
+from code_indexing_mcp.projects import initialize_project
+from code_indexing_mcp.scanner import SourceScanner
+from code_indexing_mcp.search import SearchService
+from code_indexing_mcp.storage import LanceStore
 
 
 class SemanticEmbedder:

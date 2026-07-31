@@ -29,10 +29,10 @@
 - Add runtime configuration:
 
   ```text
-  INCODE_EMBED_ACCELERATOR=auto|cpu|cuda|webgpu|migraphx|coreml
-  INCODE_EMBED_BATCH_SIZE=auto|1..256
-  INCODE_EMBED_MEMORY_MB=<positive integer>
-  INCODE_EMBED_STRICT=0|1
+  CODE_INDEXING_EMBED_ACCELERATOR=auto|cpu|cuda|webgpu|migraphx|coreml
+  CODE_INDEXING_EMBED_BATCH_SIZE=auto|1..256
+  CODE_INDEXING_EMBED_MEMORY_MB=<positive integer>
+  CODE_INDEXING_EMBED_STRICT=0|1
   ```
 
   `STRICT=1` disables CPU fallback.

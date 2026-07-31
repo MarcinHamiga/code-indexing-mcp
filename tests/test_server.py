@@ -8,9 +8,9 @@ from mcp import types
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from incode_mcp.application import Application, RuntimePaths
-from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.server import create_server
+from code_indexing_mcp.application import Application, RuntimePaths
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.server import create_server
 
 
 class TinyEmbedder:
@@ -64,7 +64,7 @@ class FlakyEmbedder(TinyEmbedder):
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
         self.calls += 1
         if self.calls == 1:
-            raise IncodeError(ErrorCode.MODEL_UNAVAILABLE, "embedding backend unavailable")
+            raise CodeIndexingError(ErrorCode.MODEL_UNAVAILABLE, "embedding backend unavailable")
         return super().embed_passages(texts)
 
 
@@ -74,7 +74,7 @@ class FailingEmbedder(TinyEmbedder):
 
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
         self.calls += 1
-        raise IncodeError(ErrorCode.MODEL_UNAVAILABLE, "embedding backend unavailable")
+        raise CodeIndexingError(ErrorCode.MODEL_UNAVAILABLE, "embedding backend unavailable")
 
 
 @pytest.mark.asyncio
@@ -388,7 +388,7 @@ async def test_auto_index_can_be_disabled(tmp_path: Path, monkeypatch: pytest.Mo
         embedder=TinyEmbedder(),
         cwd=tmp_path,
     )
-    monkeypatch.setenv("INCODE_AUTO_INDEX", "0")
+    monkeypatch.setenv("CODE_INDEXING_AUTO_INDEX", "0")
     server = create_server(app)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
@@ -586,7 +586,7 @@ async def test_first_query_fails_when_a_competing_index_holds_the_lock_past_the_
     (root / "main.py").write_text("def answer():\n    return 42\n")
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
-    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "1")
+    monkeypatch.setenv("CODE_INDEXING_INDEX_WAIT_SECONDS", "1")
     server = create_server(app)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
@@ -620,7 +620,7 @@ async def test_a_second_root_gives_up_instead_of_queueing_behind_the_first(
 
     One capacity limiter serializes roots in a session, so a second root waits
     even though no other process holds the global lock. To a first query the two
-    are indistinguishable, so both count against INCODE_INDEX_WAIT_SECONDS.
+    are indistinguishable, so both count against CODE_INDEXING_INDEX_WAIT_SECONDS.
     """
     root_a = tmp_path / "project_a"
     root_a.mkdir()
@@ -638,7 +638,7 @@ async def test_a_second_root_gives_up_instead_of_queueing_behind_the_first(
         embedder=embedder,
         cwd=tmp_path,
     )
-    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "0")
+    monkeypatch.setenv("CODE_INDEXING_INDEX_WAIT_SECONDS", "0")
     server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
@@ -693,7 +693,7 @@ async def test_first_query_succeeds_when_the_index_lock_frees_before_the_deadlin
     (root / "main.py").write_text("def answer():\n    return 42\n")
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
-    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "60")
+    monkeypatch.setenv("CODE_INDEXING_INDEX_WAIT_SECONDS", "60")
     server = create_server(app)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
@@ -775,7 +775,7 @@ def test_server_instructions_guide_index_first_usage(tmp_path: Path) -> None:
 
 
 def test_error_renders_code_message_and_details_for_clients() -> None:
-    error = IncodeError(
+    error = CodeIndexingError(
         ErrorCode.INDEX_BUSY,
         "Another indexing job is already active",
         waited_seconds=3.5,
@@ -792,7 +792,7 @@ def test_error_renders_code_message_and_details_for_clients() -> None:
 
 
 def test_error_without_details_renders_as_plain_string() -> None:
-    error = IncodeError(ErrorCode.CHUNK_NOT_FOUND, "Unknown chunk: abc")
+    error = CodeIndexingError(ErrorCode.CHUNK_NOT_FOUND, "Unknown chunk: abc")
 
     assert error.for_client() == "CHUNK_NOT_FOUND: Unknown chunk: abc"
 

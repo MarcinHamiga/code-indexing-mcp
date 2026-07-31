@@ -28,7 +28,7 @@ from .embedding import (
     resolve_tokenizer,
     validate_probe_vectors,
 )
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .worker_launcher import SpawnLauncher, WorkerLauncher, WorkerProcess
 
 SYSTEM_RESERVE_BYTES = 512 * 1024**2
@@ -269,7 +269,7 @@ class EmbeddingWorkerSession:
             )
         )
         if self.effective_ceiling_bytes < MINIMUM_WORKER_BYTES:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.INDEX_RESOURCE_LIMIT,
                 "Insufficient available memory to load the embedding model safely",
                 effective_memory_bytes=self.effective_ceiling_bytes,
@@ -335,7 +335,7 @@ class EmbeddingWorkerSession:
         status, payload = self._request("initialize", None)
         self.load_duration_ns = time.monotonic_ns() - started
         if status != "initialized":
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.EMBEDDING_WORKER_FAILED,
                 f"Embedding worker answered initialize with {status!r}",
             )
@@ -347,12 +347,12 @@ class EmbeddingWorkerSession:
     def probe(self) -> list[bytes]:
         """Run a minimum-batch inference and validate the vectors it returns.
 
-        Raises ``IncodeError`` when the worker fails outright and ``ValueError``
+        Raises ``CodeIndexingError`` when the worker fails outright and ``ValueError``
         when it answers with vectors an index could not use.
         """
         status, payload = self._request("probe", None)
         if status != "probed":
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.EMBEDDING_WORKER_FAILED,
                 f"Embedding worker answered probe with {status!r}",
             )
@@ -364,7 +364,7 @@ class EmbeddingWorkerSession:
         """Return the worker's own resident set size in bytes."""
         status, payload = self._request("memory", None)
         if status != "memory":
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.EMBEDDING_WORKER_FAILED,
                 f"Embedding worker answered memory with {status!r}",
             )
@@ -413,7 +413,7 @@ class EmbeddingWorkerSession:
                     # rediscovered by overrunning the ceiling on the next run.
                     self.safe_max_items = attempt.max_items
                 break
-            except IncodeError as exc:
+            except CodeIndexingError as exc:
                 if (
                     exc.code not in RETRYABLE_CODES
                     or attempt.max_items <= 1
@@ -471,7 +471,7 @@ class EmbeddingWorkerSession:
             if not reply_ready and not self._process.is_alive():
                 self.close()
                 self.termination_reason = "worker_exited"
-                raise IncodeError(
+                raise CodeIndexingError(
                     ErrorCode.EMBEDDING_WORKER_FAILED,
                     "Embedding worker exited without returning a result",
                 )
@@ -497,7 +497,7 @@ class EmbeddingWorkerSession:
             ):
                 self._terminate()
                 self.termination_reason = "memory_ceiling"
-                raise IncodeError(
+                raise CodeIndexingError(
                     ErrorCode.INDEX_RESOURCE_LIMIT,
                     "Indexing exceeded its memory ceiling",
                     effective_memory_bytes=self.effective_ceiling_bytes,
@@ -514,10 +514,10 @@ class EmbeddingWorkerSession:
         if status == "error":
             self.close()
             self.termination_reason = "worker_error"
-            raise IncodeError(ErrorCode.EMBEDDING_WORKER_FAILED, str(payload))
+            raise CodeIndexingError(ErrorCode.EMBEDDING_WORKER_FAILED, str(payload))
         return status, payload
 
-    def _channel_failed(self) -> IncodeError:
+    def _channel_failed(self) -> CodeIndexingError:
         """Report a broken command channel as this session's own failure.
 
         A worker that stops cleanly closes the channel, which reads as
@@ -533,7 +533,7 @@ class EmbeddingWorkerSession:
         """
         self.close()
         self.termination_reason = "channel_closed"
-        return IncodeError(
+        return CodeIndexingError(
             ErrorCode.EMBEDDING_WORKER_FAILED,
             "Embedding worker closed its result channel",
         )

@@ -18,9 +18,9 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.extractor import TreeSitterExtractor
-from incode_mcp.models import ExtractionResult
-from incode_mcp.scanner import LANGUAGES
+from code_indexing_mcp.extractor import TreeSitterExtractor
+from code_indexing_mcp.models import ExtractionResult
+from code_indexing_mcp.scanner import LANGUAGES
 
 CORPUS_DIRECTORY = Path(__file__).parent / "fixtures" / "extractor_corpus"
 SNAPSHOT_PATH = Path(__file__).parent / "fixtures" / "extractor_snapshot.json"

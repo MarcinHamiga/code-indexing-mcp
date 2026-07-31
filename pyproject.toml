@@ -91,7 +91,7 @@ migraphx = [
 tui = ["textual>=8.2,<9"]
 
 [project.scripts]
-code-indexing-mcp = "incode_mcp.cli:main"
+code-indexing-mcp = "code_indexing_mcp.cli:main"
 
 [tool.hatch.metadata]
 # MIGraphX is distributed as a versioned ROCm wheel URL rather than through a
@@ -122,7 +122,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/incode_mcp"]
+packages = ["src/code_indexing_mcp"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
@@ -148,7 +148,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["incode_mcp"]
+packages = ["code_indexing_mcp"]
 
 [[tool.mypy.overrides]]
 module = [

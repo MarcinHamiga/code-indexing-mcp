@@ -28,7 +28,7 @@ ACCELERATOR_EXTRAS = {
 }
 ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml")
 ACCELERATOR_ENVIRONMENT_DIRECTORY = ".venv-accel"
-# Bumped in lockstep with incode_mcp.accelerator_env.RECORD_SCHEMA_VERSION.
+# Bumped in lockstep with code_indexing_mcp.accelerator_env.RECORD_SCHEMA_VERSION.
 ACCELERATOR_RECORD_SCHEMA_VERSION = 1
 # A cold probe downloads the embedding model before it can run an inference, so
 # this has to cover a slow link as well as a slow device.
@@ -313,7 +313,7 @@ def plan_accelerator(
         return AcceleratorPlan(
             "cpu",
             "Core ML needs no separate environment and stays manual-only: it lost to "
-            "CPU on this model. Set INCODE_EMBED_ACCELERATOR=coreml to measure it",
+            "CPU on this model. Set CODE_INDEXING_EMBED_ACCELERATOR=coreml to measure it",
         )
     if requested == "mlx":
         return _mlx_plan(
@@ -447,7 +447,7 @@ def runtime_record_path(python: Path) -> Path:
     """Ask the installed package where the server reads its accelerator record.
 
     The package is asked rather than told: it owns the filename, and it honours
-    an ``INCODE_ACCEL_ENV`` override that a path assembled here would write
+    an ``CODE_INDEXING_ACCEL_ENV`` override that a path assembled here would write
     straight past, leaving the record somewhere the server never looks.
     """
 
@@ -455,8 +455,8 @@ def runtime_record_path(python: Path) -> Path:
         [
             str(python),
             "-c",
-            "from incode_mcp.accelerator_env import record_path;"
-            "from incode_mcp.application import RuntimePaths;"
+            "from code_indexing_mcp.accelerator_env import record_path;"
+            "from code_indexing_mcp.application import RuntimePaths;"
             "print(record_path(RuntimePaths.from_environment().data))",
         ]
     )
@@ -525,7 +525,13 @@ def sync_accelerator_environment(
 def probe_accelerator(python: Path, accelerator: str, *, offline: bool = False) -> dict[str, Any]:
     """Run a real inference in the accelerator environment and return its report."""
 
-    arguments = [str(python), "-m", "incode_mcp.accelerator_probe", "--accelerator", accelerator]
+    arguments = [
+        str(python),
+        "-m",
+        "code_indexing_mcp.accelerator_probe",
+        "--accelerator",
+        accelerator,
+    ]
     if offline:
         arguments.append("--offline")
     try:
@@ -563,7 +569,7 @@ def probe_accelerator(python: Path, accelerator: str, *, offline: bool = False) 
 def write_accelerator_record(path: Path, plan: AcceleratorPlan, probe: Mapping[str, Any]) -> None:
     """Record the verified environment where the server looks for one.
 
-    The shape is read back by ``incode_mcp.accelerator_env``; the schema version
+    The shape is read back by ``code_indexing_mcp.accelerator_env``; the schema version
     is what keeps a record written here from being misread by a server that
     changed its mind about what these fields mean.
     """

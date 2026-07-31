@@ -12,8 +12,8 @@ accelerator plan/build/probe, a numbered harness menu via `input()`, config merg
 skills symlinking — and offers exactly four customization flags: `--install-dir`,
 `--repo-url`, `--accelerator`, `--harnesses`.
 
-The server, meanwhile, has grown a large runtime configuration surface (18 `INCODE_*`
-environment variables in `src/incode_mcp/settings.py` and `application.py`), none of
+The server, meanwhile, has grown a large runtime configuration surface (18 `CODE_INDEXING_*`
+environment variables in `src/code_indexing_mcp/settings.py` and `application.py`), none of
 which the installer can set. Because MCP servers are spawned by the harness with a fixed
 command, the only way those variables reach the server is through the harness config's
 per-server environment mechanism. Today the installer writes `"env": {}` for Claude Code
@@ -33,13 +33,13 @@ behavioral guarantee of the existing installer.
    environment block. No server-side changes; `settings.py` is untouched.
 3. **Scope**: install/update plus a reconfigure mode that prefills the wizard from existing
    harness config environment blocks.
-4. **CI path**: existing flags keep working unchanged; a repeatable `--set INCODE_FOO=bar`
+4. **CI path**: existing flags keep working unchanged; a repeatable `--set CODE_INDEXING_FOO=bar`
    flag carries the new settings non-interactively. The TUI launches only on an interactive
    TTY (auto-disabled for unusable `TERM`); `--tui` / `--no-tui` force the mode.
 5. **Reconfigure entry**: the TUI ships inside the installed package as
    `code-indexing-mcp configure` (Textual lazily imported). Works offline; no git/uv needed.
 6. **Architecture**: all install logic moves from `install.py` into a new
-   `src/incode_mcp/installer/` subpackage (package-embedded). `install.py` becomes a thin
+   `src/code_indexing_mcp/installer/` subpackage (package-embedded). `install.py` becomes a thin
    bootstrap: clone/update → sync → delegate. One orchestrator, one source of truth;
    reconfigure can do everything install can, including accelerator changes.
 
@@ -58,9 +58,9 @@ behavioral guarantee of the existing installer.
 
 - No server-side configuration file or changes to how the server reads settings.
 - No uninstall flow, no doctor/status console.
-- Legacy/test-only variables stay out of the UI: `INCODE_AUTO_INDEX`,
-  `INCODE_INDEX_MEMORY_MB` (legacy alias), `INCODE_ACCEL_ENV`, `INCODE_MODEL_TEST_CACHE`,
-  `INCODE_TEST_ACCELERATOR`.
+- Legacy/test-only variables stay out of the UI: `CODE_INDEXING_AUTO_INDEX`,
+  `CODE_INDEXING_INDEX_MEMORY_MB` (legacy alias), `CODE_INDEXING_ACCEL_ENV`, `CODE_INDEXING_MODEL_TEST_CACHE`,
+  `CODE_INDEXING_TEST_ACCELERATOR`.
 - `install.sh` itself is unchanged.
 - The plain-text `--no-tui` interactive path keeps today's simple prompts (numbered harness
   menu, accelerator flag). It does not gain per-setting prompts; customization there is via
@@ -68,7 +68,7 @@ behavioral guarantee of the existing installer.
 
 ## Architecture
 
-### New subpackage `src/incode_mcp/installer/`
+### New subpackage `src/code_indexing_mcp/installer/`
 
 - `config_files.py` — JSONC/JSON/TOML comment-preserving merge machinery moved **verbatim**
   from `install.py`: JSONC scanner/parser helpers, `_merge_jsonc_text`,
@@ -94,7 +94,7 @@ behavioral guarantee of the existing installer.
   progress screen and the plain CLI printer. All accelerator failure paths keep the
   degrade-to-CPU-with-reason semantics.
 - `cli.py` + `__main__.py` — **new**: non-interactive module CLI,
-  `python -m incode_mcp.installer`, accepting `--accelerator`, `--harnesses`,
+  `python -m code_indexing_mcp.installer`, accepting `--accelerator`, `--harnesses`,
   `--set KEY=VALUE` (repeatable), `--offline`, `--tui`. Used by the bootstrap for CI and
   by `--no-tui` fallback; `--tui` launches the Textual app instead.
 - `tui/` — **new**: the Textual app (`app.py`, `screens.py`, `settings_form.py`). Forms are
@@ -107,9 +107,9 @@ Keeps: argument parsing (existing flags + `--set` repeatable + `--tui`/`--no-tui
 machines), `sync_environment` (extended to sync `--extra tui` alongside `--extra cpu`),
 TTY/`TERM` mode detection, and delegation:
 
-- Interactive TTY, TUI allowed → re-exec `.venv/bin/python -m incode_mcp.installer --tui`
+- Interactive TTY, TUI allowed → re-exec `.venv/bin/python -m code_indexing_mcp.installer --tui`
   (forwarding `--install-dir`, `--accelerator` if given, `--set` values as prefill).
-- Otherwise → `.venv/bin/python -m incode_mcp.installer` with the parsed flags; behaves as
+- Otherwise → `.venv/bin/python -m code_indexing_mcp.installer` with the parsed flags; behaves as
   today's installer (plus `--set`), including the plain-text harness menu on a TTY.
 - TUI exits non-zero → bootstrap prints the error and advises re-running with `--no-tui`.
 
@@ -117,8 +117,8 @@ TTY/`TERM` mode detection, and delegation:
 
 ### Package entry point
 
-`src/incode_mcp/cli.py` gains a `configure` subcommand. It lazily imports
-`incode_mcp.installer.tui`, so `serve` and every other command never import Textual. It
+`src/code_indexing_mcp/cli.py` gains a `configure` subcommand. It lazily imports
+`code_indexing_mcp.installer.tui`, so `serve` and every other command never import Textual. It
 opens the wizard in reconfigure mode against the existing installation: no clone, no sync.
 `configure --set KEY=VALUE` applies scripted changes without opening the UI.
 If Textual is missing (a dev environment synced without the `tui` extra), the error says
@@ -162,13 +162,13 @@ replaced by a fixed display of the existing install.
 5. **Indexing** — index mode, wait seconds, memory MB, vector index, worker execution,
    broker, data dir, cache dir, offline.
 6. **Embedding** — batch size, max tokens, overlap tokens, threads, CPU arena, crossover,
-   calibrate, strict, and the expert `INCODE_EMBED_ACCELERATOR` override.
+   calibrate, strict, and the expert `CODE_INDEXING_EMBED_ACCELERATOR` override.
 7. **Summary** — every non-default choice; the exact files that will be written (config
    paths, accelerator record); a disk-cost note when an accelerator environment will be
    built (multi-GB). Confirm runs the pipeline; any section can be jumped back to.
 8. **Progress** — step list with live log tail. `uv sync`, environment builds, and the probe
    run in Textual thread workers streaming output; the 15-minute probe timeout and
-   `INCODE_OFFLINE` behavior carry over. Cancel stops cleanly between steps.
+   `CODE_INDEXING_OFFLINE` behavior carry over. Cancel stops cleanly between steps.
 9. **Done** — what changed, "restart your clients", and the `code-indexing-mcp configure`
   pointer. Accelerator fallbacks appear here as warnings with their reasons.
 
@@ -180,24 +180,24 @@ Each entry: env name, group, label, help text, type, default, validation. Types:
 
 | Group | Variable | Type | Default | Validation |
 | --- | --- | --- | --- | --- |
-| Indexing | `INCODE_INDEX_MODE` | choice | `lazy` | lazy, eager, manual |
-| Indexing | `INCODE_INDEX_WAIT_SECONDS` | int | 300 | 0–86400 |
-| Indexing | `INCODE_EMBED_MEMORY_MB` | int | dynamic (25% RAM, clamped 1024–2048) | 1024–1048576 |
-| Indexing | `INCODE_VECTOR_INDEX` | choice | `exact` | exact, hnsw |
-| Indexing | `INCODE_INDEX_EXECUTION` | choice | `worker` | worker, in-process |
-| Indexing | `INCODE_BROKER` | choice | `auto` | auto, on, off |
-| Indexing | `INCODE_DATA_DIR` | path | platformdirs user data | — |
-| Indexing | `INCODE_CACHE_DIR` | path | platformdirs user cache | — |
-| Indexing | `INCODE_OFFLINE` | bool | off | — |
-| Embedding | `INCODE_EMBED_BATCH_SIZE` | auto\|int | auto | 1–256 |
-| Embedding | `INCODE_EMBED_MAX_TOKENS` | int | 1024 | 64–8192 |
-| Embedding | `INCODE_EMBED_OVERLAP_TOKENS` | int | 64 | 0–4096 |
-| Embedding | `INCODE_EMBED_THREADS` | int | min(2, cpu_count) | 1–64 |
-| Embedding | `INCODE_EMBED_CPU_ARENA` | bool | off | — |
-| Embedding | `INCODE_EMBED_CROSSOVER` | auto\|off\|int | auto | 0–1073741824 |
-| Embedding | `INCODE_EMBED_CALIBRATE` | bool | on | — |
-| Embedding | `INCODE_EMBED_STRICT` | bool | off | — |
-| Embedding | `INCODE_EMBED_ACCELERATOR` | choice | auto | auto, cpu, cuda, mlx, webgpu, migraphx, coreml |
+| Indexing | `CODE_INDEXING_INDEX_MODE` | choice | `lazy` | lazy, eager, manual |
+| Indexing | `CODE_INDEXING_INDEX_WAIT_SECONDS` | int | 300 | 0–86400 |
+| Indexing | `CODE_INDEXING_EMBED_MEMORY_MB` | int | dynamic (25% RAM, clamped 1024–2048) | 1024–1048576 |
+| Indexing | `CODE_INDEXING_VECTOR_INDEX` | choice | `exact` | exact, hnsw |
+| Indexing | `CODE_INDEXING_INDEX_EXECUTION` | choice | `worker` | worker, in-process |
+| Indexing | `CODE_INDEXING_BROKER` | choice | `auto` | auto, on, off |
+| Indexing | `CODE_INDEXING_DATA_DIR` | path | platformdirs user data | — |
+| Indexing | `CODE_INDEXING_CACHE_DIR` | path | platformdirs user cache | — |
+| Indexing | `CODE_INDEXING_OFFLINE` | bool | off | — |
+| Embedding | `CODE_INDEXING_EMBED_BATCH_SIZE` | auto\|int | auto | 1–256 |
+| Embedding | `CODE_INDEXING_EMBED_MAX_TOKENS` | int | 1024 | 64–8192 |
+| Embedding | `CODE_INDEXING_EMBED_OVERLAP_TOKENS` | int | 64 | 0–4096 |
+| Embedding | `CODE_INDEXING_EMBED_THREADS` | int | min(2, cpu_count) | 1–64 |
+| Embedding | `CODE_INDEXING_EMBED_CPU_ARENA` | bool | off | — |
+| Embedding | `CODE_INDEXING_EMBED_CROSSOVER` | auto\|off\|int | auto | 0–1073741824 |
+| Embedding | `CODE_INDEXING_EMBED_CALIBRATE` | bool | on | — |
+| Embedding | `CODE_INDEXING_EMBED_STRICT` | bool | off | — |
+| Embedding | `CODE_INDEXING_EMBED_ACCELERATOR` | choice | auto | auto, cpu, cuda, mlx, webgpu, migraphx, coreml |
 
 Rules:
 
@@ -205,7 +205,7 @@ Rules:
   blocks. Future default changes then flow through, and configs stay minimal.
 - **The wizard's accelerator selection is not written to env blocks.** It controls which
   environment gets built; the runtime stays on `auto` and picks the prepared backend.
-  `INCODE_EMBED_ACCELERATOR` remains an expert override on the Embedding screen.
+  `CODE_INDEXING_EMBED_ACCELERATOR` remains an expert override on the Embedding screen.
 - Dynamic defaults (memory, threads) display their resolved value at render time.
 
 ## Persistence: harness environment blocks
@@ -223,7 +223,7 @@ Per-harness environment key names (verified against each harness's docs/schema):
 
 Merge semantics:
 
-- Writing updates only keys the wizard manages (the catalog's `INCODE_*` names); unrelated
+- Writing updates only keys the wizard manages (the catalog's `CODE_INDEXING_*` names); unrelated
   keys already in the entry's env mapping survive. Managed keys removed by the user (reset to
   default) are deleted from the block; an emptied block is written as `{}` (omitted for
   Codex, where the block regenerates as `command`/`args` plus `env` only when non-empty).
@@ -251,7 +251,7 @@ Merge semantics:
 ## Testing
 
 - **Move-proof**: the existing installer tests (`tests/test_installer.py` and any others
-  importing `install.py`) update imports to `incode_mcp.installer.*` with behavior
+  importing `install.py`) update imports to `code_indexing_mcp.installer.*` with behavior
   assertions unchanged; green suite ⇒ lossless move.
 - **New unit tests**: catalog validation for every type/range/choice; env-block
   read/merge/write for all six harnesses (unknown-key preservation, Codex TOML round-trip,

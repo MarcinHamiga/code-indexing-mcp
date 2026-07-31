@@ -162,4 +162,4 @@ running macOS 26.5.2, against the corpus Phase 4A used, and passed: cosine 1.0 p
 identical top-5 rankings, and 1.52–1.56× on a forced 1,000-chunk index against a 1.25× threshold, at
 lower peak memory than CPU. MLX is promoted on that evidence, which is one machine rather than a
 matrix of Apple Silicon runners — a `--accelerator cpu` reinstall or
-`INCODE_EMBED_ACCELERATOR=cpu` is the way back for a Mac where it does not hold.
+`CODE_INDEXING_EMBED_ACCELERATOR=cpu` is the way back for a Mac where it does not hold.

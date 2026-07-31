@@ -15,7 +15,7 @@ MCP server for any selected supported harness. The initial harness list is:
 
 Codex CLI and Codex Desktop are one choice because both read the same `config.toml`.
 
-All newly initialized source projects use `.ci-mcp/project.toml`. Existing `.incode` markers
+All newly initialized source projects use `.ci-mcp/project.toml`. Existing `.code-indexing-mcp` markers
 remain readable so an upgrade does not make an already indexed checkout disappear. Both marker
 directories are always excluded from source scans.
 

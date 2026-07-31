@@ -11,16 +11,16 @@ import pyarrow as pa
 import pytest
 from filelock import FileLock
 
-from incode_mcp import application
-from incode_mcp.application import Application, RuntimePaths
-from incode_mcp.embedding import pack_vector
-from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.extractor import TreeSitterExtractor
-from incode_mcp.indexing import Indexer
-from incode_mcp.models import StoredChunk, StoredFile
-from incode_mcp.projects import initialize_project
-from incode_mcp.scanner import SourceScanner
-from incode_mcp.staging import (
+from code_indexing_mcp import application
+from code_indexing_mcp.application import Application, RuntimePaths
+from code_indexing_mcp.embedding import pack_vector
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.extractor import TreeSitterExtractor
+from code_indexing_mcp.indexing import Indexer
+from code_indexing_mcp.models import StoredChunk, StoredFile
+from code_indexing_mcp.projects import initialize_project
+from code_indexing_mcp.scanner import SourceScanner
+from code_indexing_mcp.staging import (
     CHUNKS_NAME,
     JOURNAL_NAME,
     MAX_RECOVERY_ATTEMPTS,
@@ -30,7 +30,7 @@ from incode_mcp.staging import (
     StagingJob,
     recover_staged_commits,
 )
-from incode_mcp.storage import LanceStore, TableVersions
+from code_indexing_mcp.storage import LanceStore, TableVersions
 
 
 class RecordingEmbedder:
@@ -230,13 +230,13 @@ def test_cancellation_during_staging_leaves_the_live_tables_unchanged(
     class FailingEmbedder(RecordingEmbedder):
         def embed_passages(self, texts: list[str]) -> list[list[float]]:
             if any("changed" in text for text in texts):
-                raise IncodeError(ErrorCode.MODEL_UNAVAILABLE, "model went away")
+                raise CodeIndexingError(ErrorCode.MODEL_UNAVAILABLE, "model went away")
             return super().embed_passages(texts)
 
     (root / "main.py").write_text("def changed():\n    return 1\n")
     failing, _ = make_indexer(tmp_path, FailingEmbedder())
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         failing.index(project)
 
     assert caught.value.code is ErrorCode.MODEL_UNAVAILABLE

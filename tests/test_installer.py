@@ -9,7 +9,7 @@ from types import ModuleType
 
 import pytest
 
-from incode_mcp.installer.accelerator import (
+from code_indexing_mcp.installer.accelerator import (
     ACCELERATOR_ENVIRONMENT_DIRECTORY,
     ACCELERATOR_EXTRAS,
     AcceleratorPlan,
@@ -20,12 +20,12 @@ from incode_mcp.installer.accelerator import (
     sync_accelerator_environment,
     write_accelerator_record,
 )
-from incode_mcp.installer.config_files import (
+from code_indexing_mcp.installer.config_files import (
     InstallerError,
     merge_codex_server,
     merge_json_object_entry,
 )
-from incode_mcp.installer.harnesses import (
+from code_indexing_mcp.installer.harnesses import (
     HARNESS_CHOICES,
     configuration_path,
     configure_harness,
@@ -568,7 +568,7 @@ def test_configure_selected_harnesses_isolates_failures(
             raise InstallerError("broken config")
         return tmp_path / f"{slug}.json"
 
-    monkeypatch.setattr("incode_mcp.installer.harnesses.configure_harness", fake_configure)
+    monkeypatch.setattr("code_indexing_mcp.installer.harnesses.configure_harness", fake_configure)
 
     successes, failures = configure_selected_harnesses(
         ["codex", "claude-code", "kimi-code"],
@@ -621,9 +621,9 @@ def test_main_delegates_to_the_module_cli_with_forwarded_flags(
             "--harnesses",
             "codex,kimi-code",
             "--set",
-            "INCODE_OFFLINE=1",
+            "CODE_INDEXING_OFFLINE=1",
             "--unset",
-            "INCODE_BROKER",
+            "CODE_INDEXING_BROKER",
             "--offline",
         ]
     )
@@ -633,8 +633,8 @@ def test_main_delegates_to_the_module_cli_with_forwarded_flags(
     assert tail[:4] == ["--install-dir", str(checkout), "--accelerator", "mlx"]
     for fragment in (
         ["--harnesses", "codex,kimi-code"],
-        ["--set", "INCODE_OFFLINE=1"],
-        ["--unset", "INCODE_BROKER"],
+        ["--set", "CODE_INDEXING_OFFLINE=1"],
+        ["--unset", "CODE_INDEXING_BROKER"],
         ["--offline"],
     ):
         assert any(tail[index : index + len(fragment)] == fragment for index in range(len(tail)))
@@ -674,8 +674,8 @@ def test_main_no_tui_flag_suppresses_the_wizard(
     "flags",
     [
         ["--harnesses", "codex"],
-        ["--set", "INCODE_OFFLINE=1"],
-        ["--unset", "INCODE_BROKER"],
+        ["--set", "CODE_INDEXING_OFFLINE=1"],
+        ["--unset", "CODE_INDEXING_BROKER"],
         ["--no-prompt"],
     ],
 )
@@ -769,7 +769,7 @@ def test_posix_bootstrap_has_valid_syntax_and_runs_adjacent_installer() -> None:
 
 
 def _skills_source(tmp_path: Path, names: tuple[str, ...] = ("alpha", "beta")) -> Path:
-    root = tmp_path / "repo" / "src" / "incode_mcp" / "skills"
+    root = tmp_path / "repo" / "src" / "code_indexing_mcp" / "skills"
     for name in names:
         skill = root / name
         skill.mkdir(parents=True)
@@ -818,7 +818,7 @@ def test_install_skills_links_bundled_skills(tmp_path: Path) -> None:
     for name in ("alpha", "beta"):
         link = skills_dir / name
         assert link.is_symlink()
-        assert link.resolve() == (repo / "src" / "incode_mcp" / "skills" / name).resolve()
+        assert link.resolve() == (repo / "src" / "code_indexing_mcp" / "skills" / name).resolve()
     assert len(results) == 1
     slug, message = results[0]
     assert slug == "claude-code"
@@ -882,7 +882,7 @@ def test_install_skills_backs_up_clashing_symlink(tmp_path: Path) -> None:
 
     link = skills_dir / "alpha"
     assert link.is_symlink()
-    assert link.resolve() == (repo / "src" / "incode_mcp" / "skills" / "alpha").resolve()
+    assert link.resolve() == (repo / "src" / "code_indexing_mcp" / "skills" / "alpha").resolve()
     backup = skills_dir / "alpha.bak"
     assert backup.is_symlink()
     assert backup.resolve() == elsewhere.resolve()
@@ -920,7 +920,7 @@ def test_reinstall_from_a_new_checkout_keeps_the_original_backup(tmp_path: Path)
     install_skills(["codex"], second, home=tmp_path, environment={})
 
     assert (skills_dir / "alpha").resolve() == (
-        second / "src" / "incode_mcp" / "skills" / "alpha"
+        second / "src" / "code_indexing_mcp" / "skills" / "alpha"
     ).resolve()
     assert (skills_dir / "alpha.bak" / "SKILL.md").read_text(encoding="utf-8") == "mine"
     assert not (skills_dir / "alpha.bak.2").exists()
@@ -1010,7 +1010,7 @@ def _fake_uv(tmp_path: Path) -> Path:
         # embedding runtime in it at all. Refused up front instead.
         ("auto", "linux", "amd64", "550.54.14, A100", "cpu", "no CUDA wheels"),
         ("cuda", "darwin", "arm64", None, "cpu", "CUDA was requested but"),
-        ("coreml", "darwin", "arm64", None, "cpu", "INCODE_EMBED_ACCELERATOR=coreml"),
+        ("coreml", "darwin", "arm64", None, "cpu", "CODE_INDEXING_EMBED_ACCELERATOR=coreml"),
         ("webgpu", "linux", "x86_64", None, "webgpu", "locked WebGPU"),
         ("migraphx", "linux", "x86_64", None, "webgpu", "falling back to WebGPU"),
     ],
@@ -1275,7 +1275,7 @@ def test_a_cpu_installation_retracts_an_earlier_accelerator_offer(
     record = data / "accelerator.json"
     record.write_text('{"schema_version": 1}', encoding="utf-8")
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.runtime_record_path",
+        "code_indexing_mcp.installer.accelerator.runtime_record_path",
         lambda python: data / "accelerator.json",
     )
 
@@ -1294,11 +1294,11 @@ def test_a_prepared_accelerator_is_recorded_only_after_its_probe_passes(
     data = tmp_path / "data"
     probed: list[tuple[Path, str]] = []
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.runtime_record_path",
+        "code_indexing_mcp.installer.accelerator.runtime_record_path",
         lambda python: data / "accelerator.json",
     )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
+        "code_indexing_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
     )
 
     def fake_probe(python: Path, accelerator: str, *, offline: bool = False) -> dict[str, object]:
@@ -1313,7 +1313,7 @@ def test_a_prepared_accelerator_is_recorded_only_after_its_probe_passes(
             "detail": "probed 2 passages on CUDAExecutionProvider",
         }
 
-    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator", fake_probe)
+    monkeypatch.setattr("code_indexing_mcp.installer.accelerator.probe_accelerator", fake_probe)
 
     plan = configure_accelerator(
         checkout,
@@ -1361,10 +1361,10 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
     interpreter.write_text("", encoding="utf-8")
     synced: list[str] = []
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.runtime_record_path", lambda python: record
+        "code_indexing_mcp.installer.accelerator.runtime_record_path", lambda python: record
     )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
+        "code_indexing_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
     )
 
     def fake_sync(
@@ -1375,9 +1375,11 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
         synced.append(extra)
         return interpreter
 
-    monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", fake_sync)
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.probe_accelerator",
+        "code_indexing_mcp.installer.accelerator.sync_accelerator_environment", fake_sync
+    )
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.accelerator.probe_accelerator",
         lambda python, accelerator, *, offline=False: {
             "ok": True,
             "interpreter": str(python),
@@ -1408,7 +1410,7 @@ def test_the_installer_record_is_the_shape_the_runtime_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """install.py is stdlib-only, so the schema it writes is pinned by this test."""
-    from incode_mcp.accelerator_env import load_environment
+    from code_indexing_mcp.accelerator_env import load_environment
 
     interpreter = tmp_path / "python"
     interpreter.write_text("", encoding="utf-8")
@@ -1448,11 +1450,11 @@ def test_a_failed_probe_rolls_the_installation_back_to_cpu(
     stale = data / "accelerator.json"
     stale.write_text('{"schema_version": 1}', encoding="utf-8")
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.runtime_record_path",
+        "code_indexing_mcp.installer.accelerator.runtime_record_path",
         lambda python: data / "accelerator.json",
     )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
+        "code_indexing_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
     )
 
     def failing_probe(
@@ -1460,7 +1462,7 @@ def test_a_failed_probe_rolls_the_installation_back_to_cpu(
     ) -> dict[str, object]:
         raise InstallerError("The accelerator probe failed: no CUDA-capable device")
 
-    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator", failing_probe)
+    monkeypatch.setattr("code_indexing_mcp.installer.accelerator.probe_accelerator", failing_probe)
 
     plan = configure_accelerator(
         checkout,
@@ -1539,10 +1541,10 @@ def _prepared_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple
         },
     )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.runtime_record_path", lambda python: record
+        "code_indexing_mcp.installer.accelerator.runtime_record_path", lambda python: record
     )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
+        "code_indexing_mcp.installer.accelerator.interpreter_version", lambda python: "3.12"
     )
     return checkout, record, accelerator_env
 
@@ -1557,8 +1559,10 @@ def test_an_unchanged_machine_reuses_its_environment_instead_of_rebuilding_it(
     def refuse(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("the environment was rebuilt or re-probed")
 
-    monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", refuse)
-    monkeypatch.setattr("incode_mcp.installer.accelerator.probe_accelerator", refuse)
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.accelerator.sync_accelerator_environment", refuse
+    )
+    monkeypatch.setattr("code_indexing_mcp.installer.accelerator.probe_accelerator", refuse)
 
     plan = configure_accelerator(
         checkout,
@@ -1609,7 +1613,7 @@ def test_a_driver_or_python_that_moved_forces_the_rebuild(
     """The record vouches for one combination; anything else has to be re-proven."""
     checkout, _, _ = _prepared_checkout(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version", lambda python: python_version
+        "code_indexing_mcp.installer.accelerator.interpreter_version", lambda python: python_version
     )
     rebuilt: list[str] = []
 
@@ -1617,9 +1621,11 @@ def test_a_driver_or_python_that_moved_forces_the_rebuild(
         rebuilt.append("sync")
         return checkout / ACCELERATOR_ENVIRONMENT_DIRECTORY / "python"
 
-    monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", fake_sync)
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.probe_accelerator",
+        "code_indexing_mcp.installer.accelerator.sync_accelerator_environment", fake_sync
+    )
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.accelerator.probe_accelerator",
         lambda python, accelerator, *, offline=False: {
             "ok": True,
             "interpreter": str(python),
@@ -1651,9 +1657,11 @@ def test_a_changed_lockfile_forces_the_accelerator_environment_to_rebuild(
         rebuilt.append("sync")
         return checkout / ACCELERATOR_ENVIRONMENT_DIRECTORY / "python"
 
-    monkeypatch.setattr("incode_mcp.installer.accelerator.sync_accelerator_environment", fake_sync)
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.probe_accelerator",
+        "code_indexing_mcp.installer.accelerator.sync_accelerator_environment", fake_sync
+    )
+    monkeypatch.setattr(
+        "code_indexing_mcp.installer.accelerator.probe_accelerator",
         lambda python, accelerator, *, offline=False: {
             "ok": True,
             "interpreter": str(python),
@@ -1690,10 +1698,10 @@ def test_migraphx_detection_uses_the_serving_interpreter_version(
     checkout = tmp_path / "checkout"
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.interpreter_version", lambda python: "3.13"
+        "code_indexing_mcp.installer.accelerator.interpreter_version", lambda python: "3.13"
     )
     monkeypatch.setattr(
-        "incode_mcp.installer.accelerator.accelerator_record_path",
+        "code_indexing_mcp.installer.accelerator.accelerator_record_path",
         lambda *args, **kwargs: tmp_path / "accelerator.json",
     )
 
@@ -1701,7 +1709,7 @@ def test_migraphx_detection_uses_the_serving_interpreter_version(
         captured.update(kwargs)
         return AcceleratorPlan("cpu", "test plan")
 
-    monkeypatch.setattr("incode_mcp.installer.accelerator.plan_accelerator", capture_plan)
+    monkeypatch.setattr("code_indexing_mcp.installer.accelerator.plan_accelerator", capture_plan)
 
     configure_accelerator(
         checkout,
@@ -1731,7 +1739,7 @@ def test_a_probe_that_never_finishes_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Output is captured, so an unbounded probe is indistinguishable from a hang."""
-    monkeypatch.setattr("incode_mcp.installer.accelerator.PROBE_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr("code_indexing_mcp.installer.accelerator.PROBE_TIMEOUT_SECONDS", 1)
     stalled = tmp_path / "stalled-python"
     stalled.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
     stalled.chmod(0o755)

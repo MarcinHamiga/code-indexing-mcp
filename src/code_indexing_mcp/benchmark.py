@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .application import Application, RuntimePaths
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .models import IndexReport, ProjectInfo
 from .settings import IndexSettings
 
@@ -116,12 +116,12 @@ def run_index_benchmark_command(
 ) -> dict[str, Any]:
     """Create an isolated workspace and run the CLI benchmark."""
     if files < 1 or functions_per_file < 1:
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.INVALID_CONFIGURATION,
             "Benchmark corpus dimensions must be positive",
         )
     if not 1 <= batch_size <= 256:
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.INVALID_CONFIGURATION,
             "Benchmark batch size must be from 1 to 256",
         )
@@ -129,7 +129,7 @@ def run_index_benchmark_command(
         workspace = work_dir.expanduser().resolve()
         workspace.mkdir(parents=True, exist_ok=True)
         if (workspace / "corpus").exists() or (workspace / "data").exists():
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.INVALID_CONFIGURATION,
                 f"Benchmark work directory is not fresh: {workspace}",
             )
@@ -140,7 +140,7 @@ def run_index_benchmark_command(
             functions_per_file=functions_per_file,
             batch_size=batch_size,
         )
-    with tempfile.TemporaryDirectory(prefix="incode-index-benchmark-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="code-indexing-mcp-index-benchmark-") as temporary:
         return _run_in_workspace(
             paths,
             Path(temporary),

@@ -49,7 +49,7 @@ Re-run the same command later to update an existing clean checkout with a fast-f
 pull and refresh its environment. To change settings or harnesses without updating, run
 `code-indexing-mcp configure` — it opens the same wizard offline, prefilled from your
 current configuration. Naming what to change applies it directly instead:
-`code-indexing-mcp configure --set INCODE_BROKER=off --unset INCODE_INDEX_MODE`.
+`code-indexing-mcp configure --set CODE_INDEXING_BROKER=off --unset CODE_INDEXING_INDEX_MODE`.
 
 On a terminal that cannot host the wizard (or with `--no-tui`), the installer falls back to
 a plain text interface with the numbered harness menu. Flags that already say what to
@@ -59,7 +59,7 @@ fully noninteractive installation, pass harness slugs and any settings:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MarcinHamiga/code-indexing-mcp/main/install.sh |
-  sh -s -- --harnesses codex,claude-code,opencode --set INCODE_INDEX_MODE=eager
+  sh -s -- --harnesses codex,claude-code,opencode --set CODE_INDEXING_INDEX_MODE=eager
 ```
 
 By default the installer detects whether this machine can be given an automatic GPU
@@ -189,7 +189,7 @@ workspace. Pass `--work-dir /fresh/path` to retain the corpus and index for insp
 
 Initialization creates `.ci-mcp/project.toml` and a self-ignoring `.ci-mcp/.gitignore`. The
 marker contains a checkout-local UUID and scanning configuration. It is not intended to be
-committed. Markers created by earlier releases under `.incode` remain readable, but all new
+committed. Markers created by earlier releases under `.code-indexing-mcp` remain readable, but all new
 markers use `.ci-mcp`.
 
 CLI index refreshes are explicit and incremental. MCP indexing is lazy by default: listing tools
@@ -202,9 +202,9 @@ non-ignored source file and contains `.git`, `pyproject.toml`, `setup.py`, `setu
 
 Because that first query waits for the refresh, it reports progress while the initial index builds
 so clients can tell a slow index from a stalled tool call. On a large repository the first query
-can still take a while; `INCODE_INDEX_MODE=eager` moves the refresh to tool listing instead, and
-`INCODE_INDEX_MODE=manual` restricts indexing to explicit `index_project` calls. The legacy
-`INCODE_AUTO_INDEX` flag remains supported. Clients that do not provide filesystem roots keep the
+can still take a while; `CODE_INDEXING_INDEX_MODE=eager` moves the refresh to tool listing instead, and
+`CODE_INDEXING_INDEX_MODE=manual` restricts indexing to explicit `index_project` calls. The legacy
+`CODE_INDEXING_AUTO_INDEX` flag remains supported. Clients that do not provide filesystem roots keep the
 explicit workflow.
 
 Two things can make an automatic refresh wait: another root queued ahead of it in the same session,
@@ -213,7 +213,7 @@ exponential backoff for up to five minutes, then fails the waiting query with `I
 than blocking indefinitely:
 
 ```bash
-export INCODE_INDEX_WAIT_SECONDS=300
+export CODE_INDEXING_INDEX_WAIT_SECONDS=300
 ```
 
 Set it to `0` to fail immediately whenever anything else is already indexing, or raise it when a
@@ -303,9 +303,9 @@ Platform-specific user data and cache locations are selected with `platformdirs`
 when needed:
 
 ```bash
-export INCODE_DATA_DIR=/path/to/index-data
-export INCODE_CACHE_DIR=/path/to/model-cache
-export INCODE_OFFLINE=1
+export CODE_INDEXING_DATA_DIR=/path/to/index-data
+export CODE_INDEXING_CACHE_DIR=/path/to/model-cache
+export CODE_INDEXING_OFFLINE=1
 ```
 
 Indexing uses a spawned embedding worker with an adaptive ceiling of 25% of physical RAM, clamped
@@ -313,13 +313,13 @@ to 1–2 GiB and reduced further to retain 512 MiB of currently available RAM fo
 Configure it with:
 
 ```bash
-export INCODE_EMBED_MEMORY_MB=1536   # INCODE_INDEX_MEMORY_MB is the older name and still works
-export INCODE_EMBED_BATCH_SIZE=auto  # auto, or 1–256
-export INCODE_EMBED_MAX_TOKENS=1024
-export INCODE_EMBED_OVERLAP_TOKENS=64
-export INCODE_EMBED_THREADS=2
-export INCODE_EMBED_CPU_ARENA=0
-export INCODE_VECTOR_INDEX=exact
+export CODE_INDEXING_EMBED_MEMORY_MB=1536   # CODE_INDEXING_INDEX_MEMORY_MB is the older name and still works
+export CODE_INDEXING_EMBED_BATCH_SIZE=auto  # auto, or 1–256
+export CODE_INDEXING_EMBED_MAX_TOKENS=1024
+export CODE_INDEXING_EMBED_OVERLAP_TOKENS=64
+export CODE_INDEXING_EMBED_THREADS=2
+export CODE_INDEXING_EMBED_CPU_ARENA=0
+export CODE_INDEXING_VECTOR_INDEX=exact
 ```
 
 The ceiling covers indexing memory: the embedding worker plus any growth in the host process while
@@ -329,7 +329,7 @@ reports both the budget and the true combined peak, plus a scan/parse/embed/comm
 
 Microbatches are bounded by three things at once: the item count above, the token budget per window,
 and the padded matrix `item_count × longest_padded_tokens`, which is what a batch actually
-materializes. That last budget scales with `INCODE_EMBED_MEMORY_MB` — it is memory charged to the
+materializes. That last budget scales with `CODE_INDEXING_EMBED_MEMORY_MB` — it is memory charged to the
 same ceiling — floored so a single longest window always forms a batch and capped at eight times the
 2 GiB reference, because padding cost is quadratic in the widest member and nothing has been
 measured past that.
@@ -338,7 +338,7 @@ A batch that overruns the ceiling is halved and retried, and the size that survi
 the rest of that run — otherwise every group after it asks for the size that just overran and pays
 the same retries again — and written to the probe cache so the next run starts there rather than
 rediscovering the same limit. `model status` reports that size as `"reduced"` rather than
-`"measured"`, so a machine pinned low by one bad run says so. An explicit `INCODE_EMBED_BATCH_SIZE`
+`"measured"`, so a machine pinned low by one bad run says so. An explicit `CODE_INDEXING_EMBED_BATCH_SIZE`
 overrides it outright.
 
 The same applies to a batch that takes the worker down with it rather than tripping the ceiling,
@@ -352,10 +352,10 @@ Acceleration targets passage indexing only. The query model stays in the serving
 a search never waits on a worker spawning or a model loading onto a device.
 
 ```bash
-export INCODE_EMBED_ACCELERATOR=auto  # auto, cpu, cuda, mlx, webgpu, migraphx, coreml
-export INCODE_EMBED_STRICT=0          # 1 disables the CPU fallback and the crossover
-export INCODE_EMBED_CROSSOVER=auto    # auto, off, or a character count
-export INCODE_EMBED_CALIBRATE=1       # 0 declines the one-time measurement
+export CODE_INDEXING_EMBED_ACCELERATOR=auto  # auto, cpu, cuda, mlx, webgpu, migraphx, coreml
+export CODE_INDEXING_EMBED_STRICT=0          # 1 disables the CPU fallback and the crossover
+export CODE_INDEXING_EMBED_CROSSOVER=auto    # auto, off, or a character count
+export CODE_INDEXING_EMBED_CALIBRATE=1       # 0 declines the one-time measurement
 ```
 
 `auto` selects the best backend that has passed its promotion gates *and* that this installation
@@ -444,7 +444,7 @@ The ceiling is measured as host resident memory, which on unified memory covers 
 A discrete GPU's VRAM is not visible to it, so exhausting a graphics card surfaces as a worker that
 died rather than as a budget that was exceeded — both fall back to CPU, but only one names a number.
 
-`INCODE_EMBED_STRICT=1` refuses that fallback and raises `BACKEND_UNAVAILABLE` instead, for callers
+`CODE_INDEXING_EMBED_STRICT=1` refuses that fallback and raises `BACKEND_UNAVAILABLE` instead, for callers
 who would rather fail than index at CPU speed without noticing. An `auto` selection that settles on
 CPU is not a fallback and is unaffected.
 
@@ -501,11 +501,11 @@ from its own size. `IndexReport` carries `embedded_characters`, `embedding_cross
 `embedding_selection_reason`, so a run that stayed on CPU because it was small reads differently from
 one that fell back because something broke.
 
-`INCODE_EMBED_CROSSOVER=off` starts the accelerator on the first chunk, which is what every release
-before this one did; a character count pins the threshold. `INCODE_EMBED_CALIBRATE=0` declines the
+`CODE_INDEXING_EMBED_CROSSOVER=off` starts the accelerator on the first chunk, which is what every release
+before this one did; a character count pins the threshold. `CODE_INDEXING_EMBED_CALIBRATE=0` declines the
 measurement, leaving both the batch size and the crossover unmeasured.
 
-`INCODE_EMBED_STRICT=1` turns the crossover off too. Strict mode is for a caller who would rather
+`CODE_INDEXING_EMBED_STRICT=1` turns the crossover off too. Strict mode is for a caller who would rather
 fail than quietly index at CPU speed, and a deferral is exactly that — quiet CPU indexing that no
 degradation reports and that strict mode could not refuse, because nothing failed.
 
@@ -536,7 +536,7 @@ $ code-indexing-mcp model status
   "driver_version": "",
   "embedding_model": "jinaai/jina-embeddings-v2-base-code",
   "execution_provider": "CPUExecutionProvider",
-  "fallback_reason": "no accelerator is prepared and eligible on this machine; reinstall with --accelerator to prepare one, or set INCODE_EMBED_ACCELERATOR to force a backend this installation already offers",
+  "fallback_reason": "no accelerator is prepared and eligible on this machine; reinstall with --accelerator to prepare one, or set CODE_INDEXING_EMBED_ACCELERATOR to force a backend this installation already offers",
   "precision": "float32",
   "probe_cache_state": "not-applicable",
   "recommended_override": null,
@@ -556,7 +556,7 @@ The measured fields are null until a run has verified and measured an accelerato
 `crossover_characters` is null both before measurement and when the accelerator never overtakes CPU
 at any size — the two are distinguished by `accelerator_characters_per_second` being present.
 `recommended_override` names the one setting change the measurements argue for, when they argue for
-one: `INCODE_EMBED_ACCELERATOR=cpu` for an accelerator that lost, or `INCODE_EMBED_MEMORY_MB` for a
+one: `CODE_INDEXING_EMBED_ACCELERATOR=cpu` for an accelerator that lost, or `CODE_INDEXING_EMBED_MEMORY_MB` for a
 batch size a ceiling overrun pinned down. It stays null the rest of the time rather than offering
 advice nothing measured.
 
@@ -582,8 +582,8 @@ The same 4,096 characters cost wildly different amounts depending on how densely
 ordinary source is ~984 tokens, a minified line ~2,157 — and embedding the latter as one sequence
 adds ~1,172 MiB of resident memory against ~266 MiB for the same characters split into windows.
 
-Every chunk is therefore windowed to at most `INCODE_EMBED_MAX_TOKENS` tokens with
-`INCODE_EMBED_OVERLAP_TOKENS` of overlap before it reaches the model, and each window is stored as
+Every chunk is therefore windowed to at most `CODE_INDEXING_EMBED_MAX_TOKENS` tokens with
+`CODE_INDEXING_EMBED_OVERLAP_TOKENS` of overlap before it reaches the model, and each window is stored as
 its own chunk with its own byte and line offsets. Ordinary code is unaffected: a 1,024-token budget
 is roughly 4,096 characters of source, so chunks that already fit stay whole and unchanged.
 `IndexReport` carries `embedded_segments`, `embedded_tokens`, `embedding_retries`, and
@@ -601,11 +601,11 @@ indexes were rebuilt per definition.
 
 ### Measured throughput
 
-`INCODE_EMBED_BATCH_SIZE` resolves to 1 on CPU. Measured with
+`CODE_INDEXING_EMBED_BATCH_SIZE` resolves to 1 on CPU. Measured with
 `scripts/benchmark_index_memory.py` on Apple Silicon macOS against a 1.0 MiB, 6,330-chunk
-dense-Python corpus at `INCODE_EMBED_MEMORY_MB=2048`:
+dense-Python corpus at `CODE_INDEXING_EMBED_MEMORY_MB=2048`:
 
-| `INCODE_EMBED_BATCH_SIZE` | Wall clock | Chunks/s | Peak worker RSS |
+| `CODE_INDEXING_EMBED_BATCH_SIZE` | Wall clock | Chunks/s | Peak worker RSS |
 | ------------------------- | ---------- | -------- | --------------- |
 | 1 (default)               | 147.0 s    | 44.8     | 1,415 MiB       |
 | 2                         | 136.2 s    | 48.7     | 1,419 MiB       |
@@ -616,7 +616,7 @@ Batch size 8 buys 17% throughput for 36 MiB more resident memory — not enough 
 headroom that the worst-case file shape already needs. Embedding dominates: 141 s of the 147 s at
 batch size 1. Plan for roughly **45 chunks per second**, and remember that in the default lazy mode
 the first `search_code` call waits for that work. On a large repository prefer
-`INCODE_INDEX_MODE=eager` (index during tool listing) or `INCODE_INDEX_MODE=manual` with an
+`CODE_INDEXING_INDEX_MODE=eager` (index during tool listing) or `CODE_INDEXING_INDEX_MODE=manual` with an
 explicit `code-indexing-mcp index`, so no query blocks on a cold index.
 
 ### Single-line and generated files
@@ -639,8 +639,8 @@ it changes. Environment failures — `MODEL_UNAVAILABLE`, `INDEX_RESOURCE_LIMIT`
 `EMBEDDING_WORKER_FAILED` — are not attributable to a file, so they abort the run and surface to the
 caller instead of silently leaving that file permanently unindexed.
 
-`INCODE_INDEX_EXECUTION=in-process` is a temporary diagnostic rollback. It does not enforce the
-worker ceiling. `INCODE_VECTOR_INDEX=hnsw` opts into approximate vector indexing; exact search is
+`CODE_INDEXING_INDEX_EXECUTION=in-process` is a temporary diagnostic rollback. It does not enforce the
+worker ceiling. `CODE_INDEXING_VECTOR_INDEX=hnsw` opts into approximate vector indexing; exact search is
 the safer default.
 
 All stdio adapters use the per-user daemon by default. Administrative commands are:
@@ -651,7 +651,7 @@ uv run code-indexing-mcp daemon restart
 uv run code-indexing-mcp daemon stop
 ```
 
-Set `INCODE_BROKER=off` or run `serve --direct` to bypass it. The daemon authenticates over a
+Set `CODE_INDEXING_BROKER=off` or run `serve --direct` to bypass it. The daemon authenticates over a
 current-user-only local socket, starts under leader election, and exits after five idle minutes.
 The socket lives under `XDG_RUNTIME_DIR` when set and the platform temporary directory otherwise;
 the containing directory must be a real directory owned by the current user, or startup fails
@@ -659,14 +659,14 @@ rather than binding somewhere another user controls. Startup output goes to `dae
 data directory.
 
 The daemon needs Unix domain sockets. Where they are unavailable — currently Windows — the default
-`INCODE_BROKER=auto` serves directly and logs a warning; an explicit `INCODE_BROKER=on` fails with
+`CODE_INDEXING_BROKER=auto` serves directly and logs a warning; an explicit `CODE_INDEXING_BROKER=on` fails with
 `INVALID_CONFIGURATION` instead of being silently downgraded.
 
 Storage schema v2 keeps a registry plus one LanceDB partition per project. On first upgrade from
 v1, the old global store is moved to a timestamped `lancedb-v1-backup-*` directory and projects are
 rebuilt lazily from source. Old chunk rows are never copied, which repairs duplicate chunk IDs.
 
-With `INCODE_OFFLINE=1`, Code Indexing MCP will not download a missing model and returns
+With `CODE_INDEXING_OFFLINE=1`, Code Indexing MCP will not download a missing model and returns
 `MODEL_UNAVAILABLE` instead. Source code, embeddings, and search queries remain local; there is
 no telemetry.
 
@@ -675,7 +675,7 @@ no telemetry.
 ```bash
 uv sync --all-groups --extra cpu --locked
 uv run pytest
-uv run pytest --cov=incode_mcp
+uv run pytest --cov=code_indexing_mcp
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
@@ -684,16 +684,16 @@ uv run mypy src
 To exercise the real model integration, provide a persistent cache directory and opt in:
 
 ```bash
-INCODE_MODEL_TEST_CACHE=/path/to/cache uv run pytest -m model
+CODE_INDEXING_MODEL_TEST_CACHE=/path/to/cache uv run pytest -m model
 ```
 
 Dedicated MLX/WebGPU/MIGraphX runners can exercise the correctness and ≥1,000-chunk performance
 gates against an installer-created accelerator record:
 
 ```bash
-INCODE_MODEL_TEST_CACHE=/path/to/cache \
-INCODE_ACCEL_ENV=/path/to/accelerator.json \
-INCODE_TEST_ACCELERATOR=mlx \
+CODE_INDEXING_MODEL_TEST_CACHE=/path/to/cache \
+CODE_INDEXING_ACCEL_ENV=/path/to/accelerator.json \
+CODE_INDEXING_TEST_ACCELERATOR=mlx \
   uv run pytest -m accelerator
 ```
 

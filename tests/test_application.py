@@ -5,19 +5,19 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.accelerator_env import (
+from code_indexing_mcp.accelerator_env import (
     RECORD_FILENAME,
     AcceleratorEnvironment,
     running_python_version,
     write_environment,
 )
-from incode_mcp.application import Application, RuntimePaths
-from incode_mcp.backends import CPU_BACKEND, Accelerator
-from incode_mcp.embedding_worker import default_launcher
-from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.settings import IndexSettings
-from incode_mcp.token_batching import DEFAULT_MAX_TOKEN_PRODUCT, REFERENCE_MEMORY_BYTES
-from incode_mcp.worker_launcher import ExternalInterpreterLauncher
+from code_indexing_mcp.application import Application, RuntimePaths
+from code_indexing_mcp.backends import CPU_BACKEND, Accelerator
+from code_indexing_mcp.embedding_worker import default_launcher
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.settings import IndexSettings
+from code_indexing_mcp.token_batching import DEFAULT_MAX_TOKEN_PRODUCT, REFERENCE_MEMORY_BYTES
+from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher
 
 
 class TinyEmbedder:
@@ -200,7 +200,7 @@ def test_duplicate_live_project_marker_is_rejected_but_moved_checkout_is_adopted
     project = app.init_project(original)
     shutil.copytree(original, duplicate)
 
-    with pytest.raises(IncodeError) as raised:
+    with pytest.raises(CodeIndexingError) as raised:
         app.index_project(str(duplicate))
     assert raised.value.code is ErrorCode.PROJECT_ID_CONFLICT
 
@@ -221,10 +221,10 @@ def test_duplicate_legacy_project_marker_is_still_rejected(tmp_path: Path) -> No
         cwd=tmp_path,
     )
     app.init_project(original)
-    (original / ".ci-mcp").rename(original / ".incode")
+    (original / ".ci-mcp").rename(original / ".code-indexing-mcp")
     shutil.copytree(original, duplicate)
 
-    with pytest.raises(IncodeError) as raised:
+    with pytest.raises(CodeIndexingError) as raised:
         app.index_project(str(duplicate))
 
     assert raised.value.code is ErrorCode.PROJECT_ID_CONFLICT
@@ -250,11 +250,11 @@ def test_reregistering_a_known_project_preserves_state_and_still_validates_compa
     assert app.project_status(project.id).state == "ready"
 
     other_app = Application(paths, embedder=OtherModelTinyEmbedder(), cwd=root)
-    with pytest.raises(IncodeError) as raised_init:
+    with pytest.raises(CodeIndexingError) as raised_init:
         other_app.init_project(root)
     assert raised_init.value.code is ErrorCode.INDEX_INCOMPATIBLE
 
-    with pytest.raises(IncodeError) as raised_discover:
+    with pytest.raises(CodeIndexingError) as raised_discover:
         other_app.discover_project(root)
     assert raised_discover.value.code is ErrorCode.INDEX_INCOMPATIBLE
 
@@ -485,7 +485,7 @@ def test_an_accelerator_that_lost_to_cpu_recommends_the_override(tmp_path: Path)
     status = app.model_status()
     assert status.crossover_characters is None
     assert status.recommended_override is not None
-    assert "INCODE_EMBED_ACCELERATOR=cpu" in status.recommended_override
+    assert "CODE_INDEXING_EMBED_ACCELERATOR=cpu" in status.recommended_override
     # The same None reaches the session, which is what stops it starting a
     # backend no run is large enough to justify. Reporting the largest
     # admissible run instead would name a threshold and defer against it.
@@ -513,7 +513,7 @@ def test_a_batch_size_a_ceiling_overrun_reduced_is_reported_as_reduced(
     assert status.batch_size == 1
     assert status.batch_calibration == "reduced"
     assert status.recommended_override is not None
-    assert "INCODE_EMBED_MEMORY_MB" in status.recommended_override
+    assert "CODE_INDEXING_EMBED_MEMORY_MB" in status.recommended_override
 
 
 def test_a_prepared_accelerator_runs_in_its_own_interpreter(tmp_path: Path) -> None:

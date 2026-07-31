@@ -4,7 +4,7 @@
 
 **Goal:** Ship 4 agent skills inside the Python package, symlink them into harness skill directories via `install.py`, and add always-on index-first guidance to the server's `instructions` string.
 
-**Architecture:** Skills live as `SKILL.md` folders under `src/incode_mcp/skills/` (same bundling pattern as `queries/*.scm`, rides along with hatchling's `packages = ["src/incode_mcp"]`). The installer symlinks them into each skill-capable harness's user skill directory, pointing into the cloned repo so `git pull` updates refresh them. The FastMCP `instructions` string becomes a module-level constant with index-first usage guidance.
+**Architecture:** Skills live as `SKILL.md` folders under `src/code_indexing_mcp/skills/` (same bundling pattern as `queries/*.scm`, rides along with hatchling's `packages = ["src/code_indexing_mcp"]`). The installer symlinks them into each skill-capable harness's user skill directory, pointing into the cloned repo so `git pull` updates refresh them. The FastMCP `instructions` string becomes a module-level constant with index-first usage guidance.
 
 **Tech Stack:** Python 3.12, FastMCP (`mcp>=1.27`), hatchling, pytest, stdlib-only installer.
 
@@ -12,7 +12,7 @@ Spec: `docs/superpowers/specs/2026-07-24-bundled-skills-design.md`
 
 ## Global Constraints
 
-- All skills reference tools ONLY with the `mcp__code-indexing-mcp__*` prefix (never `mcp__incode__*`).
+- All skills reference tools ONLY with the `mcp__code-indexing-mcp__*` prefix (never `mcp__code-indexing-mcp__*`).
 - `install.py` stays stdlib-only; no new dependencies anywhere.
 - Skill frontmatter keeps the existing shape: `name`, `description`, `type: prompt`, `whenToUse`, `arguments` (single-line values only — tests parse them with regex, no YAML dependency).
 - The 4 bundled skills are exactly: `codebase-exploration`, `feature-dev`, `impact-analysis`, `indexed-review`.
@@ -24,11 +24,11 @@ Spec: `docs/superpowers/specs/2026-07-24-bundled-skills-design.md`
 ### Task 1: Index-first server instructions
 
 **Files:**
-- Modify: `src/incode_mcp/server.py` (module constants near line 19, constructor at line 187-192)
+- Modify: `src/code_indexing_mcp/server.py` (module constants near line 19, constructor at line 187-192)
 - Test: `tests/test_server.py` (append; reuses the `TinyEmbedder` / `Application` pattern at lines 15-23 and 80-86)
 
 **Interfaces:**
-- Produces: `SERVER_INSTRUCTIONS: str` module constant in `incode_mcp.server`; `create_server(app).instructions` returns it (FastMCP exposes `.instructions`, confirmed against installed SDK `mcp/server/fastmcp/server.py:249`).
+- Produces: `SERVER_INSTRUCTIONS: str` module constant in `code_indexing_mcp.server`; `create_server(app).instructions` returns it (FastMCP exposes `.instructions`, confirmed against installed SDK `mcp/server/fastmcp/server.py:249`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -64,7 +64,7 @@ Expected: FAIL — `"search_code" not in "Local Tree-sitter code indexing and hy
 
 - [ ] **Step 3: Add the SERVER_INSTRUCTIONS constant and use it**
 
-In `src/incode_mcp/server.py`, add near the top of the module (with the other module-level definitions, before `class AutoIndexingMCP`):
+In `src/code_indexing_mcp/server.py`, add near the top of the module (with the other module-level definitions, before `class AutoIndexingMCP`):
 
 ```python
 SERVER_INSTRUCTIONS = (
@@ -107,7 +107,7 @@ Expected: PASS (whole file, including the new test)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/incode_mcp/server.py tests/test_server.py
+git add src/code_indexing_mcp/server.py tests/test_server.py
 git commit -m "feat: guide index-first tool usage via server instructions"
 ```
 
@@ -116,29 +116,29 @@ git commit -m "feat: guide index-first tool usage via server instructions"
 ### Task 2: Bundle the four skills in the package
 
 **Files:**
-- Create: `src/incode_mcp/skills/codebase-exploration/SKILL.md`
-- Create: `src/incode_mcp/skills/feature-dev/SKILL.md`
-- Create: `src/incode_mcp/skills/impact-analysis/SKILL.md`
-- Create: `src/incode_mcp/skills/indexed-review/SKILL.md`
+- Create: `src/code_indexing_mcp/skills/codebase-exploration/SKILL.md`
+- Create: `src/code_indexing_mcp/skills/feature-dev/SKILL.md`
+- Create: `src/code_indexing_mcp/skills/impact-analysis/SKILL.md`
+- Create: `src/code_indexing_mcp/skills/indexed-review/SKILL.md`
 - Test: `tests/test_skills.py` (new)
 
 **Interfaces:**
 - Consumes: nothing from Task 1 (independent).
-- Produces: `src/incode_mcp/skills/<name>/SKILL.md` × 4 — the exact directory Task 3's installer symlinks and Task 4's wheel check inspects.
+- Produces: `src/code_indexing_mcp/skills/<name>/SKILL.md` × 4 — the exact directory Task 3's installer symlinks and Task 4's wheel check inspects.
 
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/test_skills.py`:
 
 ```python
-"""Validation for the skills bundled under src/incode_mcp/skills/."""
+"""Validation for the skills bundled under src/code_indexing_mcp/skills/."""
 
 import re
 from pathlib import Path
 
 import pytest
 
-SKILLS_DIR = Path(__file__).resolve().parent.parent / "src" / "incode_mcp" / "skills"
+SKILLS_DIR = Path(__file__).resolve().parent.parent / "src" / "code_indexing_mcp" / "skills"
 EXPECTED_SKILLS = {
     "codebase-exploration",
     "feature-dev",
@@ -171,7 +171,7 @@ def test_skill_has_valid_frontmatter(skill_dir: Path) -> None:
 @pytest.mark.parametrize("skill_dir", _skill_dirs() if SKILLS_DIR.is_dir() else [], ids=lambda p: p.name)
 def test_skill_references_only_code_indexing_mcp_tools(skill_dir: Path) -> None:
     text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
-    assert "mcp__incode__" not in text
+    assert "mcp__code-indexing-mcp__" not in text
     assert "mcp__code-indexing-mcp__" in text
 ```
 
@@ -182,7 +182,7 @@ Note: the parametrization is evaluated at collection time, so before the skills 
 Run: `uv run pytest tests/test_skills.py -v`
 Expected: FAIL — `test_all_expected_skills_are_bundled` (`SKILLS_DIR` does not exist / empty set)
 
-- [ ] **Step 3: Create `src/incode_mcp/skills/codebase-exploration/SKILL.md`**
+- [ ] **Step 3: Create `src/code_indexing_mcp/skills/codebase-exploration/SKILL.md`**
 
 ````markdown
 ---
@@ -224,7 +224,7 @@ Keep a shortlist of candidate files and symbols; discard paths the results rule 
 Answer the question with `path:line` references for every claim, the shortest explanation that is complete, and an explicit note of anything the index could not cover so the user knows what was not verified.
 ````
 
-- [ ] **Step 4: Create `src/incode_mcp/skills/impact-analysis/SKILL.md`**
+- [ ] **Step 4: Create `src/code_indexing_mcp/skills/impact-analysis/SKILL.md`**
 
 ````markdown
 ---
@@ -275,7 +275,7 @@ Produce a structured impact report:
 Report only what you actually inspected through the tools; list blind spots the index could not cover.
 ````
 
-- [ ] **Step 5: Create `src/incode_mcp/skills/feature-dev/SKILL.md`**
+- [ ] **Step 5: Create `src/code_indexing_mcp/skills/feature-dev/SKILL.md`**
 
 Copy the current `~/.agents/skills/feature-dev/SKILL.md` verbatim — its tool references already use the `mcp__code-indexing-mcp__*` prefix. Full content:
 
@@ -342,9 +342,9 @@ Only after approval:
 - Claiming completion without running the verification commands
 ````
 
-- [ ] **Step 6: Create `src/incode_mcp/skills/indexed-review/SKILL.md`**
+- [ ] **Step 6: Create `src/code_indexing_mcp/skills/indexed-review/SKILL.md`**
 
-This is the renamed, tool-prefix-normalized port of `~/.agents/skills/incode-review/SKILL.md` (`name` changed to `indexed-review`, every `mcp__incode__` replaced with `mcp__code-indexing-mcp__`). Full content:
+This is the renamed, tool-prefix-normalized port of `~/.agents/skills/code-indexing-mcp-review/SKILL.md` (`name` changed to `indexed-review`, every `mcp__code-indexing-mcp__` replaced with `mcp__code-indexing-mcp__`). Full content:
 
 ````markdown
 ---
@@ -423,7 +423,7 @@ Expected: PASS — 1 + 4 + 4 tests
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/incode_mcp/skills tests/test_skills.py
+git add src/code_indexing_mcp/skills tests/test_skills.py
 git commit -m "feat: bundle codebase-exploration, feature-dev, impact-analysis, indexed-review skills"
 ```
 
@@ -436,7 +436,7 @@ git commit -m "feat: bundle codebase-exploration, feature-dev, impact-analysis, 
 - Test: `tests/test_installer.py` (append; uses the existing `installer` import alias and `tmp_path` style)
 
 **Interfaces:**
-- Consumes: `src/incode_mcp/skills/<name>/SKILL.md` folders from Task 2 (the test fixtures mimic that layout).
+- Consumes: `src/code_indexing_mcp/skills/<name>/SKILL.md` folders from Task 2 (the test fixtures mimic that layout).
 - Produces:
   - `skill_directory(slug: str, *, home: Path | None = None, environment: Mapping[str, str] | None = None) -> Path | None`
   - `install_skills(slugs: list[str], install_directory: Path, *, home: Path | None = None, environment: Mapping[str, str] | None = None) -> list[tuple[str, str]]` — returns `(slug, human-readable status)` lines; never raises for per-harness problems.
@@ -447,7 +447,7 @@ Append to `tests/test_installer.py`:
 
 ```python
 def _skills_source(tmp_path: Path, names: tuple[str, ...] = ("alpha", "beta")) -> Path:
-    root = tmp_path / "repo" / "src" / "incode_mcp" / "skills"
+    root = tmp_path / "repo" / "src" / "code_indexing_mcp" / "skills"
     for name in names:
         skill = root / name
         skill.mkdir(parents=True)
@@ -497,7 +497,7 @@ def test_install_skills_links_bundled_skills(tmp_path: Path) -> None:
     for name in ("alpha", "beta"):
         link = skills_dir / name
         assert link.is_symlink()
-        assert link.resolve() == (repo / "src" / "incode_mcp" / "skills" / name).resolve()
+        assert link.resolve() == (repo / "src" / "code_indexing_mcp" / "skills" / name).resolve()
     assert len(results) == 1
     slug, message = results[0]
     assert slug == "claude-code"
@@ -617,7 +617,7 @@ def install_skills(
     become "skipped" messages instead of raising.
     """
 
-    skills_source = install_directory / "src" / "incode_mcp" / "skills"
+    skills_source = install_directory / "src" / "code_indexing_mcp" / "skills"
     if not skills_source.is_dir():
         return [(slug, f"skipped: bundled skills not found at {skills_source}") for slug in slugs]
     skills = sorted(
@@ -681,7 +681,7 @@ to:
 Run: `uv run pytest tests/test_installer.py -v`
 Expected: PASS (whole file, including the 7 new tests)
 
-Note: `test_main_runs_noninteractive_install_and_reports_harness_failures` and `test_main_prompts_for_harnesses_when_option_is_omitted` monkeypatch `configure_selected_harnesses` but not `install_skills`; the real `install_skills` will run against their fake install dirs, find no `src/incode_mcp/skills`, and emit one "skipped" output line per selected slug. If either test asserts exact output, add `"skipped: bundled skills not found"` lines to its expected output or monkeypatch `installer.install_skills` to `lambda slugs, directory: []` — match the surrounding test style.
+Note: `test_main_runs_noninteractive_install_and_reports_harness_failures` and `test_main_prompts_for_harnesses_when_option_is_omitted` monkeypatch `configure_selected_harnesses` but not `install_skills`; the real `install_skills` will run against their fake install dirs, find no `src/code_indexing_mcp/skills`, and emit one "skipped" output line per selected slug. If either test asserts exact output, add `"skipped: bundled skills not found"` lines to its expected output or monkeypatch `installer.install_skills` to `lambda slugs, directory: []` — match the surrounding test style.
 
 - [ ] **Step 6: Commit**
 
@@ -709,10 +709,10 @@ Run:
 rm -rf dist && uv build --wheel && unzip -l dist/*.whl | grep skills
 ```
 
-Expected: the four `incode_mcp/skills/<name>/SKILL.md` entries are listed. If they are missing, add to `pyproject.toml` under `[tool.hatch.build.targets.wheel]`:
+Expected: the four `code_indexing_mcp/skills/<name>/SKILL.md` entries are listed. If they are missing, add to `pyproject.toml` under `[tool.hatch.build.targets.wheel]`:
 
 ```toml
-artifacts = ["src/incode_mcp/skills/**"]
+artifacts = ["src/code_indexing_mcp/skills/**"]
 ```
 
 (or the equivalent `force-include`) and re-run until the files appear. Clean up: `rm -rf dist`.
@@ -763,5 +763,5 @@ git commit -m "docs: document bundled skills and record the implementation plan"
 ## Self-Review Notes
 
 - **Spec coverage:** instructions (Task 1), 4 bundled skills incl. rename + prefix normalization (Task 2), symlink installer with skip/backup/idempotency (Task 3), wheel packaging check + tests + docs (Tasks 2-4). Out-of-scope items (MCP prompts, uninstall, per-project skills) are untouched.
-- **Type consistency:** `skill_directory` / `install_skills` signatures match between implementation and all 7 tests; `_skills_source` fixture mirrors the real `src/incode_mcp/skills/<name>/SKILL.md` layout.
+- **Type consistency:** `skill_directory` / `install_skills` signatures match between implementation and all 7 tests; `_skills_source` fixture mirrors the real `src/code_indexing_mcp/skills/<name>/SKILL.md` layout.
 - **Known soft spot:** Task 3 Step 5's note about the two existing `main()` tests — the implementer must look at their actual assertions and adapt output expectations as described.

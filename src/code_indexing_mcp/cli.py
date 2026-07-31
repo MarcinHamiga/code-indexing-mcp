@@ -22,7 +22,7 @@ from .daemon import (
     ensure_daemon,
     require_daemon_support,
 )
-from .errors import IncodeError
+from .errors import CodeIndexingError
 from .server import create_server
 from .settings import IndexSettings
 
@@ -82,7 +82,7 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="NAME=VALUE",
-        help="set a managed INCODE_* value; repeatable",
+        help="set a managed CODE_INDEXING_* value; repeatable",
     )
     configure.add_argument(
         "--unset",
@@ -90,7 +90,7 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="NAME",
-        help="remove a managed INCODE_* value from harness configs; repeatable",
+        help="remove a managed CODE_INDEXING_* value from harness configs; repeatable",
     )
     configure.add_argument("--no-tui", action="store_true", help="apply without opening the wizard")
     return parser
@@ -163,7 +163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if use_daemon:
                 try:
                     require_daemon_support()
-                except IncodeError:
+                except CodeIndexingError:
                     # An explicit opt-in cannot be silently downgraded, but the
                     # default "auto" serves directly rather than failing.
                     if settings.broker_mode == "on":
@@ -197,7 +197,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise AssertionError("unreachable command")
         print(_json(result))
         return 0
-    except IncodeError as exc:
+    except CodeIndexingError as exc:
         print(str(exc), file=sys.stderr)
         return 2
 

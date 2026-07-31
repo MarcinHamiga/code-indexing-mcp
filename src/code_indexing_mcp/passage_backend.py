@@ -33,7 +33,7 @@ from .embedding_worker import (
     EmbeddingWorkerSession,
     SessionTelemetry,
 )
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .probe_cache import ProbeCache, ProbeKey, ProbeRecord
 
 logger = logging.getLogger(__name__)
@@ -111,12 +111,12 @@ class _RunCounters:
 def _reason(exc: BaseException) -> str:
     """Render a failure for the fallback reason an ``IndexReport`` carries.
 
-    ``IncodeError.__str__`` deliberately omits details because it is used where
+    ``CodeIndexingError.__str__`` deliberately omits details because it is used where
     details travel as their own field. ``embedding_fallback_reason`` has no such
     channel, so rendering with ``str`` here would throw away exactly the numbers
     that explain the fallback -- the ceiling a backend overran and by how much.
     """
-    return exc.for_client() if isinstance(exc, IncodeError) else str(exc)
+    return exc.for_client() if isinstance(exc, CodeIndexingError) else str(exc)
 
 
 class PassageBackendSession:
@@ -286,7 +286,7 @@ class PassageBackendSession:
         """
         try:
             result = call(self._active(pending))
-        except IncodeError as exc:
+        except CodeIndexingError as exc:
             if self._on_cpu or self._on_provisional_cpu or exc.code not in BACKEND_FAILURE_CODES:
                 # Provisional CPU is what an accelerator falls back *to*, so
                 # its failure is the machine failing rather than a reason to
@@ -330,7 +330,7 @@ class PassageBackendSession:
             session = self._accelerator_factory()
         try:
             self._verify(session)
-        except (IncodeError, ValueError) as exc:
+        except (CodeIndexingError, ValueError) as exc:
             # Nothing this backend produced can be trusted, and it may still be
             # holding device memory. Adopting it first means _degrade's close()
             # both kills it and keeps what it measured -- the ceiling it overran
@@ -364,7 +364,7 @@ class PassageBackendSession:
             # ONNX Runtime drops a provider it cannot initialise and keeps
             # running on the next one, so a "CUDA" session that quietly became
             # a CPU session would otherwise look like a successful selection.
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.BACKEND_UNAVAILABLE,
                 f"{descriptor.provider} was requested but the session runs on "
                 f"{', '.join(info.resolved_providers)}",
@@ -372,7 +372,7 @@ class PassageBackendSession:
                 resolved=list(info.resolved_providers),
             )
         if info.dimension != session.config.dimension:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.BACKEND_UNAVAILABLE,
                 f"{descriptor.accelerator.value} reported dimension {info.dimension}, "
                 f"expected {session.config.dimension}",
@@ -446,7 +446,7 @@ class PassageBackendSession:
         try:
             session.initialize()
             measured = calibrate(session, self._calibration_plan, load_ns=session.load_duration_ns)
-        except (IncodeError, ValueError) as exc:
+        except (CodeIndexingError, ValueError) as exc:
             # The reference backend failing to measure is a diagnostic gap, not
             # a run-ending condition: without a crossover the accelerator is
             # simply used as it was before any of this existed.
@@ -517,10 +517,10 @@ class PassageBackendSession:
     def _degrade(self, reason: str) -> None:
         """Record a backend failure and move the run onto CPU."""
         if self.strict:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.BACKEND_UNAVAILABLE,
                 f"Embedding accelerator {self.selection.accelerator.value} failed and "
-                f"INCODE_EMBED_STRICT forbids the CPU fallback: {reason}",
+                f"CODE_INDEXING_EMBED_STRICT forbids the CPU fallback: {reason}",
                 requested=self.selection.requested.value,
                 accelerator=self.selection.accelerator.value,
                 reason=reason,

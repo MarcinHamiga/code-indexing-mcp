@@ -39,7 +39,7 @@ LANGUAGES = {
 HARD_EXCLUDED_DIRECTORIES = {
     ".git",
     ".ci-mcp",
-    ".incode",
+    ".code-indexing-mcp",
     # `.godot` is both an extension this scanner indexes and the name of Godot's
     # own cache directory, which holds a generated copy of every imported asset.
     # Excluding the directory does not exclude a `project.godot` file: only

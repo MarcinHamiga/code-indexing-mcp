@@ -48,37 +48,37 @@ rather than rewriting it; it remains the post-merge roadmap.
   > longer need excluding. The 07-24 plan's Tasks 2–3 are marked done there, with the deviations
   > recorded.
 - **Task 3's retry design has no effect at the shipped default.** It specifies a `4 → 2 → 1`
-  microbatch backoff, but `INCODE_EMBED_BATCH_SIZE` defaults to 1, so there is nothing to halve.
+  microbatch backoff, but `CODE_INDEXING_EMBED_BATCH_SIZE` defaults to 1, so there is nothing to halve.
   Retry only becomes meaningful once Task 3 of *this* plan raises the default.
 - **Task 1's benchmark corpus is under-specified.** Deterministic Python files at varying counts do
   not exercise the memory peak, which tracks the largest *single* file. See Task 5 below.
 
 ## Task 1: Bound the `INDEX_BUSY` wait
 
-**Problem.** `StartupCoordinator._run` ([server.py:123](../../src/incode_mcp/server.py)) retries
+**Problem.** `StartupCoordinator._run` ([server.py:123](../../src/code_indexing_mcp/server.py)) retries
 `index_project` in a `while True` at 20 Hz with no deadline. The polling itself is deliberate —
 the `_lifespan` comment explains that lock waiters must stay cancellable between non-blocking
 attempts — but nothing bounds it. PR #4 widened the lock from per-project to global
-(`index-global.lock`), so *any* two indexing jobs now contend. With `INCODE_BROKER=off` and two
+(`index-global.lock`), so *any* two indexing jobs now contend. With `CODE_INDEXING_BROKER=off` and two
 clients, or two roots in one session, the second client's first query blocks for the entire
 duration of the first index with no timeout and no error.
 
-**Files:** `src/incode_mcp/server.py`, `src/incode_mcp/settings.py`, `tests/test_server.py`,
+**Files:** `src/code_indexing_mcp/server.py`, `src/code_indexing_mcp/settings.py`, `tests/test_server.py`,
 `README.md`
 
 **Approach.** Keep the cancellable polling loop; add a deadline and backoff.
 
-- Add `index_wait_seconds` to `IndexSettings` (env `INCODE_INDEX_WAIT_SECONDS`, default 300,
+- Add `index_wait_seconds` to `IndexSettings` (env `CODE_INDEXING_INDEX_WAIT_SECONDS`, default 300,
   range 0–86400) using the existing `_integer` helper in
-  [settings.py](../../src/incode_mcp/settings.py).
+  [settings.py](../../src/code_indexing_mcp/settings.py).
 - Thread the value into `StartupCoordinator.__init__` alongside `mode`.
 - Replace the fixed `await anyio.sleep(0.05)` with exponential backoff capped at 1.0s, and track a
-  monotonic deadline. On expiry, re-raise the `INDEX_BUSY` `IncodeError` with the waited duration
+  monotonic deadline. On expiry, re-raise the `INDEX_BUSY` `CodeIndexingError` with the waited duration
   in `details` so `wait_for_ready` propagates a clear error instead of hanging.
 
 **Test.** Reuse the existing `FileLock` import and `BlockingEmbedder` pattern in
 `tests/test_server.py`: hold `index-global.lock` externally, call `search_code` with a short
-`INCODE_INDEX_WAIT_SECONDS`, and assert the tool returns an `INDEX_BUSY` error within the deadline
+`CODE_INDEXING_INDEX_WAIT_SECONDS`, and assert the tool returns an `INDEX_BUSY` error within the deadline
 rather than blocking. Add a second test asserting a job that becomes free before the deadline still
 succeeds.
 
@@ -86,13 +86,13 @@ succeeds.
 
 **Problem.** `tests/test_daemon.py::test_broker_application_calls_one_daemon_backend` and
 `::test_daemon_does_not_idle_exit_while_request_is_active` both call `DaemonServer.serve()`, which
-needs `AF_UNIX`. The fix on this branch converts the `AttributeError` into a clean `IncodeError`,
+needs `AF_UNIX`. The fix on this branch converts the `AttributeError` into a clean `CodeIndexingError`,
 so `daemon.ready.wait()` times out and the tests still fail — just more legibly.
 
 **Files:** `tests/test_daemon.py`
 
 **Approach.** Skip on capability, not platform — `@pytest.mark.skipif(not daemon_supported(), ...)`
-using the existing `daemon_supported()` from [daemon.py:43](../../src/incode_mcp/daemon.py). Prefer
+using the existing `daemon_supported()` from [daemon.py:43](../../src/code_indexing_mcp/daemon.py). Prefer
 it over `os.name == "nt"` so the guard tracks the real constraint. The two existing
 `skipif(os.name == "nt")` markers on the endpoint/permission tests should move to the same
 predicate where they gate socket support rather than POSIX ownership semantics.
@@ -120,7 +120,7 @@ lifecycle alone.
 The real lever is batch size. Measured peak worker RSS is 1462–1555 MiB at `batch_size=1` against a
 2048 MiB ceiling — roughly 500 MiB of headroom.
 
-**Files:** `src/incode_mcp/settings.py`, `src/incode_mcp/models.py`, `src/incode_mcp/indexing.py`,
+**Files:** `src/code_indexing_mcp/settings.py`, `src/code_indexing_mcp/models.py`, `src/code_indexing_mcp/indexing.py`,
 `README.md`
 
 **Approach.**
@@ -128,22 +128,22 @@ The real lever is batch size. Measured peak worker RSS is 1462–1555 MiB at `ba
 - Add scan/parse/embed/commit duration fields to `IndexReport` (additive and optional, matching the
   existing `memory_budget_bytes` pattern) so the load-vs-embed split is observable. This overlaps
   the 07-24 plan's Task 3 Step 3 — implement the durations here and mark that step done there.
-- Sweep `INCODE_EMBED_BATCH_SIZE` over 1, 2, 4, 8 against a fixed corpus using the harness from
+- Sweep `CODE_INDEXING_EMBED_BATCH_SIZE` over 1, 2, 4, 8 against a fixed corpus using the harness from
   Task 5, recording throughput and peak worker RSS at each.
 - Raise the default to the largest value whose peak stays within the ceiling with the 128 MiB
   hard-overshoot margin intact. **Do not guess the value** — set it from the sweep, and record the
   numbers in the README next to the setting.
 - If no batch size above 1 fits, keep the default and document the measured throughput ceiling so
-  users can choose `INCODE_INDEX_MODE=eager` knowingly.
+  users can choose `CODE_INDEXING_INDEX_MODE=eager` knowingly.
 
 **Ordering note.** The sweep consumes Task 5's harness, so implement the `IndexReport` durations
 here, build Task 5, then return to set the default from the sweep.
 
 ### Measured outcome
 
-Apple Silicon macOS, 1.0 MiB / 6,330-chunk dense-Python corpus, `INCODE_INDEX_MEMORY_MB=2048`:
+Apple Silicon macOS, 1.0 MiB / 6,330-chunk dense-Python corpus, `CODE_INDEXING_INDEX_MEMORY_MB=2048`:
 
-| `INCODE_EMBED_BATCH_SIZE` | Wall clock | Chunks/s | Peak worker RSS | Peak combined |
+| `CODE_INDEXING_EMBED_BATCH_SIZE` | Wall clock | Chunks/s | Peak worker RSS | Peak combined |
 | ------------------------- | ---------- | -------- | --------------- | ------------- |
 | 1                         | 147.0 s    | 44.8     | 1,415 MiB       | 1,656 MiB     |
 | 2                         | 136.2 s    | 48.7     | 1,419 MiB       | 1,661 MiB     |
@@ -234,9 +234,9 @@ list-of-floats ingestion path the 07-24 plan's Task 4 replaces with Arrow stagin
 
 ## Task 6: Small correctness items
 
-**Files:** `src/incode_mcp/storage.py`, `tests/test_storage.py`
+**Files:** `src/code_indexing_mcp/storage.py`, `tests/test_storage.py`
 
-- **`_tables()` creates partitions on read.** [storage.py](../../src/incode_mcp/storage.py) calls
+- **`_tables()` creates partitions on read.** [storage.py](../../src/code_indexing_mcp/storage.py) calls
   `create_table(..., exist_ok=True)`, so querying an unknown project id silently creates an empty
   partition directory — reachable from `get_chunk`, which iterates every registered project. Add a
   read-only path that uses `open_table` and returns `None` when the partition is absent; keep
@@ -263,9 +263,9 @@ wrong quantity. 4,096 characters of ordinary source is 984 tokens; the same 4,09
 minified source is 2,157. Embedding the long sequence adds ~1,172 MiB of resident memory; the same
 characters as three token-bounded windows add ~266 MiB, and finish faster (0.78 s against 1.07 s).
 
-**Files:** `src/incode_mcp/token_batching.py`, `src/incode_mcp/embedding.py`,
-`src/incode_mcp/embedding_worker.py`, `src/incode_mcp/indexing.py`, `src/incode_mcp/extractor.py`,
-`src/incode_mcp/models.py`, `src/incode_mcp/settings.py`, `src/incode_mcp/application.py`,
+**Files:** `src/code_indexing_mcp/token_batching.py`, `src/code_indexing_mcp/embedding.py`,
+`src/code_indexing_mcp/embedding_worker.py`, `src/code_indexing_mcp/indexing.py`, `src/code_indexing_mcp/extractor.py`,
+`src/code_indexing_mcp/models.py`, `src/code_indexing_mcp/settings.py`, `src/code_indexing_mcp/application.py`,
 `tests/test_token_batching.py`, `tests/test_indexing.py`, `tests/test_embedding.py`,
 `tests/test_embedding_worker.py`, `tests/test_settings.py`, `tests/test_memory_acceptance.py`,
 `README.md`
@@ -302,13 +302,13 @@ uv run pytest -q && uv run ruff check . && uv run ruff format --check . && uv ru
 ```
 
 End-to-end with the real model, against an **isolated data directory** — the live store at
-`~/Library/Application Support/incode/lancedb` is schema v1 and this code migrates destructively on
+`~/Library/Application Support/code-indexing-mcp/lancedb` is schema v1 and this code migrates destructively on
 first run:
 
 ```bash
-export INCODE_DATA_DIR=/tmp/incode-check/data
-export INCODE_CACHE_DIR="$HOME/Library/Caches/incode"
-export INCODE_OFFLINE=1
+export CODE_INDEXING_DATA_DIR=/tmp/code-indexing-mcp-check/data
+export CODE_INDEXING_CACHE_DIR="$HOME/Library/Caches/code-indexing-mcp"
+export CODE_INDEXING_OFFLINE=1
 uv run code-indexing-mcp index <path-to-a-checkout>
 uv run code-indexing-mcp daemon status
 ```

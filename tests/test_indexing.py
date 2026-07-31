@@ -9,19 +9,19 @@ import pytest
 from filelock import FileLock
 from test_token_batching import fake_encode
 
-from incode_mcp.embedding import (
+from code_indexing_mcp.embedding import (
     EmbeddedSegment,
     PassageCandidate,
     SegmentPlan,
     embed_planned_segments,
     pack_vector,
 )
-from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.extractor import TreeSitterExtractor
-from incode_mcp.indexing import Indexer
-from incode_mcp.projects import initialize_project
-from incode_mcp.scanner import SourceScanner
-from incode_mcp.storage import LanceStore
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.extractor import TreeSitterExtractor
+from code_indexing_mcp.indexing import Indexer
+from code_indexing_mcp.projects import initialize_project
+from code_indexing_mcp.scanner import SourceScanner
+from code_indexing_mcp.storage import LanceStore
 
 
 class RecordingEmbedder:
@@ -247,7 +247,7 @@ def test_global_index_lock_serializes_different_projects(tmp_path: Path) -> None
     indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
 
     lock = FileLock(tmp_path / "locks" / "index-global.lock")
-    with lock, pytest.raises(IncodeError) as caught:
+    with lock, pytest.raises(CodeIndexingError) as caught:
         indexer.index(project)
 
     assert caught.value.code is ErrorCode.INDEX_BUSY
@@ -324,9 +324,9 @@ def test_model_unavailable_marks_project_error(tmp_path: Path) -> None:
         patch.object(
             embedder,
             "embed_passages",
-            side_effect=IncodeError(ErrorCode.MODEL_UNAVAILABLE, "model missing"),
+            side_effect=CodeIndexingError(ErrorCode.MODEL_UNAVAILABLE, "model missing"),
         ),
-        pytest.raises(IncodeError) as raised,
+        pytest.raises(CodeIndexingError) as raised,
     ):
         indexer.index(project)
 
@@ -365,7 +365,7 @@ class ResourceLimitEmbedder(RecordingEmbedder):
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
         self.files_seen += 1
         if self.files_seen == 2:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.INDEX_RESOURCE_LIMIT, "Indexing exceeded its memory ceiling"
             )
         return super().embed_passages(texts)
@@ -381,7 +381,7 @@ def test_resource_limit_aborts_instead_of_poisoning_the_file_record(tmp_path: Pa
     embedder = ResourceLimitEmbedder()
     indexer, store = make_indexer(tmp_path, embedder)
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         indexer.index(project)
 
     assert caught.value.code is ErrorCode.INDEX_RESOURCE_LIMIT

@@ -8,8 +8,8 @@
 constrained schemas, and errors that carry their recovery detail — so a model can pick the right
 tool and a host can auto-approve the read-only ones.
 
-**Architecture:** Purely adapter-layer. Every change lands in `src/incode_mcp/server.py` plus a
-small rendering helper on `IncodeError`. No application, storage, or indexing logic changes. The
+**Architecture:** Purely adapter-layer. Every change lands in `src/code_indexing_mcp/server.py` plus a
+small rendering helper on `CodeIndexingError`. No application, storage, or indexing logic changes. The
 existing `Application` / `BrokerApplication` split is untouched, so the CLI and daemon behave
 exactly as before.
 
@@ -57,7 +57,7 @@ on schemas while telling the model nothing about what any tool does. Four conseq
    project resolution, so a typo surfaces as `PROJECT_NOT_FOUND`. `limit` is an unbounded integer
    silently clamped to 1–50 at `search.py:42` and `search.py:83`. `kinds` is an open `list[str]`.
    No parameter has a description.
-4. **Errors drop their details.** `IncodeError.details` carries `waited_seconds`,
+4. **Errors drop their details.** `CodeIndexingError.details` carries `waited_seconds`,
    `wait_timeout_seconds`, `registered_root`, `effective_memory_bytes` — none reaches the client:
 
    ```
@@ -72,11 +72,11 @@ on schemas while telling the model nothing about what any tool does. Four conseq
 
 | File | Responsibility after this plan |
 |---|---|
-| `src/incode_mcp/errors.py` | Adds `CHUNK_NOT_FOUND` and `IncodeError.for_client()`, which renders code, message, and details into one client-facing string. `__str__` is left alone so `IndexIssue` messages and daemon frames keep their current shape. |
-| `src/incode_mcp/server.py` | Gains `_TOOL_INSTRUCTIONS`, the `_with_error_details` decorator, and full `title`/`description`/`annotations` plus `Annotated` parameter schemas on all nine tools. |
-| `src/incode_mcp/search.py` | Raises `CHUNK_NOT_FOUND` with a recovery hint. Keeps its defensive `limit` clamp for direct CLI/daemon callers. |
-| `src/incode_mcp/application.py` | One message gains a recovery hint. |
-| `src/incode_mcp/projects.py` | One message gains a recovery hint. |
+| `src/code_indexing_mcp/errors.py` | Adds `CHUNK_NOT_FOUND` and `CodeIndexingError.for_client()`, which renders code, message, and details into one client-facing string. `__str__` is left alone so `IndexIssue` messages and daemon frames keep their current shape. |
+| `src/code_indexing_mcp/server.py` | Gains `_TOOL_INSTRUCTIONS`, the `_with_error_details` decorator, and full `title`/`description`/`annotations` plus `Annotated` parameter schemas on all nine tools. |
+| `src/code_indexing_mcp/search.py` | Raises `CHUNK_NOT_FOUND` with a recovery hint. Keeps its defensive `limit` clamp for direct CLI/daemon callers. |
+| `src/code_indexing_mcp/application.py` | One message gains a recovery hint. |
+| `src/code_indexing_mcp/projects.py` | One message gains a recovery hint. |
 | `tests/test_server.py` | Gains a metadata contract test, a schema constraint test, and an error-detail test. |
 | `README.md` | Tool list gains one line per tool describing it. |
 
@@ -88,15 +88,15 @@ tool declarations; Task 3 threads error detail through.
 ### Task 1: Error rendering and a correct code for unknown chunks
 
 **Files:**
-- Modify: `src/incode_mcp/errors.py:7-32`
-- Modify: `src/incode_mcp/search.py:120-124`
-- Modify: `src/incode_mcp/application.py:307-309`
-- Modify: `src/incode_mcp/projects.py:125`
+- Modify: `src/code_indexing_mcp/errors.py:7-32`
+- Modify: `src/code_indexing_mcp/search.py:120-124`
+- Modify: `src/code_indexing_mcp/application.py:307-309`
+- Modify: `src/code_indexing_mcp/projects.py:125`
 - Test: `tests/test_server.py`
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `ErrorCode.CHUNK_NOT_FOUND`, and `IncodeError.for_client() -> str`. Task 3 calls
+- Produces: `ErrorCode.CHUNK_NOT_FOUND`, and `CodeIndexingError.for_client() -> str`. Task 3 calls
   `for_client()` from the MCP boundary.
 
 - [ ] **Step 1: Write the failing test**
@@ -105,7 +105,7 @@ Append to `tests/test_server.py`:
 
 ```python
 def test_error_renders_code_message_and_details_for_clients() -> None:
-    error = IncodeError(
+    error = CodeIndexingError(
         ErrorCode.INDEX_BUSY,
         "Another indexing job is already active",
         waited_seconds=3.5,
@@ -122,30 +122,30 @@ def test_error_renders_code_message_and_details_for_clients() -> None:
 
 
 def test_error_without_details_renders_as_plain_string() -> None:
-    error = IncodeError(ErrorCode.CHUNK_NOT_FOUND, "Unknown chunk: abc")
+    error = CodeIndexingError(ErrorCode.CHUNK_NOT_FOUND, "Unknown chunk: abc")
 
     assert error.for_client() == "CHUNK_NOT_FOUND: Unknown chunk: abc"
 ```
 
 No new imports are needed: `tests/test_server.py:11` already has
-`from incode_mcp.errors import ErrorCode, IncodeError`.
+`from code_indexing_mcp.errors import ErrorCode, CodeIndexingError`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_server.py -k for_client -v`
 
-Expected: FAIL — `AttributeError: 'IncodeError' object has no attribute 'for_client'`, and
+Expected: FAIL — `AttributeError: 'CodeIndexingError' object has no attribute 'for_client'`, and
 `AttributeError: CHUNK_NOT_FOUND` on the `ErrorCode` lookup.
 
 - [ ] **Step 3: Write minimal implementation**
 
-In `src/incode_mcp/errors.py`, add the member after `PROJECT_ID_CONFLICT`:
+In `src/code_indexing_mcp/errors.py`, add the member after `PROJECT_ID_CONFLICT`:
 
 ```python
     CHUNK_NOT_FOUND = "CHUNK_NOT_FOUND"
 ```
 
-and add the method to `IncodeError`:
+and add the method to `CodeIndexingError`:
 
 ```python
     def for_client(self) -> str:
@@ -169,13 +169,13 @@ Expected: 2 passed.
 
 - [ ] **Step 5: Give the three vaguest errors a recovery path**
 
-In `src/incode_mcp/search.py:120-124`, replace `get_chunk`:
+In `src/code_indexing_mcp/search.py:120-124`, replace `get_chunk`:
 
 ```python
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         chunk = self.store.get_chunk(chunk_id)
         if chunk is None:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.CHUNK_NOT_FOUND,
                 f"Unknown chunk: {chunk_id}; chunk ids come from search_code or find_symbol "
                 "results and change when the file is re-indexed",
@@ -184,23 +184,23 @@ In `src/incode_mcp/search.py:120-124`, replace `get_chunk`:
         return CodeChunk.model_validate(chunk.model_dump())
 ```
 
-In `src/incode_mcp/application.py:307-309`:
+In `src/code_indexing_mcp/application.py:307-309`:
 
 ```python
         if not project_ids:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.PROJECT_NOT_FOUND,
                 "No indexed projects are available; init_project registers one and "
                 "index_project builds its index",
             )
 ```
 
-In `src/incode_mcp/projects.py:125`:
+In `src/code_indexing_mcp/projects.py:125`:
 
 ```python
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.PROJECT_NOT_FOUND,
-            "No active Incode project was detected; pass an explicit project id, name, or "
+            "No active CodeIndexing project was detected; pass an explicit project id, name, or "
             "path, or run init_project for this directory",
             searched_roots=[str(root) for root in roots],
         )
@@ -225,8 +225,8 @@ asserts `PROJECT_NOT_FOUND` for a missing chunk, update it to `CHUNK_NOT_FOUND` 
 
 ```bash
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy src tests
-git add src/incode_mcp/errors.py src/incode_mcp/search.py src/incode_mcp/application.py \
-        src/incode_mcp/projects.py tests/test_server.py
+git add src/code_indexing_mcp/errors.py src/code_indexing_mcp/search.py src/code_indexing_mcp/application.py \
+        src/code_indexing_mcp/projects.py tests/test_server.py
 git commit -m "feat: render error details for clients and add CHUNK_NOT_FOUND"
 ```
 
@@ -235,7 +235,7 @@ git commit -m "feat: render error details for clients and add CHUNK_NOT_FOUND"
 ### Task 2: Describe, title, and annotate all nine tools
 
 **Files:**
-- Modify: `src/incode_mcp/server.py:272-442`
+- Modify: `src/code_indexing_mcp/server.py:272-442`
 - Test: `tests/test_server.py`
 
 **Interfaces:**
@@ -327,7 +327,7 @@ Expected: FAIL — `AssertionError: init_project has no description`.
 
 - [ ] **Step 3: Add the server instructions and the annotation constants**
 
-In `src/incode_mcp/server.py`, add the import:
+In `src/code_indexing_mcp/server.py`, add the import:
 
 ```python
 from mcp.types import Tool as MCPTool, ToolAnnotations
@@ -740,7 +740,7 @@ Replace `project_status`, `list_projects`, `search_code`, `find_symbol`, `file_o
 - [ ] **Step 6: Define the two closed vocabularies**
 
 The `ChunkKind` and `LanguageName` aliases used above must exist. Add them to
-`src/incode_mcp/models.py`, next to the existing scanning constants, so the extractor's vocabulary
+`src/code_indexing_mcp/models.py`, next to the existing scanning constants, so the extractor's vocabulary
 has one home:
 
 ```python
@@ -772,10 +772,10 @@ ChunkKind = Literal[
 ]
 ```
 
-The ten base kinds are exactly the `@definition.*` captures in `src/incode_mcp/queries/*.scm`
+The ten base kinds are exactly the `@definition.*` captures in `src/code_indexing_mcp/queries/*.scm`
 (`annotation`, `class`, `constant`, `constructor`, `enum`, `function`, `interface`, `method`,
 `record`, `type` — verified with
-`grep -oh "@definition\.[a-z_]*" src/incode_mcp/queries/*.scm | sort -u`). `module` is not a capture;
+`grep -oh "@definition\.[a-z_]*" src/code_indexing_mcp/queries/*.scm | sort -u`). `module` is not a capture;
 `_module_chunks` synthesises it. The `_part` variants come from `_chunks_for_range`, which appends
 `"_part"` to every kind except `module`.
 
@@ -795,12 +795,12 @@ Add to `tests/test_extractor.py`:
 def test_chunk_kind_literal_covers_every_kind_the_queries_capture() -> None:
     from typing import get_args
 
-    from incode_mcp.models import ChunkKind
+    from code_indexing_mcp.models import ChunkKind
 
     declared = set(get_args(ChunkKind))
     captured = set()
     for language in ("python", "java", "javascript", "typescript", "tsx"):
-        text = files("incode_mcp.queries").joinpath(f"{language}.scm").read_text()
+        text = files("code_indexing_mcp.queries").joinpath(f"{language}.scm").read_text()
         captured |= {
             line.split("@definition.", 1)[1].split()[0].strip(")")
             for line in text.splitlines()
@@ -820,8 +820,8 @@ And to `tests/test_scanner.py`:
 def test_language_name_literal_matches_scanner_languages() -> None:
     from typing import get_args
 
-    from incode_mcp.models import LanguageName
-    from incode_mcp.scanner import LANGUAGES
+    from code_indexing_mcp.models import LanguageName
+    from code_indexing_mcp.scanner import LANGUAGES
 
     assert set(get_args(LanguageName)) == set(LANGUAGES.values())
 ```
@@ -847,7 +847,7 @@ schema.
 
 ```bash
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy src tests
-git add src/incode_mcp/server.py src/incode_mcp/models.py tests/
+git add src/code_indexing_mcp/server.py src/code_indexing_mcp/models.py tests/
 git commit -m "feat: describe, title, and annotate every MCP tool"
 ```
 
@@ -856,11 +856,11 @@ git commit -m "feat: describe, title, and annotate every MCP tool"
 ### Task 3: Surface error details at the MCP boundary
 
 **Files:**
-- Modify: `src/incode_mcp/server.py` (add decorator, apply to nine handlers)
+- Modify: `src/code_indexing_mcp/server.py` (add decorator, apply to nine handlers)
 - Test: `tests/test_server.py`
 
 **Interfaces:**
-- Consumes: `IncodeError.for_client()` from Task 1; the nine decorated handlers from Task 2.
+- Consumes: `CodeIndexingError.for_client()` from Task 1; the nine decorated handlers from Task 2.
 - Produces: nothing later tasks depend on.
 
 - [ ] **Step 1: Write the failing test**
@@ -893,15 +893,15 @@ Expected: FAIL — the message contains `CHUNK_NOT_FOUND: Unknown chunk: missing
 
 - [ ] **Step 3: Write the decorator**
 
-Add to `src/incode_mcp/server.py`, above `create_server`:
+Add to `src/code_indexing_mcp/server.py`, above `create_server`:
 
 ```python
 def _with_error_details[**P, R](
     handler: Callable[P, Awaitable[R]],
 ) -> Callable[P, Awaitable[R]]:
-    """Re-raise IncodeError as a ToolError that keeps its code and details.
+    """Re-raise CodeIndexingError as a ToolError that keeps its code and details.
 
-    FastMCP stringifies an uncaught exception, and ``IncodeError.__str__`` omits
+    FastMCP stringifies an uncaught exception, and ``CodeIndexingError.__str__`` omits
     ``details`` on purpose, so the machine-readable half of every error — which
     project, how long it waited, which memory ceiling — never reached the client.
     ``functools.wraps`` keeps the signature FastMCP introspects for the schema.
@@ -911,7 +911,7 @@ def _with_error_details[**P, R](
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return await handler(*args, **kwargs)
-        except IncodeError as exc:
+        except CodeIndexingError as exc:
             raise ToolError(exc.for_client()) from exc
 
     return wrapper
@@ -963,8 +963,8 @@ Run:
 .venv/bin/python - <<'PY'
 import asyncio, json, tempfile
 from pathlib import Path
-from incode_mcp.application import Application, RuntimePaths
-from incode_mcp.server import create_server
+from code_indexing_mcp.application import Application, RuntimePaths
+from code_indexing_mcp.server import create_server
 
 class F:
     model_id = "f"; dimension = 8
@@ -1027,8 +1027,8 @@ enforced by the tool schema, so an out-of-range value is rejected rather than si
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/incode_mcp/server.py tests/test_server.py README.md
-git commit -m "feat: surface IncodeError codes and details through MCP tool errors"
+git add src/code_indexing_mcp/server.py tests/test_server.py README.md
+git commit -m "feat: surface CodeIndexingError codes and details through MCP tool errors"
 ```
 
 ---
@@ -1041,7 +1041,7 @@ A7 (`json_response`, Task 2 Step 3) are all covered. A3 (`get_chunk` payload) is
 scope — it is [plan 3](2026-07-27-get-chunk-projection.md).
 
 **Type consistency.** `ChunkKind` and `LanguageName` are defined once in Task 2 Step 6 and used in
-`search_code` and `find_symbol` in Step 5. `IncodeError.for_client()` is defined in Task 1 Step 3
+`search_code` and `find_symbol` in Step 5. `CodeIndexingError.for_client()` is defined in Task 1 Step 3
 and consumed in Task 3 Step 3. `_READ_ONLY` / `_WRITES` / `_DESTRUCTIVE` are defined in Task 2
 Step 3 and used in Steps 4–5. `_with_error_details` is defined in Task 3 Step 3 and applied in
 Step 4.

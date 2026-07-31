@@ -4,7 +4,7 @@
 This file is stdlib-only and self-contained: install.sh downloads it into a
 temporary directory and runs it before any virtual environment exists. It
 clones or updates the repository, builds the locked environment, and delegates
-everything else to ``python -m incode_mcp.installer`` inside that environment.
+everything else to ``python -m code_indexing_mcp.installer`` inside that environment.
 """
 
 from __future__ import annotations
@@ -203,7 +203,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="NAME=VALUE",
-        help="set a managed INCODE_* value in harness configs; repeatable",
+        help="set a managed CODE_INDEXING_* value in harness configs; repeatable",
     )
     parser.add_argument(
         "--unset",
@@ -211,7 +211,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="NAME",
-        help="remove a managed INCODE_* value from harness configs; repeatable",
+        help="remove a managed CODE_INDEXING_* value from harness configs; repeatable",
     )
     parser.add_argument("--tui", action="store_true", help="force the interactive wizard")
     parser.add_argument("--no-tui", action="store_true", help="force the plain text interface")
@@ -223,7 +223,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--offline",
         action="store_true",
-        default=os.environ.get("INCODE_OFFLINE", "").strip().lower() in {"1", "true", "yes", "on"},
+        default=os.environ.get("CODE_INDEXING_OFFLINE", "").strip().lower()
+        in {"1", "true", "yes", "on"},
         help="never download the embedding model",
     )
     return parser
@@ -240,7 +241,7 @@ def _delegate(install_directory: Path, tail: list[str]) -> int:
     python = environment_python(install_directory / ".venv")
     try:
         completed = subprocess.run(
-            [str(python), "-m", "incode_mcp.installer", *tail],
+            [str(python), "-m", "code_indexing_mcp.installer", *tail],
             cwd=install_directory,
         )
     except OSError as exc:

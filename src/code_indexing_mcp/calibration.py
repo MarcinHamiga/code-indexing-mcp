@@ -14,7 +14,7 @@ Throughput is in characters per second because that is the only unit the
 crossover decision can be made in: segments are known only after windowing,
 tokens only after embedding, and characters are exactly known for every
 candidate the indexer is about to hand over. Character density varies between
-corpora -- the caveat :mod:`incode_mcp.token_batching` documents -- so the
+corpora -- the caveat :mod:`code_indexing_mcp.token_batching` documents -- so the
 corpus here is code-shaped, and the decision it feeds is whether a run is
 seconds or minutes rather than a precise prediction.
 
@@ -32,7 +32,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol
 
 from .embedding import EmbeddedSegment, PassageCandidate, SegmentPlan
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .settings import MAX_BATCH_SIZE
 
 logger = logging.getLogger(__name__)
@@ -141,7 +141,7 @@ def calibrate(
         started = clock()
         try:
             session.plan_and_embed(corpus, replace(plan, max_items=size))
-        except IncodeError as exc:
+        except CodeIndexingError as exc:
             if best is None:
                 logger.debug("Calibration abandoned at max_items=%d: %s", size, exc)
                 return None

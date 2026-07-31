@@ -22,7 +22,7 @@ class ErrorCode(StrEnum):
     INVALID_FILTER = "INVALID_FILTER"
 
 
-class IncodeError(RuntimeError):
+class CodeIndexingError(RuntimeError):
     """An error with a stable machine-readable code."""
 
     def __init__(self, code: ErrorCode, message: str, **details: Any) -> None:

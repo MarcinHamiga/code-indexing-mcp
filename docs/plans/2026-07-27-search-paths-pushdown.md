@@ -79,8 +79,8 @@ possible:
 
 | File | Responsibility |
 |---|---|
-| `src/incode_mcp/path_filter.py` | **New.** Pure translation: `glob_to_regex(pattern)` and `path_condition(patterns)`. No imports from storage, search, or models. |
-| `src/incode_mcp/search.py` | Adds the path predicate to the pushdown conditions; keeps the Python post-filter unchanged as the authority. |
+| `src/code_indexing_mcp/path_filter.py` | **New.** Pure translation: `glob_to_regex(pattern)` and `path_condition(patterns)`. No imports from storage, search, or models. |
+| `src/code_indexing_mcp/search.py` | Adds the path predicate to the pushdown conditions; keeps the Python post-filter unchanged as the authority. |
 | `tests/test_path_filter.py` | **New.** Unit tests plus the differential equivalence test against `PurePosixPath.match`. |
 | `tests/test_search.py` | Gains the end-to-end regression test for the reported bug. |
 | `README.md` | Documents that `paths` is pushed down and how patterns anchor. |
@@ -90,7 +90,7 @@ possible:
 ### Task 1: The pure translation module
 
 **Files:**
-- Create: `src/incode_mcp/path_filter.py`
+- Create: `src/code_indexing_mcp/path_filter.py`
 - Test: `tests/test_path_filter.py`
 
 **Interfaces:**
@@ -117,7 +117,7 @@ from pathlib import PurePosixPath
 
 import pytest
 
-from incode_mcp.path_filter import glob_to_regex, path_condition
+from code_indexing_mcp.path_filter import glob_to_regex, path_condition
 
 # Every shape the translation must handle, including the two that make it subtle:
 # right-anchored relative matching, and ** behaving as a single segment in 3.12.
@@ -230,11 +230,11 @@ def test_path_condition_escapes_single_quotes() -> None:
 
 Run: `.venv/bin/python -m pytest tests/test_path_filter.py -q`
 
-Expected: collection error — `ModuleNotFoundError: No module named 'incode_mcp.path_filter'`.
+Expected: collection error — `ModuleNotFoundError: No module named 'code_indexing_mcp.path_filter'`.
 
 - [ ] **Step 3: Write the implementation**
 
-Create `src/incode_mcp/path_filter.py`:
+Create `src/code_indexing_mcp/path_filter.py`:
 
 ```python
 """Translate search path globs into a LanceDB pushdown predicate.
@@ -330,7 +330,7 @@ Expected: `32 passed` (26 parametrized equivalence cases plus 6 unit tests).
 
 ```bash
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy src tests
-git add src/incode_mcp/path_filter.py tests/test_path_filter.py
+git add src/code_indexing_mcp/path_filter.py tests/test_path_filter.py
 git commit -m "feat: add glob-to-regex translation for path pushdown"
 ```
 
@@ -339,7 +339,7 @@ git commit -m "feat: add glob-to-regex translation for path pushdown"
 ### Task 2: Push the predicate into the search
 
 **Files:**
-- Modify: `src/incode_mcp/search.py:27-70`
+- Modify: `src/code_indexing_mcp/search.py:27-70`
 - Test: `tests/test_search.py`
 
 **Interfaces:**
@@ -452,7 +452,7 @@ Expected: `test_path_filter_finds_matches_below_the_fetch_window` FAILS with
 
 - [ ] **Step 3: Add the pushdown**
 
-In `src/incode_mcp/search.py`, add the imports:
+In `src/code_indexing_mcp/search.py`, add the imports:
 
 ```python
 import logging
@@ -522,9 +522,9 @@ Run:
 .venv/bin/python - <<'PY'
 import os, random, tempfile
 from pathlib import Path
-os.environ["INCODE_OFFLINE"] = "1"
-os.environ["INCODE_INDEX_EXECUTION"] = "in-process"
-from incode_mcp.application import Application, RuntimePaths
+os.environ["CODE_INDEXING_OFFLINE"] = "1"
+os.environ["CODE_INDEXING_INDEX_EXECUTION"] = "in-process"
+from code_indexing_mcp.application import Application, RuntimePaths
 
 random.seed(1)
 class F:
@@ -578,7 +578,7 @@ window instead of returning an empty result.
 
 ```bash
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy src tests
-git add src/incode_mcp/search.py tests/test_search.py README.md
+git add src/code_indexing_mcp/search.py tests/test_search.py README.md
 git commit -m "fix: push search path patterns into the scan so filtered hits are not lost"
 ```
 

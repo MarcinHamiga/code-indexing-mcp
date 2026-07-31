@@ -3,13 +3,13 @@ from pathlib import Path
 import pytest
 import tomli_w
 
-from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.models import (
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.models import (
     DEFAULT_INCLUDES,
     LEGACY_DEFAULT_INCLUDES_V1,
     LEGACY_DEFAULT_INCLUDES_V2,
 )
-from incode_mcp.projects import (
+from code_indexing_mcp.projects import (
     ProjectResolver,
     find_project_root,
     initialize_project,
@@ -36,7 +36,7 @@ def test_legacy_marker_remains_readable(tmp_path: Path) -> None:
     root.mkdir()
     project = initialize_project(root)
     current_directory = root / ".ci-mcp"
-    legacy_directory = root / ".incode"
+    legacy_directory = root / ".code-indexing-mcp"
     if current_directory.exists():
         current_directory.rename(legacy_directory)
 
@@ -66,7 +66,7 @@ def test_any_legacy_default_marker_gains_the_current_languages_without_rewriting
 ) -> None:
     root = tmp_path / "demo"
     root.mkdir()
-    marker = root / ".incode" / "project.toml"
+    marker = root / ".code-indexing-mcp" / "project.toml"
     marker.parent.mkdir()
     contents = tomli_w.dumps(
         {
@@ -91,7 +91,7 @@ def test_any_legacy_default_marker_gains_the_current_languages_without_rewriting
 def test_custom_marker_includes_are_preserved(tmp_path: Path) -> None:
     root = tmp_path / "demo"
     root.mkdir()
-    marker = root / ".incode" / "project.toml"
+    marker = root / ".code-indexing-mcp" / "project.toml"
     marker.parent.mkdir()
     marker.write_text(
         tomli_w.dumps(
@@ -140,7 +140,7 @@ def test_resolver_rejects_ambiguous_roots(tmp_path: Path) -> None:
     projects = [initialize_project(root) for root in roots]
     resolver = ProjectResolver(projects)
 
-    with pytest.raises(IncodeError) as raised:
+    with pytest.raises(CodeIndexingError) as raised:
         resolver.resolve(roots=roots, cwd=tmp_path)
 
     assert raised.value.code is ErrorCode.AMBIGUOUS_PROJECT

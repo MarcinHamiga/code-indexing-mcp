@@ -1,11 +1,11 @@
-"""Validation for the skills bundled under src/incode_mcp/skills/."""
+"""Validation for the skills bundled under src/code_indexing_mcp/skills/."""
 
 import re
 from pathlib import Path
 
 import pytest
 
-SKILLS_DIR = Path(__file__).resolve().parent.parent / "src" / "incode_mcp" / "skills"
+SKILLS_DIR = Path(__file__).resolve().parent.parent / "src" / "code_indexing_mcp" / "skills"
 EXPECTED_SKILLS = {
     "codebase-exploration",
     "feature-dev",
@@ -42,5 +42,5 @@ def test_skill_has_valid_frontmatter(skill_dir: Path) -> None:
 @pytest.mark.parametrize("skill_dir", _skill_dirs_param(), ids=lambda p: p.name)
 def test_skill_references_only_code_indexing_mcp_tools(skill_dir: Path) -> None:
     text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
-    assert "mcp__incode__" not in text
+    assert "mcp__code-indexing-mcp__" not in text
     assert "mcp__code-indexing-mcp__" in text

@@ -28,7 +28,7 @@ onnx = pytest.importorskip("onnx", reason="the mlx extra's environment is requir
 
 from onnx import helper, numpy_helper  # noqa: E402
 
-from incode_mcp.mlx_backend import (  # noqa: E402
+from code_indexing_mcp.mlx_backend import (  # noqa: E402
     MASK_FILL,
     JinaBertMlx,
     ModelConfig,

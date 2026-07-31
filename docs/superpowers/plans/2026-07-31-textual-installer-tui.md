@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the linear `install.py` experience with a Textual TUI wizard covering installation, accelerator selection, harness setup, and the full 18-setting `INCODE_*` surface, while keeping the curl-pipe one-liner and a scripted CI path.
+**Goal:** Replace the linear `install.py` experience with a Textual TUI wizard covering installation, accelerator selection, harness setup, and the full 18-setting `CODE_INDEXING_*` surface, while keeping the curl-pipe one-liner and a scripted CI path.
 
-**Architecture:** All install logic moves from `install.py` into a new `src/incode_mcp/installer/` subpackage. `install.py` becomes a stdlib-only bootstrap (clone/update → `uv sync --extra cpu --extra tui` → delegate to `python -m incode_mcp.installer`). The TUI ships in the package and is reachable as `code-indexing-mcp configure` for offline reconfiguration. Settings persist into per-harness MCP config env blocks (`env`, or `environment` for OpenCode/KiloCode).
+**Architecture:** All install logic moves from `install.py` into a new `src/code_indexing_mcp/installer/` subpackage. `install.py` becomes a stdlib-only bootstrap (clone/update → `uv sync --extra cpu --extra tui` → delegate to `python -m code_indexing_mcp.installer`). The TUI ships in the package and is reachable as `code-indexing-mcp configure` for offline reconfiguration. Settings persist into per-harness MCP config env blocks (`env`, or `environment` for OpenCode/KiloCode).
 
 **Tech Stack:** Python 3.12/3.13, Textual `>=8.2,<9` (lazily imported), uv-locked environment, pytest + pytest-asyncio (strict marker mode), ruff, mypy strict.
 
@@ -12,11 +12,11 @@
 
 ## Global Constraints
 
-- Python `>=3.12,<3.14`; ruff line-length 100; ruff lint `E,F,I,UP,B,SIM,RUF`; mypy `strict = true` with `packages = ["incode_mcp"]` — the new package is fully type-checked.
-- `install.py` must stay stdlib-only and self-contained: `install.sh` downloads it into a temp directory and runs it before any virtual environment exists. It must never import `incode_mcp` or Textual.
-- Textual is imported lazily (inside functions), never at module import time on the `serve` path. `python -c "import incode_mcp.cli"` must not import Textual.
+- Python `>=3.12,<3.14`; ruff line-length 100; ruff lint `E,F,I,UP,B,SIM,RUF`; mypy `strict = true` with `packages = ["code_indexing_mcp"]` — the new package is fully type-checked.
+- `install.py` must stay stdlib-only and self-contained: `install.sh` downloads it into a temp directory and runs it before any virtual environment exists. It must never import `code_indexing_mcp` or Textual.
+- Textual is imported lazily (inside functions), never at module import time on the `serve` path. `python -c "import code_indexing_mcp.cli"` must not import Textual.
 - The `tui` extra is NOT added to the `[tool.uv]` conflicts list; it must combine with `cpu`.
-- Only non-default settings are written to harness env blocks. The wizard's accelerator selection is never written as `INCODE_EMBED_ACCELERATOR`.
+- Only non-default settings are written to harness env blocks. The wizard's accelerator selection is never written as `CODE_INDEXING_EMBED_ACCELERATOR`.
 - Per-harness env keys: `env` for codex (TOML table), claude-code, kimi-code, claude-desktop; `environment` for opencode and kilocode.
 - Accelerator failures always degrade to CPU with the reason attached — never fail the install.
 - No network, no real `uv sync`, no real probe in tests. Async TUI tests use `@pytest.mark.asyncio` (pytest-asyncio runs in strict mode).
@@ -25,24 +25,24 @@
 
 ---
 
-### Task 1: Move install logic into the `incode_mcp.installer` package
+### Task 1: Move install logic into the `code_indexing_mcp.installer` package
 
 Mechanical, behavior-preserving move. `install.py` is left completely untouched in this task (its copies die in Task 13); the test suite is re-pointed at the package so a green run proves the move is lossless.
 
 **Files:**
-- Create: `src/incode_mcp/installer/__init__.py`
-- Create: `src/incode_mcp/installer/config_files.py`
-- Create: `src/incode_mcp/installer/accelerator.py`
-- Create: `src/incode_mcp/installer/harnesses.py`
+- Create: `src/code_indexing_mcp/installer/__init__.py`
+- Create: `src/code_indexing_mcp/installer/config_files.py`
+- Create: `src/code_indexing_mcp/installer/accelerator.py`
+- Create: `src/code_indexing_mcp/installer/harnesses.py`
 - Modify: `tests/test_installer.py` (imports + monkeypatch targets only)
 
 **Interfaces:**
 - Consumes: nothing (first task).
-- Produces: `incode_mcp.installer.config_files` (`InstallerError`, `SERVER_NAME`, `merge_json_object_entry`, `merge_codex_server`, `_jsonc_as_json`), `incode_mcp.installer.accelerator` (`AcceleratorPlan`, `ACCELERATOR_EXTRAS`, `ACCELERATOR_ENVIRONMENT_DIRECTORY`, `ACCELERATOR_CHOICES`, `plan_accelerator`, `configure_accelerator`, `sync_accelerator_environment`, `probe_accelerator`, `write_accelerator_record`, `clear_accelerator_record`, `reusable_accelerator_environment`, `accelerator_lock_fingerprint`, `accelerator_record_path`, `runtime_record_path`, `interpreter_version`, `server_executable`, `environment_python`, `_run_command`, `_nvidia_smi_report`, `_rocm_report`), `incode_mcp.installer.harnesses` (`HarnessChoice`, `HARNESS_CHOICES`, `parse_harness_selection`, `configuration_path`, `configure_harness`, `configure_selected_harnesses`, `skill_directory`, `install_skills`, `harness_label`).
+- Produces: `code_indexing_mcp.installer.config_files` (`InstallerError`, `SERVER_NAME`, `merge_json_object_entry`, `merge_codex_server`, `_jsonc_as_json`), `code_indexing_mcp.installer.accelerator` (`AcceleratorPlan`, `ACCELERATOR_EXTRAS`, `ACCELERATOR_ENVIRONMENT_DIRECTORY`, `ACCELERATOR_CHOICES`, `plan_accelerator`, `configure_accelerator`, `sync_accelerator_environment`, `probe_accelerator`, `write_accelerator_record`, `clear_accelerator_record`, `reusable_accelerator_environment`, `accelerator_lock_fingerprint`, `accelerator_record_path`, `runtime_record_path`, `interpreter_version`, `server_executable`, `environment_python`, `_run_command`, `_nvidia_smi_report`, `_rocm_report`), `code_indexing_mcp.installer.harnesses` (`HarnessChoice`, `HARNESS_CHOICES`, `parse_harness_selection`, `configuration_path`, `configure_harness`, `configure_selected_harnesses`, `skill_directory`, `install_skills`, `harness_label`).
 
 - [ ] **Step 1: Create the package skeleton**
 
-`src/incode_mcp/installer/__init__.py`:
+`src/code_indexing_mcp/installer/__init__.py`:
 
 ```python
 """Install-time logic for Code Indexing MCP: configuration, accelerators, harnesses.
@@ -99,8 +99,8 @@ from types import ModuleType
 
 import pytest
 
-from incode_mcp.installer import accelerator, config_files, harnesses
-from incode_mcp.installer.accelerator import (
+from code_indexing_mcp.installer import accelerator, config_files, harnesses
+from code_indexing_mcp.installer.accelerator import (
     ACCELERATOR_ENVIRONMENT_DIRECTORY,
     ACCELERATOR_EXTRAS,
     AcceleratorPlan,
@@ -111,12 +111,12 @@ from incode_mcp.installer.accelerator import (
     sync_accelerator_environment,
     write_accelerator_record,
 )
-from incode_mcp.installer.config_files import (
+from code_indexing_mcp.installer.config_files import (
     InstallerError,
     merge_codex_server,
     merge_json_object_entry,
 )
-from incode_mcp.installer.harnesses import (
+from code_indexing_mcp.installer.harnesses import (
     HARNESS_CHOICES,
     configuration_path,
     configure_harness,
@@ -165,17 +165,17 @@ Transformation rules for all other tests:
 
 ```bash
 uv run pytest tests/test_installer.py -q
-uv run ruff check src/incode_mcp/installer tests/test_installer.py
+uv run ruff check src/code_indexing_mcp/installer tests/test_installer.py
 uv run mypy
 ```
 
-Expected: all tests pass as before. Ruff may flag import order — run `uv run ruff check --fix` for `I` rules. **mypy may report new errors: the moved code was never type-checked as part of `incode_mcp` before.** Fix any fallout minimally (typical: `Callable[[], str | None]` defaults, `subprocess` env typing). Do not weaken `strict`.
+Expected: all tests pass as before. Ruff may flag import order — run `uv run ruff check --fix` for `I` rules. **mypy may report new errors: the moved code was never type-checked as part of `code_indexing_mcp` before.** Fix any fallout minimally (typical: `Callable[[], str | None]` defaults, `subprocess` env typing). Do not weaken `strict`.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/incode_mcp/installer tests/test_installer.py
-git commit -m "refactor: move install logic into the incode_mcp.installer package"
+git add src/code_indexing_mcp/installer tests/test_installer.py
+git commit -m "refactor: move install logic into the code_indexing_mcp.installer package"
 ```
 
 ---
@@ -185,7 +185,7 @@ git commit -m "refactor: move install logic into the incode_mcp.installer packag
 The single source of truth for the 18 manageable settings: drives TUI form generation, `--set` validation, and summary display.
 
 **Files:**
-- Create: `src/incode_mcp/installer/settings_spec.py`
+- Create: `src/code_indexing_mcp/installer/settings_spec.py`
 - Test: `tests/test_installer_settings_spec.py`
 
 **Interfaces:**
@@ -201,7 +201,7 @@ The single source of truth for the 18 manageable settings: drives TUI form gener
 
 import pytest
 
-from incode_mcp.installer.settings_spec import (
+from code_indexing_mcp.installer.settings_spec import (
     BY_NAME,
     SETTINGS,
     default_value,
@@ -212,24 +212,24 @@ from incode_mcp.installer.settings_spec import (
 
 def test_catalog_covers_exactly_the_documented_settings() -> None:
     assert {setting.name for setting in SETTINGS} == {
-        "INCODE_INDEX_MODE",
-        "INCODE_INDEX_WAIT_SECONDS",
-        "INCODE_EMBED_MEMORY_MB",
-        "INCODE_VECTOR_INDEX",
-        "INCODE_INDEX_EXECUTION",
-        "INCODE_BROKER",
-        "INCODE_DATA_DIR",
-        "INCODE_CACHE_DIR",
-        "INCODE_OFFLINE",
-        "INCODE_EMBED_BATCH_SIZE",
-        "INCODE_EMBED_MAX_TOKENS",
-        "INCODE_EMBED_OVERLAP_TOKENS",
-        "INCODE_EMBED_THREADS",
-        "INCODE_EMBED_CPU_ARENA",
-        "INCODE_EMBED_CROSSOVER",
-        "INCODE_EMBED_CALIBRATE",
-        "INCODE_EMBED_STRICT",
-        "INCODE_EMBED_ACCELERATOR",
+        "CODE_INDEXING_INDEX_MODE",
+        "CODE_INDEXING_INDEX_WAIT_SECONDS",
+        "CODE_INDEXING_EMBED_MEMORY_MB",
+        "CODE_INDEXING_VECTOR_INDEX",
+        "CODE_INDEXING_INDEX_EXECUTION",
+        "CODE_INDEXING_BROKER",
+        "CODE_INDEXING_DATA_DIR",
+        "CODE_INDEXING_CACHE_DIR",
+        "CODE_INDEXING_OFFLINE",
+        "CODE_INDEXING_EMBED_BATCH_SIZE",
+        "CODE_INDEXING_EMBED_MAX_TOKENS",
+        "CODE_INDEXING_EMBED_OVERLAP_TOKENS",
+        "CODE_INDEXING_EMBED_THREADS",
+        "CODE_INDEXING_EMBED_CPU_ARENA",
+        "CODE_INDEXING_EMBED_CROSSOVER",
+        "CODE_INDEXING_EMBED_CALIBRATE",
+        "CODE_INDEXING_EMBED_STRICT",
+        "CODE_INDEXING_EMBED_ACCELERATOR",
     }
 
 
@@ -242,31 +242,31 @@ def test_every_setting_has_display_metadata_and_a_group() -> None:
 @pytest.mark.parametrize(
     ("name", "raw", "ok"),
     [
-        ("INCODE_INDEX_MODE", "eager", True),
-        ("INCODE_INDEX_MODE", "sometimes", False),
-        ("INCODE_INDEX_WAIT_SECONDS", "300", True),
-        ("INCODE_INDEX_WAIT_SECONDS", "86401", False),
-        ("INCODE_INDEX_WAIT_SECONDS", "-1", False),
-        ("INCODE_EMBED_MEMORY_MB", "2048", True),
-        ("INCODE_EMBED_MEMORY_MB", "512", False),
-        ("INCODE_EMBED_BATCH_SIZE", "auto", True),
-        ("INCODE_EMBED_BATCH_SIZE", "256", True),
-        ("INCODE_EMBED_BATCH_SIZE", "0", False),
-        ("INCODE_EMBED_CROSSOVER", "off", True),
-        ("INCODE_EMBED_CROSSOVER", "auto", True),
-        ("INCODE_EMBED_CROSSOVER", "100000", True),
-        ("INCODE_EMBED_CROSSOVER", "banana", False),
-        ("INCODE_EMBED_MAX_TOKENS", "8192", True),
-        ("INCODE_EMBED_MAX_TOKENS", "63", False),
-        ("INCODE_EMBED_OVERLAP_TOKENS", "0", True),
-        ("INCODE_EMBED_THREADS", "64", True),
-        ("INCODE_EMBED_THREADS", "65", False),
-        ("INCODE_OFFLINE", "yes", True),
-        ("INCODE_OFFLINE", "maybe", False),
-        ("INCODE_DATA_DIR", "/tmp/data", True),
-        ("INCODE_DATA_DIR", "", False),
-        ("INCODE_EMBED_ACCELERATOR", "coreml", True),
-        ("INCODE_EMBED_ACCELERATOR", "tpu", False),
+        ("CODE_INDEXING_INDEX_MODE", "eager", True),
+        ("CODE_INDEXING_INDEX_MODE", "sometimes", False),
+        ("CODE_INDEXING_INDEX_WAIT_SECONDS", "300", True),
+        ("CODE_INDEXING_INDEX_WAIT_SECONDS", "86401", False),
+        ("CODE_INDEXING_INDEX_WAIT_SECONDS", "-1", False),
+        ("CODE_INDEXING_EMBED_MEMORY_MB", "2048", True),
+        ("CODE_INDEXING_EMBED_MEMORY_MB", "512", False),
+        ("CODE_INDEXING_EMBED_BATCH_SIZE", "auto", True),
+        ("CODE_INDEXING_EMBED_BATCH_SIZE", "256", True),
+        ("CODE_INDEXING_EMBED_BATCH_SIZE", "0", False),
+        ("CODE_INDEXING_EMBED_CROSSOVER", "off", True),
+        ("CODE_INDEXING_EMBED_CROSSOVER", "auto", True),
+        ("CODE_INDEXING_EMBED_CROSSOVER", "100000", True),
+        ("CODE_INDEXING_EMBED_CROSSOVER", "banana", False),
+        ("CODE_INDEXING_EMBED_MAX_TOKENS", "8192", True),
+        ("CODE_INDEXING_EMBED_MAX_TOKENS", "63", False),
+        ("CODE_INDEXING_EMBED_OVERLAP_TOKENS", "0", True),
+        ("CODE_INDEXING_EMBED_THREADS", "64", True),
+        ("CODE_INDEXING_EMBED_THREADS", "65", False),
+        ("CODE_INDEXING_OFFLINE", "yes", True),
+        ("CODE_INDEXING_OFFLINE", "maybe", False),
+        ("CODE_INDEXING_DATA_DIR", "/tmp/data", True),
+        ("CODE_INDEXING_DATA_DIR", "", False),
+        ("CODE_INDEXING_EMBED_ACCELERATOR", "coreml", True),
+        ("CODE_INDEXING_EMBED_ACCELERATOR", "tpu", False),
     ],
 )
 def test_validate(name: str, raw: str, ok: bool) -> None:
@@ -274,18 +274,18 @@ def test_validate(name: str, raw: str, ok: bool) -> None:
 
 
 def test_validate_unknown_names_are_rejected_by_lookup() -> None:
-    assert "INCODE_FROBNICATE" not in BY_NAME
+    assert "CODE_INDEXING_FROBNICATE" not in BY_NAME
 
 
 @pytest.mark.parametrize(
     ("name", "raw", "stored"),
     [
-        ("INCODE_OFFLINE", "YES", "1"),
-        ("INCODE_OFFLINE", "off", "0"),
-        ("INCODE_INDEX_MODE", "EAGER", "eager"),
-        ("INCODE_EMBED_BATCH_SIZE", "AUTO", "auto"),
-        ("INCODE_EMBED_BATCH_SIZE", "8", "8"),
-        ("INCODE_DATA_DIR", "/data", "/data"),
+        ("CODE_INDEXING_OFFLINE", "YES", "1"),
+        ("CODE_INDEXING_OFFLINE", "off", "0"),
+        ("CODE_INDEXING_INDEX_MODE", "EAGER", "eager"),
+        ("CODE_INDEXING_EMBED_BATCH_SIZE", "AUTO", "auto"),
+        ("CODE_INDEXING_EMBED_BATCH_SIZE", "8", "8"),
+        ("CODE_INDEXING_DATA_DIR", "/data", "/data"),
     ],
 )
 def test_normalize(name: str, raw: str, stored: str) -> None:
@@ -293,9 +293,9 @@ def test_normalize(name: str, raw: str, stored: str) -> None:
 
 
 def test_dynamic_defaults_resolve_to_valid_values() -> None:
-    assert validate(BY_NAME["INCODE_EMBED_MEMORY_MB"], default_value(BY_NAME["INCODE_EMBED_MEMORY_MB"])) is None
-    assert validate(BY_NAME["INCODE_EMBED_THREADS"], default_value(BY_NAME["INCODE_EMBED_THREADS"])) is None
-    assert default_value(BY_NAME["INCODE_DATA_DIR"]).endswith("incode")
+    assert validate(BY_NAME["CODE_INDEXING_EMBED_MEMORY_MB"], default_value(BY_NAME["CODE_INDEXING_EMBED_MEMORY_MB"])) is None
+    assert validate(BY_NAME["CODE_INDEXING_EMBED_THREADS"], default_value(BY_NAME["CODE_INDEXING_EMBED_THREADS"])) is None
+    assert default_value(BY_NAME["CODE_INDEXING_DATA_DIR"]).endswith("code-indexing-mcp")
 ```
 
 Run: `uv run pytest tests/test_installer_settings_spec.py -q` — expect FAIL (`ModuleNotFoundError`).
@@ -306,7 +306,7 @@ Run: `uv run pytest tests/test_installer_settings_spec.py -q` — expect FAIL (`
 """Declarative catalog of the runtime settings the installer can manage.
 
 One source drives the Textual wizard's forms, ``--set`` validation, and the
-summary screen. Validation mirrors ``incode_mcp.settings`` exactly; the server
+summary screen. Validation mirrors ``code_indexing_mcp.settings`` exactly; the server
 keeps reading only real environment variables.
 """
 
@@ -351,92 +351,92 @@ def _default_threads() -> str:
 
 SETTINGS: tuple[Setting, ...] = (
     Setting(
-        "INCODE_INDEX_MODE", "Indexing", "Index mode",
+        "CODE_INDEXING_INDEX_MODE", "Indexing", "Index mode",
         "When projects get indexed: lazy on first use, eager at startup, manual only.",
         "choice", "lazy", choices=("lazy", "eager", "manual"),
     ),
     Setting(
-        "INCODE_INDEX_WAIT_SECONDS", "Indexing", "Index wait (seconds)",
+        "CODE_INDEXING_INDEX_WAIT_SECONDS", "Indexing", "Index wait (seconds)",
         "How long a startup index waits out a competing job before failing; 0 disables waiting.",
         "int", "300", minimum=0, maximum=24 * 60 * 60,
     ),
     Setting(
-        "INCODE_EMBED_MEMORY_MB", "Indexing", "Indexing memory (MB)",
+        "CODE_INDEXING_EMBED_MEMORY_MB", "Indexing", "Indexing memory (MB)",
         "Ceiling for the indexing worker. The default is 25% of RAM clamped to 1024-2048.",
         "int", "", minimum=1024, maximum=1024 * 1024, dynamic_default=_default_memory_mb,
     ),
     Setting(
-        "INCODE_VECTOR_INDEX", "Indexing", "Vector index",
+        "CODE_INDEXING_VECTOR_INDEX", "Indexing", "Vector index",
         "exact search, or approximate HNSW indexing.",
         "choice", "exact", choices=("exact", "hnsw"),
     ),
     Setting(
-        "INCODE_INDEX_EXECUTION", "Indexing", "Index execution",
+        "CODE_INDEXING_INDEX_EXECUTION", "Indexing", "Index execution",
         "worker enforces the memory ceiling; in-process is a diagnostic rollback.",
         "choice", "worker", choices=("worker", "in-process"),
     ),
     Setting(
-        "INCODE_BROKER", "Indexing", "Broker",
+        "CODE_INDEXING_BROKER", "Indexing", "Broker",
         "Share one indexing process between clients through the daemon.",
         "choice", "auto", choices=("auto", "on", "off"),
     ),
     Setting(
-        "INCODE_DATA_DIR", "Indexing", "Data directory",
+        "CODE_INDEXING_DATA_DIR", "Indexing", "Data directory",
         "Where the indexes live.",
-        "path", "", dynamic_default=lambda: str(user_data_path("incode")),
+        "path", "", dynamic_default=lambda: str(user_data_path("code-indexing-mcp")),
     ),
     Setting(
-        "INCODE_CACHE_DIR", "Indexing", "Cache directory",
+        "CODE_INDEXING_CACHE_DIR", "Indexing", "Cache directory",
         "Where the embedding model is cached.",
-        "path", "", dynamic_default=lambda: str(user_cache_path("incode")),
+        "path", "", dynamic_default=lambda: str(user_cache_path("code-indexing-mcp")),
     ),
     Setting(
-        "INCODE_OFFLINE", "Indexing", "Offline mode",
+        "CODE_INDEXING_OFFLINE", "Indexing", "Offline mode",
         "Never download the model; fail if it is missing.",
         "bool", "0",
     ),
     Setting(
-        "INCODE_EMBED_BATCH_SIZE", "Embedding", "Batch size",
+        "CODE_INDEXING_EMBED_BATCH_SIZE", "Embedding", "Batch size",
         "Embedding microbatch size; auto resolves to 1 unless calibration raised it.",
         "auto_int", "auto", minimum=1, maximum=256,
     ),
     Setting(
-        "INCODE_EMBED_MAX_TOKENS", "Embedding", "Max tokens",
+        "CODE_INDEXING_EMBED_MAX_TOKENS", "Embedding", "Max tokens",
         "Sequence window per chunk; attention memory is quadratic in tokens.",
         "int", "1024", minimum=64, maximum=8192,
     ),
     Setting(
-        "INCODE_EMBED_OVERLAP_TOKENS", "Embedding", "Overlap tokens",
+        "CODE_INDEXING_EMBED_OVERLAP_TOKENS", "Embedding", "Overlap tokens",
         "Overlap between consecutive windows of a long chunk.",
         "int", "64", minimum=0, maximum=4096,
     ),
     Setting(
-        "INCODE_EMBED_THREADS", "Embedding", "Threads",
+        "CODE_INDEXING_EMBED_THREADS", "Embedding", "Threads",
         "CPU inference threads.",
         "int", "", minimum=1, maximum=64, dynamic_default=_default_threads,
     ),
     Setting(
-        "INCODE_EMBED_CPU_ARENA", "Embedding", "CPU arena",
+        "CODE_INDEXING_EMBED_CPU_ARENA", "Embedding", "CPU arena",
         "Preallocate the CPU inference arena.",
         "bool", "0",
     ),
     Setting(
-        "INCODE_EMBED_CROSSOVER", "Embedding", "Accelerator crossover",
+        "CODE_INDEXING_EMBED_CROSSOVER", "Embedding", "Accelerator crossover",
         "Run size in characters above which starting the accelerator repays its model load.",
         "auto_off_int", "auto", minimum=0, maximum=1024**3,
     ),
     Setting(
-        "INCODE_EMBED_CALIBRATE", "Embedding", "Calibrate",
+        "CODE_INDEXING_EMBED_CALIBRATE", "Embedding", "Calibrate",
         "Measure the backend once to set the batch size and crossover.",
         "bool", "1",
     ),
     Setting(
-        "INCODE_EMBED_STRICT", "Embedding", "Strict accelerator",
+        "CODE_INDEXING_EMBED_STRICT", "Embedding", "Strict accelerator",
         "Refuse the CPU fallback when the requested backend is unavailable.",
         "bool", "0",
     ),
     Setting(
-        "INCODE_EMBED_ACCELERATOR", "Embedding", "Backend override",
+        "CODE_INDEXING_EMBED_ACCELERATOR", "Embedding", "Backend override",
         "Expert override; auto uses the backend the installer prepared.",
         "choice", "auto",
         choices=("auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml"),
@@ -497,9 +497,9 @@ def normalize(setting: Setting, raw: str) -> str:
 
 ```bash
 uv run pytest tests/test_installer_settings_spec.py -q
-uv run ruff check src/incode_mcp/installer/settings_spec.py tests/test_installer_settings_spec.py
+uv run ruff check src/code_indexing_mcp/installer/settings_spec.py tests/test_installer_settings_spec.py
 uv run mypy
-git add src/incode_mcp/installer/settings_spec.py tests/test_installer_settings_spec.py
+git add src/code_indexing_mcp/installer/settings_spec.py tests/test_installer_settings_spec.py
 git commit -m "feat: add the installer's declarative settings catalog"
 ```
 
@@ -510,9 +510,9 @@ git commit -m "feat: add the installer's declarative settings catalog"
 Read the current server entry out of any harness config, merge managed env updates (preserving unrelated keys), and extend `configure_harness` / `merge_codex_server` to write env blocks. `env=None` must reproduce today's exact behavior so Task 1's suite stays green.
 
 **Files:**
-- Create: `src/incode_mcp/installer/env_blocks.py`
-- Modify: `src/incode_mcp/installer/harnesses.py` (`configure_harness`, `configure_selected_harnesses`, new `read_server_entry`)
-- Modify: `src/incode_mcp/installer/config_files.py` (`_codex_server_block`, `merge_codex_server` gain `env`)
+- Create: `src/code_indexing_mcp/installer/env_blocks.py`
+- Modify: `src/code_indexing_mcp/installer/harnesses.py` (`configure_harness`, `configure_selected_harnesses`, new `read_server_entry`)
+- Modify: `src/code_indexing_mcp/installer/config_files.py` (`_codex_server_block`, `merge_codex_server` gain `env`)
 - Test: `tests/test_installer_env_blocks.py`
 
 **Interfaces:**
@@ -530,8 +530,8 @@ import json
 import tomllib
 from pathlib import Path
 
-from incode_mcp.installer.env_blocks import entry_from_text, env_from_entry, merge_env
-from incode_mcp.installer.harnesses import configure_harness, read_server_entry
+from code_indexing_mcp.installer.env_blocks import entry_from_text, env_from_entry, merge_env
+from code_indexing_mcp.installer.harnesses import configure_harness, read_server_entry
 
 SERVER_COMMAND = str(Path("/opt/ci-mcp"))
 
@@ -543,11 +543,11 @@ def test_entry_from_text_reads_jsonc_with_comments() -> None:
 
 
 def test_entry_from_text_reads_codex_toml() -> None:
-    text = '[mcp_servers.code-indexing-mcp]\ncommand = "/old"\nargs = ["serve"]\nenv = { INCODE_OFFLINE = "1" }\n'
+    text = '[mcp_servers.code-indexing-mcp]\ncommand = "/old"\nargs = ["serve"]\nenv = { CODE_INDEXING_OFFLINE = "1" }\n'
     assert entry_from_text("codex", text) == {
         "command": "/old",
         "args": ["serve"],
-        "env": {"INCODE_OFFLINE": "1"},
+        "env": {"CODE_INDEXING_OFFLINE": "1"},
     }
 
 
@@ -564,35 +564,35 @@ def test_env_from_entry_uses_the_per_harness_key() -> None:
 
 
 def test_merge_env_applies_updates_deletions_and_preserves_unknown_keys() -> None:
-    merged = merge_env({"KEEP": "x", "INCODE_OFFLINE": "1", "INCODE_BROKER": "off"}, {
-        "INCODE_OFFLINE": "0",
-        "INCODE_BROKER": None,
+    merged = merge_env({"KEEP": "x", "CODE_INDEXING_OFFLINE": "1", "CODE_INDEXING_BROKER": "off"}, {
+        "CODE_INDEXING_OFFLINE": "0",
+        "CODE_INDEXING_BROKER": None,
     })
-    assert merged == {"KEEP": "x", "INCODE_OFFLINE": "0"}
+    assert merged == {"KEEP": "x", "CODE_INDEXING_OFFLINE": "0"}
 
 
 def test_configure_harness_writes_env_and_preserves_unmanaged_keys(tmp_path: Path) -> None:
     config = tmp_path / "mcp.json"
     config.write_text(json.dumps({
         "mcpServers": {"code-indexing-mcp": {"command": "/old", "args": ["serve"],
-                                             "env": {"KEEP": "x", "INCODE_BROKER": "off"}}}
+                                             "env": {"KEEP": "x", "CODE_INDEXING_BROKER": "off"}}}
     }))
     configure_harness(
         "kimi-code", Path(SERVER_COMMAND),
-        env={"INCODE_BROKER": None, "INCODE_INDEX_MODE": "eager"},
+        env={"CODE_INDEXING_BROKER": None, "CODE_INDEXING_INDEX_MODE": "eager"},
         environment={"KIMI_CODE_HOME": str(tmp_path)},
     )
     entry = json.loads(config.read_text())["mcpServers"]["code-indexing-mcp"]
     assert entry == {
         "command": SERVER_COMMAND,
         "args": ["serve"],
-        "env": {"KEEP": "x", "INCODE_INDEX_MODE": "eager"},
+        "env": {"KEEP": "x", "CODE_INDEXING_INDEX_MODE": "eager"},
     }
 
 
 def test_configure_harness_opencode_uses_environment_key(tmp_path: Path) -> None:
     configure_harness(
-        "opencode", Path(SERVER_COMMAND), env={"INCODE_OFFLINE": "1"},
+        "opencode", Path(SERVER_COMMAND), env={"CODE_INDEXING_OFFLINE": "1"},
         environment={"OPENCODE_CONFIG_DIR": str(tmp_path)},
     )
     entry = json.loads((tmp_path / "opencode.json").read_text())["mcp"]["code-indexing-mcp"]
@@ -600,20 +600,20 @@ def test_configure_harness_opencode_uses_environment_key(tmp_path: Path) -> None
         "type": "local",
         "command": [SERVER_COMMAND, "serve"],
         "enabled": True,
-        "environment": {"INCODE_OFFLINE": "1"},
+        "environment": {"CODE_INDEXING_OFFLINE": "1"},
     }
     assert "env" not in entry
 
 
 def test_configure_harness_codex_writes_toml_env_table(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
-    configure_harness("codex", Path(SERVER_COMMAND), env={"INCODE_OFFLINE": "1"},
+    configure_harness("codex", Path(SERVER_COMMAND), env={"CODE_INDEXING_OFFLINE": "1"},
                       environment={"CODEX_HOME": str(tmp_path)})
     parsed = tomllib.loads(path.read_text())
     assert parsed["mcp_servers"]["code-indexing-mcp"] == {
         "command": SERVER_COMMAND,
         "args": ["serve"],
-        "env": {"INCODE_OFFLINE": "1"},
+        "env": {"CODE_INDEXING_OFFLINE": "1"},
     }
 
 
@@ -623,10 +623,10 @@ def test_configure_harness_codex_update_preserves_unmanaged_env(tmp_path: Path) 
         '[mcp_servers.code-indexing-mcp]\ncommand = "/old"\nargs = ["serve"]\n'
         'env = { KEEP = "x" }\n'
     )
-    configure_harness("codex", Path(SERVER_COMMAND), env={"INCODE_OFFLINE": "1"},
+    configure_harness("codex", Path(SERVER_COMMAND), env={"CODE_INDEXING_OFFLINE": "1"},
                       environment={"CODEX_HOME": str(tmp_path)})
     parsed = tomllib.loads(path.read_text())
-    assert parsed["mcp_servers"]["code-indexing-mcp"]["env"] == {"KEEP": "x", "INCODE_OFFLINE": "1"}
+    assert parsed["mcp_servers"]["code-indexing-mcp"]["env"] == {"KEEP": "x", "CODE_INDEXING_OFFLINE": "1"}
 
 
 def test_configure_harness_without_env_reproduces_the_legacy_entries(tmp_path: Path) -> None:
@@ -741,7 +741,7 @@ def merge_codex_server(path: Path, command: Path, *, env: Mapping[str, str] | No
     """Create or replace only the Code Indexing MCP table in a Codex config."""
 ```
 
-(INCODE_* names are valid TOML bare keys: uppercase letters, digits, underscores only.) Change the one call site inside `merge_codex_server` from `block = _codex_server_block(command)` to `block = _codex_server_block(command, env)`. Keep everything else in the function byte-identical, including the comment-preserving replacement logic.
+(CODE_INDEXING_* names are valid TOML bare keys: uppercase letters, digits, underscores only.) Change the one call site inside `merge_codex_server` from `block = _codex_server_block(command)` to `block = _codex_server_block(command, env)`. Keep everything else in the function byte-identical, including the comment-preserving replacement logic.
 
 - [ ] **Step 4: Extend `harnesses.py`**
 
@@ -838,9 +838,9 @@ Extend `configure_selected_harnesses` with `env: Mapping[str, str | None] | None
 
 ```bash
 uv run pytest tests/test_installer_env_blocks.py tests/test_installer.py -q
-uv run ruff check src/incode_mcp/installer tests/test_installer_env_blocks.py
+uv run ruff check src/code_indexing_mcp/installer tests/test_installer_env_blocks.py
 uv run mypy
-git add src/incode_mcp/installer/env_blocks.py src/incode_mcp/installer/harnesses.py src/incode_mcp/installer/config_files.py tests/test_installer_env_blocks.py
+git add src/code_indexing_mcp/installer/env_blocks.py src/code_indexing_mcp/installer/harnesses.py src/code_indexing_mcp/installer/config_files.py tests/test_installer_env_blocks.py
 git commit -m "feat: write managed settings into harness environment blocks"
 ```
 
@@ -851,7 +851,7 @@ git commit -m "feat: write managed settings into harness environment blocks"
 The post-sync pipeline as event-emitting steps, shared by the module CLI and the TUI progress screen.
 
 **Files:**
-- Create: `src/incode_mcp/installer/orchestrator.py`
+- Create: `src/code_indexing_mcp/installer/orchestrator.py`
 - Test: `tests/test_installer_orchestrator.py`
 
 **Interfaces:**
@@ -869,8 +869,8 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.installer import accelerator, harnesses
-from incode_mcp.installer.orchestrator import (
+from code_indexing_mcp.installer import accelerator, harnesses
+from code_indexing_mcp.installer.orchestrator import (
     InstallPlan,
     StepEvent,
     default_install_directory,
@@ -883,7 +883,7 @@ def _plan(**overrides) -> InstallPlan:
         "install_directory": Path("/opt/ci-mcp"),
         "accelerator": "cpu",
         "harness_slugs": ("kimi-code",),
-        "env_updates": {"INCODE_OFFLINE": "1"},
+        "env_updates": {"CODE_INDEXING_OFFLINE": "1"},
     }
     values.update(overrides)
     return InstallPlan(**values)
@@ -915,7 +915,7 @@ def test_run_install_emits_step_events_in_order(monkeypatch, tmp_path: Path) -> 
 
     assert calls == [
         ("accel", "cpu"),
-        ("harnesses", ("kimi-code",), {"INCODE_OFFLINE": "1"}),
+        ("harnesses", ("kimi-code",), {"CODE_INDEXING_OFFLINE": "1"}),
         ("skills", ("kimi-code",)),
     ]
     assert [event.step for event in events] == [
@@ -1095,9 +1095,9 @@ def run_install(
 
 ```bash
 uv run pytest tests/test_installer_orchestrator.py -q
-uv run ruff check src/incode_mcp/installer/orchestrator.py tests/test_installer_orchestrator.py
+uv run ruff check src/code_indexing_mcp/installer/orchestrator.py tests/test_installer_orchestrator.py
 uv run mypy
-git add src/incode_mcp/installer/orchestrator.py tests/test_installer_orchestrator.py
+git add src/code_indexing_mcp/installer/orchestrator.py tests/test_installer_orchestrator.py
 git commit -m "feat: add the event-emitting install pipeline"
 ```
 
@@ -1108,7 +1108,7 @@ git commit -m "feat: add the event-emitting install pipeline"
 Textual-free state for the wizard: mode, prefill from existing harness configs, and conversion to an `InstallPlan`. Fully unit-testable without a terminal.
 
 **Files:**
-- Create: `src/incode_mcp/installer/wizard.py`
+- Create: `src/code_indexing_mcp/installer/wizard.py`
 - Test: `tests/test_installer_wizard.py`
 
 **Interfaces:**
@@ -1138,7 +1138,7 @@ def test_detection_report_mentions_platform_and_devices(monkeypatch) -> None:
     assert any(line == "ROCm: not detected" for line in facts)
 ```
 
-Implement in `src/incode_mcp/installer/accelerator.py`:
+Implement in `src/code_indexing_mcp/installer/accelerator.py`:
 
 ```python
 def prepared_accelerator(install_directory: Path) -> str | None:
@@ -1195,8 +1195,8 @@ def detection_report() -> list[str]:
 import json
 from pathlib import Path
 
-from incode_mcp.installer import accelerator
-from incode_mcp.installer.wizard import WizardState, load_prefill
+from code_indexing_mcp.installer import accelerator
+from code_indexing_mcp.installer.wizard import WizardState, load_prefill
 
 
 def _write_kimi_config(home: Path, env: dict[str, str]) -> None:
@@ -1209,41 +1209,41 @@ def _write_kimi_config(home: Path, env: dict[str, str]) -> None:
 
 
 def test_load_prefill_collects_values_and_configured_harnesses(tmp_path: Path) -> None:
-    _write_kimi_config(tmp_path, {"INCODE_INDEX_MODE": "eager", "UNRELATED": "keep"})
+    _write_kimi_config(tmp_path, {"CODE_INDEXING_INDEX_MODE": "eager", "UNRELATED": "keep"})
     prefill = load_prefill(home=tmp_path)
-    assert prefill.values == {"INCODE_INDEX_MODE": "eager"}
+    assert prefill.values == {"CODE_INDEXING_INDEX_MODE": "eager"}
     assert prefill.configured_slugs == ("kimi-code",)
     assert prefill.disagreements == ()
 
 
 def test_load_prefill_reports_disagreements_in_choice_order(tmp_path: Path) -> None:
-    _write_kimi_config(tmp_path, {"INCODE_INDEX_MODE": "manual"})
+    _write_kimi_config(tmp_path, {"CODE_INDEXING_INDEX_MODE": "manual"})
     codex = tmp_path / ".codex"
     codex.mkdir()
     (codex / "config.toml").write_text(
         '[mcp_servers.code-indexing-mcp]\ncommand = "/opt/ci-mcp"\nargs = ["serve"]\n'
-        'env = { INCODE_INDEX_MODE = "eager" }\n'
+        'env = { CODE_INDEXING_INDEX_MODE = "eager" }\n'
     )
     prefill = load_prefill(home=tmp_path)
     # codex precedes kimi-code in HARNESS_CHOICES, so its value wins.
-    assert prefill.values == {"INCODE_INDEX_MODE": "eager"}
-    assert prefill.disagreements == ("INCODE_INDEX_MODE",)
+    assert prefill.values == {"CODE_INDEXING_INDEX_MODE": "eager"}
+    assert prefill.disagreements == ("CODE_INDEXING_INDEX_MODE",)
     assert prefill.configured_slugs == ("codex", "kimi-code")
 
 
 def test_env_updates_omit_defaults_and_delete_reset_prefills(tmp_path: Path) -> None:
-    _write_kimi_config(tmp_path, {"INCODE_INDEX_MODE": "eager", "INCODE_BROKER": "off"})
+    _write_kimi_config(tmp_path, {"CODE_INDEXING_INDEX_MODE": "eager", "CODE_INDEXING_BROKER": "off"})
     state = WizardState.for_reconfigure(Path("/opt/ci-mcp"), home=tmp_path)
-    state.set_field("INCODE_INDEX_MODE", "lazy")   # back to default -> delete
-    state.set_field("INCODE_BROKER", "on")         # non-default -> write
-    state.set_field("INCODE_EMBED_THREADS", "")    # untouched -> no entry
-    assert state.env_updates() == {"INCODE_INDEX_MODE": None, "INCODE_BROKER": "on"}
+    state.set_field("CODE_INDEXING_INDEX_MODE", "lazy")   # back to default -> delete
+    state.set_field("CODE_INDEXING_BROKER", "on")         # non-default -> write
+    state.set_field("CODE_INDEXING_EMBED_THREADS", "")    # untouched -> no entry
+    assert state.env_updates() == {"CODE_INDEXING_INDEX_MODE": None, "CODE_INDEXING_BROKER": "on"}
 
 
 def test_install_mode_never_deletes(tmp_path: Path) -> None:
     state = WizardState.for_install(Path("/opt/ci-mcp"), "https://example.invalid/repo.git",
                                     home=tmp_path)
-    state.set_field("INCODE_INDEX_MODE", "lazy")
+    state.set_field("CODE_INDEXING_INDEX_MODE", "lazy")
     assert state.env_updates() == {}
 
 
@@ -1252,12 +1252,12 @@ def test_to_plan_carries_everything(tmp_path: Path) -> None:
                                     home=tmp_path)
     state.accelerator = "mlx"
     state.harness_slugs = ["kimi-code"]
-    state.set_field("INCODE_OFFLINE", "1")
+    state.set_field("CODE_INDEXING_OFFLINE", "1")
     plan = state.to_plan()
     assert plan.install_directory == Path("/opt/ci-mcp")
     assert plan.accelerator == "mlx"
     assert plan.harness_slugs == ("kimi-code",)
-    assert plan.env_updates == {"INCODE_OFFLINE": "1"}
+    assert plan.env_updates == {"CODE_INDEXING_OFFLINE": "1"}
 
 
 def test_for_reconfigure_keeps_prepared_backend_by_default(tmp_path: Path, monkeypatch) -> None:
@@ -1411,9 +1411,9 @@ class WizardState:
 
 ```bash
 uv run pytest tests/test_installer_wizard.py -q
-uv run ruff check src/incode_mcp/installer/wizard.py src/incode_mcp/installer/accelerator.py tests/test_installer_wizard.py
+uv run ruff check src/code_indexing_mcp/installer/wizard.py src/code_indexing_mcp/installer/accelerator.py tests/test_installer_wizard.py
 uv run mypy
-git add src/incode_mcp/installer/wizard.py src/incode_mcp/installer/accelerator.py tests/test_installer_wizard.py
+git add src/code_indexing_mcp/installer/wizard.py src/code_indexing_mcp/installer/accelerator.py tests/test_installer_wizard.py
 git commit -m "feat: add wizard state with harness-config prefill"
 ```
 
@@ -1424,8 +1424,8 @@ git commit -m "feat: add wizard state with harness-config prefill"
 The non-interactive entry point the bootstrap delegates to. Also serves `configure --set` scripted reconfiguration via `--reconfigure`.
 
 **Files:**
-- Create: `src/incode_mcp/installer/cli.py`
-- Create: `src/incode_mcp/installer/__main__.py`
+- Create: `src/code_indexing_mcp/installer/cli.py`
+- Create: `src/code_indexing_mcp/installer/__main__.py`
 - Test: `tests/test_installer_cli.py`
 
 **Interfaces:**
@@ -1443,21 +1443,21 @@ from pathlib import Path
 
 import pytest
 
-from incode_mcp.installer import orchestrator
-from incode_mcp.installer.cli import main, parse_settings
-from incode_mcp.installer.config_files import InstallerError
+from code_indexing_mcp.installer import orchestrator
+from code_indexing_mcp.installer.cli import main, parse_settings
+from code_indexing_mcp.installer.config_files import InstallerError
 
 
 def test_parse_settings_validates_and_normalizes() -> None:
     updates = parse_settings(
-        ["INCODE_INDEX_MODE=EAGER", "INCODE_OFFLINE=yes"], ["INCODE_BROKER"]
+        ["CODE_INDEXING_INDEX_MODE=EAGER", "CODE_INDEXING_OFFLINE=yes"], ["CODE_INDEXING_BROKER"]
     )
-    assert updates == {"INCODE_INDEX_MODE": "eager", "INCODE_OFFLINE": "1", "INCODE_BROKER": None}
+    assert updates == {"CODE_INDEXING_INDEX_MODE": "eager", "CODE_INDEXING_OFFLINE": "1", "CODE_INDEXING_BROKER": None}
 
 
 @pytest.mark.parametrize(
     "pair",
-    ["INCODE_FROBNICATE=1", "INCODE_INDEX_MODE=sometimes", "INCODE_OFFLINE"],
+    ["CODE_INDEXING_FROBNICATE=1", "CODE_INDEXING_INDEX_MODE=sometimes", "CODE_INDEXING_OFFLINE"],
 )
 def test_parse_settings_rejects_bad_input(pair: str) -> None:
     with pytest.raises(InstallerError):
@@ -1471,7 +1471,7 @@ def _stub_pipeline(monkeypatch, recorded: list) -> None:
 
     monkeypatch.setattr(orchestrator, "run_install", fake_run_install)
     # cli.py imported run_install by name; patch the name it looks up.
-    import incode_mcp.installer.cli as cli
+    import code_indexing_mcp.installer.cli as cli
 
     monkeypatch.setattr(cli, "run_install", fake_run_install)
 
@@ -1483,14 +1483,14 @@ def test_main_runs_plan_without_prompting(monkeypatch, tmp_path: Path, capsys) -
         "--install-dir", str(tmp_path),
         "--accelerator", "cpu",
         "--harnesses", "kimi-code",
-        "--set", "INCODE_OFFLINE=1",
+        "--set", "CODE_INDEXING_OFFLINE=1",
         "--no-prompt",
     ])
     assert code == 0
     (plan,) = recorded
     assert plan.accelerator == "cpu"
     assert plan.harness_slugs == ("kimi-code",)
-    assert plan.env_updates == {"INCODE_OFFLINE": "1"}
+    assert plan.env_updates == {"CODE_INDEXING_OFFLINE": "1"}
 
 
 def test_main_defaults_to_auto_accelerator_on_install(monkeypatch, tmp_path: Path) -> None:
@@ -1505,8 +1505,8 @@ def test_reconfigure_keeps_backend_and_prefills_harnesses(monkeypatch, tmp_path:
     recorded = []
     _stub_pipeline(monkeypatch, recorded)
     monkeypatch.setattr(
-        "incode_mcp.installer.cli.load_prefill",
-        lambda: __import__("incode_mcp.installer.wizard", fromlist=["Prefill"]).Prefill(
+        "code_indexing_mcp.installer.cli.load_prefill",
+        lambda: __import__("code_indexing_mcp.installer.wizard", fromlist=["Prefill"]).Prefill(
             {}, ("kimi-code",), ()
         ),
     )
@@ -1517,9 +1517,9 @@ def test_reconfigure_keeps_backend_and_prefills_harnesses(monkeypatch, tmp_path:
 
 def test_main_reports_installer_errors(monkeypatch, tmp_path: Path, capsys) -> None:
     _stub_pipeline(monkeypatch, [])
-    code = main(["--install-dir", str(tmp_path), "--set", "INCODE_NOPE=1", "--no-prompt"])
+    code = main(["--install-dir", str(tmp_path), "--set", "CODE_INDEXING_NOPE=1", "--no-prompt"])
     assert code == 1
-    assert "INCODE_NOPE" in capsys.readouterr().err
+    assert "CODE_INDEXING_NOPE" in capsys.readouterr().err
 
 
 def test_main_tui_flag_delegates(monkeypatch, tmp_path: Path) -> None:
@@ -1535,20 +1535,20 @@ def test_main_tui_flag_delegates(monkeypatch, tmp_path: Path) -> None:
     import sys as _sys
     import types
 
-    fake_module = types.ModuleType("incode_mcp.installer.tui.app")
+    fake_module = types.ModuleType("code_indexing_mcp.installer.tui.app")
     fake_module.InstallerApp = FakeApp  # type: ignore[attr-defined]
-    monkeypatch.setitem(_sys.modules, "incode_mcp.installer.tui.app", fake_module)
-    monkeypatch.setitem(_sys.modules, "incode_mcp.installer.tui", types.ModuleType("incode_mcp.installer.tui"))
-    code = main(["--install-dir", str(tmp_path), "--tui", "--set", "INCODE_OFFLINE=1"])
+    monkeypatch.setitem(_sys.modules, "code_indexing_mcp.installer.tui.app", fake_module)
+    monkeypatch.setitem(_sys.modules, "code_indexing_mcp.installer.tui", types.ModuleType("code_indexing_mcp.installer.tui"))
+    code = main(["--install-dir", str(tmp_path), "--tui", "--set", "CODE_INDEXING_OFFLINE=1"])
     assert code == 0
-    assert calls and calls[0].values.get("INCODE_OFFLINE") == "1"
+    assert calls and calls[0].values.get("CODE_INDEXING_OFFLINE") == "1"
 ```
 
 Run: `uv run pytest tests/test_installer_cli.py -q` — expect FAIL.
 
 - [ ] **Step 2: Implement `cli.py` and `__main__.py`**
 
-`src/incode_mcp/installer/cli.py`:
+`src/code_indexing_mcp/installer/cli.py`:
 
 ```python
 """Non-interactive installer entry shared by the bootstrap and ``configure``."""
@@ -1577,7 +1577,7 @@ from .wizard import load_prefill
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="incode_mcp.installer",
+        prog="code_indexing_mcp.installer",
         description="Install, update, or reconfigure Code Indexing MCP.",
     )
     parser.add_argument("--install-dir", default=str(default_install_directory()))
@@ -1590,16 +1590,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--harnesses", help="comma-separated harness numbers/slugs or 'all'")
     parser.add_argument(
         "--set", dest="settings", action="append", default=[], metavar="NAME=VALUE",
-        help="set a managed INCODE_* value; repeatable",
+        help="set a managed CODE_INDEXING_* value; repeatable",
     )
     parser.add_argument(
         "--unset", dest="unsets", action="append", default=[], metavar="NAME",
-        help="remove a managed INCODE_* value from harness configs; repeatable",
+        help="remove a managed CODE_INDEXING_* value from harness configs; repeatable",
     )
     parser.add_argument(
         "--offline",
         action="store_true",
-        default=os.environ.get("INCODE_OFFLINE", "").lower() in {"1", "true", "yes"},
+        default=os.environ.get("CODE_INDEXING_OFFLINE", "").lower() in {"1", "true", "yes"},
     )
     parser.add_argument("--tui", action="store_true", help="open the interactive wizard")
     parser.add_argument(
@@ -1745,10 +1745,10 @@ def configure_main(
     return main(argv)
 ```
 
-`src/incode_mcp/installer/__main__.py`:
+`src/code_indexing_mcp/installer/__main__.py`:
 
 ```python
-"""``python -m incode_mcp.installer`` — the bootstrap's delegation target."""
+"""``python -m code_indexing_mcp.installer`` — the bootstrap's delegation target."""
 
 from .cli import main
 
@@ -1760,18 +1760,18 @@ if __name__ == "__main__":
 
 ```bash
 uv run pytest tests/test_installer_cli.py -q
-uv run ruff check src/incode_mcp/installer tests/test_installer_cli.py
+uv run ruff check src/code_indexing_mcp/installer tests/test_installer_cli.py
 uv run mypy
-git add src/incode_mcp/installer/cli.py src/incode_mcp/installer/__main__.py tests/test_installer_cli.py
+git add src/code_indexing_mcp/installer/cli.py src/code_indexing_mcp/installer/__main__.py tests/test_installer_cli.py
 git commit -m "feat: add the installer module CLI with --set/--unset"
 ```
 
 ---
 
-### Task 7: `configure` subcommand in `incode_mcp.cli`
+### Task 7: `configure` subcommand in `code_indexing_mcp.cli`
 
 **Files:**
-- Modify: `src/incode_mcp/cli.py` (parser + dispatch)
+- Modify: `src/code_indexing_mcp/cli.py` (parser + dispatch)
 - Test: `tests/test_cli.py` (extend)
 
 **Interfaces:**
@@ -1790,17 +1790,17 @@ def test_configure_delegates_to_the_installer(monkeypatch, capsys) -> None:
         calls.append(kwargs)
         return 0
 
-    import incode_mcp.installer.cli as installer_cli
+    import code_indexing_mcp.installer.cli as installer_cli
 
     monkeypatch.setattr(installer_cli, "configure_main", fake_configure_main)
-    code = main(["configure", "--install-dir", "/opt/ci-mcp", "--set", "INCODE_OFFLINE=1"])
+    code = main(["configure", "--install-dir", "/opt/ci-mcp", "--set", "CODE_INDEXING_OFFLINE=1"])
     assert code == 0
     assert calls == [
         {
             "install_dir": "/opt/ci-mcp",
             "accelerator": None,
             "harnesses": None,
-            "settings": ["INCODE_OFFLINE=1"],
+            "settings": ["CODE_INDEXING_OFFLINE=1"],
             "unsets": [],
             "no_tui": False,
         }
@@ -1812,14 +1812,14 @@ def test_serve_path_does_not_import_textual() -> None:
     import sys
 
     result = subprocess.run(
-        [sys.executable, "-c", "import incode_mcp.cli, sys; print('textual' in sys.modules)"],
+        [sys.executable, "-c", "import code_indexing_mcp.cli, sys; print('textual' in sys.modules)"],
         capture_output=True,
         text=True,
     )
     assert result.stdout.strip() == "False"
 ```
 
-(Check `tests/test_cli.py`'s existing `main` import and match it — it already imports `from incode_mcp.cli import main` or similar; reuse its convention.)
+(Check `tests/test_cli.py`'s existing `main` import and match it — it already imports `from code_indexing_mcp.cli import main` or similar; reuse its convention.)
 
 Run: `uv run pytest tests/test_cli.py -q -k configure` — expect FAIL.
 
@@ -1841,11 +1841,11 @@ In `_parser()`, after the `daemon` subparser block, add:
     configure.add_argument("--harnesses", help="comma-separated harness slugs or 'all'")
     configure.add_argument(
         "--set", dest="settings", action="append", default=[], metavar="NAME=VALUE",
-        help="set a managed INCODE_* value; repeatable",
+        help="set a managed CODE_INDEXING_* value; repeatable",
     )
     configure.add_argument(
         "--unset", dest="unsets", action="append", default=[], metavar="NAME",
-        help="remove a managed INCODE_* value from harness configs; repeatable",
+        help="remove a managed CODE_INDEXING_* value from harness configs; repeatable",
     )
     configure.add_argument(
         "--no-tui", action="store_true", help="apply without opening the wizard"
@@ -1874,9 +1874,9 @@ In `main()`, immediately after the `daemon` branch (before `settings = IndexSett
 
 ```bash
 uv run pytest tests/test_cli.py -q
-uv run ruff check src/incode_mcp/cli.py tests/test_cli.py
+uv run ruff check src/code_indexing_mcp/cli.py tests/test_cli.py
 uv run mypy
-git add src/incode_mcp/cli.py tests/test_cli.py
+git add src/code_indexing_mcp/cli.py tests/test_cli.py
 git commit -m "feat: add the code-indexing-mcp configure subcommand"
 ```
 
@@ -1927,10 +1927,10 @@ git commit -m "feat: add the tui extra with textual"
 The `InstallerApp` with a `ContentSwitcher`, central Back/Next/Cancel navigation, and per-panel `commit()` validation hooks. Panels live in `tui/panels.py`; this task creates them as minimal placeholders that later tasks fill in — with their final class signatures, so later tasks only add behavior.
 
 **Files:**
-- Create: `src/incode_mcp/installer/tui/__init__.py`
-- Create: `src/incode_mcp/installer/tui/app.py`
-- Create: `src/incode_mcp/installer/tui/panels.py`
-- Create: `src/incode_mcp/installer/tui/settings_form.py`
+- Create: `src/code_indexing_mcp/installer/tui/__init__.py`
+- Create: `src/code_indexing_mcp/installer/tui/app.py`
+- Create: `src/code_indexing_mcp/installer/tui/panels.py`
+- Create: `src/code_indexing_mcp/installer/tui/settings_form.py`
 - Test: `tests/test_installer_tui.py`
 
 **Interfaces:**
@@ -1947,8 +1947,8 @@ The `InstallerApp` with a `ContentSwitcher`, central Back/Next/Cancel navigation
 import pytest
 from pathlib import Path
 
-from incode_mcp.installer.tui.app import InstallerApp
-from incode_mcp.installer.wizard import WizardState
+from code_indexing_mcp.installer.tui.app import InstallerApp
+from code_indexing_mcp.installer.wizard import WizardState
 
 
 def _install_state(tmp_path: Path) -> WizardState:
@@ -1956,7 +1956,7 @@ def _install_state(tmp_path: Path) -> WizardState:
 
 
 def _reconfigure_state(tmp_path: Path, monkeypatch) -> WizardState:
-    import incode_mcp.installer.wizard as wizard
+    import code_indexing_mcp.installer.wizard as wizard
 
     monkeypatch.setattr(wizard.accelerator, "prepared_accelerator", lambda directory: None)
     return WizardState.for_reconfigure(tmp_path, home=tmp_path)
@@ -1996,13 +1996,13 @@ Run: `uv run pytest tests/test_installer_tui.py -q` — expect FAIL (module miss
 
 - [ ] **Step 2: Create `tui/__init__.py` and `tui/app.py`**
 
-`src/incode_mcp/installer/tui/__init__.py`:
+`src/code_indexing_mcp/installer/tui/__init__.py`:
 
 ```python
 """The Textual installer wizard. Imported lazily; Textual is optional."""
 ```
 
-`src/incode_mcp/installer/tui/app.py`:
+`src/code_indexing_mcp/installer/tui/app.py`:
 
 ```python
 """The Textual installer wizard application."""
@@ -2140,7 +2140,7 @@ class InstallerApp(App[None]):
 
 - [ ] **Step 3: Create placeholder panels with final signatures**
 
-`src/incode_mcp/installer/tui/panels.py` (later tasks replace the placeholder bodies one panel at a time):
+`src/code_indexing_mcp/installer/tui/panels.py` (later tasks replace the placeholder bodies one panel at a time):
 
 ```python
 """Wizard panels. Each panel owns its widgets and a commit() into WizardState."""
@@ -2240,7 +2240,7 @@ class DonePanel(Vertical):
         raise NotImplementedError
 ```
 
-`src/incode_mcp/installer/tui/settings_form.py` (filled in Task 11):
+`src/code_indexing_mcp/installer/tui/settings_form.py` (filled in Task 11):
 
 ```python
 """Spec-driven settings forms for the wizard."""
@@ -2287,9 +2287,9 @@ Wait — `app.py` imports `SettingsPanel` from `.panels`, but it's defined in `s
 
 ```bash
 uv run pytest tests/test_installer_tui.py -q
-uv run ruff check src/incode_mcp/installer/tui tests/test_installer_tui.py
+uv run ruff check src/code_indexing_mcp/installer/tui tests/test_installer_tui.py
 uv run mypy
-git add src/incode_mcp/installer/tui tests/test_installer_tui.py
+git add src/code_indexing_mcp/installer/tui tests/test_installer_tui.py
 git commit -m "feat: add the wizard app shell and navigation"
 ```
 
@@ -2298,7 +2298,7 @@ git commit -m "feat: add the wizard app shell and navigation"
 ### Task 10: Wizard panels — Welcome, Location, Accelerator, Harnesses
 
 **Files:**
-- Modify: `src/incode_mcp/installer/tui/panels.py`
+- Modify: `src/code_indexing_mcp/installer/tui/panels.py`
 - Test: `tests/test_installer_tui.py` (extend)
 
 **Interfaces:**
@@ -2524,9 +2524,9 @@ class HarnessesPanel(Vertical):
 
 ```bash
 uv run pytest tests/test_installer_tui.py -q
-uv run ruff check src/incode_mcp/installer/tui tests/test_installer_tui.py
+uv run ruff check src/code_indexing_mcp/installer/tui tests/test_installer_tui.py
 uv run mypy
-git add src/incode_mcp/installer/tui/panels.py tests/test_installer_tui.py
+git add src/code_indexing_mcp/installer/tui/panels.py tests/test_installer_tui.py
 git commit -m "feat: add the wizard's welcome, location, accelerator, and harness panels"
 ```
 
@@ -2535,8 +2535,8 @@ git commit -m "feat: add the wizard's welcome, location, accelerator, and harnes
 ### Task 11: Settings forms and the summary panel
 
 **Files:**
-- Modify: `src/incode_mcp/installer/tui/settings_form.py`
-- Modify: `src/incode_mcp/installer/tui/panels.py` (`SummaryPanel`)
+- Modify: `src/code_indexing_mcp/installer/tui/settings_form.py`
+- Modify: `src/code_indexing_mcp/installer/tui/panels.py` (`SummaryPanel`)
 - Test: `tests/test_installer_tui.py` (extend)
 
 **Interfaces:**
@@ -2556,20 +2556,20 @@ async def test_settings_panels_validate_and_commit(tmp_path: Path) -> None:
         for _ in range(4):
             await pilot.click("#next")
         assert app.current == "indexing"
-        field = app.query_one("#f-INCODE_INDEX_WAIT_SECONDS", Input)
+        field = app.query_one("#f-CODE_INDEXING_INDEX_WAIT_SECONDS", Input)
         field.value = "99999999"
         await pilot.click("#next")
         assert app.current == "indexing"  # blocked by validation
         field.value = "60"
         await pilot.click("#next")
         assert app.current == "embedding"
-        assert state.values["INCODE_INDEX_WAIT_SECONDS"] == "60"
+        assert state.values["CODE_INDEXING_INDEX_WAIT_SECONDS"] == "60"
 
 
 @pytest.mark.asyncio
 async def test_summary_lists_updates_and_target_files(tmp_path: Path) -> None:
     state = _install_state(tmp_path)
-    state.values["INCODE_OFFLINE"] = "1"
+    state.values["CODE_INDEXING_OFFLINE"] = "1"
     state.harness_slugs = ["kimi-code"]
     app = InstallerApp(state)
     async with app.run_test() as pilot:
@@ -2577,7 +2577,7 @@ async def test_summary_lists_updates_and_target_files(tmp_path: Path) -> None:
             await pilot.click("#next")
         assert app.current == "summary"
         text = str(app.query_one("#summary-body", Static).render())
-        assert "INCODE_OFFLINE" in text
+        assert "CODE_INDEXING_OFFLINE" in text
         assert "mcp.json" in text
         assert "auto" in text  # accelerator choice
 
@@ -2752,9 +2752,9 @@ class SummaryPanel(Vertical):
 
 ```bash
 uv run pytest tests/test_installer_tui.py -q
-uv run ruff check src/incode_mcp/installer/tui tests/test_installer_tui.py
+uv run ruff check src/code_indexing_mcp/installer/tui tests/test_installer_tui.py
 uv run mypy
-git add src/incode_mcp/installer/tui tests/test_installer_tui.py
+git add src/code_indexing_mcp/installer/tui tests/test_installer_tui.py
 git commit -m "feat: add spec-driven settings forms and the summary panel"
 ```
 
@@ -2763,7 +2763,7 @@ git commit -m "feat: add spec-driven settings forms and the summary panel"
 ### Task 12: Progress and Done panels
 
 **Files:**
-- Modify: `src/incode_mcp/installer/tui/panels.py` (`ProgressPanel`, `DonePanel`)
+- Modify: `src/code_indexing_mcp/installer/tui/panels.py` (`ProgressPanel`, `DonePanel`)
 - Test: `tests/test_installer_tui.py` (extend)
 
 **Interfaces:**
@@ -2776,8 +2776,8 @@ Append to `tests/test_installer_tui.py`:
 
 ```python
 def _fake_result(failures: tuple = ()) -> "InstallResult":
-    from incode_mcp.installer.orchestrator import InstallResult
-    from incode_mcp.installer.accelerator import AcceleratorPlan
+    from code_indexing_mcp.installer.orchestrator import InstallResult
+    from code_indexing_mcp.installer.accelerator import AcceleratorPlan
 
     return InstallResult(
         AcceleratorPlan("cpu", "CPU was requested"),
@@ -2789,7 +2789,7 @@ def _fake_result(failures: tuple = ()) -> "InstallResult":
 
 @pytest.mark.asyncio
 async def test_progress_runs_pipeline_and_finishes_on_done(tmp_path: Path, monkeypatch) -> None:
-    import incode_mcp.installer.tui.panels as panels
+    import code_indexing_mcp.installer.tui.panels as panels
 
     def fake_run_install(plan, on_event=lambda event: None, should_continue=lambda: True):
         on_event(StepEvent("accelerator", "started", "auto"))
@@ -2811,7 +2811,7 @@ async def test_progress_runs_pipeline_and_finishes_on_done(tmp_path: Path, monke
 
 @pytest.mark.asyncio
 async def test_done_reports_failures_with_exit_1(tmp_path: Path, monkeypatch) -> None:
-    import incode_mcp.installer.tui.panels as panels
+    import code_indexing_mcp.installer.tui.panels as panels
 
     monkeypatch.setattr(
         panels, "run_install",
@@ -2828,8 +2828,8 @@ async def test_done_reports_failures_with_exit_1(tmp_path: Path, monkeypatch) ->
 
 @pytest.mark.asyncio
 async def test_pipeline_error_finishes_with_exit_1(tmp_path: Path, monkeypatch) -> None:
-    import incode_mcp.installer.tui.panels as panels
-    from incode_mcp.installer.config_files import InstallerError
+    import code_indexing_mcp.installer.tui.panels as panels
+    from code_indexing_mcp.installer.config_files import InstallerError
 
     def explode(plan, on_event=None, should_continue=None):
         raise InstallerError("boom")
@@ -2844,7 +2844,7 @@ async def test_pipeline_error_finishes_with_exit_1(tmp_path: Path, monkeypatch) 
         assert "boom" in str(app.query_one("#done-body", Static).render())
 ```
 
-Add `from incode_mcp.installer.orchestrator import StepEvent` to the test imports.
+Add `from code_indexing_mcp.installer.orchestrator import StepEvent` to the test imports.
 
 Run — expect FAIL (`ProgressPanel.start` is `NotImplementedError`).
 
@@ -2951,9 +2951,9 @@ class DonePanel(Vertical):
 
 ```bash
 uv run pytest tests/test_installer_tui.py -q
-uv run ruff check src/incode_mcp/installer/tui tests/test_installer_tui.py
+uv run ruff check src/code_indexing_mcp/installer/tui tests/test_installer_tui.py
 uv run mypy
-git add src/incode_mcp/installer/tui/panels.py tests/test_installer_tui.py
+git add src/code_indexing_mcp/installer/tui/panels.py tests/test_installer_tui.py
 git commit -m "feat: add the progress and done panels"
 ```
 
@@ -2968,7 +2968,7 @@ The old installer internals (everything moved in Task 1) are deleted. What remai
 - Modify: `tests/test_installer.py` (rewrite the six bootstrap-surface tests; add delegation tests)
 
 **Interfaces:**
-- Consumes: `incode_mcp.installer` module CLI (Task 6) via subprocess.
+- Consumes: `code_indexing_mcp.installer` module CLI (Task 6) via subprocess.
 - Produces: `install.py` surface: `main(argv) -> int`, `clone_or_update_repository`, `sync_environment` (now syncs `--extra cpu --extra tui`), `server_executable`, `environment_python`, `tui_available() -> bool`, `build_argument_parser()`.
 
 - [ ] **Step 1: Rewrite `install.py`**
@@ -2982,7 +2982,7 @@ Full new content:
 This file is stdlib-only and self-contained: install.sh downloads it into a
 temporary directory and runs it before any virtual environment exists. It
 clones or updates the repository, builds the locked environment, and delegates
-everything else to ``python -m incode_mcp.installer`` inside that environment.
+everything else to ``python -m code_indexing_mcp.installer`` inside that environment.
 """
 
 from __future__ import annotations
@@ -3177,11 +3177,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--set", dest="settings", action="append", default=[], metavar="NAME=VALUE",
-        help="set a managed INCODE_* value in harness configs; repeatable",
+        help="set a managed CODE_INDEXING_* value in harness configs; repeatable",
     )
     parser.add_argument(
         "--unset", dest="unsets", action="append", default=[], metavar="NAME",
-        help="remove a managed INCODE_* value from harness configs; repeatable",
+        help="remove a managed CODE_INDEXING_* value from harness configs; repeatable",
     )
     parser.add_argument(
         "--tui", action="store_true", help="force the interactive wizard"
@@ -3196,7 +3196,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--offline",
         action="store_true",
-        default=os.environ.get("INCODE_OFFLINE", "").lower() in {"1", "true", "yes"},
+        default=os.environ.get("CODE_INDEXING_OFFLINE", "").lower() in {"1", "true", "yes"},
         help="never download the embedding model",
     )
     return parser
@@ -3213,7 +3213,7 @@ def _delegate(install_directory: Path, tail: list[str]) -> int:
     python = environment_python(install_directory / ".venv")
     try:
         completed = subprocess.run(
-            [str(python), "-m", "incode_mcp.installer", *tail],
+            [str(python), "-m", "code_indexing_mcp.installer", *tail],
             cwd=install_directory,
         )
     except OSError as exc:
@@ -3309,8 +3309,8 @@ def test_main_delegates_to_the_module_cli_with_forwarded_flags(tmp_path: Path, m
         "--install-dir", str(tmp_path),
         "--accelerator", "mlx",
         "--harnesses", "kimi-code",
-        "--set", "INCODE_OFFLINE=1",
-        "--unset", "INCODE_BROKER",
+        "--set", "CODE_INDEXING_OFFLINE=1",
+        "--unset", "CODE_INDEXING_BROKER",
         "--offline",
     ])
 
@@ -3319,8 +3319,8 @@ def test_main_delegates_to_the_module_cli_with_forwarded_flags(tmp_path: Path, m
     assert tail[:4] == ["--install-dir", str(tmp_path), "--accelerator", "mlx"]
     for fragment in (
         ["--harnesses", "kimi-code"],
-        ["--set", "INCODE_OFFLINE=1"],
-        ["--unset", "INCODE_BROKER"],
+        ["--set", "CODE_INDEXING_OFFLINE=1"],
+        ["--unset", "CODE_INDEXING_BROKER"],
         ["--offline"],
     ):
         assert any(tail[index : index + len(fragment)] == fragment for index in range(len(tail)))
@@ -3433,7 +3433,7 @@ Re-run the same command later to update an existing clean checkout with a fast-f
 pull and refresh its environment. To change settings or harnesses without updating, run
 `code-indexing-mcp configure` — it opens the same wizard offline, prefilled from your
 current configuration. Scripted changes work too:
-`code-indexing-mcp configure --set INCODE_BROKER=off --unset INCODE_INDEX_MODE`.
+`code-indexing-mcp configure --set CODE_INDEXING_BROKER=off --unset CODE_INDEXING_INDEX_MODE`.
 
 On a terminal that cannot host the wizard (or with `--no-tui`), the installer falls back to
 a plain text interface with the numbered harness menu. For a fully noninteractive
@@ -3441,7 +3441,7 @@ installation, pass harness slugs and any settings:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MarcinHamiga/code-indexing-mcp/main/install.sh |
-  sh -s -- --harnesses codex,claude-code,opencode --set INCODE_INDEX_MODE=eager
+  sh -s -- --harnesses codex,claude-code,opencode --set CODE_INDEXING_INDEX_MODE=eager
 ```
 
 By default the installer detects whether this machine can be given an automatic GPU
@@ -3476,8 +3476,8 @@ location. Run `python3 install.py --help` for all installer options.
 uv run pytest -q
 uv run ruff check .
 uv run mypy
-uv run python -c "import incode_mcp.cli, sys; assert 'textual' not in sys.modules"
-uv run python -m incode_mcp.installer --help
+uv run python -c "import code_indexing_mcp.cli, sys; assert 'textual' not in sys.modules"
+uv run python -m code_indexing_mcp.installer --help
 uv run code-indexing-mcp configure --help
 ```
 
@@ -3487,7 +3487,7 @@ Then one real end-to-end smoke test in a scratch directory (real uv sync, no pro
 SCRATCH=$(mktemp -d)
 python3 install.py --install-dir "$SCRATCH/install" --harnesses "" --accelerator cpu --no-tui --no-prompt
 ls "$SCRATCH/install/.venv/bin/code-indexing-mcp"
-"$SCRATCH/install/.venv/bin/code-indexing-mcp" configure --no-tui --set INCODE_BROKER=off --harnesses "" 
+"$SCRATCH/install/.venv/bin/code-indexing-mcp" configure --no-tui --set CODE_INDEXING_BROKER=off --harnesses ""
 rm -rf "$SCRATCH"
 ```
 

@@ -6,15 +6,15 @@ from collections.abc import Sequence
 
 import pytest
 
-from incode_mcp.calibration import (
+from code_indexing_mcp.calibration import (
     CANDIDATE_BATCH_SIZES,
     CalibrationResult,
     calibrate,
     calibration_candidates,
     crossover_characters,
 )
-from incode_mcp.embedding import EmbeddedSegment, PassageCandidate, SegmentPlan
-from incode_mcp.errors import ErrorCode, IncodeError
+from code_indexing_mcp.embedding import EmbeddedSegment, PassageCandidate, SegmentPlan
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 
 PLAN = SegmentPlan(max_items=1)
 
@@ -53,7 +53,7 @@ class ExhaustedSession(FakeSession):
     ) -> list[list[EmbeddedSegment]]:
         if plan.max_items > self.fails_above:
             self.batch_sizes.append(plan.max_items)
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.INDEX_RESOURCE_LIMIT, "Indexing exceeded its memory ceiling"
             )
         return super().plan_and_embed(candidates, plan)
@@ -131,7 +131,7 @@ def test_a_session_that_fails_outright_is_not_calibrated() -> None:
         def plan_and_embed(
             self, candidates: Sequence[PassageCandidate], plan: SegmentPlan
         ) -> list[list[EmbeddedSegment]]:
-            raise IncodeError(ErrorCode.EMBEDDING_WORKER_FAILED, "the worker died")
+            raise CodeIndexingError(ErrorCode.EMBEDDING_WORKER_FAILED, "the worker died")
 
     assert calibrate(BrokenSession({}), PLAN, load_ns=0, clock=lambda: 0) is None
 
@@ -147,7 +147,7 @@ def test_a_batch_that_kills_the_worker_keeps_what_smaller_ones_measured() -> Non
             self, candidates: Sequence[PassageCandidate], plan: SegmentPlan
         ) -> list[list[EmbeddedSegment]]:
             if plan.max_items > 4:
-                raise IncodeError(ErrorCode.EMBEDDING_WORKER_FAILED, "the worker died")
+                raise CodeIndexingError(ErrorCode.EMBEDDING_WORKER_FAILED, "the worker died")
             return super().plan_and_embed(candidates, plan)
 
     session = DyingSession(_halving(1_000_000_000))

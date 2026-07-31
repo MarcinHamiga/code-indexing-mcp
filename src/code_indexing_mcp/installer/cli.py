@@ -23,7 +23,7 @@ from .wizard import load_prefill
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="incode_mcp.installer",
+        prog="code_indexing_mcp.installer",
         description="Install, update, or reconfigure Code Indexing MCP.",
     )
     parser.add_argument("--install-dir", default=str(default_install_directory()))
@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="NAME=VALUE",
-        help="set a managed INCODE_* value; repeatable",
+        help="set a managed CODE_INDEXING_* value; repeatable",
     )
     parser.add_argument(
         "--unset",
@@ -48,12 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="NAME",
-        help="remove a managed INCODE_* value from harness configs; repeatable",
+        help="remove a managed CODE_INDEXING_* value from harness configs; repeatable",
     )
     parser.add_argument(
         "--offline",
         action="store_true",
-        default=as_bool(os.environ.get("INCODE_OFFLINE", "")),
+        default=as_bool(os.environ.get("CODE_INDEXING_OFFLINE", "")),
     )
     parser.add_argument("--tui", action="store_true", help="open the interactive wizard")
     parser.add_argument(

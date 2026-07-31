@@ -4,8 +4,8 @@ import json
 import tomllib
 from pathlib import Path
 
-from incode_mcp.installer.env_blocks import entry_from_text, env_from_entry, merge_env
-from incode_mcp.installer.harnesses import configure_harness, read_server_entry
+from code_indexing_mcp.installer.env_blocks import entry_from_text, env_from_entry, merge_env
+from code_indexing_mcp.installer.harnesses import configure_harness, read_server_entry
 
 SERVER_COMMAND = str(Path("/opt/ci-mcp"))
 
@@ -22,12 +22,12 @@ def test_entry_from_text_reads_jsonc_with_comments() -> None:
 def test_entry_from_text_reads_codex_toml() -> None:
     text = (
         '[mcp_servers.code-indexing-mcp]\ncommand = "/old"\nargs = ["serve"]\n'
-        'env = { INCODE_OFFLINE = "1" }\n'
+        'env = { CODE_INDEXING_OFFLINE = "1" }\n'
     )
     assert entry_from_text("codex", text) == {
         "command": "/old",
         "args": ["serve"],
-        "env": {"INCODE_OFFLINE": "1"},
+        "env": {"CODE_INDEXING_OFFLINE": "1"},
     }
 
 
@@ -54,13 +54,13 @@ def test_env_from_entry_uses_the_per_harness_key() -> None:
 
 def test_merge_env_applies_updates_deletions_and_preserves_unknown_keys() -> None:
     merged = merge_env(
-        {"KEEP": "x", "INCODE_OFFLINE": "1", "INCODE_BROKER": "off"},
+        {"KEEP": "x", "CODE_INDEXING_OFFLINE": "1", "CODE_INDEXING_BROKER": "off"},
         {
-            "INCODE_OFFLINE": "0",
-            "INCODE_BROKER": None,
+            "CODE_INDEXING_OFFLINE": "0",
+            "CODE_INDEXING_BROKER": None,
         },
     )
-    assert merged == {"KEEP": "x", "INCODE_OFFLINE": "0"}
+    assert merged == {"KEEP": "x", "CODE_INDEXING_OFFLINE": "0"}
 
 
 def test_configure_harness_writes_env_and_preserves_unmanaged_keys(tmp_path: Path) -> None:
@@ -72,7 +72,7 @@ def test_configure_harness_writes_env_and_preserves_unmanaged_keys(tmp_path: Pat
                     "code-indexing-mcp": {
                         "command": "/old",
                         "args": ["serve"],
-                        "env": {"KEEP": "x", "INCODE_BROKER": "off"},
+                        "env": {"KEEP": "x", "CODE_INDEXING_BROKER": "off"},
                     }
                 }
             }
@@ -81,14 +81,14 @@ def test_configure_harness_writes_env_and_preserves_unmanaged_keys(tmp_path: Pat
     configure_harness(
         "kimi-code",
         Path(SERVER_COMMAND),
-        env={"INCODE_BROKER": None, "INCODE_INDEX_MODE": "eager"},
+        env={"CODE_INDEXING_BROKER": None, "CODE_INDEXING_INDEX_MODE": "eager"},
         environment={"KIMI_CODE_HOME": str(tmp_path)},
     )
     entry = json.loads(config.read_text())["mcpServers"]["code-indexing-mcp"]
     assert entry == {
         "command": SERVER_COMMAND,
         "args": ["serve"],
-        "env": {"KEEP": "x", "INCODE_INDEX_MODE": "eager"},
+        "env": {"KEEP": "x", "CODE_INDEXING_INDEX_MODE": "eager"},
     }
 
 
@@ -96,7 +96,7 @@ def test_configure_harness_opencode_uses_environment_key(tmp_path: Path) -> None
     configure_harness(
         "opencode",
         Path(SERVER_COMMAND),
-        env={"INCODE_OFFLINE": "1"},
+        env={"CODE_INDEXING_OFFLINE": "1"},
         environment={"OPENCODE_CONFIG_DIR": str(tmp_path)},
     )
     entry = json.loads((tmp_path / "opencode.json").read_text())["mcp"]["code-indexing-mcp"]
@@ -104,7 +104,7 @@ def test_configure_harness_opencode_uses_environment_key(tmp_path: Path) -> None
         "type": "local",
         "command": [SERVER_COMMAND, "serve"],
         "enabled": True,
-        "environment": {"INCODE_OFFLINE": "1"},
+        "environment": {"CODE_INDEXING_OFFLINE": "1"},
     }
     assert "env" not in entry
 
@@ -114,14 +114,14 @@ def test_configure_harness_codex_writes_toml_env_table(tmp_path: Path) -> None:
     configure_harness(
         "codex",
         Path(SERVER_COMMAND),
-        env={"INCODE_OFFLINE": "1"},
+        env={"CODE_INDEXING_OFFLINE": "1"},
         environment={"CODEX_HOME": str(tmp_path)},
     )
     parsed = tomllib.loads(path.read_text())
     assert parsed["mcp_servers"]["code-indexing-mcp"] == {
         "command": SERVER_COMMAND,
         "args": ["serve"],
-        "env": {"INCODE_OFFLINE": "1"},
+        "env": {"CODE_INDEXING_OFFLINE": "1"},
     }
 
 
@@ -134,13 +134,13 @@ def test_configure_harness_codex_update_preserves_unmanaged_env(tmp_path: Path) 
     configure_harness(
         "codex",
         Path(SERVER_COMMAND),
-        env={"INCODE_OFFLINE": "1"},
+        env={"CODE_INDEXING_OFFLINE": "1"},
         environment={"CODEX_HOME": str(tmp_path)},
     )
     parsed = tomllib.loads(path.read_text())
     assert parsed["mcp_servers"]["code-indexing-mcp"]["env"] == {
         "KEEP": "x",
-        "INCODE_OFFLINE": "1",
+        "CODE_INDEXING_OFFLINE": "1",
     }
 
 

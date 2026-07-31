@@ -31,11 +31,11 @@ fallback always has, which is what the parity gates cover.
   selected an accelerator embeds on CPU until the run passes the threshold, counting the request in
   hand so the one group large enough to justify the device is not itself sent to CPU. A deferral is
   not a fallback and does not pin the process to CPU.
-- `max_token_product` derived from `INCODE_EMBED_MEMORY_MB` instead of the constant measured at
+- `max_token_product` derived from `CODE_INDEXING_EMBED_MEMORY_MB` instead of the constant measured at
   2 GiB, floored at one longest window and capped at eight times the reference.
 - A reduced batch size written back to the cache and reported as `"reduced"`, distinct from
   `"measured"`.
-- `INCODE_EMBED_CROSSOVER=auto|off|<characters>` and `INCODE_EMBED_CALIBRATE=0|1`, both of which
+- `CODE_INDEXING_EMBED_CROSSOVER=auto|off|<characters>` and `CODE_INDEXING_EMBED_CALIBRATE=0|1`, both of which
   restore the previous behaviour exactly.
 - `model status` reporting both rates, the cold-load cost, the crossover, and a recommended override
   when the numbers argue for one; `IndexReport` reporting `embedded_characters`,
@@ -48,7 +48,7 @@ fallback always has, which is what the parity gates cover.
 - The verified spawn re-anchored after the sweep. A sweep that overran respawned the worker, and the
   successor is the process that verification covered; treating it as unproven cost a second model
   load on every first run — the cost the crossover exists to spend only when it repays itself.
-- `INCODE_EMBED_STRICT=1` turning the crossover off. Strict mode exists for a caller who would rather
+- `CODE_INDEXING_EMBED_STRICT=1` turning the crossover off. Strict mode exists for a caller who would rather
   fail than index quietly on CPU, and a deferral is quiet CPU indexing that no degradation reports
   and that strict mode could not have refused, because nothing failed.
 - The CPU reference measured from teardown rather than mid-run, after the accelerator's worker has
@@ -71,7 +71,7 @@ fallback always has, which is what the parity gates cover.
 ## Acceptance evidence
 
 Measured on an Apple M4 Pro running macOS 26.5.2, against a 151-file, 2,976-chunk corpus (this
-project's own `src/incode_mcp`), through an installer-shaped locked MLX environment that passed the
+project's own `src/code_indexing_mcp`), through an installer-shaped locked MLX environment that passed the
 real probe (`resolved_providers: ["MlxMetalBackend"]`, MLX 0.32.0, device `metal`).
 
 What the first accelerated run measured and wrote to the probe cache:
@@ -89,7 +89,7 @@ to earn back and it starts on the first chunk.
 | CPU only | `cpu` | 1 | 135.4 s |
 | MLX, first run (measuring) | `mlx` | 1 | 53.3 s |
 | MLX, calibrated | `mlx` | 4 | 46.7 s |
-| `INCODE_EMBED_CROSSOVER=10000000` | `cpu` | 1 | 137.5 s |
+| `CODE_INDEXING_EMBED_CROSSOVER=10000000` | `cpu` | 1 | 137.5 s |
 
 The deferred run reported `embedding_backend: "cpu"`, `fallback_count: 0`, and
 `embedding_selection_reason: "embedded 2125973 characters, below the 10000000-character crossover

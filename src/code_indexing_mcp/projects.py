@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 import tomli_w
 from pydantic import ValidationError
 
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .models import (
     DEFAULT_INCLUDES,
     LEGACY_DEFAULT_INCLUDES_V1,
@@ -20,7 +20,7 @@ from .models import (
 )
 
 MARKER_DIRECTORY = ".ci-mcp"
-LEGACY_MARKER_DIRECTORY = ".incode"
+LEGACY_MARKER_DIRECTORY = ".code-indexing-mcp"
 MARKER_FILE = "project.toml"
 
 
@@ -47,7 +47,9 @@ def initialize_project(
 ) -> ProjectInfo:
     root = root.expanduser().resolve()
     if not root.is_dir():
-        raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, f"Project directory does not exist: {root}")
+        raise CodeIndexingError(
+            ErrorCode.PROJECT_NOT_FOUND, f"Project directory does not exist: {root}"
+        )
     if existing_marker_path(root) is not None and not force_new_id:
         return read_project_marker(root)
 
@@ -88,7 +90,7 @@ def read_project_marker(root: Path) -> ProjectInfo:
             scan=scan,
         )
     except (OSError, KeyError, TypeError, ValueError, ValidationError) as exc:
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.PROJECT_NOT_FOUND,
             f"Invalid or missing project marker: {path}",
             path=str(path),
@@ -124,7 +126,7 @@ class ProjectResolver:
         if len(marked) == 1:
             return marked[0]
         if len(marked) > 1:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.AMBIGUOUS_PROJECT,
                 "Multiple MCP roots contain initialized projects",
                 projects=[project.id for project in marked],
@@ -132,9 +134,9 @@ class ProjectResolver:
 
         if cwd is not None and (root := find_project_root(cwd)) is not None:
             return self._by_root_or_marker(root)
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.PROJECT_NOT_FOUND,
-            "No active Incode project was detected; pass an explicit project id, name, or "
+            "No active CodeIndexing project was detected; pass an explicit project id, name, or "
             "path, or run init_project for this directory",
             searched_roots=[str(root) for root in roots],
         )
@@ -148,7 +150,7 @@ class ProjectResolver:
         if len(direct) == 1:
             return direct[0]
         if len(direct) > 1:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.AMBIGUOUS_PROJECT,
                 f"Project name is ambiguous: {explicit}",
                 projects=[project.id for project in direct],
@@ -158,7 +160,7 @@ class ProjectResolver:
             root = find_project_root(candidate)
             if root is not None:
                 return self._by_root_or_marker(root)
-        raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {explicit}")
+        raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {explicit}")
 
     def _marked_projects(self, roots: Iterable[Path]) -> list[ProjectInfo]:
         found: dict[str, ProjectInfo] = {}

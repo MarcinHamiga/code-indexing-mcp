@@ -64,14 +64,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.model-cache
-          key: incode-model-jina-v2-base-code
+          key: code-indexing-mcp-model-jina-v2-base-code
       - name: Populate the model cache
         env:
-          INCODE_CACHE_DIR: ${{ github.workspace }}/.model-cache
+          CODE_INDEXING_CACHE_DIR: ${{ github.workspace }}/.model-cache
         run: uv run code-indexing-mcp model pull
       - name: Run the memory gate
         env:
-          INCODE_MODEL_TEST_CACHE: ${{ github.workspace }}/.model-cache
+          CODE_INDEXING_MODEL_TEST_CACHE: ${{ github.workspace }}/.model-cache
         run: uv run pytest -q -m memory
       - name: Benchmark at the dispatched corpus scale
         if: always()

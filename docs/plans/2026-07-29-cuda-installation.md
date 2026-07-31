@@ -66,7 +66,7 @@ anything at request time.
   accelerator, driver, and the server's Python — and its interpreter is still present. Anything that
   moved puts the full build and probe back. Re-downloading CUDA and re-probing the device on every
   update would be a lot of work to arrive back where the last run already was.
-- `incode_mcp.accelerator_probe` runs a real inference *in that environment* through the same
+- `code_indexing_mcp.accelerator_probe` runs a real inference *in that environment* through the same
   `_load_model` path the worker uses, and validates the vectors the same way. Only then is the
   record written. Detection nominates; the probe confirms. It is bounded: a cold probe downloads the
   model first, but a device that wedges initialising wedges forever, and the output is captured, so

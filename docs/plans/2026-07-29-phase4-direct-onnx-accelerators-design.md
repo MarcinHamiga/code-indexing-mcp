@@ -37,7 +37,7 @@ Alternatives rejected:
 ## Runtime and data flow
 
 1. The installer builds one mutually exclusive accelerator extra in `.venv-accel`.
-2. `incode_mcp.accelerator_probe` runs in that interpreter.
+2. `code_indexing_mcp.accelerator_probe` runs in that interpreter.
 3. The probe asks the direct backend to prepare the provider:
    - WebGPU registers `onnxruntime-ep-webgpu`, discovers matching EP devices, and attaches them to
      `SessionOptions`.

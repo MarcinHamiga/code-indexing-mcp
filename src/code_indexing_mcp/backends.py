@@ -15,7 +15,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +282,7 @@ class BackendSelection:
         """Raise when strict mode forbids the fallback this selection records."""
         if self.honored:
             return
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.BACKEND_UNAVAILABLE,
             f"Requested embedding accelerator is unavailable: {self.requested.value}",
             requested=self.requested.value,
@@ -297,7 +297,7 @@ def parse_accelerator(value: str) -> Accelerator:
         return Accelerator(value.strip().lower())
     except ValueError as exc:
         expected = ", ".join(member.value for member in Accelerator)
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.INVALID_CONFIGURATION,
             f"Unknown embedding accelerator: {value!r}; expected one of {expected}",
             value=value,
@@ -397,7 +397,7 @@ def select_backend(
             # backend and CPU is the correct answer when none qualifies.
             fallback_reason=(
                 "no accelerator is prepared and eligible on this machine; reinstall "
-                "with --accelerator to prepare one, or set INCODE_EMBED_ACCELERATOR "
+                "with --accelerator to prepare one, or set CODE_INDEXING_EMBED_ACCELERATOR "
                 "to force a backend this installation already offers"
             ),
         )

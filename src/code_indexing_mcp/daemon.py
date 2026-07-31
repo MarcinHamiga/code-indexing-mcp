@@ -23,7 +23,7 @@ from filelock import FileLock, Timeout
 from pydantic import BaseModel
 
 from .application import Application, RuntimePaths
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .models import (
     CodeChunk,
     IndexReport,
@@ -53,10 +53,10 @@ def daemon_supported() -> bool:
 
 def require_daemon_support() -> None:
     if not daemon_supported():
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.INVALID_CONFIGURATION,
             "The shared indexing daemon requires Unix domain sockets, which are "
-            "unavailable on this platform; set INCODE_BROKER=off or run "
+            "unavailable on this platform; set CODE_INDEXING_BROKER=off or run "
             "'code-indexing-mcp serve --direct'",
             platform=sys.platform,
         )
@@ -81,13 +81,13 @@ def _private_directory(directory: Path) -> Path:
         return directory
     info = os.lstat(directory)
     if not stat.S_ISDIR(info.st_mode):
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.INVALID_CONFIGURATION,
             "The daemon runtime path is not a directory",
             path=str(directory),
         )
     if info.st_uid != os.getuid():
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.INVALID_CONFIGURATION,
             "The daemon runtime directory is not owned by the current user",
             path=str(directory),
@@ -106,7 +106,7 @@ def daemon_endpoint(paths: RuntimePaths) -> Path:
     # and validated by _private_directory everywhere.
     runtime_root = os.environ.get("XDG_RUNTIME_DIR")
     root = Path(runtime_root) if runtime_root else Path(tempfile.gettempdir())
-    directory = _private_directory(root / f"incode-{identity}")
+    directory = _private_directory(root / f"code-indexing-mcp-{identity}")
     digest = sha256(str(paths.data.resolve()).encode()).hexdigest()[:16]
     return directory / f"{digest}.sock"
 
@@ -126,7 +126,7 @@ def _receive_exact(connection: socket.socket, size: int) -> bytes:
 def send_frame(connection: socket.socket, payload: Mapping[str, Any]) -> None:
     encoded = json.dumps(payload, separators=(",", ":")).encode()
     if len(encoded) > MAX_FRAME_BYTES:
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.PROTOCOL_ERROR,
             "Local daemon request exceeds the maximum frame size",
             maximum_bytes=MAX_FRAME_BYTES,
@@ -137,7 +137,7 @@ def send_frame(connection: socket.socket, payload: Mapping[str, Any]) -> None:
 def receive_frame(connection: socket.socket) -> dict[str, Any]:
     size = struct.unpack("!I", _receive_exact(connection, 4))[0]
     if size > MAX_FRAME_BYTES:
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.PROTOCOL_ERROR,
             "Local daemon frame exceeds the maximum size",
             maximum_bytes=MAX_FRAME_BYTES,
@@ -189,7 +189,7 @@ class DaemonServer:
         try:
             lifetime_lock.acquire(timeout=0)
         except Timeout as exc:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.INDEX_BUSY, "The per-user indexing daemon is already running"
             ) from exc
         self._token = self._load_or_create_token()
@@ -223,7 +223,7 @@ class DaemonServer:
                     threading.Thread(
                         target=self._handle,
                         args=(connection,),
-                        name="incode-daemon-request",
+                        name="code-indexing-mcp-daemon-request",
                         daemon=True,
                     ).start()
                 except BaseException:
@@ -248,19 +248,19 @@ class DaemonServer:
                 request = receive_frame(connection)
                 request_id = request.get("id")
                 if request.get("protocol") != PROTOCOL_VERSION:
-                    raise IncodeError(
+                    raise CodeIndexingError(
                         ErrorCode.INVALID_CONFIGURATION,
                         "Incompatible local daemon protocol",
                         expected=PROTOCOL_VERSION,
                     )
                 if not secrets.compare_digest(str(request.get("token", "")), self._token):
-                    raise IncodeError(
+                    raise CodeIndexingError(
                         ErrorCode.INVALID_CONFIGURATION,
                         "Local daemon authentication failed",
                     )
                 result = self._dispatch(str(request.get("method")), request.get("params") or {})
                 send_frame(connection, {"id": request_id, "result": _jsonable(result)})
-            except IncodeError as exc:
+            except CodeIndexingError as exc:
                 send_frame(
                     connection,
                     {
@@ -326,7 +326,7 @@ class DaemonServer:
             # Answered by the daemon rather than the caller, because the daemon
             # is the process that will actually run indexing.
             return app.model_status()
-        raise IncodeError(ErrorCode.PROTOCOL_ERROR, f"Unknown daemon method: {method}")
+        raise CodeIndexingError(ErrorCode.PROTOCOL_ERROR, f"Unknown daemon method: {method}")
 
     def _load_or_create_token(self) -> str:
         if self.token_path.exists():
@@ -380,7 +380,7 @@ class BrokerApplication:
                 code = ErrorCode(error["code"])
             except ValueError:
                 code = ErrorCode.PROTOCOL_ERROR
-            raise IncodeError(code, str(error["message"]), **error.get("details", {}))
+            raise CodeIndexingError(code, str(error["message"]), **error.get("details", {}))
         return response.get("result")
 
     def _call(self, method: str, **params: Any) -> Any:
@@ -500,7 +500,7 @@ class BrokerApplication:
 def daemon_status(paths: RuntimePaths) -> dict[str, Any]:
     try:
         return {"running": True, **BrokerApplication(paths)._ping_once()}
-    except (EOFError, OSError, IncodeError):
+    except (EOFError, OSError, CodeIndexingError):
         # EOFError is what a daemon shutting down mid-ping looks like: the
         # connect and the send both succeed, and the socket closes before the
         # reply arrives. It is not an OSError, so it used to escape a question
@@ -524,7 +524,7 @@ def ensure_daemon(paths: RuntimePaths, *, timeout_seconds: float = 10) -> Broker
         # indistinguishable from a slow one, and surfaces only as a timeout.
         with log_path.open("a") as log:
             subprocess.Popen(
-                [sys.executable, "-m", "incode_mcp.cli", "daemon", "run"],
+                [sys.executable, "-m", "code_indexing_mcp.cli", "daemon", "run"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=log,
@@ -536,9 +536,9 @@ def ensure_daemon(paths: RuntimePaths, *, timeout_seconds: float = 10) -> Broker
             try:
                 broker._ping_once()
                 return broker
-            except (OSError, IncodeError):
+            except (OSError, CodeIndexingError):
                 time.sleep(0.05)
-    raise IncodeError(
+    raise CodeIndexingError(
         ErrorCode.DAEMON_UNAVAILABLE,
         f"Timed out starting the local indexing daemon; see {log_path}",
         log_path=str(log_path),

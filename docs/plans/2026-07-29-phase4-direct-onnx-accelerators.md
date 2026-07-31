@@ -18,7 +18,7 @@ Hub, tokenizers, NumPy, uv, pytest.
 **Files:**
 
 - Create: `tests/test_direct_onnx.py`
-- Create: `src/incode_mcp/direct_onnx.py`
+- Create: `src/code_indexing_mcp/direct_onnx.py`
 - Modify: `pyproject.toml`
 
 **Step 1: Write failing tests**
@@ -44,7 +44,7 @@ Run:
 uv run pytest tests/test_direct_onnx.py -q
 ```
 
-Expected: collection fails because `incode_mcp.direct_onnx` does not exist.
+Expected: collection fails because `code_indexing_mcp.direct_onnx` does not exist.
 
 **Step 3: Implement the minimum direct model**
 
@@ -66,7 +66,7 @@ Run the direct-model tests, then:
 
 ```bash
 uv run pytest tests/test_embedding.py tests/test_direct_onnx.py -q
-uv run ruff check src/incode_mcp/direct_onnx.py tests/test_direct_onnx.py
+uv run ruff check src/code_indexing_mcp/direct_onnx.py tests/test_direct_onnx.py
 uv run mypy src
 ```
 
@@ -75,7 +75,7 @@ Expected: all pass.
 **Step 5: Commit**
 
 ```bash
-git add src/incode_mcp/direct_onnx.py tests/test_direct_onnx.py pyproject.toml
+git add src/code_indexing_mcp/direct_onnx.py tests/test_direct_onnx.py pyproject.toml
 git commit -m "feat: add direct ONNX passage model"
 ```
 
@@ -83,11 +83,11 @@ git commit -m "feat: add direct ONNX passage model"
 
 **Files:**
 
-- Modify: `src/incode_mcp/embedding.py`
-- Modify: `src/incode_mcp/embedding_worker.py`
-- Modify: `src/incode_mcp/accelerator_probe.py`
-- Modify: `src/incode_mcp/backends.py`
-- Modify: `src/incode_mcp/application.py`
+- Modify: `src/code_indexing_mcp/embedding.py`
+- Modify: `src/code_indexing_mcp/embedding_worker.py`
+- Modify: `src/code_indexing_mcp/accelerator_probe.py`
+- Modify: `src/code_indexing_mcp/backends.py`
+- Modify: `src/code_indexing_mcp/application.py`
 - Modify: `tests/test_embedding_worker.py`
 - Modify: `tests/test_backends.py`
 - Modify: `tests/test_application.py`
@@ -139,7 +139,7 @@ Expected: all pass.
 **Step 5: Commit**
 
 ```bash
-git add src/incode_mcp tests
+git add src/code_indexing_mcp tests
 git commit -m "feat: route experimental providers through direct ONNX"
 ```
 
@@ -223,7 +223,7 @@ assert min(cosine_rows(cpu, direct)) >= 0.999
 assert top_k_overlap(cpu, direct) >= 0.99
 ```
 
-Add provider-gated tests selected by `INCODE_TEST_ACCELERATOR` so WebGPU/MIGraphX runners exercise
+Add provider-gated tests selected by `CODE_INDEXING_TEST_ACCELERATOR` so WebGPU/MIGraphX runners exercise
 the same vectors and a 1,000-chunk end-to-end benchmark without failing ordinary CPU CI.
 
 **Step 2: Verify RED and GREEN**
@@ -231,7 +231,7 @@ the same vectors and a 1,000-chunk end-to-end benchmark without failing ordinary
 Run first to observe missing acceptance helpers, implement them, then run:
 
 ```bash
-INCODE_MODEL_TEST_CACHE=<shared-cache> uv run pytest -m model -q
+CODE_INDEXING_MODEL_TEST_CACHE=<shared-cache> uv run pytest -m model -q
 uv run pytest tests/test_accelerator_acceptance.py -q
 ```
 
@@ -274,7 +274,7 @@ Expected: all commands pass; only documented opt-in hardware tests skip.
 **Step 3: Real WebGPU smoke test**
 
 On a supported host, build a temporary locked WebGPU environment, run
-`python -m incode_mcp.accelerator_probe --accelerator webgpu`, and confirm the report names the
+`python -m code_indexing_mcp.accelerator_probe --accelerator webgpu`, and confirm the report names the
 WebGPU provider and returns normalized 768-dimensional vectors. If the host does not expose a
 WebGPU device, retain the diagnostic and verify CPU rollback.
 

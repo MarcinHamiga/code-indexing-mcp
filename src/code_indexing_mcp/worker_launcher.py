@@ -48,7 +48,7 @@ from multiprocessing.connection import Client, Connection, answer_challenge, del
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 
 if TYPE_CHECKING:  # pragma: no cover - imported for annotations only
     from .embedding_worker import WorkerConfig, WorkerTarget
@@ -62,7 +62,7 @@ HANDSHAKE_TIMEOUT_SECONDS = 30.0
 # How often the wait for the dial-back looks up from the socket to check whether
 # the child is still running.
 HANDSHAKE_POLL_SECONDS = 0.1
-DEFAULT_WORKER_TARGET = "incode_mcp.embedding_worker:_worker_main"
+DEFAULT_WORKER_TARGET = "code_indexing_mcp.embedding_worker:_worker_main"
 
 
 class WorkerProcess(Protocol):
@@ -119,7 +119,7 @@ class SpawnLauncher:
         process = context.Process(
             target=self._target,
             args=(child, config),
-            name="incode-embedding-worker",
+            name="code-indexing-mcp-embedding-worker",
             daemon=True,
         )
         process.start()
@@ -209,14 +209,14 @@ class ExternalInterpreterLauncher:
 
     def _start(self, channel: _Channel) -> subprocess.Popen[bytes]:
         if not self.executable.is_file():
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.BACKEND_UNAVAILABLE,
                 f"The recorded accelerator interpreter is missing: {self.executable}",
                 interpreter=str(self.executable),
             )
         try:
             popen = subprocess.Popen(
-                [str(self.executable), "-m", "incode_mcp.worker_launcher"],
+                [str(self.executable), "-m", "code_indexing_mcp.worker_launcher"],
                 stdin=subprocess.PIPE,
                 # This process may itself be speaking MCP over its own stdout, and
                 # a child that printed there would corrupt that stream. stderr is
@@ -226,7 +226,7 @@ class ExternalInterpreterLauncher:
                 env={**os.environ, **self._extra_environment},
             )
         except OSError as exc:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.BACKEND_UNAVAILABLE,
                 f"Could not start the accelerator interpreter: {exc}",
                 interpreter=str(self.executable),
@@ -235,7 +235,7 @@ class ExternalInterpreterLauncher:
             _write_handshake(popen, channel.handshake_payload(self._target))
         except OSError as exc:
             _reap(popen)
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.EMBEDDING_WORKER_FAILED,
                 f"Could not hand the accelerator worker its connection details: {exc}",
             ) from exc
@@ -289,7 +289,7 @@ def _still_expected(
     """Raise unless the worker can still be expected to arrive."""
     exit_code = popen.poll()
     if exit_code is not None:
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.BACKEND_UNAVAILABLE,
             f"The accelerator worker exited with status {exit_code} before it "
             "could be reached; its environment is most likely incomplete",
@@ -299,7 +299,7 @@ def _still_expected(
         # A handshake nobody could complete is a different fault from silence,
         # and on a shared loopback port it is the one worth naming.
         detail = f"; {rejected} connection(s) failed the handshake" if rejected else ""
-        raise IncodeError(
+        raise CodeIndexingError(
             ErrorCode.EMBEDDING_WORKER_FAILED,
             f"The accelerator worker did not connect within {timeout_seconds:.0f}s{detail}",
         )
@@ -355,7 +355,7 @@ class _Channel:
             host, port = server.getsockname()[:2]
             address: str | tuple[str, int] = (str(host), int(port))
         else:
-            directory = Path(tempfile.mkdtemp(prefix="incode-worker-"))
+            directory = Path(tempfile.mkdtemp(prefix="code-indexing-mcp-worker-"))
             server = socket.socket(socket.AF_UNIX)
             address = str(directory / "worker.sock")
             server.bind(address)
@@ -384,7 +384,7 @@ class _Channel:
                 _still_expected(popen, deadline, timeout_seconds, rejected)
                 continue
             except OSError as exc:
-                raise IncodeError(
+                raise CodeIndexingError(
                     ErrorCode.EMBEDDING_WORKER_FAILED,
                     f"Could not accept the accelerator worker connection: {exc}",
                 ) from exc

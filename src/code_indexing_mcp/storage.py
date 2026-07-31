@@ -21,7 +21,7 @@ from lancedb.index import FTS, BTree, HnswSq
 from lancedb.query import ColumnOrdering
 from lancedb.table import LanceTable
 
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .models import (
     ChunkPreview,
     CodeChunk,
@@ -161,7 +161,7 @@ class LanceStore:
                 or int(existing[0]["schema_version"]) != SCHEMA_VERSION
             )
         ):
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.INDEX_INCOMPATIBLE,
                 "Project index uses an incompatible schema or embedding model",
                 project=project.id,
@@ -173,7 +173,7 @@ class LanceStore:
                 registered_root != incoming_root
                 and existing_marker_path(registered_root) is not None
             ):
-                raise IncodeError(
+                raise CodeIndexingError(
                     ErrorCode.PROJECT_ID_CONFLICT,
                     "The project ID is already active at another path",
                     project=project.id,
@@ -201,7 +201,7 @@ class LanceStore:
     def project_state(self, project_id: str) -> str:
         rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
         if not rows:
-            raise IncodeError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {project_id}")
+            raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {project_id}")
         return str(rows[0]["state"])
 
     def list_files(self, project_id: str) -> list[StoredFile]:

@@ -3,9 +3,9 @@ from unittest.mock import patch
 
 import pytest
 
-from incode_mcp.models import DEFAULT_INCLUDES, ScanConfig
-from incode_mcp.projects import initialize_project
-from incode_mcp.scanner import LANGUAGES, SourceScanner
+from code_indexing_mcp.models import DEFAULT_INCLUDES, ScanConfig
+from code_indexing_mcp.projects import initialize_project
+from code_indexing_mcp.scanner import LANGUAGES, SourceScanner
 
 
 def test_scanner_honors_languages_gitignore_and_hard_exclusions(tmp_path: Path) -> None:
@@ -202,7 +202,7 @@ def test_scanner_never_walks_hard_excluded_directories(tmp_path: Path) -> None:
     git = root / ".git"
     git.mkdir()
     (git / "hook.py").write_text("hook = True\n")
-    for marker_directory in (".incode", ".ci-mcp"):
+    for marker_directory in (".code-indexing-mcp", ".ci-mcp"):
         marker = root / marker_directory
         marker.mkdir(exist_ok=True)
         (marker / "private.py").write_text("private = True\n")
@@ -212,7 +212,8 @@ def test_scanner_never_walks_hard_excluded_directories(tmp_path: Path) -> None:
 
     def fail_if_excluded_is_statted(path: Path, *args, **kwargs):
         if any(
-            excluded in path.parts for excluded in ("node_modules", ".git", ".incode", ".ci-mcp")
+            excluded in path.parts
+            for excluded in ("node_modules", ".git", ".code-indexing-mcp", ".ci-mcp")
         ):
             stat_failures.append(path)
             raise AssertionError(f"excluded path was statted: {path}")
@@ -261,7 +262,7 @@ def test_has_supported_source_applies_nested_gitignore_rules(tmp_path: Path) -> 
 def test_language_name_literal_matches_scanner_languages() -> None:
     from typing import get_args
 
-    from incode_mcp.models import LanguageName
-    from incode_mcp.scanner import LANGUAGES
+    from code_indexing_mcp.models import LanguageName
+    from code_indexing_mcp.scanner import LANGUAGES
 
     assert set(get_args(LanguageName)) == set(LANGUAGES.values())

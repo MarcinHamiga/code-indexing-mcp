@@ -10,7 +10,7 @@ from enum import StrEnum
 import psutil
 
 from .backends import Accelerator, parse_accelerator
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .token_batching import DEFAULT_MAX_TOKENS, DEFAULT_OVERLAP_TOKENS
 
 # The batch size ``auto`` resolves to when no calibration record applies. One
@@ -30,8 +30,8 @@ class IndexMode(StrEnum):
     MANUAL = "manual"
 
 
-def _configuration_error(name: str, value: str, expected: str) -> IncodeError:
-    return IncodeError(
+def _configuration_error(name: str, value: str, expected: str) -> CodeIndexingError:
+    return CodeIndexingError(
         ErrorCode.INVALID_CONFIGURATION,
         f"{name}={value!r} is invalid; expected {expected}",
         setting=name,
@@ -68,10 +68,10 @@ def _boolean(environment: Mapping[str, str], name: str, default: bool) -> bool:
 
 def _batch_size(environment: Mapping[str, str]) -> tuple[int, bool]:
     """Return the configured microbatch size and whether it was left automatic."""
-    raw = environment.get("INCODE_EMBED_BATCH_SIZE")
+    raw = environment.get("CODE_INDEXING_EMBED_BATCH_SIZE")
     if raw is None or raw.strip().lower() == "auto":
         return DEFAULT_AUTO_BATCH_SIZE, True
-    return _integer(environment, "INCODE_EMBED_BATCH_SIZE", 1, 1, MAX_BATCH_SIZE), False
+    return _integer(environment, "CODE_INDEXING_EMBED_BATCH_SIZE", 1, 1, MAX_BATCH_SIZE), False
 
 
 def _crossover(environment: Mapping[str, str]) -> tuple[int, bool]:
@@ -81,7 +81,7 @@ def _crossover(environment: Mapping[str, str]) -> tuple[int, bool]:
     run is smaller than the threshold, so the accelerator starts on the first
     chunk, exactly as it did before anything measured whether that paid.
     """
-    raw = environment.get("INCODE_EMBED_CROSSOVER")
+    raw = environment.get("CODE_INDEXING_EMBED_CROSSOVER")
     if raw is None or raw.strip().lower() == "auto":
         return 0, True
     if raw.strip().lower() == "off":
@@ -90,11 +90,13 @@ def _crossover(environment: Mapping[str, str]) -> tuple[int, bool]:
         value = int(raw)
     except ValueError as exc:
         raise _configuration_error(
-            "INCODE_EMBED_CROSSOVER", raw, "auto, off, or a character count"
+            "CODE_INDEXING_EMBED_CROSSOVER", raw, "auto, off, or a character count"
         ) from exc
     if not 0 <= value <= MAX_CROSSOVER_CHARACTERS:
         raise _configuration_error(
-            "INCODE_EMBED_CROSSOVER", raw, f"a character count up to {MAX_CROSSOVER_CHARACTERS}"
+            "CODE_INDEXING_EMBED_CROSSOVER",
+            raw,
+            f"a character count up to {MAX_CROSSOVER_CHARACTERS}",
         )
     return value, False
 
@@ -102,16 +104,16 @@ def _crossover(environment: Mapping[str, str]) -> tuple[int, bool]:
 def _memory_bytes(environment: Mapping[str, str], default_megabytes: int) -> int:
     """Resolve the indexing memory ceiling from either accepted variable.
 
-    ``INCODE_EMBED_MEMORY_MB`` is the documented name. ``INCODE_INDEX_MEMORY_MB``
+    ``CODE_INDEXING_EMBED_MEMORY_MB`` is the documented name. ``CODE_INDEXING_INDEX_MEMORY_MB``
     predates it and keeps working; the newer name wins when both are set.
     """
     # Truthiness, not membership: an exported-but-empty variable is how a shell
     # says "unset", and letting it win would both fail on int("") and shadow a
     # perfectly good value under the legacy name.
     name = (
-        "INCODE_EMBED_MEMORY_MB"
-        if environment.get("INCODE_EMBED_MEMORY_MB")
-        else "INCODE_INDEX_MEMORY_MB"
+        "CODE_INDEXING_EMBED_MEMORY_MB"
+        if environment.get("CODE_INDEXING_EMBED_MEMORY_MB")
+        else "CODE_INDEXING_INDEX_MEMORY_MB"
     )
     return _integer(environment, name, default_megabytes, 1024, 1024 * 1024) * 1024 * 1024
 
@@ -150,15 +152,15 @@ class IndexSettings:
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> IndexSettings:
         environment = os.environ if environment is None else environment
-        mode_raw = environment.get("INCODE_INDEX_MODE")
+        mode_raw = environment.get("CODE_INDEXING_INDEX_MODE")
         if mode_raw is None:
-            legacy = environment.get("INCODE_AUTO_INDEX")
+            legacy = environment.get("CODE_INDEXING_AUTO_INDEX")
             if legacy is None:
                 mode = IndexMode.LAZY
             else:
                 mode = (
                     IndexMode.EAGER
-                    if _boolean(environment, "INCODE_AUTO_INDEX", False)
+                    if _boolean(environment, "CODE_INDEXING_AUTO_INDEX", False)
                     else IndexMode.MANUAL
                 )
         else:
@@ -166,25 +168,27 @@ class IndexSettings:
                 mode = IndexMode(mode_raw.lower())
             except ValueError as exc:
                 raise _configuration_error(
-                    "INCODE_INDEX_MODE", mode_raw, "lazy, eager, or manual"
+                    "CODE_INDEXING_INDEX_MODE", mode_raw, "lazy, eager, or manual"
                 ) from exc
 
-        vector_index = environment.get("INCODE_VECTOR_INDEX", "exact").lower()
+        vector_index = environment.get("CODE_INDEXING_VECTOR_INDEX", "exact").lower()
         if vector_index not in {"exact", "hnsw"}:
-            raise _configuration_error("INCODE_VECTOR_INDEX", vector_index, "exact or hnsw")
-        execution = environment.get("INCODE_INDEX_EXECUTION", "worker").lower()
+            raise _configuration_error("CODE_INDEXING_VECTOR_INDEX", vector_index, "exact or hnsw")
+        execution = environment.get("CODE_INDEXING_INDEX_EXECUTION", "worker").lower()
         if execution not in {"worker", "in-process"}:
-            raise _configuration_error("INCODE_INDEX_EXECUTION", execution, "worker or in-process")
-        broker_mode = environment.get("INCODE_BROKER", "auto").lower()
+            raise _configuration_error(
+                "CODE_INDEXING_INDEX_EXECUTION", execution, "worker or in-process"
+            )
+        broker_mode = environment.get("CODE_INDEXING_BROKER", "auto").lower()
         if broker_mode not in {"auto", "on", "off"}:
-            raise _configuration_error("INCODE_BROKER", broker_mode, "auto, on, or off")
+            raise _configuration_error("CODE_INDEXING_BROKER", broker_mode, "auto, on, or off")
         default_memory_mb = max(
             1024,
             min(2048, int(psutil.virtual_memory().total * 0.25) // (1024 * 1024)),
         )
         batch_size, batch_auto = _batch_size(environment)
         crossover, crossover_auto = _crossover(environment)
-        accelerator = parse_accelerator(environment.get("INCODE_EMBED_ACCELERATOR", "auto"))
+        accelerator = parse_accelerator(environment.get("CODE_INDEXING_EMBED_ACCELERATOR", "auto"))
 
         return cls(
             mode=mode,
@@ -192,33 +196,33 @@ class IndexSettings:
             # The global index lock serializes every job on the machine, so a
             # cold index elsewhere can hold it for minutes; 0 disables waiting.
             index_wait_seconds=_integer(
-                environment, "INCODE_INDEX_WAIT_SECONDS", 300, 0, 24 * 60 * 60
+                environment, "CODE_INDEXING_INDEX_WAIT_SECONDS", 300, 0, 24 * 60 * 60
             ),
             embedding_batch_size=batch_size,
             embedding_batch_auto=batch_auto,
             embedding_crossover_characters=crossover,
             embedding_crossover_auto=crossover_auto,
-            embedding_calibrate=_boolean(environment, "INCODE_EMBED_CALIBRATE", True),
+            embedding_calibrate=_boolean(environment, "CODE_INDEXING_EMBED_CALIBRATE", True),
             embedding_accelerator=accelerator,
-            embedding_strict=_boolean(environment, "INCODE_EMBED_STRICT", False),
+            embedding_strict=_boolean(environment, "CODE_INDEXING_EMBED_STRICT", False),
             # Sequence length, not character count, drives embedding memory:
             # attention is quadratic in tokens. 1,024 keeps the widest window
             # well inside the model's 8,192-token limit and inside the default
             # memory ceiling even for token-dense minified source.
             embedding_max_tokens=_integer(
-                environment, "INCODE_EMBED_MAX_TOKENS", DEFAULT_MAX_TOKENS, 64, 8192
+                environment, "CODE_INDEXING_EMBED_MAX_TOKENS", DEFAULT_MAX_TOKENS, 64, 8192
             ),
             embedding_overlap_tokens=_integer(
-                environment, "INCODE_EMBED_OVERLAP_TOKENS", DEFAULT_OVERLAP_TOKENS, 0, 4096
+                environment, "CODE_INDEXING_EMBED_OVERLAP_TOKENS", DEFAULT_OVERLAP_TOKENS, 0, 4096
             ),
             embedding_threads=_integer(
                 environment,
-                "INCODE_EMBED_THREADS",
+                "CODE_INDEXING_EMBED_THREADS",
                 max(1, min(2, os.cpu_count() or 1)),
                 1,
                 64,
             ),
-            embedding_cpu_arena=_boolean(environment, "INCODE_EMBED_CPU_ARENA", False),
+            embedding_cpu_arena=_boolean(environment, "CODE_INDEXING_EMBED_CPU_ARENA", False),
             vector_index=vector_index,
             index_memory_bytes=_memory_bytes(environment, default_memory_mb),
             index_execution=execution,

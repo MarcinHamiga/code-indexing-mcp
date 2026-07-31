@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from incode_mcp.backends import Accelerator
-from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.settings import IndexMode, IndexSettings
+from code_indexing_mcp.backends import Accelerator
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.settings import IndexMode, IndexSettings
 
 
 def test_indexing_defaults_to_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("INCODE_INDEX_MODE", raising=False)
-    monkeypatch.delenv("INCODE_AUTO_INDEX", raising=False)
+    monkeypatch.delenv("CODE_INDEXING_INDEX_MODE", raising=False)
+    monkeypatch.delenv("CODE_INDEXING_AUTO_INDEX", raising=False)
 
     settings = IndexSettings.from_environment()
 
@@ -22,11 +22,11 @@ def test_indexing_defaults_to_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_index_wait_seconds_is_validated(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "0")
+    monkeypatch.setenv("CODE_INDEXING_INDEX_WAIT_SECONDS", "0")
     assert IndexSettings.from_environment().index_wait_seconds == 0
 
-    monkeypatch.setenv("INCODE_INDEX_WAIT_SECONDS", "-1")
-    with pytest.raises(IncodeError) as caught:
+    monkeypatch.setenv("CODE_INDEXING_INDEX_WAIT_SECONDS", "-1")
+    with pytest.raises(CodeIndexingError) as caught:
         IndexSettings.from_environment()
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
@@ -39,31 +39,31 @@ def test_index_wait_seconds_is_validated(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_legacy_auto_index_maps_to_index_mode(
     monkeypatch: pytest.MonkeyPatch, legacy: str, expected: IndexMode
 ) -> None:
-    monkeypatch.delenv("INCODE_INDEX_MODE", raising=False)
-    monkeypatch.setenv("INCODE_AUTO_INDEX", legacy)
+    monkeypatch.delenv("CODE_INDEXING_INDEX_MODE", raising=False)
+    monkeypatch.setenv("CODE_INDEXING_AUTO_INDEX", legacy)
 
     assert IndexSettings.from_environment().mode is expected
 
 
 def test_index_mode_takes_precedence_over_legacy_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("INCODE_INDEX_MODE", "manual")
-    monkeypatch.setenv("INCODE_AUTO_INDEX", "1")
+    monkeypatch.setenv("CODE_INDEXING_INDEX_MODE", "manual")
+    monkeypatch.setenv("CODE_INDEXING_AUTO_INDEX", "1")
 
     assert IndexSettings.from_environment().mode is IndexMode.MANUAL
 
 
 def test_invalid_index_settings_raise_stable_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("INCODE_EMBED_BATCH_SIZE", "0")
+    monkeypatch.setenv("CODE_INDEXING_EMBED_BATCH_SIZE", "0")
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         IndexSettings.from_environment()
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
 
 
 def test_memory_budget_override_and_worker_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("INCODE_INDEX_MEMORY_MB", "1536")
-    monkeypatch.delenv("INCODE_INDEX_EXECUTION", raising=False)
+    monkeypatch.setenv("CODE_INDEXING_INDEX_MEMORY_MB", "1536")
+    monkeypatch.delenv("CODE_INDEXING_INDEX_EXECUTION", raising=False)
 
     settings = IndexSettings.from_environment()
 
@@ -80,7 +80,7 @@ def test_token_window_settings_default_to_the_measured_budget() -> None:
 
 def test_token_window_settings_are_configurable() -> None:
     settings = IndexSettings.from_environment(
-        {"INCODE_EMBED_MAX_TOKENS": "512", "INCODE_EMBED_OVERLAP_TOKENS": "32"}
+        {"CODE_INDEXING_EMBED_MAX_TOKENS": "512", "CODE_INDEXING_EMBED_OVERLAP_TOKENS": "32"}
     )
 
     assert settings.embedding_max_tokens == 512
@@ -88,8 +88,8 @@ def test_token_window_settings_are_configurable() -> None:
 
 
 def test_a_token_budget_above_the_model_limit_is_rejected() -> None:
-    with pytest.raises(IncodeError) as caught:
-        IndexSettings.from_environment({"INCODE_EMBED_MAX_TOKENS": "16384"})
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment({"CODE_INDEXING_EMBED_MAX_TOKENS": "16384"})
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
 
@@ -113,32 +113,37 @@ def test_the_accelerator_defaults_to_automatic_selection() -> None:
     ],
 )
 def test_the_accelerator_is_configurable(value: str, expected: Accelerator) -> None:
-    settings = IndexSettings.from_environment({"INCODE_EMBED_ACCELERATOR": value})
+    settings = IndexSettings.from_environment({"CODE_INDEXING_EMBED_ACCELERATOR": value})
 
     assert settings.embedding_accelerator is expected
 
 
 def test_an_unknown_accelerator_is_a_configuration_error() -> None:
-    with pytest.raises(IncodeError) as caught:
-        IndexSettings.from_environment({"INCODE_EMBED_ACCELERATOR": "tpu"})
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment({"CODE_INDEXING_EMBED_ACCELERATOR": "tpu"})
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
 
 
 def test_strict_mode_is_configurable() -> None:
-    assert IndexSettings.from_environment({"INCODE_EMBED_STRICT": "1"}).embedding_strict is True
-    assert IndexSettings.from_environment({"INCODE_EMBED_STRICT": "off"}).embedding_strict is False
+    assert (
+        IndexSettings.from_environment({"CODE_INDEXING_EMBED_STRICT": "1"}).embedding_strict is True
+    )
+    assert (
+        IndexSettings.from_environment({"CODE_INDEXING_EMBED_STRICT": "off"}).embedding_strict
+        is False
+    )
 
 
 def test_an_automatic_batch_size_keeps_the_cpu_default() -> None:
-    settings = IndexSettings.from_environment({"INCODE_EMBED_BATCH_SIZE": "auto"})
+    settings = IndexSettings.from_environment({"CODE_INDEXING_EMBED_BATCH_SIZE": "auto"})
 
     assert settings.embedding_batch_size == 1
     assert settings.embedding_batch_auto is True
 
 
 def test_an_explicit_batch_size_is_marked_as_not_calibratable() -> None:
-    settings = IndexSettings.from_environment({"INCODE_EMBED_BATCH_SIZE": "64"})
+    settings = IndexSettings.from_environment({"CODE_INDEXING_EMBED_BATCH_SIZE": "64"})
 
     assert settings.embedding_batch_size == 64
     assert settings.embedding_batch_auto is False
@@ -155,50 +160,53 @@ def test_the_crossover_is_measured_by_default() -> None:
 def test_the_crossover_can_be_turned_off_entirely() -> None:
     """ "off" means the accelerator starts on the first chunk, which is what
     every run did before anything measured whether that paid."""
-    settings = IndexSettings.from_environment({"INCODE_EMBED_CROSSOVER": "off"})
+    settings = IndexSettings.from_environment({"CODE_INDEXING_EMBED_CROSSOVER": "off"})
 
     assert settings.embedding_crossover_auto is False
     assert settings.embedding_crossover_characters == 0
 
 
 def test_an_explicit_crossover_overrides_the_measured_one() -> None:
-    settings = IndexSettings.from_environment({"INCODE_EMBED_CROSSOVER": "250000"})
+    settings = IndexSettings.from_environment({"CODE_INDEXING_EMBED_CROSSOVER": "250000"})
 
     assert settings.embedding_crossover_auto is False
     assert settings.embedding_crossover_characters == 250_000
 
 
 def test_a_crossover_that_is_neither_a_mode_nor_a_size_is_rejected() -> None:
-    with pytest.raises(IncodeError) as caught:
-        IndexSettings.from_environment({"INCODE_EMBED_CROSSOVER": "sometimes"})
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment({"CODE_INDEXING_EMBED_CROSSOVER": "sometimes"})
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
 
 
 def test_calibration_can_be_declined() -> None:
     assert (
-        IndexSettings.from_environment({"INCODE_EMBED_CALIBRATE": "0"}).embedding_calibrate is False
+        IndexSettings.from_environment({"CODE_INDEXING_EMBED_CALIBRATE": "0"}).embedding_calibrate
+        is False
     )
 
 
 def test_the_batch_size_range_reaches_the_documented_maximum() -> None:
-    assert IndexSettings.from_environment({"INCODE_EMBED_BATCH_SIZE": "256"}).embedding_batch_size
+    assert IndexSettings.from_environment(
+        {"CODE_INDEXING_EMBED_BATCH_SIZE": "256"}
+    ).embedding_batch_size
 
-    with pytest.raises(IncodeError) as caught:
-        IndexSettings.from_environment({"INCODE_EMBED_BATCH_SIZE": "257"})
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment({"CODE_INDEXING_EMBED_BATCH_SIZE": "257"})
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
 
 
 def test_the_documented_memory_variable_is_accepted() -> None:
-    settings = IndexSettings.from_environment({"INCODE_EMBED_MEMORY_MB": "2048"})
+    settings = IndexSettings.from_environment({"CODE_INDEXING_EMBED_MEMORY_MB": "2048"})
 
     assert settings.index_memory_bytes == 2048 * 1024 * 1024
 
 
 def test_the_newer_memory_variable_wins_over_the_legacy_one() -> None:
     settings = IndexSettings.from_environment(
-        {"INCODE_EMBED_MEMORY_MB": "2048", "INCODE_INDEX_MEMORY_MB": "1024"}
+        {"CODE_INDEXING_EMBED_MEMORY_MB": "2048", "CODE_INDEXING_INDEX_MEMORY_MB": "1024"}
     )
 
     assert settings.index_memory_bytes == 2048 * 1024 * 1024
@@ -207,7 +215,7 @@ def test_the_newer_memory_variable_wins_over_the_legacy_one() -> None:
 def test_an_exported_but_empty_memory_variable_does_not_shadow_the_legacy_name() -> None:
     """An empty export is a shell saying "unset", not a value of zero length."""
     settings = IndexSettings.from_environment(
-        {"INCODE_EMBED_MEMORY_MB": "", "INCODE_INDEX_MEMORY_MB": "1536"}
+        {"CODE_INDEXING_EMBED_MEMORY_MB": "", "CODE_INDEXING_INDEX_MEMORY_MB": "1536"}
     )
 
     assert settings.index_memory_bytes == 1536 * 1024 * 1024

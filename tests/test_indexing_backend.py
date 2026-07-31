@@ -18,7 +18,7 @@ import pytest
 from test_indexing import RecordingEmbedder
 from test_token_batching import fake_encode
 
-from incode_mcp.backends import (
+from code_indexing_mcp.backends import (
     CPU_BACKEND,
     CPU_PROVIDER,
     Accelerator,
@@ -27,21 +27,21 @@ from incode_mcp.backends import (
     Precision,
     Stability,
 )
-from incode_mcp.embedding import (
+from code_indexing_mcp.embedding import (
     PROBE_TEXTS,
     PassageCandidate,
     SegmentPlan,
     embed_windows,
     plan_passages,
 )
-from incode_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig, WorkerTarget
-from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.extractor import TreeSitterExtractor
-from incode_mcp.indexing import Indexer
-from incode_mcp.passage_backend import PassageBackendSession
-from incode_mcp.projects import initialize_project
-from incode_mcp.scanner import SourceScanner
-from incode_mcp.storage import LanceStore
+from code_indexing_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig, WorkerTarget
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.extractor import TreeSitterExtractor
+from code_indexing_mcp.indexing import Indexer
+from code_indexing_mcp.passage_backend import PassageBackendSession
+from code_indexing_mcp.projects import initialize_project
+from code_indexing_mcp.scanner import SourceScanner
+from code_indexing_mcp.storage import LanceStore
 
 DIMENSION = 4
 CUDA_PROVIDER = "CUDAExecutionProvider"
@@ -323,7 +323,7 @@ def test_strict_mode_fails_the_run_instead_of_falling_back(tmp_path: Path) -> No
     project = initialize_project(_repository(tmp_path))
     indexer, store = _indexer(tmp_path, _session_factory(_unloadable_worker, strict=True))
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         indexer.index(project)
 
     assert caught.value.code is ErrorCode.BACKEND_UNAVAILABLE
@@ -360,7 +360,7 @@ def test_a_strict_failure_leaves_an_existing_index_intact(tmp_path: Path) -> Non
     for index in range(3):
         (root / f"module_{index}.py").write_text(f"def changed_{index}():\n    return {index}\n")
 
-    with pytest.raises(IncodeError) as caught:
+    with pytest.raises(CodeIndexingError) as caught:
         indexer_with(_session_factory(_crashing_worker, strict=True)).index(project)
 
     assert caught.value.code is ErrorCode.BACKEND_UNAVAILABLE
@@ -387,7 +387,7 @@ def test_the_index_recovers_on_the_next_run_after_a_backend_failure(tmp_path: Pa
             staging_directory=tmp_path / "staging",
         )
 
-    with pytest.raises(IncodeError):
+    with pytest.raises(CodeIndexingError):
         indexer_with(_session_factory(_unloadable_worker, strict=True)).index(project)
 
     # No file was stamped with the environment's failure, so the retry is a

@@ -307,7 +307,7 @@ def _is_stale_bundled_link(target: Path) -> bool:
     if not target.is_symlink():
         return False
     skills_dir = _link_destination(target).parent
-    return skills_dir.name == "skills" and skills_dir.parent.name == "incode_mcp"
+    return skills_dir.name == "skills" and skills_dir.parent.name == "code_indexing_mcp"
 
 
 def _link_skill(source: Path, target: Path) -> bool:
@@ -351,7 +351,7 @@ def install_skills(
     become "skipped" messages instead of raising.
     """
 
-    skills_source = install_directory / "src" / "incode_mcp" / "skills"
+    skills_source = install_directory / "src" / "code_indexing_mcp" / "skills"
     if not skills_source.is_dir():
         return [(slug, f"skipped: bundled skills not found at {skills_source}") for slug in slugs]
     skills = sorted(entry for entry in skills_source.iterdir() if (entry / "SKILL.md").is_file())

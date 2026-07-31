@@ -3,7 +3,7 @@
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add an idempotent cross-platform installer with interactive harness selection and move
-new project markers from `.incode` to `.ci-mcp` without breaking legacy marker discovery.
+new project markers from `.code-indexing-mcp` to `.ci-mcp` without breaking legacy marker discovery.
 
 **Architecture:** A standalone `install.py` owns clone/update, environment synchronization,
 interactive selection, and targeted user-configuration edits. A small `install.sh` bootstraps
@@ -19,23 +19,23 @@ read-only compatibility path for legacy markers.
 - Modify: `tests/test_application.py`
 - Modify: `tests/test_indexing.py`
 - Modify: `tests/test_scanner.py`
-- Modify: `src/incode_mcp/projects.py`
-- Modify: `src/incode_mcp/scanner.py`
+- Modify: `src/code_indexing_mcp/projects.py`
+- Modify: `src/code_indexing_mcp/scanner.py`
 
 **Step 1: Write the failing tests**
 
 Change marker assertions to `.ci-mcp`, add a project-resolution test with a hand-built legacy
-`.incode/project.toml`, and assert both marker directories are excluded from scans.
+`.code-indexing-mcp/project.toml`, and assert both marker directories are excluded from scans.
 
 **Step 2: Run tests to verify they fail**
 
 Run: `.venv/bin/pytest tests/test_projects.py tests/test_application.py tests/test_indexing.py tests/test_scanner.py -v`
 
-Expected: failures show new markers are still written under `.incode` and `.ci-mcp` is scanned.
+Expected: failures show new markers are still written under `.code-indexing-mcp` and `.ci-mcp` is scanned.
 
 **Step 3: Write the minimal implementation**
 
-Set `MARKER_DIRECTORY = ".ci-mcp"`, add `LEGACY_MARKER_DIRECTORY = ".incode"`, resolve the new
+Set `MARKER_DIRECTORY = ".ci-mcp"`, add `LEGACY_MARKER_DIRECTORY = ".code-indexing-mcp"`, resolve the new
 marker first and the legacy marker second, and hard-exclude both directory names.
 
 **Step 4: Run tests to verify they pass**

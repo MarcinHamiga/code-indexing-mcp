@@ -19,18 +19,18 @@ workflow that narrows down via the index before any grep/read fallback.
   `~/.local/share/code-indexing-mcp`, so `install.py` updates / fast-forward
   pulls refresh skills automatically.
 - **Skill set (4):** `codebase-exploration` (new), `feature-dev` (ported),
-  `indexed-review` (ported, renamed from `incode-review`), `impact-analysis`
+  `indexed-review` (ported, renamed from `code-indexing-mcp-review`), `impact-analysis`
   (new).
 - **Tool-name normalization:** all bundled skills reference
   `mcp__code-indexing-mcp__*` (the server name install.py registers). The
-  existing loose copies use inconsistent prefixes (`mcp__incode__*`).
+  existing loose copies use inconsistent prefixes (`mcp__code-indexing-mcp__*`).
 
 ## Components
 
 ### 1. Baseline behavior via server instructions
 
 Expand the `instructions=` string in `create_server()`
-(`src/incode_mcp/server.py`, currently the one-liner at ~line 189) into a short
+(`src/code_indexing_mcp/server.py`, currently the one-liner at ~line 189) into a short
 guidance block injected into every MCP client on connect:
 
 - Prefer `search_code` / `find_symbol` / `file_outline` / `get_chunk` over
@@ -42,9 +42,9 @@ Keep it to a few lines — instructions are injected into every context.
 
 ### 2. Bundled skills in the Python package
 
-New directory `src/incode_mcp/skills/`, shipped with the package (same
+New directory `src/code_indexing_mcp/skills/`, shipped with the package (same
 mechanism as `queries/*.scm` — files inside the package directory ride along
-with hatchling's `packages = ["src/incode_mcp"]`; verify the built wheel
+with hatchling's `packages = ["src/code_indexing_mcp"]`; verify the built wheel
 contains them). One folder per skill, each with a `SKILL.md`:
 
 - `codebase-exploration/SKILL.md` — index-first narrowing:
@@ -54,7 +54,7 @@ contains them). One folder per skill, each with a `SKILL.md`:
   matches semantic search can't express).
 - `feature-dev/SKILL.md` — ported from `~/.agents/skills/feature-dev/`,
   tool names normalized to `mcp__code-indexing-mcp__*`.
-- `indexed-review/SKILL.md` — ported from `~/.agents/skills/incode-review/`,
+- `indexed-review/SKILL.md` — ported from `~/.agents/skills/code-indexing-mcp-review/`,
   renamed (`name: indexed-review`), tool names normalized.
 - `impact-analysis/SKILL.md` — new; plays to `find_symbol`'s strength. Before
   a rename/refactor/signature change: map all definitions and call sites via
@@ -91,7 +91,7 @@ this iteration.
 
 - Harness without skill support → skip with note, never fail the install.
 - Unwritable skill dir → warn, continue with remaining harnesses.
-- Repo missing `src/incode_mcp/skills/` (old checkout) → skip with note.
+- Repo missing `src/code_indexing_mcp/skills/` (old checkout) → skip with note.
 
 ## Testing
 
@@ -99,7 +99,7 @@ this iteration.
   symlinks for skill-capable harnesses, skips unsupported ones, backs up
   clashing non-symlink entries, idempotent on re-run.
 - New test (e.g. `tests/test_skills.py`): every folder under
-  `src/incode_mcp/skills/` contains a `SKILL.md` with valid frontmatter
+  `src/code_indexing_mcp/skills/` contains a `SKILL.md` with valid frontmatter
   (`name`, `description`) and references only `mcp__code-indexing-mcp__*`
   tool prefixes.
 - Existing test suite must stay green (`uv run pytest`).

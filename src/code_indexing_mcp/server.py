@@ -24,7 +24,7 @@ from pydantic import Field
 
 from .application import Application
 from .daemon import BrokerApplication
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .models import (
     ChunkKind,
     CodeChunk,
@@ -207,7 +207,7 @@ class StartupCoordinator:
                     partial(self.application.index_project, project_id),
                     abandon_on_cancel=False,
                 )
-            except IncodeError as exc:
+            except CodeIndexingError as exc:
                 if exc.code is not ErrorCode.INDEX_BUSY:
                     raise
                 remaining = deadline - time.monotonic()
@@ -216,14 +216,14 @@ class StartupCoordinator:
                 await anyio.sleep(min(delay, remaining))
                 delay = min(delay * 2, MAXIMUM_RETRY_DELAY_SECONDS)
 
-    def _busy(self, waited: float, *, cause: IncodeError | None = None) -> IncodeError:
+    def _busy(self, waited: float, *, cause: CodeIndexingError | None = None) -> CodeIndexingError:
         message = (
             str(cause.args[0]) if cause is not None else "Another indexing job is already active"
         )
         details = dict(cause.details) if cause is not None else {}
         details["waited_seconds"] = round(waited, 3)
         details["wait_timeout_seconds"] = self.wait_seconds
-        return IncodeError(
+        return CodeIndexingError(
             ErrorCode.INDEX_BUSY,
             f"{message}; gave up after waiting {waited:.1f}s",
             **details,
@@ -371,9 +371,9 @@ class AutoIndexingMCP(FastMCP):
 def _with_error_details[**P, R](
     handler: Callable[P, Awaitable[R]],
 ) -> Callable[P, Awaitable[R]]:
-    """Re-raise IncodeError as a ToolError that keeps its code and details.
+    """Re-raise CodeIndexingError as a ToolError that keeps its code and details.
 
-    FastMCP stringifies an uncaught exception, and ``IncodeError.__str__`` omits
+    FastMCP stringifies an uncaught exception, and ``CodeIndexingError.__str__`` omits
     ``details`` on purpose, so the machine-readable half of every error — which
     project, how long it waited, which memory ceiling — never reached the client.
     ``functools.wraps`` keeps the signature FastMCP introspects for the schema.
@@ -383,7 +383,7 @@ def _with_error_details[**P, R](
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return await handler(*args, **kwargs)
-        except IncodeError as exc:
+        except CodeIndexingError as exc:
             raise ToolError(exc.for_client()) from exc
 
     return wrapper

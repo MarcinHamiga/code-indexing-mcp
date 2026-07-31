@@ -25,7 +25,7 @@ from .embedding import (
     pack_vector,
 )
 from .embedding_worker import TelemetrySource
-from .errors import ErrorCode, IncodeError
+from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
 from .models import ExtractedChunk, IndexIssue, IndexReport, ProjectInfo, SkippedFile, StoredFile
 from .scanner import SourceScanner
@@ -171,7 +171,7 @@ class Indexer:
             ):
                 report = self._index_locked(project, force=force)
         except Timeout as exc:
-            raise IncodeError(
+            raise CodeIndexingError(
                 ErrorCode.INDEX_BUSY,
                 f"Another indexing job is already active: {project.name}",
                 project=project.id,
@@ -414,7 +414,7 @@ class Indexer:
                     pending_chunks += len(extraction.chunks)
                     pending_chars += source_chars
                 except Exception as exc:
-                    if isinstance(exc, IncodeError) and exc.code in ENVIRONMENT_ERROR_CODES:
+                    if isinstance(exc, CodeIndexingError) and exc.code in ENVIRONMENT_ERROR_CODES:
                         # Not attributable to this file. Recording it below would
                         # stamp the file's current content hash and skip it on every
                         # later run, leaving a permanent hole in the index for what
@@ -579,7 +579,7 @@ class Indexer:
             )
         except Exception as exc:
             if isinstance(exc, MemoryError) or (
-                isinstance(exc, IncodeError) and exc.code in ENVIRONMENT_ERROR_CODES
+                isinstance(exc, CodeIndexingError) and exc.code in ENVIRONMENT_ERROR_CODES
             ):
                 raise
             if len(candidates) == 1:

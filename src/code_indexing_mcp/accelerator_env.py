@@ -38,7 +38,7 @@ RECORD_SCHEMA_VERSION = 1
 RECORD_FILENAME = "accelerator.json"
 # Points at a record elsewhere, for a machine whose data directory is not where
 # the installer wrote one -- and for tests, which need a record without one.
-RECORD_PATH_VARIABLE = "INCODE_ACCEL_ENV"
+RECORD_PATH_VARIABLE = "CODE_INDEXING_ACCEL_ENV"
 
 
 def interpreter_path(environment_directory: Path, *, platform_name: str | None = None) -> Path:

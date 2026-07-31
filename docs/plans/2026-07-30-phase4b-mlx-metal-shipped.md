@@ -61,7 +61,7 @@ gates against the corpus Phase 4A used:
 
 The promotion gate is 1.25×, so MLX was promoted to `AUTOMATIC` and `--accelerator auto` now
 prepares it on a supported Mac. The evidence is one machine rather than a matrix of Apple Silicon
-runners; reinstalling with `--accelerator cpu`, or setting `INCODE_EMBED_ACCELERATOR=cpu`, is the way
+runners; reinstalling with `--accelerator cpu`, or setting `CODE_INDEXING_EMBED_ACCELERATOR=cpu`, is the way
 back on a Mac where it does not hold.
 
 ## Verification commands
@@ -82,11 +82,11 @@ uv run --extra mlx pytest tests/test_mlx_backend.py
 Real-model and hardware gates:
 
 ```bash
-INCODE_MODEL_TEST_CACHE=/path/to/cache uv run --extra cpu pytest -m model
+CODE_INDEXING_MODEL_TEST_CACHE=/path/to/cache uv run --extra cpu pytest -m model
 
-INCODE_MODEL_TEST_CACHE=/path/to/cache \
-INCODE_ACCEL_ENV=/path/to/accelerator.json \
-INCODE_TEST_ACCELERATOR=mlx \
+CODE_INDEXING_MODEL_TEST_CACHE=/path/to/cache \
+CODE_INDEXING_ACCEL_ENV=/path/to/accelerator.json \
+CODE_INDEXING_TEST_ACCELERATOR=mlx \
   uv run --extra cpu pytest -m accelerator
 ```
 

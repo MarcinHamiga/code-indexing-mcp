@@ -5,7 +5,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from incode_mcp.accelerator_env import (
+from code_indexing_mcp.accelerator_env import (
     RECORD_FILENAME,
     RECORD_PATH_VARIABLE,
     AcceleratorEnvironment,
@@ -16,7 +16,7 @@ from incode_mcp.accelerator_env import (
     running_python_version,
     write_environment,
 )
-from incode_mcp.backends import ACCELERATOR_BACKENDS, CPU_BACKEND, Accelerator
+from code_indexing_mcp.backends import ACCELERATOR_BACKENDS, CPU_BACKEND, Accelerator
 
 CUDA_BACKEND = next(
     backend for backend in ACCELERATOR_BACKENDS if backend.accelerator is Accelerator.CUDA

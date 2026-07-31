@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from incode_mcp import embedding
-from incode_mcp.embedding import (
+from code_indexing_mcp import embedding
+from code_indexing_mcp.embedding import (
     FastEmbedder,
     PassageCandidate,
     SegmentPlan,

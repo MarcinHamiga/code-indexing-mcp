@@ -328,7 +328,7 @@ def ensure_converted_weights(
     ceiling and normally happens during installation, where no ceiling applies.
     A worker that does hit the ceiling here reports it and the run finishes on
     CPU, leaving the conversion for a reinstall or a larger
-    ``INCODE_EMBED_MEMORY_MB``.
+    ``CODE_INDEXING_EMBED_MEMORY_MB``.
     """
     import mlx.core as mx
 

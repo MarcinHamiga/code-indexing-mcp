@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from incode_mcp.backends import (
+from code_indexing_mcp.backends import (
     CPU_BACKEND,
     CPU_PROVIDER,
     Accelerator,
@@ -17,12 +17,12 @@ from incode_mcp.backends import (
     Precision,
     Stability,
 )
-from incode_mcp.calibration import CalibrationResult
-from incode_mcp.embedding import PROBE_TEXTS, PassageCandidate, SegmentPlan
-from incode_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig, WorkerTarget
-from incode_mcp.errors import ErrorCode, IncodeError
-from incode_mcp.passage_backend import PassageBackendSession
-from incode_mcp.probe_cache import ProbeCache, ProbeKey
+from code_indexing_mcp.calibration import CalibrationResult
+from code_indexing_mcp.embedding import PROBE_TEXTS, PassageCandidate, SegmentPlan
+from code_indexing_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig, WorkerTarget
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.passage_backend import PassageBackendSession
+from code_indexing_mcp.probe_cache import ProbeCache, ProbeKey
 
 DIMENSION = 4
 CUDA_PROVIDER = "CUDAExecutionProvider"
@@ -355,7 +355,7 @@ def test_the_accelerator_worker_is_terminated_when_it_is_abandoned() -> None:
 
 def test_strict_mode_refuses_the_fallback_when_verification_fails() -> None:
     with (
-        pytest.raises(IncodeError) as caught,
+        pytest.raises(CodeIndexingError) as caught,
         _backend(_dead_on_initialize_worker, strict=True) as backend,
     ):
         backend.plan_and_embed(_candidates(1), PLAN)
@@ -366,7 +366,7 @@ def test_strict_mode_refuses_the_fallback_when_verification_fails() -> None:
 
 def test_strict_mode_refuses_the_fallback_when_a_worker_dies_mid_run() -> None:
     with (
-        pytest.raises(IncodeError) as caught,
+        pytest.raises(CodeIndexingError) as caught,
         _backend(_dies_after_first_batch_worker, strict=True) as backend,
     ):
         backend.plan_and_embed(_candidates(1), PLAN)
@@ -385,7 +385,7 @@ def test_strict_mode_fails_before_any_work_when_the_selection_was_denied() -> No
     )
 
     with (
-        pytest.raises(IncodeError) as caught,
+        pytest.raises(CodeIndexingError) as caught,
         _backend(_healthy_worker, strict=True, selection=denied),
     ):
         pass
@@ -557,7 +557,7 @@ def test_strict_mode_reports_no_degradation_because_it_permits_none() -> None:
     remembered: list[BackendSelection] = []
 
     with (
-        pytest.raises(IncodeError),
+        pytest.raises(CodeIndexingError),
         _backend(_dead_on_initialize_worker, strict=True, on_degrade=remembered.append) as backend,
     ):
         backend.plan_and_embed(_candidates(1), PLAN)
@@ -659,7 +659,7 @@ def test_a_deferred_run_that_cannot_embed_on_cpu_does_not_try_the_accelerator() 
         _backend(
             _healthy_worker, cpu_target=_dead_on_initialize_worker, crossover_characters=10_000
         ) as backend,
-        pytest.raises(IncodeError),
+        pytest.raises(CodeIndexingError),
     ):
         backend.plan_and_embed(_sized_candidates(1, 10), PLAN)
 
@@ -751,7 +751,7 @@ def test_a_size_an_overrun_forced_down_is_used_for_the_rest_of_the_run() -> None
 def test_the_run_that_measured_a_size_embeds_at_it(monkeypatch: pytest.MonkeyPatch) -> None:
     """Otherwise the sweep is paid for by a run that cannot benefit from it."""
     monkeypatch.setattr(
-        "incode_mcp.passage_backend.calibrate",
+        "code_indexing_mcp.passage_backend.calibrate",
         lambda *args, **kwargs: CalibrationResult(
             max_items=4, characters_per_second=1_000.0, load_ns=1
         ),

@@ -11,37 +11,37 @@ import numpy as np
 import pytest
 from test_model_integration import GOLDEN_PASSAGES, GOLDEN_QUERIES
 
-from incode_mcp.accelerator_env import load_environment
-from incode_mcp.acceptance import cosine_rows, top_k_overlap
-from incode_mcp.application import Application, RuntimePaths
-from incode_mcp.backends import Accelerator, backend_for
-from incode_mcp.benchmark import write_benchmark_corpus
-from incode_mcp.embedding import DEFAULT_DIMENSION, FastEmbedder
-from incode_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig
-from incode_mcp.settings import IndexSettings
-from incode_mcp.worker_launcher import ExternalInterpreterLauncher
+from code_indexing_mcp.accelerator_env import load_environment
+from code_indexing_mcp.acceptance import cosine_rows, top_k_overlap
+from code_indexing_mcp.application import Application, RuntimePaths
+from code_indexing_mcp.backends import Accelerator, backend_for
+from code_indexing_mcp.benchmark import write_benchmark_corpus
+from code_indexing_mcp.embedding import DEFAULT_DIMENSION, FastEmbedder
+from code_indexing_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig
+from code_indexing_mcp.settings import IndexSettings
+from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher
 
 GATED_ACCELERATORS = (Accelerator.MLX, Accelerator.WEBGPU, Accelerator.MIGRAPHX)
 _NAMES = ", ".join(accelerator.value for accelerator in GATED_ACCELERATORS)
 
 
 def _accelerator() -> Accelerator:
-    configured = os.environ.get("INCODE_TEST_ACCELERATOR")
+    configured = os.environ.get("CODE_INDEXING_TEST_ACCELERATOR")
     if not configured:
-        pytest.skip(f"set INCODE_TEST_ACCELERATOR to one of {_NAMES} on a prepared runner")
+        pytest.skip(f"set CODE_INDEXING_TEST_ACCELERATOR to one of {_NAMES} on a prepared runner")
     try:
         accelerator = Accelerator(configured.lower())
     except ValueError:
-        pytest.fail(f"INCODE_TEST_ACCELERATOR names unknown backend {configured!r}")
+        pytest.fail(f"CODE_INDEXING_TEST_ACCELERATOR names unknown backend {configured!r}")
     if accelerator not in GATED_ACCELERATORS:
-        pytest.fail(f"INCODE_TEST_ACCELERATOR must be one of {_NAMES}")
+        pytest.fail(f"CODE_INDEXING_TEST_ACCELERATOR must be one of {_NAMES}")
     return accelerator
 
 
 def _cache() -> Path:
-    configured = os.environ.get("INCODE_MODEL_TEST_CACHE")
+    configured = os.environ.get("CODE_INDEXING_MODEL_TEST_CACHE")
     if not configured:
-        pytest.fail("INCODE_MODEL_TEST_CACHE must point at the prepared model cache")
+        pytest.fail("CODE_INDEXING_MODEL_TEST_CACHE must point at the prepared model cache")
     return Path(configured)
 
 
@@ -50,7 +50,7 @@ def _prepared_worker(accelerator: Accelerator, cache: Path) -> EmbeddingWorkerSe
     record = status.environment
     if record is None:
         pytest.fail(
-            "INCODE_ACCEL_ENV must point at a verified accelerator record"
+            "CODE_INDEXING_ACCEL_ENV must point at a verified accelerator record"
             + (f": {status.reason}" if status.reason else "")
         )
     if record.accelerator is not accelerator:

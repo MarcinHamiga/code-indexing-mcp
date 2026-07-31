@@ -386,23 +386,23 @@ def _environment(
     offline: bool,
 ) -> dict[str, str]:
     environment = dict(os.environ)
-    environment["INCODE_DATA_DIR"] = str(data_directory)
-    environment["INCODE_CACHE_DIR"] = str(cache_directory)
-    environment["INCODE_EMBED_BATCH_SIZE"] = str(batch_size)
-    environment["INCODE_BROKER"] = "off"
+    environment["CODE_INDEXING_DATA_DIR"] = str(data_directory)
+    environment["CODE_INDEXING_CACHE_DIR"] = str(cache_directory)
+    environment["CODE_INDEXING_EMBED_BATCH_SIZE"] = str(batch_size)
+    environment["CODE_INDEXING_BROKER"] = "off"
     # The ceiling this run reports must be the ceiling it ran under. Both names
     # are cleared before the requested one is set, because the shell running
     # this script is exactly the one the README tells developers to export
-    # INCODE_EMBED_MEMORY_MB into, and an inherited value outranks the legacy
+    # CODE_INDEXING_EMBED_MEMORY_MB into, and an inherited value outranks the legacy
     # name -- which would silently override --memory-mb.
-    for inherited in ("INCODE_EMBED_MEMORY_MB", "INCODE_INDEX_MEMORY_MB"):
+    for inherited in ("CODE_INDEXING_EMBED_MEMORY_MB", "CODE_INDEXING_INDEX_MEMORY_MB"):
         environment.pop(inherited, None)
     if memory_mb is not None:
-        environment["INCODE_EMBED_MEMORY_MB"] = str(memory_mb)
+        environment["CODE_INDEXING_EMBED_MEMORY_MB"] = str(memory_mb)
     if offline:
-        environment["INCODE_OFFLINE"] = "1"
+        environment["CODE_INDEXING_OFFLINE"] = "1"
     else:
-        environment.pop("INCODE_OFFLINE", None)
+        environment.pop("CODE_INDEXING_OFFLINE", None)
     return environment
 
 
@@ -524,7 +524,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     # Outside the repository on purpose: the corpus must not be picked up by the
     # project's own scanner, .gitignore rules, or editors.
-    workspace = args.work_dir or Path(tempfile.mkdtemp(prefix="incode-benchmark-"))
+    workspace = args.work_dir or Path(tempfile.mkdtemp(prefix="code-indexing-mcp-benchmark-"))
     workspace.mkdir(parents=True, exist_ok=True)
     root = workspace / "corpus"
     shapes = [shape for shape in args.shapes.split(",") if shape]
@@ -542,7 +542,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         memory_mb=args.memory_mb,
         offline=offline,
         sample_interval=args.sample_interval,
-        command_prefix=[sys.executable, "-m", "incode_mcp.cli"],
+        command_prefix=[sys.executable, "-m", "code_indexing_mcp.cli"],
     )
 
     baseline = None
@@ -561,7 +561,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # overridable from the environment. What must not happen is a run
             # that measured one backend while the document implied another --
             # the resolved backend is in run.report.embedding_backend.
-            "accelerator": os.environ.get("INCODE_EMBED_ACCELERATOR", "auto"),
+            "accelerator": os.environ.get("CODE_INDEXING_EMBED_ACCELERATOR", "auto"),
             "offline": offline,
             "sample_interval": args.sample_interval,
             "workspace": str(workspace),

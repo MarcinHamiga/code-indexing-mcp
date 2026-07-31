@@ -81,10 +81,10 @@ already in hand. `ScannedFile.content` exists for precisely this (`models.py:69`
 
 | File | Responsibility after this plan |
 |---|---|
-| `src/incode_mcp/storage.py` | `_partitions` becomes a bounded LRU; `list_chunks` projects away the vector. |
-| `src/incode_mcp/models.py` | `IndexedChunk` (stored chunk minus vector) is introduced and `StoredChunk` extends it. |
-| `src/incode_mcp/scanner.py` | Task 3 only: stops reading file contents. |
-| `src/incode_mcp/indexing.py` | Task 3 only: validates content where it is already read, and accounts for skips. |
+| `src/code_indexing_mcp/storage.py` | `_partitions` becomes a bounded LRU; `list_chunks` projects away the vector. |
+| `src/code_indexing_mcp/models.py` | `IndexedChunk` (stored chunk minus vector) is introduced and `StoredChunk` extends it. |
+| `src/code_indexing_mcp/scanner.py` | Task 3 only: stops reading file contents. |
+| `src/code_indexing_mcp/indexing.py` | Task 3 only: validates content where it is already read, and accounts for skips. |
 | `tests/test_storage.py` | Gains LRU eviction and projection tests. |
 | `tests/test_scanner.py`, `tests/test_indexing.py` | Task 3 only: the binary/encoding assertions move from scanner to indexer. |
 
@@ -93,7 +93,7 @@ already in hand. `ScannedFile.content` exists for precisely this (`models.py:69`
 ### Task 1: Bound the partition cache with an LRU
 
 **Files:**
-- Modify: `src/incode_mcp/storage.py:58-83` (constructor), `:347-355` (`remove_project`),
+- Modify: `src/code_indexing_mcp/storage.py:58-83` (constructor), `:347-355` (`remove_project`),
   `:419-464` (`_tables`, `_existing_tables`)
 - Test: `tests/test_storage.py`
 
@@ -115,7 +115,7 @@ def test_partition_cache_evicts_least_recently_used(tmp_path: Path) -> None:
     Without a bound, two open LanceTable handles per project accumulate for the life
     of the process.
     """
-    from incode_mcp import storage as storage_module
+    from code_indexing_mcp import storage as storage_module
 
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     projects = []
@@ -136,7 +136,7 @@ def test_partition_cache_evicts_least_recently_used(tmp_path: Path) -> None:
 
 
 def test_partition_cache_keeps_recently_used_entries(tmp_path: Path) -> None:
-    from incode_mcp import storage as storage_module
+    from code_indexing_mcp import storage as storage_module
 
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     ids = []
@@ -162,7 +162,7 @@ def test_partition_cache_keeps_recently_used_entries(tmp_path: Path) -> None:
 
 def test_evicted_partition_reopens_with_its_data(tmp_path: Path) -> None:
     """Eviction is a cache decision, never a data decision."""
-    from incode_mcp import storage as storage_module
+    from code_indexing_mcp import storage as storage_module
 
     store, project, chunk_id = _store_with_one_chunk(tmp_path)
     for index in range(storage_module.MAX_CACHED_PARTITIONS + 1):
@@ -187,12 +187,12 @@ shared block. Also confirm `ProjectInfo` is imported in that file.
 
 Run: `.venv/bin/python -m pytest tests/test_storage.py -k partition_cache -v`
 
-Expected: FAIL — `AttributeError: module 'incode_mcp.storage' has no attribute
+Expected: FAIL — `AttributeError: module 'code_indexing_mcp.storage' has no attribute
 'MAX_CACHED_PARTITIONS'`.
 
 - [ ] **Step 3: Write the implementation**
 
-In `src/incode_mcp/storage.py`, add the import and constant:
+In `src/code_indexing_mcp/storage.py`, add the import and constant:
 
 ```python
 from collections import OrderedDict
@@ -313,7 +313,7 @@ surface a locking mistake.
 
 ```bash
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy src tests
-git add src/incode_mcp/storage.py tests/test_storage.py
+git add src/code_indexing_mcp/storage.py tests/test_storage.py
 git commit -m "fix: bound the per-project table cache with an LRU"
 ```
 
@@ -322,8 +322,8 @@ git commit -m "fix: bound the per-project table cache with an LRU"
 ### Task 2: Stop `list_chunks` reading embedding vectors
 
 **Files:**
-- Modify: `src/incode_mcp/models.py:122-141`
-- Modify: `src/incode_mcp/storage.py:173-181`
+- Modify: `src/code_indexing_mcp/models.py:122-141`
+- Modify: `src/code_indexing_mcp/storage.py:173-181`
 - Test: `tests/test_storage.py`
 
 **Interfaces:**
@@ -339,7 +339,7 @@ Append to `tests/test_storage.py`:
 ```python
 def test_list_chunks_does_not_materialize_vectors(tmp_path: Path) -> None:
     """Nothing in production calls list_chunks; the vectors were read for no one."""
-    from incode_mcp.models import IndexedChunk
+    from code_indexing_mcp.models import IndexedChunk
 
     store, project, _ = _store_with_one_chunk(tmp_path)
 
@@ -356,7 +356,7 @@ def test_list_chunks_does_not_materialize_vectors(tmp_path: Path) -> None:
 
 def test_stored_chunk_still_carries_its_vector(tmp_path: Path) -> None:
     """The write path is unaffected: StoredChunk keeps the vector it commits."""
-    from incode_mcp.models import IndexedChunk, StoredChunk
+    from code_indexing_mcp.models import IndexedChunk, StoredChunk
 
     assert issubclass(StoredChunk, IndexedChunk)
     assert "vector" in StoredChunk.model_fields
@@ -370,11 +370,11 @@ def test_stored_chunk_still_carries_its_vector(tmp_path: Path) -> None:
 
 Run: `.venv/bin/python -m pytest tests/test_storage.py -k "list_chunks_does_not or still_carries" -v`
 
-Expected: FAIL — `ImportError: cannot import name 'IndexedChunk' from 'incode_mcp.models'`.
+Expected: FAIL — `ImportError: cannot import name 'IndexedChunk' from 'code_indexing_mcp.models'`.
 
 - [ ] **Step 3: Split the model**
 
-In `src/incode_mcp/models.py`, replace the `StoredChunk` definition at lines 122-141:
+In `src/code_indexing_mcp/models.py`, replace the `StoredChunk` definition at lines 122-141:
 
 ```python
 class IndexedChunk(FrozenModel):
@@ -412,7 +412,7 @@ class StoredChunk(IndexedChunk):
 
 - [ ] **Step 4: Project the columns in `list_chunks`**
 
-In `src/incode_mcp/storage.py`, add `IndexedChunk` to the models import, add the column list beside
+In `src/code_indexing_mcp/storage.py`, add `IndexedChunk` to the models import, add the column list beside
 the other projections:
 
 ```python
@@ -472,7 +472,7 @@ Expected: all pass. `tests/test_indexing.py` has ten `list_chunks` call sites re
 ```bash
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy src tests
-git add src/incode_mcp/models.py src/incode_mcp/storage.py tests/test_storage.py
+git add src/code_indexing_mcp/models.py src/code_indexing_mcp/storage.py tests/test_storage.py
 git commit -m "perf: project away embedding vectors in list_chunks"
 ```
 
@@ -488,9 +488,9 @@ git commit -m "perf: project away embedding vectors in list_chunks"
 > otherwise. Tasks 1 and 2 stand alone without it.
 
 **Files:**
-- Modify: `src/incode_mcp/scanner.py:114-151`
-- Modify: `src/incode_mcp/indexing.py:168-296`
-- Modify: `src/incode_mcp/models.py:63-69` (drop the now-dead `content` field)
+- Modify: `src/code_indexing_mcp/scanner.py:114-151`
+- Modify: `src/code_indexing_mcp/indexing.py:168-296`
+- Modify: `src/code_indexing_mcp/models.py:63-69` (drop the now-dead `content` field)
 - Test: `tests/test_scanner.py:76-92`, `tests/test_indexing.py`
 
 **Interfaces:**
@@ -608,7 +608,7 @@ Expected: FAIL — `AssertionError: scan must not read .../ok.py`, and
 
 - [ ] **Step 3: Stop the scanner reading**
 
-In `src/incode_mcp/scanner.py`, replace the body of the per-candidate loop in `scan` from the
+In `src/code_indexing_mcp/scanner.py`, replace the body of the per-candidate loop in `scan` from the
 `previous = known_files.get(...)` line through the `files.append(...)` call:
 
 ```python
@@ -644,7 +644,7 @@ Then remove `content: bytes | None = None` from `ScannedFile` in `models.py:63-6
 
 - [ ] **Step 4: Validate content in the indexer**
 
-In `src/incode_mcp/indexing.py`, add the helper above the `Indexer` class:
+In `src/code_indexing_mcp/indexing.py`, add the helper above the `Indexer` class:
 
 ```python
 def _content_rejection(source: bytes) -> str | None:
@@ -718,9 +718,9 @@ reclassification rather than a lost file before updating the number.
 .venv/bin/python - <<'PY'
 import os, tempfile
 from pathlib import Path
-os.environ["INCODE_OFFLINE"] = "1"
-os.environ["INCODE_INDEX_EXECUTION"] = "in-process"
-from incode_mcp.application import Application, RuntimePaths
+os.environ["CODE_INDEXING_OFFLINE"] = "1"
+os.environ["CODE_INDEXING_INDEX_EXECUTION"] = "in-process"
+from code_indexing_mcp.application import Application, RuntimePaths
 
 class F:
     model_id = "f"; dimension = 8
@@ -757,7 +757,7 @@ Expected: `reads per file [1], total 25 (was 50)` and `warm re-index: unchanged=
 ```bash
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy src tests
-git add src/incode_mcp/scanner.py src/incode_mcp/indexing.py src/incode_mcp/models.py tests/
+git add src/code_indexing_mcp/scanner.py src/code_indexing_mcp/indexing.py src/code_indexing_mcp/models.py tests/
 git commit -m "perf: read each changed file once by validating content in the indexer"
 ```
 
