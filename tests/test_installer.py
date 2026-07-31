@@ -523,7 +523,7 @@ def test_repository_update_rejects_non_repo_dirty_and_mismatched_targets(
 
 
 def test_sync_environment_runs_locked_sync_and_finds_server(tmp_path: Path) -> None:
-    """The serving environment is pinned to the CPU extra, which is not optional."""
+    """The serving environment is pinned to the CPU extra plus the TUI extra."""
     installer = load_installer()
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -536,6 +536,8 @@ def test_sync_environment_runs_locked_sync_and_finds_server(tmp_path: Path) -> N
             'if not "%~2"=="--locked" exit /b 1\r\n'
             'if not "%~3"=="--extra" exit /b 1\r\n'
             'if not "%~4"=="cpu" exit /b 1\r\n'
+            'if not "%~5"=="--extra" exit /b 1\r\n'
+            'if not "%~6"=="tui" exit /b 1\r\n'
             "md .venv\\Scripts\r\n"
             "type nul > .venv\\Scripts\\code-indexing-mcp.exe\r\n",
             newline="",
@@ -548,6 +550,8 @@ def test_sync_environment_runs_locked_sync_and_finds_server(tmp_path: Path) -> N
             'test "$2" = "--locked"\n'
             'test "$3" = "--extra"\n'
             'test "$4" = "cpu"\n'
+            'test "$5" = "--extra"\n'
+            'test "$6" = "tui"\n'
             "mkdir -p .venv/bin\n"
             "touch .venv/bin/code-indexing-mcp\n"
         )
@@ -602,124 +606,116 @@ def test_configure_selected_harnesses_isolates_non_utf8_config(tmp_path: Path) -
     assert (tmp_path / ".kimi-code" / "mcp.json").exists()
 
 
-def test_main_runs_noninteractive_install_and_reports_harness_failures(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_main_delegates_to_the_module_cli_with_forwarded_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     installer = load_installer()
     checkout = tmp_path / "checkout"
-    command = checkout / ".venv" / "bin" / "code-indexing-mcp"
-    calls: list[object] = []
-    output: list[str] = []
-    errors: list[str] = []
-
-    def fake_repository(repository_url: str, install_directory: Path) -> str:
-        calls.append(("repository", repository_url, install_directory))
-        return "installed"
-
-    def fake_sync(install_directory: Path) -> Path:
-        calls.append(("sync", install_directory))
-        return command
-
-    def fake_configure(
-        slugs: list[str], server_command: Path
-    ) -> tuple[list[tuple[str, Path]], list[tuple[str, str]]]:
-        calls.append(("configure", slugs, server_command))
-        return [("codex", tmp_path / "config.toml")], [("kimi-code", "invalid JSON")]
-
-    monkeypatch.setattr(installer, "clone_or_update_repository", fake_repository)
-    monkeypatch.setattr(installer, "sync_environment", fake_sync)
-    monkeypatch.setattr(installer, "configure_selected_harnesses", fake_configure)
-    # This checkout has no interpreter to interrogate; accelerator planning has
-    # its own tests, and letting it run here would only add its own diagnosis to
-    # the harness failures this one is about.
     monkeypatch.setattr(
-        installer,
-        "configure_accelerator",
-        lambda *_args, **_kwargs: installer.AcceleratorPlan("cpu", "CPU was requested"),
+        installer, "clone_or_update_repository", lambda url, directory: "installed"
+    )
+    monkeypatch.setattr(installer, "sync_environment", lambda directory: checkout / "server")
+    monkeypatch.setattr(installer, "tui_available", lambda: False)
+    delegated: list[list[str]] = []
+    monkeypatch.setattr(
+        installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0
     )
 
-    status = installer.main(
+    code = installer.main(
         [
-            "--repo-url",
-            "https://example.test/repo.git",
             "--install-dir",
             str(checkout),
+            "--accelerator",
+            "mlx",
             "--harnesses",
             "codex,kimi-code",
-        ],
-        output_fn=output.append,
-        error_fn=errors.append,
+            "--set",
+            "INCODE_OFFLINE=1",
+            "--unset",
+            "INCODE_BROKER",
+            "--offline",
+        ]
     )
 
-    assert status == 1
-    assert calls == [
-        ("repository", "https://example.test/repo.git", checkout),
-        ("sync", checkout),
-        ("configure", ["codex", "kimi-code"], command),
-    ]
-    assert any("Installed repository" in line for line in output)
-    assert any("Configured Codex" in line for line in output)
-    assert errors == ["Failed to configure Kimi Code: invalid JSON"]
+    assert code == 0
+    (tail,) = delegated
+    assert tail[:4] == ["--install-dir", str(checkout), "--accelerator", "mlx"]
+    for fragment in (
+        ["--harnesses", "codex,kimi-code"],
+        ["--set", "INCODE_OFFLINE=1"],
+        ["--unset", "INCODE_BROKER"],
+        ["--offline"],
+    ):
+        assert any(tail[index : index + len(fragment)] == fragment for index in range(len(tail)))
+    assert "--tui" not in tail
+    assert "Installed repository" in capsys.readouterr().out
 
 
-def test_main_prompts_for_harnesses_when_option_is_omitted(
+def test_main_adds_tui_flag_on_a_capable_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     installer = load_installer()
-    selected: list[str] = []
-    output: list[str] = []
-
+    monkeypatch.setattr(installer, "clone_or_update_repository", lambda url, directory: "updated")
+    monkeypatch.setattr(installer, "sync_environment", lambda directory: tmp_path / "server")
+    monkeypatch.setattr(installer, "tui_available", lambda: True)
+    delegated: list[list[str]] = []
     monkeypatch.setattr(
-        installer,
-        "clone_or_update_repository",
-        lambda repository_url, install_directory: "updated",
+        installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0
     )
+
+    assert installer.main(["--install-dir", str(tmp_path / "checkout")]) == 0
+    assert "--tui" in delegated[0]
+
+
+def test_main_no_tui_flag_suppresses_the_wizard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    monkeypatch.setattr(installer, "clone_or_update_repository", lambda url, directory: "updated")
+    monkeypatch.setattr(installer, "sync_environment", lambda directory: tmp_path / "server")
+    monkeypatch.setattr(installer, "tui_available", lambda: True)
+    delegated: list[list[str]] = []
     monkeypatch.setattr(
-        installer,
-        "sync_environment",
-        lambda install_directory: tmp_path / "server",
+        installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0
     )
 
-    def fake_configure(
-        slugs: list[str], command: Path
-    ) -> tuple[list[tuple[str, Path]], list[tuple[str, str]]]:
-        selected.extend(slugs)
-        return [], []
-
-    monkeypatch.setattr(installer, "configure_selected_harnesses", fake_configure)
-
-    status = installer.main(
-        ["--install-dir", str(tmp_path / "checkout")],
-        input_fn=lambda prompt: "1,3",
-        output_fn=output.append,
-        error_fn=output.append,
-    )
-
-    assert status == 0
-    assert selected == ["codex", "kimi-code"]
-    assert any("Codex (CLI + Desktop)" in line for line in output)
-    assert any("Updated repository" in line for line in output)
+    assert installer.main(["--install-dir", str(tmp_path / "checkout"), "--no-tui"]) == 0
+    assert "--tui" not in delegated[0]
 
 
 def test_main_reports_actionable_installer_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     installer = load_installer()
-    errors: list[str] = []
 
     def fail(repository_url: str, install_directory: Path) -> str:
         raise installer.InstallerError("Git is required")
 
     monkeypatch.setattr(installer, "clone_or_update_repository", fail)
 
-    status = installer.main(
-        ["--install-dir", str(tmp_path / "checkout"), "--harnesses", ""],
-        output_fn=lambda message: None,
-        error_fn=errors.append,
-    )
+    status = installer.main(["--install-dir", str(tmp_path / "checkout")])
 
     assert status == 1
-    assert errors == ["Error: Git is required"]
+    assert "Error: Git is required" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("tty", "term", "expected"),
+    [
+        (True, "xterm-256color", True),
+        (True, "dumb", False),
+        (True, "", False),
+        (False, "xterm", False),
+    ],
+)
+def test_tui_available_detects_capable_terminals(
+    monkeypatch: pytest.MonkeyPatch, tty: bool, term: str, expected: bool
+) -> None:
+    installer = load_installer()
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: tty)
+    monkeypatch.setattr(installer.sys.stdout, "isatty", lambda: tty)
+    monkeypatch.setenv("TERM", term)
+    assert installer.tui_available() is expected
 
 
 @pytest.mark.skipif(
