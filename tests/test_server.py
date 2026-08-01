@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from mcp import types
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 
+from code_indexing_mcp import server as server_module
 from code_indexing_mcp.application import Application, RuntimePaths
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.server import create_server
@@ -907,3 +909,48 @@ async def test_tool_error_carries_code_and_details(tmp_path: Path) -> None:
     assert "CHUNK_NOT_FOUND" in message
     assert "chunk_id=missing" in message
     assert "search_code or find_symbol" in message
+
+
+@pytest.mark.asyncio
+async def test_index_project_reports_file_counts_while_it_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual index must show what it is doing, not an empty bar until the JSON lands."""
+
+    class SlowEmbedder(TinyEmbedder):
+        def embed_passages(self, texts: list[str]) -> list[list[float]]:
+            time.sleep(0.05)
+            return super().embed_passages(texts)
+
+    monkeypatch.setattr(server_module, "PROGRESS_POLL_SECONDS", 0.02)
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    for number in range(8):
+        (root / f"module_{number}.py").write_text(f"def answer_{number}():\n    return {number}\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=SlowEmbedder(),
+        cwd=tmp_path,
+    )
+    server = create_server(app)
+    reports: list[tuple[float, float | None, str | None]] = []
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async def on_progress(progress: float, total: float | None, message: str | None) -> None:
+        reports.append((progress, total, message))
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "index_project", {"project": str(root)}, progress_callback=on_progress
+        )
+
+    assert not result.isError
+    assert reports[0][2] == "Indexing project"
+    assert any("files" in (message or "") for _, _, message in reports[1:-1]), reports
+    assert [value for value, _, _ in reports] == sorted(value for value, _, _ in reports)
+    assert "chunks embedded" in (reports[-1][2] or "")

@@ -44,6 +44,7 @@ from .models import (
 )
 from .passage_backend import PassageBackendSession
 from .probe_cache import ProbeCache, ProbeKey, ProbeRecord, model_artifact_fingerprint
+from .progress import IndexProgress, read_progress
 from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
 from .scanner import SourceScanner
 from .search import SearchService
@@ -203,6 +204,7 @@ class Application:
             ),
             passage_session_factory=passage_session_factory,
             staging_directory=paths.data / "staging",
+            progress_directory=paths.data / "progress",
         )
         self.search = SearchService(self.store, embedder)
 
@@ -566,10 +568,19 @@ class Application:
         roots: list[Path] | None = None,
         force: bool = False,
         wait_for_lock: bool = False,
+        on_progress: Callable[[IndexProgress], None] | None = None,
     ) -> IndexReport:
         return self.indexer.index(
-            self._resolve(project, roots), force=force, wait_for_lock=wait_for_lock
+            self._resolve(project, roots),
+            force=force,
+            wait_for_lock=wait_for_lock,
+            on_progress=on_progress,
         )
+
+    def index_progress(self, project_id: str) -> IndexProgress | None:
+        """Return the live progress of whichever process is indexing *project_id*."""
+
+        return read_progress(self.paths.data / "progress", project_id)
 
     def project_status(
         self, project: str | None = None, *, roots: list[Path] | None = None

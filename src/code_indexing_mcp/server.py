@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from functools import partial, wraps
 from pathlib import Path
@@ -56,6 +56,11 @@ SERVER_INSTRUCTIONS = (
 # keeps a long wait from spinning.
 INITIAL_RETRY_DELAY_SECONDS = 0.05
 MAXIMUM_RETRY_DELAY_SECONDS = 1.0
+
+# How often a waiting tool call re-reads the indexing progress snapshot. Fast
+# enough that a client's progress bar keeps moving, slow enough that polling a
+# small file costs nothing next to the indexing it is watching.
+PROGRESS_POLL_SECONDS = 0.5
 
 
 @dataclass
@@ -266,6 +271,69 @@ async def _startup_roots(
     return roots
 
 
+@dataclass
+class _ProgressStream:
+    """Forwards the indexing snapshot to the client for as long as it runs.
+
+    The run being watched usually belongs to another process (the per-user
+    daemon), so the numbers come from the snapshot that process publishes rather
+    than from an in-process callback. Reported progress only ever moves forward,
+    as the protocol requires, even when one run's snapshot replaces another's.
+    """
+
+    ctx: ServerContext
+    application: Application | BrokerApplication
+    project_ids: list[str]
+    message: str
+    highest: float = 0.0
+
+    async def run(self) -> None:
+        await self.ctx.report_progress(0, None, self.message)
+        while True:
+            await asyncio.sleep(PROGRESS_POLL_SECONDS)
+            snapshot = next(
+                (
+                    found
+                    for found in (
+                        self.application.index_progress(project_id)
+                        for project_id in self.project_ids
+                    )
+                    if found is not None
+                ),
+                None,
+            )
+            if snapshot is None:
+                continue
+            self.highest = max(self.highest, float(snapshot.files_seen))
+            await self.ctx.report_progress(self.highest, snapshot.files_total, snapshot.describe())
+
+    async def finish(self, message: str) -> None:
+        """Close the bar out at 100%, whatever scale it reached."""
+
+        total = max(self.highest, 1.0)
+        await self.ctx.report_progress(total, total, message)
+
+
+@asynccontextmanager
+async def _reporting_index_progress(
+    ctx: ServerContext,
+    application: Application | BrokerApplication,
+    project_ids: list[str],
+    *,
+    message: str,
+) -> AsyncIterator[_ProgressStream]:
+    """Report indexing progress for the duration of the enclosed work."""
+
+    stream = _ProgressStream(ctx, application, project_ids, message)
+    reporter = asyncio.create_task(stream.run())
+    try:
+        yield stream
+    finally:
+        reporter.cancel()
+        with suppress(asyncio.CancelledError):
+            await reporter
+
+
 async def _wait_for_startup_projects(
     ctx: ServerContext, roots: list[Path], project_ids: list[str]
 ) -> None:
@@ -274,14 +342,18 @@ async def _wait_for_startup_projects(
         return
     wanted = set(project_ids)
     # In lazy mode the first code query blocks on a full initial index. Report
-    # progress so the client can distinguish a slow index from a hung tool call.
+    # progress so the client can distinguish a slow index from a hung tool call,
+    # and so the wait shows how far along it is rather than just that it exists.
     pending = await coordinator.has_pending_indexing(roots, wanted)
-    if pending:
-        logger.info("Waiting for the initial index before serving the first query")
-        await ctx.report_progress(0, 1, "Building the initial index")
-    await coordinator.wait_for_ready(roots, wanted)
-    if pending:
-        await ctx.report_progress(1, 1, "Index ready")
+    if not pending:
+        await coordinator.wait_for_ready(roots, wanted)
+        return
+    logger.info("Waiting for the initial index before serving the first query")
+    async with _reporting_index_progress(
+        ctx, coordinator.application, project_ids, message="Building the initial index"
+    ) as stream:
+        await coordinator.wait_for_ready(roots, wanted)
+    await stream.finish("Index ready")
 
 
 _TOOL_INSTRUCTIONS = """\
@@ -489,9 +561,18 @@ def create_server(
         # running, app.index_project's 0-timeout file lock raises INDEX_BUSY, which is
         # acceptable, pre-existing behavior.
         roots = await _startup_roots(ctx, discover=True)
-        await ctx.report_progress(0, 1, "Indexing project")
-        report = await asyncio.to_thread(app.index_project, project, roots=roots, force=force)
-        await ctx.report_progress(1, 1, "Index complete")
+        # Resolved up front because progress is published per project id, and the
+        # process doing the work may be the daemon rather than this one.
+        resolved = await asyncio.to_thread(app.resolve_project, project, roots)
+        async with _reporting_index_progress(
+            ctx, app, [resolved.id], message=f"Indexing {resolved.name}"
+        ) as stream:
+            report = await asyncio.to_thread(
+                app.index_project, resolved.id, roots=roots, force=force
+            )
+        await stream.finish(
+            f"Indexed {report.indexed_files} files, {report.embedded_chunks} chunks embedded"
+        )
         return report
 
     @mcp.tool(

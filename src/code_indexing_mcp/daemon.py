@@ -35,6 +35,7 @@ from .models import (
     SearchResponse,
     SymbolResponse,
 )
+from .progress import IndexProgress, read_progress
 from .settings import IndexSettings
 
 PROTOCOL_VERSION = 1
@@ -446,6 +447,15 @@ class BrokerApplication:
                 wait_for_lock=wait_for_lock,
             )
         )
+
+    def index_progress(self, project_id: str) -> IndexProgress | None:
+        """Read the daemon's live progress snapshot straight from the shared data directory.
+
+        Deliberately not an RPC: the daemon thread running the index is the one
+        that would have to answer, and it is busy indexing.
+        """
+
+        return read_progress(self.paths.data / "progress", project_id)
 
     def project_status(
         self, project: str | None = None, *, roots: list[Path] | None = None
