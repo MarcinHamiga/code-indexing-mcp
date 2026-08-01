@@ -83,12 +83,11 @@ def _launcher_resolves(
         return Check("command on PATH", "ok", found)
     if profiles_updated:
         # The block was written into a profile this shell read before it existed.
-        # That is the expected state right after an install, not a problem.
-        return Check(
-            "command on PATH",
-            "warn",
-            f"resolves once you start a new shell ({shell_path.activation_hint(profiles_updated)})",
-        )
+        # That is the expected state right after an install, not a problem. The
+        # hint has to come from the environment being verified, not this process:
+        # they differ whenever the caller passed one in.
+        hint = shell_path.activation_hint(profiles_updated, environment=environment)
+        return Check("command on PATH", "warn", f"resolves once you start a new shell ({hint})")
     if found is not None:
         return Check("command on PATH", "warn", f"{found} is found first, not {launcher.path}")
     return Check(
@@ -147,10 +146,12 @@ def _skill_links(
         directory = harnesses.skill_directory(slug, home=home, environment=environment)
         if directory is None or not directory.is_dir():
             continue
+        # Only the links this installer made. A broken symlink the user put in
+        # their own skill directory is not this installation's to report on.
         broken = [
             entry.name
             for entry in directory.iterdir()
-            if entry.is_symlink() and not entry.resolve().is_dir()
+            if harnesses.is_bundled_skill_link(entry) and not entry.resolve().is_dir()
         ]
         name = f"{slug} skills"
         if broken:

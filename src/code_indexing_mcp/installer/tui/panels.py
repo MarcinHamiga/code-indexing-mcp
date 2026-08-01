@@ -225,9 +225,15 @@ class HarnessesPanel(Vertical):
 class PathPanel(Vertical):
     """Whether to create the `code-indexing-mcp` launcher, and where."""
 
+    # Inspecting a directory reads every shell profile and walks PATH with
+    # shutil.which. That is far too much work to repeat on each keystroke, so
+    # typing schedules it and only the last keystroke of a burst pays for it.
+    INSPECT_DEBOUNCE_SECONDS = 0.4
+
     def __init__(self, state: WizardState, *, id: str | None = None) -> None:
         super().__init__(id=id, classes="panel")
         self.state = state
+        self._inspect_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         yield Label("Command-line access")
@@ -257,10 +263,14 @@ class PathPanel(Vertical):
         self._refresh_status()
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "path-bin-dir":
-            self._refresh_status()
+        if event.input.id != "path-bin-dir":
+            return
+        if self._inspect_timer is not None:
+            self._inspect_timer.stop()
+        self._inspect_timer = self.set_timer(self.INSPECT_DEBOUNCE_SECONDS, self._refresh_status)
 
     def _refresh_status(self) -> None:
+        self._inspect_timer = None
         raw = self.query_one("#path-bin-dir", Input).value.strip()
         if not raw:
             self.query_one("#path-status", Static).update("")
@@ -275,6 +285,11 @@ class PathPanel(Vertical):
             profile_checkbox.value = False
             profile_checkbox.disabled = True
         else:
+            if profile_checkbox.disabled:
+                # Coming back from a directory that was already on PATH: restore
+                # the answer the user actually gave rather than leaving the
+                # unchecked box this panel set for its own display reasons.
+                profile_checkbox.value = self.state.modify_shell_profiles
             profile_checkbox.disabled = False
             if state.profiles:
                 names = ", ".join(str(profile) for profile in state.profiles)
@@ -286,17 +301,25 @@ class PathPanel(Vertical):
                 )
         if state.shadowed_by is not None:
             lines.append(
-                f"Note: {state.shadowed_by} comes earlier on PATH and would keep "
-                "winning the name."
+                f"Note: {state.shadowed_by} comes earlier on PATH and would keep winning the name."
             )
         self.query_one("#path-status", Static).update("\n".join(lines))
 
     def commit(self) -> bool:
         error = self.query_one("#path-error", Label)
         self.state.install_launcher = self.query_one("#path-launcher", Checkbox).value
-        self.state.modify_shell_profiles = self.query_one("#path-profile", Checkbox).value
+        profile_checkbox = self.query_one("#path-profile", Checkbox)
+        if not profile_checkbox.disabled:
+            # A disabled box was unchecked by _refresh_status for display, not by
+            # the user; recording that as their answer would lose their choice if
+            # they moved the launcher somewhere that is not on PATH.
+            self.state.modify_shell_profiles = profile_checkbox.value
         raw = self.query_one("#path-bin-dir", Input).value.strip()
         if not raw:
+            if not self.state.install_launcher:
+                # No launcher means no directory to put one in. Demanding a path
+                # that nothing will use would block the user for nothing.
+                return True
             error.update("Launcher directory cannot be empty.")
             return False
         directory = Path(raw).expanduser()

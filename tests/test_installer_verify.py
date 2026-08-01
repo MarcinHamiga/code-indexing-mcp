@@ -231,7 +231,12 @@ def test_a_broken_skill_link_warns(tmp_path: Path) -> None:
     skills = skill_directory(slug, home=tmp_path, environment={})
     assert skills is not None
     skills.mkdir(parents=True)
-    (skills / "gone").symlink_to(tmp_path / "never-existed", target_is_directory=True)
+    # Shaped like one of ours -- it points into a code_indexing_mcp/skills
+    # directory -- but the checkout it names is not there any more.
+    bundled = checkout / "src" / "code_indexing_mcp" / "skills" / "gone"
+    (skills / "gone").symlink_to(bundled, target_is_directory=True)
+    # A broken link the user owns is not ours to report on, so it must not appear.
+    (skills / "theirs").symlink_to(tmp_path / "never-existed", target_is_directory=True)
 
     check = _check(
         verify.run_checks(
@@ -246,6 +251,7 @@ def test_a_broken_skill_link_warns(tmp_path: Path) -> None:
 
     assert check.status == "warn"
     assert "gone" in check.detail
+    assert "theirs" not in check.detail
 
 
 def test_format_check_marks_a_failure_distinctly() -> None:

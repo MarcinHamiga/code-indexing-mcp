@@ -42,7 +42,9 @@ The supported clients are Codex (CLI + Desktop, one shared configuration), Claud
 Kimi Code, Claude Desktop, OpenCode, and KiloCode. Configuration changes are limited to the
 `code-indexing-mcp` entry; an existing configuration is backed up alongside the original
 with a `.bak` suffix before it changes, and unrelated keys in the entry's env block are
-preserved. For Codex the whole `[mcp_servers.code-indexing-mcp]` table is rewritten, so any
+preserved. That `.bak` is the file as *you* wrote it and is never overwritten — later
+writes roll into a `.bak.prev` beside it, so re-running `configure` cannot cost you the
+original. For Codex the whole `[mcp_servers.code-indexing-mcp]` table is rewritten, so any
 other key you added inside that one table is replaced rather than merged.
 
 Re-run the same command later to update an existing clean checkout with a fast-forward-only
@@ -137,11 +139,12 @@ went missing.
 from each configured client, the bundled skill links, the launcher, and the PATH block. It
 prints what it will do and asks before doing any of it (`--yes` skips the prompt).
 
-Removal is evidence-based, not name-based. A file at the launcher's path that is not one of
-our symlinks stays; a skill directory entry that does not point into this checkout stays; a
-PATH block whose end marker was edited away stays, because removing to end-of-file would take
-your edits with it. Client configs are restored to what they were before the install —
-comments, formatting, and neighbouring servers included.
+Removal is evidence-based, not name-based. A launcher that does not point into *this*
+checkout stays, even if it points into some other virtual environment; a skill directory
+entry that does not point into this checkout stays, so a second installation keeps its own
+links; a PATH block whose end marker was edited away stays, because removing to end-of-file
+would take your edits with it. Client configs are restored to what they were before the
+install — comments, formatting, and neighbouring servers included.
 
 Indexes and caches are **kept** by default; they cost minutes of CPU to rebuild and an
 uninstall that discards them silently is not one you can undo. The checkout is kept too:
@@ -152,6 +155,12 @@ code-indexing-mcp uninstall --purge            # also delete the index and cache
 code-indexing-mcp uninstall --remove-checkout  # also delete ~/.local/share/code-indexing-mcp
 code-indexing-mcp uninstall --keep-launcher --keep-path   # leave the command in place
 ```
+
+Both deleting flags check the directory before touching it. `--purge` removes a data or
+cache directory only if it is named `code-indexing-mcp` or holds a recognizable index or
+model cache, and `--remove-checkout` only a directory that actually looks like a checkout.
+A `CODE_INDEXING_DATA_DIR` pointing somewhere else is reported and left alone: a
+confirmation prompt is not a safety net for a recursive delete you cannot undo.
 
 ### Bundled skills
 

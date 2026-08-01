@@ -17,7 +17,7 @@ from .config_files import (
     remove_json_object_entry,
 )
 from .env_blocks import OBJECT_KEYS, entry_from_text, env_from_entry, merge_env
-from .links import link_destination, replace_link
+from .links import is_under, link_destination, replace_link
 
 
 class HarnessChoice(NamedTuple):
@@ -286,11 +286,16 @@ def deconfigure_selected_harnesses(
 
 def remove_skills(
     slugs: list[str],
+    install_directory: Path | None = None,
     *,
     home: Path | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> list[tuple[str, str]]:
-    """Unlink bundled skills, leaving anything the user owns exactly where it is."""
+    """Unlink bundled skills, leaving anything the user owns exactly where it is.
+
+    ``install_directory`` scopes removal to links pointing into the checkout
+    being uninstalled, so a second installation elsewhere keeps its own links.
+    """
 
     results: list[tuple[str, str]] = []
     for slug in slugs:
@@ -302,7 +307,7 @@ def remove_skills(
         try:
             for entry in sorted(directory.iterdir()):
                 # Only links this installer left, recognised by where they point.
-                if _is_stale_bundled_link(entry):
+                if is_bundled_skill_link(entry, install_directory):
                     entry.unlink()
                     removed += 1
         except OSError as exc:
@@ -362,13 +367,30 @@ def skill_directory(
     return None
 
 
-def _is_stale_bundled_link(target: Path) -> bool:
-    """True when target is a link this installer left pointing at an older checkout."""
+def is_bundled_skill_link(target: Path, install_directory: Path | None = None) -> bool:
+    """True when ``target`` is a link to a skill bundled with this project.
+
+    Without ``install_directory`` the test is shape-only -- it points into some
+    ``code_indexing_mcp/skills`` directory -- which is what installing needs:
+    a link left by an *older* checkout is exactly the one to replace. Removal
+    needs the opposite, so it passes the checkout and requires a link into it.
+    """
 
     if not target.is_symlink():
         return False
-    skills_dir = link_destination(target).parent
-    return skills_dir.name == "skills" and skills_dir.parent.name == "code_indexing_mcp"
+    destination = link_destination(target)
+    skills_dir = destination.parent
+    if not (skills_dir.name == "skills" and skills_dir.parent.name == "code_indexing_mcp"):
+        return False
+    if install_directory is None:
+        return True
+    return is_under(destination, install_directory)
+
+
+def _is_stale_bundled_link(target: Path) -> bool:
+    """True when target is a link this installer left pointing at an older checkout."""
+
+    return is_bundled_skill_link(target)
 
 
 def _link_skill(source: Path, target: Path) -> bool:

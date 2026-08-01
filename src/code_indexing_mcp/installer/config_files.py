@@ -305,9 +305,12 @@ def _remove_jsonc_member(text: str, members: list[JsonMember], index: int) -> st
     # of the line is left exactly where the user put it.
     line_start = text.rfind("\n", 0, start) + 1
     if not text[line_start:start].strip():
-        line_end = text.find("\n", end)
-        if line_end != -1 and not text[end:line_end].strip():
-            start, end = line_start, line_end + 1
+        newline = text.find("\n", end)
+        # A member on the final line has no newline after it; the line still
+        # belongs to it, and leaving it behind is the blank line this avoids.
+        line_end = len(text) if newline == -1 else newline + 1
+        if not text[end:line_end].strip():
+            start, end = line_start, line_end
     return text[:start] + text[end:]
 
 
@@ -364,11 +367,29 @@ def _atomic_write(path: Path, content: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _write_changed_configuration(path: Path, original: str | None, updated: str) -> bool:
+def _backup_configuration(path: Path) -> None:
+    """Keep a copy of ``path`` before overwriting it, without losing the first one.
+
+    ``.bak`` is the file as it was before this installer ever touched it, which
+    is the copy worth keeping: a user restoring a shell profile wants what they
+    wrote, not what a previous run of ours left. Later writes roll into a second
+    slot instead, so the pair stays bounded however often configure is re-run.
+    """
+
+    pristine = path.with_name(f"{path.name}.bak")
+    if pristine.is_symlink() or pristine.exists():
+        shutil.copy2(path, path.with_name(f"{path.name}.bak.prev"))
+    else:
+        shutil.copy2(path, pristine)
+
+
+def write_changed_configuration(path: Path, original: str | None, updated: str) -> bool:
+    """Write ``updated`` unless it matches ``original``. True when the file changed."""
+
     if original == updated:
         return False
     if original is not None:
-        shutil.copy2(path, path.with_name(f"{path.name}.bak"))
+        _backup_configuration(path)
     _atomic_write(path, updated)
     return True
 
@@ -398,7 +419,7 @@ def merge_json_object_entry(
         _validate_jsonc(updated)
     except ValueError as exc:
         raise InstallerError(f"Invalid JSON/JSONC configuration in {path}: {exc}") from exc
-    return _write_changed_configuration(path, original, updated)
+    return write_changed_configuration(path, original, updated)
 
 
 def remove_json_object_entry(path: Path, object_key: str, entry_key: str) -> bool:
@@ -415,7 +436,7 @@ def remove_json_object_entry(path: Path, object_key: str, entry_key: str) -> boo
         _validate_jsonc(updated)
     except ValueError as exc:
         raise InstallerError(f"Invalid JSON/JSONC configuration in {path}: {exc}") from exc
-    return _write_changed_configuration(path, original, updated)
+    return write_changed_configuration(path, original, updated)
 
 
 _TOML_TABLE = re.compile(
@@ -543,10 +564,15 @@ def remove_codex_server(path: Path) -> bool:
     # Comments trailing the table were not written by the installer, so they stay.
     trailing_trivia = _trailing_toml_trivia(original[start:end])
     prefix = original[:start]
-    # The merge separated the table from what came before it with a blank line.
-    # Collapsing the run back to one newline is what puts the file where it was.
-    stripped = prefix.rstrip("\n")
-    prefix = f"{stripped}\n" if stripped else ""
+    if not prefix.strip():
+        # Nothing but whitespace came before the table, so there is nothing to keep.
+        prefix = ""
+    elif prefix.endswith("\n\n"):
+        # The merge separated the table from what came before it with exactly one
+        # blank line. Take that one line back and no more: collapsing the whole
+        # run would eat the spacing a user put between their own tables when our
+        # table sits in the middle of the file rather than at the end of it.
+        prefix = prefix[:-1]
     updated = prefix + trailing_trivia + original[end:]
     try:
         tomllib.loads(updated)
@@ -554,7 +580,7 @@ def remove_codex_server(path: Path) -> bool:
         raise InstallerError(
             f"Refusing to write invalid TOML configuration to {path}: {exc}"
         ) from exc
-    return _write_changed_configuration(path, original, updated)
+    return write_changed_configuration(path, original, updated)
 
 
 def merge_codex_server(path: Path, command: Path, *, env: Mapping[str, str] | None = None) -> bool:
@@ -592,4 +618,4 @@ def merge_codex_server(path: Path, command: Path, *, env: Mapping[str, str] | No
         raise InstallerError(
             f"Refusing to write invalid TOML configuration to {path}: {exc}"
         ) from exc
-    return _write_changed_configuration(path, original, updated)
+    return write_changed_configuration(path, original, updated)

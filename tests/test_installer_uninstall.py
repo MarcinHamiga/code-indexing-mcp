@@ -1,5 +1,6 @@
 """Tests for taking an installation back out."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -23,6 +24,9 @@ def _checkout(tmp_path: Path) -> Path:
     command.parent.mkdir(parents=True, exist_ok=True)
     command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     command.chmod(0o755)
+    # The markers --remove-checkout insists on before deleting anything.
+    (directory / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (directory / "src" / "code_indexing_mcp").mkdir(parents=True, exist_ok=True)
     return directory
 
 
@@ -53,6 +57,63 @@ def test_configure_then_deconfigure_restores_the_original_file(tmp_path: Path, s
     assert changed is True
     assert path.read_text(encoding="utf-8") == original
     assert harnesses.read_server_entry(slug, home=tmp_path, environment={}) is None
+
+
+def test_codex_removal_keeps_the_users_spacing_between_their_own_tables(
+    tmp_path: Path,
+) -> None:
+    """Our table is not always last; collapsing every newline would eat their blank lines."""
+
+    checkout = _checkout(tmp_path)
+    path = harnesses.configuration_path("codex", home=tmp_path, environment={})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = "[first]\na = 1\n\n\n[last]\nz = 26\n"
+    path.write_text(original, encoding="utf-8")
+
+    harnesses.configure_harness(
+        "codex", server_executable(checkout), env={}, home=tmp_path, environment={}
+    )
+    harnesses.deconfigure_harness("codex", home=tmp_path, environment={})
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_jsonc_removal_of_a_member_on_the_final_line(tmp_path: Path) -> None:
+    """No trailing newline after the entry: the line still goes with it."""
+
+    checkout = _checkout(tmp_path)
+    path = harnesses.configuration_path("kimi-code", home=tmp_path, environment={})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{\n  "other": {"keep": "this"},\n  "mcpServers": {}\n}'
+    path.write_text(original, encoding="utf-8")
+
+    harnesses.configure_harness(
+        "kimi-code", server_executable(checkout), env={}, home=tmp_path, environment={}
+    )
+    harnesses.deconfigure_harness("kimi-code", home=tmp_path, environment={})
+
+    text = path.read_text(encoding="utf-8")
+    assert "code-indexing-mcp" not in text
+    assert "\n\n" not in text  # no blank line left where the entry was
+    assert json.loads(text)["other"] == {"keep": "this"}
+
+
+def test_the_first_backup_survives_a_second_write(tmp_path: Path) -> None:
+    """`.bak` is the file as the user wrote it, not as our previous run left it."""
+
+    checkout = _checkout(tmp_path)
+    path = harnesses.configuration_path("kimi-code", home=tmp_path, environment={})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pristine = '{\n  "other": {"keep": "this"}\n}\n'
+    path.write_text(pristine, encoding="utf-8")
+
+    harnesses.configure_harness(
+        "kimi-code", server_executable(checkout), env={}, home=tmp_path, environment={}
+    )
+    harnesses.deconfigure_harness("kimi-code", home=tmp_path, environment={})
+
+    assert path.with_name(f"{path.name}.bak").read_text(encoding="utf-8") == pristine
+    assert path.with_name(f"{path.name}.bak.prev").exists()
 
 
 def test_deconfigure_is_idempotent_and_honest_about_it(tmp_path: Path) -> None:
@@ -146,7 +207,7 @@ def test_remove_skills_unlinks_only_the_bundled_ones(tmp_path: Path) -> None:
     theirs = skills / "their-own-skill"
     theirs.mkdir()
 
-    (_, message), = harnesses.remove_skills(["kimi-code"], home=tmp_path, environment={})
+    ((_, message),) = harnesses.remove_skills(["kimi-code"], home=tmp_path, environment={})
 
     assert "1 unlinked" in message
     assert not (skills / "codebase-exploration").exists()
@@ -207,8 +268,8 @@ def test_run_uninstall_purges_data_directories_when_asked(tmp_path: Path) -> Non
     data = tmp_path / "data"
     cache = tmp_path / "cache"
     for directory in (data, cache):
-        directory.mkdir()
-        (directory / "index.lance").write_text("x", encoding="utf-8")
+        # "lancedb" is one of the markers that identifies the directory as ours.
+        (directory / "lancedb").mkdir(parents=True)
 
     result = run_uninstall(
         UninstallPlan(
@@ -224,6 +285,75 @@ def test_run_uninstall_purges_data_directories_when_asked(tmp_path: Path) -> Non
 
     assert set(result.directories_removed) == {data, cache}
     assert not data.exists() and not cache.exists()
+
+
+def test_purge_refuses_a_directory_that_holds_nothing_of_ours(tmp_path: Path) -> None:
+    """A setting can point anywhere; a confirmation prompt is not a safety net."""
+
+    documents = tmp_path / "Documents"
+    (documents / "taxes").mkdir(parents=True)
+
+    result = run_uninstall(
+        UninstallPlan(
+            install_directory=_checkout(tmp_path), remove_launcher=False, remove_data=True
+        ),
+        home=tmp_path,
+        environment={
+            "CODE_INDEXING_DATA_DIR": str(documents),
+            "CODE_INDEXING_CACHE_DIR": str(documents),
+            "SHELL": "/bin/zsh",
+        },
+    )
+
+    assert result.directories_removed == ()
+    assert (documents / "taxes").is_dir()
+    assert result.failures
+
+
+def test_purge_refuses_the_home_directory(tmp_path: Path) -> None:
+    result = run_uninstall(
+        UninstallPlan(
+            install_directory=_checkout(tmp_path), remove_launcher=False, remove_data=True
+        ),
+        home=tmp_path,
+        environment={"CODE_INDEXING_DATA_DIR": str(tmp_path), "SHELL": "/bin/zsh"},
+    )
+
+    assert result.directories_removed == ()
+    assert tmp_path.is_dir()
+    assert any("home directory" in message for _, message in result.failures)
+
+
+def test_remove_checkout_refuses_a_directory_that_is_not_a_checkout(tmp_path: Path) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "work").mkdir(parents=True)
+
+    result = run_uninstall(
+        UninstallPlan(install_directory=elsewhere, remove_launcher=False, remove_checkout=True),
+        home=tmp_path,
+        environment={"SHELL": "/bin/zsh"},
+    )
+
+    assert result.directories_removed == ()
+    assert (elsewhere / "work").is_dir()
+
+
+def test_remove_skills_leaves_another_installations_links_alone(tmp_path: Path) -> None:
+    """Two checkouts share a skill directory; uninstalling one keeps the other."""
+
+    ours = _checkout(tmp_path)
+    theirs = tmp_path / "other-checkout"
+    skills = tmp_path / ".agents" / "skills"
+    skills.mkdir(parents=True)
+    for checkout, name in ((ours, "mine"), (theirs, "not-mine")):
+        source = checkout / "src" / "code_indexing_mcp" / "skills" / name
+        source.mkdir(parents=True)
+        (skills / name).symlink_to(source, target_is_directory=True)
+
+    harnesses.remove_skills(["kimi-code"], ours, home=tmp_path, environment={})
+
+    assert not (skills / "mine").is_symlink()
+    assert (skills / "not-mine").is_symlink()
 
 
 def test_run_uninstall_isolates_one_harnesss_failure(

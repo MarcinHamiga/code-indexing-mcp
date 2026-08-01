@@ -8,6 +8,7 @@ import pytest
 
 from code_indexing_mcp.installer import shell_path
 from code_indexing_mcp.installer.accelerator import server_executable
+from code_indexing_mcp.installer.config_files import InstallerError
 
 
 def _checkout(tmp_path: Path, *, platform_name: str | None = None) -> Path:
@@ -147,6 +148,38 @@ def test_remove_launcher_takes_back_only_its_own(tmp_path: Path) -> None:
     assert theirs.is_file()
 
 
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlink launcher")
+def test_remove_launcher_leaves_a_link_into_another_venv_alone(tmp_path: Path) -> None:
+    """Pointing at *a* virtual environment is not evidence of pointing at ours."""
+
+    ours = _checkout(tmp_path)
+    theirs = tmp_path / "their-project"
+    their_command = server_executable(theirs)
+    their_command.parent.mkdir(parents=True)
+    their_command.touch(mode=0o755)
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir()
+    (bin_directory / "code-indexing-mcp").symlink_to(their_command)
+
+    assert shell_path.remove_launcher(bin_directory, ours) is None
+    assert (bin_directory / "code-indexing-mcp").is_symlink()
+
+    assert shell_path.remove_launcher(bin_directory, theirs) == bin_directory / "code-indexing-mcp"
+
+
+def test_remove_launcher_checks_the_shim_names_this_checkout_on_windows(tmp_path: Path) -> None:
+    ours = _checkout(tmp_path, platform_name="win32")
+    theirs = tmp_path / "their-project"
+    their_command = server_executable(theirs, platform_name="win32")
+    their_command.parent.mkdir(parents=True)
+    their_command.touch()
+    bin_directory = tmp_path / "bin"
+    shell_path.install_launcher(theirs, bin_directory, platform_name="win32")
+
+    assert shell_path.remove_launcher(bin_directory, ours, platform_name="win32") is None
+    assert shell_path.remove_launcher(bin_directory, theirs, platform_name="win32") is not None
+
+
 # --- PATH detection ----------------------------------------------------------
 
 
@@ -271,7 +304,70 @@ def test_update_profile_uses_fish_syntax_for_a_fish_config(tmp_path: Path) -> No
 
     shell_path.update_profile(profile, tmp_path / ".local" / "bin", home=tmp_path)
 
-    assert "fish_add_path $HOME/.local/bin" in profile.read_text(encoding="utf-8")
+    assert 'fish_add_path "$HOME/.local/bin"' in profile.read_text(encoding="utf-8")
+
+
+def test_update_profile_quotes_a_directory_with_a_space(tmp_path: Path) -> None:
+    """--bin-dir takes whatever the user types; the profile has to survive it."""
+
+    profile = tmp_path / ".zshrc"
+    profile.write_text("", encoding="utf-8")
+    fish = tmp_path / "config.fish"
+    fish.write_text("", encoding="utf-8")
+    awkward = tmp_path / "my bin"
+
+    shell_path.update_profile(profile, awkward, home=tmp_path)
+    shell_path.update_profile(fish, awkward, home=tmp_path)
+
+    assert 'export PATH="$HOME/my bin:$PATH"' in profile.read_text(encoding="utf-8")
+    assert 'fish_add_path "$HOME/my bin"' in fish.read_text(encoding="utf-8")
+
+
+def test_update_profile_escapes_shell_metacharacters_in_the_directory(tmp_path: Path) -> None:
+    profile = tmp_path / ".zshrc"
+    profile.write_text("", encoding="utf-8")
+
+    shell_path.update_profile(profile, Path('/opt/a"b`c$d'), home=tmp_path)
+
+    line = next(
+        text
+        for text in profile.read_text(encoding="utf-8").splitlines()
+        if text.startswith("export")
+    )
+    assert line == 'export PATH="/opt/a\\"b\\`c\\$d:$PATH"'
+
+
+def test_update_profile_does_not_mistake_a_neighbouring_directory_for_this_one(
+    tmp_path: Path,
+) -> None:
+    """A substring match here would leave the user with no PATH entry at all."""
+
+    profile = tmp_path / ".zshrc"
+    profile.write_text('export PATH="$HOME/bin2:$PATH"\n', encoding="utf-8")
+
+    assert shell_path.update_profile(profile, tmp_path / "bin", home=tmp_path) is True
+    assert shell_path.BLOCK_START in profile.read_text(encoding="utf-8")
+
+
+def test_update_profile_honours_a_tilde_spelled_path_line(tmp_path: Path) -> None:
+    profile = tmp_path / ".zshrc"
+    profile.write_text('export PATH="~/.local/bin:$PATH"\n', encoding="utf-8")
+
+    assert shell_path.update_profile(profile, tmp_path / ".local" / "bin", home=tmp_path) is False
+
+
+def test_update_profile_reports_a_profile_it_cannot_decode(tmp_path: Path) -> None:
+    """Silently returning False here would read as "already configured"."""
+
+    profile = tmp_path / ".zshrc"
+    profile.write_bytes(b"\xff\xfe not utf-8 \x00\n")
+
+    with pytest.raises(InstallerError):
+        shell_path.update_profile(profile, tmp_path / "bin", home=tmp_path)
+
+    written, failures = shell_path.update_profiles(tmp_path / "bin", [profile], home=tmp_path)
+    assert written == []
+    assert [path for path, _ in failures] == [profile]
 
 
 def test_update_profiles_isolates_one_files_failure(tmp_path: Path) -> None:

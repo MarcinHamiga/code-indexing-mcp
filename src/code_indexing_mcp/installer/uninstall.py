@@ -17,6 +17,7 @@ from pathlib import Path
 
 from . import harnesses, shell_path
 from .config_files import InstallerError
+from .links import is_under
 from .orchestrator import StepEvent, default_install_directory
 
 
@@ -64,6 +65,53 @@ def data_directories(
     return tuple(directories)
 
 
+# Files and directories the server itself creates under its data or cache
+# directory. One of these present is what distinguishes "our index lives here"
+# from "the user pointed the setting at a directory that holds other things".
+_DATA_MARKERS = (
+    "lancedb",
+    "locks",
+    "staging",
+    "accelerator.json",
+    "daemon.token",
+    "daemon.log",
+    "models",
+)
+
+
+def _refuse_reason(directory: Path, *, checkout: bool, home: Path | None = None) -> str | None:
+    """Why ``directory`` must not be deleted, or None when removing it is safe.
+
+    ``--purge`` and ``--remove-checkout`` take their targets from a setting and a
+    flag, either of which can name somewhere that is not ours. The confirmation
+    prompt shows what will go, but a prompt is not a safety net for a recursive
+    delete that cannot be undone: the directory has to look like ours as well.
+    """
+
+    home = home or Path.home()
+    try:
+        resolved = directory.resolve()
+    except (OSError, ValueError) as exc:
+        return f"cannot be resolved ({exc})"
+    if resolved.parent == resolved:
+        return "is a filesystem root"
+    if resolved == home.resolve():
+        return "is your home directory"
+    if is_under(home.resolve(), resolved):
+        return "contains your home directory"
+    if checkout:
+        if not (resolved / "pyproject.toml").is_file():
+            return "does not look like a code-indexing-mcp checkout (no pyproject.toml)"
+        if not (resolved / "src" / "code_indexing_mcp").is_dir():
+            return "does not look like a code-indexing-mcp checkout (no src/code_indexing_mcp)"
+        return None
+    if resolved.name == "code-indexing-mcp":
+        return None
+    if any((resolved / marker).exists() for marker in _DATA_MARKERS):
+        return None
+    return "holds no code-indexing-mcp index or cache, so it is not ours to delete"
+
+
 def run_uninstall(
     plan: UninstallPlan,
     on_event: Callable[[StepEvent], None] = lambda event: None,
@@ -98,13 +146,18 @@ def run_uninstall(
 
     on_event(StepEvent("skills", "started"))
     result.skills = tuple(
-        harnesses.remove_skills(list(plan.harness_slugs), home=home, environment=environment)
+        harnesses.remove_skills(
+            list(plan.harness_slugs),
+            plan.install_directory,
+            home=home,
+            environment=environment,
+        )
     )
     for slug, message in result.skills:
         on_event(StepEvent("skills", "finished", f"{slug}: {message}"))
 
     _remove_launcher(plan, result, on_event, home=home, environment=environment)
-    _remove_directories(plan, result, on_event, environment=environment)
+    _remove_directories(plan, result, on_event, home=home, environment=environment)
     return result
 
 
@@ -122,7 +175,7 @@ def _remove_launcher(
     on_event(StepEvent("path", "started", str(bin_directory)))
     if plan.remove_launcher:
         try:
-            removed = shell_path.remove_launcher(bin_directory)
+            removed = shell_path.remove_launcher(bin_directory, plan.install_directory)
         except OSError as exc:
             result.failures.append(("launcher", str(exc)))
             on_event(StepEvent("path", "failed", str(exc)))
@@ -132,9 +185,7 @@ def _remove_launcher(
                 StepEvent(
                     "path",
                     "finished" if removed else "skipped",
-                    f"removed {removed}"
-                    if removed
-                    else f"no launcher of ours in {bin_directory}",
+                    f"removed {removed}" if removed else f"no launcher of ours in {bin_directory}",
                 )
             )
     if not plan.remove_path_block:
@@ -156,20 +207,27 @@ def _remove_directories(
     result: UninstallResult,
     on_event: Callable[[StepEvent], None],
     *,
+    home: Path | None,
     environment: Mapping[str, str] | None,
 ) -> None:
-    targets: list[Path] = []
+    targets: list[tuple[Path, bool]] = []
     if plan.remove_data:
-        targets.extend(data_directories(environment=environment))
+        for directory in data_directories(environment=environment):
+            targets.append((directory, False))
     if plan.remove_checkout:
-        targets.append(plan.install_directory)
+        targets.append((plan.install_directory, True))
     if not targets:
         return
     on_event(StepEvent("directories", "started"))
     removed: list[Path] = []
-    for directory in targets:
+    for directory, is_checkout in targets:
         if not directory.is_dir():
             on_event(StepEvent("directories", "skipped", f"{directory} does not exist"))
+            continue
+        refusal = _refuse_reason(directory, checkout=is_checkout, home=home)
+        if refusal is not None:
+            result.failures.append((str(directory), f"not removed: it {refusal}"))
+            on_event(StepEvent("directories", "failed", f"{directory} {refusal}; left alone"))
             continue
         try:
             shutil.rmtree(directory)

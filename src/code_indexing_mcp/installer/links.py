@@ -40,6 +40,20 @@ def link_destination(link: Path) -> Path:
     return link.resolve()
 
 
+def is_under(path: Path, directory: Path) -> bool:
+    """True when ``path`` sits inside ``directory``, comparing resolved forms.
+
+    This is what turns "looks like one of ours" into "is one of ours": removal
+    decisions that only match on shape will eventually match something the user
+    owns instead.
+    """
+
+    try:
+        return path.resolve().is_relative_to(directory.resolve())
+    except (OSError, ValueError):
+        return False
+
+
 def replace_link(
     source: Path,
     target: Path,

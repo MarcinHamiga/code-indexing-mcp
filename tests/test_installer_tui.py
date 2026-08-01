@@ -7,6 +7,7 @@ from textual.pilot import Pilot
 from textual.widgets import Label, Static
 
 from code_indexing_mcp.installer.tui.app import InstallerApp
+from code_indexing_mcp.installer.tui.panels import PathPanel
 from code_indexing_mcp.installer.wizard import WizardState
 
 
@@ -317,6 +318,23 @@ async def test_path_panel_rejects_an_empty_directory(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_path_panel_allows_an_empty_directory_with_no_launcher(tmp_path: Path) -> None:
+    """Nothing will be put anywhere, so there is nothing to demand a path for."""
+
+    from textual.widgets import Checkbox, Input
+
+    state = _install_state(tmp_path)
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "path")
+        app.query_one("#path-launcher", Checkbox).value = False
+        app.query_one("#path-bin-dir", Input).value = ""
+        await click(pilot, "#next")
+        assert app.current == "indexing"
+        assert state.install_launcher is False
+
+
+@pytest.mark.asyncio
 async def test_path_panel_disables_the_profile_edit_when_already_on_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -333,7 +351,38 @@ async def test_path_panel_disables_the_profile_edit_when_already_on_path(
         assert profile.value is False and profile.disabled is True
         assert "already on PATH" in str(app.query_one("#path-status", Static).render())
         await click(pilot, "#next")
-        assert state.modify_shell_profiles is False
+        # The box was unchecked by the panel for display, not by the user, so
+        # their answer is left as it was rather than overwritten with False.
+        assert state.modify_shell_profiles is True
+
+
+@pytest.mark.asyncio
+async def test_path_panel_restores_the_profile_choice_when_the_directory_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moving off an on-PATH directory must not leave the box silently unchecked."""
+
+    from textual.widgets import Checkbox, Input
+
+    import code_indexing_mcp.installer.shell_path as shell_path
+
+    on_path = {str(tmp_path / ".local" / "bin")}
+    monkeypatch.setattr(
+        shell_path, "is_on_path", lambda directory, **kwargs: str(directory) in on_path
+    )
+    state = _install_state(tmp_path)
+    state.bin_directory = tmp_path / ".local" / "bin"
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "path")
+        profile = app.query_one("#path-profile", Checkbox)
+        assert profile.disabled is True
+
+        app.query_one("#path-bin-dir", Input).value = str(tmp_path / "elsewhere")
+        await pilot.pause(PathPanel.INSPECT_DEBOUNCE_SECONDS + 0.2)
+
+        assert profile.disabled is False
+        assert profile.value is True
 
 
 @pytest.mark.asyncio
