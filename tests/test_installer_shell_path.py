@@ -323,6 +323,7 @@ def test_update_profile_quotes_a_directory_with_a_space(tmp_path: Path) -> None:
     assert 'fish_add_path "$HOME/my bin"' in fish.read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="a POSIX path in a POSIX profile")
 def test_update_profile_escapes_shell_metacharacters_in_the_directory(tmp_path: Path) -> None:
     profile = tmp_path / ".zshrc"
     profile.write_text("", encoding="utf-8")

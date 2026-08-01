@@ -235,13 +235,17 @@ def test_run_install_creates_the_launcher_and_adds_it_to_path(
         on_event=events.append,
     )
 
-    launcher = bin_directory / "code-indexing-mcp"
-    assert launcher.is_symlink()
+    launcher = shell_path.launcher_path(bin_directory)
+    # A symlink on POSIX, a .cmd shim on Windows; both land at launcher_path.
+    assert launcher.is_symlink() or launcher.is_file()
     assert result.launcher is not None and result.launcher.status == "created"
     assert result.profiles_updated == (profile,)
     text = profile.read_text(encoding="utf-8")
     assert text.startswith("# mine\n")
-    assert shell_path.BLOCK_START in text and str(bin_directory) in text
+    # The block spells the directory relative to $HOME when it sits under it, so
+    # ask the module whether the line names it rather than matching raw text.
+    assert shell_path.BLOCK_START in text
+    assert shell_path.profile_mentions_directory(text, bin_directory, Path.home())
     assert [event.step for event in events].count("path") == 3
 
 

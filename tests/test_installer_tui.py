@@ -6,6 +6,7 @@ import pytest
 from textual.pilot import Pilot
 from textual.widgets import Label, Static
 
+from code_indexing_mcp.installer import shell_path
 from code_indexing_mcp.installer.tui.app import InstallerApp
 from code_indexing_mcp.installer.tui.panels import PathPanel
 from code_indexing_mcp.installer.wizard import WizardState
@@ -179,7 +180,7 @@ async def test_a_healthy_install_says_nothing_about_repair(
     from textual.css.query import NoMatches
 
     state = _reconfigure_state(_prepare_checkout(tmp_path), monkeypatch)
-    launcher = state.bin_directory / "code-indexing-mcp"
+    launcher = shell_path.launcher_path(state.bin_directory)
     launcher.parent.mkdir(parents=True, exist_ok=True)
     launcher.touch()
     app = InstallerApp(state)
