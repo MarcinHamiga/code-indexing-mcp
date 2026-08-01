@@ -740,3 +740,24 @@ async def test_done_panel_gives_the_full_path_when_no_launcher_was_made(
         body = str(app.query_one("#done-body", Static).render())
         assert "no launcher was created" in body
         assert "Launcher NOT created" in body
+
+
+@pytest.mark.asyncio
+async def test_navigation_buttons_clear_the_footer(tmp_path: Path) -> None:
+    """The nav row and the footer both dock to the bottom; they must not share rows.
+
+    Textual does not reserve space for a second widget docked to the same edge,
+    so the button borders used to paint over the key hints.
+    """
+
+    from textual.widgets import Footer
+
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        footer = app.query_one(Footer).region
+        for panel in ("welcome", "summary"):
+            await advance_to(pilot, app, panel)
+            nav = app.query_one("#nav").region
+            assert not nav.overlaps(footer), f"{panel}: {nav} overlaps the footer at {footer}"
+            assert app.query_one("#screens").region.bottom <= nav.y
