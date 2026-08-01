@@ -695,6 +695,54 @@ def test_main_does_not_open_the_wizard_over_scripted_flags(
     assert "--tui" not in delegated[0]
 
 
+def test_main_forwards_the_launcher_flags_and_still_opens_the_wizard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--bin-dir says where the launcher goes, not that the run is scripted."""
+
+    installer = load_installer()
+    monkeypatch.setattr(installer, "clone_or_update_repository", lambda url, directory: "updated")
+    monkeypatch.setattr(installer, "sync_environment", lambda directory: tmp_path / "server")
+    monkeypatch.setattr(installer, "tui_available", lambda: True)
+    delegated: list[list[str]] = []
+    monkeypatch.setattr(installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0)
+
+    assert (
+        installer.main(
+            [
+                "--install-dir",
+                str(tmp_path / "checkout"),
+                "--bin-dir",
+                str(tmp_path / "bin"),
+                "--no-modify-path",
+            ]
+        )
+        == 0
+    )
+    (tail,) = delegated
+    assert "--tui" in tail
+    assert "--no-modify-path" in tail
+    assert tail[tail.index("--bin-dir") + 1] == str(tmp_path / "bin")
+    assert "--no-launcher" not in tail
+
+
+def test_main_reads_the_bin_directory_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    monkeypatch.setenv("CODE_INDEXING_MCP_BIN_DIR", str(tmp_path / "from-env"))
+    installer = load_installer()  # re-imported so the default picks the env up
+    monkeypatch.setattr(installer, "clone_or_update_repository", lambda url, directory: "updated")
+    monkeypatch.setattr(installer, "sync_environment", lambda directory: tmp_path / "server")
+    monkeypatch.setattr(installer, "tui_available", lambda: False)
+    delegated: list[list[str]] = []
+    monkeypatch.setattr(installer, "_delegate", lambda directory, tail: delegated.append(tail) or 0)
+
+    assert installer.main(["--install-dir", str(tmp_path / "checkout")]) == 0
+    (tail,) = delegated
+    assert tail[tail.index("--bin-dir") + 1] == str(tmp_path / "from-env")
+
+
 def test_explicit_tui_flag_wins_over_scripted_flags(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

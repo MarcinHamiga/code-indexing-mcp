@@ -160,6 +160,10 @@ def test_configure_delegates_to_the_installer(monkeypatch, capsys) -> None:  # t
             "settings": ["CODE_INDEXING_OFFLINE=1"],
             "unsets": [],
             "no_tui": False,
+            "bin_dir": None,
+            "no_launcher": False,
+            "no_modify_path": False,
+            "repair": False,
         }
     ]
 

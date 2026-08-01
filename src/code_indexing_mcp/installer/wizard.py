@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import accelerator, harnesses
+from . import accelerator, harnesses, shell_path
 from .env_blocks import env_from_entry
 from .orchestrator import InstallPlan, default_install_directory
 from .settings_spec import BY_NAME, SETTINGS, default_value, normalize, validate
@@ -68,6 +68,11 @@ class WizardState:
     prefilled_names: set[str] = field(default_factory=set)  # names found in existing configs
     disagreements: list[str] = field(default_factory=list)
     offline: bool = False
+    # Where the `code-indexing-mcp` launcher goes, and whether the wizard is
+    # allowed to put that directory on PATH. Both are answered on the path panel.
+    bin_directory: Path = field(default_factory=shell_path.default_bin_directory)
+    install_launcher: bool = True
+    modify_shell_profiles: bool = True
 
     @classmethod
     def for_install(
@@ -91,6 +96,7 @@ class WizardState:
             values=values,
             prefilled_names=set(prefill.values),
             disagreements=list(prefill.disagreements),
+            bin_directory=shell_path.default_bin_directory(home=home, environment=environment),
         )
 
     @classmethod
@@ -112,6 +118,7 @@ class WizardState:
             values=dict(prefill.values),
             prefilled_names=set(prefill.values),
             disagreements=list(prefill.disagreements),
+            bin_directory=shell_path.default_bin_directory(home=home, environment=environment),
         )
 
     def field_value(self, name: str) -> str:
@@ -145,4 +152,7 @@ class WizardState:
             harness_slugs=tuple(self.harness_slugs),
             env_updates=self.env_updates(),
             offline=self.offline,
+            bin_directory=self.bin_directory,
+            install_launcher=self.install_launcher,
+            modify_shell_profiles=self.modify_shell_profiles,
         )

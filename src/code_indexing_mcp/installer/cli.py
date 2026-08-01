@@ -51,6 +51,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="remove a managed CODE_INDEXING_* value from harness configs; repeatable",
     )
     parser.add_argument(
+        "--bin-dir",
+        default=None,
+        help="directory for the code-indexing-mcp launcher (default: ~/.local/bin)",
+    )
+    parser.add_argument(
+        "--no-launcher",
+        action="store_true",
+        help="do not create the code-indexing-mcp launcher",
+    )
+    parser.add_argument(
+        "--no-modify-path",
+        action="store_true",
+        help="never edit a shell profile to put the launcher directory on PATH",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         default=as_bool(os.environ.get("CODE_INDEXING_OFFLINE", "")),
@@ -62,6 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="never prompt; a missing harness selection configures none",
     )
     parser.add_argument("--reconfigure", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help=(
+            "re-apply the launcher, client entries, and skills for the harnesses already "
+            "configured, keeping the prepared accelerator and every current setting"
+        ),
+    )
     return parser
 
 
@@ -143,9 +166,45 @@ def _run_tui(
     if args.harnesses is not None:
         state.harness_slugs = parse_harness_selection(args.harnesses)
     state.offline = args.offline
+    if args.bin_dir:
+        state.bin_directory = Path(args.bin_dir).expanduser()
+    state.install_launcher = not args.no_launcher
+    state.modify_shell_profiles = not args.no_modify_path
     app = InstallerApp(state)
     app.run()
     return app.done_code if app.done_code is not None else 130
+
+
+def _repair(install_directory: Path, args: argparse.Namespace) -> int:
+    """Re-apply the launcher, client entries, and skills for an existing install."""
+
+    prefill = load_prefill()
+    selected = (
+        parse_harness_selection(args.harnesses)
+        if args.harnesses is not None
+        else list(prefill.configured_slugs)
+    )
+    plan = InstallPlan(
+        install_directory=install_directory,
+        accelerator=None,
+        harness_slugs=tuple(selected),
+        # The values already in the configs, written back as they are: repair
+        # fixes what is broken, it does not change what the user chose.
+        env_updates=dict(prefill.values),
+        offline=args.offline,
+        bin_directory=Path(args.bin_dir).expanduser() if args.bin_dir else None,
+        install_launcher=not args.no_launcher,
+        modify_shell_profiles=not args.no_modify_path,
+    )
+    result = run_install(plan, on_event=_print_event)
+    if result.failures:
+        print(
+            f"Repair finished with {len(result.failures)} failure(s); see above.",
+            file=sys.stderr,
+        )
+        return 1
+    print("Repair complete.")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -155,6 +214,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         env_updates = parse_settings(args.settings, args.unsets)
         if args.tui:
             return _run_tui(args, install_directory, env_updates)
+        if args.repair:
+            # Repair re-runs the cheap steps against what is already configured.
+            # Nothing is chosen anew, so it never opens the wizard and never
+            # rebuilds an accelerator environment that already works.
+            return _repair(install_directory, args)
         if args.harnesses is not None:
             selected = parse_harness_selection(args.harnesses)
         elif args.reconfigure:
@@ -172,6 +236,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             harness_slugs=tuple(selected),
             env_updates=env_updates,
             offline=args.offline,
+            bin_directory=Path(args.bin_dir).expanduser() if args.bin_dir else None,
+            install_launcher=not args.no_launcher,
+            modify_shell_profiles=not args.no_modify_path,
         )
         result = run_install(plan, on_event=_print_event)
     except InstallerError as exc:
@@ -189,7 +256,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    if result.warnings:
+        print(
+            f"Installation complete with {len(result.warnings)} check warning(s); "
+            "see the [verify] lines above.",
+            file=sys.stderr,
+        )
     print("Installation complete. Restart configured clients to load the MCP server.")
+    if result.profiles_updated:
+        from .shell_path import activation_hint
+
+        names = ", ".join(str(profile) for profile in result.profiles_updated)
+        print(f"PATH was updated in {names}; start a new shell or run: ")
+        print(f"  {activation_hint(result.profiles_updated)}")
     return 0
 
 
@@ -201,6 +280,10 @@ def configure_main(
     settings: Sequence[str],
     unsets: Sequence[str],
     no_tui: bool,
+    bin_dir: str | None = None,
+    no_launcher: bool = False,
+    no_modify_path: bool = False,
+    repair: bool = False,
 ) -> int:
     """Entry for ``code-indexing-mcp configure``: reconfigure an existing install."""
 
@@ -223,9 +306,20 @@ def configure_main(
         argv += ["--set", pair]
     for name in unsets:
         argv += ["--unset", name]
+    if bin_dir is not None:
+        argv += ["--bin-dir", bin_dir]
+    if no_launcher:
+        argv.append("--no-launcher")
+    if no_modify_path:
+        argv.append("--no-modify-path")
+    if repair:
+        argv.append("--repair")
     # Any flag that already says what to do is an instruction to apply it, not an
-    # invitation to open a wizard over the top of it.
-    scripted = bool(settings or unsets or harnesses is not None or accelerator is not None)
+    # invitation to open a wizard over the top of it. The launcher flags are not
+    # among them: they say where things go, not which steps to skip.
+    scripted = bool(
+        settings or unsets or harnesses is not None or accelerator is not None or repair
+    )
     if not no_tui and not scripted and sys.stdin.isatty():
         argv.remove("--no-prompt")
         argv.append("--tui")

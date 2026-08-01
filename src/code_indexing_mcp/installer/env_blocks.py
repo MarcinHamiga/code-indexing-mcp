@@ -24,7 +24,7 @@ ENV_KEYS: dict[str, str] = {
     "kilocode": "environment",
 }
 
-_OBJECT_KEYS: dict[str, str] = {
+OBJECT_KEYS: dict[str, str] = {
     "claude-code": "mcpServers",
     "kimi-code": "mcpServers",
     "claude-desktop": "mcpServers",
@@ -40,7 +40,7 @@ def entry_from_text(slug: str, text: str) -> dict[str, Any] | None:
         if slug == "codex":
             servers = tomllib.loads(text).get("mcp_servers")
         else:
-            object_key = _OBJECT_KEYS.get(slug)
+            object_key = OBJECT_KEYS.get(slug)
             if object_key is None:
                 return None
             servers = json.loads(_jsonc_as_json(text)).get(object_key)
@@ -58,6 +58,21 @@ def env_from_entry(slug: str, entry: Mapping[str, Any]) -> dict[str, str]:
     if not isinstance(raw, dict):
         return {}
     return {str(key): str(value) for key, value in raw.items()}
+
+
+def command_from_entry(slug: str, entry: Mapping[str, Any]) -> str | None:
+    """Return the executable the entry launches, or None if it names none.
+
+    The OpenCode-schema harnesses put the command and its arguments in one list;
+    everywhere else ``command`` is the executable on its own.
+    """
+
+    raw = entry.get("command")
+    if isinstance(raw, str):
+        return raw or None
+    if isinstance(raw, list) and raw and isinstance(raw[0], str):
+        return raw[0] or None
+    return None
 
 
 def merge_env(existing: Mapping[str, str], updates: Mapping[str, str | None]) -> dict[str, str]:

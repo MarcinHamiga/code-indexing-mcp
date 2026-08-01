@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import os
-import shutil
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from .config_files import SERVER_NAME, InstallerError, merge_codex_server, merge_json_object_entry
-from .env_blocks import entry_from_text, env_from_entry, merge_env
+from .config_files import (
+    SERVER_NAME,
+    InstallerError,
+    merge_codex_server,
+    merge_json_object_entry,
+    remove_codex_server,
+    remove_json_object_entry,
+)
+from .env_blocks import OBJECT_KEYS, entry_from_text, env_from_entry, merge_env
+from .links import is_under, link_destination, replace_link
 
 
 class HarnessChoice(NamedTuple):
@@ -222,6 +229,94 @@ def configure_harness(
     return path
 
 
+def deconfigure_harness(
+    slug: str,
+    *,
+    home: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    platform_name: str | None = None,
+) -> tuple[Path, bool]:
+    """Remove the Code Indexing MCP entry from one harness config.
+
+    Returns the config path and whether anything was actually removed. Only the
+    server's own entry goes; every other key in the file is left untouched.
+    """
+
+    path = configuration_path(
+        slug,
+        home=home,
+        environment=environment,
+        platform_name=platform_name,
+    )
+    if not path.exists():
+        return path, False
+    if slug == "codex":
+        return path, remove_codex_server(path)
+    object_key = OBJECT_KEYS.get(slug)
+    if object_key is None:
+        raise InstallerError(f"Unknown harness {slug!r}")
+    return path, remove_json_object_entry(path, object_key, SERVER_NAME)
+
+
+def deconfigure_selected_harnesses(
+    slugs: list[str],
+    *,
+    home: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    platform_name: str | None = None,
+) -> tuple[list[tuple[str, Path, bool]], list[tuple[str, str]]]:
+    """Remove the entry from every selection, keeping one client's failure isolated."""
+
+    removed: list[tuple[str, Path, bool]] = []
+    failures: list[tuple[str, str]] = []
+    for slug in slugs:
+        try:
+            path, changed = deconfigure_harness(
+                slug,
+                home=home,
+                environment=environment,
+                platform_name=platform_name,
+            )
+        except (InstallerError, OSError) as exc:
+            failures.append((slug, str(exc)))
+        else:
+            removed.append((slug, path, changed))
+    return removed, failures
+
+
+def remove_skills(
+    slugs: list[str],
+    install_directory: Path | None = None,
+    *,
+    home: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> list[tuple[str, str]]:
+    """Unlink bundled skills, leaving anything the user owns exactly where it is.
+
+    ``install_directory`` scopes removal to links pointing into the checkout
+    being uninstalled, so a second installation elsewhere keeps its own links.
+    """
+
+    results: list[tuple[str, str]] = []
+    for slug in slugs:
+        directory = skill_directory(slug, home=home, environment=environment)
+        if directory is None or not directory.is_dir():
+            results.append((slug, "skipped: no skill directory"))
+            continue
+        removed = 0
+        try:
+            for entry in sorted(directory.iterdir()):
+                # Only links this installer left, recognised by where they point.
+                if is_bundled_skill_link(entry, install_directory):
+                    entry.unlink()
+                    removed += 1
+        except OSError as exc:
+            results.append((slug, f"skipped: {exc}"))
+            continue
+        results.append((slug, f"{removed} unlinked from {directory}"))
+    return results
+
+
 def configure_selected_harnesses(
     slugs: list[str],
     command: Path,
@@ -272,42 +367,30 @@ def skill_directory(
     return None
 
 
-def _remove_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    else:
-        shutil.rmtree(path)
+def is_bundled_skill_link(target: Path, install_directory: Path | None = None) -> bool:
+    """True when ``target`` is a link to a skill bundled with this project.
 
-
-def _backup_path(target: Path) -> Path:
-    """Pick a backup name that does not overwrite a backup from an earlier install."""
-
-    candidate = target.with_name(f"{target.name}.bak")
-    counter = 2
-    while candidate.is_symlink() or candidate.exists():
-        candidate = target.with_name(f"{target.name}.bak.{counter}")
-        counter += 1
-    return candidate
-
-
-def _link_destination(link: Path) -> Path:
-    """Where a symlink points, in a form that compares reliably.
-
-    Raw os.readlink output is not comparable: Windows hands back an extended-length
-    "\\\\?\\C:\\..." path that never equals the plain path the link was created from,
-    which would make every re-install look like a first install.
+    Without ``install_directory`` the test is shape-only -- it points into some
+    ``code_indexing_mcp/skills`` directory -- which is what installing needs:
+    a link left by an *older* checkout is exactly the one to replace. Removal
+    needs the opposite, so it passes the checkout and requires a link into it.
     """
 
-    return link.resolve()
+    if not target.is_symlink():
+        return False
+    destination = link_destination(target)
+    skills_dir = destination.parent
+    if not (skills_dir.name == "skills" and skills_dir.parent.name == "code_indexing_mcp"):
+        return False
+    if install_directory is None:
+        return True
+    return is_under(destination, install_directory)
 
 
 def _is_stale_bundled_link(target: Path) -> bool:
     """True when target is a link this installer left pointing at an older checkout."""
 
-    if not target.is_symlink():
-        return False
-    skills_dir = _link_destination(target).parent
-    return skills_dir.name == "skills" and skills_dir.parent.name == "code_indexing_mcp"
+    return is_bundled_skill_link(target)
 
 
 def _link_skill(source: Path, target: Path) -> bool:
@@ -316,26 +399,12 @@ def _link_skill(source: Path, target: Path) -> bool:
     Returns True when a new link was created, False when it already existed.
     """
 
-    if target.is_symlink() and _link_destination(target) == source.resolve():
-        return False
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # Build the replacement link before disturbing what is already there, so a
-    # platform that cannot create symlinks at all fails without having moved a
-    # skill the user owns out from under its harness.
-    staged = target.with_name(f"{target.name}.incoming")
-    if staged.is_symlink() or staged.exists():
-        _remove_path(staged)
-    staged.symlink_to(source, target_is_directory=True)
-    try:
-        if _is_stale_bundled_link(target):
-            target.unlink()
-        elif target.is_symlink() or target.exists():
-            target.rename(_backup_path(target))
-        staged.rename(target)
-    except OSError:
-        staged.unlink(missing_ok=True)
-        raise
-    return True
+    return replace_link(
+        source,
+        target,
+        is_directory=True,
+        stale=_is_stale_bundled_link(target),
+    )
 
 
 def install_skills(
