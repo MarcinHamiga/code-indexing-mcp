@@ -13,6 +13,7 @@ from typing import Any, TextIO
 
 from pydantic import BaseModel
 
+from . import __version__, update_check
 from .application import Application, RuntimePaths
 from .benchmark import run_index_benchmark_command
 from .daemon import (
@@ -27,9 +28,37 @@ from .progress import IndexProgress
 from .server import create_server
 from .settings import IndexSettings
 
+# Commands a human runs and reads: the only place an update notice belongs.
+_NOTIFY_COMMANDS = frozenset({"init", "index", "status", "projects", "model"})
+
+
+class _VersionAction(argparse.Action):
+    """Print the version, reading the revision only when the flag is used."""
+
+    def __init__(
+        self,
+        option_strings: Sequence[str],
+        dest: str = argparse.SUPPRESS,
+        help: str | None = None,
+    ) -> None:
+        super().__init__(option_strings=list(option_strings), dest=dest, nargs=0, help=help)
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        head = update_check.checkout_head(Path(__file__).resolve().parents[2])
+        print(f"code-indexing-mcp {__version__} ({head[:7] if head else 'unknown'})")
+        # Exits during parsing, so --version needs no subcommand despite required=True.
+        parser.exit()
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="code-indexing-mcp", description="Local MCP code indexer")
+    parser.add_argument("--version", action=_VersionAction, help="show the version and exit")
     commands = parser.add_subparsers(dest="command", required=True)
     serve = commands.add_parser("serve", help="Run the stdio MCP server")
     serve.add_argument("--direct", action="store_true", help="Bypass the per-user daemon")
@@ -137,6 +166,20 @@ def _parser() -> argparse.ArgumentParser:
         help="also delete the installation checkout and its virtual environments",
     )
     uninstall.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    update = commands.add_parser("update", help="Update this installation to the latest main")
+    update.add_argument("--install-dir", help="checkout location of the installation")
+    update.add_argument(
+        "--check",
+        action="store_true",
+        help="report whether an update is available; exit 0 up-to-date, 10 available, 1 unknown",
+    )
+    update.add_argument(
+        "--skip-accelerator",
+        action="store_true",
+        help="do not rebuild a prepared accelerator whose locked runtime changed",
+    )
+    update.add_argument("--finalize", action="store_true", help=argparse.SUPPRESS)
+    update.add_argument("--previous-sha", default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -189,6 +232,14 @@ class _ProgressPrinter:
             self._width = 0
 
 
+def _update_notice(cache_directory: Path) -> str | None:
+    """The notice, honouring the disable switch even when a cache lingers."""
+
+    if update_check._disabled():
+        return None
+    return update_check.notice(cache_directory)
+
+
 def _json(value: BaseModel | Sequence[BaseModel] | dict[str, Any]) -> str:
     if isinstance(value, BaseModel):
         payload: Any = value.model_dump(mode="json")
@@ -203,9 +254,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     paths = RuntimePaths.from_environment()
+    refresh = (
+        update_check.start_background_refresh(paths.cache)
+        if args.command in _NOTIFY_COMMANDS
+        else None
+    )
     try:
         if args.command == "daemon":
             if args.daemon_command == "run":
+                update_check.start_background_refresh(paths.cache)
+                notice = _update_notice(paths.cache)
+                if notice is not None:
+                    logging.info(notice)
                 DaemonServer(paths).serve()
                 return 0
             if args.daemon_command == "status":
@@ -254,6 +314,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 no_modify_path=args.no_modify_path,
                 repair=args.repair,
             )
+        if args.command == "update":
+            # Lazy for the same reason as configure: never on the serve path.
+            from .installer.update import update_main
+
+            return update_main(
+                install_dir=args.install_dir,
+                check=args.check,
+                skip_accelerator=args.skip_accelerator,
+                finalize=args.finalize,
+                previous_sha=args.previous_sha,
+            )
         if args.command == "uninstall":
             # Lazy for the same reason as configure: never on the serve path.
             from .installer.uninstall import uninstall_main
@@ -286,6 +357,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     use_daemon = False
             app = ensure_daemon(paths) if use_daemon else Application(paths, cwd=Path.cwd())
+            update_check.start_background_refresh(paths.cache)
+            # Logged rather than printed: stdout carries the MCP protocol.
+            notice = _update_notice(paths.cache)
+            if notice is not None:
+                logging.info(notice)
             create_server(app).run(transport="stdio")
             return 0
         app = Application(paths, cwd=Path.cwd())
@@ -312,6 +388,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             raise AssertionError("unreachable command")
         print(_json(result))
+        if refresh is not None:
+            refresh.join(timeout=1.0)
+        notice = _update_notice(paths.cache)
+        if notice is not None:
+            print(notice, file=sys.stderr)
         return 0
     except CodeIndexingError as exc:
         print(str(exc), file=sys.stderr)

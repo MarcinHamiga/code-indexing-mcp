@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-indexing-mcp"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Local-only Tree-sitter code indexer exposed over MCP"
 license = "MIT"
 readme = "README.md"
@@ -92,6 +92,9 @@ tui = ["textual>=8.2,<9"]
 
 [project.scripts]
 code-indexing-mcp = "code_indexing_mcp.cli:main"
+
+[tool.hatch.version]
+path = "src/code_indexing_mcp/__init__.py"
 
 [tool.hatch.metadata]
 # MIGraphX is distributed as a versioned ROCm wheel URL rather than through a

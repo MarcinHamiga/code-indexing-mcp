@@ -169,7 +169,30 @@ def test_configure_delegates_to_the_installer(monkeypatch, capsys) -> None:  # t
     ]
 
 
-def test_serve_path_does_not_import_textual() -> None:
+def test_update_delegates_to_the_installer(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = []
+
+    def fake_update_main(**kwargs):  # type: ignore[no-untyped-def]
+        calls.append(kwargs)
+        return 0
+
+    import code_indexing_mcp.installer.update as installer_update
+
+    monkeypatch.setattr(installer_update, "update_main", fake_update_main)
+    code = main(["update", "--install-dir", "/opt/ci-mcp", "--skip-accelerator"])
+    assert code == 0
+    assert calls == [
+        {
+            "install_dir": "/opt/ci-mcp",
+            "check": False,
+            "skip_accelerator": True,
+            "finalize": False,
+            "previous_sha": None,
+        }
+    ]
+
+
+def test_serve_path_does_not_import_textual_or_the_updater() -> None:
     import subprocess
     import sys
 
@@ -177,12 +200,98 @@ def test_serve_path_does_not_import_textual() -> None:
         [
             sys.executable,
             "-c",
-            "import code_indexing_mcp.cli, sys; print('textual' in sys.modules)",
+            "import code_indexing_mcp.cli, sys; "
+            "print('textual' in sys.modules, "
+            "'code_indexing_mcp.installer.update' in sys.modules)",
         ],
         capture_output=True,
         text=True,
     )
-    assert result.stdout.strip() == "False"
+    assert result.stdout.strip() == "False False"
+
+
+def test_serve_does_not_spawn_git_on_a_development_checkout(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Without a managed install there is nothing to check, so nothing may run."""
+
+    import subprocess
+
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("CODE_INDEXING_MCP_INSTALL_DIR", str(tmp_path / "absent"))
+    monkeypatch.setattr(daemon, "daemon_supported", lambda: False)
+
+    def refuse(*_: object, **__: object) -> object:
+        raise AssertionError("the serve path must not spawn a subprocess")
+
+    monkeypatch.setattr(subprocess, "run", refuse)
+
+    class FakeServer:
+        def run(self, transport: str) -> None:
+            return None
+
+    monkeypatch.setattr(cli, "create_server", lambda app: FakeServer())
+
+    assert cli.main(["serve"]) == 0
+
+
+def test_version_flag_prints_the_version_and_exits(capsys) -> None:  # type: ignore[no-untyped-def]
+    from code_indexing_mcp import __version__
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--version"])
+
+    assert exit_info.value.code == 0
+    printed = capsys.readouterr().out.strip()
+    assert printed.startswith("code-indexing-mcp ")
+    assert __version__ in printed
+
+
+def _fake_managed_install(tmp_path: Path, monkeypatch, remote_sha: str) -> None:  # type: ignore[no-untyped-def]
+    """Make update_check believe this process runs from a managed install."""
+
+    import sys
+    import time
+
+    from code_indexing_mcp import update_check
+
+    install_dir = tmp_path / "install"
+    git_dir = install_dir / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+    (git_dir / "refs" / "heads" / "main").write_text("a" * 40 + "\n")
+    monkeypatch.setenv("CODE_INDEXING_MCP_INSTALL_DIR", str(install_dir))
+    monkeypatch.setattr(sys, "prefix", str(install_dir / ".venv"))
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(cache))
+    # A fresh timestamp keeps the throttle closed, so no background refresh runs.
+    update_check.write_cache(
+        cache,
+        update_check.UpdateStatus(
+            checked_at=time.time(), local_sha="a" * 40, remote_sha=remote_sha
+        ),
+    )
+
+
+def test_projects_list_reports_an_available_update_on_stderr(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _fake_managed_install(tmp_path, monkeypatch, remote_sha="b" * 40)
+
+    assert main(["projects", "list"]) == 0
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == []
+    assert "code-indexing-mcp update" in captured.err
+
+
+def test_update_notice_is_silent_when_disabled(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    _fake_managed_install(tmp_path, monkeypatch, remote_sha="b" * 40)
+    monkeypatch.setenv("CODE_INDEXING_UPDATE_CHECK", "off")
+
+    assert main(["projects", "list"]) == 0
+
+    assert "update is available" not in capsys.readouterr().err
 
 
 class _TinyEmbedder:

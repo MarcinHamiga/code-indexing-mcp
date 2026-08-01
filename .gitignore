@@ -4,6 +4,9 @@
 # refuse to update the checkout it sits in.
 .venv/
 .venv-accel/
+# Left behind by `code-indexing-mcp update`'s single-flight lock; if tracked as
+# dirt it would make install.py refuse to update the checkout it sits in.
+.update.lock
 __pycache__/
 .pytest_cache/
 .mypy_cache/

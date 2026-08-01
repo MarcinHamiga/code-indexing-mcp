@@ -8,6 +8,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from conftest import create_test_remote, run_git
 
 from code_indexing_mcp.installer.accelerator import (
     ACCELERATOR_ENVIRONMENT_DIRECTORY,
@@ -450,31 +451,6 @@ def test_claude_desktop_uses_linux_config_directory(tmp_path: Path) -> None:
         )
         == tmp_path / ".config" / "Claude" / "claude_desktop_config.json"
     )
-
-
-def run_git(*arguments: str, cwd: Path | None = None) -> None:
-    subprocess.run(
-        ["git", *arguments],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-
-def create_test_remote(tmp_path: Path, name: str = "remote") -> tuple[Path, Path]:
-    remote = tmp_path / f"{name}.git"
-    publisher = tmp_path / f"{name}-publisher"
-    run_git("init", "--bare", "--initial-branch=main", str(remote))
-    run_git("init", "--initial-branch=main", str(publisher))
-    run_git("config", "user.name", "Installer Tests", cwd=publisher)
-    run_git("config", "user.email", "installer@example.test", cwd=publisher)
-    (publisher / "version.txt").write_text("one\n")
-    run_git("add", "version.txt", cwd=publisher)
-    run_git("commit", "-m", "initial", cwd=publisher)
-    run_git("remote", "add", "origin", str(remote), cwd=publisher)
-    run_git("push", "-u", "origin", "main", cwd=publisher)
-    return remote, publisher
 
 
 def test_repository_is_cloned_then_fast_forwarded_on_update(tmp_path: Path) -> None:

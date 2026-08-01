@@ -186,6 +186,32 @@ def run_checks(
     return tuple(checks)
 
 
+def run_update_checks(
+    install_directory: Path,
+    configured: Sequence[tuple[str, Path]] = (),
+    *,
+    accelerator_was_prepared: bool = True,
+    home: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[Check, ...]:
+    """Check an updated installation. Same checks as ``run_checks``, minus the launcher.
+
+    An update never touches the launcher, so its "no launcher was requested"
+    warning would be noise on every single run.
+    """
+
+    checks = [_server_runs(install_directory)]
+    checks.extend(
+        _harness_entries(configured, install_directory, home=home, environment=environment)
+    )
+    if accelerator_was_prepared:
+        checks.append(_accelerator_recorded(install_directory))
+    checks.extend(
+        _skill_links([slug for slug, _ in configured], home=home, environment=environment)
+    )
+    return tuple(checks)
+
+
 def format_check(check: Check) -> str:
     """One display line per check.
 

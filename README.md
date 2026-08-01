@@ -47,8 +47,9 @@ writes roll into a `.bak.prev` beside it, so re-running `configure` cannot cost 
 original. For Codex the whole `[mcp_servers.code-indexing-mcp]` table is rewritten, so any
 other key you added inside that one table is replaced rather than merged.
 
-Re-run the same command later to update an existing clean checkout with a fast-forward-only
-pull and refresh its environment. To change settings or harnesses without updating, run
+Later, `code-indexing-mcp update` updates an existing clean checkout with a fast-forward-only
+pull and refreshes its environment — see [Update](#update). Re-running the install command above
+does the same thing. To change settings or harnesses without updating, run
 `code-indexing-mcp configure` — it opens the same wizard offline, prefilled from your
 current configuration. Naming what to change applies it directly instead:
 `code-indexing-mcp configure --set CODE_INDEXING_BROKER=off --unset CODE_INDEXING_INDEX_MODE`.
@@ -127,6 +128,40 @@ Reinstalling as `--accelerator cpu` removes the environment again.
 
 Use `--install-dir /custom/path` or `CODE_INDEXING_MCP_INSTALL_DIR` to change the checkout
 location. Run `python3 install.py --help` for all installer options.
+
+### Update
+
+`code-indexing-mcp update` updates an existing installation in place. It checks first — git on
+PATH, a clean checkout on `main` whose origin is this repository, and `uv` resolvable — and
+refuses with one actionable sentence before touching anything if any of that does not hold. Then
+it fast-forwards to the tip of `main`, refreshes the locked environment, rebuilds the prepared
+accelerator environment only when the pull moved the runtime lock it was built against, stops the
+daemon so the next client starts it on the new code, and re-runs the installation checks for the
+harnesses you already have configured. Two updates cannot run at once; the second refuses
+immediately.
+
+```bash
+code-indexing-mcp update
+code-indexing-mcp update --check              # report only, change nothing
+code-indexing-mcp update --skip-accelerator   # defer the accelerator rebuild
+```
+
+`--check` prints a JSON report of the local and remote commits and exits `0` when you are up to
+date, `10` when an update is available, and `1` when the check itself could not be made — offline,
+no checkout, or an origin that is not this repository.
+
+`--skip-accelerator` leaves a stale accelerator environment in place. Nothing retires it at
+runtime, so the previously prepared accelerator keeps serving the *old* locked runtime until you
+rebuild it; the command prints the exact repair command.
+
+Once a day, in the background, the CLI compares your checkout against the tip of `main` and prints
+one line on stderr when an update is available. It never updates anything by itself, it is silent
+on a development checkout, and `CODE_INDEXING_UPDATE_CHECK=off` turns it off entirely.
+
+Restart your MCP clients after an update: a running server keeps the code it started with.
+
+On Windows, an update that raises the project's required Python cannot rebuild the environment it
+is running from — the sync fails and says so; re-run the installer.
 
 ### Repair and uninstall
 
@@ -761,6 +796,9 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
 ```
+
+A version bump in `src/code_indexing_mcp/__init__.py` must ship with a regenerated `uv.lock`
+(`uv lock`), or every user's `update` fails at the locked sync; CI's `--locked` sync gates it.
 
 To exercise the real model integration, provide a persistent cache directory and opt in:
 
