@@ -9,7 +9,7 @@ import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from pydantic import BaseModel
 
@@ -23,6 +23,7 @@ from .daemon import (
     require_daemon_support,
 )
 from .errors import CodeIndexingError
+from .progress import IndexProgress
 from .server import create_server
 from .settings import IndexSettings
 
@@ -139,6 +140,55 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+class _ProgressPrinter:
+    """Render live indexing progress to *stream* without touching stdout.
+
+    Indexing a large repository takes minutes, and printing nothing until the
+    report lands makes a working command indistinguishable from a hung one. The
+    JSON result stays alone on stdout, so piping the command is unaffected.
+    """
+
+    # A redirected stream has no cursor to rewrite, so it gets periodic lines
+    # instead of a status line refreshed several times a second.
+    LOG_INTERVAL_SECONDS = 5.0
+
+    def __init__(self, stream: TextIO) -> None:
+        self.stream = stream
+        self.interactive = stream.isatty()
+        self._width = 0
+        self._logged_at: float | None = None
+        self._logged_phase: str | None = None
+
+    def __call__(self, progress: IndexProgress) -> None:
+        line = progress.describe()
+        if self.interactive:
+            self.stream.write("\r" + line.ljust(self._width))
+            self._width = len(line)
+            self.stream.flush()
+            return
+        now = time.monotonic()
+        # A phase change is news whenever it happens: embedding a batch is where
+        # a run spends minutes without a word, and the log should say so before
+        # the wait rather than after it.
+        if (
+            progress.phase == self._logged_phase
+            and self._logged_at is not None
+            and now - self._logged_at < self.LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._logged_at = now
+        self._logged_phase = progress.phase
+        print(line, file=self.stream, flush=True)
+
+    def clear(self) -> None:
+        """Take the status line back down before anything else is printed."""
+
+        if self.interactive and self._width:
+            self.stream.write("\r" + " " * self._width + "\r")
+            self.stream.flush()
+            self._width = 0
+
+
 def _json(value: BaseModel | Sequence[BaseModel] | dict[str, Any]) -> str:
     if isinstance(value, BaseModel):
         payload: Any = value.model_dump(mode="json")
@@ -243,7 +293,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "init":
             result = app.init_project(args.path, args.name, args.force_new_id)
         elif args.command == "index":
-            result = app.index_project(args.project, force=args.force)
+            printer = _ProgressPrinter(sys.stderr)
+            try:
+                result = app.index_project(args.project, force=args.force, on_progress=printer)
+            finally:
+                printer.clear()
         elif args.command == "status":
             result = app.project_status(args.project)
         elif args.command == "projects" and args.projects_command == "list":

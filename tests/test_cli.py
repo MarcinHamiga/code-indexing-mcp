@@ -1,3 +1,4 @@
+import io
 import json
 from pathlib import Path
 
@@ -182,3 +183,64 @@ def test_serve_path_does_not_import_textual() -> None:
         text=True,
     )
     assert result.stdout.strip() == "False"
+
+
+class _TinyEmbedder:
+    model_id = "test/tiny"
+    dimension = 4
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0, 0.0, float(len(text))] for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return [1.0, 0.0, 0.0, float(len(text))]
+
+
+def test_index_narrates_its_progress_on_stderr_and_keeps_stdout_json(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A long index must say what it is doing without polluting the machine-readable output."""
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        cli,
+        "Application",
+        lambda paths, cwd: Application(paths, embedder=_TinyEmbedder(), cwd=cwd),
+    )
+
+    assert main(["init", str(root)]) == 0
+    capsys.readouterr()
+    assert main(["index", str(root)]) == 0
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["indexed_files"] == 1
+    # Redirected stderr gets whole lines, and every phase gets one.
+    assert "Scanning for changed files" in captured.err
+    assert "Embedding" in captured.err
+    assert "Committing the index" in captured.err
+
+
+def test_a_terminal_gets_one_status_line_that_is_cleaned_up_afterwards() -> None:
+    from code_indexing_mcp.progress import IndexProgress
+
+    class Terminal(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = Terminal()
+    printer = cli._ProgressPrinter(stream)
+
+    printer(IndexProgress(project_id="abc", files_seen=1, phase="scanning"))
+    printer(IndexProgress(project_id="abc", files_seen=2, phase="scanning"))
+    printer.clear()
+
+    written = stream.getvalue()
+    assert written.count("\n") == 0, "a status line must not scroll the terminal"
+    assert "Scanning 2 files" in written
+    # Whatever the last line was, the cursor ends on a blank line so the JSON
+    # report is not printed on top of it.
+    assert written.rstrip("\r").endswith(" " * len("Scanning 2 files"))

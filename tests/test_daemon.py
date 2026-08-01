@@ -358,3 +358,33 @@ def test_the_daemon_reports_the_backend_it_would_index_with(tmp_path: Path) -> N
     assert status.dimension == 4
     assert status.requested_accelerator == "auto"
     assert "CPUExecutionProvider" in status.available_providers
+
+
+def test_the_broker_reads_the_progress_the_indexing_process_publishes(tmp_path: Path) -> None:
+    """Progress crosses the process boundary as a file, not as an RPC.
+
+    The daemon thread that would have to answer an RPC is the one busy indexing,
+    so a caller watching a daemon-side run reads the snapshot it publishes into
+    the shared data directory.
+    """
+
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = application.init_project(root)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+    seen: list[str] = []
+
+    application.index_project(
+        project.id,
+        on_progress=lambda _: seen.extend(
+            snapshot.phase
+            for snapshot in [broker.index_progress(project.id)]
+            if snapshot is not None
+        ),
+    )
+
+    assert "scanning" in seen
+    assert broker.index_progress(project.id) is None

@@ -28,6 +28,7 @@ from .embedding_worker import TelemetrySource
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
 from .models import ExtractedChunk, IndexIssue, IndexReport, ProjectInfo, SkippedFile, StoredFile
+from .progress import IndexProgress, ProgressPublisher
 from .scanner import SourceScanner
 from .staging import ChunkRow, StagingJob
 from .storage import LanceStore
@@ -146,6 +147,7 @@ class Indexer:
         passage_session_factory: Callable[[], AbstractContextManager[PassageEmbedder]]
         | None = None,
         staging_directory: Path | None = None,
+        progress_directory: Path | None = None,
     ) -> None:
         self.store = store
         self.scanner = scanner
@@ -156,20 +158,34 @@ class Indexer:
         self.segment_plan = segment_plan or SegmentPlan(max_items=batch_size)
         self.passage_session_factory = passage_session_factory
         self.staging_directory = staging_directory or lock_directory.parent / "staging"
+        self.progress_directory = progress_directory or lock_directory.parent / "progress"
 
     def index(
-        self, project: ProjectInfo, *, force: bool = False, wait_for_lock: bool = False
+        self,
+        project: ProjectInfo,
+        *,
+        force: bool = False,
+        wait_for_lock: bool = False,
+        on_progress: Callable[[IndexProgress], None] | None = None,
     ) -> IndexReport:
         started = time.monotonic_ns()
         self.lock_directory.mkdir(parents=True, exist_ok=True)
         global_lock = FileLock(self.lock_directory / "index-global.lock")
         project_lock = FileLock(self.lock_directory / f"{project.id}.lock")
+        progress = ProgressPublisher(
+            project.id, directory=self.progress_directory, listener=on_progress
+        )
         try:
             with (
                 global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
                 project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
             ):
-                report = self._index_locked(project, force=force)
+                try:
+                    report = self._index_locked(project, force=force, progress=progress)
+                finally:
+                    # Only the run that holds the lock owns the snapshot, so
+                    # clearing here can never delete another process's progress.
+                    progress.clear()
         except Timeout as exc:
             raise CodeIndexingError(
                 ErrorCode.INDEX_BUSY,
@@ -179,7 +195,9 @@ class Indexer:
         duration_ms = (time.monotonic_ns() - started) // 1_000_000
         return report.model_copy(update={"duration_ms": duration_ms})
 
-    def _index_locked(self, project: ProjectInfo, *, force: bool) -> IndexReport:
+    def _index_locked(
+        self, project: ProjectInfo, *, force: bool, progress: ProgressPublisher
+    ) -> IndexReport:
         self.store.upsert_project(project, model_id=self.embedder.model_id, state="indexing")
         try:
             context = (
@@ -188,7 +206,9 @@ class Indexer:
                 else contextlib.nullcontext(self.embedder)
             )
             with context as passage_embedder:
-                report = self._index_scan(project, force=force, passage_embedder=passage_embedder)
+                report = self._index_scan(
+                    project, force=force, passage_embedder=passage_embedder, progress=progress
+                )
             if isinstance(context, TelemetrySource):
                 # Read after the context exits, so a session that fell back from
                 # an accelerator to CPU reports the backend it finished on and
@@ -220,13 +240,26 @@ class Indexer:
             raise
 
     def _index_scan(
-        self, project: ProjectInfo, *, force: bool, passage_embedder: PassageEmbedder
+        self,
+        project: ProjectInfo,
+        *,
+        force: bool,
+        passage_embedder: PassageEmbedder,
+        progress: ProgressPublisher,
     ) -> IndexReport:
         timer = _PhaseTimer()
         with timer.measure("scan"):
             existing = {record.path: record for record in self.store.list_files(project.id)}
+        # The scanner streams, so the only honest total before the walk finishes
+        # is what the last run saw. A first index reports a bare count instead.
+        progress.update(
+            phase="scanning",
+            files_total=len(existing) or None,
+            force=True,
+        )
         current_paths: set[str] = set()
         indexed = parsed = embedded = unchanged = metadata_only = removed = skipped = 0
+        files_seen = 0
         fallback_count = 0
         errors: list[IndexIssue] = []
         job: StagingJob | None = None
@@ -277,6 +310,10 @@ class Indexer:
                 for owner, staged_file in enumerate(pending)
                 for chunk in staged_file.chunks
             ]
+            # Announced before the work rather than after it: embedding a batch
+            # is the longest thing an index does between two updates, and the
+            # watcher should learn what the pause is for while it lasts.
+            progress.update(phase="embedding", current_path=None, force=True)
             for group in _candidate_groups(candidates):
                 active = [
                     candidate for candidate in group if pending[candidate.owner].error is None
@@ -291,6 +328,7 @@ class Indexer:
                     finally:
                         sample_memory()
                 fallback_count += retries
+                progress.update(phase="embedding")
                 staged_rows: dict[int, list[ChunkRow]] = {}
                 for candidate, segments in succeeded:
                     target = pending[candidate.owner]
@@ -330,6 +368,9 @@ class Indexer:
                     staging_job().mark_replaced(target.record.file_id)
                     indexed += 1
                     embedded += target.embedded_chunks
+            progress.update(
+                phase="embedding", files_indexed=indexed, chunks_embedded=embedded, force=True
+            )
             pending.clear()
             pending_chunks = 0
             pending_chars = 0
@@ -341,10 +382,18 @@ class Indexer:
                     item = next(stream, None)
                 if item is None:
                     break
+                files_seen += 1
                 if isinstance(item, SkippedFile):
                     skipped += 1
+                    progress.update(phase="scanning", files_seen=files_seen, current_path=None)
                     continue
                 path = item.path.as_posix()
+                progress.update(
+                    phase="scanning",
+                    files_seen=files_seen,
+                    files_unchanged=unchanged,
+                    current_path=path,
+                )
                 current_paths.add(path)
                 previous = existing.get(path)
                 if (
@@ -447,6 +496,14 @@ class Indexer:
                         )
 
             flush_pending()
+            progress.update(
+                phase="committing",
+                files_seen=files_seen,
+                files_total=len(current_paths) or None,
+                files_unchanged=unchanged,
+                current_path=None,
+                force=True,
+            )
             with timer.measure("commit"):
                 for path, record in existing.items():
                     if path not in current_paths:

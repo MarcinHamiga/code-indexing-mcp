@@ -68,7 +68,9 @@ class InstallerApp(App[None]):
     .help { color: $text-muted; }
     .field { height: auto; margin-bottom: 1; }
     .error { color: $error; }
-    #nav { height: auto; dock: bottom; padding: 0 1; }
+    /* The Footer docks to the same edge, so the row it occupies is reserved
+       here; without it the button borders paint over the key hints. */
+    #nav { height: auto; dock: bottom; padding: 0 1; margin-bottom: 1; }
     #nav Button { margin: 0 1; }
     /* Docked so the retry/continue buttons stay reachable however long the
        detail log grows. */

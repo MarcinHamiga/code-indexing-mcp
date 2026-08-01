@@ -250,6 +250,12 @@ uv run --project /path/to/code-indexing-mcp code-indexing-mcp index
 uv run --project /path/to/code-indexing-mcp code-indexing-mcp status
 ```
 
+`index` reports live progress — the phase, how many files it has walked against the previous run's
+count, and how many chunks it has embedded — on stderr, as a status line on a terminal and as
+periodic lines when redirected. The JSON report stays alone on stdout, so piping is unaffected. The
+same numbers reach an MCP client as tool progress notifications, whether the work runs in this
+process or in the shared daemon.
+
 Benchmark the CPU indexing pipeline with a generated, deterministic corpus:
 
 ```bash
