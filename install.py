@@ -275,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         action = clone_or_update_repository(arguments.repo_url, install_directory)
         print(f"{action.title()} repository: {install_directory}")
+        if action == "updated":
+            print("Next time you can run: code-indexing-mcp update")
         command = sync_environment(install_directory)
         print(f"Prepared MCP executable: {command}")
     except InstallerError as exc:

@@ -146,7 +146,6 @@ wheels = [
 
 [[package]]
 name = "code-indexing-mcp"
-version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "filelock" },
@@ -252,7 +251,7 @@ requires-dist = [
     { name = "tree-sitter-typescript", specifier = ">=0.23,<0.24" },
     { name = "tree-sitter-yaml", specifier = ">=0.7,<0.8" },
 ]
-provides-extras = ["cpu", "cuda", "webgpu", "mlx", "migraphx", "tui"]
+provides-extras = ["cpu", "cuda", "migraphx", "mlx", "tui", "webgpu"]
 
 [package.metadata.requires-dev]
 dev = [
