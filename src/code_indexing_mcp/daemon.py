@@ -464,6 +464,12 @@ class BrokerApplication:
             self._call("project_status", project=project, roots=roots or [])
         )
 
+    def project_is_stale(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> bool:
+        """Use the status RPC so adding freshness does not change the daemon protocol."""
+        return self.project_status(project, roots=roots).state == "stale"
+
     def remove_project(self, project: str) -> RemovalReport:
         return RemovalReport.model_validate(self._call("remove_project", project=project))
 

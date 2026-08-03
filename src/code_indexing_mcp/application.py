@@ -39,7 +39,9 @@ from .models import (
     ProjectStatus,
     RemovalReport,
     ScanConfig,
+    ScannedFile,
     SearchResponse,
+    StoredFile,
     SymbolResponse,
 )
 from .passage_backend import PassageBackendSession
@@ -586,11 +588,42 @@ class Application:
         self, project: str | None = None, *, roots: list[Path] | None = None
     ) -> ProjectStatus:
         resolved = self._resolve(project, roots)
+        files = self.store.list_files(resolved.id)
+        state = self.store.project_state(resolved.id)
+        if state in {"ready", "partial"} and self._project_is_stale(
+            resolved, {record.path: record for record in files}
+        ):
+            state = "stale"
         return ProjectStatus(
             project=resolved,
-            state=self.store.project_state(resolved.id),
-            file_count=len(self.store.list_files(resolved.id)),
+            state=state,
+            file_count=len(files),
             chunk_count=self.store.count_chunks([resolved.id]),
+        )
+
+    def project_is_stale(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> bool:
+        """Return whether eligible source metadata differs from the live index."""
+        return self._project_is_stale(self._resolve(project, roots))
+
+    def _project_is_stale(
+        self, project: ProjectInfo, existing: dict[str, StoredFile] | None = None
+    ) -> bool:
+        if existing is None:
+            existing = {record.path: record for record in self.store.list_files(project.id)}
+        current = {
+            item.path.as_posix(): item
+            for item in self.indexer.scanner.iter_scan(project, existing, read_contents=False)
+            if isinstance(item, ScannedFile)
+        }
+        if current.keys() != existing.keys():
+            return True
+        return any(
+            item.size != existing[path].size
+            or item.mtime_ns != existing[path].mtime_ns
+            or item.language != existing[path].language
+            for path, item in current.items()
         )
 
     def list_projects(self) -> list[ProjectInfo]:

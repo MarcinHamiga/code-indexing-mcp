@@ -76,6 +76,27 @@ def test_broker_application_calls_one_daemon_backend(tmp_path: Path) -> None:
     assert not thread.is_alive()
 
 
+def test_broker_freshness_uses_the_existing_status_rpc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = application.init_project(root)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+    calls: list[tuple[str | None, list[Path] | None]] = []
+
+    def project_status(project_name: str | None = None, *, roots=None):  # type: ignore[no-untyped-def]
+        calls.append((project_name, roots))
+        return application.project_status(project.id).model_copy(update={"state": "stale"})
+
+    monkeypatch.setattr(broker, "project_status", project_status)
+
+    assert broker.project_is_stale(project.id, roots=[root]) is True
+    assert calls == [(project.id, [root])]
+
+
 @requires_local_sockets
 def test_broker_restarts_daemon_after_idle_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

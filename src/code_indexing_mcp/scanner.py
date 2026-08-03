@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -97,6 +98,8 @@ class SourceScanner:
                 )
                 if language is None:
                     continue
+                if relative in self._git_ignored_paths(root, [absolute]):
+                    continue
                 try:
                     if absolute.stat().st_size <= scan.max_file_bytes:
                         return True
@@ -138,6 +141,7 @@ class SourceScanner:
         include_spec = GitIgnoreSpec.from_lines(project.scan.include)
         candidates, gitignores = self._walk(root)
         ignore_specs = self._load_ignore_specs(root, gitignores)
+        standard_ignored = self._git_ignored_paths(root, candidates)
 
         for absolute in candidates:
             relative = absolute.relative_to(root)
@@ -147,6 +151,7 @@ class SourceScanner:
                 include_spec=include_spec,
                 config_excludes=config_excludes,
                 ignore_specs=ignore_specs,
+                standard_ignored=relative in standard_ignored,
             )
             if language is None:
                 if skip_reason is not None:
@@ -211,6 +216,7 @@ class SourceScanner:
         include_spec: GitIgnoreSpec,
         config_excludes: GitIgnoreSpec,
         ignore_specs: list[tuple[Path, GitIgnoreSpec]],
+        standard_ignored: bool = False,
     ) -> tuple[str | None, str | None]:
         """Decide whether a candidate file is eligible for indexing.
 
@@ -236,11 +242,40 @@ class SourceScanner:
         language = LANGUAGES.get(absolute.suffix.lower())
         if language is None or not include_spec.match_file(relative.as_posix()):
             return None, "unsupported"
-        if config_excludes.match_file(relative.as_posix()) or SourceScanner._is_ignored(
-            relative, ignore_specs
+        if (
+            standard_ignored
+            or config_excludes.match_file(relative.as_posix())
+            or SourceScanner._is_ignored(relative, ignore_specs)
         ):
             return None, "ignored"
         return language, None
+
+    @staticmethod
+    def _git_ignored_paths(root: Path, candidates: list[Path]) -> set[Path]:
+        """Return paths ignored by Git's complete standard exclude stack.
+
+        ``git check-ignore`` applies nested ``.gitignore`` files, the repository's
+        ``info/exclude``, and the user's configured global excludes in one batch.
+        Non-Git projects and environments without Git keep using the in-process
+        ``.gitignore`` fallback loaded by :meth:`_load_ignore_specs`.
+        """
+        relative = [path.relative_to(root) for path in candidates]
+        if not relative:
+            return set()
+        payload = b"\0".join(os.fsencode(path.as_posix()) for path in relative) + b"\0"
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), "check-ignore", "--no-index", "--stdin", "-z"],
+                input=payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            return set()
+        if result.returncode not in {0, 1}:
+            return set()
+        return {Path(os.fsdecode(path)) for path in result.stdout.split(b"\0") if path}
 
     @staticmethod
     def _in_hard_excluded_directory(path: Path) -> bool:

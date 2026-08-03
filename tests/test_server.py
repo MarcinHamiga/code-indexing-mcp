@@ -1,6 +1,8 @@
 import asyncio
+import os
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -79,6 +81,22 @@ class FailingEmbedder(TinyEmbedder):
         raise CodeIndexingError(ErrorCode.MODEL_UNAVAILABLE, "embedding backend unavailable")
 
 
+async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("condition was not met before the timeout")
+        await asyncio.sleep(0.02)
+
+
+def _write_with_later_mtime(path: Path, content: str) -> None:
+    """Write with a visibly later timestamp for watchfiles' test polling backend."""
+
+    previous_mtime = path.stat().st_mtime_ns
+    path.write_text(content)
+    os.utime(path, ns=(path.stat().st_atime_ns, previous_mtime + 2_000_000_000))
+
+
 @pytest.mark.asyncio
 async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
     app = Application(
@@ -138,6 +156,207 @@ async def test_default_server_defers_indexing_until_first_code_query(tmp_path: P
 
     assert not result.isError
     assert app.project_status(roots=[root]).state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_lazy_query_refreshes_a_modified_source(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    source = root / "main.py"
+    source.write_text("def before_change():\n    return 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.call_tool("find_symbol", {"name": "before_change"})
+        source.write_text("def after_change():\n    return 2\n")
+
+        result = await client.call_tool("find_symbol", {"name": "after_change"})
+
+    project = app.list_projects()[0]
+    assert not result.isError
+    assert app.find_symbol("after_change", project.id).hits
+    assert not app.find_symbol("before_change", project.id).hits
+
+
+@pytest.mark.asyncio
+async def test_lazy_query_refreshes_created_and_deleted_sources(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    removed = root / "removed.py"
+    removed.write_text("def removed_symbol():\n    return True\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.call_tool("find_symbol", {"name": "removed_symbol"})
+        removed.unlink()
+        (root / "added.py").write_text("def added_symbol():\n    return True\n")
+
+        result = await client.call_tool("find_symbol", {"name": "added_symbol"})
+
+    project = app.list_projects()[0]
+    assert not result.isError
+    assert app.find_symbol("added_symbol", project.id).hits
+    assert not app.find_symbol("removed_symbol", project.id).hits
+
+
+@pytest.mark.asyncio
+async def test_lazy_query_refreshes_an_explicit_project_outside_the_active_roots(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def before_change():\n    return 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    source.write_text("def after_change():\n    return 2\n")
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "find_symbol", {"name": "after_change", "project": project.id}
+        )
+
+    assert not result.isError
+    assert app.find_symbol("after_change", project.id).hits
+    assert not app.find_symbol("before_change", project.id).hits
+
+
+@pytest.mark.asyncio
+async def test_manual_mode_does_not_refresh_a_changed_source(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def before_change():\n    return 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    source.write_text("def after_change():\n    return 2\n")
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool("find_symbol", {"name": "after_change"})
+
+    assert not result.isError
+    assert not app.find_symbol("after_change", project.id).hits
+    assert app.find_symbol("before_change", project.id).hits
+
+
+@pytest.mark.asyncio
+async def test_eager_monitor_refreshes_created_and_deleted_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # macOS FSEvents are unavailable in the test sandbox. watchfiles' polling
+    # backend exercises the same producer/consumer path deterministically.
+    monkeypatch.setenv("WATCHFILES_FORCE_POLLING", "true")
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    removed = root / "removed.py"
+    removed.write_text("def removed_symbol():\n    return True\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    server = create_server(app, auto_index=True)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        await client.call_tool("find_symbol", {"name": "removed_symbol"})
+        project = app.list_projects()[0]
+        removed.unlink()
+        (root / "added.py").write_text("def added_symbol():\n    return True\n")
+
+        await _wait_until(lambda: bool(app.find_symbol("added_symbol", project.id).hits))
+
+        assert not app.find_symbol("removed_symbol", project.id).hits
+
+
+@pytest.mark.asyncio
+async def test_eager_monitor_repeats_when_source_changes_during_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WATCHFILES_FORCE_POLLING", "true")
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    source = root / "main.py"
+    source.write_text("def initial_symbol():\n    return 0\n")
+    embedder = SwitchableBlockingEmbedder()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=embedder,
+        cwd=tmp_path,
+    )
+    server = create_server(app, auto_index=True)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        await client.call_tool("find_symbol", {"name": "initial_symbol"})
+        project = app.list_projects()[0]
+        embedder.block = True
+        _write_with_later_mtime(source, "def first_change():\n    return 1\n")
+        assert app.project_is_stale(project.id)
+        assert await asyncio.to_thread(embedder.started.wait, 5)
+
+        _write_with_later_mtime(source, "def final_change():\n    return 2\n")
+        embedder.release.set()
+        await _wait_until(lambda: bool(app.find_symbol("final_change", project.id).hits))
+
+        assert not app.find_symbol("first_change", project.id).hits
+        assert not app.find_symbol("initial_symbol", project.id).hits
 
 
 @pytest.mark.asyncio

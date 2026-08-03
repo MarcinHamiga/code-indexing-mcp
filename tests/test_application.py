@@ -105,6 +105,62 @@ def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> N
     assert (root / ".ci-mcp" / "project.toml").exists()
 
 
+def test_modified_source_marks_an_index_stale(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("value = 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    assert app.project_is_stale(project.id) is False
+
+    source.write_text("value = 200\n")
+
+    assert app.project_is_stale(project.id) is True
+    assert app.project_status(project.id).state == "stale"
+
+
+def test_created_source_marks_an_index_stale(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("value = 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    (root / "added.py").write_text("added = True\n")
+
+    assert app.project_is_stale(project.id) is True
+
+
+def test_deleted_source_marks_an_index_stale(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("value = 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    source.unlink()
+
+    assert app.project_is_stale(project.id) is True
+
+
 def test_init_project_defaults_to_the_single_client_root(tmp_path: Path) -> None:
     root = tmp_path / "client-root"
     root.mkdir()

@@ -21,6 +21,7 @@ from mcp.server.session import ServerSession
 from mcp.types import Tool as MCPTool
 from mcp.types import ToolAnnotations
 from pydantic import Field
+from watchfiles import awatch
 
 from .application import Application
 from .daemon import BrokerApplication
@@ -62,6 +63,13 @@ MAXIMUM_RETRY_DELAY_SECONDS = 1.0
 # small file costs nothing next to the indexing it is watching.
 PROGRESS_POLL_SECONDS = 0.5
 
+# Filesystem events are collapsed before they reach the indexing coordinator.
+# The bounded dirty queue below provides the second layer: one more refresh is
+# enough no matter how many saves happen while an index is already running.
+WATCH_DEBOUNCE_MILLISECONDS = 250
+WATCH_STEP_MILLISECONDS = 50
+WATCH_RUST_TIMEOUT_MILLISECONDS = 1_000
+
 
 @dataclass
 class _StartupJob:
@@ -91,6 +99,7 @@ class StartupCoordinator:
         self.mode = mode
         self.wait_seconds = wait_seconds
         self._jobs: dict[Path, _StartupJob] = {}
+        self._monitors: dict[Path, asyncio.Queue[None]] = {}
         self._lock = asyncio.Lock()
         self._limiter = anyio.CapacityLimiter(1)
 
@@ -104,11 +113,24 @@ class StartupCoordinator:
                 if existing is not None:
                     if not existing.ready.is_set():
                         continue
-                    if not existing.failed and (existing.indexes or not indexes):
-                        continue
+                    if not existing.failed:
+                        if not indexes:
+                            continue
+                        if (
+                            existing.indexes
+                            and existing.project_id is not None
+                            and not await self._is_stale(existing.project_id)
+                        ):
+                            continue
                 job = _StartupJob(indexes=indexes)
                 self._jobs[root] = job
                 self.task_group.start_soon(self._run, root, job)
+
+    async def _is_stale(self, project_id: str) -> bool:
+        return await anyio.to_thread.run_sync(
+            partial(self.application.project_is_stale, project_id),
+            abandon_on_cancel=False,
+        )
 
     async def wait_for_discovery(self, roots: list[Path]) -> None:
         for job in await self._jobs_for(roots):
@@ -149,6 +171,7 @@ class StartupCoordinator:
             if project is None or not job.indexes:
                 logger.info("Skipping automatic indexing for non-project root: %s", root)
                 return
+            await self._ensure_monitor(root, project.id)
             report = await self._index_when_free(project.id)
             logger.info(
                 "Automatic indexing complete for %s: %s files indexed",
@@ -164,6 +187,51 @@ class StartupCoordinator:
             logger.exception("Automatic indexing failed for %s", root)
         finally:
             job.ready.set()
+
+    async def _ensure_monitor(self, root: Path, project_id: str) -> None:
+        if self.mode is not IndexMode.EAGER:
+            return
+        root = root.resolve()
+        async with self._lock:
+            if root in self._monitors:
+                return
+            dirty: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+            # The watch backend takes its first filesystem snapshot when its
+            # task begins. Seed one freshness pass so an edit made between
+            # project discovery and that snapshot cannot be missed.
+            dirty.put_nowait(None)
+            self._monitors[root] = dirty
+            self.task_group.start_soon(self._watch_root, root, dirty)
+            self.task_group.start_soon(self._refresh_dirty_root, root, project_id, dirty)
+
+    async def _watch_root(self, root: Path, dirty: asyncio.Queue[None]) -> None:
+        try:
+            async for _changes in awatch(
+                root,
+                debounce=WATCH_DEBOUNCE_MILLISECONDS,
+                step=WATCH_STEP_MILLISECONDS,
+                rust_timeout=WATCH_RUST_TIMEOUT_MILLISECONDS,
+                ignore_permission_denied=True,
+            ):
+                with suppress(asyncio.QueueFull):
+                    dirty.put_nowait(None)
+        except Exception:
+            logger.exception("Filesystem monitor failed for %s", root)
+
+    async def _refresh_dirty_root(
+        self, root: Path, project_id: str, dirty: asyncio.Queue[None]
+    ) -> None:
+        while True:
+            await dirty.get()
+            try:
+                # The first pass either starts a refresh or waits for one that
+                # was already active. The second pass rechecks freshness after
+                # that job, closing the race where a save landed after its scan.
+                for _ in range(2):
+                    await self.schedule([root], indexes=True)
+                    await self.wait_for_ready([root], {project_id})
+            except Exception:
+                logger.exception("Automatic refresh after a file change failed for %s", root)
 
     async def _index_when_free(self, project_id: str) -> IndexReport:
         """Index *project_id* once the machine is free, within ``wait_seconds``.
@@ -340,19 +408,49 @@ async def _wait_for_startup_projects(
     coordinator = _coordinator(ctx)
     if coordinator is None:
         return
+    if coordinator.mode is IndexMode.MANUAL:
+        return
+    projects = await asyncio.gather(
+        *(
+            asyncio.to_thread(coordinator.application.resolve_project, project_id)
+            for project_id in project_ids
+        )
+    )
+    # An explicit project or all_projects query can select registrations that
+    # are not among the client's advertised roots. Freshen those too; otherwise
+    # lazy mode would silently serve an old index for exactly those scopes.
+    selected_roots = list(dict.fromkeys([*roots, *(project.root for project in projects)]))
+    statuses = await asyncio.gather(
+        *(
+            asyncio.to_thread(coordinator.application.project_status, project.id)
+            for project in projects
+        )
+    )
+    refresh_roots = [
+        project.root
+        for project, status in zip(projects, statuses, strict=True)
+        if status.state not in {"ready", "partial"}
+    ]
+    await coordinator.schedule(refresh_roots, indexes=True)
+    await coordinator.wait_for_discovery(selected_roots)
     wanted = set(project_ids)
-    # In lazy mode the first code query blocks on a full initial index. Report
+    # A lazy query blocks on any refresh its selected scope needs. Report
     # progress so the client can distinguish a slow index from a hung tool call,
     # and so the wait shows how far along it is rather than just that it exists.
-    pending = await coordinator.has_pending_indexing(roots, wanted)
+    pending = await coordinator.has_pending_indexing(selected_roots, wanted)
     if not pending:
-        await coordinator.wait_for_ready(roots, wanted)
+        await coordinator.wait_for_ready(selected_roots, wanted)
         return
-    logger.info("Waiting for the initial index before serving the first query")
+    message = (
+        "Building the initial index"
+        if all(status.file_count == 0 for status in statuses)
+        else "Refreshing the stale index"
+    )
+    logger.info("%s before serving the code query", message)
     async with _reporting_index_progress(
-        ctx, coordinator.application, project_ids, message="Building the initial index"
+        ctx, coordinator.application, project_ids, message=message
     ) as stream:
-        await coordinator.wait_for_ready(roots, wanted)
+        await coordinator.wait_for_ready(selected_roots, wanted)
     await stream.finish("Index ready")
 
 
@@ -369,8 +467,9 @@ Scope defaults to the active MCP root, or the nearest .ci-mcp/project.toml above
 directory. Searching every registered project requires all_projects=true, so cross-project results \
 are never mixed in by accident.
 
-In the default lazy mode the first code query builds the initial index, which can take minutes on \
-a large repository; it reports progress while it runs."""
+In the default lazy mode every project-scoped code query checks freshness and refreshes only when \
+the source tree has changed. The initial refresh can take minutes on a large repository and \
+reports progress while it runs."""
 
 # openWorldHint is False on every tool: this server touches only the local
 # filesystem and a local index, never the network.
@@ -578,10 +677,11 @@ def create_server(
     @mcp.tool(
         title="Project status",
         description=(
-            "Report one project's index state — pending, indexing, ready, partial, or error — "
-            "with its indexed file count and chunk count. Does not scan for file changes or "
-            "rebuild the index; index_project does that. A root that is not registered yet is "
-            "registered first, which writes its .ci-mcp/project.toml marker."
+            "Report one project's index state — pending, indexing, ready, partial, stale, or "
+            "error — with its indexed file count and chunk count. Compares eligible source "
+            "metadata with the index but does not rebuild it; index_project does that. A root "
+            "that is not registered yet is registered first, which writes its "
+            ".ci-mcp/project.toml marker."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -644,7 +744,8 @@ def create_server(
             "history, not comments in unindexed files, and not files excluded by .gitignore or "
             "the 1 MiB size cap. For a declaration whose name is already known, find_symbol is "
             "direct; for one file's structure, file_outline is cheaper. A root that is not "
-            "registered yet is registered and indexed before the first query is answered."
+            "registered yet is registered and indexed before the first query is answered; later "
+            "queries refresh selected projects when source metadata has changed."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -700,7 +801,7 @@ def create_server(
             int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
         ] = 8,
     ) -> SearchResponse:
-        roots = await _startup_roots(ctx, indexes=True)
+        roots = await _startup_roots(ctx, discover=True)
         project_ids = await asyncio.to_thread(
             app.resolve_search_scope, projects, all_projects, roots
         )
@@ -729,7 +830,7 @@ def create_server(
             "chunk_id. Matches declaration names only — not call sites, imports, or other "
             "references. For a conceptual query rather than a known name, search_code applies. A "
             "root that is not registered yet is registered and indexed before the first query is "
-            "answered."
+            "answered; later queries refresh it when source metadata has changed."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -771,7 +872,7 @@ def create_server(
             int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
         ] = 20,
     ) -> SymbolResponse:
-        roots = await _startup_roots(ctx, indexes=True)
+        roots = await _startup_roots(ctx, discover=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved.id])
         selected_kinds: list[str] | None = list(kinds) if kinds else None
@@ -792,7 +893,7 @@ def create_server(
             "qualified name, parent, and line range. Returns structure metadata only, never code "
             "text, so it is the cheap way to understand a file before fetching parts of it. The "
             "file must already be indexed; a root that is not registered yet is registered and "
-            "indexed first."
+            "indexed first, and a changed index is refreshed before the outline is returned."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -818,7 +919,7 @@ def create_server(
             ),
         ] = None,
     ) -> OutlineResponse:
-        roots = await _startup_roots(ctx, indexes=True)
+        roots = await _startup_roots(ctx, discover=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved.id])
         return await asyncio.to_thread(app.file_outline, path, resolved.id, roots=roots)

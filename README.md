@@ -309,19 +309,25 @@ committed. Markers created by earlier releases under `.code-indexing-mcp` remain
 markers use `.ci-mcp`.
 
 CLI index refreshes are explicit and incremental. MCP indexing is lazy by default: listing tools
-does not discover projects, load the model, or start indexing. The first project-scoped code query
-discovers and refreshes each qualifying root, then waits for that bounded refresh. A new root
-qualifies when it has at least one supported,
+does not discover projects, load the model, or start indexing. Every project-scoped code query
+compares eligible file paths, sizes, and nanosecond mtimes with the stored index. It refreshes and
+waits only when that metadata has changed; the first query also discovers and indexes qualifying
+roots. A new root qualifies when it has at least one supported,
 non-ignored source file and contains `.git`, `pyproject.toml`, `setup.py`, `setup.cfg`,
 `package.json`, `tsconfig.json`, or `jsconfig.json`. The server creates the usual local
 `.ci-mcp/project.toml` marker only after that check passes.
 
-Because that first query waits for the refresh, it reports progress while the initial index builds
+Because a query waits for any required refresh, it reports progress while the initial index builds
 so clients can tell a slow index from a stalled tool call. On a large repository the first query
-can still take a while; `CODE_INDEXING_INDEX_MODE=eager` moves the refresh to tool listing instead, and
-`CODE_INDEXING_INDEX_MODE=manual` restricts indexing to explicit `index_project` calls. The legacy
-`CODE_INDEXING_AUTO_INDEX` flag remains supported. Clients that do not provide filesystem roots keep the
-explicit workflow.
+can still take a while. `CODE_INDEXING_INDEX_MODE=eager` indexes during tool listing, then keeps one
+debounced filesystem monitor per discovered root and refreshes it after later changes. Changes that
+arrive during a refresh are coalesced into one follow-up pass. `CODE_INDEXING_INDEX_MODE=manual`
+restricts indexing to explicit `index_project` calls. The legacy `CODE_INDEXING_AUTO_INDEX` flag
+remains supported. Clients that do not provide filesystem roots can still auto-refresh explicitly
+selected, already registered projects; discovering a new project requires a root or `init_project`.
+
+`project_status` performs the same metadata comparison without rebuilding and reports `stale` when
+a stored `ready` or `partial` index has drifted from the source tree.
 
 Two things can make an automatic refresh wait: another root queued ahead of it in the same session,
 and another process holding the global index lock. One budget covers both. The refresh retries with
@@ -386,9 +392,10 @@ Godot scene and resource files name only some of their sections: `[gd_scene]`, `
 `[resource]`, `[connection]`, and the sections of a `project.godot` carry neither a `name` nor an
 `id`, so they reach the index as searchable text rather than as symbols.
 
-The scanner respects root and nested `.gitignore` files and excludes symlinks, binary files, files
-over 1 MiB, build outputs, virtual environments, dependency directories, and Godot's own `.godot`
-asset cache — a `project.godot` file is still indexed. That 1 MiB cap is what
+The scanner respects Git's complete standard ignore stack: root and nested `.gitignore` files,
+`.git/info/exclude`, and the configured global excludes file. It also excludes symlinks, binary
+files, files over 1 MiB, build outputs, virtual environments, dependency directories, and Godot's
+own `.godot` asset cache — a `project.godot` file is still indexed. That 1 MiB cap is what
 usually keeps a large generated `package-lock.json` or similar out of the index; exclude it through
 `scan.exclude` if a smaller one is not worth indexing.
 
@@ -732,8 +739,9 @@ Batch size 8 buys 17% throughput for 36 MiB more resident memory — not enough 
 headroom that the worst-case file shape already needs. Embedding dominates: 141 s of the 147 s at
 batch size 1. Plan for roughly **45 chunks per second**, and remember that in the default lazy mode
 the first `search_code` call waits for that work. On a large repository prefer
-`CODE_INDEXING_INDEX_MODE=eager` (index during tool listing) or `CODE_INDEXING_INDEX_MODE=manual` with an
-explicit `code-indexing-mcp index`, so no query blocks on a cold index.
+`CODE_INDEXING_INDEX_MODE=eager` (index during tool listing and monitor later changes) or
+`CODE_INDEXING_INDEX_MODE=manual` with an explicit `code-indexing-mcp index`, so no query blocks on
+a cold index.
 
 ### Single-line and generated files
 
@@ -828,8 +836,8 @@ same graph:
 uv run --extra mlx pytest tests/test_mlx_backend.py
 ```
 
-The project intentionally excludes filesystem watching, HTTP transports, dependency/call graphs,
-cross-reference resolution, and custom embedding profiles.
+The project intentionally excludes HTTP transports, dependency/call graphs, cross-reference
+resolution, and custom embedding profiles.
 
 ## License
 

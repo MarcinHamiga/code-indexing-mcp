@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,6 +29,21 @@ def test_scanner_honors_languages_gitignore_and_hard_exclusions(tmp_path: Path) 
         ("main.py", "python"),
     ]
     assert {skip.reason for skip in result.skipped} >= {"unsupported", "ignored"}
+
+
+def test_scanner_honors_git_info_exclude(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    (root / "main.py").write_text("value = 1\n")
+    (root / "local_only.py").write_text("local = True\n")
+    (root / ".git" / "info" / "exclude").write_text("local_only.py\n")
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["main.py"]
+    assert any(item.path.as_posix() == "local_only.py" for item in result.skipped)
 
 
 def test_default_includes_and_the_extension_map_describe_the_same_languages() -> None:
