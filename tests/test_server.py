@@ -330,8 +330,14 @@ async def test_eager_monitor_refreshes_created_and_deleted_sources(
         removed.unlink()
         (root / "added.py").write_text("def added_symbol():\n    return True\n")
 
-        await _wait_until(lambda: bool(app.find_symbol("added_symbol", project.id).hits))
+        await _wait_until(
+            lambda: (
+                bool(app.find_symbol("added_symbol", project.id).hits)
+                and not app.find_symbol("removed_symbol", project.id).hits
+            )
+        )
 
+        assert app.find_symbol("added_symbol", project.id).hits
         assert not app.find_symbol("removed_symbol", project.id).hits
 
 
