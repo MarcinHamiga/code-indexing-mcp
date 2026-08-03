@@ -41,6 +41,7 @@ correctness fallback if an OS event is missed.
 
 ## Testing
 
-Tests cover create/modify/delete refreshes, a change arriving during an active eager refresh, lazy
-query refresh, manual-mode stability, stale status, daemon freshness RPC, and `.git/info/exclude`.
+Tests cover create/modify/delete refreshes, a change arriving during an active eager refresh,
+watcher failure/restart, periodic reconciliation of `.git/info/exclude`, lazy query refresh,
+manual-mode stability, stale status, daemon freshness RPC, and bounded Git-ignore discovery.
 Existing startup, lock, cancellation, scanner, and daemon tests remain regression coverage.
