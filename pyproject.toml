@@ -33,6 +33,7 @@ dependencies = [
     "tree-sitter-sql>=0.3.11,<0.4",
     "tree-sitter-typescript>=0.23,<0.24",
     "tree-sitter-yaml>=0.7,<0.8",
+    "watchfiles>=1,<2",
 ]
 
 [project.optional-dependencies]

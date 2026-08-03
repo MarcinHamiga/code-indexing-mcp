@@ -50,7 +50,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_INDEX_MODE",
         "Indexing",
         "Index mode",
-        "When projects get indexed: lazy on first use, eager at startup, manual only.",
+        "Lazy checks freshness before each code query; eager indexes at startup and watches for "
+        "changes; manual only indexes explicitly.",
         "choice",
         "lazy",
         choices=("lazy", "eager", "manual"),

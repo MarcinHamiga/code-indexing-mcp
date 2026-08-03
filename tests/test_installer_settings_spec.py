@@ -43,6 +43,13 @@ def test_every_setting_has_display_metadata_and_a_group() -> None:
         assert setting.label and setting.help
 
 
+def test_index_mode_help_describes_continuous_eager_monitoring() -> None:
+    help_text = BY_NAME["CODE_INDEXING_INDEX_MODE"].help
+
+    assert "watch" in help_text
+    assert "each code query" in help_text
+
+
 @pytest.mark.parametrize(
     ("name", "raw", "ok"),
     [

@@ -316,7 +316,11 @@ def test_purge_refuses_the_home_directory(tmp_path: Path) -> None:
             install_directory=_checkout(tmp_path), remove_launcher=False, remove_data=True
         ),
         home=tmp_path,
-        environment={"CODE_INDEXING_DATA_DIR": str(tmp_path), "SHELL": "/bin/zsh"},
+        environment={
+            "CODE_INDEXING_DATA_DIR": str(tmp_path),
+            "CODE_INDEXING_CACHE_DIR": str(tmp_path / "cache"),
+            "SHELL": "/bin/zsh",
+        },
     )
 
     assert result.directories_removed == ()
