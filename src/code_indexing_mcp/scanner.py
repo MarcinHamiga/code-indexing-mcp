@@ -60,6 +60,9 @@ HARD_EXCLUDED_DIRECTORIES = {
     "htmlcov",
 }
 
+GIT_IGNORE_DISCOVERY_BATCH_SIZE = 256
+GIT_CHECK_IGNORE_TIMEOUT_SECONDS = 10
+
 
 class SourceScanner:
     def has_supported_source(self, root: Path, scan: ScanConfig) -> bool:
@@ -68,6 +71,7 @@ class SourceScanner:
         config_excludes = GitIgnoreSpec.from_lines(scan.exclude)
         include_spec = GitIgnoreSpec.from_lines(scan.include)
         inherited_specs: dict[Path, list[tuple[Path, GitIgnoreSpec]]] = {root: []}
+        eligible: list[Path] = []
 
         for dirpath, dirnames, filenames in os.walk(root):
             base = Path(dirpath)
@@ -98,14 +102,19 @@ class SourceScanner:
                 )
                 if language is None:
                     continue
-                if relative in self._git_ignored_paths(root, [absolute]):
-                    continue
                 try:
-                    if absolute.stat().st_size <= scan.max_file_bytes:
-                        return True
+                    if absolute.stat().st_size > scan.max_file_bytes:
+                        continue
                 except OSError:
                     continue
-        return False
+                eligible.append(absolute)
+                if len(eligible) >= GIT_IGNORE_DISCOVERY_BATCH_SIZE:
+                    batch, eligible = eligible, []
+                    ignored = self._git_ignored_paths(root, batch)
+                    if any(path.relative_to(root) not in ignored for path in batch):
+                        return True
+        ignored = self._git_ignored_paths(root, eligible)
+        return any(path.relative_to(root) not in ignored for path in eligible)
 
     def scan(
         self, project: ProjectInfo, known_files: dict[str, StoredFile] | None = None
@@ -270,8 +279,9 @@ class SourceScanner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                timeout=GIT_CHECK_IGNORE_TIMEOUT_SECONDS,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             return set()
         if result.returncode not in {0, 1}:
             return set()

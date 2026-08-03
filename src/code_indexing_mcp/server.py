@@ -69,6 +69,13 @@ PROGRESS_POLL_SECONDS = 0.5
 WATCH_DEBOUNCE_MILLISECONDS = 250
 WATCH_STEP_MILLISECONDS = 50
 WATCH_RUST_TIMEOUT_MILLISECONDS = 1_000
+WATCH_RETRY_INITIAL_SECONDS = 1.0
+WATCH_RETRY_MAXIMUM_SECONDS = 30.0
+
+# Native filesystem notifications can be lost, and Git's global excludes live
+# outside the watched root. A slow stat-only reconciliation is the correctness
+# backstop; normal edits still take the event-driven path above.
+EAGER_RECONCILE_SECONDS = 30.0
 
 
 @dataclass
@@ -205,29 +212,38 @@ class StartupCoordinator:
             self.task_group.start_soon(self._refresh_dirty_root, root, project_id, dirty)
 
     async def _watch_root(self, root: Path, dirty: asyncio.Queue[None]) -> None:
-        try:
-            async for _changes in awatch(
-                root,
-                debounce=WATCH_DEBOUNCE_MILLISECONDS,
-                step=WATCH_STEP_MILLISECONDS,
-                rust_timeout=WATCH_RUST_TIMEOUT_MILLISECONDS,
-                ignore_permission_denied=True,
-            ):
-                with suppress(asyncio.QueueFull):
-                    dirty.put_nowait(None)
-        except Exception:
-            logger.exception("Filesystem monitor failed for %s", root)
+        retry_seconds = WATCH_RETRY_INITIAL_SECONDS
+        while True:
+            try:
+                async for _changes in awatch(
+                    root,
+                    debounce=WATCH_DEBOUNCE_MILLISECONDS,
+                    step=WATCH_STEP_MILLISECONDS,
+                    rust_timeout=WATCH_RUST_TIMEOUT_MILLISECONDS,
+                    ignore_permission_denied=True,
+                ):
+                    retry_seconds = WATCH_RETRY_INITIAL_SECONDS
+                    with suppress(asyncio.QueueFull):
+                        dirty.put_nowait(None)
+                logger.warning("Filesystem monitor stopped for %s; restarting", root)
+            except Exception:
+                logger.exception("Filesystem monitor failed for %s; restarting", root)
+            await anyio.sleep(retry_seconds)
+            retry_seconds = min(retry_seconds * 2, WATCH_RETRY_MAXIMUM_SECONDS)
 
     async def _refresh_dirty_root(
         self, root: Path, project_id: str, dirty: asyncio.Queue[None]
     ) -> None:
         while True:
-            await dirty.get()
+            with anyio.move_on_after(EAGER_RECONCILE_SECONDS) as reconcile:
+                await dirty.get()
             try:
                 # The first pass either starts a refresh or waits for one that
-                # was already active. The second pass rechecks freshness after
-                # that job, closing the race where a save landed after its scan.
-                for _ in range(2):
+                # was already active. Event-driven refreshes make a second pass
+                # to close the race where a save landed after that job's scan;
+                # the periodic reconciliation needs only its one stat pass.
+                passes = 1 if reconcile.cancel_called else 2
+                for _ in range(passes):
                     await self.schedule([root], indexes=True)
                     await self.wait_for_ready([root], {project_id})
             except Exception:

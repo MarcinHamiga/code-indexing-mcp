@@ -275,6 +275,43 @@ def test_has_supported_source_applies_nested_gitignore_rules(tmp_path: Path) -> 
     assert scanner.has_supported_source(root, ScanConfig()) is False
 
 
+def test_has_supported_source_batches_git_ignore_queries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    for index in range(300):
+        (root / f"ignored_{index:03d}.py").write_text("ignored = True\n")
+    scanner = SourceScanner()
+    batches: list[list[Path]] = []
+
+    def all_ignored(_: Path, candidates: list[Path]) -> set[Path]:
+        batches.append(candidates)
+        return {path.relative_to(root) for path in candidates}
+
+    monkeypatch.setattr(scanner, "_git_ignored_paths", all_ignored)
+
+    assert scanner.has_supported_source(root, ScanConfig()) is False
+    assert len(batches) == 2
+    assert max(map(len, batches)) == 256
+
+
+def test_git_ignore_timeout_falls_back_to_local_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("value = 1\n")
+
+    def time_out(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.TimeoutExpired("git check-ignore", timeout=10)
+
+    monkeypatch.setattr(subprocess, "run", time_out)
+
+    assert SourceScanner._git_ignored_paths(root, [source]) == set()
+
+
 def test_language_name_literal_matches_scanner_languages() -> None:
     from typing import get_args
 

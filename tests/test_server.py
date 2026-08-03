@@ -1,5 +1,6 @@
 import asyncio
 import os
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -95,6 +96,19 @@ def _write_with_later_mtime(path: Path, content: str) -> None:
     previous_mtime = path.stat().st_mtime_ns
     path.write_text(content)
     os.utime(path, ns=(path.stat().st_atime_ns, previous_mtime + 2_000_000_000))
+
+
+def _observe_freshness_check(app: Application, monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    checked = threading.Event()
+    original = app.project_is_stale
+
+    def observed(project_name: str | None = None, *, roots: list[Path] | None = None) -> bool:
+        result = original(project_name, roots=roots)
+        checked.set()
+        return result
+
+    monkeypatch.setattr(app, "project_is_stale", observed)
+    return checked
 
 
 @pytest.mark.asyncio
@@ -300,6 +314,7 @@ async def test_eager_monitor_refreshes_created_and_deleted_sources(
         embedder=TinyEmbedder(),
         cwd=tmp_path,
     )
+    seed_refresh_finished = _observe_freshness_check(app, monkeypatch)
     server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
@@ -310,6 +325,7 @@ async def test_eager_monitor_refreshes_created_and_deleted_sources(
     ) as client:
         await client.list_tools()
         await client.call_tool("find_symbol", {"name": "removed_symbol"})
+        assert await asyncio.to_thread(seed_refresh_finished.wait, 5)
         project = app.list_projects()[0]
         removed.unlink()
         (root / "added.py").write_text("def added_symbol():\n    return True\n")
@@ -335,6 +351,7 @@ async def test_eager_monitor_repeats_when_source_changes_during_refresh(
         embedder=embedder,
         cwd=tmp_path,
     )
+    seed_refresh_finished = _observe_freshness_check(app, monkeypatch)
     server = create_server(app, auto_index=True)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
@@ -345,6 +362,7 @@ async def test_eager_monitor_repeats_when_source_changes_during_refresh(
     ) as client:
         await client.list_tools()
         await client.call_tool("find_symbol", {"name": "initial_symbol"})
+        assert await asyncio.to_thread(seed_refresh_finished.wait, 5)
         project = app.list_projects()[0]
         embedder.block = True
         _write_with_later_mtime(source, "def first_change():\n    return 1\n")
@@ -357,6 +375,99 @@ async def test_eager_monitor_repeats_when_source_changes_during_refresh(
 
         assert not app.find_symbol("first_change", project.id).hits
         assert not app.find_symbol("initial_symbol", project.id).hits
+
+
+@pytest.mark.asyncio
+async def test_eager_reconciliation_detects_git_exclusion_changes_without_an_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    source = root / "local_only.py"
+    source.write_text("def local_symbol():\n    return True\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    seed_refresh_finished = _observe_freshness_check(app, monkeypatch)
+
+    async def silent_watch(*args: object, **kwargs: object):
+        del args, kwargs
+        await asyncio.Event().wait()
+        yield set()
+
+    monkeypatch.setattr(server_module, "awatch", silent_watch)
+    monkeypatch.setattr(server_module, "EAGER_RECONCILE_SECONDS", 0.05)
+    server = create_server(app, auto_index=True)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        await client.call_tool("find_symbol", {"name": "local_symbol"})
+        assert await asyncio.to_thread(seed_refresh_finished.wait, 5)
+        project = app.list_projects()[0]
+
+        (root / ".git" / "info" / "exclude").write_text("local_only.py\n")
+        await _wait_until(lambda: not app.find_symbol("local_symbol", project.id).hits)
+
+
+@pytest.mark.asyncio
+async def test_eager_monitor_restarts_after_a_watcher_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    source = root / "main.py"
+    source.write_text("def before_failure():\n    return 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    seed_refresh_finished = _observe_freshness_check(app, monkeypatch)
+    change = asyncio.Event()
+    watch_calls = 0
+
+    async def flaky_watch(*args: object, **kwargs: object):
+        nonlocal watch_calls
+        del args, kwargs
+        watch_calls += 1
+        if watch_calls == 1:
+            raise RuntimeError("simulated watcher failure")
+        await change.wait()
+        yield {(2, str(source))}
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(server_module, "awatch", flaky_watch)
+    monkeypatch.setattr(server_module, "WATCH_RETRY_INITIAL_SECONDS", 0.01)
+    monkeypatch.setattr(server_module, "WATCH_RETRY_MAXIMUM_SECONDS", 0.02)
+    server = create_server(app, auto_index=True)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        await client.call_tool("find_symbol", {"name": "before_failure"})
+        assert await asyncio.to_thread(seed_refresh_finished.wait, 5)
+        await _wait_until(lambda: watch_calls >= 2)
+        project = app.list_projects()[0]
+
+        source.write_text("def after_recovery():\n    return 2\n")
+        change.set()
+        await _wait_until(lambda: bool(app.find_symbol("after_recovery", project.id).hits))
+
+        assert not app.find_symbol("before_failure", project.id).hits
 
 
 @pytest.mark.asyncio

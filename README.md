@@ -321,10 +321,12 @@ Because a query waits for any required refresh, it reports progress while the in
 so clients can tell a slow index from a stalled tool call. On a large repository the first query
 can still take a while. `CODE_INDEXING_INDEX_MODE=eager` indexes during tool listing, then keeps one
 debounced filesystem monitor per discovered root and refreshes it after later changes. Changes that
-arrive during a refresh are coalesced into one follow-up pass. `CODE_INDEXING_INDEX_MODE=manual`
-restricts indexing to explicit `index_project` calls. The legacy `CODE_INDEXING_AUTO_INDEX` flag
-remains supported. Clients that do not provide filesystem roots can still auto-refresh explicitly
-selected, already registered projects; discovering a new project requires a root or `init_project`.
+arrive during a refresh are coalesced into one follow-up pass. A stat-only reconciliation every 30
+seconds catches missed notifications and Git exclusion changes outside the watched root, and a
+failed filesystem watcher restarts with bounded backoff. `CODE_INDEXING_INDEX_MODE=manual` restricts
+indexing to explicit `index_project` calls. The legacy `CODE_INDEXING_AUTO_INDEX` flag remains
+supported. Clients that do not provide filesystem roots can still auto-refresh explicitly selected,
+already registered projects; discovering a new project requires a root or `init_project`.
 
 `project_status` performs the same metadata comparison without rebuilding and reports `stale` when
 a stored `ready` or `partial` index has drifted from the source tree.
