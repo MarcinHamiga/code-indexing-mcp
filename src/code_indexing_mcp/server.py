@@ -47,8 +47,10 @@ SERVER_INSTRUCTIONS = (
     "When exploring code, prefer these index tools over grep-style file reading: "
     "search_code (semantic natural-language queries), find_symbol (definitions and call "
     "sites), file_outline (file structure before reading), get_chunk (exact code for a "
-    "search hit). Check list_projects/project_status for index freshness first and run "
-    "index_project if the index is missing or stale."
+    "search hit). When correlating code across explicitly related services, use list_projects "
+    "to discover them and search_across_projects to search the selected repositories together. "
+    "Check list_projects/project_status for index freshness first and run index_project if the "
+    "index is missing or stale."
 )
 
 # Bounds on the retry cadence used while another indexing job holds the global
@@ -483,6 +485,10 @@ Scope defaults to the active MCP root, or the nearest .ci-mcp/project.toml above
 directory. Searching every registered project requires all_projects=true, so cross-project results \
 are never mixed in by accident.
 
+For cross-repository debugging, use list_projects to discover related registrations, then prefer \
+search_across_projects with at least two explicit project ids, names, or paths. It searches only \
+that deliberate scope and globally ranks the combined results.
+
 In the default lazy mode every project-scoped code query checks freshness and refreshes only when \
 the source tree has changed. The initial refresh can take minutes on a large repository and \
 reports progress while it runs."""
@@ -591,6 +597,33 @@ def create_server(
         else settings.mode
     )
     mcp = AutoIndexingMCP(app, mode=mode, wait_seconds=settings.index_wait_seconds)
+
+    async def search_resolved_projects(
+        ctx: ServerContext,
+        query: str,
+        project_ids: list[str],
+        roots: list[Path],
+        languages: list[LanguageName] | None,
+        paths: list[str] | None,
+        kinds: list[ChunkKind] | None,
+        limit: int,
+    ) -> SearchResponse:
+        await _wait_for_startup_projects(ctx, roots, project_ids)
+        # The service layer takes open list[str]; the closed Literal lists exist to
+        # constrain the tool schema, and list invariance blocks passing them through.
+        selected_languages: list[str] | None = list(languages) if languages else None
+        selected_kinds: list[str] | None = list(kinds) if kinds else None
+        return await asyncio.to_thread(
+            app.search_code,
+            query,
+            projects=project_ids,
+            all_projects=False,
+            languages=selected_languages,
+            paths=paths,
+            kinds=selected_kinds,
+            limit=limit,
+            roots=roots,
+        )
 
     @mcp.tool(
         title="Initialize project",
@@ -821,21 +854,93 @@ def create_server(
         project_ids = await asyncio.to_thread(
             app.resolve_search_scope, projects, all_projects, roots
         )
-        await _wait_for_startup_projects(ctx, roots, project_ids)
-        # The service layer takes open list[str]; the closed Literal lists exist to
-        # constrain the tool schema, and list invariance blocks passing them through.
-        selected_languages: list[str] | None = list(languages) if languages else None
-        selected_kinds: list[str] | None = list(kinds) if kinds else None
-        return await asyncio.to_thread(
-            app.search_code,
+        return await search_resolved_projects(
+            ctx,
             query,
-            projects=project_ids,
-            all_projects=False,
-            languages=selected_languages,
-            paths=paths,
-            kinds=selected_kinds,
-            limit=limit,
-            roots=roots,
+            project_ids,
+            roots,
+            languages,
+            paths,
+            kinds,
+            limit,
+        )
+
+    @mcp.tool(
+        title="Search across projects",
+        description=(
+            "Hybrid semantic and keyword search across an explicit set of related projects for "
+            "cross-repository debugging. Accepts project ids, unique names, or paths and requires "
+            "at least two distinct resolved projects. Returns one globally ranked hit list with "
+            "project metadata; use list_projects first to discover the intended repositories."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def search_across_projects(
+        ctx: ServerContext,
+        query: Annotated[
+            str,
+            Field(
+                description=(
+                    "What to look for across the selected projects, as natural language or "
+                    "keywords. Matched against chunk text and normalized identifier names."
+                )
+            ),
+        ],
+        projects: Annotated[
+            list[str],
+            Field(
+                min_length=2,
+                description=(
+                    "At least two project ids, unique names, or paths to search together. "
+                    "Selectors must resolve to at least two distinct projects."
+                ),
+            ),
+        ],
+        languages: Annotated[
+            list[LanguageName] | None,
+            Field(description="Restrict to these languages across the complete selected scope."),
+        ] = None,
+        paths: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Restrict to paths matching these glob patterns relative to each selected "
+                    "project root, for example 'src/*' or '**/*.py'. Patterns match from the "
+                    "right, so '*.py' matches any Python file at any depth."
+                )
+            ),
+        ] = None,
+        kinds: Annotated[
+            list[ChunkKind] | None,
+            Field(description="Restrict to these chunk kinds across the selected projects."),
+        ] = None,
+        limit: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=50,
+                description="Maximum globally ranked hits to return. Hard cap of 50.",
+            ),
+        ] = 8,
+    ) -> SearchResponse:
+        roots = await _startup_roots(ctx, discover=True)
+        resolved_ids = await asyncio.to_thread(app.resolve_search_scope, projects, False, roots)
+        project_ids = list(dict.fromkeys(resolved_ids))
+        if len(project_ids) < 2:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                "search_across_projects requires at least two distinct projects",
+            )
+        return await search_resolved_projects(
+            ctx,
+            query,
+            project_ids,
+            roots,
+            languages,
+            paths,
+            kinds,
+            limit,
         )
 
     @mcp.tool(
