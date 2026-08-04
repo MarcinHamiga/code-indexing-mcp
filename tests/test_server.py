@@ -129,10 +129,12 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "list_projects",
         "remove_project",
         "search_code",
+        "search_across_projects",
         "find_symbol",
         "file_outline",
         "get_chunk",
     }
+    assert len(tools) == 10
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -295,6 +297,236 @@ async def test_manual_mode_does_not_refresh_a_changed_source(tmp_path: Path) -> 
     assert not result.isError
     assert not app.find_symbol("after_change", project.id).hits
     assert app.find_symbol("before_change", project.id).hits
+
+
+@pytest.mark.asyncio
+async def test_search_across_projects_returns_filtered_globally_limited_hits(
+    tmp_path: Path,
+) -> None:
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    roots = [tmp_path / "alpha", tmp_path / "beta"]
+    for root in roots:
+        (root / "src").mkdir(parents=True)
+    (roots[0] / "src" / "feature.py").write_text(
+        "def shared_feature_alpha():\n    return 'alpha'\n"
+    )
+    (roots[1] / "src" / "feature.ts").write_text(
+        "export function sharedFeatureBeta() { return 'beta'; }\n"
+    )
+    alpha = app.init_project(roots[0], "alpha-service")
+    beta = app.init_project(roots[1], "beta-service")
+    app.index_project(alpha.id)
+    app.index_project(beta.id)
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "search_across_projects",
+            {
+                "query": "shared feature",
+                "projects": [alpha.id, str(roots[1])],
+                "languages": ["python", "typescript"],
+                "paths": ["src/*"],
+                "kinds": ["function"],
+                "limit": 2,
+            },
+        )
+        limited = await client.call_tool(
+            "search_across_projects",
+            {
+                "query": "shared feature",
+                "projects": [alpha.name, beta.id],
+                "languages": ["python", "typescript"],
+                "paths": ["src/*"],
+                "kinds": ["function"],
+                "limit": 1,
+            },
+        )
+        python_only = await client.call_tool(
+            "search_across_projects",
+            {
+                "query": "shared feature",
+                "projects": [alpha.id, beta.name],
+                "languages": ["python"],
+            },
+        )
+
+    assert not result.isError
+    assert result.structuredContent is not None
+    hits = result.structuredContent["hits"]
+    assert len(hits) == 2
+    assert {hit["project_id"] for hit in hits} == {alpha.id, beta.id}
+    assert {hit["project_name"] for hit in hits} == {alpha.name, beta.name}
+    assert all(hit["path"].startswith("src/") and hit["kind"] == "function" for hit in hits)
+    assert limited.structuredContent is not None
+    assert len(limited.structuredContent["hits"]) == 1
+    assert python_only.structuredContent is not None
+    assert {hit["project_id"] for hit in python_only.structuredContent["hits"]} == {alpha.id}
+
+
+@pytest.mark.asyncio
+async def test_search_across_projects_rejects_duplicate_project_aliases(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root, "service")
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "search_across_projects",
+            {"query": "answer", "projects": [project.id, project.name]},
+        )
+
+    assert result.isError
+    message = "".join(
+        block.text for block in result.content if isinstance(block, types.TextContent)
+    )
+    assert ErrorCode.INVALID_FILTER.value in message
+
+
+@pytest.mark.asyncio
+async def test_search_across_projects_preserves_missing_selector_error(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root, "service")
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "search_across_projects",
+            {"query": "answer", "projects": [project.id, "missing-project"]},
+        )
+
+    assert result.isError
+    message = "".join(
+        block.text for block in result.content if isinstance(block, types.TextContent)
+    )
+    assert ErrorCode.PROJECT_NOT_FOUND.value in message
+
+
+@pytest.mark.asyncio
+async def test_search_across_projects_preserves_ambiguous_selector_error(tmp_path: Path) -> None:
+    app = _tiny_application(tmp_path)
+    roots = [tmp_path / name for name in ("one", "two", "three")]
+    for root in roots:
+        root.mkdir()
+    app.init_project(roots[0], "shared-service")
+    app.init_project(roots[1], "shared-service")
+    unique = app.init_project(roots[2], "unique-service")
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "search_across_projects",
+            {"query": "answer", "projects": ["shared-service", unique.id]},
+        )
+
+    assert result.isError
+    message = "".join(
+        block.text for block in result.content if isinstance(block, types.TextContent)
+    )
+    assert ErrorCode.AMBIGUOUS_PROJECT.value in message
+
+
+@pytest.mark.asyncio
+async def test_lazy_search_across_projects_refreshes_projects_outside_active_roots(
+    tmp_path: Path,
+) -> None:
+    app = _tiny_application(tmp_path)
+    projects = []
+    sources = []
+    for name in ("one", "two"):
+        root = tmp_path / name
+        root.mkdir()
+        source = root / "main.py"
+        source.write_text(f"def before_change_{name}():\n    return 1\n")
+        project = app.init_project(root, f"service-{name}")
+        app.index_project(project.id)
+        projects.append(project)
+        sources.append(source)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    for name, source in zip(("one", "two"), sources, strict=True):
+        source.write_text(f"def after_change_{name}():\n    return 2\n")
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "search_across_projects",
+            {"query": "after change", "projects": [project.id for project in projects]},
+        )
+
+    assert not result.isError
+    for name, project in zip(("one", "two"), projects, strict=True):
+        assert app.find_symbol(f"after_change_{name}", project.id).hits
+        assert not app.find_symbol(f"before_change_{name}", project.id).hits
+
+
+@pytest.mark.asyncio
+async def test_manual_search_across_projects_does_not_refresh_changed_sources(
+    tmp_path: Path,
+) -> None:
+    app = _tiny_application(tmp_path)
+    projects = []
+    sources = []
+    for name in ("one", "two"):
+        root = tmp_path / name
+        root.mkdir()
+        source = root / "main.py"
+        source.write_text(f"def before_change_{name}():\n    return 1\n")
+        project = app.init_project(root, f"service-{name}")
+        app.index_project(project.id)
+        projects.append(project)
+        sources.append(source)
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    for name, source in zip(("one", "two"), sources, strict=True):
+        source.write_text(f"def after_change_{name}():\n    return 2\n")
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "search_across_projects",
+            {"query": "after change", "projects": [project.id for project in projects]},
+        )
+
+    assert not result.isError
+    for name, project in zip(("one", "two"), projects, strict=True):
+        assert not app.find_symbol(f"after_change_{name}", project.id).hits
+        assert app.find_symbol(f"before_change_{name}", project.id).hits
 
 
 @pytest.mark.asyncio
@@ -1103,6 +1335,7 @@ def test_server_instructions_guide_index_first_usage(tmp_path: Path) -> None:
     assert instructions is not None
     for tool in (
         "search_code",
+        "search_across_projects",
         "find_symbol",
         "file_outline",
         "get_chunk",
@@ -1138,7 +1371,15 @@ def test_error_without_details_renders_as_plain_string() -> None:
 READ_ONLY_TOOLS = frozenset({"list_projects", "get_chunk"})
 # These answer read queries but first go through _startup_roots, which registers
 # an unknown root as a project — writing its marker — before serving the call.
-AUTO_REGISTERING_TOOLS = frozenset({"project_status", "search_code", "find_symbol", "file_outline"})
+AUTO_REGISTERING_TOOLS = frozenset(
+    {
+        "project_status",
+        "search_code",
+        "search_across_projects",
+        "find_symbol",
+        "file_outline",
+    }
+)
 WRITE_TOOLS = frozenset({"init_project", "index_project", "remove_project"})
 
 
@@ -1227,11 +1468,44 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
 
     limit = tools["search_code"].inputSchema["properties"]["limit"]
     assert (limit["minimum"], limit["maximum"]) == (1, 50)
+    cross_project_schema = tools["search_across_projects"].inputSchema
+    assert set(cross_project_schema["properties"]) == {
+        "query",
+        "projects",
+        "languages",
+        "paths",
+        "kinds",
+        "limit",
+    }
+    assert set(cross_project_schema["required"]) == {"query", "projects"}
+    assert cross_project_schema["properties"]["projects"]["minItems"] == 2
+    cross_project_limit = cross_project_schema["properties"]["limit"]
+    assert (cross_project_limit["minimum"], cross_project_limit["maximum"]) == (1, 50)
+    assert set(tools["search_code"].inputSchema["properties"]) == {
+        "query",
+        "projects",
+        "all_projects",
+        "languages",
+        "paths",
+        "kinds",
+        "limit",
+    }
     assert tools["find_symbol"].inputSchema["properties"]["match"]["enum"] == [
         "exact",
         "prefix",
         "contains",
     ]
+
+
+@pytest.mark.asyncio
+async def test_search_across_projects_schema_rejects_one_project(tmp_path: Path) -> None:
+    server = create_server(_tiny_application(tmp_path), auto_index=False)
+
+    with pytest.raises(ToolError, match="at least 2"):
+        await server.call_tool(
+            "search_across_projects",
+            {"query": "answer", "projects": ["only-one"]},
+        )
 
 
 @pytest.mark.asyncio

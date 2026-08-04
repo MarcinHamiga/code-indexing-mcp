@@ -250,9 +250,9 @@ A generic MCP client configuration looks like this:
 }
 ```
 
-The server exposes nine tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
+The server exposes ten tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
 so hosts may auto-approve them. The other query tools are not: on a root the server has not seen
-before they register it first, which writes a `.ci-mcp/project.toml` marker, and the three code
+before they register it first, which writes a `.ci-mcp/project.toml` marker, and the four code
 queries also build its initial index. `remove_project` is annotated `destructiveHint`;
 `init_project` carries the same hint and is non-idempotent because `force_new_id=true` can
 overwrite a marker and orphan the previous index.
@@ -265,12 +265,14 @@ overwrite a marker and orphan the previous index.
 | `project_status` | read, registers | Index state plus file and chunk counts. |
 | `list_projects` | read only | Every registered project, sorted by name. |
 | `search_code` | read, registers and indexes | Hybrid semantic and keyword search returning ranked snippets. |
+| `search_across_projects` | read, registers and indexes | Globally ranked search across at least two explicitly selected projects. |
 | `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
 | `file_outline` | read, registers and indexes | One file's declared symbols, metadata only. |
 | `get_chunk` | read only | Full stored text for one `chunk_id`. |
 
-`limit` is capped at 50 and `match` accepts only `exact`, `prefix`, or `contains`; both are
-enforced by the tool schema, so an out-of-range value is rejected rather than silently clamped.
+Search `limit` values are capped at 50 and `match` accepts only `exact`, `prefix`, or `contains`;
+both are enforced by the tool schema, so an out-of-range value is rejected rather than silently
+clamped.
 
 `get_chunk` returns one chunk's full stored text with its path, symbol, line range, byte range, and
 content hash. It deliberately excludes the embedding vector and the derived `embedding_text` and
@@ -409,15 +411,22 @@ want (`**/*.cs`, `**/*.gd`, `**/*.gdshader`, `**/*.tscn`, `**/*.tres`, `**/*.sql
 
 ## Multi-project search
 
-Tools use the current MCP root or nearest `.ci-mcp/project.toml` by default. `search_code` can
-instead receive a list of project IDs/names/paths or set `all_projects=true`. Searching all
-projects is always explicit, preventing accidental context mixing.
+For deliberate cross-repository debugging, call `list_projects` first, choose the related
+registrations, then call `search_across_projects` with at least two project IDs, unique names, or
+paths. Selection is required: the dedicated tool has no `all_projects` switch, and aliases must
+resolve to at least two distinct projects. It returns one globally ranked hit list with
+`project_id` and `project_name` on every result.
 
-`search_code`'s `paths` argument takes glob patterns relative to the project root. Patterns match
-from the right, so `*.py` matches a Python file at any depth while `src/*` matches only direct
-children of `src`. A single `*` and `**` both span one path segment. Patterns are translated into
-the index scan itself, so a filtered search finds matches that rank below the unfiltered result
-window instead of returning an empty result.
+`languages`, `paths`, `kinds`, and `limit` apply across the complete selected scope rather than
+once per repository. Path globs are interpreted relative to each project root; `*.py` matches a
+Python file at any depth while `src/*` matches only direct children of `src`. A single `*` and
+`**` both span one path segment. Patterns are translated into the index scan itself, so a filtered
+search finds matches that rank below the unfiltered result window instead of returning an empty
+result.
+
+`search_code` remains compatible: it still defaults to the active project, accepts an explicit
+list of project IDs/names/paths, and supports `all_projects=true` when searching every registration
+is intentional.
 
 `remove_project` deletes only central index data. It never removes source files or the local
 `.ci-mcp` marker.
