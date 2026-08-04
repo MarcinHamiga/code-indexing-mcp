@@ -8,6 +8,7 @@ import pytest
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "src" / "code_indexing_mcp" / "skills"
 EXPECTED_SKILLS = {
     "codebase-exploration",
+    "cross-repo-debugging",
     "feature-dev",
     "impact-analysis",
     "indexed-review",

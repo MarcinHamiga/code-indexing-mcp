@@ -389,6 +389,64 @@ class _Prefill:
 
 
 @posix_only
+def test_finalize_relinks_only_skill_directories_owned_by_this_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    installation = _install(tmp_path, monkeypatch)
+    monkeypatch.setattr(update, "prepared_accelerator", lambda directory: None)
+    monkeypatch.setattr(update, "daemon_supported", lambda: False)
+
+    class ConfiguredPrefill:
+        configured_slugs = ("codex", "kimi-code", "opencode")
+
+    monkeypatch.setattr(update, "load_prefill", lambda: ConfiguredPrefill())
+    monkeypatch.setattr(update, "configuration_path", lambda slug: tmp_path / f"{slug}.json")
+    entries = {
+        "codex": {"command": str(update.server_executable(installation.checkout))},
+        "kimi-code": {"command": str(update.server_executable(tmp_path / "other-install"))},
+        "opencode": {"command": [str(update.server_executable(installation.checkout)), "serve"]},
+    }
+    monkeypatch.setattr(update, "read_server_entry", lambda slug: entries[slug], raising=False)
+    shared_skills = tmp_path / ".agents" / "skills"
+    shared_skills.mkdir(parents=True)
+    agents_alias = tmp_path / "agents-alias"
+    agents_alias.symlink_to(shared_skills.parent, target_is_directory=True)
+    skill_directories = {
+        "codex": shared_skills,
+        "kimi-code": agents_alias / "skills",
+        "opencode": tmp_path / ".config" / "opencode" / "skills",
+    }
+    monkeypatch.setattr(
+        update, "skill_directory", lambda slug: skill_directories[slug], raising=False
+    )
+    monkeypatch.setattr(update, "run_update_checks", lambda *args, **kwargs: ())
+    calls: list[tuple[list[str], Path]] = []
+
+    def install_skills(slugs: list[str], directory: Path) -> list[tuple[str, str]]:
+        calls.append((slugs, directory))
+        return [(slug, "1 linked") for slug in slugs]
+
+    monkeypatch.setattr(update, "install_skills", install_skills, raising=False)
+
+    assert (
+        update.update_main(
+            install_dir=str(installation.checkout),
+            check=False,
+            skip_accelerator=False,
+            finalize=True,
+            previous_sha="0" * 40,
+        )
+        == 0
+    )
+
+    assert calls == [(["opencode"], installation.checkout)]
+    output = capsys.readouterr().out
+    assert "[skills] ok: opencode: 1 linked" in output
+    assert "[skills] warn: codex: skipped:" in output
+    assert "shared with kimi-code" in output
+
+
+@posix_only
 def test_finalize_rebuilds_the_accelerator_when_the_lockfile_moved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

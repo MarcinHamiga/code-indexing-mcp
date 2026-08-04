@@ -199,12 +199,14 @@ confirmation prompt is not a safety net for a recursive delete you cannot undo.
 
 ### Bundled skills
 
-The installer also symlinks four agent skills into skill-capable harnesses
+The installer also symlinks five agent skills into skill-capable harnesses
 (Claude Code, Kimi Code, Codex, OpenCode), pointing into the cloned repo so
 they update on every re-install: `codebase-exploration` (index-first
-navigation), `feature-dev` (index-grounded feature workflow), `indexed-review`
+navigation), `cross-repo-debugging` (evidence-driven debugging across related
+repositories), `feature-dev` (index-grounded feature workflow), `indexed-review`
 (angle-based code review), and `impact-analysis` (blast-radius mapping before a
-change). Harnesses without skill support are skipped.
+change). Harnesses without skill support are skipped. The update command re-links
+this complete set after pulling so newly bundled skills are installed as well.
 
 ## Manual setup
 

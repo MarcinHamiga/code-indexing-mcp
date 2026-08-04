@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cross-Repo Debugging"
+  short_description: "Trace failures across related repositories"
+  default_prompt: "Use $cross-repo-debugging to trace this failure across the related repositories."

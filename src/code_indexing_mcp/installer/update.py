@@ -41,7 +41,8 @@ from .accelerator import (
     server_executable,
 )
 from .config_files import InstallerError
-from .harnesses import configuration_path
+from .env_blocks import command_from_entry
+from .harnesses import configuration_path, install_skills, read_server_entry, skill_directory
 from .orchestrator import default_install_directory
 from .verify import format_check, run_update_checks
 from .wizard import load_prefill
@@ -487,7 +488,44 @@ def _finalize_main(
     status, detail = _stop_daemon(paths, changed=changed)
     _print_status("daemon", status, detail)
 
-    configured = [(slug, configuration_path(slug)) for slug in load_prefill().configured_slugs]
+    expected_command = server_executable(directory)
+    configured_slugs = list(load_prefill().configured_slugs)
+    owned: dict[str, bool] = {}
+    for slug in configured_slugs:
+        entry = read_server_entry(slug)
+        command = command_from_entry(slug, entry) if entry is not None else None
+        owned[slug] = command is not None and Path(command) == expected_command
+
+    skill_groups: dict[Path, list[str]] = {}
+    for slug in configured_slugs:
+        skills = skill_directory(slug)
+        if skills is not None:
+            try:
+                group_key = skills.resolve()
+            except (OSError, RuntimeError, ValueError):
+                group_key = skills.absolute()
+            skill_groups.setdefault(group_key, []).append(slug)
+
+    install_slugs: list[str] = []
+    for skills, group in skill_groups.items():
+        ours = [slug for slug in group if owned[slug]]
+        others = [slug for slug in group if not owned[slug]]
+        if ours and others:
+            shared_with = ", ".join(others)
+            for slug in ours:
+                detail = (
+                    f"{slug}: skipped: {skills} is shared with {shared_with} configured for "
+                    "another installation"
+                )
+                _print_status("skills", "warn", detail)
+        else:
+            install_slugs.extend(ours)
+
+    owned_slugs = [slug for slug in configured_slugs if owned[slug]]
+    configured = [(slug, configuration_path(slug)) for slug in owned_slugs]
+    for slug, message in install_skills(install_slugs, directory):
+        status = "warn" if message.startswith("skipped:") else "ok"
+        _print_status("skills", status, f"{slug}: {message}")
     checks = run_update_checks(
         directory, configured, accelerator_was_prepared=accelerator.prepared is not None
     )
