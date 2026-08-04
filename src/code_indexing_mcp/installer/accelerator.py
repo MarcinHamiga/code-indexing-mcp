@@ -61,11 +61,20 @@ MINIMUM_WEBGPU_MACOS = (14, 0)
 MLX_PLATFORMS = {"darwin": {"arm64"}}
 MINIMUM_MLX_MACOS = (14, 0)
 # AMD publishes this ONNX Runtime/MIGraphX combination as a single wheel rather
-# than on PyPI. Nomination stays exact so the installer never assembles an
-# untested Python/ROCm pair around it.
+# than on PyPI, so the Python version stays exact: the installer never assembles
+# an untested interpreter around it. ROCm is a floor within its major instead,
+# because AMD ships compatible point releases far faster than this pin moves and
+# an exact match refused every stock install that was newer than the wheel.
 MIGRAPHX_PLATFORM = ("linux", "x86_64")
 MIGRAPHX_PYTHON_VERSION = "3.12"
-MIGRAPHX_ROCM_VERSION = "7.2.1"
+MINIMUM_MIGRAPHX_ROCM = (7, 2, 1)
+# The root ROCm installs itself under, and the component directories the version
+# file has lived in across packagings. ROCm 7's packages put it under the
+# versioned `core` component, reached through the `core` alternatives symlink,
+# so checking `/opt/rocm/.info/version` alone misses a stock 7.x install
+# entirely and reports a machine with a working ROCm as having none.
+ROCM_ROOT = Path("/opt/rocm")
+ROCM_VERSION_FILES = (".info/version", ".info/version-dev")
 
 
 def _run_command(
@@ -169,19 +178,52 @@ def _nvidia_smi_report() -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def _rocm_report() -> str | None:
+def _rocm_version_directories(root: Path) -> list[Path]:
+    """Return the directories a ROCm version file has been installed into."""
+
+    directories = []
+    override = os.environ.get("ROCM_PATH", "").strip()
+    if override:
+        directories.append(Path(override))
+    # `core` is the alternatives symlink to the active component; the sorted
+    # glob is what is left when a packaging never registered that alternative.
+    directories.extend((root, root / "core"))
+    directories.extend(sorted(root.glob("core-*")))
+    return directories
+
+
+def _rocm_version(root: Path) -> str:
+    for directory in _rocm_version_directories(root):
+        for name in ROCM_VERSION_FILES:
+            try:
+                contents = (directory / name).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            match = re.search(r"\d+\.\d+(?:\.\d+)?", contents)
+            if match is not None:
+                return match.group()
+    return ""
+
+
+def _rocminfo_device_name(output: str) -> str:
+    """Return the first GPU agent's marketing name from rocminfo's output."""
+
+    # rocminfo lists the host processor as agent 1, so the first marketing name
+    # in the output names a CPU rather than anything MIGraphX could run on. Only
+    # an agent reporting `Device Type: GPU` describes a card.
+    for block in re.split(r"(?m)^Agent \d+", output)[1:]:
+        if re.search(r"(?m)^\s*Device Type:\s*GPU\s*$", block) is None:
+            continue
+        match = re.search(r"(?m)^\s*Marketing Name:\s*(.+?)\s*$", block)
+        if match is not None and match.group(1).strip().lower() != "unknown":
+            return match.group(1).strip()
+    return ""
+
+
+def _rocm_report(*, root: Path = ROCM_ROOT) -> str | None:
     """Return the installed ROCm version and, when available, an AMD device."""
 
-    version = ""
-    for path in (Path("/opt/rocm/.info/version"), Path("/opt/rocm/.info/version-dev")):
-        try:
-            contents = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        match = re.search(r"\d+\.\d+(?:\.\d+)?", contents)
-        if match is not None:
-            version = match.group()
-            break
+    version = _rocm_version(root)
     if not version:
         return None
 
@@ -198,9 +240,7 @@ def _rocm_report() -> str | None:
         except (OSError, subprocess.SubprocessError):
             result = None
         if result is not None and result.returncode == 0:
-            match = re.search(r"(?m)^\s*Marketing Name:\s*(.+?)\s*$", result.stdout)
-            if match is not None and match.group(1).strip().lower() != "unknown":
-                device = match.group(1).strip()
+            device = _rocminfo_device_name(result.stdout)
     return f"{version}, {device or 'AMD GPU'}"
 
 
@@ -346,16 +386,23 @@ def plan_accelerator(
             else:
                 first = report.strip().splitlines()[0]
                 rocm_version, _, device_name = (part.strip() for part in first.partition(","))
-                if rocm_version != MIGRAPHX_ROCM_VERSION:
+                components = _driver_components(rocm_version)
+                minimum = ".".join(str(part) for part in MINIMUM_MIGRAPHX_ROCM)
+                if (
+                    not components
+                    or components[0] != MINIMUM_MIGRAPHX_ROCM[0]
+                    or components < MINIMUM_MIGRAPHX_ROCM
+                ):
                     problem = (
-                        f"ROCm {rocm_version or 'unknown'} does not match the pinned "
-                        f"{MIGRAPHX_ROCM_VERSION} runtime"
+                        f"ROCm {rocm_version or 'unknown'} is outside the {minimum}+ "
+                        f"support window this release's MIGraphX runtime was built "
+                        f"against (ROCm {MINIMUM_MIGRAPHX_ROCM[0]} only)"
                     )
                 else:
                     return AcceleratorPlan(
                         "migraphx",
-                        f"ROCm {rocm_version} on {device_name or 'an AMD device'} matches "
-                        "the pinned MIGraphX runtime",
+                        f"ROCm {rocm_version} on {device_name or 'an AMD device'} is "
+                        "within this release's MIGraphX support window",
                         driver_version=rocm_version,
                         device_name=device_name,
                     )

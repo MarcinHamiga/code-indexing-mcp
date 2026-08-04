@@ -509,7 +509,7 @@ The locked installation matrix is:
 | CUDA | Linux x86-64 or Windows x86-64; NVIDIA driver 525.60+ or 527.41+ | ONNX Runtime GPU 1.22–1.23, CUDA 12, cuDNN 9 | CUDA | automatic |
 | MLX | macOS 14+ Apple Silicon | MLX 0.32.0 | Metal | automatic |
 | WebGPU | macOS 14+ Apple Silicon, Linux x86-64 with glibc 2.27+, or Windows x86-64 | ONNX Runtime 1.24.4 + WebGPU plugin 0.1.0 | Metal, Vulkan, or D3D12/Vulkan | experimental, explicit only |
-| MIGraphX | Linux x86-64, Python 3.12, ROCm 7.2.1 | AMD ONNX Runtime/MIGraphX 1.23.2 | ROCm/MIGraphX | experimental, explicit only |
+| MIGraphX | Linux x86-64, Python 3.12, ROCm 7.2.1+ (ROCm 7 only) | AMD ONNX Runtime/MIGraphX 1.23.2 | ROCm/MIGraphX | experimental, explicit only |
 | Core ML | macOS, when the serving runtime exposes it | serving CPU environment | Core ML | manual only |
 
 An unsupported explicit MIGraphX request tries the locked WebGPU path when that platform has the

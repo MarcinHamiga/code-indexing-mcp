@@ -10,6 +10,7 @@ from types import ModuleType
 import pytest
 from conftest import create_test_remote, run_git
 
+from code_indexing_mcp.installer import accelerator as accelerator_module
 from code_indexing_mcp.installer.accelerator import (
     ACCELERATOR_ENVIRONMENT_DIRECTORY,
     ACCELERATOR_EXTRAS,
@@ -1098,12 +1099,21 @@ def test_webgpu_is_prepared_only_where_the_locked_plugin_has_a_wheel(
     ("platform_name", "machine", "python_version", "rocm", "expected", "honored"),
     [
         ("linux", "x86_64", "3.12", "7.2.1, AMD Radeon PRO W7900", "migraphx", True),
+        # A point release above the floor is what a stock ROCm install actually
+        # is; refusing it left working AMD machines on WebGPU.
+        ("linux", "x86_64", "3.12", "7.14.0, AMD Radeon RX 7900 XT", "migraphx", True),
+        ("linux", "x86_64", "3.12", "7.3, AMD Radeon PRO W7900", "migraphx", True),
         ("linux", "x86_64", "3.12", "7.2, AMD Radeon PRO W7900", "webgpu", False),
+        ("linux", "x86_64", "3.12", "6.4.1, AMD Radeon PRO W7900", "webgpu", False),
+        # The floor is a floor within ROCm 7 only: the next major is a runtime
+        # this release's wheel was never built against.
+        ("linux", "x86_64", "3.12", "8.0.0, AMD Radeon PRO W7900", "webgpu", False),
+        ("linux", "x86_64", "3.12", "unknown, AMD Radeon PRO W7900", "webgpu", False),
         ("linux", "x86_64", "3.13", "7.2.1, AMD Radeon PRO W7900", "webgpu", False),
         ("linux", "aarch64", "3.12", "7.2.1, AMD GPU", "cpu", False),
     ],
 )
-def test_migraphx_uses_only_the_pinned_rocm_python_matrix_then_falls_back(
+def test_migraphx_uses_only_the_supported_rocm_python_matrix_then_falls_back(
     platform_name: str,
     machine: str,
     python_version: str,
@@ -1125,10 +1135,82 @@ def test_migraphx_uses_only_the_pinned_rocm_python_matrix_then_falls_back(
     assert plan.accelerator == expected
     assert plan.honored is honored
     if expected == "migraphx":
-        assert plan.driver_version == "7.2.1"
-        assert plan.device_name == "AMD Radeon PRO W7900"
+        assert plan.driver_version == rocm.split(",")[0]
+        assert plan.device_name == rocm.split(", ")[1]
     else:
         assert "MIGraphX was requested but" in plan.reason
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        # Where ROCm 6 and earlier put it, and where the detection used to look.
+        ".info/version",
+        ".info/version-dev",
+        # Where ROCm 7's packages put it: under the versioned `core` component,
+        # normally reached through the `core` alternatives symlink.
+        "core-7.14/.info/version",
+        "core/.info/version",
+    ],
+)
+def test_rocm_is_detected_wherever_the_packaging_put_its_version_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str
+) -> None:
+    monkeypatch.delenv("ROCM_PATH", raising=False)
+    monkeypatch.setattr(accelerator_module.shutil, "which", lambda name: None)
+    version_file = tmp_path / relative
+    version_file.parent.mkdir(parents=True)
+    version_file.write_text("7.14.0\n", encoding="utf-8")
+
+    assert accelerator_module._rocm_report(root=tmp_path) == "7.14.0, AMD GPU"
+
+
+def test_a_machine_without_rocm_reports_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ROCM_PATH", raising=False)
+
+    assert accelerator_module._rocm_report(root=tmp_path / "missing") is None
+
+
+def test_rocm_path_overrides_the_default_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(accelerator_module.shutil, "which", lambda name: None)
+    override = tmp_path / "rocm-7.2.1"
+    (override / ".info").mkdir(parents=True)
+    (override / ".info" / "version").write_text("7.2.1\n", encoding="utf-8")
+    monkeypatch.setenv("ROCM_PATH", str(override))
+
+    assert accelerator_module._rocm_report(root=tmp_path / "missing") == "7.2.1, AMD GPU"
+
+
+def test_the_reported_device_is_a_gpu_agent_and_not_the_host_processor() -> None:
+    """rocminfo lists the CPU as agent 1, so the first name in it is not a card."""
+    output = """\
+Agent 1
+  Name:                    AMD Ryzen 7 9800X3D 8-Core Processor
+  Marketing Name:          AMD Ryzen 7 9800X3D 8-Core Processor
+  Device Type:             CPU
+Agent 2
+  Name:                    gfx1100
+  Marketing Name:          AMD Radeon RX 7900 XT
+  Device Type:             GPU
+"""
+
+    assert accelerator_module._rocminfo_device_name(output) == "AMD Radeon RX 7900 XT"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "",
+        "Agent 1\n  Marketing Name:          AMD Ryzen 7 9800X3D\n  Device Type:  CPU\n",
+        "Agent 1\n  Marketing Name:          Unknown\n  Device Type:             GPU\n",
+    ],
+)
+def test_an_unnameable_device_falls_back_rather_than_naming_a_cpu(output: str) -> None:
+    assert accelerator_module._rocminfo_device_name(output) == ""
 
 
 @pytest.mark.parametrize(
