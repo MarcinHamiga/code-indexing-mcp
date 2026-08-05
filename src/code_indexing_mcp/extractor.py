@@ -266,9 +266,12 @@ class TreeSitterExtractor:
     ) -> tuple[list[ExtractedReference], list[ExtractedDeclarationShape]]:
         """Extract syntax facts using the already parsed tree and definition index."""
         matches = QueryCursor(self._structural_query(language)).matches(root)
-        roots = [node for _, captures in matches for node in captures.get("root", [])]
-        structural_root = roots[0] if roots else root
-        declarations = self._declaration_shapes(language, index, line_index)
+        parameter_nodes: dict[int, Node] = {}
+        for _, captures in matches:
+            for parameter_node in captures.get("declaration.parameters", []):
+                if parameter_node.parent is not None:
+                    parameter_nodes[parameter_node.parent.id] = parameter_node
+        declarations = self._declaration_shapes(language, index, line_index, parameter_nodes)
         declaration_by_node = {
             definition.node.id: declaration
             for definition, declaration in zip(index.definitions, declarations, strict=True)
@@ -281,7 +284,7 @@ class TreeSitterExtractor:
             node: Node,
             *,
             written_name: str | None = None,
-            target_name: str | None = None,
+            target_name: str,
             module_path: str | None = None,
             imported_name: str | None = None,
             alias: str | None = None,
@@ -311,14 +314,15 @@ class TreeSitterExtractor:
                 )
             )
 
-        stack = [structural_root]
-        while stack:
-            node = stack.pop()
-            stack.extend(reversed(node.named_children))
-            if language == "python":
-                self._python_records(node, source, add)
-            else:
-                self._javascript_records(node, source, add)
+        for _, captures in matches:
+            for capture, nodes in captures.items():
+                if not capture.startswith("reference."):
+                    continue
+                for node in nodes:
+                    if language == "python":
+                        self._python_records(node, source, add)
+                    else:
+                        self._javascript_records(node, source, add)
         references.sort(key=lambda item: (item.start_byte, item.end_byte, item.kind))
         return references, declarations
 
@@ -339,7 +343,11 @@ class TreeSitterExtractor:
         return None
 
     def _declaration_shapes(
-        self, language: str, index: _DefinitionIndex, line_index: _LineIndex
+        self,
+        language: str,
+        index: _DefinitionIndex,
+        line_index: _LineIndex,
+        parameter_nodes: dict[int, Node],
     ) -> list[ExtractedDeclarationShape]:
         rows: list[ExtractedDeclarationShape] = []
         for definition in index.definitions:
@@ -355,21 +363,28 @@ class TreeSitterExtractor:
                     end_line=line_index.line_at(
                         max(definition.node.start_byte, definition.node.end_byte - 1)
                     ),
-                    parameters=self._parameter_shapes(language, definition.node),
+                    parameters=self._parameter_shapes(
+                        language, parameter_nodes.get(definition.node.id)
+                    ),
                 )
             )
         return rows
 
     @staticmethod
-    def _parameter_shapes(language: str, definition: Node) -> list[ParameterShape]:
-        parameters = definition.child_by_field_name("parameters")
+    def _parameter_shapes(language: str, parameters: Node | None) -> list[ParameterShape]:
         if parameters is None:
             return []
         rows: list[ParameterShape] = []
-        positional_only = language == "python"
+        positional_only = False
         keyword_only = False
         for child in parameters.named_children:
             if child.type == "positional_separator":
+                rows = [
+                    row.model_copy(update={"kind": "positional_only"})
+                    if row.kind == "positional"
+                    else row
+                    for row in rows
+                ]
                 positional_only = False
                 continue
             if child.type == "keyword_separator":
@@ -465,6 +480,7 @@ class TreeSitterExtractor:
                 add_reference(
                     "import",
                     child,
+                    target_name=imported_name,
                     written_name=alias or imported_name,
                     module_path=module_path,
                     imported_name=imported_name,
@@ -487,6 +503,7 @@ class TreeSitterExtractor:
                 add_reference(
                     "import",
                     child,
+                    target_name=imported_name,
                     written_name=alias or imported_name,
                     module_path=imported_name,
                     imported_name=imported_name,
@@ -500,8 +517,8 @@ class TreeSitterExtractor:
                 add_reference(
                     "decorator",
                     target,
-                    written_name=_capture_name(source, target),
                     target_name=_capture_name(source, target),
+                    written_name=_capture_name(source, target),
                 )
         elif node.type == "class_definition":
             superclasses = node.child_by_field_name("superclasses")
@@ -510,8 +527,8 @@ class TreeSitterExtractor:
                     add_reference(
                         "inheritance",
                         item,
-                        written_name=_capture_name(source, item),
                         target_name=_capture_name(source, item),
+                        written_name=_capture_name(source, item),
                     )
         elif node.type == "call":
             function = node.child_by_field_name("function")
@@ -520,8 +537,8 @@ class TreeSitterExtractor:
                 add_reference(
                     "call",
                     function,
-                    written_name=_capture_name(source, function),
                     target_name=_capture_name(source, function),
+                    written_name=_capture_name(source, function),
                     receiver_text=_capture_name(source, receiver) if receiver is not None else None,
                     call_shape=self._call_shape(node),
                 )
@@ -531,8 +548,8 @@ class TreeSitterExtractor:
                 add_reference(
                     "type_use",
                     target,
-                    written_name=_capture_name(source, target),
                     target_name=_capture_name(source, target),
+                    written_name=_capture_name(source, target),
                 )
 
     def _javascript_records(
@@ -561,6 +578,7 @@ class TreeSitterExtractor:
                             add_reference(
                                 "import",
                                 specifier,
+                                target_name=imported,
                                 written_name=alias_text or imported,
                                 module_path=module_path,
                                 imported_name=imported,
@@ -572,6 +590,7 @@ class TreeSitterExtractor:
                             add_reference(
                                 "import",
                                 alias,
+                                target_name="*",
                                 written_name=_capture_name(source, alias),
                                 module_path=module_path,
                                 imported_name="*",
@@ -581,6 +600,7 @@ class TreeSitterExtractor:
                         add_reference(
                             "import",
                             item,
+                            target_name="default",
                             written_name=_capture_name(source, item),
                             module_path=module_path,
                             imported_name="default",
@@ -599,6 +619,9 @@ class TreeSitterExtractor:
                         add_reference(
                             "export",
                             specifier,
+                            target_name=_capture_name(source, name)
+                            if name is not None
+                            else exported,
                             written_name=exported,
                             module_path=module_path,
                             imported_name=_capture_name(source, name)
@@ -611,8 +634,8 @@ class TreeSitterExtractor:
                 add_reference(
                     "inheritance",
                     item,
-                    written_name=_capture_name(source, item),
                     target_name=_capture_name(source, item),
+                    written_name=_capture_name(source, item),
                 )
         elif node.type in {"call_expression", "new_expression"}:
             function = node.child_by_field_name("function") or node.child_by_field_name(
@@ -623,8 +646,8 @@ class TreeSitterExtractor:
                 add_reference(
                     "call",
                     function,
-                    written_name=_capture_name(source, function),
                     target_name=_capture_name(source, function),
+                    written_name=_capture_name(source, function),
                     receiver_text=_capture_name(source, receiver) if receiver is not None else None,
                     call_shape=self._call_shape(node),
                 )
@@ -632,8 +655,8 @@ class TreeSitterExtractor:
             add_reference(
                 "type_use",
                 node,
-                written_name=_capture_name(source, node),
                 target_name=_capture_name(source, node),
+                written_name=_capture_name(source, node),
             )
         elif node.type == "type_annotation":
             target = node.named_child(0)
@@ -641,8 +664,8 @@ class TreeSitterExtractor:
                 add_reference(
                     "type_use",
                     target,
-                    written_name=_capture_name(source, target),
                     target_name=_capture_name(source, target),
+                    written_name=_capture_name(source, target),
                 )
 
     def _definitions(self, language_name: str, root: Node, source: bytes) -> list[_Definition]:

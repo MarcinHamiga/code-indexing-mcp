@@ -81,6 +81,51 @@ def test_python_extracts_structural_references_and_exact_ranges() -> None:
     ]
 
 
+def test_python_parameter_modes_import_targets_and_direct_call() -> None:
+    source = (
+        "from pkg.auth import enforce as check\n\n"
+        "def run(self, user, *, strict=True):\n"
+        "    return check(user, strict=strict)\n"
+    )
+    result = TreeSitterExtractor().extract(Path("sample.py"), "python", source.encode())
+    by_name = {
+        reference.kind + ":" + reference.written_name: reference for reference in result.references
+    }
+
+    imported = by_name["import:check"]
+    assert (imported.target_name, imported.imported_name, imported.alias, imported.module_path) == (
+        "enforce",
+        "enforce",
+        "check",
+        "pkg.auth",
+    )
+    direct_call = by_name["call:check"]
+    assert direct_call.target_name == "check"
+    assert direct_call.source_qualified_symbol == "run"
+    assert direct_call.call_shape is not None
+    assert (direct_call.call_shape.positional_count, direct_call.call_shape.keywords) == (
+        1,
+        ["strict"],
+    )
+    assert (
+        direct_call.start_byte,
+        direct_call.end_byte,
+        direct_call.start_line,
+        direct_call.end_line,
+    ) == (
+        source.index("check(user"),
+        source.index("check(user") + len("check"),
+        4,
+        4,
+    )
+    declaration = next(item for item in result.declarations if item.qualified_symbol == "run")
+    assert [(item.name, item.kind, item.required) for item in declaration.parameters] == [
+        ("self", "positional", True),
+        ("user", "positional", True),
+        ("strict", "keyword_only", False),
+    ]
+
+
 def test_javascript_typescript_and_tsx_extract_structural_syntax() -> None:
     javascript = (
         "import Default, { named as local } from 'pkg';\n"

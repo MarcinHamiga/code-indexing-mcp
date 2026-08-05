@@ -221,7 +221,7 @@ class ParameterShape(FrozenModel):
 class ExtractedReference(FrozenModel):
     kind: ReferenceKind
     written_name: str
-    target_name: str | None = None
+    target_name: str
     source_qualified_symbol: str | None = None
     module_path: str | None = None
     imported_name: str | None = None
