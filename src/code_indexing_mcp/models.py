@@ -41,7 +41,7 @@ LEGACY_DEFAULT_INCLUDES_V1 = [
 
 LEGACY_DEFAULT_INCLUDES_V2 = [*LEGACY_DEFAULT_INCLUDES_V1, "**/*.java"]
 
-DEFAULT_INCLUDES = [
+LEGACY_DEFAULT_INCLUDES_V3 = [
     *LEGACY_DEFAULT_INCLUDES_V2,
     "**/*.cs",
     "**/*.csx",
@@ -55,6 +55,23 @@ DEFAULT_INCLUDES = [
     "**/*.yaml",
     "**/*.yml",
     "**/*.json",
+]
+
+DEFAULT_INCLUDES = [
+    *LEGACY_DEFAULT_INCLUDES_V3,
+    "**/*.go",
+    "**/*.tf",
+    "**/*.tfvars",
+    "**/*.rs",
+    "**/*.c",
+    "**/*.h",
+    "**/*.cc",
+    "**/*.cpp",
+    "**/*.cxx",
+    "**/*.hh",
+    "**/*.hpp",
+    "**/*.hxx",
+    "**/*.lua",
 ]
 
 # The kinds TreeSitterExtractor emits, plus the "_part" variants it produces when a
@@ -117,6 +134,12 @@ LanguageName = Literal[
     "godot_resource",
     "yaml",
     "json",
+    "go",
+    "terraform",
+    "rust",
+    "c",
+    "cpp",
+    "lua",
 ]
 
 

@@ -56,6 +56,25 @@ def test_default_includes_and_the_extension_map_describe_the_same_languages() ->
     assert {pattern.removeprefix("**/*") for pattern in DEFAULT_INCLUDES} == set(LANGUAGES)
 
 
+def test_next_language_extensions_have_stable_language_names() -> None:
+    expected = {
+        ".go": "go",
+        ".tf": "terraform",
+        ".tfvars": "terraform",
+        ".rs": "rust",
+        ".c": "c",
+        ".h": "c",
+        ".cc": "cpp",
+        ".cpp": "cpp",
+        ".cxx": "cpp",
+        ".hh": "cpp",
+        ".hpp": "cpp",
+        ".hxx": "cpp",
+        ".lua": "lua",
+    }
+    assert all(LANGUAGES.get(extension) == language for extension, language in expected.items())
+
+
 def test_scanner_discovers_every_default_language(tmp_path: Path) -> None:
     """Every extension in the map is discovered under the default include list.
 

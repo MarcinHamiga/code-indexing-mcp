@@ -35,6 +35,19 @@ LANGUAGES = {
     ".yaml": "yaml",
     ".yml": "yaml",
     ".json": "json",
+    ".go": "go",
+    ".tf": "terraform",
+    ".tfvars": "terraform",
+    ".rs": "rust",
+    ".c": "c",
+    ".h": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cxx": "cpp",
+    ".hh": "cpp",
+    ".hpp": "cpp",
+    ".hxx": "cpp",
+    ".lua": "lua",
 }
 
 HARD_EXCLUDED_DIRECTORIES = {
