@@ -67,9 +67,11 @@ def make_project(root: Path, source: str = "def answer():\n    return 42\n"):
     return initialize_project(root)
 
 
-def chunk_row(project_id: str, file_id: str, vector: list[float]) -> ChunkRow:
+def chunk_row(
+    project_id: str, file_id: str, vector: list[float], *, chunk_id: str = "chunk-1"
+) -> ChunkRow:
     return ChunkRow(
-        chunk_id="chunk-1",
+        chunk_id=chunk_id,
         file_id=file_id,
         project_id=project_id,
         path="main.py",
@@ -183,6 +185,79 @@ def test_staged_references_stream_to_arrow_without_object_row_materialization(
     assert table.column("reference_id")[0].as_py() == "reference-1"
     assert table.column("shape_json")[0].as_py() == '{"positional_count": 0}'
     job.discard()
+
+
+def test_mixed_file_reference_batch_replaces_each_file_independently(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+        chunk_groups=(),
+        reference_groups=[
+            (
+                "file-a",
+                pa.Table.from_pylist(
+                    [reference_row(project.id, "file-a", reference_id="old-a").__dict__],
+                    schema=LanceStore.reference_arrow_schema(),
+                ),
+            ),
+            (
+                "file-b",
+                pa.Table.from_pylist(
+                    [reference_row(project.id, "file-b", reference_id="old-b").__dict__],
+                    schema=LanceStore.reference_arrow_schema(),
+                ),
+            ),
+        ],
+        replace_reference_file_ids=["file-a", "file-b"],
+    )
+    job = make_job(tmp_path, store, project.id)
+    # One Arrow record batch carries both file ids; grouping must split it
+    # before the per-file merge/delete transaction reaches storage.
+    job.stage_references(
+        [
+            reference_row(project.id, "file-a", reference_id="new-a"),
+            reference_row(project.id, "file-b", reference_id="new-b"),
+        ]
+    )
+    job.stage_references([reference_row(project.id, "file-a", reference_id="new-a-second")])
+    job.mark_references_replaced("file-a")
+    job.mark_references_replaced("file-b")
+    # Repeated completion signals must not turn a later empty group into a
+    # second delete for file-a.
+    job.mark_references_replaced("file-a")
+    job.begin_commit(store.table_versions(project.id))
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+        chunk_groups=(),
+        reference_groups=job.iter_reference_groups(),
+        replace_reference_file_ids=job.replace_reference_file_ids,
+    )
+
+    records = store.list_reference_records(project.id)
+    assert {(row["file_id"], row["reference_id"]) for row in records} == {
+        ("file-a", "new-a"),
+        ("file-a", "new-a-second"),
+        ("file-b", "new-b"),
+    }
+
+
+def test_staging_chunks_rejects_mixed_file_batches(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+
+    with pytest.raises(ValueError, match="one file"):
+        job.stage_chunks(
+            [
+                chunk_row("project-1", "file-a", [1.0, 2.0, 3.0, 4.0], chunk_id="chunk-a"),
+                chunk_row("project-1", "file-b", [4.0, 3.0, 2.0, 1.0], chunk_id="chunk-b"),
+            ]
+        )
 
 
 def test_the_write_path_never_dumps_a_stored_chunk(tmp_path: Path) -> None:
@@ -457,9 +532,8 @@ def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -
     )
     references_before = store.list_reference_records(project.id)
 
-    # Stage a replacement, record the versions, and then "crash": the chunks
-    # merge lands but the run dies before the files merge and before any
-    # rollback code runs.
+    # Stage a replacement, record the versions, and then "crash" after all
+    # three live tables mutate but before rollback code runs.
     job = make_job(tmp_path, store, project.id)
     record = files_before[0].model_copy(update={"mtime_ns": 2})
     job.stage_file(record)
@@ -473,13 +547,15 @@ def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -
     job.begin_commit(versions)
     store.replace_files_from_arrow(
         project.id,
-        files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+        files=job.files_table(),
         chunk_groups=job.iter_chunk_groups(),
         reference_groups=job.iter_reference_groups(),
         replace_reference_file_ids=job.replace_reference_file_ids,
     )
+    assert store.list_files(project.id) != files_before
     assert store.count_chunks([project.id]) == 1
     assert store.list_chunks([project.id])[0].content != chunks_before[0].content
+    assert store.list_reference_records(project.id) != references_before
 
     recovered = recover_staged_commits(tmp_path / "staging", store)
 

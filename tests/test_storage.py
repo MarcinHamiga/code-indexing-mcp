@@ -150,10 +150,20 @@ def test_removing_a_file_deletes_its_reference_rows(tmp_path: Path) -> None:
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
+        chunk_groups=[
+            (
+                record.file_id,
+                pa.Table.from_pylist(
+                    [_stored_chunks(project.id, 1)[0].model_dump()],
+                    schema=LanceStore.chunk_arrow_schema(store.vector_dimension),
+                ),
+            )
+        ],
         reference_groups=[("file-1", reference_table(reference_record(project.id, "file-1")))],
         replace_reference_file_ids=["file-1"],
     )
+
+    assert store.count_chunks([project.id]) == 1
 
     store.remove_file(project.id, "file-1")
 

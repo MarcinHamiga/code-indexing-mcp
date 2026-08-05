@@ -28,6 +28,7 @@ from typing import Any, cast
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from .models import StoredFile
 from .storage import LanceStore, TableVersions
@@ -206,6 +207,8 @@ class StagingJob:
         assert self._chunks_writer is not None
         if not rows:
             return
+        if any(row.file_id != rows[0].file_id for row in rows[1:]):
+            raise ValueError("A staged chunk batch must contain rows from one file")
         vector_type = self._chunk_schema.field("vector").type
         dimension = vector_type.list_size
         columns: list[pa.Array] = []
@@ -235,11 +238,13 @@ class StagingJob:
         )
 
     def mark_replaced(self, file_id: str) -> None:
-        self.replace_file_ids.append(file_id)
+        if file_id not in self.replace_file_ids:
+            self.replace_file_ids.append(file_id)
 
     def mark_references_replaced(self, file_id: str) -> None:
         """Mark one file's structural rows for replacement, independently of chunks."""
-        self.replace_reference_file_ids.append(file_id)
+        if file_id not in self.replace_reference_file_ids:
+            self.replace_reference_file_ids.append(file_id)
 
     def mark_removed(self, file_id: str) -> None:
         self.removed_file_ids.append(file_id)
@@ -298,34 +303,35 @@ class StagingJob:
                 yield file_id, empty
 
     def iter_reference_groups(self) -> Iterator[tuple[str, pa.Table]]:
-        """Yield one staged structural table per replaced-reference file."""
+        """Yield complete staged structural tables per replaced-reference file.
+
+        A producer may stage rows from several files in one Arrow record batch,
+        or stage the same file in non-contiguous batches. Partitioning each
+        batch by its Arrow ``file_id`` column lets the final merge/delete see
+        one complete table per file without materializing Python row objects.
+        """
         wanted = set(self.replace_reference_file_ids)
-        seen: set[str] = set()
-        current_file_id: str | None = None
-        batches: list[pa.RecordBatch] = []
+        batches_by_file: dict[str, list[pa.RecordBatch]] = {}
         reader = pa.ipc.open_file(self.directory / REFERENCES_NAME)
         for index in range(reader.num_record_batches):
             batch = reader.get_batch(index)
-            file_id = cast(str, batch.column("file_id")[0].as_py())
-            if file_id != current_file_id:
-                if batches:
-                    assert current_file_id is not None
-                    seen.add(current_file_id)
-                    yield current_file_id, pa.Table.from_batches(
-                        batches, schema=self._reference_schema
-                    )
-                    batches = []
-                current_file_id = file_id
-            if file_id in wanted:
-                batches.append(batch)
-        if batches:
-            assert current_file_id is not None
-            seen.add(current_file_id)
-            yield current_file_id, pa.Table.from_batches(batches, schema=self._reference_schema)
+            file_ids = batch.column("file_id")
+            for value in pc.unique(file_ids):
+                file_id = cast(str, value.as_py())
+                if file_id not in wanted:
+                    continue
+                batches_by_file.setdefault(file_id, []).append(
+                    batch.filter(pc.equal(file_ids, value))
+                )
         empty = pa.Table.from_batches([], schema=self._reference_schema)
         for file_id in self.replace_reference_file_ids:
-            if file_id not in seen:
-                yield file_id, empty
+            batches = batches_by_file.pop(file_id, None)
+            yield (
+                file_id,
+                pa.Table.from_batches(batches, schema=self._reference_schema)
+                if batches is not None
+                else empty,
+            )
 
     def complete(self) -> None:
         """Mark the commit successful and remove the staged directory."""
