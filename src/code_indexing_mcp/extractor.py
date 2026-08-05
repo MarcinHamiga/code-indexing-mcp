@@ -634,15 +634,33 @@ class TreeSitterExtractor:
                         )
             declaration = node.child_by_field_name("declaration")
             if declaration is not None:
-                name = declaration.child_by_field_name("name")
-                if name is not None:
-                    exported = _capture_name(source, name)
-                    add_reference(
-                        "export",
-                        name,
-                        target_name=exported,
-                        written_name=exported,
-                    )
+                if declaration.type == "lexical_declaration":
+                    for declarator in declaration.named_children:
+                        if declarator.type != "variable_declarator":
+                            continue
+                        name = declarator.child_by_field_name("name")
+                        if name is None:
+                            continue
+                        exported = _capture_name(source, name)
+                        add_reference(
+                            "export",
+                            name,
+                            target_name=exported,
+                            written_name=exported,
+                        )
+                else:
+                    name = declaration.child_by_field_name("name")
+                    if name is not None:
+                        exported = _capture_name(source, name)
+                        is_default = source[node.start_byte : node.end_byte].lstrip().startswith(
+                            b"export default"
+                        )
+                        add_reference(
+                            "export",
+                            name,
+                            target_name=exported,
+                            written_name="default" if is_default else exported,
+                        )
             value = node.child_by_field_name("value")
             if value is not None:
                 add_reference(

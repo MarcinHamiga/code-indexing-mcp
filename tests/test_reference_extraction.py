@@ -293,3 +293,64 @@ def test_python_extracts_relative_and_wildcard_imports() -> None:
         "pkg",
         None,
     )
+
+
+@pytest.mark.parametrize(
+    ("language", "source"),
+    [
+        (
+            "javascript",
+            "export const alpha = 1, gamma = 2;\n"
+            "export let beta;\n"
+            "export default function named() {}\n",
+        ),
+        (
+            "typescript",
+            "export const alpha = 1, gamma = 2;\n"
+            "export let beta: number;\n"
+            "export default function named() {}\n",
+        ),
+        (
+            "tsx",
+            "export const alpha = 1, gamma = 2;\n"
+            "export let beta: number;\n"
+            "export default function named() { return <div />; }\n",
+        ),
+    ],
+)
+def test_js_family_extracts_lexical_and_named_default_exports(language: str, source: str) -> None:
+    references = _references(source, language)
+    exports = [reference for reference in references if reference.kind == "export"]
+    by_name = {reference.written_name: reference for reference in exports}
+
+    assert len(exports) == 4
+    assert {name: by_name[name].target_name for name in ("alpha", "gamma", "beta", "default")} == {
+        "alpha": "alpha",
+        "gamma": "gamma",
+        "beta": "beta",
+        "default": "named",
+    }
+
+
+def test_python_extracts_aliased_relative_and_wildcard_imports() -> None:
+    source = "from .pkg import x as y\nfrom ..pkg import a as b\nfrom ...pkg import *\n"
+    references = _references(source)
+    imports = {
+        reference.written_name: reference for reference in references if reference.kind == "import"
+    }
+
+    assert (imports["y"].target_name, imports["y"].module_path, imports["y"].alias) == (
+        "x",
+        ".pkg",
+        "y",
+    )
+    assert (imports["b"].target_name, imports["b"].module_path, imports["b"].alias) == (
+        "a",
+        "..pkg",
+        "b",
+    )
+    assert (imports["*"].target_name, imports["*"].module_path, imports["*"].alias) == (
+        "*",
+        "...pkg",
+        None,
+    )
