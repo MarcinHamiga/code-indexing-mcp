@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import lancedb
 import pyarrow as pa
 import pytest
 from filelock import FileLock
@@ -23,6 +24,7 @@ from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner
 from code_indexing_mcp.staging import (
     CHUNKS_NAME,
+    JOURNAL_FORMAT_VERSION,
     JOURNAL_NAME,
     MAX_RECOVERY_ATTEMPTS,
     PHASE_COMMITTING,
@@ -187,64 +189,45 @@ def test_staged_references_stream_to_arrow_without_object_row_materialization(
     job.discard()
 
 
-def test_mixed_file_reference_batch_replaces_each_file_independently(tmp_path: Path) -> None:
+def test_staging_references_rejects_mixed_file_batches(tmp_path: Path) -> None:
     store = LanceStore(tmp_path / "data", vector_dimension=4)
-    root = tmp_path / "repo"
-    root.mkdir()
-    project = initialize_project(root)
-    store.upsert_project(project, model_id="test/model")
-    store.replace_files_from_arrow(
-        project.id,
-        files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=[
-            (
-                "file-a",
-                pa.Table.from_pylist(
-                    [reference_row(project.id, "file-a", reference_id="old-a").__dict__],
-                    schema=LanceStore.reference_arrow_schema(),
-                ),
-            ),
-            (
-                "file-b",
-                pa.Table.from_pylist(
-                    [reference_row(project.id, "file-b", reference_id="old-b").__dict__],
-                    schema=LanceStore.reference_arrow_schema(),
-                ),
-            ),
-        ],
-        replace_reference_file_ids=["file-a", "file-b"],
-    )
-    job = make_job(tmp_path, store, project.id)
-    # One Arrow record batch carries both file ids; grouping must split it
-    # before the per-file merge/delete transaction reaches storage.
-    job.stage_references(
-        [
-            reference_row(project.id, "file-a", reference_id="new-a"),
-            reference_row(project.id, "file-b", reference_id="new-b"),
-        ]
-    )
-    job.stage_references([reference_row(project.id, "file-a", reference_id="new-a-second")])
+    job = make_job(tmp_path, store, "project-1")
+
+    with pytest.raises(ValueError, match="one file"):
+        job.stage_references(
+            [
+                reference_row("project-1", "file-a", reference_id="a"),
+                reference_row("project-1", "file-b", reference_id="b"),
+            ]
+        )
+
+
+def test_contiguous_reference_batches_stream_one_complete_group_per_file(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_references([reference_row("project-1", "file-a", reference_id="a-1")])
+    job.stage_references([reference_row("project-1", "file-a", reference_id="a-2")])
+    job.stage_references([reference_row("project-1", "file-b", reference_id="b-1")])
     job.mark_references_replaced("file-a")
     job.mark_references_replaced("file-b")
-    # Repeated completion signals must not turn a later empty group into a
-    # second delete for file-a.
     job.mark_references_replaced("file-a")
-    job.begin_commit(store.table_versions(project.id))
-    store.replace_files_from_arrow(
-        project.id,
-        files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=job.iter_reference_groups(),
-        replace_reference_file_ids=job.replace_reference_file_ids,
-    )
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
 
-    records = store.list_reference_records(project.id)
-    assert {(row["file_id"], row["reference_id"]) for row in records} == {
-        ("file-a", "new-a"),
-        ("file-a", "new-a-second"),
-        ("file-b", "new-b"),
-    }
+    groups = list(job.iter_reference_groups())
+
+    assert [file_id for file_id, _ in groups] == ["file-a", "file-b"]
+    assert groups[0][1].column("reference_id").to_pylist() == ["a-1", "a-2"]
+    assert groups[1][1].column("reference_id").to_pylist() == ["b-1"]
+
+
+def test_staging_references_rejects_non_contiguous_file_batches(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_references([reference_row("project-1", "file-a", reference_id="a-1")])
+    job.stage_references([reference_row("project-1", "file-b", reference_id="b-1")])
+
+    with pytest.raises(ValueError, match="contiguous"):
+        job.stage_references([reference_row("project-1", "file-a", reference_id="a-2")])
 
 
 def test_staging_chunks_rejects_mixed_file_batches(tmp_path: Path) -> None:
@@ -578,7 +561,7 @@ def test_repeated_recovery_is_idempotent(tmp_path: Path) -> None:
     journal_dir = tmp_path / "staging" / project.id / "job-1"
     journal_dir.mkdir(parents=True)
     journal = {
-        "version": 1,
+        "version": JOURNAL_FORMAT_VERSION,
         "job_id": "job-1",
         "project_id": project.id,
         "phase": PHASE_COMMITTING,
@@ -607,7 +590,7 @@ def _committing_journal(directory: Path, project_id: str, versions: TableVersion
     path.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": JOURNAL_FORMAT_VERSION,
                 "job_id": directory.name,
                 "project_id": project_id,
                 "phase": PHASE_COMMITTING,
@@ -620,6 +603,58 @@ def _committing_journal(directory: Path, project_id: str, versions: TableVersion
         )
     )
     return path
+
+
+def test_upgrade_recovery_rolls_back_a_legacy_two_table_journal(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    database = lancedb.connect(store.directory / "projects" / project.id)
+    files = database.create_table("files", schema=LanceStore.file_arrow_schema())
+    chunks = database.create_table("chunks", schema=LanceStore.chunk_arrow_schema(4))
+    original_file = StoredFile(
+        file_id="file-1",
+        project_id=project.id,
+        path="main.py",
+        language="python",
+        size=4,
+        mtime_ns=1,
+        content_hash="old",
+        indexed_at=1,
+    )
+    original_chunk = {
+        **chunk_row(project.id, "file-1", [1.0, 2.0, 3.0, 4.0]).__dict__,
+        "vector": [1.0, 2.0, 3.0, 4.0],
+    }
+    files.add([original_file.model_dump()])
+    chunks.add([original_chunk])
+    versions = TableVersions(files=files.version, chunks=chunks.version, references=0)
+    files.delete("file_id = 'file-1'")
+    files.add([original_file.model_copy(update={"mtime_ns": 2}).model_dump()])
+    chunks.delete("file_id = 'file-1'")
+    chunks.add([{**original_chunk, "content": "new", "content_hash": "new"}])
+    directory = tmp_path / "staging" / project.id / "legacy-job"
+    directory.mkdir(parents=True)
+    (directory / JOURNAL_NAME).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "job_id": "legacy-job",
+                "project_id": project.id,
+                "phase": PHASE_COMMITTING,
+                "files_version": versions.files,
+                "chunks_version": versions.chunks,
+            }
+        )
+    )
+
+    assert recover_staged_commits(tmp_path / "staging", store) == 1
+    assert store.list_files(project.id) == [original_file]
+    assert store.list_chunks([project.id])[0].content == original_chunk["content"]
+    assert not (store.directory / "projects" / project.id / "references.lance").exists()
+    assert not directory.exists()
 
 
 def test_recovery_for_a_removed_project_does_not_recreate_its_partition(

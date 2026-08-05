@@ -5,6 +5,7 @@ from pathlib import Path
 
 import lancedb
 import pyarrow as pa
+import pytest
 
 from code_indexing_mcp.models import ProjectInfo, StoredChunk, StoredFile
 from code_indexing_mcp.projects import initialize_project
@@ -220,6 +221,42 @@ def test_reference_read_methods_apply_exact_structural_filters(tmp_path: Path) -
     assert store.declaration_shapes(project.id, "package.answer") == [declaration]
     assert store.imports_for(project.id, "package") == [imported]
     assert store.target_name_candidates(project.id, "answer") == [declaration, imported]
+
+
+@pytest.mark.parametrize("schema_version", [True, "1"])
+def test_coverage_for_file_rejects_non_integer_schema_versions(
+    tmp_path: Path, schema_version: object
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+
+    with pytest.raises(ValueError, match="schema_version"):
+        store.coverage_for_file("project-1", "file-1", schema_version)  # type: ignore[arg-type]
+
+
+def test_reference_indexes_cover_every_exact_filter(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.ensure_indexes(project.id)
+    store.ensure_indexes(project.id)
+    tables = store._existing_tables(project.id)
+    assert tables is not None and tables.references is not None
+
+    indexed_columns = {
+        column for index in tables.references.list_indices() for column in index.columns
+    }
+
+    assert {
+        "file_id",
+        "record_kind",
+        "target_name",
+        "module_path",
+        "kind",
+        "source_qualified_symbol",
+        "schema_version",
+    } <= indexed_columns
 
 
 def test_v1_store_is_backed_up_and_registered_for_lazy_rebuild(tmp_path: Path) -> None:

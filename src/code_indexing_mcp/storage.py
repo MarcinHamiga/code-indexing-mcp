@@ -276,7 +276,13 @@ class LanceStore:
             references=tables.references.version,
         )
 
-    def restore_versions(self, project_id: str, versions: TableVersions) -> bool:
+    def restore_versions(
+        self,
+        project_id: str,
+        versions: TableVersions,
+        *,
+        restore_references: bool = True,
+    ) -> bool:
         """Return every partition table to *versions*' data.
 
         ``restore`` followed by ``checkout_latest`` makes the recorded version
@@ -293,12 +299,15 @@ class LanceStore:
             return False
         tables.files.restore(versions.files)
         tables.chunks.restore(versions.chunks)
-        if tables.references is None:
-            raise RuntimeError("Reference table is missing from an interrupted transaction")
-        tables.references.restore(versions.references)
+        if restore_references:
+            if tables.references is None:
+                raise RuntimeError("Reference table is missing from an interrupted transaction")
+            tables.references.restore(versions.references)
         tables.files.checkout_latest()
         tables.chunks.checkout_latest()
-        tables.references.checkout_latest()
+        if restore_references:
+            assert tables.references is not None
+            tables.references.checkout_latest()
         return True
 
     def mark_project_state(self, project_id: str, state: str) -> bool:
@@ -386,6 +395,8 @@ class LanceStore:
     def coverage_for_file(
         self, project_id: str, file_id: str, schema_version: int
     ) -> list[ReferenceRecord]:
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise ValueError("schema_version must be a non-boolean integer")
         return self._reference_rows(
             project_id,
             "record_kind = 'coverage' "
@@ -598,7 +609,15 @@ class LanceStore:
         indexed_reference_columns = {
             column for index in reference_indices for column in index.columns
         }
-        for column in ("file_id", "record_kind", "target_name", "module_path", "kind"):
+        for column in (
+            "file_id",
+            "record_kind",
+            "target_name",
+            "module_path",
+            "kind",
+            "source_qualified_symbol",
+            "schema_version",
+        ):
             if column not in indexed_reference_columns:
                 tables.references.create_index(column, config=BTree(), replace=False)
         tables.references.optimize(cleanup_older_than=timedelta(days=1) if compact else None)
