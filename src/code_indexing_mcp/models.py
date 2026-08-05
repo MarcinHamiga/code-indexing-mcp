@@ -252,6 +252,30 @@ class ExtractionResult(FrozenModel):
     has_errors: bool = False
 
 
+class ReferenceCoverage(FrozenModel):
+    """The structural extraction generation known for one indexed file."""
+
+    file_id: str
+    path: str
+    content_hash: str
+    schema_version: int
+
+
+class ReferenceBackfillReport(FrozenModel):
+    """Outcome of a parse-only structural-index catch-up run."""
+
+    project_id: str
+    files_checked: int = 0
+    files_backfilled: int = 0
+    files_current: int = 0
+    incomplete_paths: list[str] = Field(default_factory=list)
+    stale_paths: list[str] = Field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return not self.incomplete_paths and not self.stale_paths
+
+
 class StoredFile(FrozenModel):
     file_id: str
     project_id: str

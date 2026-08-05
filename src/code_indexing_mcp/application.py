@@ -37,6 +37,7 @@ from .models import (
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
+    ReferenceBackfillReport,
     RemovalReport,
     ScanConfig,
     ScannedFile,
@@ -583,6 +584,26 @@ class Application:
         """Return the live progress of whichever process is indexing *project_id*."""
 
         return read_progress(self.paths.data / "progress", project_id)
+
+    def ensure_reference_index(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> ReferenceBackfillReport:
+        """Bring structural rows current without running during semantic searches.
+
+        Reference tools call this boundary before resolution. If a source moved
+        between freshness inspection and parse-only backfill, advance its normal
+        semantic index first and retry once so files, chunks, and references
+        remain one coherent generation.
+        """
+
+        resolved = self._resolve(project, roots)
+        if self._project_is_stale(resolved):
+            self.indexer.index(resolved, wait_for_lock=True)
+        report = self.indexer.backfill_references(resolved, wait_for_lock=True)
+        if report.stale_paths:
+            self.indexer.index(resolved, wait_for_lock=True)
+            report = self.indexer.backfill_references(resolved, wait_for_lock=True)
+        return report
 
     def project_status(
         self, project: str | None = None, *, roots: list[Path] | None = None

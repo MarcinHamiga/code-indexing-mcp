@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import time
 from collections.abc import Callable, Iterator
@@ -27,10 +28,22 @@ from .embedding import (
 from .embedding_worker import TelemetrySource
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
-from .models import ExtractedChunk, IndexIssue, IndexReport, ProjectInfo, SkippedFile, StoredFile
+from .models import (
+    ExtractedChunk,
+    ExtractedDeclarationShape,
+    ExtractedReference,
+    IndexIssue,
+    IndexReport,
+    ProjectInfo,
+    ReferenceBackfillReport,
+    ReferenceCoverage,
+    ScannedFile,
+    SkippedFile,
+    StoredFile,
+)
 from .progress import IndexProgress, ProgressPublisher
 from .scanner import SourceScanner
-from .staging import ChunkRow, StagingJob
+from .staging import ChunkRow, ReferenceRow, StagingJob
 from .storage import LanceStore
 
 logger = logging.getLogger(__name__)
@@ -44,6 +57,10 @@ SEGMENT_TEXT_GROWTH_LIMIT = 2
 # into thousands of chunks, and keeps a retry from re-embedding the whole file.
 CANDIDATE_GROUP_CHARS = 256 * 1024
 CANDIDATE_GROUP_COUNT = 256
+
+# Bump only when the normalized structural-row contract changes. Coverage rows
+# make a new generation discoverable without coupling it to project metadata.
+REFERENCE_SCHEMA_VERSION = 1
 
 # Failures caused by the environment rather than by a file's own content. They
 # abort the run instead of being recorded against whichever file was in flight.
@@ -63,6 +80,8 @@ ENVIRONMENT_ERROR_CODES = frozenset(
 class _PendingFile:
     record: StoredFile
     chunks: list[ExtractedChunk]
+    references: list[ExtractedReference]
+    declarations: list[ExtractedDeclarationShape]
     source_chars: int
     error: Exception | None = None
     embedded_chunks: int = 0
@@ -194,6 +213,167 @@ class Indexer:
             ) from exc
         duration_ms = (time.monotonic_ns() - started) // 1_000_000
         return report.model_copy(update={"duration_ms": duration_ms})
+
+    def backfill_references(
+        self,
+        project: ProjectInfo,
+        *,
+        wait_for_lock: bool = False,
+        on_progress: Callable[[IndexProgress], None] | None = None,
+    ) -> ReferenceBackfillReport:
+        """Parse missing structural generations without embedding source chunks."""
+
+        self.lock_directory.mkdir(parents=True, exist_ok=True)
+        global_lock = FileLock(self.lock_directory / "index-global.lock")
+        project_lock = FileLock(self.lock_directory / f"{project.id}.lock")
+        progress = ProgressPublisher(
+            project.id, directory=self.progress_directory, listener=on_progress
+        )
+        try:
+            with (
+                global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
+                project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
+            ):
+                try:
+                    return self._backfill_references_locked(project, progress=progress)
+                finally:
+                    progress.clear()
+        except Timeout as exc:
+            raise CodeIndexingError(
+                ErrorCode.INDEX_BUSY,
+                f"Another indexing job is already active: {project.name}",
+                project=project.id,
+            ) from exc
+
+    def _backfill_references_locked(
+        self, project: ProjectInfo, *, progress: ProgressPublisher
+    ) -> ReferenceBackfillReport:
+        existing = {record.path: record for record in self.store.list_files(project.id)}
+        coverage = {
+            row["file_id"]: ReferenceCoverage(
+                file_id=row["file_id"],
+                path=row["path"],
+                content_hash=row["content_hash"],
+                schema_version=row["schema_version"],
+            )
+            for row in self.store.reference_coverage(project.id)
+            if row["schema_version"] == REFERENCE_SCHEMA_VERSION
+        }
+        missing = {
+            record.file_id: record
+            for record in existing.values()
+            if (known := coverage.get(record.file_id)) is None
+            or known.content_hash != record.content_hash
+        }
+        if not missing:
+            return ReferenceBackfillReport(project_id=project.id, files_current=len(existing))
+
+        progress.update(
+            phase="extracting_references",
+            files_total=len(missing),
+            force=True,
+        )
+        job: StagingJob | None = None
+        files_checked = 0
+        files_backfilled = 0
+        incomplete_paths: list[str] = []
+        stale_paths: list[str] = []
+        seen_file_ids: set[str] = set()
+
+        def staging_job() -> StagingJob:
+            nonlocal job
+            if job is None:
+                job = StagingJob(
+                    self.staging_directory,
+                    project.id,
+                    file_schema=LanceStore.file_arrow_schema(),
+                    chunk_schema=LanceStore.chunk_arrow_schema(self.store.vector_dimension),
+                    reference_schema=LanceStore.reference_arrow_schema(),
+                )
+                job.begin()
+            return job
+
+        try:
+            for item in self.scanner.iter_scan(project, existing, read_contents=False):
+                if not isinstance(item, ScannedFile):
+                    continue
+                record = existing.get(item.path.as_posix())
+                if record is None or record.file_id not in missing:
+                    continue
+                seen_file_ids.add(record.file_id)
+                files_checked += 1
+                progress.update(
+                    phase="extracting_references",
+                    files_seen=files_checked,
+                    current_path=record.path,
+                )
+                try:
+                    source = item.absolute_path.read_bytes()
+                except OSError:
+                    stale_paths.append(record.path)
+                    continue
+                if _content_rejection(source) is not None or _digest(source) != record.content_hash:
+                    stale_paths.append(record.path)
+                    continue
+                try:
+                    extraction = self.extractor.extract(item.path, item.language, source)
+                except CodeIndexingError:
+                    raise
+                except Exception:
+                    # A broken parser/query must not erase a prior structural
+                    # generation. Leave this file uncovered so the next
+                    # backfill retries it after the extractor is healthy.
+                    incomplete_paths.append(record.path)
+                    continue
+                if extraction.has_errors:
+                    incomplete_paths.append(record.path)
+                    continue
+                staging_job().stage_references(
+                    self._reference_rows(
+                        project.id,
+                        record,
+                        extraction.references,
+                        extraction.declarations,
+                    )
+                )
+                staging_job().mark_references_replaced(record.file_id)
+                files_backfilled += 1
+
+            stale_paths.extend(
+                record.path for file_id, record in missing.items() if file_id not in seen_file_ids
+            )
+            if stale_paths:
+                # Do not publish a partial generation when the normal index
+                # must first make a changed/deleted source and its embeddings
+                # consistent with storage.
+                if job is not None:
+                    job.discard()
+                return ReferenceBackfillReport(
+                    project_id=project.id,
+                    files_checked=files_checked,
+                    files_current=len(existing) - len(missing),
+                    incomplete_paths=sorted(incomplete_paths),
+                    stale_paths=sorted(set(stale_paths)),
+                )
+            if job is not None:
+                self._commit_staged(project, job, errors=[])
+            progress.update(
+                phase="committing",
+                files_seen=files_checked,
+                current_path=None,
+                force=True,
+            )
+            return ReferenceBackfillReport(
+                project_id=project.id,
+                files_checked=files_checked,
+                files_backfilled=files_backfilled,
+                files_current=len(existing) - len(missing),
+                incomplete_paths=sorted(incomplete_paths),
+            )
+        except BaseException:
+            if job is not None:
+                job.discard()
+            raise
 
     def _index_locked(
         self, project: ProjectInfo, *, force: bool, progress: ProgressPublisher
@@ -367,6 +547,20 @@ class Indexer:
                         continue
                     staging_job().stage_file(target.record)
                     staging_job().mark_replaced(target.record.file_id)
+                    # Structural records become visible only alongside the
+                    # fully embedded replacement. A failed embed/windowing
+                    # pass therefore leaves the prior reference generation
+                    # untouched, just like it leaves prior chunks untouched.
+                    if not target.record.has_errors:
+                        staging_job().stage_references(
+                            self._reference_rows(
+                                project.id,
+                                target.record,
+                                target.references,
+                                target.declarations,
+                            )
+                        )
+                        staging_job().mark_references_replaced(target.record.file_id)
                     indexed += 1
                     embedded += target.embedded_chunks
             progress.update(
@@ -458,6 +652,8 @@ class Indexer:
                         _PendingFile(
                             record=record.model_copy(update={"has_errors": extraction.has_errors}),
                             chunks=extraction.chunks,
+                            references=extraction.references,
+                            declarations=extraction.declarations,
                             source_chars=source_chars,
                         )
                     )
@@ -704,6 +900,125 @@ class Indexer:
                 "search_text": f"{embedding_text}\n{chunk.search_suffix}",
             }
         )
+
+    @staticmethod
+    def _reference_rows(
+        project_id: str,
+        file: StoredFile,
+        references: list[ExtractedReference],
+        declarations: list[ExtractedDeclarationShape],
+    ) -> list[ReferenceRow]:
+        """Build one deterministic structural generation for *file*.
+
+        A coverage record is deliberately emitted even when the parser found
+        no occurrences. It is the durable proof that the current structural
+        schema parsed this exact content, rather than merely an empty query
+        result from an unindexed legacy project.
+        """
+
+        rows: list[ReferenceRow] = []
+
+        def identity(record_kind: str, start_byte: int | None, end_byte: int | None) -> str:
+            return _digest(
+                "\0".join(
+                    (
+                        file.file_id,
+                        record_kind,
+                        str(start_byte if start_byte is not None else -1),
+                        str(end_byte if end_byte is not None else -1),
+                        str(REFERENCE_SCHEMA_VERSION),
+                    )
+                )
+            )
+
+        for reference in references:
+            rows.append(
+                ReferenceRow(
+                    reference_id=identity("reference", reference.start_byte, reference.end_byte),
+                    record_kind="reference",
+                    file_id=file.file_id,
+                    project_id=project_id,
+                    path=file.path,
+                    language=file.language,
+                    kind=reference.kind,
+                    source_qualified_symbol=reference.source_qualified_symbol,
+                    written_name=reference.written_name,
+                    target_name=reference.target_name,
+                    module_path=reference.module_path,
+                    imported_name=reference.imported_name,
+                    alias=reference.alias,
+                    receiver_text=reference.receiver_text,
+                    start_byte=reference.start_byte,
+                    end_byte=reference.end_byte,
+                    start_line=reference.start_line,
+                    end_line=reference.end_line,
+                    shape_json=(
+                        reference.call_shape.model_dump_json()
+                        if reference.call_shape is not None
+                        else None
+                    ),
+                    content_hash=file.content_hash,
+                    schema_version=REFERENCE_SCHEMA_VERSION,
+                )
+            )
+        for declaration in declarations:
+            rows.append(
+                ReferenceRow(
+                    reference_id=identity(
+                        "declaration", declaration.start_byte, declaration.end_byte
+                    ),
+                    record_kind="declaration",
+                    file_id=file.file_id,
+                    project_id=project_id,
+                    path=file.path,
+                    language=file.language,
+                    kind=declaration.kind,
+                    source_qualified_symbol=declaration.qualified_symbol,
+                    written_name=declaration.symbol,
+                    target_name=declaration.symbol,
+                    module_path=None,
+                    imported_name=None,
+                    alias=None,
+                    receiver_text=None,
+                    start_byte=declaration.start_byte,
+                    end_byte=declaration.end_byte,
+                    start_line=declaration.start_line,
+                    end_line=declaration.end_line,
+                    shape_json=json.dumps(
+                        [parameter.model_dump(mode="json") for parameter in declaration.parameters],
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    content_hash=file.content_hash,
+                    schema_version=REFERENCE_SCHEMA_VERSION,
+                )
+            )
+        rows.append(
+            ReferenceRow(
+                reference_id=identity("coverage", None, None),
+                record_kind="coverage",
+                file_id=file.file_id,
+                project_id=project_id,
+                path=file.path,
+                language=file.language,
+                kind=None,
+                source_qualified_symbol=None,
+                written_name=None,
+                target_name=None,
+                module_path=None,
+                imported_name=None,
+                alias=None,
+                receiver_text=None,
+                start_byte=None,
+                end_byte=None,
+                start_line=None,
+                end_line=None,
+                shape_json=None,
+                content_hash=file.content_hash,
+                schema_version=REFERENCE_SCHEMA_VERSION,
+            )
+        )
+        return rows
 
     @staticmethod
     def _chunk_row(

@@ -105,6 +105,26 @@ def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> N
     assert (root / ".ci-mcp" / "project.toml").exists()
 
 
+def test_application_can_ensure_the_structural_index_without_a_semantic_search(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    report = app.ensure_reference_index(project.id)
+
+    assert report.complete is True
+    assert report.files_current == 1
+
+
 def test_modified_source_marks_an_index_stale(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
