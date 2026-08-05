@@ -102,6 +102,27 @@ ChunkKind = Literal[
     "view_part",
 ]
 
+ReferenceKind = Literal[
+    "import",
+    "export",
+    "call",
+    "type_use",
+    "inheritance",
+    "decorator",
+    "read",
+    "write",
+]
+
+ParameterKind = Literal[
+    "positional_only",
+    "positional",
+    "keyword_only",
+    "variadic",
+    "keyword_variadic",
+]
+
+ResolutionLevel = Literal["exact", "likely", "unresolved"]
+
 # Mirrors scanner.LANGUAGES values. Kept here rather than imported from scanner so
 # models stays free of scanner imports.
 LanguageName = Literal[
@@ -181,8 +202,53 @@ class ExtractedChunk(FrozenModel):
     search_suffix: str = ""
 
 
+class CallShape(FrozenModel):
+    positional_count: int = 0
+    keywords: list[str] = Field(default_factory=list)
+    has_positional_spread: bool = False
+    has_keyword_spread: bool = False
+    type_argument_count: int | None = None
+    constructor: bool = False
+
+
+class ParameterShape(FrozenModel):
+    name: str
+    kind: ParameterKind
+    required: bool
+    position: int
+
+
+class ExtractedReference(FrozenModel):
+    kind: ReferenceKind
+    written_name: str
+    target_name: str | None = None
+    source_qualified_symbol: str | None = None
+    module_path: str | None = None
+    imported_name: str | None = None
+    alias: str | None = None
+    receiver_text: str | None = None
+    start_byte: int
+    end_byte: int
+    start_line: int
+    end_line: int
+    call_shape: CallShape | None = None
+
+
+class ExtractedDeclarationShape(FrozenModel):
+    symbol: str
+    qualified_symbol: str
+    kind: str
+    start_byte: int
+    end_byte: int
+    start_line: int
+    end_line: int
+    parameters: list[ParameterShape] = Field(default_factory=list)
+
+
 class ExtractionResult(FrozenModel):
     chunks: list[ExtractedChunk]
+    references: list[ExtractedReference] = Field(default_factory=list)
+    declarations: list[ExtractedDeclarationShape] = Field(default_factory=list)
     has_errors: bool = False
 
 
