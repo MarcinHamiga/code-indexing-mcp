@@ -392,6 +392,13 @@ class LanceStore:
     def reference_coverage(self, project_id: str) -> list[ReferenceRecord]:
         return self._reference_rows(project_id, "record_kind = 'coverage'")
 
+    def reference_version(self, project_id: str) -> int:
+        """Return the current structural snapshot without creating a partition."""
+        tables = self._existing_tables(project_id)
+        if tables is None or tables.references is None:
+            return 0
+        return int(tables.references.version)
+
     def coverage_for_file(
         self, project_id: str, file_id: str, schema_version: int
     ) -> list[ReferenceRecord]:
@@ -843,9 +850,7 @@ class LanceStore:
             query = query.where(condition)
         return cast(list[dict[str, Any]], query.to_list())
 
-    def _reference_rows(
-        self, project_id: str, condition: str | None
-    ) -> list[ReferenceRecord]:
+    def _reference_rows(self, project_id: str, condition: str | None) -> list[ReferenceRecord]:
         tables = self._existing_tables(project_id)
         if tables is None or tables.references is None:
             return []

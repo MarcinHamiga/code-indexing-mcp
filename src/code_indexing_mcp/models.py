@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, GetJsonSchemaHandler
+from pydantic import BaseModel, ConfigDict, Field, GetJsonSchemaHandler, model_validator
 from pydantic.json_schema import JsonSchemaValue
 
 
@@ -274,6 +274,78 @@ class ReferenceBackfillReport(FrozenModel):
     @property
     def complete(self) -> bool:
         return not self.incomplete_paths and not self.stale_paths
+
+
+class DeclarationSelector(FrozenModel):
+    """One declaration identity, by chunk id or its stable source location."""
+
+    chunk_id: str | None = None
+    project: str | None = None
+    path: str | None = None
+    qualified_symbol: str | None = None
+
+    @model_validator(mode="after")
+    def _one_selector_mode(self) -> "DeclarationSelector":
+        by_chunk = self.chunk_id is not None
+        by_location = all(
+            value is not None for value in (self.project, self.path, self.qualified_symbol)
+        )
+        any_location = any(
+            value is not None for value in (self.project, self.path, self.qualified_symbol)
+        )
+        if by_chunk and any_location:
+            raise ValueError("chunk_id cannot be combined with project, path, or qualified_symbol")
+        if by_chunk:
+            return self
+        if not by_location:
+            raise ValueError(
+                "Provide exactly chunk_id or project, path, and qualified_symbol together"
+            )
+        return self
+
+
+class SelectedDeclaration(FrozenModel):
+    project_id: str
+    file_id: str
+    path: str
+    language: str
+    symbol: str
+    qualified_symbol: str
+    kind: str
+    start_line: int
+    end_line: int
+    chunk_id: str | None = None
+
+
+class ReferenceHit(FrozenModel):
+    reference_id: str
+    project_id: str
+    path: str
+    language: str
+    kind: ReferenceKind
+    start_line: int
+    end_line: int
+    start_byte: int
+    end_byte: int
+    snippet: str = ""
+    resolution: ResolutionLevel
+    reason_code: str
+    explanation: str
+    edit_required: bool | None = None
+
+
+class ReferenceLimitation(FrozenModel):
+    code: str
+    explanation: str
+    path: str | None = None
+
+
+class ReferenceResponse(FrozenModel):
+    selected: SelectedDeclaration
+    hits: list[ReferenceHit] = Field(default_factory=list)
+    limitations: list[ReferenceLimitation] = Field(default_factory=list)
+    cursor: str | None = None
+    snapshot_version: int = 0
 
 
 class StoredFile(FrozenModel):
