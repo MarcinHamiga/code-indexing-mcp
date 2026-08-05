@@ -354,3 +354,48 @@ def test_python_extracts_aliased_relative_and_wildcard_imports() -> None:
         "...pkg",
         None,
     )
+
+
+@pytest.mark.parametrize(
+    ("language", "source"),
+    [
+        (
+            "javascript",
+            "export var legacy = 3;\n"
+            "export const { first, renamed: local, nested: [second = 2, ...rest] } = obj;\n"
+            "export /* comment */ default function Commented() {}\n",
+        ),
+        (
+            "typescript",
+            "export var legacy = 3;\n"
+            "export const { first, renamed: local, nested: [second = 2, ...rest] } = obj;\n"
+            "export /* comment */ default function Commented() {}\n",
+        ),
+        (
+            "tsx",
+            "export var legacy = 3;\n"
+            "export const { first, renamed: local, nested: [second = 2, ...rest] } = obj;\n"
+            "export /* comment */ default function Commented() { return <div />; }\n",
+        ),
+    ],
+)
+def test_js_family_exports_binding_identifiers_and_commented_defaults(
+    language: str, source: str
+) -> None:
+    references = _references(source, language)
+    exports = [reference for reference in references if reference.kind == "export"]
+    by_name = {reference.written_name: reference for reference in exports}
+
+    assert len(exports) == 6
+    names = ("legacy", "first", "local", "second", "rest")
+    assert {name: by_name[name].target_name for name in names} == {
+        "legacy": "legacy",
+        "first": "first",
+        "local": "local",
+        "second": "second",
+        "rest": "rest",
+    }
+    assert (by_name["default"].target_name, by_name["default"].written_name) == (
+        "Commented",
+        "default",
+    )

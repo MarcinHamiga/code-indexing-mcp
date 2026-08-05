@@ -461,6 +461,27 @@ class TreeSitterExtractor:
             constructor=node.type == "new_expression",
         )
 
+    @staticmethod
+    def _binding_identifiers(node: Node) -> Iterator[Node]:
+        """Yield local binding identifiers without mistaking object property keys for bindings."""
+        if node.type in {"identifier", "shorthand_property_identifier_pattern"}:
+            yield node
+        elif node.type == "pair_pattern":
+            value = node.child_by_field_name("value")
+            if value is not None:
+                yield from TreeSitterExtractor._binding_identifiers(value)
+        elif node.type == "assignment_pattern":
+            left = node.child_by_field_name("left")
+            if left is not None:
+                yield from TreeSitterExtractor._binding_identifiers(left)
+        elif node.type == "rest_pattern":
+            child = node.named_child(0)
+            if child is not None:
+                yield from TreeSitterExtractor._binding_identifiers(child)
+        elif node.type in {"array_pattern", "object_pattern"}:
+            for child in node.named_children:
+                yield from TreeSitterExtractor._binding_identifiers(child)
+
     def _python_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
         if node.type == "import_from_statement":
             module = node.child_by_field_name("module_name")
@@ -634,27 +655,26 @@ class TreeSitterExtractor:
                         )
             declaration = node.child_by_field_name("declaration")
             if declaration is not None:
-                if declaration.type == "lexical_declaration":
+                if declaration.type in {"lexical_declaration", "variable_declaration"}:
                     for declarator in declaration.named_children:
                         if declarator.type != "variable_declarator":
                             continue
                         name = declarator.child_by_field_name("name")
                         if name is None:
                             continue
-                        exported = _capture_name(source, name)
-                        add_reference(
-                            "export",
-                            name,
-                            target_name=exported,
-                            written_name=exported,
-                        )
+                        for binding in self._binding_identifiers(name):
+                            exported = _capture_name(source, binding)
+                            add_reference(
+                                "export",
+                                binding,
+                                target_name=exported,
+                                written_name=exported,
+                            )
                 else:
                     name = declaration.child_by_field_name("name")
                     if name is not None:
                         exported = _capture_name(source, name)
-                        is_default = source[node.start_byte : node.end_byte].lstrip().startswith(
-                            b"export default"
-                        )
+                        is_default = any(child.type == "default" for child in node.children)
                         add_reference(
                             "export",
                             name,
