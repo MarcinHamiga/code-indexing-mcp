@@ -222,3 +222,74 @@ def test_variable_assigned_callables_include_default_and_rest_parameters(
             ("first" if qualified == "run" else "value", "positional", False),
             ("rest" if qualified == "run" else "more", "variadic", False),
         ]
+
+
+@pytest.mark.parametrize(
+    ("language", "source", "expected"),
+    [
+        (
+            "javascript",
+            "export { foo };\nexport default foo;\nexport function Screen() {}\n",
+            {"foo": ("foo", None), "default": ("foo", None), "Screen": ("Screen", None)},
+        ),
+        (
+            "typescript",
+            "export { foo };\nexport default foo;\nexport function Screen() {}\n",
+            {"foo": ("foo", None), "default": ("foo", None), "Screen": ("Screen", None)},
+        ),
+        (
+            "tsx",
+            "export { foo };\nexport default foo;\nexport function Screen() { return <div />; }\n",
+            {"foo": ("foo", None), "default": ("foo", None), "Screen": ("Screen", None)},
+        ),
+    ],
+)
+def test_js_family_extracts_local_default_and_declaration_exports(
+    language: str, source: str, expected: dict[str, tuple[str, str | None]]
+) -> None:
+    references = _references(source, language)
+    exports = {
+        reference.written_name: reference for reference in references if reference.kind == "export"
+    }
+
+    assert set(exports) == set(expected)
+    for written_name, (target_name, module_path) in expected.items():
+        assert (exports[written_name].target_name, exports[written_name].module_path) == (
+            target_name,
+            module_path,
+        )
+
+
+@pytest.mark.parametrize("language", ["typescript", "tsx"])
+def test_typescript_optional_parameters_are_not_required(language: str) -> None:
+    source = "function f(value?: string) { return value; }\n"
+    result = TreeSitterExtractor().extract(Path(f"sample.{language}"), language, source.encode())
+    declaration = next(item for item in result.declarations if item.qualified_symbol == "f")
+
+    assert [(item.name, item.kind, item.required) for item in declaration.parameters] == [
+        ("value", "positional", False)
+    ]
+
+
+def test_python_extracts_relative_and_wildcard_imports() -> None:
+    source = "from . import x\nfrom ..pkg import y\nfrom pkg import *\n"
+    references = _references(source)
+    imports = {
+        reference.written_name: reference for reference in references if reference.kind == "import"
+    }
+
+    assert (imports["x"].target_name, imports["x"].module_path, imports["x"].alias) == (
+        "x",
+        ".",
+        None,
+    )
+    assert (imports["y"].target_name, imports["y"].module_path, imports["y"].alias) == (
+        "y",
+        "..pkg",
+        None,
+    )
+    assert (imports["*"].target_name, imports["*"].module_path, imports["*"].alias) == (
+        "*",
+        "pkg",
+        None,
+    )

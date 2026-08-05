@@ -5,6 +5,7 @@
       (import_specifier name: (identifier) @name alias: (identifier) @alias)))
   source: (string) @module) @reference.import
 (export_statement source: (string) @module) @reference.export
+(export_statement) @reference.export
 (class_heritage (_) @name) @reference.inheritance
 (call_expression function: (_) @name arguments: (arguments) @arguments) @reference.call
 (call_expression

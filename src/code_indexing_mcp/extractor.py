@@ -422,7 +422,7 @@ class TreeSitterExtractor:
             else:
                 kind = "positional"
             default = child.child_by_field_name("value") is not None or "=" in child_text
-            required = not default
+            required = not default and child.type != "optional_parameter"
             if language != "python" and kind == "variadic":
                 required = False
             rows.append(ParameterShape(name=name, kind=kind, required=required, position=len(rows)))
@@ -632,6 +632,25 @@ class TreeSitterExtractor:
                             else exported,
                             alias=_capture_name(source, alias) if alias is not None else None,
                         )
+            declaration = node.child_by_field_name("declaration")
+            if declaration is not None:
+                name = declaration.child_by_field_name("name")
+                if name is not None:
+                    exported = _capture_name(source, name)
+                    add_reference(
+                        "export",
+                        name,
+                        target_name=exported,
+                        written_name=exported,
+                    )
+            value = node.child_by_field_name("value")
+            if value is not None:
+                add_reference(
+                    "export",
+                    value,
+                    target_name=_capture_name(source, value),
+                    written_name="default",
+                )
         elif node.type in {"class_heritage", "extends_type_clause"}:
             for item in node.named_children:
                 add_reference(

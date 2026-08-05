@@ -8,6 +8,14 @@
   module_name: (dotted_name) @module
   name: (dotted_name) @name) @reference.import
 
+(import_from_statement
+  module_name: (relative_import) @module
+  name: (dotted_name) @name) @reference.import
+
+(import_from_statement
+  module_name: (dotted_name) @module
+  (wildcard_import) @name) @reference.import
+
 (import_statement
   name: (aliased_import
     name: (dotted_name) @name
