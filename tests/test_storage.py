@@ -4,10 +4,49 @@ import time
 from pathlib import Path
 
 import lancedb
+import pyarrow as pa
 
 from code_indexing_mcp.models import ProjectInfo, StoredChunk, StoredFile
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.storage import LanceStore
+
+
+def reference_record(
+    project_id: str,
+    file_id: str,
+    *,
+    reference_id: str = "reference-1",
+    target_name: str = "answer",
+    **updates: object,
+) -> dict[str, object]:
+    row = {
+        "reference_id": reference_id,
+        "record_kind": "reference",
+        "file_id": file_id,
+        "project_id": project_id,
+        "path": "module.py",
+        "language": "python",
+        "kind": "call",
+        "source_qualified_symbol": "caller",
+        "written_name": target_name,
+        "target_name": target_name,
+        "module_path": None,
+        "imported_name": None,
+        "alias": None,
+        "receiver_text": None,
+        "start_byte": 0,
+        "end_byte": len(target_name or ""),
+        "start_line": 1,
+        "end_line": 1,
+        "shape_json": '{"positional_count": 0}',
+        "content_hash": "hash",
+        "schema_version": 1,
+    }
+    return {**row, **updates}
+
+
+def reference_table(*rows: dict[str, object]) -> pa.Table:
+    return pa.Table.from_pylist(list(rows), schema=LanceStore.reference_arrow_schema())
 
 
 def stored_file(project_id: str, *, file_id: str = "file-1") -> StoredFile:
@@ -35,6 +74,7 @@ def test_storage_uses_one_partition_per_project(tmp_path: Path) -> None:
     assert (store.directory / "registry" / "projects.lance").exists()
     assert (store.directory / "projects" / project.id / "files.lance").exists()
     assert (store.directory / "projects" / project.id / "chunks.lance").exists()
+    assert (store.directory / "projects" / project.id / "references.lance").exists()
 
 
 def test_reads_never_materialize_a_partition(tmp_path: Path) -> None:
@@ -51,8 +91,125 @@ def test_reads_never_materialize_a_partition(tmp_path: Path) -> None:
     assert store.count_chunks([project.id]) == 0
     assert store.outline_chunks("module.py", project.id) == []
     assert store.find_symbol_chunks("answer", project.id, match="exact", kinds=None, limit=5) == []
+    assert store.list_reference_records(project.id) == []
+    assert store.reference_coverage(project.id) == []
+    assert store.declaration_shapes(project.id, "answer") == []
+    assert store.imports_for(project.id, "module") == []
+    assert store.target_name_candidates(project.id, "answer") == []
 
     assert not (store.directory / "projects").exists()
+
+
+def test_reference_rows_are_replaced_independently_from_chunk_rows(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    record = stored_file(project.id)
+    store.upsert_project(project, model_id="test/model")
+
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_groups=(),
+        reference_groups=[("file-1", reference_table(reference_record(project.id, "file-1")))],
+        replace_reference_file_ids=["file-1"],
+    )
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_groups=(),
+        reference_groups=[
+            (
+                "file-1",
+                reference_table(
+                    reference_record(
+                        project.id,
+                        "file-1",
+                        reference_id="reference-2",
+                        target_name="renamed",
+                    )
+                ),
+            )
+        ],
+        replace_reference_file_ids=["file-1"],
+    )
+
+    records = store.list_reference_records(project.id)
+    assert [row["reference_id"] for row in records] == ["reference-2"]
+    assert store.target_name_candidates(project.id, "renamed") == records
+
+
+def test_removing_a_file_deletes_its_reference_rows(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    record = stored_file(project.id)
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_groups=(),
+        reference_groups=[("file-1", reference_table(reference_record(project.id, "file-1")))],
+        replace_reference_file_ids=["file-1"],
+    )
+
+    store.remove_file(project.id, "file-1")
+
+    assert store.list_files(project.id) == []
+    assert store.count_chunks([project.id]) == 0
+    assert store.list_reference_records(project.id) == []
+
+
+def test_reference_read_methods_apply_exact_structural_filters(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    record = stored_file(project.id)
+    coverage = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="coverage",
+        record_kind="coverage",
+        kind=None,
+        source_qualified_symbol=None,
+        written_name=None,
+        target_name=None,
+        shape_json=None,
+    )
+    declaration = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="declaration",
+        record_kind="declaration",
+        kind="function",
+        source_qualified_symbol="package.answer",
+        target_name="answer",
+        shape_json="[]",
+    )
+    imported = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="import",
+        kind="import",
+        module_path="package",
+        target_name="answer",
+    )
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_groups=(),
+        reference_groups=[("file-1", reference_table(coverage, declaration, imported))],
+        replace_reference_file_ids=["file-1"],
+    )
+
+    assert store.coverage_for_file(project.id, "file-1", 1) == [coverage]
+    assert store.declaration_shapes(project.id, "package.answer") == [declaration]
+    assert store.imports_for(project.id, "package") == [imported]
+    assert store.target_name_candidates(project.id, "answer") == [declaration, imported]
 
 
 def test_v1_store_is_backed_up_and_registered_for_lazy_rebuild(tmp_path: Path) -> None:

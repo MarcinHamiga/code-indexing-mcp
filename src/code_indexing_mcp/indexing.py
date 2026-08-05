@@ -285,6 +285,7 @@ class Indexer:
                     project.id,
                     file_schema=LanceStore.file_arrow_schema(),
                     chunk_schema=LanceStore.chunk_arrow_schema(self.store.vector_dimension),
+                    reference_schema=LanceStore.reference_arrow_schema(),
                 )
                 job.begin()
             return job
@@ -568,9 +569,11 @@ class Indexer:
                 project.id,
                 files=job.files_table(),
                 chunk_groups=job.iter_chunk_groups(),
+                reference_groups=job.iter_reference_groups(),
+                replace_reference_file_ids=job.replace_reference_file_ids,
                 removed_file_ids=job.removed_file_ids,
             )
-            if job.replace_file_ids or job.removed_file_ids:
+            if job.replace_file_ids or job.replace_reference_file_ids or job.removed_file_ids:
                 self.store.ensure_indexes(project.id, compact=bool(job.removed_file_ids))
             self.store.upsert_project(
                 project,
