@@ -13,3 +13,9 @@
 (new_expression constructor: (_) @name arguments: (arguments) @arguments) @reference.call
 (function_declaration name: (identifier) @name parameters: (formal_parameters) @declaration.parameters)
 (method_definition name: (_) @name parameters: (formal_parameters) @declaration.parameters)
+(variable_declarator
+  name: (identifier) @name
+  value: (arrow_function parameters: (formal_parameters) @declaration.parameters))
+(variable_declarator
+  name: (identifier) @name
+  value: (function_expression parameters: (formal_parameters) @declaration.parameters))

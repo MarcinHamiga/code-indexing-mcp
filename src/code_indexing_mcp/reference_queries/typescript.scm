@@ -16,3 +16,9 @@
 (type_annotation (_) @name) @reference.type_use
 (function_declaration name: (identifier) @name parameters: (formal_parameters) @declaration.parameters)
 (method_definition name: (_) @name parameters: (formal_parameters) @declaration.parameters)
+(variable_declarator
+  name: (identifier) @name
+  value: (arrow_function parameters: (formal_parameters) @declaration.parameters))
+(variable_declarator
+  name: (identifier) @name
+  value: (function_expression parameters: (formal_parameters) @declaration.parameters))

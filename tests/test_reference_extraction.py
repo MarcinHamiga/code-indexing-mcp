@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from code_indexing_mcp.extractor import TreeSitterExtractor
 
 
@@ -184,3 +186,39 @@ def test_javascript_typescript_and_tsx_extract_structural_syntax() -> None:
         for reference in tsx_result.references
     )
     assert any(item.qualified_symbol == "Screen" for item in tsx_result.declarations)
+
+
+@pytest.mark.parametrize(
+    ("language", "source"),
+    [
+        (
+            "javascript",
+            "const run = (first = 1, ...rest) => rest;\n"
+            "const outer = function (value = 1, ...more) { return more; };\n",
+        ),
+        (
+            "typescript",
+            "const run = (first: number = 1, ...rest: number[]) => rest;\n"
+            "const outer = function (value: number = 1, ...more: number[]) { return more; };\n",
+        ),
+        (
+            "tsx",
+            "const run = (first: number = 1, ...rest: number[]) => <>{rest}</>;\n"
+            "const outer = function (value: number = 1, ...more: number[]) "
+            "{ return <>{more}</>; };\n",
+        ),
+    ],
+)
+def test_variable_assigned_callables_include_default_and_rest_parameters(
+    language: str, source: str
+) -> None:
+    result = TreeSitterExtractor().extract(Path(f"sample.{language}"), language, source.encode())
+    declarations = {item.qualified_symbol: item for item in result.declarations}
+
+    for qualified in ("run", "outer"):
+        declaration = declarations[qualified]
+        assert declaration.symbol == qualified
+        assert [(item.name, item.kind, item.required) for item in declaration.parameters] == [
+            ("first" if qualified == "run" else "value", "positional", False),
+            ("rest" if qualified == "run" else "more", "variadic", False),
+        ]

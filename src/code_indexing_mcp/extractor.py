@@ -269,8 +269,11 @@ class TreeSitterExtractor:
         parameter_nodes: dict[int, Node] = {}
         for _, captures in matches:
             for parameter_node in captures.get("declaration.parameters", []):
-                if parameter_node.parent is not None:
-                    parameter_nodes[parameter_node.parent.id] = parameter_node
+                owner = parameter_node.parent
+                while owner is not None and owner.id not in index.by_node_id:
+                    owner = owner.parent
+                if owner is not None:
+                    parameter_nodes[owner.id] = parameter_node
         declarations = self._declaration_shapes(language, index, line_index, parameter_nodes)
         declaration_by_node = {
             definition.node.id: declaration
