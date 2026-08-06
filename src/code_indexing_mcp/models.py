@@ -348,6 +348,41 @@ class ReferenceResponse(FrozenModel):
     snapshot_version: int = 0
 
 
+class RenameOperation(FrozenModel):
+    kind: Literal["rename"] = "rename"
+    new_name: str
+
+
+class SignatureChangeOperation(FrozenModel):
+    kind: Literal["signature_change"] = "signature_change"
+    parameters: list[ParameterShape]
+
+
+RefactorOperation = Annotated[
+    RenameOperation | SignatureChangeOperation, Field(discriminator="kind")
+]
+
+
+class RefactorFinding(ReferenceHit):
+    written_name: str | None = None
+    edit_required: bool = False
+
+
+class CompletenessReport(FrozenModel):
+    state: Literal["complete", "complete_with_dynamic_limitations", "incomplete"] = "complete"
+    explanation: str = "All indexed structural candidates were considered."
+
+
+class RefactorAnalysis(FrozenModel):
+    selected: SelectedDeclaration
+    operation: RefactorOperation
+    must_change: list[RefactorFinding] = Field(default_factory=list)
+    likely_change: list[RefactorFinding] = Field(default_factory=list)
+    review: list[RefactorFinding] = Field(default_factory=list)
+    limitations: list[ReferenceLimitation] = Field(default_factory=list)
+    completeness: CompletenessReport = Field(default_factory=CompletenessReport)
+
+
 class StoredFile(FrozenModel):
     file_id: str
     project_id: str

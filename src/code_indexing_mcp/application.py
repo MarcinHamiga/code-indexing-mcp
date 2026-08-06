@@ -38,6 +38,8 @@ from .models import (
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
+    RefactorAnalysis,
+    RefactorOperation,
     ReferenceBackfillReport,
     ReferenceResponse,
     RemovalReport,
@@ -722,6 +724,22 @@ class Application:
             project_id = self.search.get_chunk(selector.chunk_id or "").project_id
         self.ensure_reference_index(project_id, roots=roots)
         return self.references.find_references(selector, kinds=kinds, limit=limit, cursor=cursor)
+
+    def analyze_refactor(
+        self,
+        selector: DeclarationSelector,
+        operation: RefactorOperation,
+        *,
+        roots: list[Path] | None = None,
+    ) -> RefactorAnalysis:
+        if selector.project is not None:
+            resolved = self._resolve(selector.project, roots)
+            selector = selector.model_copy(update={"project": resolved.id})
+            project_id = resolved.id
+        else:
+            project_id = self.search.get_chunk(selector.chunk_id or "").project_id
+        self.ensure_reference_index(project_id, roots=roots)
+        return self.references.analyze_refactor(selector, operation)
 
     def prepare_model(self) -> None:
         if not isinstance(self.embedder, FastEmbedder):

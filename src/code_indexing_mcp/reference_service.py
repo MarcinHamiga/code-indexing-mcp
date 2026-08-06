@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from pathlib import PurePosixPath
 from typing import Literal, cast
 
 from .errors import CodeIndexingError, ErrorCode
 from .models import (
+    CompletenessReport,
     DeclarationSelector,
+    RefactorAnalysis,
+    RefactorFinding,
+    RefactorOperation,
     ReferenceHit,
     ReferenceLimitation,
     ReferenceResponse,
+    RenameOperation,
     SelectedDeclaration,
+    SignatureChangeOperation,
 )
 from .storage import LanceStore, ReferenceRecord
 
@@ -122,6 +129,110 @@ class ReferenceService:
             ),
             cursor=next_cursor,
             snapshot_version=version,
+        )
+
+    def analyze_refactor(
+        self, selector: DeclarationSelector, operation: RefactorOperation
+    ) -> RefactorAnalysis:
+        response = self.find_references(selector, limit=500)
+        if isinstance(operation, RenameOperation) and not re.fullmatch(
+            r"[A-Za-z_$][A-Za-z0-9_$]*", operation.new_name
+        ):
+            raise CodeIndexingError(ErrorCode.INVALID_REFACTOR, "Invalid identifier for rename")
+        must_change: list[RefactorFinding] = []
+        likely_change: list[RefactorFinding] = []
+        review: list[RefactorFinding] = []
+        if isinstance(operation, RenameOperation):
+            must_change.append(
+                RefactorFinding(
+                    reference_id=f"declaration:{response.selected.file_id}",
+                    project_id=response.selected.project_id,
+                    path=response.selected.path,
+                    language=response.selected.language,
+                    kind="write",
+                    start_line=response.selected.start_line,
+                    end_line=response.selected.end_line,
+                    start_byte=0,
+                    end_byte=0,
+                    snippet=response.selected.symbol,
+                    resolution="exact",
+                    reason_code="declaration",
+                    explanation="The selected declaration must be renamed.",
+                    written_name=response.selected.symbol,
+                    edit_required=True,
+                )
+            )
+        for hit in response.hits:
+            finding = RefactorFinding(
+                **hit.model_dump(), written_name=hit.snippet, edit_required=False
+            )
+            if hit.resolution == "unresolved":
+                review.append(finding)
+                continue
+            if hit.resolution == "likely":
+                likely_change.append(finding.model_copy(update={"edit_required": True}))
+                continue
+            if isinstance(operation, RenameOperation):
+                needs_edit = hit.snippet == response.selected.symbol or hit.kind in {
+                    "import",
+                    "export",
+                }
+                if needs_edit:
+                    must_change.append(finding.model_copy(update={"edit_required": True}))
+                continue
+            if self._signature_requires_change(
+                response.selected.project_id, hit.reference_id, operation
+            ):
+                must_change.append(
+                    finding.model_copy(
+                        update={"edit_required": True, "reason_code": "missing_required_parameter"}
+                    )
+                )
+        limitations = response.limitations
+        state = "complete_with_dynamic_limitations" if limitations or review else "complete"
+        return RefactorAnalysis(
+            selected=response.selected,
+            operation=operation,
+            must_change=must_change,
+            likely_change=likely_change,
+            review=review,
+            limitations=limitations,
+            completeness=CompletenessReport(
+                state=cast(
+                    Literal["complete", "complete_with_dynamic_limitations", "incomplete"], state
+                )
+            ),
+        )
+
+    def _signature_requires_change(
+        self, project_id: str, reference_id: str, operation: SignatureChangeOperation
+    ) -> bool:
+        row = next(
+            (
+                record
+                for record in self.store.list_reference_records(project_id)
+                if record["reference_id"] == reference_id
+            ),
+            None,
+        )
+        if row is None or row["shape_json"] is None:
+            return False
+        shape = json.loads(row["shape_json"])
+        if shape.get("has_positional_spread") or shape.get("has_keyword_spread"):
+            return False
+        positional = [
+            parameter
+            for parameter in operation.parameters
+            if parameter.required and parameter.kind in {"positional", "positional_only"}
+        ]
+        if int(shape.get("positional_count", 0)) < len(positional):
+            return True
+        keywords = set(shape.get("keywords", []))
+        return any(
+            parameter.required
+            and parameter.kind == "keyword_only"
+            and parameter.name not in keywords
+            for parameter in operation.parameters
         )
 
     def _select(self, selector: DeclarationSelector) -> SelectedDeclaration:
