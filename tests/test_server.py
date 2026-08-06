@@ -129,13 +129,14 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "list_projects",
         "remove_project",
         "search_code",
-            "search_across_projects",
-            "find_symbol",
-            "find_references",
-            "file_outline",
+        "search_across_projects",
+        "find_symbol",
+        "find_references",
+        "analyze_refactor",
+        "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 11
+    assert len(tools) == 12
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -1338,6 +1339,8 @@ def test_server_instructions_guide_index_first_usage(tmp_path: Path) -> None:
         "search_code",
         "search_across_projects",
         "find_symbol",
+        "find_references",
+        "analyze_refactor",
         "file_outline",
         "get_chunk",
         "project_status",

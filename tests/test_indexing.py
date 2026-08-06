@@ -124,8 +124,7 @@ def test_successful_index_stages_references_declarations_and_coverage(tmp_path: 
         for row in rows
     )
     assert any(
-        row["record_kind"] == "declaration"
-        and row["source_qualified_symbol"] == "caller"
+        row["record_kind"] == "declaration" and row["source_qualified_symbol"] == "caller"
         for row in rows
     )
     assert [row["schema_version"] for row in rows if row["record_kind"] == "coverage"] == [

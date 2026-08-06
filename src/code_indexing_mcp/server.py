@@ -35,6 +35,8 @@ from .models import (
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
+    RefactorAnalysis,
+    RefactorOperation,
     ReferenceResponse,
     RemovalReport,
     SearchResponse,
@@ -47,8 +49,10 @@ logger = logging.getLogger(__name__)
 SERVER_INSTRUCTIONS = (
     "Local Tree-sitter code indexing and hybrid search. "
     "When exploring code, prefer these index tools over grep-style file reading: "
-    "search_code (semantic natural-language queries), find_symbol (definitions and call "
-    "sites), file_outline (file structure before reading), get_chunk (exact code for a "
+    "search_code (semantic natural-language queries), find_symbol (definitions), "
+    "find_references (structural uses of a selected declaration), analyze_refactor "
+    "(rename or signature impact), file_outline (file structure before reading), "
+    "get_chunk (exact code for a "
     "search hit). When correlating code across explicitly related services, use list_projects "
     "to discover them and search_across_projects to search the selected repositories together. "
     "Check list_projects/project_status for index freshness first and run index_project if the "
@@ -1035,6 +1039,27 @@ def create_server(
             cursor=cursor,
             roots=roots,
         )
+
+    @mcp.tool(
+        title="Analyze refactor impact",
+        description=(
+            "Analyze a proposed rename or signature change without editing source files. "
+            "Returns deterministic required edits, likely changes, dynamic-review findings, "
+            "and evidence for resolved aliases that need no spelling change."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def analyze_refactor(
+        ctx: ServerContext,
+        selector: DeclarationSelector,
+        operation: Annotated[
+            RefactorOperation,
+            Field(description="Discriminated rename or signature-change operation."),
+        ],
+    ) -> RefactorAnalysis:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(app.analyze_refactor, selector, operation, roots=roots)
 
     @mcp.tool(
         title="File outline",

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from filelock import FileLock, Timeout
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from .application import Application, RuntimePaths
 from .errors import CodeIndexingError, ErrorCode
@@ -32,6 +32,8 @@ from .models import (
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
+    RefactorAnalysis,
+    RefactorOperation,
     ReferenceResponse,
     RemovalReport,
     SearchResponse,
@@ -42,6 +44,7 @@ from .settings import IndexSettings
 
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 16 * 1024**2
+_REFACTOR_OPERATION: TypeAdapter[RefactorOperation] = TypeAdapter(RefactorOperation)
 
 # Looked up dynamically because Windows' socket stubs have no AF_UNIX at all,
 # so a direct reference fails type checking there even though it never runs.
@@ -328,6 +331,10 @@ class DaemonServer:
         if method == "find_references":
             selector = DeclarationSelector.model_validate(params.pop("selector"))
             return app.find_references(selector, roots=roots, **params)
+        if method == "analyze_refactor":
+            selector = DeclarationSelector.model_validate(params.pop("selector"))
+            operation = _REFACTOR_OPERATION.validate_python(params.pop("operation"))
+            return app.analyze_refactor(selector, operation, roots=roots)
         if method == "model_status":
             # Answered by the daemon rather than the caller, because the daemon
             # is the process that will actually run indexing.
@@ -517,6 +524,13 @@ class BrokerApplication:
     def find_references(self, selector: DeclarationSelector, **params: Any) -> ReferenceResponse:
         return ReferenceResponse.model_validate(
             self._call("find_references", selector=selector, **params)
+        )
+
+    def analyze_refactor(
+        self, selector: DeclarationSelector, operation: RefactorOperation, **params: Any
+    ) -> RefactorAnalysis:
+        return RefactorAnalysis.model_validate(
+            self._call("analyze_refactor", selector=selector, operation=operation, **params)
         )
 
     def model_status(self) -> ModelStatus:

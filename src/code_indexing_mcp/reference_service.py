@@ -6,13 +6,14 @@ import base64
 import json
 import re
 from pathlib import PurePosixPath
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from .errors import CodeIndexingError, ErrorCode
 from .models import (
     CompletenessReport,
     DeclarationSelector,
     RefactorAnalysis,
+    RefactorCounts,
     RefactorFinding,
     RefactorOperation,
     ReferenceHit,
@@ -46,8 +47,9 @@ class ReferenceService:
         offset = 0
         if cursor is not None:
             payload = self._decode_cursor(cursor)
-            if payload["version"] != version:
-                raise CodeIndexingError(ErrorCode.STALE_CURSOR, "Reference cursor snapshot expired")
+            cursor_version = payload["version"]
+            if isinstance(cursor_version, bool) or not isinstance(cursor_version, int):
+                raise ValueError("invalid reference cursor")
             if payload["project_id"] != selected.project_id or payload["path"] != selected.path:
                 raise ValueError("cursor does not match the selected declaration")
             if payload["qualified_symbol"] != selected.qualified_symbol:
@@ -58,8 +60,14 @@ class ReferenceService:
             if isinstance(offset_value, bool) or not isinstance(offset_value, int):
                 raise ValueError("invalid reference cursor")
             offset = offset_value
+            version = cursor_version
 
-        records = self.store.list_reference_records(selected.project_id)
+        try:
+            records = self.store.list_reference_records(selected.project_id, version=version)
+        except (FileNotFoundError, ValueError) as error:
+            raise CodeIndexingError(
+                ErrorCode.STALE_CURSOR, "Reference cursor snapshot expired"
+            ) from error
         declarations = [row for row in records if row["record_kind"] == "declaration"]
         imports = self._imports_by_file(records)
         hits: list[ReferenceHit] = []
@@ -142,6 +150,7 @@ class ReferenceService:
         must_change: list[RefactorFinding] = []
         likely_change: list[RefactorFinding] = []
         review: list[RefactorFinding] = []
+        evidence: list[RefactorFinding] = []
         if isinstance(operation, RenameOperation):
             must_change.append(
                 RefactorFinding(
@@ -179,15 +188,28 @@ class ReferenceService:
                 }
                 if needs_edit:
                     must_change.append(finding.model_copy(update={"edit_required": True}))
+                else:
+                    evidence.append(finding)
                 continue
-            if self._signature_requires_change(
-                response.selected.project_id, hit.reference_id, operation
-            ):
-                must_change.append(
+            issue = self._signature_issue(response.selected, hit.reference_id, operation)
+            if issue in {"spread_uncertainty", "overload_ambiguity"}:
+                review.append(
                     finding.model_copy(
-                        update={"edit_required": True, "reason_code": "missing_required_parameter"}
+                        update={"reason_code": issue, "explanation": self._issue_explanation(issue)}
                     )
                 )
+            elif issue is not None:
+                must_change.append(
+                    finding.model_copy(
+                        update={
+                            "edit_required": True,
+                            "reason_code": issue,
+                            "explanation": self._issue_explanation(issue),
+                        }
+                    )
+                )
+            else:
+                evidence.append(finding)
         limitations = response.limitations
         state = "complete_with_dynamic_limitations" if limitations or review else "complete"
         return RefactorAnalysis(
@@ -196,7 +218,14 @@ class ReferenceService:
             must_change=must_change,
             likely_change=likely_change,
             review=review,
+            evidence=evidence,
             limitations=limitations,
+            counts=RefactorCounts(
+                must_change=len(must_change),
+                likely_change=len(likely_change),
+                review=len(review),
+                evidence=len(evidence),
+            ),
             completeness=CompletenessReport(
                 state=cast(
                     Literal["complete", "complete_with_dynamic_limitations", "incomplete"], state
@@ -204,36 +233,107 @@ class ReferenceService:
             ),
         )
 
-    def _signature_requires_change(
-        self, project_id: str, reference_id: str, operation: SignatureChangeOperation
-    ) -> bool:
+    def _signature_issue(
+        self,
+        selected: SelectedDeclaration,
+        reference_id: str,
+        operation: SignatureChangeOperation,
+    ) -> str | None:
         row = next(
             (
                 record
-                for record in self.store.list_reference_records(project_id)
+                for record in self.store.list_reference_records(selected.project_id)
                 if record["reference_id"] == reference_id
             ),
             None,
         )
         if row is None or row["shape_json"] is None:
-            return False
+            return None
         shape = json.loads(row["shape_json"])
         if shape.get("has_positional_spread") or shape.get("has_keyword_spread"):
-            return False
-        positional = [
+            return "spread_uncertainty"
+        old_shapes = self.store.declaration_shapes(selected.project_id, selected.qualified_symbol)
+        if len(old_shapes) != 1 or old_shapes[0]["shape_json"] is None:
+            return "overload_ambiguity" if len(old_shapes) > 1 else None
+        old_parameters = json.loads(old_shapes[0]["shape_json"])
+        if not isinstance(old_parameters, list):
+            return None
+        old_records = [
+            cast(dict[str, Any], parameter)
+            for parameter in old_parameters
+            if isinstance(parameter, dict)
+        ]
+        new_positional = [
             parameter
             for parameter in operation.parameters
-            if parameter.required and parameter.kind in {"positional", "positional_only"}
+            if parameter.kind in {"positional", "positional_only"}
         ]
-        if int(shape.get("positional_count", 0)) < len(positional):
-            return True
+        positional_count = int(shape.get("positional_count", 0))
+        required_positional = [parameter for parameter in new_positional if parameter.required]
         keywords = set(shape.get("keywords", []))
-        return any(
+        new_by_name = {parameter.name: parameter for parameter in operation.parameters}
+        if any(
             parameter.required
             and parameter.kind == "keyword_only"
             and parameter.name not in keywords
             for parameter in operation.parameters
-        )
+        ):
+            return "missing_required_parameter"
+        for keyword in keywords:
+            parameter = new_by_name.get(keyword)
+            if parameter is None:
+                return "invalid_keyword"
+            if parameter.kind == "positional_only":
+                return "parameter_mode_change"
+        if positional_count < len(required_positional):
+            return "missing_required_parameter"
+        if positional_count > len(new_positional) and not any(
+            parameter.kind == "variadic" for parameter in operation.parameters
+        ):
+            old_positional = [
+                parameter
+                for parameter in old_records
+                if parameter.get("kind") in {"positional", "positional_only"}
+            ]
+            for positional_parameter in old_positional[len(new_positional) : positional_count]:
+                old_name = positional_parameter.get("name")
+                new_parameter = new_by_name.get(old_name) if isinstance(old_name, str) else None
+                if new_parameter is not None and new_parameter.kind == "keyword_only":
+                    return "parameter_mode_change"
+            return "removed_positional_parameter"
+        old_positions = {
+            name: parameter.get("position")
+            for parameter in old_records
+            if isinstance(name := parameter.get("name"), str)
+        }
+        for position, parameter in enumerate(new_positional[:positional_count]):
+            old_parameter: object = (
+                old_parameters[position] if position < len(old_parameters) else None
+            )
+            if not isinstance(old_parameter, dict):
+                continue
+            old_name = old_parameter.get("name")
+            if old_name != parameter.name and old_positions.get(parameter.name) not in {
+                None,
+                position,
+            }:
+                return "positional_order_change"
+        return None
+
+    @staticmethod
+    def _issue_explanation(issue: str) -> str:
+        explanations = {
+            "missing_required_parameter": "This call omits a required proposed parameter.",
+            "invalid_keyword": "This call uses a keyword absent from the proposed signature.",
+            "parameter_mode_change": "This call is incompatible with a proposed parameter mode.",
+            "removed_positional_parameter": "This call supplies a removed positional parameter.",
+            "positional_order_change": (
+                "This call depends on a positional parameter order that changes."
+            ),
+            "spread_uncertainty": "A spread argument prevents a deterministic compatibility check.",
+            "overload_ambiguity": "Multiple declaration shapes prevent a deterministic comparison.",
+        }
+        return explanations[issue]
 
     def _select(self, selector: DeclarationSelector) -> SelectedDeclaration:
         if selector.chunk_id is not None:

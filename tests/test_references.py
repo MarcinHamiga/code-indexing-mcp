@@ -3,7 +3,6 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import Indexer
 from code_indexing_mcp.models import DeclarationSelector
@@ -81,7 +80,7 @@ def test_unknown_member_receiver_is_never_exact(tmp_path: Path) -> None:
     assert call.reason_code == "unknown_receiver"
 
 
-def test_cursor_is_filter_bound_and_rejects_a_changed_snapshot(tmp_path: Path) -> None:
+def test_cursor_is_filter_bound_and_reads_its_original_snapshot(tmp_path: Path) -> None:
     service, project_id = _indexed_service(
         tmp_path,
         {
@@ -110,9 +109,9 @@ def test_cursor_is_filter_bound_and_rejects_a_changed_snapshot(tmp_path: Path) -
         ],
         replace_reference_file_ids=[file_id],
     )
-    with pytest.raises(CodeIndexingError) as raised:
-        service.find_references(selector, limit=1, cursor=first.cursor)
-    assert raised.value.code is ErrorCode.STALE_CURSOR
+    original_snapshot = service.find_references(selector, limit=1, cursor=first.cursor)
+    assert original_snapshot.hits
+    assert original_snapshot.snapshot_version == first.snapshot_version
 
 
 @pytest.mark.parametrize(

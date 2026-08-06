@@ -248,9 +248,7 @@ class StagingJob:
             pa.array([getattr(row, field.name) for row in rows], type=field.type)
             for field in self._reference_schema
         ]
-        self._references_writer.write_batch(
-            pa.record_batch(columns, schema=self._reference_schema)
-        )
+        self._references_writer.write_batch(pa.record_batch(columns, schema=self._reference_schema))
 
     def mark_replaced(self, file_id: str) -> None:
         if file_id not in self.replace_file_ids:
@@ -336,8 +334,9 @@ class StagingJob:
                 if batches:
                     assert current_file_id is not None
                     seen.add(current_file_id)
-                    yield current_file_id, pa.Table.from_batches(
-                        batches, schema=self._reference_schema
+                    yield (
+                        current_file_id,
+                        pa.Table.from_batches(batches, schema=self._reference_schema),
                     )
                     batches = []
                 current_file_id = file_id

@@ -331,7 +331,6 @@ class ReferenceHit(FrozenModel):
     resolution: ResolutionLevel
     reason_code: str
     explanation: str
-    edit_required: bool | None = None
 
 
 class ReferenceLimitation(FrozenModel):
@@ -373,14 +372,29 @@ class CompletenessReport(FrozenModel):
     explanation: str = "All indexed structural candidates were considered."
 
 
+class RefactorCounts(FrozenModel):
+    must_change: int = 0
+    likely_change: int = 0
+    review: int = 0
+    evidence: int = 0
+
+
 class RefactorAnalysis(FrozenModel):
     selected: SelectedDeclaration
     operation: RefactorOperation
     must_change: list[RefactorFinding] = Field(default_factory=list)
     likely_change: list[RefactorFinding] = Field(default_factory=list)
     review: list[RefactorFinding] = Field(default_factory=list)
+    evidence: list[RefactorFinding] = Field(default_factory=list)
     limitations: list[ReferenceLimitation] = Field(default_factory=list)
+    counts: RefactorCounts = Field(default_factory=RefactorCounts)
+    cursor: str | None = None
     completeness: CompletenessReport = Field(default_factory=CompletenessReport)
+
+    @property
+    def findings(self) -> list[RefactorFinding]:
+        """Return every finding while preserving the caller-facing priority order."""
+        return [*self.must_change, *self.likely_change, *self.review, *self.evidence]
 
 
 class StoredFile(FrozenModel):

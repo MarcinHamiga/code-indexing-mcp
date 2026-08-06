@@ -385,9 +385,11 @@ class LanceStore:
             tables.references.delete(condition)
             tables.files.delete(condition)
 
-    def list_reference_records(self, project_id: str) -> list[ReferenceRecord]:
-        """Return a project's structural rows without creating an empty partition."""
-        return self._reference_rows(project_id, None)
+    def list_reference_records(
+        self, project_id: str, *, version: int | None = None
+    ) -> list[ReferenceRecord]:
+        """Return structural rows from the requested immutable table version."""
+        return self._reference_rows(project_id, None, version=version)
 
     def reference_coverage(self, project_id: str) -> list[ReferenceRecord]:
         return self._reference_rows(project_id, "record_kind = 'coverage'")
@@ -850,11 +852,20 @@ class LanceStore:
             query = query.where(condition)
         return cast(list[dict[str, Any]], query.to_list())
 
-    def _reference_rows(self, project_id: str, condition: str | None) -> list[ReferenceRecord]:
+    def _reference_rows(
+        self, project_id: str, condition: str | None, *, version: int | None = None
+    ) -> list[ReferenceRecord]:
         tables = self._existing_tables(project_id)
         if tables is None or tables.references is None:
             return []
-        query = tables.references.search()
+        references = tables.references
+        if version is not None and version != int(references.version):
+            database = lancedb.connect(
+                self.directory / "projects" / project_id,
+                read_consistency_interval=timedelta(0),
+            )
+            references = cast(LanceTable, database.open_table("references", version=version))
+        query = references.search()
         if condition:
             query = query.where(condition)
         query = query.order_by(
