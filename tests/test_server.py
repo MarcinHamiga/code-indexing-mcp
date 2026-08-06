@@ -1462,6 +1462,32 @@ async def test_project_status_registers_an_unmarked_root(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_project_status_deduplicates_case_insensitive_client_roots(
+    tmp_path: Path, case_insensitive_path_alias: Callable[[Path], Path]
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    alias = case_insensitive_path_alias(root)
+    app = _tiny_application(tmp_path)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(
+            roots=[types.Root(uri=root.as_uri()), types.Root(uri=alias.as_uri())]
+        )
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool("project_status", {})
+
+    assert not result.isError
+    assert len(app.list_projects()) == 1
+
+
+@pytest.mark.asyncio
 async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) -> None:
     tools = {
         tool.name: tool

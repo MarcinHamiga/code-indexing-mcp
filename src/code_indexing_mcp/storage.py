@@ -30,7 +30,7 @@ from .models import (
     StoredChunk,
     StoredFile,
 )
-from .projects import existing_marker_path
+from .projects import existing_marker_path, same_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -195,10 +195,8 @@ class LanceStore:
         if existing:
             registered_root = Path(str(existing[0]["root"])).resolve()
             incoming_root = project.root.resolve()
-            if (
-                registered_root != incoming_root
-                and existing_marker_path(registered_root) is not None
-            ):
+            same_root = same_project_root(registered_root, incoming_root)
+            if not same_root and existing_marker_path(registered_root) is not None:
                 raise CodeIndexingError(
                     ErrorCode.PROJECT_ID_CONFLICT,
                     "The project ID is already active at another path",
@@ -206,6 +204,8 @@ class LanceStore:
                     registered_root=str(registered_root),
                     incoming_root=str(incoming_root),
                 )
+            if same_root:
+                project = project.model_copy(update={"root": registered_root})
         row = {
             "id": project.id,
             "name": project.name,
