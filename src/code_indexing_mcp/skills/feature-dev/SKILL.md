@@ -21,6 +21,7 @@ The core rule of this phase: **the code-indexing-mcp tools are the primary navig
    - `mcp__code-indexing-mcp__search_code` — issue several targeted semantic queries derived from the feature request (the area being changed, the patterns it must follow, the tests that cover it). Not one broad query.
    - `mcp__code-indexing-mcp__file_outline` — get a file's structure before reading it; decide which parts matter instead of dumping whole files.
    - `mcp__code-indexing-mcp__find_symbol` — trace functions/classes the feature will touch to all definitions and call sites, to map impact.
+   - When changing an existing declaration, `mcp__code-indexing-mcp__find_references` — identify structural uses from its selected `chunk_id` or project/path/qualified-symbol tuple. For a rename or signature change, use `mcp__code-indexing-mcp__analyze_refactor` and retain its `likely_change`, `review`, and limitation findings in the plan.
    - `mcp__code-indexing-mcp__get_chunk` — pull the full body of a chunk when you need exact code.
 4. Only use Grep when the task genuinely needs a literal match semantic search cannot express (exact string literals, config keys, TODO/FIXME markers) or when the MCP tools are unavailable — and say so when you do.
 

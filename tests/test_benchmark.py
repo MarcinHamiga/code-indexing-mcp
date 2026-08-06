@@ -48,6 +48,8 @@ def test_benchmark_runs_cold_warm_incremental_and_forced_scenarios(tmp_path: Pat
     ]
     assert payload["scenarios"]["incremental_index"]["report"]["indexed_files"] == 1
     assert payload["scenarios"]["warm_index"]["chunks_per_second"] == 80.0
+    assert payload["scenarios"]["cold_start"]["structural_records"] == 0
+    assert payload["scenarios"]["cold_start"]["reference_extraction_duration_ms"] == 0
     assert "phase_1_incremental_marker" in (root / "module_0000.py").read_text()
 
 

@@ -252,7 +252,7 @@ A generic MCP client configuration looks like this:
 }
 ```
 
-The server exposes ten tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
+The server exposes twelve tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
 so hosts may auto-approve them. The other query tools are not: on a root the server has not seen
 before they register it first, which writes a `.ci-mcp/project.toml` marker, and the four code
 queries also build its initial index. `remove_project` is annotated `destructiveHint`;
@@ -269,6 +269,8 @@ overwrite a marker and orphan the previous index.
 | `search_code` | read, registers and indexes | Hybrid semantic and keyword search returning ranked snippets. |
 | `search_across_projects` | read, registers and indexes | Globally ranked search across at least two explicitly selected projects. |
 | `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
+| `find_references` | read, registers and indexes | Structural references to one selected Python, JavaScript, TypeScript, or TSX declaration. |
+| `analyze_refactor` | read, registers and indexes | Read-only rename or signature-change impact analysis for one selected declaration. |
 | `file_outline` | read, registers and indexes | One file's declared symbols, metadata only. |
 | `get_chunk` | read only | Full stored text for one `chunk_id`. |
 
@@ -279,6 +281,27 @@ clamped.
 `get_chunk` returns one chunk's full stored text with its path, symbol, line range, byte range, and
 content hash. It deliberately excludes the embedding vector and the derived `embedding_text` and
 `search_text` columns, which exist for ranking and are not useful to a caller.
+
+### Reference and refactor workflows
+
+Use `find_symbol` to select one declaration, then pass its `chunk_id` to `find_references` (or use
+the explicit `project`, `path`, and `qualified_symbol` selector). Reference results are paged with
+an opaque cursor that stays bound to the original structural-table snapshot. They distinguish
+`exact` bindings from `likely` and `unresolved` evidence; callers must review the latter and the
+reported limitations rather than treating them as safe edits.
+
+Structural references are extracted during the normal parse and are backfilled parse-only for an
+older semantic index—no second embedding pass is needed. The first reference query may therefore
+write structural coverage while it refreshes its index, which is why both tools carry the
+registering-read annotation. Python, JavaScript, TypeScript, and TSX are supported. Runtime imports,
+wildcard imports, inferred receiver types, TypeScript path aliases, and other dynamic dispatch stay
+conservative and are reported as limitations.
+
+`analyze_refactor` accepts a discriminated `operation`: `{"kind":"rename","new_name":"..."}`
+or `{"kind":"signature_change","parameters":[...]}`. It never edits source. Its
+`must_change` items are deterministic, `likely_change` and `review` require inspection, and
+`evidence` includes exact aliases that identify the target but need no spelling change. Signature
+analysis reports spread arguments and ambiguous declaration shapes for review instead of guessing.
 
 ## Project workflow
 
