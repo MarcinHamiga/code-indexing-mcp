@@ -1,6 +1,6 @@
 ---
 name: impact-analysis
-description: Map the blast radius of changing or removing a symbol, module, or API using code-indexing-mcp (find_symbol for definitions and call sites, search_code for indirect usages) before any edit
+description: Map the blast radius of changing a symbol or API using code-indexing-mcp structural references plus semantic search before any edit
 type: prompt
 whenToUse: When the user plans a rename, refactor, signature change, move, or removal and wants to know what it affects, and the code-indexing-mcp tools are available
 arguments:
@@ -21,9 +21,10 @@ The core rule of this skill: **map usages with the index tools, not with grep.**
 - `mcp__code-indexing-mcp__find_symbol` with an exact match on the target name to locate every definition. If several unrelated symbols match, ask the user which one is meant — do not guess.
 - `mcp__code-indexing-mcp__get_chunk` — read the definition itself so the analysis is grounded in what the symbol actually does and exposes.
 
-## 3. Map direct usages
+## 3. Map direct usages and refactor impact
 
-- `mcp__code-indexing-mcp__find_symbol` — collect all references and call sites of the resolved symbol.
+- `mcp__code-indexing-mcp__find_references` — pass the selected declaration's `chunk_id`, or its project/path/qualified-symbol tuple, to retrieve structural uses. Treat `exact` as binding evidence, `likely` as a required review, and `unresolved` plus limitations as blind spots; do not promote them to exact yourself.
+- `mcp__code-indexing-mcp__analyze_refactor` — for a rename or signature proposal, use its discriminated `operation` input before planning edits. `must_change` is deterministic, `likely_change` and `review` need human inspection, and `evidence` can show aliases that bind the target but need no spelling edit.
 - For each distinct file in the results, `mcp__code-indexing-mcp__file_outline` to place the usage in context, and `mcp__code-indexing-mcp__get_chunk` where the exact call matters (signature changes, argument reordering).
 
 ## 4. Hunt indirect usages

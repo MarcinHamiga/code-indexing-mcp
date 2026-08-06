@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import lancedb
 import pyarrow as pa
 import pytest
 from filelock import FileLock
@@ -22,11 +24,14 @@ from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner
 from code_indexing_mcp.staging import (
     CHUNKS_NAME,
+    JOURNAL_FORMAT_VERSION,
     JOURNAL_NAME,
     MAX_RECOVERY_ATTEMPTS,
     PHASE_COMMITTING,
     PHASE_STAGING,
+    REFERENCES_NAME,
     ChunkRow,
+    ReferenceRow,
     StagingJob,
     recover_staged_commits,
 )
@@ -64,9 +69,11 @@ def make_project(root: Path, source: str = "def answer():\n    return 42\n"):
     return initialize_project(root)
 
 
-def chunk_row(project_id: str, file_id: str, vector: list[float]) -> ChunkRow:
+def chunk_row(
+    project_id: str, file_id: str, vector: list[float], *, chunk_id: str = "chunk-1"
+) -> ChunkRow:
     return ChunkRow(
-        chunk_id="chunk-1",
+        chunk_id=chunk_id,
         file_id=file_id,
         project_id=project_id,
         path="main.py",
@@ -88,6 +95,38 @@ def chunk_row(project_id: str, file_id: str, vector: list[float]) -> ChunkRow:
     )
 
 
+def reference_row(
+    project_id: str,
+    file_id: str,
+    *,
+    reference_id: str = "reference-1",
+    target_name: str = "answer",
+) -> ReferenceRow:
+    return ReferenceRow(
+        reference_id=reference_id,
+        record_kind="reference",
+        file_id=file_id,
+        project_id=project_id,
+        path="main.py",
+        language="python",
+        kind="call",
+        source_qualified_symbol="caller",
+        written_name=target_name,
+        target_name=target_name,
+        module_path=None,
+        imported_name=None,
+        alias=None,
+        receiver_text=None,
+        start_byte=0,
+        end_byte=len(target_name),
+        start_line=1,
+        end_line=1,
+        shape_json='{"positional_count": 0}',
+        content_hash="hash",
+        schema_version=1,
+    )
+
+
 def make_job(
     tmp_path: Path, store: LanceStore, project_id: str, job_id: str = "job-1"
 ) -> StagingJob:
@@ -96,6 +135,7 @@ def make_job(
         project_id,
         file_schema=LanceStore.file_arrow_schema(),
         chunk_schema=LanceStore.chunk_arrow_schema(store.vector_dimension),
+        reference_schema=LanceStore.reference_arrow_schema(),
         job_id=job_id,
     )
     job.begin()
@@ -106,7 +146,7 @@ def test_staged_vectors_stay_packed_float32_arrow_arrays(tmp_path: Path) -> None
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     job = make_job(tmp_path, store, "project-1")
     job.stage_chunks([chunk_row("project-1", "file-1", [1.5, 2.5, 3.5, 4.5])])
-    job.begin_commit(TableVersions(files=1, chunks=1))
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
 
     table = pa.ipc.open_file(job.directory / CHUNKS_NAME).read_all()
 
@@ -119,7 +159,88 @@ def test_staged_vectors_stay_packed_float32_arrow_arrays(tmp_path: Path) -> None
     assert journal["phase"] == PHASE_COMMITTING
     assert journal["files_version"] == 1
     assert journal["chunks_version"] == 1
+    assert journal["references_version"] == 1
     job.discard()
+
+
+def test_staged_references_stream_to_arrow_without_object_row_materialization(
+    tmp_path: Path,
+) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+
+    arrow = SimpleNamespace(
+        array=pa.array,
+        record_batch=pa.record_batch,
+        RecordBatch=SimpleNamespace(
+            from_pylist=lambda *_: (_ for _ in ()).throw(
+                AssertionError("reference rows must stream as Arrow columns")
+            )
+        ),
+    )
+    with patch("code_indexing_mcp.staging.pa", arrow):
+        job.stage_references([reference_row("project-1", "file-1")])
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    table = pa.ipc.open_file(job.directory / REFERENCES_NAME).read_all()
+
+    assert table.column("reference_id")[0].as_py() == "reference-1"
+    assert table.column("shape_json")[0].as_py() == '{"positional_count": 0}'
+    job.discard()
+
+
+def test_staging_references_rejects_mixed_file_batches(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+
+    with pytest.raises(ValueError, match="one file"):
+        job.stage_references(
+            [
+                reference_row("project-1", "file-a", reference_id="a"),
+                reference_row("project-1", "file-b", reference_id="b"),
+            ]
+        )
+
+
+def test_contiguous_reference_batches_stream_one_complete_group_per_file(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_references([reference_row("project-1", "file-a", reference_id="a-1")])
+    job.stage_references([reference_row("project-1", "file-a", reference_id="a-2")])
+    job.stage_references([reference_row("project-1", "file-b", reference_id="b-1")])
+    job.mark_references_replaced("file-a")
+    job.mark_references_replaced("file-b")
+    job.mark_references_replaced("file-a")
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    groups = list(job.iter_reference_groups())
+
+    assert [file_id for file_id, _ in groups] == ["file-a", "file-b"]
+    assert groups[0][1].column("reference_id").to_pylist() == ["a-1", "a-2"]
+    assert groups[1][1].column("reference_id").to_pylist() == ["b-1"]
+
+
+def test_staging_references_rejects_non_contiguous_file_batches(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_references([reference_row("project-1", "file-a", reference_id="a-1")])
+    job.stage_references([reference_row("project-1", "file-b", reference_id="b-1")])
+
+    with pytest.raises(ValueError, match="contiguous"):
+        job.stage_references([reference_row("project-1", "file-a", reference_id="a-2")])
+
+
+def test_staging_chunks_rejects_mixed_file_batches(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+
+    with pytest.raises(ValueError, match="one file"):
+        job.stage_chunks(
+            [
+                chunk_row("project-1", "file-a", [1.0, 2.0, 3.0, 4.0], chunk_id="chunk-a"),
+                chunk_row("project-1", "file-b", [4.0, 3.0, 2.0, 1.0], chunk_id="chunk-b"),
+            ]
+        )
 
 
 def test_the_write_path_never_dumps_a_stored_chunk(tmp_path: Path) -> None:
@@ -278,6 +399,52 @@ def test_a_failed_commit_restores_both_table_versions(tmp_path: Path) -> None:
     assert {chunk.qualified_symbol for chunk in store.list_chunks([project.id])} == {"renamed"}
 
 
+def test_a_failed_commit_restores_reference_rows_with_files_and_chunks(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    project = make_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    file_id = store.list_files(project.id)[0].file_id
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+        chunk_groups=(),
+        reference_groups=[
+            (
+                file_id,
+                pa.Table.from_pylist(
+                    [reference_row(project.id, file_id).__dict__],
+                    schema=LanceStore.reference_arrow_schema(),
+                ),
+            )
+        ],
+        replace_reference_file_ids=[file_id],
+    )
+    files_before = store.list_files(project.id)
+    chunks_before = store.list_chunks([project.id])
+    references_before = store.list_reference_records(project.id)
+    job = make_job(tmp_path, store, project.id)
+    job.stage_references(
+        [reference_row(project.id, file_id, reference_id="replacement", target_name="renamed")]
+    )
+    job.mark_references_replaced(file_id)
+    original = LanceStore.replace_files_from_arrow
+
+    def apply_then_crash(self: LanceStore, project_id: str, **kwargs: object) -> None:
+        original(self, project_id, **kwargs)  # type: ignore[arg-type]
+        raise RuntimeError("simulated crash after the live writes")
+
+    with (
+        patch.object(LanceStore, "replace_files_from_arrow", apply_then_crash),
+        pytest.raises(RuntimeError, match="simulated crash"),
+    ):
+        indexer._commit_staged(project, job, errors=[])
+
+    assert store.list_files(project.id) == files_before
+    assert store.list_chunks([project.id]) == chunks_before
+    assert store.list_reference_records(project.id) == references_before
+
+
 def test_a_commit_whose_rollback_fails_keeps_its_journal_for_recovery(
     tmp_path: Path,
 ) -> None:
@@ -331,30 +498,54 @@ def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -
     files_before = store.list_files(project.id)
     chunks_before = store.list_chunks([project.id])
     file_id = files_before[0].file_id
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+        chunk_groups=(),
+        reference_groups=[
+            (
+                file_id,
+                pa.Table.from_pylist(
+                    [reference_row(project.id, file_id).__dict__],
+                    schema=LanceStore.reference_arrow_schema(),
+                ),
+            )
+        ],
+        replace_reference_file_ids=[file_id],
+    )
+    references_before = store.list_reference_records(project.id)
 
-    # Stage a replacement, record the versions, and then "crash": the chunks
-    # merge lands but the run dies before the files merge and before any
-    # rollback code runs.
+    # Stage a replacement, record the versions, and then "crash" after all
+    # three live tables mutate but before rollback code runs.
     job = make_job(tmp_path, store, project.id)
     record = files_before[0].model_copy(update={"mtime_ns": 2})
     job.stage_file(record)
     job.stage_chunks([chunk_row(project.id, file_id, [9.0, 9.0, 9.0, 9.0])])
+    job.stage_references(
+        [reference_row(project.id, file_id, reference_id="replacement", target_name="renamed")]
+    )
     job.mark_replaced(file_id)
+    job.mark_references_replaced(file_id)
     versions = store.table_versions(project.id)
     job.begin_commit(versions)
     store.replace_files_from_arrow(
         project.id,
-        files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+        files=job.files_table(),
         chunk_groups=job.iter_chunk_groups(),
+        reference_groups=job.iter_reference_groups(),
+        replace_reference_file_ids=job.replace_reference_file_ids,
     )
+    assert store.list_files(project.id) != files_before
     assert store.count_chunks([project.id]) == 1
     assert store.list_chunks([project.id])[0].content != chunks_before[0].content
+    assert store.list_reference_records(project.id) != references_before
 
     recovered = recover_staged_commits(tmp_path / "staging", store)
 
     assert recovered == 1
     assert store.list_files(project.id) == files_before
     assert store.list_chunks([project.id]) == chunks_before
+    assert store.list_reference_records(project.id) == references_before
     assert list((tmp_path / "staging").glob("*/*/")) == []
 
 
@@ -370,12 +561,13 @@ def test_repeated_recovery_is_idempotent(tmp_path: Path) -> None:
     journal_dir = tmp_path / "staging" / project.id / "job-1"
     journal_dir.mkdir(parents=True)
     journal = {
-        "version": 1,
+        "version": JOURNAL_FORMAT_VERSION,
         "job_id": "job-1",
         "project_id": project.id,
         "phase": PHASE_COMMITTING,
         "files_version": versions.files,
         "chunks_version": versions.chunks,
+        "references_version": versions.references,
         "replace_file_ids": [],
         "removed_file_ids": [],
     }
@@ -398,18 +590,71 @@ def _committing_journal(directory: Path, project_id: str, versions: TableVersion
     path.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": JOURNAL_FORMAT_VERSION,
                 "job_id": directory.name,
                 "project_id": project_id,
                 "phase": PHASE_COMMITTING,
                 "files_version": versions.files,
                 "chunks_version": versions.chunks,
+                "references_version": versions.references,
                 "replace_file_ids": [],
                 "removed_file_ids": [],
             }
         )
     )
     return path
+
+
+def test_upgrade_recovery_rolls_back_a_legacy_two_table_journal(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    database = lancedb.connect(store.directory / "projects" / project.id)
+    files = database.create_table("files", schema=LanceStore.file_arrow_schema())
+    chunks = database.create_table("chunks", schema=LanceStore.chunk_arrow_schema(4))
+    original_file = StoredFile(
+        file_id="file-1",
+        project_id=project.id,
+        path="main.py",
+        language="python",
+        size=4,
+        mtime_ns=1,
+        content_hash="old",
+        indexed_at=1,
+    )
+    original_chunk = {
+        **chunk_row(project.id, "file-1", [1.0, 2.0, 3.0, 4.0]).__dict__,
+        "vector": [1.0, 2.0, 3.0, 4.0],
+    }
+    files.add([original_file.model_dump()])
+    chunks.add([original_chunk])
+    versions = TableVersions(files=files.version, chunks=chunks.version, references=0)
+    files.delete("file_id = 'file-1'")
+    files.add([original_file.model_copy(update={"mtime_ns": 2}).model_dump()])
+    chunks.delete("file_id = 'file-1'")
+    chunks.add([{**original_chunk, "content": "new", "content_hash": "new"}])
+    directory = tmp_path / "staging" / project.id / "legacy-job"
+    directory.mkdir(parents=True)
+    (directory / JOURNAL_NAME).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "job_id": "legacy-job",
+                "project_id": project.id,
+                "phase": PHASE_COMMITTING,
+                "files_version": versions.files,
+                "chunks_version": versions.chunks,
+            }
+        )
+    )
+
+    assert recover_staged_commits(tmp_path / "staging", store) == 1
+    assert store.list_files(project.id) == [original_file]
+    assert store.list_chunks([project.id])[0].content == original_chunk["content"]
+    assert not (store.directory / "projects" / project.id / "references.lance").exists()
+    assert not directory.exists()
 
 
 def test_recovery_for_a_removed_project_does_not_recreate_its_partition(
@@ -423,7 +668,7 @@ def test_recovery_for_a_removed_project_does_not_recreate_its_partition(
     """
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     directory = tmp_path / "staging" / "ghost-project" / "job-1"
-    _committing_journal(directory, "ghost-project", TableVersions(files=3, chunks=3))
+    _committing_journal(directory, "ghost-project", TableVersions(files=3, chunks=3, references=3))
 
     assert recover_staged_commits(tmp_path / "staging", store) == 0
 
@@ -474,7 +719,9 @@ def test_startup_recovery_does_not_wait_out_an_active_index_run(
     root = tmp_path / "repo"
     make_project(root)
     directory = paths.data / "staging" / "ghost-project" / "job-1"
-    journal_path = _committing_journal(directory, "ghost-project", TableVersions(files=1, chunks=1))
+    journal_path = _committing_journal(
+        directory, "ghost-project", TableVersions(files=1, chunks=1, references=1)
+    )
     lock_directory = paths.data / "locks"
     lock_directory.mkdir(parents=True, exist_ok=True)
 

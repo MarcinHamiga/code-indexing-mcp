@@ -68,6 +68,105 @@ def test_extracts_javascript_and_typescript_symbols(
     assert expected <= symbols
 
 
+@pytest.mark.parametrize(
+    ("language", "path", "source", "expected"),
+    [
+        (
+            "go",
+            "pkg/user.go",
+            b"""package user
+
+type User struct {
+    Name string
+}
+
+func (u User) Greeting() string { return u.Name }
+func NewUser() *User { return &User{} }
+const Version = 1
+""",
+            {
+                ("class", "User"),
+                ("method", "Greeting"),
+                ("function", "NewUser"),
+                ("constant", "Version"),
+            },
+        ),
+        (
+            "terraform",
+            "infra/main.tf",
+            b"""variable "region" {
+  default = "eu"
+}
+
+resource "aws_instance" "web" {
+  ami = "ami-123"
+}
+""",
+            {("object", "region"), ("object", "aws_instance")},
+        ),
+        (
+            "rust",
+            "src/lib.rs",
+            b"""struct User {
+    name: String,
+}
+
+enum State { Ready, Done }
+fn build_user() -> User { User { name: String::new() } }
+const VERSION: u32 = 1;
+""",
+            {
+                ("struct", "User"),
+                ("enum", "State"),
+                ("function", "build_user"),
+                ("constant", "VERSION"),
+            },
+        ),
+        (
+            "c",
+            "src/math.c",
+            b"""#define LIMIT 10
+typedef struct User { int id; } User;
+int add(int left, int right) { return left + right; }
+""",
+            {("constant", "LIMIT"), ("struct", "User"), ("function", "add")},
+        ),
+        (
+            "cpp",
+            "src/user.cpp",
+            b"""class User {
+public:
+    void greet() {}
+};
+
+int build_user() { return 1; }
+""",
+            {("class", "User"), ("method", "User.greet"), ("function", "build_user")},
+        ),
+        (
+            "lua",
+            "lua/user.lua",
+            b"""local function greet(name)
+  return "hello " .. name
+end
+""",
+            {("function", "greet")},
+        ),
+    ],
+)
+def test_extracts_next_language_symbols(
+    language: str,
+    path: str,
+    source: bytes,
+    expected: set[tuple[str, str]],
+) -> None:
+    result = TreeSitterExtractor().extract(Path(path), language, source)
+
+    assert not result.has_errors
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert expected <= symbols
+
+
 def test_extracts_java_symbols_with_precise_kinds_and_nested_qualification() -> None:
     source = b"""package demo;
 

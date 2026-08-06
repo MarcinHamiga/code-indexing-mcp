@@ -21,7 +21,7 @@ from code_indexing_mcp.daemon import (
 )
 from code_indexing_mcp.embedding import FastEmbedder
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
-from code_indexing_mcp.models import IndexReport
+from code_indexing_mcp.models import DeclarationSelector, IndexReport, RenameOperation
 from code_indexing_mcp.settings import IndexSettings
 
 # Gate on the capability the code actually needs rather than on the platform, so
@@ -74,6 +74,41 @@ def test_broker_application_calls_one_daemon_backend(tmp_path: Path) -> None:
     broker.stop()
     thread.join(timeout=2)
     assert not thread.is_alive()
+
+
+@requires_local_sockets
+def test_broker_forwards_refactor_pagination_parameters(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text(
+        "def answer():\n    return 42\n\ncallback = answer\n\ndef caller():\n    return answer()\n"
+    )
+    application = Application(paths, embedder=TinyEmbedder(), cwd=root)
+    project = application.init_project(root)
+    application.index_project(project.id)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=root)
+
+    try:
+        analysis = broker.analyze_refactor(
+            DeclarationSelector(
+                project=project.id,
+                path="main.py",
+                qualified_symbol="answer",
+            ),
+            RenameOperation(new_name="result"),
+            limit=1,
+        )
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+    assert analysis.cursor is not None
+    assert analysis.completeness.state == "incomplete"
 
 
 def test_broker_freshness_uses_the_existing_status_rpc(

@@ -15,6 +15,7 @@ from .models import (
     DEFAULT_INCLUDES,
     LEGACY_DEFAULT_INCLUDES_V1,
     LEGACY_DEFAULT_INCLUDES_V2,
+    LEGACY_DEFAULT_INCLUDES_V3,
     ProjectInfo,
     ScanConfig,
 )
@@ -100,7 +101,11 @@ def read_project_marker(root: Path) -> ProjectInfo:
         # A marker still carrying an older default include list is upgraded to the
         # current one, so a project written before a language was supported picks
         # it up. An include list the user has edited is left exactly as written.
-        if scan.include in (LEGACY_DEFAULT_INCLUDES_V1, LEGACY_DEFAULT_INCLUDES_V2):
+        if scan.include in (
+            LEGACY_DEFAULT_INCLUDES_V1,
+            LEGACY_DEFAULT_INCLUDES_V2,
+            LEGACY_DEFAULT_INCLUDES_V3,
+        ):
             scan = scan.model_copy(update={"include": list(DEFAULT_INCLUDES)})
         return ProjectInfo(
             version=raw["version"],

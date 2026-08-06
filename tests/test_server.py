@@ -131,10 +131,12 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "search_code",
         "search_across_projects",
         "find_symbol",
+        "find_references",
+        "analyze_refactor",
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 10
+    assert len(tools) == 12
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -1337,6 +1339,8 @@ def test_server_instructions_guide_index_first_usage(tmp_path: Path) -> None:
         "search_code",
         "search_across_projects",
         "find_symbol",
+        "find_references",
+        "analyze_refactor",
         "file_outline",
         "get_chunk",
         "project_status",
@@ -1377,6 +1381,8 @@ AUTO_REGISTERING_TOOLS = frozenset(
         "search_code",
         "search_across_projects",
         "find_symbol",
+        "find_references",
+        "analyze_refactor",
         "file_outline",
     }
 )
@@ -1521,6 +1527,15 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "prefix",
         "contains",
     ]
+    analyze_refactor_schema = tools["analyze_refactor"].inputSchema
+    assert set(analyze_refactor_schema["properties"]) == {
+        "selector",
+        "operation",
+        "limit",
+        "cursor",
+    }
+    analyze_limit = analyze_refactor_schema["properties"]["limit"]
+    assert (analyze_limit["minimum"], analyze_limit["maximum"]) == (1, 500)
 
 
 @pytest.mark.asyncio

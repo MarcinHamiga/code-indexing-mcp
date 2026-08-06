@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
 
+import pyarrow as pa
 import pytest
 from filelock import FileLock
 from test_token_batching import fake_encode
@@ -18,7 +19,8 @@ from code_indexing_mcp.embedding import (
 )
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
-from code_indexing_mcp.indexing import Indexer
+from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
+from code_indexing_mcp.models import ExtractionResult
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner
 from code_indexing_mcp.storage import LanceStore
@@ -101,6 +103,63 @@ def test_indexer_skips_unchanged_and_metadata_only_files(tmp_path: Path) -> None
     assert metadata_only.parsed_files == 0
     assert len(embedder.passage_batches) == 1
     assert len(store.list_files(project.id)) == 1
+
+
+def test_successful_index_stages_references_declarations_and_coverage(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text(
+        "def callee(value):\n    return value\n\ndef caller():\n    return callee(1)\n"
+    )
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+
+    indexer.index(project)
+
+    rows = store.list_reference_records(project.id)
+    assert any(
+        row["record_kind"] == "reference"
+        and row["kind"] == "call"
+        and row["target_name"] == "callee"
+        for row in rows
+    )
+    assert any(
+        row["record_kind"] == "declaration" and row["source_qualified_symbol"] == "caller"
+        for row in rows
+    )
+    assert [row["schema_version"] for row in rows if row["record_kind"] == "coverage"] == [
+        REFERENCE_SCHEMA_VERSION
+    ]
+
+
+def test_a_file_with_no_structural_occurrences_still_gets_coverage(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "empty.py").write_text("# nothing to resolve\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+
+    indexer.index(project)
+
+    rows = store.list_reference_records(project.id)
+    assert [row["record_kind"] for row in rows] == ["coverage"]
+
+
+def test_changed_file_replaces_its_structural_generation_atomically(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def old():\n    return 1\n\ndef caller():\n    return old()\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+
+    source.write_text("def new():\n    return 2\n\ndef caller():\n    return new()\n")
+    indexer.index(project)
+
+    rows = store.list_reference_records(project.id)
+    assert {row["target_name"] for row in rows if row["record_kind"] == "reference"} == {"new"}
+    assert len([row for row in rows if row["record_kind"] == "coverage"]) == 1
 
 
 def test_index_report_splits_duration_into_phases(tmp_path: Path) -> None:
@@ -212,6 +271,7 @@ def test_indexer_replaces_changed_files_and_removes_deleted_files(tmp_path: Path
     assert changed_ids != original_ids
     assert removed.removed_files == 1
     assert store.list_chunks([project.id]) == []
+    assert store.list_reference_records(project.id) == []
 
 
 def test_failed_changed_file_preserves_previous_chunks(tmp_path: Path) -> None:
@@ -224,12 +284,14 @@ def test_failed_changed_file_preserves_previous_chunks(tmp_path: Path) -> None:
     indexer, store = make_indexer(tmp_path, embedder)
     indexer.index(project)
     original = store.list_chunks([project.id])
+    original_references = store.list_reference_records(project.id)
 
     source.write_text("def RAISE_EMBEDDING():\n    return 2\n")
     report = indexer.index(project)
 
     assert len(report.errors) == 1
     assert store.list_chunks([project.id]) == original
+    assert store.list_reference_records(project.id) == original_references
     # A failed file is recorded with its current size/mtime, so subsequent
     # runs skip it instead of re-reading, re-parsing, and re-embedding it.
     batches = len(embedder.passage_batches)
@@ -237,6 +299,171 @@ def test_failed_changed_file_preserves_previous_chunks(tmp_path: Path) -> None:
     assert len(embedder.passage_batches) == batches
     assert second.unchanged_files == 1
     assert store.list_chunks([project.id]) == original
+    assert store.list_reference_records(project.id) == original_references
+
+
+def test_failed_changed_file_preserves_previous_references_on_extraction_failure(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def stable():\n    return 1\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    original_references = store.list_reference_records(project.id)
+    source.write_text("def changed():\n    return 2\n")
+
+    with patch.object(indexer.extractor, "extract", side_effect=RuntimeError("query failed")):
+        report = indexer.index(project)
+
+    assert [issue.path for issue in report.errors] == ["main.py"]
+    assert store.list_reference_records(project.id) == original_references
+
+
+def _remove_reference_generation(store: LanceStore, project_id: str) -> None:
+    for record in store.list_files(project_id):
+        store.replace_files_from_arrow(
+            project_id,
+            files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+            chunk_groups=(),
+            reference_groups=[
+                (
+                    record.file_id,
+                    pa.Table.from_batches([], schema=LanceStore.reference_arrow_schema()),
+                )
+            ],
+            replace_reference_file_ids=[record.file_id],
+        )
+
+
+def _remove_reference_coverage(store: LanceStore, project_id: str) -> None:
+    records = store.list_reference_records(project_id)
+    for record in store.list_files(project_id):
+        remaining = [
+            row
+            for row in records
+            if row["file_id"] == record.file_id and row["record_kind"] != "coverage"
+        ]
+        store.replace_files_from_arrow(
+            project_id,
+            files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+            chunk_groups=(),
+            reference_groups=[
+                (
+                    record.file_id,
+                    pa.Table.from_pylist(remaining, schema=LanceStore.reference_arrow_schema()),
+                )
+            ],
+            replace_reference_file_ids=[record.file_id],
+        )
+
+
+def test_reference_backfill_parses_unchanged_files_without_embedding(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    indexer.index(project)
+    _remove_reference_generation(store, project.id)
+    batches_before = len(embedder.passage_batches)
+
+    report = indexer.backfill_references(project)
+
+    assert report.files_backfilled == 1
+    assert report.complete is True
+    assert len(embedder.passage_batches) == batches_before
+    assert store.coverage_for_file(
+        project.id,
+        store.list_files(project.id)[0].file_id,
+        REFERENCE_SCHEMA_VERSION,
+    )
+
+
+def test_reference_backfill_reports_a_source_hash_mismatch_without_committing(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    indexer.index(project)
+    _remove_reference_generation(store, project.id)
+    source.write_text("def changed():\n    return 43\n")
+    batches_before = len(embedder.passage_batches)
+
+    report = indexer.backfill_references(project)
+
+    assert report.stale_paths == ["main.py"]
+    assert store.list_reference_records(project.id) == []
+    assert len(embedder.passage_batches) == batches_before
+
+
+def test_reference_backfill_interruption_keeps_the_previous_generation(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    _remove_reference_coverage(store, project.id)
+    before = store.list_reference_records(project.id)
+
+    with (
+        patch.object(
+            indexer.extractor,
+            "extract",
+            side_effect=CodeIndexingError(ErrorCode.INDEX_CANCELLED, "interrupted"),
+        ),
+        pytest.raises(CodeIndexingError) as raised,
+    ):
+        indexer.backfill_references(project)
+
+    assert raised.value.code is ErrorCode.INDEX_CANCELLED
+    assert store.list_reference_records(project.id) == before
+
+
+def test_reference_backfill_covers_a_file_with_no_occurrences(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "empty.py").write_text("# no occurrences\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    _remove_reference_generation(store, project.id)
+
+    report = indexer.backfill_references(project)
+
+    assert report.complete is True
+    assert [row["record_kind"] for row in store.list_reference_records(project.id)] == ["coverage"]
+
+
+def test_reference_backfill_retries_an_incomplete_parse(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    _remove_reference_generation(store, project.id)
+
+    with patch.object(
+        indexer.extractor,
+        "extract",
+        return_value=ExtractionResult(chunks=[], has_errors=True),
+    ):
+        incomplete = indexer.backfill_references(project)
+    retried = indexer.backfill_references(project)
+
+    assert incomplete.incomplete_paths == ["main.py"]
+    assert retried.files_backfilled == 1
+    assert retried.complete is True
 
 
 def test_global_index_lock_serializes_different_projects(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-"""Partitioned LanceDB persistence for projects, files, and chunks."""
+"""Partitioned LanceDB persistence for projects, files, chunks, and references."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 import lancedb
 import pyarrow as pa
@@ -113,14 +113,40 @@ def _symbol_matches(chunk: ChunkPreview, name: str, match: str) -> bool:
 class _ProjectTables:
     files: LanceTable
     chunks: LanceTable
+    references: LanceTable | None
+
+
+class ReferenceRecord(TypedDict):
+    reference_id: str
+    record_kind: str
+    file_id: str
+    project_id: str
+    path: str
+    language: str
+    kind: str | None
+    source_qualified_symbol: str | None
+    written_name: str | None
+    target_name: str | None
+    module_path: str | None
+    imported_name: str | None
+    alias: str | None
+    receiver_text: str | None
+    start_byte: int | None
+    end_byte: int | None
+    start_line: int | None
+    end_line: int | None
+    shape_json: str | None
+    content_hash: str
+    schema_version: int
 
 
 @dataclass(frozen=True)
 class TableVersions:
-    """A point-in-time snapshot of a project partition's two tables."""
+    """A point-in-time snapshot of a project partition's three tables."""
 
     files: int
     chunks: int
+    references: int
 
 
 class LanceStore:
@@ -236,15 +262,28 @@ class LanceStore:
         tables = self._tables(project_id)
         condition = f"file_id = {_quoted(file_id)}"
         tables.chunks.delete(condition)
+        assert tables.references is not None
+        tables.references.delete(condition)
         tables.files.delete(condition)
 
     def table_versions(self, project_id: str) -> TableVersions:
-        """Snapshot both partition tables' versions before a commit begins."""
+        """Snapshot every partition table's version before a commit begins."""
         tables = self._tables(project_id)
-        return TableVersions(files=tables.files.version, chunks=tables.chunks.version)
+        assert tables.references is not None
+        return TableVersions(
+            files=tables.files.version,
+            chunks=tables.chunks.version,
+            references=tables.references.version,
+        )
 
-    def restore_versions(self, project_id: str, versions: TableVersions) -> bool:
-        """Return both partition tables to *versions*' data.
+    def restore_versions(
+        self,
+        project_id: str,
+        versions: TableVersions,
+        *,
+        restore_references: bool = True,
+    ) -> bool:
+        """Return every partition table to *versions*' data.
 
         ``restore`` followed by ``checkout_latest`` makes the recorded version
         the live one; restoring a table that is already at that version's data
@@ -260,8 +299,15 @@ class LanceStore:
             return False
         tables.files.restore(versions.files)
         tables.chunks.restore(versions.chunks)
+        if restore_references:
+            if tables.references is None:
+                raise RuntimeError("Reference table is missing from an interrupted transaction")
+            tables.references.restore(versions.references)
         tables.files.checkout_latest()
         tables.chunks.checkout_latest()
+        if restore_references:
+            assert tables.references is not None
+            tables.references.checkout_latest()
         return True
 
     def mark_project_state(self, project_id: str, state: str) -> bool:
@@ -286,6 +332,8 @@ class LanceStore:
         *,
         files: pa.Table,
         chunk_groups: Iterable[tuple[str, pa.Table]],
+        reference_groups: Iterable[tuple[str, pa.Table]] = (),
+        replace_reference_file_ids: Iterable[str] = (),
         removed_file_ids: Iterable[str] = (),
     ) -> None:
         """Commit staged Arrow batches without materializing chunk objects.
@@ -309,12 +357,77 @@ class LanceStore:
                 )
             else:
                 tables.chunks.delete(condition)
+        assert tables.references is not None
+        wanted_reference_ids = set(replace_reference_file_ids)
+        seen_reference_ids: set[str] = set()
+        for file_id, references in reference_groups:
+            if file_id not in wanted_reference_ids:
+                continue
+            condition = f"file_id = {_quoted(file_id)}"
+            if references.num_rows:
+                (
+                    tables.references.merge_insert("reference_id")
+                    .when_matched_update_all()
+                    .when_not_matched_insert_all()
+                    .when_not_matched_by_source_delete(condition)
+                    .execute(references)
+                )
+            else:
+                tables.references.delete(condition)
+            seen_reference_ids.add(file_id)
+        for file_id in wanted_reference_ids - seen_reference_ids:
+            tables.references.delete(f"file_id = {_quoted(file_id)}")
         if files.num_rows:
             self._merge(tables.files, "file_id", files)
         for file_id in removed_file_ids:
             condition = f"file_id = {_quoted(file_id)}"
             tables.chunks.delete(condition)
+            tables.references.delete(condition)
             tables.files.delete(condition)
+
+    def list_reference_records(
+        self, project_id: str, *, version: int | None = None
+    ) -> list[ReferenceRecord]:
+        """Return structural rows from the requested immutable table version."""
+        return self._reference_rows(project_id, None, version=version)
+
+    def reference_coverage(self, project_id: str) -> list[ReferenceRecord]:
+        return self._reference_rows(project_id, "record_kind = 'coverage'")
+
+    def reference_version(self, project_id: str) -> int:
+        """Return the current structural snapshot without creating a partition."""
+        tables = self._existing_tables(project_id)
+        if tables is None or tables.references is None:
+            return 0
+        return int(tables.references.version)
+
+    def coverage_for_file(
+        self, project_id: str, file_id: str, schema_version: int
+    ) -> list[ReferenceRecord]:
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise ValueError("schema_version must be a non-boolean integer")
+        return self._reference_rows(
+            project_id,
+            "record_kind = 'coverage' "
+            f"AND file_id = {_quoted(file_id)} AND schema_version = {schema_version}",
+        )
+
+    def declaration_shapes(self, project_id: str, qualified_symbol: str) -> list[ReferenceRecord]:
+        return self._reference_rows(
+            project_id,
+            "record_kind = 'declaration' "
+            f"AND source_qualified_symbol = {_quoted(qualified_symbol)}",
+        )
+
+    def imports_for(self, project_id: str, module_path: str) -> list[ReferenceRecord]:
+        return self._reference_rows(
+            project_id,
+            "record_kind = 'reference' AND kind = 'import' "
+            f"AND module_path = {_quoted(module_path)}",
+        )
+
+    def target_name_candidates(self, project_id: str, target_name: str) -> list[ReferenceRecord]:
+        return self._reference_rows(project_id, f"target_name = {_quoted(target_name)}")
 
     def list_chunks(self, project_ids: Iterable[str] | None = None) -> list[IndexedChunk]:
         ids = list(project_ids or [project.id for project in self.list_projects()])
@@ -473,7 +586,8 @@ class LanceStore:
         return [ChunkPreview.model_validate(row) for row in rows]
 
     def ensure_indexes(self, project_id: str, *, compact: bool = False) -> None:
-        chunks = self._tables(project_id).chunks
+        tables = self._tables(project_id)
+        chunks = tables.chunks
         indices = list(chunks.list_indices())
         indexed_columns = {column for index in indices for column in index.columns}
         if "search_text" not in indexed_columns:
@@ -499,6 +613,23 @@ class LanceStore:
         # zero age: searches run concurrently from the daemon and from direct
         # CLI processes, so versions in active use must not be reaped.
         chunks.optimize(cleanup_older_than=timedelta(days=1) if compact else None)
+        assert tables.references is not None
+        reference_indices = list(tables.references.list_indices())
+        indexed_reference_columns = {
+            column for index in reference_indices for column in index.columns
+        }
+        for column in (
+            "file_id",
+            "record_kind",
+            "target_name",
+            "module_path",
+            "kind",
+            "source_qualified_symbol",
+            "schema_version",
+        ):
+            if column not in indexed_reference_columns:
+                tables.references.create_index(column, config=BTree(), replace=False)
+        tables.references.optimize(cleanup_older_than=timedelta(days=1) if compact else None)
 
     def remove_project(self, project_id: str) -> bool:
         existed = bool(self._rows(self._projects, f"id = {_quoted(project_id)}"))
@@ -572,6 +703,34 @@ class LanceStore:
             ]
         )
 
+    @staticmethod
+    def _reference_schema() -> pa.Schema:
+        return pa.schema(
+            [
+                ("reference_id", pa.string()),
+                ("record_kind", pa.string()),
+                ("file_id", pa.string()),
+                ("project_id", pa.string()),
+                ("path", pa.string()),
+                ("language", pa.string()),
+                ("kind", pa.string()),
+                ("source_qualified_symbol", pa.string()),
+                ("written_name", pa.string()),
+                ("target_name", pa.string()),
+                ("module_path", pa.string()),
+                ("imported_name", pa.string()),
+                ("alias", pa.string()),
+                ("receiver_text", pa.string()),
+                ("start_byte", pa.int64()),
+                ("end_byte", pa.int64()),
+                ("start_line", pa.int32()),
+                ("end_line", pa.int32()),
+                ("shape_json", pa.string()),
+                ("content_hash", pa.string()),
+                ("schema_version", pa.int32()),
+            ]
+        )
+
     def _cached(self, project_id: str) -> _ProjectTables | None:
         """Return the cached partition for *project_id*, marking it recently used."""
         with self._partitions_lock:
@@ -603,7 +762,7 @@ class LanceStore:
     def _tables(self, project_id: str) -> _ProjectTables:
         """Open *project_id*'s partition, creating it. For write paths only."""
         cached = self._cached(project_id)
-        if cached is not None:
+        if cached is not None and cached.references is not None:
             return cached
         database = lancedb.connect(
             self.directory / "projects" / project_id,
@@ -616,8 +775,18 @@ class LanceStore:
                 "chunks",
                 self._chunk_schema(self.vector_dimension),
             ),
+            references=self._table(database, "references", self._reference_schema()),
         )
+        if cached is not None:
+            return self._replace_cached(project_id, tables)
         return self._remember(project_id, tables)
+
+    def _replace_cached(self, project_id: str, tables: _ProjectTables) -> _ProjectTables:
+        """Replace a cached legacy partition after adding its references table."""
+        with self._partitions_lock:
+            self._partitions[project_id] = tables
+            self._partitions.move_to_end(project_id)
+        return tables
 
     def _existing_tables(self, project_id: str) -> _ProjectTables | None:
         """Open *project_id*'s partition without creating it, or return None.
@@ -638,6 +807,7 @@ class LanceStore:
             tables = _ProjectTables(
                 files=cast(LanceTable, database.open_table("files")),
                 chunks=cast(LanceTable, database.open_table("chunks")),
+                references=self._open_optional_table(database, "references"),
             )
         except (ValueError, FileNotFoundError):
             return None
@@ -659,6 +829,14 @@ class LanceStore:
         return LanceStore._chunk_schema(vector_dimension)
 
     @staticmethod
+    def reference_schema() -> pa.Schema:
+        return LanceStore._reference_schema()
+
+    @staticmethod
+    def reference_arrow_schema() -> pa.Schema:
+        return LanceStore._reference_schema()
+
+    @staticmethod
     def _merge(table: LanceTable, key: str, rows: list[dict[str, Any]] | pa.Table) -> None:
         (
             table.merge_insert(key)
@@ -673,6 +851,38 @@ class LanceStore:
         if condition:
             query = query.where(condition)
         return cast(list[dict[str, Any]], query.to_list())
+
+    def _reference_rows(
+        self, project_id: str, condition: str | None, *, version: int | None = None
+    ) -> list[ReferenceRecord]:
+        tables = self._existing_tables(project_id)
+        if tables is None or tables.references is None:
+            return []
+        references = tables.references
+        if version is not None and version != int(references.version):
+            database = lancedb.connect(
+                self.directory / "projects" / project_id,
+                read_consistency_interval=timedelta(0),
+            )
+            references = cast(LanceTable, database.open_table("references", version=version))
+        query = references.search()
+        if condition:
+            query = query.where(condition)
+        query = query.order_by(
+            [
+                ColumnOrdering(column_name="path"),
+                ColumnOrdering(column_name="start_line"),
+                ColumnOrdering(column_name="reference_id"),
+            ]
+        )
+        return cast(list[ReferenceRecord], query.to_list())
+
+    @staticmethod
+    def _open_optional_table(database: Any, name: str) -> LanceTable | None:
+        try:
+            return cast(LanceTable, database.open_table(name))
+        except (ValueError, FileNotFoundError):
+            return None
 
     @staticmethod
     def _projected_chunks(

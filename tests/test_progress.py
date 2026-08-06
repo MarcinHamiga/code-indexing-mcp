@@ -71,6 +71,12 @@ def test_the_first_run_admits_it_has_no_total(tmp_path: Path) -> None:
     assert "files" in seen[0].describe()
 
 
+def test_reference_extraction_has_a_distinct_progress_description() -> None:
+    progress = IndexProgress(project_id="project", phase="extracting_references")
+
+    assert progress.describe() == "Extracting structural references"
+
+
 def test_another_process_can_read_the_snapshot_and_it_is_gone_afterwards(tmp_path: Path) -> None:
     project = initialize_project(_repo(tmp_path))
     embedder = RecordingEmbedder()

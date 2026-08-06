@@ -59,6 +59,8 @@ class IndexProgress(BaseModel):
 
         if self.phase == "committing":
             return "Committing the index"
+        if self.phase == "extracting_references":
+            return "Extracting structural references"
         if not self.files_seen:
             return "Scanning for changed files"
         if self.files_total:

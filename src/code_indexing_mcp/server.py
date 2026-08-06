@@ -29,11 +29,15 @@ from .errors import CodeIndexingError, ErrorCode
 from .models import (
     ChunkKind,
     CodeChunk,
+    DeclarationSelector,
     IndexReport,
     LanguageName,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
+    RefactorAnalysis,
+    RefactorOperation,
+    ReferenceResponse,
     RemovalReport,
     SearchResponse,
     SymbolResponse,
@@ -46,8 +50,10 @@ logger = logging.getLogger(__name__)
 SERVER_INSTRUCTIONS = (
     "Local Tree-sitter code indexing and hybrid search. "
     "When exploring code, prefer these index tools over grep-style file reading: "
-    "search_code (semantic natural-language queries), find_symbol (definitions and call "
-    "sites), file_outline (file structure before reading), get_chunk (exact code for a "
+    "search_code (semantic natural-language queries), find_symbol (definitions), "
+    "find_references (structural uses of a selected declaration), analyze_refactor "
+    "(rename or signature impact), file_outline (file structure before reading), "
+    "get_chunk (exact code for a "
     "search hit). When correlating code across explicitly related services, use list_projects "
     "to discover them and search_across_projects to search the selected repositories together. "
     "Check list_projects/project_status for index freshness first and run index_project if the "
@@ -706,8 +712,8 @@ def create_server(
             "Incrementally index a project: scan for supported source files, parse changed files "
             "with Tree-sitter, embed their chunks, and commit them. Files whose size, mtime, and "
             "content hash are unchanged are skipped without being re-read. Returns per-phase "
-            "counts and durations plus any per-file errors. Indexes Python, Java, JavaScript, and "
-            "TypeScript only, skipping symlinks, binaries, and files over 1 MiB."
+            "counts and durations plus any per-file errors. Indexes supported source files, "
+            "skipping symlinks, binaries, and files over 1 MiB."
         ),
         annotations=_WRITES,
     )
@@ -1033,6 +1039,69 @@ def create_server(
             match=match,
             kinds=selected_kinds,
             limit=limit,
+            roots=roots,
+        )
+
+    @mcp.tool(
+        title="Find references",
+        description=(
+            "Find structural uses of one declaration. Select it with a chunk_id or project, path, "
+            "and qualified_symbol. Results distinguish exact, likely, and unresolved bindings and "
+            "may trigger parse-only structural backfill; they never edit source files."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def find_references(
+        ctx: ServerContext,
+        selector: Annotated[
+            DeclarationSelector,
+            Field(description="Declaration selected by chunk id or stable source location."),
+        ],
+        kinds: Annotated[list[str] | None, Field(description="Optional reference kinds.")] = None,
+        limit: Annotated[int, Field(ge=1, le=500, description="Maximum results per page.")] = 100,
+        cursor: Annotated[str | None, Field(description="Opaque page cursor.")] = None,
+    ) -> ReferenceResponse:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(
+            app.find_references,
+            selector,
+            kinds=set(kinds) if kinds else None,
+            limit=limit,
+            cursor=cursor,
+            roots=roots,
+        )
+
+    @mcp.tool(
+        title="Analyze refactor impact",
+        description=(
+            "Analyze a proposed rename or signature change without editing source files. "
+            "Returns deterministic required edits, likely changes, dynamic-review findings, "
+            "and evidence for resolved aliases that need no spelling change."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def analyze_refactor(
+        ctx: ServerContext,
+        selector: Annotated[
+            DeclarationSelector,
+            Field(description="Declaration selected by chunk id or stable source location."),
+        ],
+        operation: Annotated[
+            RefactorOperation,
+            Field(description="Discriminated rename or signature-change operation."),
+        ],
+        limit: Annotated[int, Field(ge=1, le=500, description="Maximum findings per page.")] = 500,
+        cursor: Annotated[str | None, Field(description="Opaque analysis page cursor.")] = None,
+    ) -> RefactorAnalysis:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(
+            app.analyze_refactor,
+            selector,
+            operation,
+            limit=limit,
+            cursor=cursor,
             roots=roots,
         )
 
