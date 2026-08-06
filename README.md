@@ -359,7 +359,7 @@ Incremental refreshes:
   scan, so each changed file is read once. They count toward `skipped_files` and are not recorded as
   per-file errors.
 
-These languages are supported, all through bundled grammars that need no toolchain of their own —
+These languages are supported, all through packaged grammars that need no toolchain of their own —
 no JDK, Maven, Gradle, .NET SDK, Godot, or database connection:
 
 The `languages` column is the exact value `search_code`'s `languages` filter accepts, which is not
@@ -380,6 +380,13 @@ TypeScript, and the two Godot data formats are one language.
 | SQL        | `.sql`                         | `sql`             | tables, views, materialized views, indexes, functions, triggers, types |
 | YAML       | `.yaml`, `.yml`                | `yaml`            | collection-valued keys, qualified by their path               |
 | JSON       | `.json`                        | `json`            | collection-valued keys, qualified by their path               |
+
+| Go         | .go                           | go                | types, functions, methods, constants                          |
+| Terraform  | .tf, .tfvars                  | terraform         | variable and resource blocks                                  |
+| Rust       | .rs                           | rust              | structs, enums, functions, constants                          |
+| C          | .c, .h                        | c                 | preprocessor constants, structs, functions                    |
+| C++        | .cc, .cpp, .cxx, .hh, .hpp, .hxx | cpp            | classes, methods, functions                                  |
+| Lua        | .lua                          | lua               | functions                                                     |
 
 Nested declarations are qualified by their enclosing scope in every language, so a C# method
 indexes as `Outer.Inner.Work` and a Compose service port list as `services.web.ports`.

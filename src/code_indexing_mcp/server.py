@@ -677,8 +677,8 @@ def create_server(
             "Incrementally index a project: scan for supported source files, parse changed files "
             "with Tree-sitter, embed their chunks, and commit them. Files whose size, mtime, and "
             "content hash are unchanged are skipped without being re-read. Returns per-phase "
-            "counts and durations plus any per-file errors. Indexes Python, Java, JavaScript, and "
-            "TypeScript only, skipping symlinks, binaries, and files over 1 MiB."
+            "counts and durations plus any per-file errors. Indexes supported source files, "
+            "skipping symlinks, binaries, and files over 1 MiB."
         ),
         annotations=_WRITES,
     )

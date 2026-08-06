@@ -11,11 +11,17 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Final
 
+import tree_sitter_c
 import tree_sitter_c_sharp
+import tree_sitter_cpp
+import tree_sitter_go
+import tree_sitter_hcl
 import tree_sitter_java
 import tree_sitter_javascript
 import tree_sitter_json
+import tree_sitter_lua
 import tree_sitter_python
+import tree_sitter_rust
 import tree_sitter_sql
 import tree_sitter_typescript
 import tree_sitter_yaml
@@ -75,6 +81,12 @@ def _languages() -> dict[str, Language]:
         "tsx": Language(tree_sitter_typescript.language_tsx()),
         "csharp": Language(tree_sitter_c_sharp.language()),
         "sql": Language(tree_sitter_sql.language()),
+        "go": Language(tree_sitter_go.language()),
+        "terraform": Language(tree_sitter_hcl.language()),
+        "rust": Language(tree_sitter_rust.language()),
+        "c": Language(tree_sitter_c.language()),
+        "cpp": Language(tree_sitter_cpp.language()),
+        "lua": Language(tree_sitter_lua.language()),
         # No standalone GDScript grammar is published to PyPI; the language pack
         # is the only packaged source. It already returns a Language, not a
         # PyCapsule, so it is not wrapped like the others. The two sibling Godot
