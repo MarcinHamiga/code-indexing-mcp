@@ -1,5 +1,6 @@
 import shutil
 import threading
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -173,6 +174,28 @@ def test_init_project_defaults_to_the_single_client_root(tmp_path: Path) -> None
     project = app.init_project(roots=[root])
 
     assert project.root == root.resolve()
+
+
+def test_case_insensitive_root_alias_is_one_registration_and_one_lock(
+    tmp_path: Path, case_insensitive_path_alias: Callable[[Path], Path]
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    alias = case_insensitive_path_alias(root)
+
+    from_alias = app.init_project(alias)
+    from_duplicate_roots = app.init_project(roots=[root, alias])
+
+    assert from_alias.id == project.id
+    assert from_duplicate_roots.id == project.id
+    assert app._root_lock(root).lock_file == app._root_lock(alias).lock_file
+    assert app.list_projects() == [project]
 
 
 def test_discover_project_requires_marker_and_supported_source(tmp_path: Path) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from functools import partial, wraps
@@ -38,6 +38,7 @@ from .models import (
     SearchResponse,
     SymbolResponse,
 )
+from .projects import same_project_root
 from .settings import IndexMode, IndexSettings
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,15 @@ WATCH_RETRY_MAXIMUM_SECONDS = 30.0
 EAGER_RECONCILE_SECONDS = 30.0
 
 
+def _unique_project_roots(roots: Iterable[Path]) -> list[Path]:
+    unique: list[Path] = []
+    for root in roots:
+        resolved = root.resolve()
+        if not any(same_project_root(resolved, existing) for existing in unique):
+            unique.append(resolved)
+    return unique
+
+
 @dataclass
 class _StartupJob:
     discovered: anyio.Event = field(default_factory=anyio.Event)
@@ -118,7 +128,11 @@ class StartupCoordinator:
         async with self._lock:
             for root in roots:
                 root = root.resolve()
-                existing = self._jobs.get(root)
+                registered_root = next(
+                    (candidate for candidate in self._jobs if same_project_root(candidate, root)),
+                    None,
+                )
+                existing = self._jobs.get(registered_root) if registered_root is not None else None
                 if existing is not None:
                     if not existing.ready.is_set():
                         continue
@@ -132,8 +146,9 @@ class StartupCoordinator:
                         ):
                             continue
                 job = _StartupJob(indexes=indexes)
-                self._jobs[root] = job
-                self.task_group.start_soon(self._run, root, job)
+                job_root = registered_root or root
+                self._jobs[job_root] = job
+                self.task_group.start_soon(self._run, job_root, job)
 
     async def _is_stale(self, project_id: str) -> bool:
         return await anyio.to_thread.run_sync(
@@ -166,7 +181,21 @@ class StartupCoordinator:
 
     async def _jobs_for(self, roots: list[Path]) -> list[_StartupJob]:
         async with self._lock:
-            return [self._jobs[root.resolve()] for root in roots if root.resolve() in self._jobs]
+            jobs: list[_StartupJob] = []
+            seen: set[int] = set()
+            for root in roots:
+                job = next(
+                    (
+                        candidate_job
+                        for candidate_root, candidate_job in self._jobs.items()
+                        if same_project_root(candidate_root, root)
+                    ),
+                    None,
+                )
+                if job is not None and id(job) not in seen:
+                    jobs.append(job)
+                    seen.add(id(job))
+            return jobs
 
     async def _run(self, root: Path, job: _StartupJob) -> None:
         try:
@@ -202,7 +231,7 @@ class StartupCoordinator:
             return
         root = root.resolve()
         async with self._lock:
-            if root in self._monitors:
+            if any(same_project_root(existing, root) for existing in self._monitors):
                 return
             dirty: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
             # The watch backend takes its first filesystem snapshot when its
@@ -334,7 +363,7 @@ async def _roots(ctx: ServerContext) -> list[Path]:
         parsed = urlparse(str(root.uri))
         if parsed.scheme == "file":
             roots.append(Path(url2pathname(unquote(parsed.path))).resolve())
-    return roots
+    return _unique_project_roots(roots)
 
 
 def _coordinator(ctx: ServerContext) -> StartupCoordinator | None:
@@ -437,7 +466,7 @@ async def _wait_for_startup_projects(
     # An explicit project or all_projects query can select registrations that
     # are not among the client's advertised roots. Freshen those too; otherwise
     # lazy mode would silently serve an old index for exactly those scopes.
-    selected_roots = list(dict.fromkeys([*roots, *(project.root for project in projects)]))
+    selected_roots = _unique_project_roots([*roots, *(project.root for project in projects)])
     statuses = await asyncio.gather(
         *(
             asyncio.to_thread(coordinator.application.project_status, project.id)

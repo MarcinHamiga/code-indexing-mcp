@@ -24,6 +24,26 @@ LEGACY_MARKER_DIRECTORY = ".code-indexing-mcp"
 MARKER_FILE = "project.toml"
 
 
+def same_project_root(left: Path, right: Path) -> bool:
+    """Return whether two path spellings identify the same project directory."""
+    left = left.expanduser()
+    right = right.expanduser()
+    try:
+        return left.samefile(right)
+    except OSError:
+        return left.resolve() == right.resolve()
+
+
+def project_root_identity(root: Path) -> str:
+    """Return a cross-process identity for an existing project directory."""
+    resolved = root.expanduser().resolve()
+    try:
+        info = resolved.stat()
+    except OSError:
+        return f"path:{resolved}"
+    return f"inode:{info.st_dev}:{info.st_ino}"
+
+
 def marker_path(root: Path) -> Path:
     return root / MARKER_DIRECTORY / MARKER_FILE
 
@@ -174,6 +194,6 @@ class ProjectResolver:
     def _by_root_or_marker(self, root: Path) -> ProjectInfo:
         resolved = root.resolve()
         for project in self._projects:
-            if project.root.resolve() == resolved:
+            if same_project_root(project.root, resolved):
                 return project
         return read_project_marker(resolved)

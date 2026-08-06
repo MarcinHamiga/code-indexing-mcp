@@ -47,7 +47,14 @@ from .models import (
 from .passage_backend import PassageBackendSession
 from .probe_cache import ProbeCache, ProbeKey, ProbeRecord, model_artifact_fingerprint
 from .progress import IndexProgress, read_progress
-from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
+from .projects import (
+    ProjectResolver,
+    find_project_root,
+    initialize_project,
+    project_root_identity,
+    read_project_marker,
+    same_project_root,
+)
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
@@ -531,12 +538,16 @@ class Application:
         roots: list[Path] | None = None,
     ) -> ProjectInfo:
         if path is None and roots:
-            if len(roots) > 1:
+            unique_roots: list[Path] = []
+            for root in roots:
+                if not any(same_project_root(root, existing) for existing in unique_roots):
+                    unique_roots.append(root)
+            if len(unique_roots) > 1:
                 raise CodeIndexingError(
                     ErrorCode.AMBIGUOUS_PROJECT,
                     "Multiple MCP roots are available; provide an explicit path",
                 )
-            path = roots[0]
+            path = unique_roots[0]
         root = Path(path) if path is not None else self.cwd
         # The daemon serves every client on its own thread, so N clients calling
         # this for one root would otherwise all miss the marker and register N
@@ -689,7 +700,7 @@ class Application:
         """Return the cross-thread, cross-process lock guarding *root*'s marker."""
         directory = self.paths.data / "locks"
         directory.mkdir(parents=True, exist_ok=True)
-        digest = sha256(str(root.expanduser().resolve()).encode()).hexdigest()
+        digest = sha256(project_root_identity(root).encode()).hexdigest()
         return FileLock(directory / f"discover-{digest}.lock")
 
     def _register_project(self, project: ProjectInfo) -> None:

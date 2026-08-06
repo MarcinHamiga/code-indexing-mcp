@@ -1,9 +1,25 @@
-"""Helpers shared by the installer test modules."""
+"""Helpers shared by the test suite."""
 
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def case_insensitive_path_alias() -> Callable[[Path], Path]:
+    """Return a differently-cased alias, or skip when the filesystem is case-sensitive."""
+
+    def alias(path: Path) -> Path:
+        candidate = path.with_name(path.name.swapcase())
+        if candidate == path or not candidate.exists() or not candidate.samefile(path):
+            pytest.skip("test requires a case-insensitive filesystem")
+        return candidate
+
+    return alias
 
 
 def run_git(*arguments: str, cwd: Path | None = None) -> None:

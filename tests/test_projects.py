@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,9 @@ from code_indexing_mcp.projects import (
     ProjectResolver,
     find_project_root,
     initialize_project,
+    project_root_identity,
     read_project_marker,
+    same_project_root,
 )
 
 
@@ -144,3 +147,32 @@ def test_resolver_rejects_ambiguous_roots(tmp_path: Path) -> None:
         resolver.resolve(roots=roots, cwd=tmp_path)
 
     assert raised.value.code is ErrorCode.AMBIGUOUS_PROJECT
+
+
+def test_project_root_identity_uses_filesystem_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    upper = Path("/Projects/Example")
+    lower = Path("/projects/example")
+
+    class Identity:
+        st_dev = 12
+        st_ino = 34
+
+    monkeypatch.setattr(Path, "stat", lambda _path: Identity())
+    monkeypatch.setattr(Path, "samefile", lambda _path, _other: True)
+
+    assert project_root_identity(upper) == project_root_identity(lower)
+    assert same_project_root(upper, lower) is True
+
+
+def test_resolver_reuses_registered_project_for_case_insensitive_path_alias(
+    tmp_path: Path, case_insensitive_path_alias: Callable[[Path], Path]
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    alias = case_insensitive_path_alias(root)
+
+    resolved = ProjectResolver([project]).resolve(explicit=str(alias))
+
+    assert resolved == project
+    assert resolved.root == root.resolve()
