@@ -1,7 +1,7 @@
 """Journalled Arrow staging for crash-recoverable index commits.
 
 An index run never touches the live Lance tables while it scans, parses, and
-embeds. It streams file and chunk rows into Arrow IPC files under
+embeds. It streams file, chunk, and structural-reference rows into Arrow IPC files under
 ``<data>/staging/<project-id>/<job-id>/`` and records its progress in
 ``journal.json``. Only once staging finishes does the run record the live
 tables' versions, switch the journal to ``committing``, and apply the staged
@@ -37,13 +37,15 @@ logger = logging.getLogger(__name__)
 JOURNAL_NAME = "journal.json"
 FILES_NAME = "files.arrow"
 CHUNKS_NAME = "chunks.arrow"
+REFERENCES_NAME = "references.arrow"
 
 PHASE_STAGING = "staging"
 PHASE_COMMITTING = "committing"
 PHASE_COMPLETE = "complete"
 PHASE_ROLLED_BACK = "rolled_back"
 
-JOURNAL_FORMAT_VERSION = 1
+LEGACY_JOURNAL_FORMAT_VERSION = 1
+JOURNAL_FORMAT_VERSION = 2
 
 # A rollback that keeps failing must not be retried forever: every startup
 # would pay for it, under the global index lock, with no prospect of success.
@@ -81,6 +83,33 @@ class ChunkRow:
     content_hash: str
     part_index: int
     vector: bytes
+
+
+@dataclass(frozen=True)
+class ReferenceRow:
+    """One structural reference, declaration shape, or coverage record."""
+
+    reference_id: str
+    record_kind: str
+    file_id: str
+    project_id: str
+    path: str
+    language: str
+    kind: str | None
+    source_qualified_symbol: str | None
+    written_name: str | None
+    target_name: str | None
+    module_path: str | None
+    imported_name: str | None
+    alias: str | None
+    receiver_text: str | None
+    start_byte: int | None
+    end_byte: int | None
+    start_line: int | None
+    end_line: int | None
+    shape_json: str | None
+    content_hash: str
+    schema_version: int
 
 
 def _write_atomically(path: Path, payload: bytes) -> None:
@@ -127,6 +156,7 @@ class StagingJob:
         *,
         file_schema: pa.Schema,
         chunk_schema: pa.Schema,
+        reference_schema: pa.Schema,
         job_id: str | None = None,
     ) -> None:
         self.staging_root = staging_root
@@ -134,13 +164,19 @@ class StagingJob:
         self.job_id = job_id or f"{time.time_ns():x}-{os.getpid()}"
         self._file_schema = file_schema
         self._chunk_schema = chunk_schema
+        self._reference_schema = reference_schema
         self.replace_file_ids: list[str] = []
+        self.replace_reference_file_ids: list[str] = []
+        self._reference_file_ids: set[str] = set()
+        self._last_reference_file_id: str | None = None
         self.removed_file_ids: list[str] = []
         self._journal: dict[str, Any] = {}
         self._files_sink: Any = None
         self._chunks_sink: Any = None
+        self._references_sink: Any = None
         self._files_writer: pa.RecordBatchWriter | None = None
         self._chunks_writer: pa.RecordBatchWriter | None = None
+        self._references_writer: pa.RecordBatchWriter | None = None
 
     @property
     def directory(self) -> Path:
@@ -158,6 +194,9 @@ class StagingJob:
         self._write_journal()
         self._files_sink, self._files_writer = self._open_writer(FILES_NAME, self._file_schema)
         self._chunks_sink, self._chunks_writer = self._open_writer(CHUNKS_NAME, self._chunk_schema)
+        self._references_sink, self._references_writer = self._open_writer(
+            REFERENCES_NAME, self._reference_schema
+        )
 
     def stage_file(self, record: StoredFile) -> None:
         """Stage one file record. Files are few and carry no vectors."""
@@ -170,6 +209,8 @@ class StagingJob:
         assert self._chunks_writer is not None
         if not rows:
             return
+        if any(row.file_id != rows[0].file_id for row in rows[1:]):
+            raise ValueError("A staged chunk batch must contain rows from one file")
         vector_type = self._chunk_schema.field("vector").type
         dimension = vector_type.list_size
         columns: list[pa.Array] = []
@@ -185,8 +226,38 @@ class StagingJob:
                 )
         self._chunks_writer.write_batch(pa.record_batch(columns, schema=self._chunk_schema))
 
+    def stage_references(self, rows: list[ReferenceRow]) -> None:
+        """Stage one file's structural rows as one ordered Arrow batch.
+
+        Calls for a file may be repeated while contiguous, but once another
+        file is staged that file is closed for this job. This lets commit stream
+        one complete file group at a time without retaining the whole staged
+        reference dataset in memory.
+        """
+        assert self._references_writer is not None
+        if not rows:
+            return
+        file_id = rows[0].file_id
+        if any(row.file_id != file_id for row in rows[1:]):
+            raise ValueError("A staged reference batch must contain rows from one file")
+        if file_id in self._reference_file_ids and file_id != self._last_reference_file_id:
+            raise ValueError("Staged reference batches for a file must be contiguous")
+        self._reference_file_ids.add(file_id)
+        self._last_reference_file_id = file_id
+        columns = [
+            pa.array([getattr(row, field.name) for row in rows], type=field.type)
+            for field in self._reference_schema
+        ]
+        self._references_writer.write_batch(pa.record_batch(columns, schema=self._reference_schema))
+
     def mark_replaced(self, file_id: str) -> None:
-        self.replace_file_ids.append(file_id)
+        if file_id not in self.replace_file_ids:
+            self.replace_file_ids.append(file_id)
+
+    def mark_references_replaced(self, file_id: str) -> None:
+        """Mark one file's structural rows for replacement, independently of chunks."""
+        if file_id not in self.replace_reference_file_ids:
+            self.replace_reference_file_ids.append(file_id)
 
     def mark_removed(self, file_id: str) -> None:
         self.removed_file_ids.append(file_id)
@@ -199,7 +270,9 @@ class StagingJob:
                 "phase": PHASE_COMMITTING,
                 "files_version": versions.files,
                 "chunks_version": versions.chunks,
+                "references_version": versions.references,
                 "replace_file_ids": self.replace_file_ids,
+                "replace_reference_file_ids": self.replace_reference_file_ids,
                 "removed_file_ids": self.removed_file_ids,
             }
         )
@@ -239,6 +312,42 @@ class StagingJob:
             yield current_file_id, pa.Table.from_batches(batches, schema=self._chunk_schema)
         empty = pa.Table.from_batches([], schema=self._chunk_schema)
         for file_id in self.replace_file_ids:
+            if file_id not in seen:
+                yield file_id, empty
+
+    def iter_reference_groups(self) -> Iterator[tuple[str, pa.Table]]:
+        """Yield one complete staged structural table per replaced file.
+
+        :meth:`stage_references` enforces one file per contiguous batch, so
+        only the current file's Arrow batches are retained while streaming the
+        staged IPC file back into the commit.
+        """
+        wanted = set(self.replace_reference_file_ids)
+        seen: set[str] = set()
+        current_file_id: str | None = None
+        batches: list[pa.RecordBatch] = []
+        reader = pa.ipc.open_file(self.directory / REFERENCES_NAME)
+        for index in range(reader.num_record_batches):
+            batch = reader.get_batch(index)
+            file_id = cast(str, batch.column("file_id")[0].as_py())
+            if file_id != current_file_id:
+                if batches:
+                    assert current_file_id is not None
+                    seen.add(current_file_id)
+                    yield (
+                        current_file_id,
+                        pa.Table.from_batches(batches, schema=self._reference_schema),
+                    )
+                    batches = []
+                current_file_id = file_id
+            if file_id in wanted:
+                batches.append(batch)
+        if batches:
+            assert current_file_id is not None
+            seen.add(current_file_id)
+            yield current_file_id, pa.Table.from_batches(batches, schema=self._reference_schema)
+        empty = pa.Table.from_batches([], schema=self._reference_schema)
+        for file_id in self.replace_reference_file_ids:
             if file_id not in seen:
                 yield file_id, empty
 
@@ -285,6 +394,7 @@ class StagingJob:
         for name, sink, writer in (
             (FILES_NAME, self._files_sink, self._files_writer),
             (CHUNKS_NAME, self._chunks_sink, self._chunks_writer),
+            (REFERENCES_NAME, self._references_sink, self._references_writer),
         ):
             if writer is None:
                 continue
@@ -297,8 +407,8 @@ class StagingJob:
                     self.directory / f"{name}.tmp",
                     self.directory / name,
                 )
-        self._files_sink = self._chunks_sink = None
-        self._files_writer = self._chunks_writer = None
+        self._files_sink = self._chunks_sink = self._references_sink = None
+        self._files_writer = self._chunks_writer = self._references_writer = None
         if finalize:
             _sync_directory(self.directory)
 
@@ -313,7 +423,7 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
     A journal still in ``staging`` never reached the live tables, and one in a
     terminal phase only failed to clean up, so both are simply removed. A
     journal in ``committing`` means a crash after live writes began: restore
-    both tables to the recorded versions, mark the journal ``rolled_back``,
+    the tables recorded by that journal generation, mark the journal ``rolled_back``,
     and remove the directory. Restoring an already-restored table is safe, so
     repeated recovery over the same journal is idempotent.
 
@@ -337,12 +447,25 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
             continue
         project_id = str(journal["project_id"])
         try:
-            restored = store.restore_versions(
-                project_id,
-                TableVersions(
+            journal_version = int(journal.get("version", LEGACY_JOURNAL_FORMAT_VERSION))
+            if journal_version == LEGACY_JOURNAL_FORMAT_VERSION:
+                versions = TableVersions(
                     files=int(journal["files_version"]),
                     chunks=int(journal["chunks_version"]),
-                ),
+                    references=0,
+                )
+            elif journal_version == JOURNAL_FORMAT_VERSION:
+                versions = TableVersions(
+                    files=int(journal["files_version"]),
+                    chunks=int(journal["chunks_version"]),
+                    references=int(journal["references_version"]),
+                )
+            else:
+                raise ValueError(f"Unsupported staging journal version: {journal_version}")
+            restored = store.restore_versions(
+                project_id,
+                versions,
+                restore_references=journal_version != LEGACY_JOURNAL_FORMAT_VERSION,
             )
         except Exception:
             attempts = int(journal.get("recovery_attempts", 0)) + 1

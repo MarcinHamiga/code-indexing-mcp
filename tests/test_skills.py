@@ -45,3 +45,11 @@ def test_skill_references_only_code_indexing_mcp_tools(skill_dir: Path) -> None:
     text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
     referenced_servers = set(re.findall(r"mcp__([\w-]+?)__", text))
     assert referenced_servers == {"code-indexing-mcp"}
+
+
+@pytest.mark.parametrize("skill_name", ["impact-analysis", "feature-dev"])
+def test_refactoring_workflows_name_the_structural_analysis_tools(skill_name: str) -> None:
+    text = (SKILLS_DIR / skill_name / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "mcp__code-indexing-mcp__find_references" in text
+    assert "mcp__code-indexing-mcp__analyze_refactor" in text

@@ -2,6 +2,7 @@ import shutil
 import threading
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -15,6 +16,7 @@ from code_indexing_mcp.application import Application, RuntimePaths
 from code_indexing_mcp.backends import CPU_BACKEND, Accelerator
 from code_indexing_mcp.embedding_worker import default_launcher
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.models import DeclarationSelector, ReferenceBackfillReport
 from code_indexing_mcp.settings import IndexSettings
 from code_indexing_mcp.token_batching import DEFAULT_MAX_TOKEN_PRODUCT, REFERENCE_MEMORY_BYTES
 from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher
@@ -103,6 +105,60 @@ def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> N
     assert removal.removed is True
     assert app.list_projects() == []
     assert (root / ".ci-mcp" / "project.toml").exists()
+
+
+def test_application_can_ensure_the_structural_index_without_a_semantic_search(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    report = app.ensure_reference_index(project.id)
+
+    assert report.complete is True
+    assert report.files_current == 1
+
+
+def test_reference_query_rejects_an_incomplete_structural_index(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    with (
+        patch.object(
+            app.indexer,
+            "backfill_references",
+            return_value=ReferenceBackfillReport(
+                project_id=project.id, incomplete_paths=["main.py"]
+            ),
+        ),
+        pytest.raises(CodeIndexingError) as raised,
+    ):
+        app.find_references(
+            DeclarationSelector(
+                project=project.id,
+                path="main.py",
+                qualified_symbol="answer",
+            )
+        )
+
+    assert raised.value.code is ErrorCode.REFERENCE_INDEX_UNAVAILABLE
+    assert raised.value.details["incomplete_paths"] == ["main.py"]
 
 
 def test_modified_source_marks_an_index_stale(tmp_path: Path) -> None:

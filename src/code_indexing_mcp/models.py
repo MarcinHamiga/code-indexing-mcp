@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, GetJsonSchemaHandler
+from pydantic import BaseModel, ConfigDict, Field, GetJsonSchemaHandler, model_validator
 from pydantic.json_schema import JsonSchemaValue
 
 
@@ -119,6 +119,27 @@ ChunkKind = Literal[
     "view_part",
 ]
 
+ReferenceKind = Literal[
+    "import",
+    "export",
+    "call",
+    "type_use",
+    "inheritance",
+    "decorator",
+    "read",
+    "write",
+]
+
+ParameterKind = Literal[
+    "positional_only",
+    "positional",
+    "keyword_only",
+    "variadic",
+    "keyword_variadic",
+]
+
+ResolutionLevel = Literal["exact", "likely", "unresolved"]
+
 # Mirrors scanner.LANGUAGES values. Kept here rather than imported from scanner so
 # models stays free of scanner imports.
 LanguageName = Literal[
@@ -204,9 +225,199 @@ class ExtractedChunk(FrozenModel):
     search_suffix: str = ""
 
 
+class CallShape(FrozenModel):
+    positional_count: int = 0
+    keywords: list[str] = Field(default_factory=list)
+    has_positional_spread: bool = False
+    has_keyword_spread: bool = False
+    type_argument_count: int | None = None
+    constructor: bool = False
+
+
+class ParameterShape(FrozenModel):
+    name: str
+    kind: ParameterKind
+    required: bool
+    position: int
+
+
+class ExtractedReference(FrozenModel):
+    kind: ReferenceKind
+    written_name: str
+    target_name: str
+    source_qualified_symbol: str | None = None
+    module_path: str | None = None
+    imported_name: str | None = None
+    alias: str | None = None
+    receiver_text: str | None = None
+    start_byte: int
+    end_byte: int
+    start_line: int
+    end_line: int
+    call_shape: CallShape | None = None
+
+
+class ExtractedDeclarationShape(FrozenModel):
+    symbol: str
+    qualified_symbol: str
+    kind: str
+    start_byte: int
+    end_byte: int
+    start_line: int
+    end_line: int
+    parameters: list[ParameterShape] = Field(default_factory=list)
+
+
 class ExtractionResult(FrozenModel):
     chunks: list[ExtractedChunk]
+    references: list[ExtractedReference] = Field(default_factory=list)
+    declarations: list[ExtractedDeclarationShape] = Field(default_factory=list)
     has_errors: bool = False
+
+
+class ReferenceCoverage(FrozenModel):
+    """The structural extraction generation known for one indexed file."""
+
+    file_id: str
+    path: str
+    content_hash: str
+    schema_version: int
+
+
+class ReferenceBackfillReport(FrozenModel):
+    """Outcome of a parse-only structural-index catch-up run."""
+
+    project_id: str
+    files_checked: int = 0
+    files_backfilled: int = 0
+    files_current: int = 0
+    incomplete_paths: list[str] = Field(default_factory=list)
+    stale_paths: list[str] = Field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return not self.incomplete_paths and not self.stale_paths
+
+
+class DeclarationSelector(FrozenModel):
+    """One declaration identity, by chunk id or its stable source location."""
+
+    chunk_id: str | None = None
+    project: str | None = None
+    path: str | None = None
+    qualified_symbol: str | None = None
+
+    @model_validator(mode="after")
+    def _one_selector_mode(self) -> "DeclarationSelector":
+        by_chunk = self.chunk_id is not None
+        by_location = all(
+            value is not None for value in (self.project, self.path, self.qualified_symbol)
+        )
+        any_location = any(
+            value is not None for value in (self.project, self.path, self.qualified_symbol)
+        )
+        if by_chunk and any_location:
+            raise ValueError("chunk_id cannot be combined with project, path, or qualified_symbol")
+        if by_chunk:
+            return self
+        if not by_location:
+            raise ValueError(
+                "Provide exactly chunk_id or project, path, and qualified_symbol together"
+            )
+        return self
+
+
+class SelectedDeclaration(FrozenModel):
+    project_id: str
+    file_id: str
+    path: str
+    language: str
+    symbol: str
+    qualified_symbol: str
+    kind: str
+    start_line: int
+    end_line: int
+    chunk_id: str | None = None
+
+
+class ReferenceHit(FrozenModel):
+    reference_id: str
+    project_id: str
+    path: str
+    language: str
+    kind: ReferenceKind
+    start_line: int
+    end_line: int
+    start_byte: int
+    end_byte: int
+    snippet: str = ""
+    resolution: ResolutionLevel
+    reason_code: str
+    explanation: str
+
+
+class ReferenceLimitation(FrozenModel):
+    code: str
+    explanation: str
+    path: str | None = None
+
+
+class ReferenceResponse(FrozenModel):
+    selected: SelectedDeclaration
+    hits: list[ReferenceHit] = Field(default_factory=list)
+    limitations: list[ReferenceLimitation] = Field(default_factory=list)
+    cursor: str | None = None
+    snapshot_version: int = 0
+
+
+class RenameOperation(FrozenModel):
+    kind: Literal["rename"] = "rename"
+    new_name: str
+
+
+class SignatureChangeOperation(FrozenModel):
+    kind: Literal["signature_change"] = "signature_change"
+    parameters: list[ParameterShape]
+
+
+RefactorOperation = Annotated[
+    RenameOperation | SignatureChangeOperation, Field(discriminator="kind")
+]
+
+
+class RefactorFinding(ReferenceHit):
+    written_name: str | None = None
+    edit_required: bool = False
+
+
+class CompletenessReport(FrozenModel):
+    state: Literal["complete", "complete_with_dynamic_limitations", "incomplete"] = "complete"
+    explanation: str = "All indexed structural candidates were considered."
+
+
+class RefactorCounts(FrozenModel):
+    must_change: int = 0
+    likely_change: int = 0
+    review: int = 0
+    evidence: int = 0
+
+
+class RefactorAnalysis(FrozenModel):
+    selected: SelectedDeclaration
+    operation: RefactorOperation
+    must_change: list[RefactorFinding] = Field(default_factory=list)
+    likely_change: list[RefactorFinding] = Field(default_factory=list)
+    review: list[RefactorFinding] = Field(default_factory=list)
+    evidence: list[RefactorFinding] = Field(default_factory=list)
+    limitations: list[ReferenceLimitation] = Field(default_factory=list)
+    counts: RefactorCounts = Field(default_factory=RefactorCounts)
+    cursor: str | None = None
+    completeness: CompletenessReport = Field(default_factory=CompletenessReport)
+
+    @property
+    def findings(self) -> list[RefactorFinding]:
+        """Return every finding while preserving the caller-facing priority order."""
+        return [*self.must_change, *self.likely_change, *self.review, *self.evidence]
 
 
 class StoredFile(FrozenModel):

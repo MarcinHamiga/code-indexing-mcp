@@ -32,11 +32,16 @@ from .extractor import TreeSitterExtractor
 from .indexing import Indexer
 from .models import (
     CodeChunk,
+    DeclarationSelector,
     IndexReport,
     ModelStatus,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
+    RefactorAnalysis,
+    RefactorOperation,
+    ReferenceBackfillReport,
+    ReferenceResponse,
     RemovalReport,
     ScanConfig,
     ScannedFile,
@@ -48,6 +53,7 @@ from .passage_backend import PassageBackendSession
 from .probe_cache import ProbeCache, ProbeKey, ProbeRecord, model_artifact_fingerprint
 from .progress import IndexProgress, read_progress
 from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
+from .reference_service import ReferenceService
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
@@ -209,6 +215,7 @@ class Application:
             progress_directory=paths.data / "progress",
         )
         self.search = SearchService(self.store, embedder)
+        self.references = ReferenceService(self.store)
 
     def _select_backend(self) -> BackendSelection:
         """Choose a backend from everything this machine can actually execute."""
@@ -584,6 +591,34 @@ class Application:
 
         return read_progress(self.paths.data / "progress", project_id)
 
+    def ensure_reference_index(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> ReferenceBackfillReport:
+        """Bring structural rows current without running during semantic searches.
+
+        Reference tools call this boundary before resolution. If a source moved
+        between freshness inspection and parse-only backfill, advance its normal
+        semantic index first and retry once so files, chunks, and references
+        remain one coherent generation.
+        """
+
+        resolved = self._resolve(project, roots)
+        if self._project_is_stale(resolved):
+            self.indexer.index(resolved, wait_for_lock=True)
+        report = self.indexer.backfill_references(resolved, wait_for_lock=True)
+        if report.stale_paths:
+            self.indexer.index(resolved, wait_for_lock=True)
+            report = self.indexer.backfill_references(resolved, wait_for_lock=True)
+        if not report.complete:
+            raise CodeIndexingError(
+                ErrorCode.REFERENCE_INDEX_UNAVAILABLE,
+                f"Structural reference index is incomplete: {resolved.name}",
+                project=resolved.id,
+                incomplete_paths=report.incomplete_paths,
+                stale_paths=report.stale_paths,
+            )
+        return report
+
     def project_status(
         self, project: str | None = None, *, roots: list[Path] | None = None
     ) -> ProjectStatus:
@@ -679,6 +714,42 @@ class Application:
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         return self.search.get_chunk(chunk_id)
+
+    def find_references(
+        self,
+        selector: DeclarationSelector,
+        *,
+        kinds: set[str] | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+        roots: list[Path] | None = None,
+    ) -> ReferenceResponse:
+        if selector.project is not None:
+            resolved = self._resolve(selector.project, roots)
+            selector = selector.model_copy(update={"project": resolved.id})
+            project_id = resolved.id
+        else:
+            project_id = self.search.get_chunk(selector.chunk_id or "").project_id
+        self.ensure_reference_index(project_id, roots=roots)
+        return self.references.find_references(selector, kinds=kinds, limit=limit, cursor=cursor)
+
+    def analyze_refactor(
+        self,
+        selector: DeclarationSelector,
+        operation: RefactorOperation,
+        *,
+        limit: int = 500,
+        cursor: str | None = None,
+        roots: list[Path] | None = None,
+    ) -> RefactorAnalysis:
+        if selector.project is not None:
+            resolved = self._resolve(selector.project, roots)
+            selector = selector.model_copy(update={"project": resolved.id})
+            project_id = resolved.id
+        else:
+            project_id = self.search.get_chunk(selector.chunk_id or "").project_id
+        self.ensure_reference_index(project_id, roots=roots)
+        return self.references.analyze_refactor(selector, operation, limit=limit, cursor=cursor)
 
     def prepare_model(self) -> None:
         if not isinstance(self.embedder, FastEmbedder):
