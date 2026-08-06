@@ -29,11 +29,13 @@ from .errors import CodeIndexingError, ErrorCode
 from .models import (
     ChunkKind,
     CodeChunk,
+    DeclarationSelector,
     IndexReport,
     LanguageName,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
+    ReferenceResponse,
     RemovalReport,
     SearchResponse,
     SymbolResponse,
@@ -1004,6 +1006,33 @@ def create_server(
             match=match,
             kinds=selected_kinds,
             limit=limit,
+            roots=roots,
+        )
+
+    @mcp.tool(
+        title="Find references",
+        description=(
+            "Find structural uses of one declaration. Select it with a chunk_id or project, path, "
+            "and qualified_symbol. Results distinguish exact, likely, and unresolved bindings and "
+            "may trigger parse-only structural backfill; they never edit source files."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def find_references(
+        ctx: ServerContext,
+        selector: DeclarationSelector,
+        kinds: Annotated[list[str] | None, Field(description="Optional reference kinds.")] = None,
+        limit: Annotated[int, Field(ge=1, le=500, description="Maximum results per page.")] = 100,
+        cursor: Annotated[str | None, Field(description="Opaque page cursor.")] = None,
+    ) -> ReferenceResponse:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(
+            app.find_references,
+            selector,
+            kinds=set(kinds) if kinds else None,
+            limit=limit,
+            cursor=cursor,
             roots=roots,
         )
 

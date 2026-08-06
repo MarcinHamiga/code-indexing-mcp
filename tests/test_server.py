@@ -129,12 +129,13 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "list_projects",
         "remove_project",
         "search_code",
-        "search_across_projects",
-        "find_symbol",
-        "file_outline",
+            "search_across_projects",
+            "find_symbol",
+            "find_references",
+            "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 10
+    assert len(tools) == 11
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 

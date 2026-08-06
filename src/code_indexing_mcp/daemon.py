@@ -26,11 +26,13 @@ from .application import Application, RuntimePaths
 from .errors import CodeIndexingError, ErrorCode
 from .models import (
     CodeChunk,
+    DeclarationSelector,
     IndexReport,
     ModelStatus,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
+    ReferenceResponse,
     RemovalReport,
     SearchResponse,
     SymbolResponse,
@@ -323,6 +325,9 @@ class DaemonServer:
             return app.file_outline(roots=roots, **params)
         if method == "get_chunk":
             return app.get_chunk(**params)
+        if method == "find_references":
+            selector = DeclarationSelector.model_validate(params.pop("selector"))
+            return app.find_references(selector, roots=roots, **params)
         if method == "model_status":
             # Answered by the daemon rather than the caller, because the daemon
             # is the process that will actually run indexing.
@@ -508,6 +513,11 @@ class BrokerApplication:
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         return CodeChunk.model_validate(self._call("get_chunk", chunk_id=chunk_id))
+
+    def find_references(self, selector: DeclarationSelector, **params: Any) -> ReferenceResponse:
+        return ReferenceResponse.model_validate(
+            self._call("find_references", selector=selector, **params)
+        )
 
     def model_status(self) -> ModelStatus:
         return ModelStatus.model_validate(self._call("model_status"))

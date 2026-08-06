@@ -32,12 +32,14 @@ from .extractor import TreeSitterExtractor
 from .indexing import Indexer
 from .models import (
     CodeChunk,
+    DeclarationSelector,
     IndexReport,
     ModelStatus,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
     ReferenceBackfillReport,
+    ReferenceResponse,
     RemovalReport,
     ScanConfig,
     ScannedFile,
@@ -49,6 +51,7 @@ from .passage_backend import PassageBackendSession
 from .probe_cache import ProbeCache, ProbeKey, ProbeRecord, model_artifact_fingerprint
 from .progress import IndexProgress, read_progress
 from .projects import ProjectResolver, find_project_root, initialize_project, read_project_marker
+from .reference_service import ReferenceService
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
@@ -210,6 +213,7 @@ class Application:
             progress_directory=paths.data / "progress",
         )
         self.search = SearchService(self.store, embedder)
+        self.references = ReferenceService(self.store)
 
     def _select_backend(self) -> BackendSelection:
         """Choose a backend from everything this machine can actually execute."""
@@ -700,6 +704,24 @@ class Application:
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         return self.search.get_chunk(chunk_id)
+
+    def find_references(
+        self,
+        selector: DeclarationSelector,
+        *,
+        kinds: set[str] | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+        roots: list[Path] | None = None,
+    ) -> ReferenceResponse:
+        if selector.project is not None:
+            resolved = self._resolve(selector.project, roots)
+            selector = selector.model_copy(update={"project": resolved.id})
+            project_id = resolved.id
+        else:
+            project_id = self.search.get_chunk(selector.chunk_id or "").project_id
+        self.ensure_reference_index(project_id, roots=roots)
+        return self.references.find_references(selector, kinds=kinds, limit=limit, cursor=cursor)
 
     def prepare_model(self) -> None:
         if not isinstance(self.embedder, FastEmbedder):
