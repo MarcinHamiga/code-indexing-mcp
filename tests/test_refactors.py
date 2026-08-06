@@ -114,3 +114,102 @@ def test_signature_spread_calls_are_reviewed_not_silently_ignored(tmp_path: Path
 
     call = next(item for item in analysis.review if item.kind == "call")
     assert call.reason_code == "spread_uncertainty"
+
+
+def test_rename_marks_exact_qualified_member_calls_for_edit(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"auth.py": ("class Gate:\n    def authorize(self):\n        return self.authorize()\n")},
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="Gate.authorize"),
+        RenameOperation(new_name="validate"),
+    )
+
+    call = next(item for item in analysis.must_change if item.kind == "call")
+    assert call.written_name == "self.authorize"
+    assert call.edit_required is True
+
+
+def test_rename_marks_identifier_reads_for_edit(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"lib.py": "def answer():\n    return 42\n\ncallback = answer\n"},
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer"),
+        RenameOperation(new_name="result"),
+    )
+
+    read = next(item for item in analysis.must_change if item.kind == "read")
+    assert read.written_name == "answer"
+
+
+def test_refactor_analysis_exposes_pagination_and_incomplete_state(tmp_path: Path) -> None:
+    callers = "".join(f"def caller_{index}():\n    return answer()\n\n" for index in range(501))
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"lib.py": f"def answer():\n    return 42\n\n{callers}"},
+    )
+    selector = DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    operation = RenameOperation(new_name="result")
+
+    first = service.analyze_refactor(selector, operation)
+    assert first.cursor is not None
+    assert first.completeness.state == "incomplete"
+    second = service.analyze_refactor(selector, operation, cursor=first.cursor)
+
+    calls = [
+        item for analysis in (first, second) for item in analysis.must_change if item.kind == "call"
+    ]
+    assert len(calls) == 501
+    assert second.cursor is None
+    assert second.completeness.state == "complete"
+
+
+def test_signature_keyword_satisfies_required_positional_parameter(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "mail.py": "def send(message):\n    return message\n",
+            "consumer.py": "from mail import send\n\nsend(message='hi')\n",
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="mail.py", qualified_symbol="send"),
+        SignatureChangeOperation(
+            parameters=[
+                ParameterShape(name="message", kind="positional", required=True, position=0)
+            ]
+        ),
+    )
+
+    call = next(item for item in analysis.evidence if item.kind == "call")
+    assert call.reason_code == "direct_import_alias"
+
+
+def test_signature_bound_receiver_does_not_consume_a_call_argument(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "mail.py": (
+                "class Mailer:\n    def send(self, message):\n        return self.send(message)\n"
+            )
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="mail.py", qualified_symbol="Mailer.send"),
+        SignatureChangeOperation(
+            parameters=[
+                ParameterShape(name="self", kind="positional", required=True, position=0),
+                ParameterShape(name="message", kind="positional", required=True, position=1),
+            ]
+        ),
+    )
+
+    call = next(item for item in analysis.evidence if item.kind == "call")
+    assert call.reason_code == "known_owner_member"

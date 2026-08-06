@@ -334,7 +334,7 @@ class DaemonServer:
         if method == "analyze_refactor":
             selector = DeclarationSelector.model_validate(params.pop("selector"))
             operation = _REFACTOR_OPERATION.validate_python(params.pop("operation"))
-            return app.analyze_refactor(selector, operation, roots=roots)
+            return app.analyze_refactor(selector, operation, roots=roots, **params)
         if method == "model_status":
             # Answered by the daemon rather than the caller, because the daemon
             # is the process that will actually run indexing.

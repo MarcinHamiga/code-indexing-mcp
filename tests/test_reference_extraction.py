@@ -15,6 +15,25 @@ def _references(source: str, language: str = "python"):
     )
 
 
+@pytest.mark.parametrize(
+    ("language", "source"),
+    [
+        ("python", "def answer():\n    return 42\n\ncallback = answer\n"),
+        ("javascript", "function answer() { return 42; }\nconst callback = answer;\n"),
+        ("typescript", "function answer(): number { return 42; }\nconst callback = answer;\n"),
+        ("tsx", "function answer(): number { return 42; }\nconst callback = answer;\n"),
+    ],
+)
+def test_extracts_identifier_value_reads(language: str, source: str) -> None:
+    references = _references(source, language)
+
+    reads = [reference for reference in references if reference.kind == "read"]
+    assert [reference.written_name for reference in reads] == ["answer"]
+    read = reads[0]
+    expected_start = source.rindex("answer")
+    assert (read.start_byte, read.end_byte) == (expected_start, expected_start + len("answer"))
+
+
 def test_python_extracts_structural_references_and_exact_ranges() -> None:
     source = (
         "from pkg import Widget as LocalWidget\n"

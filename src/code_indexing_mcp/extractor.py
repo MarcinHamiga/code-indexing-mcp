@@ -322,12 +322,92 @@ class TreeSitterExtractor:
                 if not capture.startswith("reference."):
                     continue
                 for node in nodes:
-                    if language == "python":
+                    if capture == "reference.identifier":
+                        self._identifier_record(language, node, source, add)
+                    elif language == "python":
                         self._python_records(node, source, add)
                     else:
                         self._javascript_records(node, source, add)
         references.sort(key=lambda item: (item.start_byte, item.end_byte, item.kind))
         return references, declarations
+
+    @staticmethod
+    def _identifier_record(
+        language: str, node: Node, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        """Record identifier values while excluding bindings and richer structural uses."""
+
+        def contains(outer: Node | None) -> bool:
+            return bool(
+                outer is not None
+                and outer.start_byte <= node.start_byte
+                and node.end_byte <= outer.end_byte
+            )
+
+        current = node
+        while (parent := current.parent) is not None:
+            if parent.type in {
+                "import_statement",
+                "import_from_statement",
+                "export_clause",
+                "decorator",
+                "type",
+                "type_annotation",
+                "generic_type",
+                "class_heritage",
+                "extends_type_clause",
+            }:
+                return
+            if parent.type in {"parameters", "formal_parameters", "lambda_parameters"}:
+                parameter = node
+                while parameter.parent is not None and parameter.parent != parent:
+                    parameter = parameter.parent
+                    if contains(parameter.child_by_field_name("value")):
+                        break
+                else:
+                    return
+            excluded_fields: tuple[str, ...] = ()
+            if parent.type in {
+                "function_definition",
+                "function_expression",
+                "generator_function_declaration",
+                "generator_function",
+                "class_definition",
+                "function_declaration",
+                "class_declaration",
+                "method_definition",
+                "variable_declarator",
+            }:
+                excluded_fields = ("name",)
+            elif parent.type in {
+                "assignment",
+                "assignment_expression",
+                "augmented_assignment",
+                "named_expression",
+                "for_statement",
+                "for_in_clause",
+            }:
+                excluded_fields = ("left", "name")
+            elif parent.type in {"arrow_function", "lambda"}:
+                excluded_fields = ("parameter", "parameters")
+            elif parent.type in {"attribute", "member_expression"}:
+                excluded_fields = ("attribute", "property")
+            elif parent.type in {"call", "call_expression", "new_expression"}:
+                excluded_fields = ("function", "constructor")
+            elif parent.type == "keyword_argument":
+                excluded_fields = ("name",)
+            elif parent.type in {"as_pattern", "catch_clause"}:
+                excluded_fields = ("alias", "parameter")
+            elif parent.type == "export_statement":
+                excluded_fields = ("value",)
+            elif language != "python" and parent.type in {"pair", "pair_pattern"}:
+                excluded_fields = ("key",)
+            if any(contains(parent.child_by_field_name(field)) for field in excluded_fields):
+                return
+            current = parent
+
+        name = _capture_name(source, node)
+        add_reference("read", node, target_name=name, written_name=name)
 
     @staticmethod
     def _enclosing_symbol(

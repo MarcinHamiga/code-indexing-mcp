@@ -60,7 +60,7 @@ CANDIDATE_GROUP_COUNT = 256
 
 # Bump only when the normalized structural-row contract changes. Coverage rows
 # make a new generation discoverable without coupling it to project metadata.
-REFERENCE_SCHEMA_VERSION = 1
+REFERENCE_SCHEMA_VERSION = 2
 
 # Failures caused by the environment rather than by a file's own content. They
 # abort the run instead of being recorded against whichever file was in flight.

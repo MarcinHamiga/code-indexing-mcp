@@ -54,3 +54,5 @@
   parameters: (parameters) @declaration.parameters)
 
 (class_definition name: (identifier) @name)
+
+(identifier) @reference.identifier

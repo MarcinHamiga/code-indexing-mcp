@@ -1025,7 +1025,10 @@ def create_server(
     @_with_error_details
     async def find_references(
         ctx: ServerContext,
-        selector: DeclarationSelector,
+        selector: Annotated[
+            DeclarationSelector,
+            Field(description="Declaration selected by chunk id or stable source location."),
+        ],
         kinds: Annotated[list[str] | None, Field(description="Optional reference kinds.")] = None,
         limit: Annotated[int, Field(ge=1, le=500, description="Maximum results per page.")] = 100,
         cursor: Annotated[str | None, Field(description="Opaque page cursor.")] = None,
@@ -1052,14 +1055,26 @@ def create_server(
     @_with_error_details
     async def analyze_refactor(
         ctx: ServerContext,
-        selector: DeclarationSelector,
+        selector: Annotated[
+            DeclarationSelector,
+            Field(description="Declaration selected by chunk id or stable source location."),
+        ],
         operation: Annotated[
             RefactorOperation,
             Field(description="Discriminated rename or signature-change operation."),
         ],
+        limit: Annotated[int, Field(ge=1, le=500, description="Maximum findings per page.")] = 500,
+        cursor: Annotated[str | None, Field(description="Opaque analysis page cursor.")] = None,
     ) -> RefactorAnalysis:
         roots = await _startup_roots(ctx, discover=True)
-        return await asyncio.to_thread(app.analyze_refactor, selector, operation, roots=roots)
+        return await asyncio.to_thread(
+            app.analyze_refactor,
+            selector,
+            operation,
+            limit=limit,
+            cursor=cursor,
+            roots=roots,
+        )
 
     @mcp.tool(
         title="File outline",

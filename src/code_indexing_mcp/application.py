@@ -609,6 +609,14 @@ class Application:
         if report.stale_paths:
             self.indexer.index(resolved, wait_for_lock=True)
             report = self.indexer.backfill_references(resolved, wait_for_lock=True)
+        if not report.complete:
+            raise CodeIndexingError(
+                ErrorCode.REFERENCE_INDEX_UNAVAILABLE,
+                f"Structural reference index is incomplete: {resolved.name}",
+                project=resolved.id,
+                incomplete_paths=report.incomplete_paths,
+                stale_paths=report.stale_paths,
+            )
         return report
 
     def project_status(
@@ -730,6 +738,8 @@ class Application:
         selector: DeclarationSelector,
         operation: RefactorOperation,
         *,
+        limit: int = 500,
+        cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> RefactorAnalysis:
         if selector.project is not None:
@@ -739,7 +749,7 @@ class Application:
         else:
             project_id = self.search.get_chunk(selector.chunk_id or "").project_id
         self.ensure_reference_index(project_id, roots=roots)
-        return self.references.analyze_refactor(selector, operation)
+        return self.references.analyze_refactor(selector, operation, limit=limit, cursor=cursor)
 
     def prepare_model(self) -> None:
         if not isinstance(self.embedder, FastEmbedder):

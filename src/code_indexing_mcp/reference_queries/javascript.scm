@@ -20,3 +20,5 @@
 (variable_declarator
   name: (identifier) @name
   value: (function_expression parameters: (formal_parameters) @declaration.parameters))
+
+(identifier) @reference.identifier

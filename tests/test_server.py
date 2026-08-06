@@ -1381,6 +1381,8 @@ AUTO_REGISTERING_TOOLS = frozenset(
         "search_code",
         "search_across_projects",
         "find_symbol",
+        "find_references",
+        "analyze_refactor",
         "file_outline",
     }
 )
@@ -1499,6 +1501,15 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "prefix",
         "contains",
     ]
+    analyze_refactor_schema = tools["analyze_refactor"].inputSchema
+    assert set(analyze_refactor_schema["properties"]) == {
+        "selector",
+        "operation",
+        "limit",
+        "cursor",
+    }
+    analyze_limit = analyze_refactor_schema["properties"]["limit"]
+    assert (analyze_limit["minimum"], analyze_limit["maximum"]) == (1, 500)
 
 
 @pytest.mark.asyncio

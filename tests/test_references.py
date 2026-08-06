@@ -80,6 +80,33 @@ def test_unknown_member_receiver_is_never_exact(tmp_path: Path) -> None:
     assert call.reason_code == "unknown_receiver"
 
 
+def test_same_file_shadowed_call_does_not_bind_the_selected_declaration(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": (
+                "def target():\n"
+                "    return 1\n\n"
+                "def direct():\n"
+                "    return target()\n\n"
+                "def outer():\n"
+                "    def target():\n"
+                "        return 2\n"
+                "    return target()\n"
+            )
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="target")
+    )
+
+    calls = [hit for hit in response.hits if hit.kind == "call"]
+    assert [(call.start_line, call.resolution) for call in calls] == [(5, "exact")]
+
+
 def test_cursor_is_filter_bound_and_reads_its_original_snapshot(tmp_path: Path) -> None:
     service, project_id = _indexed_service(
         tmp_path,

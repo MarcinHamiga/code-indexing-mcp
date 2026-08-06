@@ -77,6 +77,13 @@ class ReferenceService:
                 continue
             if kinds is not None and row["kind"] not in kinds:
                 continue
+            lexical = self._lexical_declaration(row, declarations)
+            if (
+                lexical is not None
+                and row["file_id"] == selected.file_id
+                and lexical["source_qualified_symbol"] != selected.qualified_symbol
+            ):
+                continue
             resolution, reason, explanation = self._classify(row, selected, declarations, imports)
             if resolution == "unresolved" and reason in {"wildcard_import", "unknown_receiver"}:
                 limitations.append(
@@ -140,9 +147,14 @@ class ReferenceService:
         )
 
     def analyze_refactor(
-        self, selector: DeclarationSelector, operation: RefactorOperation
+        self,
+        selector: DeclarationSelector,
+        operation: RefactorOperation,
+        *,
+        limit: int = 500,
+        cursor: str | None = None,
     ) -> RefactorAnalysis:
-        response = self.find_references(selector, limit=500)
+        response = self.find_references(selector, limit=limit, cursor=cursor)
         if isinstance(operation, RenameOperation) and not re.fullmatch(
             r"[A-Za-z_$][A-Za-z0-9_$]*", operation.new_name
         ):
@@ -151,7 +163,7 @@ class ReferenceService:
         likely_change: list[RefactorFinding] = []
         review: list[RefactorFinding] = []
         evidence: list[RefactorFinding] = []
-        if isinstance(operation, RenameOperation):
+        if isinstance(operation, RenameOperation) and cursor is None:
             must_change.append(
                 RefactorFinding(
                     reference_id=f"declaration:{response.selected.file_id}",
@@ -182,7 +194,9 @@ class ReferenceService:
                 likely_change.append(finding.model_copy(update={"edit_required": True}))
                 continue
             if isinstance(operation, RenameOperation):
-                needs_edit = hit.snippet == response.selected.symbol or hit.kind in {
+                needs_edit = hit.snippet.rsplit(".", 1)[
+                    -1
+                ] == response.selected.symbol or hit.kind in {
                     "import",
                     "export",
                 }
@@ -211,7 +225,12 @@ class ReferenceService:
             else:
                 evidence.append(finding)
         limitations = response.limitations
-        state = "complete_with_dynamic_limitations" if limitations or review else "complete"
+        if response.cursor is not None:
+            state = "incomplete"
+            explanation = "More structural candidates remain available through the cursor."
+        else:
+            state = "complete_with_dynamic_limitations" if limitations or review else "complete"
+            explanation = "All indexed structural candidates were considered."
         return RefactorAnalysis(
             selected=response.selected,
             operation=operation,
@@ -226,10 +245,12 @@ class ReferenceService:
                 review=len(review),
                 evidence=len(evidence),
             ),
+            cursor=response.cursor,
             completeness=CompletenessReport(
                 state=cast(
                     Literal["complete", "complete_with_dynamic_limitations", "incomplete"], state
-                )
+                ),
+                explanation=explanation,
             ),
         )
 
@@ -269,9 +290,15 @@ class ReferenceService:
             if parameter.kind in {"positional", "positional_only"}
         ]
         positional_count = int(shape.get("positional_count", 0))
-        required_positional = [parameter for parameter in new_positional if parameter.required]
         keywords = set(shape.get("keywords", []))
         new_by_name = {parameter.name: parameter for parameter in operation.parameters}
+        bound_receiver = (
+            selected.language == "python"
+            and selected.kind == "method"
+            and row["receiver_text"] in {"self", "cls"}
+        )
+        if bound_receiver:
+            new_positional = new_positional[1:]
         if any(
             parameter.required
             and parameter.kind == "keyword_only"
@@ -285,7 +312,10 @@ class ReferenceService:
                 return "invalid_keyword"
             if parameter.kind == "positional_only":
                 return "parameter_mode_change"
-        if positional_count < len(required_positional):
+        if any(
+            parameter.required and position >= positional_count and parameter.name not in keywords
+            for position, parameter in enumerate(new_positional)
+        ):
             return "missing_required_parameter"
         if positional_count > len(new_positional) and not any(
             parameter.kind == "variadic" for parameter in operation.parameters
@@ -295,20 +325,29 @@ class ReferenceService:
                 for parameter in old_records
                 if parameter.get("kind") in {"positional", "positional_only"}
             ]
+            if bound_receiver:
+                old_positional = old_positional[1:]
             for positional_parameter in old_positional[len(new_positional) : positional_count]:
                 old_name = positional_parameter.get("name")
                 new_parameter = new_by_name.get(old_name) if isinstance(old_name, str) else None
                 if new_parameter is not None and new_parameter.kind == "keyword_only":
                     return "parameter_mode_change"
             return "removed_positional_parameter"
-        old_positions = {
-            name: parameter.get("position")
+        old_positional = [
+            parameter
             for parameter in old_records
+            if parameter.get("kind") in {"positional", "positional_only"}
+        ]
+        if bound_receiver:
+            old_positional = old_positional[1:]
+        old_positions = {
+            name: position
+            for position, parameter in enumerate(old_positional)
             if isinstance(name := parameter.get("name"), str)
         }
         for position, parameter in enumerate(new_positional[:positional_count]):
             old_parameter: object = (
-                old_parameters[position] if position < len(old_parameters) else None
+                old_positional[position] if position < len(old_positional) else None
             )
             if not isinstance(old_parameter, dict):
                 continue
@@ -405,6 +444,25 @@ class ReferenceService:
             and self._import_targets(item, selected)
             for item in imports.get(row["file_id"], [])
         )
+
+    @staticmethod
+    def _lexical_declaration(
+        row: ReferenceRecord,
+        declarations: list[ReferenceRecord],
+    ) -> ReferenceRecord | None:
+        if row["receiver_text"] is not None or row["kind"] not in {"call", "read", "write"}:
+            return None
+        source = row["source_qualified_symbol"] or ""
+        target = (row["target_name"] or "").rsplit(".", 1)[-1]
+        visible: list[tuple[int, ReferenceRecord]] = []
+        for declaration in declarations:
+            if declaration["file_id"] != row["file_id"] or declaration["target_name"] != target:
+                continue
+            qualified = declaration["source_qualified_symbol"] or ""
+            scope = qualified.rsplit(".", 1)[0] if "." in qualified else ""
+            if not scope or source == scope or source.startswith(scope + "."):
+                visible.append((scope.count(".") + bool(scope), declaration))
+        return max(visible, key=lambda item: item[0])[1] if visible else None
 
     def _classify(
         self,
