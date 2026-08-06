@@ -63,7 +63,7 @@ def test_python_extracts_structural_references_and_exact_ranges() -> None:
         1,
         1,
     )
-    assert refs["import:util"].module_path == "tools"
+    assert (refs["import:util"].module_path, refs["import:util"].imported_name) == ("tools", None)
     assert refs["decorator:trace"].source_qualified_symbol == "Child"
     assert {
         refs["inheritance:Base"].written_name,

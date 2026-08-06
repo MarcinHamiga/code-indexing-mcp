@@ -610,7 +610,7 @@ class TreeSitterExtractor:
                     target_name=imported_name,
                     written_name=alias or imported_name,
                     module_path=imported_name,
-                    imported_name=imported_name,
+                    imported_name=None,
                     alias=alias,
                 )
         elif node.type == "decorator":

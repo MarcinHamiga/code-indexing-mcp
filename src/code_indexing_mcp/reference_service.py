@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import keyword as keyword_module
 import re
 from pathlib import PurePosixPath
 from typing import Any, Literal, cast
@@ -155,10 +156,15 @@ class ReferenceService:
         cursor: str | None = None,
     ) -> RefactorAnalysis:
         response = self.find_references(selector, limit=limit, cursor=cursor)
-        if isinstance(operation, RenameOperation) and not re.fullmatch(
-            r"[A-Za-z_$][A-Za-z0-9_$]*", operation.new_name
-        ):
-            raise CodeIndexingError(ErrorCode.INVALID_REFACTOR, "Invalid identifier for rename")
+        if isinstance(operation, RenameOperation):
+            valid_identifier = (
+                operation.new_name.isidentifier()
+                and not keyword_module.iskeyword(operation.new_name)
+                if response.selected.language == "python"
+                else bool(re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", operation.new_name))
+            )
+            if not valid_identifier:
+                raise CodeIndexingError(ErrorCode.INVALID_REFACTOR, "Invalid identifier for rename")
         must_change: list[RefactorFinding] = []
         likely_change: list[RefactorFinding] = []
         review: list[RefactorFinding] = []
@@ -438,9 +444,11 @@ class ReferenceService:
         written_tail = (row["written_name"] or "").rsplit(".", 1)[-1]
         if selected.symbol in {row["target_name"], row["written_name"], target_tail, written_tail}:
             return True
+        if row["kind"] == "import" and self._is_namespace_import(row):
+            return False
         spelling = row["receiver_text"] or row["written_name"]
         return any(
-            (item["alias"] or item["imported_name"]) == spelling
+            (item["alias"] or item["written_name"] or item["imported_name"]) == spelling
             and self._import_targets(item, selected)
             for item in imports.get(row["file_id"], [])
         )
@@ -472,7 +480,10 @@ class ReferenceService:
         imports: dict[str, list[ReferenceRecord]],
     ) -> tuple[str, str, str]:
         source_imports = imports.get(row["file_id"], [])
-        if any(item["imported_name"] == "*" for item in source_imports):
+        if any(
+            item["imported_name"] == "*" and not self._is_namespace_import(item)
+            for item in source_imports
+        ):
             return (
                 "unresolved",
                 "wildcard_import",
@@ -487,7 +498,8 @@ class ReferenceService:
                     "The receiver is the declaration's enclosing owner.",
                 )
             for item in source_imports:
-                if item["alias"] == receiver and self._import_targets(item, selected):
+                binding = item["alias"] or item["written_name"] or item["imported_name"]
+                if binding == receiver and self._import_targets(item, selected):
                     return (
                         "exact",
                         "known_namespace_member",
@@ -499,7 +511,7 @@ class ReferenceService:
                 "Receiver type inference is outside this syntax-only index.",
             )
         for item in source_imports:
-            alias = item["alias"] or item["imported_name"]
+            alias = item["alias"] or item["written_name"] or item["imported_name"]
             if alias == row["written_name"] and self._import_targets(item, selected):
                 return (
                     "exact",
@@ -527,12 +539,23 @@ class ReferenceService:
 
     def _import_targets(self, item: ReferenceRecord, selected: SelectedDeclaration) -> bool:
         imported = item["imported_name"]
-        if imported not in {selected.symbol, "default", None}:
+        if not self._is_namespace_import(item) and imported not in {
+            selected.symbol,
+            "default",
+            None,
+        }:
             return False
         module_path = item["module_path"]
         if module_path is None:
             return False
         return self._module_matches(item["path"], item["language"], module_path, selected.path)
+
+    @staticmethod
+    def _is_namespace_import(item: ReferenceRecord) -> bool:
+        imported = item["imported_name"]
+        return (imported == "*" and item["alias"] is not None) or (
+            item["language"] == "python" and imported is None and item["module_path"] is not None
+        )
 
     @staticmethod
     def _same_owner(row: ReferenceRecord, selected: SelectedDeclaration) -> bool:

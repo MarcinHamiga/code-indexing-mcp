@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import Indexer
 from code_indexing_mcp.models import (
@@ -145,6 +148,47 @@ def test_rename_marks_identifier_reads_for_edit(tmp_path: Path) -> None:
 
     read = next(item for item in analysis.must_change if item.kind == "read")
     assert read.written_name == "answer"
+
+
+@pytest.mark.parametrize("new_name", ["$answer", "class"])
+def test_python_rename_rejects_invalid_identifiers(tmp_path: Path, new_name: str) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"lib.py": "def answer():\n    return 42\n"},
+    )
+
+    with pytest.raises(CodeIndexingError) as raised:
+        service.analyze_refactor(
+            DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer"),
+            RenameOperation(new_name=new_name),
+        )
+
+    assert raised.value.code is ErrorCode.INVALID_REFACTOR
+
+
+def test_rename_validation_uses_the_selected_language(tmp_path: Path) -> None:
+    (tmp_path / "python").mkdir()
+    (tmp_path / "javascript").mkdir()
+    python_service, python_project = _indexed_service(
+        tmp_path / "python",
+        {"lib.py": "def answer():\n    return 42\n"},
+    )
+    javascript_service, javascript_project = _indexed_service(
+        tmp_path / "javascript",
+        {"lib.js": "function answer() { return 42; }\n"},
+    )
+
+    python_analysis = python_service.analyze_refactor(
+        DeclarationSelector(project=python_project, path="lib.py", qualified_symbol="answer"),
+        RenameOperation(new_name="_answer"),
+    )
+    javascript_analysis = javascript_service.analyze_refactor(
+        DeclarationSelector(project=javascript_project, path="lib.js", qualified_symbol="answer"),
+        RenameOperation(new_name="$answer"),
+    )
+
+    assert python_analysis.operation.new_name == "_answer"
+    assert javascript_analysis.operation.new_name == "$answer"
 
 
 def test_refactor_analysis_exposes_pagination_and_incomplete_state(tmp_path: Path) -> None:
