@@ -37,6 +37,7 @@ from .models import (
     ProjectStatus,
     RefactorAnalysis,
     RefactorOperation,
+    ReferenceKind,
     ReferenceResponse,
     RemovalReport,
     SearchResponse,
@@ -1045,9 +1046,13 @@ def create_server(
     @mcp.tool(
         title="Find references",
         description=(
-            "Find structural uses of one declaration. Select it with a chunk_id or project, path, "
-            "and qualified_symbol. Results distinguish exact, likely, and unresolved bindings and "
-            "may trigger parse-only structural backfill; they never edit source files."
+            "Find structural uses of one Python, JavaScript, TypeScript, or TSX declaration; "
+            "other languages return UNSUPPORTED_LANGUAGE. Select it with a chunk_id or project, "
+            "path, and qualified_symbol. Results distinguish exact, likely, and unresolved "
+            "bindings and may trigger parse-only structural backfill; they never edit source "
+            "files. This is a syntax-only index: dynamic dispatch, reflection, and files in "
+            "other languages are invisible to it, so check `limitations` before concluding a "
+            "declaration is unused."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -1058,7 +1063,15 @@ def create_server(
             DeclarationSelector,
             Field(description="Declaration selected by chunk id or stable source location."),
         ],
-        kinds: Annotated[list[str] | None, Field(description="Optional reference kinds.")] = None,
+        kinds: Annotated[
+            list[ReferenceKind] | None,
+            Field(
+                description=(
+                    "Optional reference kinds to keep. Omit for all kinds; an unknown kind is "
+                    "rejected rather than silently returning nothing."
+                )
+            ),
+        ] = None,
         limit: Annotated[int, Field(ge=1, le=500, description="Maximum results per page.")] = 100,
         cursor: Annotated[str | None, Field(description="Opaque page cursor.")] = None,
     ) -> ReferenceResponse:
@@ -1066,7 +1079,7 @@ def create_server(
         return await asyncio.to_thread(
             app.find_references,
             selector,
-            kinds=set(kinds) if kinds else None,
+            kinds=set[str](kinds) if kinds else None,
             limit=limit,
             cursor=cursor,
             roots=roots,
@@ -1075,9 +1088,13 @@ def create_server(
     @mcp.tool(
         title="Analyze refactor impact",
         description=(
-            "Analyze a proposed rename or signature change without editing source files. "
-            "Returns deterministic required edits, likely changes, dynamic-review findings, "
-            "and evidence for resolved aliases that need no spelling change."
+            "Analyze a proposed rename or signature change without editing source files, for a "
+            "Python, JavaScript, TypeScript, or TSX declaration. Returns required edits, likely "
+            "changes, dynamic-review findings, and evidence for resolved aliases that need no "
+            "spelling change. Always read `completeness` and `limitations`: only the state "
+            "'complete' means every indexed file was analyzed, and edits should use "
+            "edit_start_byte/edit_end_byte, which cover just the identifier, rather than the "
+            "wider reference range."
         ),
         annotations=_READS_AND_REGISTERS,
     )

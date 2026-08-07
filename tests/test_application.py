@@ -17,7 +17,11 @@ from code_indexing_mcp.application import Application, RuntimePaths
 from code_indexing_mcp.backends import CPU_BACKEND, Accelerator
 from code_indexing_mcp.embedding_worker import default_launcher
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
-from code_indexing_mcp.models import DeclarationSelector, ReferenceBackfillReport
+from code_indexing_mcp.models import (
+    DeclarationSelector,
+    ReferenceBackfillReport,
+    RenameOperation,
+)
 from code_indexing_mcp.settings import IndexSettings
 from code_indexing_mcp.token_batching import DEFAULT_MAX_TOKEN_PRODUCT, REFERENCE_MEMORY_BYTES
 from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher
@@ -128,7 +132,14 @@ def test_application_can_ensure_the_structural_index_without_a_semantic_search(
     assert report.files_current == 1
 
 
-def test_reference_query_rejects_an_incomplete_structural_index(tmp_path: Path) -> None:
+def test_reference_query_reports_an_incomplete_structural_index(tmp_path: Path) -> None:
+    """An uncoverable file degrades the answer instead of disabling the tool.
+
+    Refusing outright meant one unparseable file anywhere in a repository made
+    both reference tools permanently unusable, because such a file never gains
+    coverage and so fails the same way on every later call.
+    """
+
     root = tmp_path / "repo"
     root.mkdir()
     (root / "main.py").write_text("def answer():\n    return 42\n")
@@ -140,26 +151,30 @@ def test_reference_query_rejects_an_incomplete_structural_index(tmp_path: Path) 
     project = app.init_project(root)
     app.index_project(project.id)
 
-    with (
-        patch.object(
-            app.indexer,
-            "backfill_references",
-            return_value=ReferenceBackfillReport(
-                project_id=project.id, incomplete_paths=["main.py"]
-            ),
-        ),
-        pytest.raises(CodeIndexingError) as raised,
+    with patch.object(
+        app.indexer,
+        "backfill_references",
+        return_value=ReferenceBackfillReport(project_id=project.id, incomplete_paths=["broken.py"]),
     ):
-        app.find_references(
+        response = app.find_references(
             DeclarationSelector(
                 project=project.id,
                 path="main.py",
                 qualified_symbol="answer",
             )
         )
+        analysis = app.analyze_refactor(
+            DeclarationSelector(
+                project=project.id,
+                path="main.py",
+                qualified_symbol="answer",
+            ),
+            RenameOperation(new_name="result"),
+        )
 
-    assert raised.value.code is ErrorCode.REFERENCE_INDEX_UNAVAILABLE
-    assert raised.value.details["incomplete_paths"] == ["main.py"]
+    limitation = next(item for item in response.limitations if item.code == "parse_error")
+    assert "broken.py" in limitation.explanation
+    assert analysis.completeness.state == "incomplete"
 
 
 def test_modified_source_marks_an_index_stale(tmp_path: Path) -> None:

@@ -293,15 +293,29 @@ reported limitations rather than treating them as safe edits.
 Structural references are extracted during the normal parse and are backfilled parse-only for an
 older semantic index—no second embedding pass is needed. The first reference query may therefore
 write structural coverage while it refreshes its index, which is why both tools carry the
-registering-read annotation. Python, JavaScript, TypeScript, and TSX are supported. Runtime imports,
-wildcard imports, inferred receiver types, TypeScript path aliases, and other dynamic dispatch stay
-conservative and are reported as limitations.
+registering-read annotation. Python, JavaScript, TypeScript, and TSX are supported; selecting a
+declaration in any other language returns `UNSUPPORTED_LANGUAGE` rather than an empty result that
+would read as "no callers". Runtime imports, wildcard imports, inferred receiver types, TypeScript
+path aliases, and other dynamic dispatch stay conservative and are reported as limitations.
+
+Because this is a syntax-only index, a repository usually contains files it cannot analyze — other
+languages, or files that failed to parse. Those are reported as `limitations` with the codes
+`unsupported_language`, `parse_error`, and `stale_file`, and any of them makes `completeness.state`
+`incomplete`. A single unparseable file degrades the result; it does not disable the tools.
 
 `analyze_refactor` accepts a discriminated `operation`: `{"kind":"rename","new_name":"..."}`
 or `{"kind":"signature_change","parameters":[...]}`. It never edits source. Its
 `must_change` items are deterministic, `likely_change` and `review` require inspection, and
 `evidence` includes exact aliases that identify the target but need no spelling change. Signature
 analysis reports spread arguments and ambiguous declaration shapes for review instead of guessing.
+
+`completeness.state` is `complete` only when every indexed file was analyzed and every candidate was
+proven; a result carrying `likely_change` or `review` entries reports
+`complete_with_dynamic_limitations` instead. Apply renames at `edit_start_byte`/`edit_end_byte`,
+which cover just the identifier — a finding's `start_byte`/`end_byte` span the whole reference, so
+they include the receiver in `auth.authorize` and the alias in `authorize as check`. When the
+identifier could not be located unambiguously both edit offsets are null and the edit has to be made
+by hand.
 
 ## Project workflow
 

@@ -246,3 +246,101 @@ def test_cursor_is_filter_bound_and_reads_its_original_snapshot(tmp_path: Path) 
 def test_declaration_selector_requires_one_complete_mode(payload: dict[str, str]) -> None:
     with pytest.raises(ValueError):
         DeclarationSelector(**payload)
+
+
+def test_a_class_body_does_not_shadow_a_module_level_function(tmp_path: Path) -> None:
+    """A method is not in a sibling method's scope chain.
+
+    Python and JS/TS both resolve a bare `helper()` inside `Gate.run` to the
+    module-level `helper`. Treating the class body as an enclosing scope made
+    the resolver discard that call site, so a rename reported no callers at all.
+    """
+
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "app.py": (
+                "def helper():\n"
+                "    return 1\n"
+                "\n"
+                "class Gate:\n"
+                "    def helper(self):\n"
+                "        return 2\n"
+                "\n"
+                "    def run(self):\n"
+                "        return helper()\n"
+            )
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="app.py", qualified_symbol="helper")
+    )
+
+    calls = [hit for hit in response.hits if hit.kind == "call"]
+    assert [(call.start_line, call.resolution) for call in calls] == [(9, "exact")]
+
+
+def test_a_method_still_shadows_a_reference_made_through_its_own_receiver(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "app.py": (
+                "def helper():\n"
+                "    return 1\n"
+                "\n"
+                "class Gate:\n"
+                "    def helper(self):\n"
+                "        return 2\n"
+                "\n"
+                "    def run(self):\n"
+                "        return self.helper()\n"
+            )
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="app.py", qualified_symbol="helper")
+    )
+
+    # `self.helper()` names the method, so the module function must not claim it
+    # as an exact use.
+    assert all(hit.resolution != "exact" for hit in response.hits if hit.kind == "call")
+
+
+def test_an_unproven_receiver_is_reported_as_a_limitation(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "main.py": "def caller(thing):\n    return thing.answer()\n",
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    )
+
+    assert any(item.code == "unknown_receiver" for item in response.limitations)
+
+
+def test_files_without_reference_extraction_are_reported_as_a_coverage_gap(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "svc.go": "package main\n\nfunc Run() int {\n\treturn 1\n}\n",
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    )
+
+    limitation = next(item for item in response.limitations if item.code == "unsupported_language")
+    assert "svc.go" in limitation.explanation
+    assert "go" in limitation.explanation

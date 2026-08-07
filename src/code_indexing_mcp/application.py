@@ -611,6 +611,11 @@ class Application:
         between freshness inspection and parse-only backfill, advance its normal
         semantic index first and retry once so files, chunks, and references
         remain one coherent generation.
+
+        Files that still could not be covered are returned rather than raised.
+        One unparseable file used to disable both reference tools for the whole
+        project on every call, with no way to clear it; the resolver now reports
+        those paths as limitations so the rest of the analysis stays usable.
         """
 
         resolved = self._resolve(project, roots)
@@ -620,14 +625,6 @@ class Application:
         if report.stale_paths:
             self.indexer.index(resolved, wait_for_lock=True)
             report = self.indexer.backfill_references(resolved, wait_for_lock=True)
-        if not report.complete:
-            raise CodeIndexingError(
-                ErrorCode.REFERENCE_INDEX_UNAVAILABLE,
-                f"Structural reference index is incomplete: {resolved.name}",
-                project=resolved.id,
-                incomplete_paths=report.incomplete_paths,
-                stale_paths=report.stale_paths,
-            )
         return report
 
     def project_status(
@@ -741,8 +738,10 @@ class Application:
             project_id = resolved.id
         else:
             project_id = self.search.get_chunk(selector.chunk_id or "").project_id
-        self.ensure_reference_index(project_id, roots=roots)
-        return self.references.find_references(selector, kinds=kinds, limit=limit, cursor=cursor)
+        report = self.ensure_reference_index(project_id, roots=roots)
+        return self.references.find_references(
+            selector, kinds=kinds, limit=limit, cursor=cursor, backfill=report
+        )
 
     def analyze_refactor(
         self,
@@ -759,8 +758,10 @@ class Application:
             project_id = resolved.id
         else:
             project_id = self.search.get_chunk(selector.chunk_id or "").project_id
-        self.ensure_reference_index(project_id, roots=roots)
-        return self.references.analyze_refactor(selector, operation, limit=limit, cursor=cursor)
+        report = self.ensure_reference_index(project_id, roots=roots)
+        return self.references.analyze_refactor(
+            selector, operation, limit=limit, cursor=cursor, backfill=report
+        )
 
     def prepare_model(self) -> None:
         if not isinstance(self.embedder, FastEmbedder):

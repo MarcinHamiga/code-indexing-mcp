@@ -351,6 +351,7 @@ class ReferenceHit(FrozenModel):
     start_byte: int
     end_byte: int
     snippet: str = ""
+    written_name: str | None = None
     resolution: ResolutionLevel
     reason_code: str
     explanation: str
@@ -386,8 +387,13 @@ RefactorOperation = Annotated[
 
 
 class RefactorFinding(ReferenceHit):
-    written_name: str | None = None
     edit_required: bool = False
+    # The identifier to rewrite, which is narrower than the occurrence range:
+    # the call `auth.authorize(u)` spans `auth.authorize`, but only `authorize`
+    # may be replaced. Null when the identifier could not be located uniquely,
+    # which means the edit has to be made by hand.
+    edit_start_byte: int | None = None
+    edit_end_byte: int | None = None
 
 
 class CompletenessReport(FrozenModel):

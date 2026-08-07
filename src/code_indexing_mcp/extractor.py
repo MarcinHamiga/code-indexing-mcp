@@ -58,7 +58,7 @@ _CONTAINER_KINDS: Final = frozenset(
 )
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 _QUOTE_CHARACTERS: Final = ("'", '"')
-_STRUCTURAL_LANGUAGES: Final = frozenset({"python", "javascript", "typescript", "tsx"})
+STRUCTURAL_LANGUAGES: Final = frozenset({"python", "javascript", "typescript", "tsx"})
 _ReferenceAdder = Callable[..., None]
 
 
@@ -231,7 +231,7 @@ class TreeSitterExtractor:
         line_index = _LineIndex(normalized_source)
         references: list[ExtractedReference] = []
         declarations: list[ExtractedDeclarationShape] = []
-        if language in _STRUCTURAL_LANGUAGES:
+        if language in STRUCTURAL_LANGUAGES:
             references, declarations = self._structural_records(
                 language, tree.root_node, normalized_source, index, line_index
             )

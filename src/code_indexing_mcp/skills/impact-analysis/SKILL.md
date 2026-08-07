@@ -25,6 +25,8 @@ The core rule of this skill: **map usages with the index tools, not with grep.**
 
 - `mcp__code-indexing-mcp__find_references` — pass the selected declaration's `chunk_id`, or its project/path/qualified-symbol tuple, to retrieve structural uses. Treat `exact` as binding evidence, `likely` as a required review, and `unresolved` plus limitations as blind spots; do not promote them to exact yourself.
 - `mcp__code-indexing-mcp__analyze_refactor` — for a rename or signature proposal, use its discriminated `operation` input before planning edits. `must_change` is deterministic, `likely_change` and `review` need human inspection, and `evidence` can show aliases that bind the target but need no spelling edit.
+- Read `completeness.state` before you characterise the blast radius. Only `complete` means every indexed file was analyzed; `incomplete` means whole files were not, and the named `limitations` (other languages, parse failures, stale files) are the gap. Report that gap to the user instead of presenting the finding list as exhaustive.
+- If you apply the edits, use each finding's `edit_start_byte`/`edit_end_byte`, which cover just the identifier. The wider `start_byte`/`end_byte` span the whole reference, so replacing that range turns `auth.authorize(u)` into `permit(u)` and drops the alias from `import authorize as check`. Null edit offsets mean edit that site by hand.
 - For each distinct file in the results, `mcp__code-indexing-mcp__file_outline` to place the usage in context, and `mcp__code-indexing-mcp__get_chunk` where the exact call matters (signature changes, argument reordering).
 
 ## 4. Hunt indirect usages

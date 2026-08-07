@@ -6,10 +6,11 @@ import base64
 import json
 import keyword as keyword_module
 import re
-from pathlib import PurePosixPath
-from typing import Any, Literal, cast
+from pathlib import Path, PurePosixPath
+from typing import Any, Final, Literal, cast
 
 from .errors import CodeIndexingError, ErrorCode
+from .extractor import STRUCTURAL_LANGUAGES
 from .models import (
     CompletenessReport,
     DeclarationSelector,
@@ -17,6 +18,7 @@ from .models import (
     RefactorCounts,
     RefactorFinding,
     RefactorOperation,
+    ReferenceBackfillReport,
     ReferenceHit,
     ReferenceLimitation,
     ReferenceResponse,
@@ -25,6 +27,20 @@ from .models import (
     SignatureChangeOperation,
 )
 from .storage import LanceStore, ReferenceRecord
+
+# Reason codes that describe something the syntax-only index could not see.
+# They are surfaced as limitations whatever resolution level they carry, so a
+# caller never reads an empty limitation list as proof of full coverage.
+_LIMITATION_REASONS: Final = frozenset({"wildcard_import", "unknown_receiver", "ambiguous_symbol"})
+
+# Limitations that mean whole files were never analyzed. Any of them forces the
+# completeness state to "incomplete" rather than merely "dynamic limitations".
+_COVERAGE_GAP_CODES: Final = frozenset({"unsupported_language", "parse_error", "stale_file"})
+
+_BOM: Final = b"\xef\xbb\xbf"
+
+# How many individual paths a coverage limitation names before it summarizes.
+_MAX_LIMITATION_PATHS: Final = 10
 
 
 class ReferenceService:
@@ -40,10 +56,20 @@ class ReferenceService:
         kinds: set[str] | None = None,
         limit: int = 100,
         cursor: str | None = None,
+        backfill: ReferenceBackfillReport | None = None,
     ) -> ReferenceResponse:
         if limit < 1 or limit > 500:
-            raise ValueError("limit must be between 1 and 500")
+            raise CodeIndexingError(ErrorCode.INVALID_FILTER, "limit must be between 1 and 500")
         selected = self._select(selector)
+        if selected.language not in STRUCTURAL_LANGUAGES:
+            raise CodeIndexingError(
+                ErrorCode.UNSUPPORTED_LANGUAGE,
+                f"Structural references are not extracted for {selected.language}. "
+                f"Supported languages are {', '.join(sorted(STRUCTURAL_LANGUAGES))}.",
+                project=selected.project_id,
+                path=selected.path,
+                language=selected.language,
+            )
         version = self.store.reference_version(selected.project_id)
         offset = 0
         if cursor is not None:
@@ -71,14 +97,24 @@ class ReferenceService:
             ) from error
         declarations = [row for row in records if row["record_kind"] == "declaration"]
         imports = self._imports_by_file(records)
+        # A declaration nested directly in a class body is reachable only
+        # through a receiver, so it must not shadow a bare name the way a
+        # nested function does.
+        class_scopes = {
+            scope
+            for row in declarations
+            if row["kind"] == "class" and (scope := row["source_qualified_symbol"])
+        }
+        root = self._project_root(selected.project_id)
+        sources: dict[str, tuple[bytes, int]] = {}
         hits: list[ReferenceHit] = []
-        limitations: list[ReferenceLimitation] = []
+        limitations: list[ReferenceLimitation] = self._coverage_limitations(records, backfill)
         for row in records:
             if row["record_kind"] != "reference" or not self._may_refer(row, selected, imports):
                 continue
             if kinds is not None and row["kind"] not in kinds:
                 continue
-            lexical = self._lexical_declaration(row, declarations)
+            lexical = self._lexical_declaration(row, declarations, class_scopes)
             if (
                 lexical is not None
                 and row["file_id"] == selected.file_id
@@ -86,10 +122,13 @@ class ReferenceService:
             ):
                 continue
             resolution, reason, explanation = self._classify(row, selected, declarations, imports)
-            if resolution == "unresolved" and reason in {"wildcard_import", "unknown_receiver"}:
+            if reason in _LIMITATION_REASONS:
                 limitations.append(
                     ReferenceLimitation(code=reason, explanation=explanation, path=row["path"])
                 )
+            source, bom = self._file_bytes(root, row["path"], sources)
+            start_byte = row["start_byte"] or 0
+            end_byte = row["end_byte"] or 0
             hits.append(
                 ReferenceHit(
                     reference_id=row["reference_id"],
@@ -111,9 +150,14 @@ class ReferenceService:
                     ),
                     start_line=row["start_line"] or 0,
                     end_line=row["end_line"] or 0,
-                    start_byte=row["start_byte"] or 0,
-                    end_byte=row["end_byte"] or 0,
-                    snippet=self._snippet(row),
+                    # Offsets are reported against the file as it sits on disk.
+                    # Extraction works on BOM-stripped bytes, so a byte-order
+                    # mark has to be added back or every edit lands three bytes
+                    # early.
+                    start_byte=start_byte + bom,
+                    end_byte=end_byte + bom,
+                    snippet=source[start_byte:end_byte].decode("utf-8", errors="replace"),
+                    written_name=row["written_name"],
                     resolution=cast(Literal["exact", "likely", "unresolved"], resolution),
                     reason_code=reason,
                     explanation=explanation,
@@ -154,8 +198,15 @@ class ReferenceService:
         *,
         limit: int = 500,
         cursor: str | None = None,
+        backfill: ReferenceBackfillReport | None = None,
     ) -> RefactorAnalysis:
-        response = self.find_references(selector, limit=limit, cursor=cursor)
+        response = self.find_references(selector, limit=limit, cursor=cursor, backfill=backfill)
+        records = self.store.list_reference_records(
+            response.selected.project_id, version=response.snapshot_version
+        )
+        shapes_by_id = {row["reference_id"]: row for row in records}
+        root = self._project_root(response.selected.project_id)
+        sources: dict[str, tuple[bytes, int]] = {}
         if isinstance(operation, RenameOperation):
             valid_identifier = (
                 operation.new_name.isidentifier()
@@ -170,6 +221,29 @@ class ReferenceService:
         review: list[RefactorFinding] = []
         evidence: list[RefactorFinding] = []
         if isinstance(operation, RenameOperation) and cursor is None:
+            declaration = next(
+                (
+                    row
+                    for row in records
+                    if row["record_kind"] == "declaration"
+                    and row["file_id"] == response.selected.file_id
+                    and row["source_qualified_symbol"] == response.selected.qualified_symbol
+                ),
+                None,
+            )
+            start_byte, end_byte = 0, 0
+            edit_start, edit_end = None, None
+            if declaration is not None:
+                source, bom = self._file_bytes(root, response.selected.path, sources)
+                start_byte = (declaration["start_byte"] or 0) + bom
+                end_byte = (declaration["end_byte"] or 0) + bom
+                edit_start, edit_end = self._edit_span(
+                    source,
+                    declaration["start_byte"] or 0,
+                    declaration["end_byte"] or 0,
+                    response.selected.symbol,
+                    bom,
+                )
             must_change.append(
                 RefactorFinding(
                     reference_id=f"declaration:{response.selected.file_id}",
@@ -179,20 +253,20 @@ class ReferenceService:
                     kind="write",
                     start_line=response.selected.start_line,
                     end_line=response.selected.end_line,
-                    start_byte=0,
-                    end_byte=0,
+                    start_byte=start_byte,
+                    end_byte=end_byte,
                     snippet=response.selected.symbol,
                     resolution="exact",
                     reason_code="declaration",
                     explanation="The selected declaration must be renamed.",
                     written_name=response.selected.symbol,
                     edit_required=True,
+                    edit_start_byte=edit_start,
+                    edit_end_byte=edit_end,
                 )
             )
         for hit in response.hits:
-            finding = RefactorFinding(
-                **hit.model_dump(), written_name=hit.snippet, edit_required=False
-            )
+            finding = RefactorFinding(**hit.model_dump(), edit_required=False)
             if hit.resolution == "unresolved":
                 review.append(finding)
                 continue
@@ -200,18 +274,38 @@ class ReferenceService:
                 likely_change.append(finding.model_copy(update={"edit_required": True}))
                 continue
             if isinstance(operation, RenameOperation):
-                needs_edit = hit.snippet.rsplit(".", 1)[
-                    -1
-                ] == response.selected.symbol or hit.kind in {
+                # The indexed spelling, not the snippet: re-reading the file to
+                # decide whether an edit is needed turns an unreadable file or
+                # a byte-order mark into a silently skipped call site.
+                written = hit.written_name or hit.snippet
+                needs_edit = written.rsplit(".", 1)[-1] == response.selected.symbol or hit.kind in {
                     "import",
                     "export",
                 }
                 if needs_edit:
-                    must_change.append(finding.model_copy(update={"edit_required": True}))
+                    source, bom = self._file_bytes(root, hit.path, sources)
+                    edit_start, edit_end = self._edit_span(
+                        source,
+                        hit.start_byte - bom,
+                        hit.end_byte - bom,
+                        response.selected.symbol,
+                        bom,
+                    )
+                    must_change.append(
+                        finding.model_copy(
+                            update={
+                                "edit_required": True,
+                                "edit_start_byte": edit_start,
+                                "edit_end_byte": edit_end,
+                            }
+                        )
+                    )
                 else:
                     evidence.append(finding)
                 continue
-            issue = self._signature_issue(response.selected, hit.reference_id, operation)
+            issue = self._signature_issue(
+                response.selected, shapes_by_id.get(hit.reference_id), records, operation
+            )
             if issue in {"spread_uncertainty", "overload_ambiguity"}:
                 review.append(
                     finding.model_copy(
@@ -231,11 +325,26 @@ class ReferenceService:
             else:
                 evidence.append(finding)
         limitations = response.limitations
+        coverage_gaps = [item for item in limitations if item.code in _COVERAGE_GAP_CODES]
         if response.cursor is not None:
             state = "incomplete"
             explanation = "More structural candidates remain available through the cursor."
+        elif coverage_gaps:
+            state = "incomplete"
+            explanation = (
+                "Some files could not be analyzed, so this list may omit real uses. "
+                "See limitations."
+            )
+        elif limitations or review or likely_change:
+            # "likely" is unproven by definition, so a result carrying any is
+            # not the same as one the resolver could fully account for.
+            state = "complete_with_dynamic_limitations"
+            explanation = (
+                "Every indexed file was analyzed, but some uses could not be proven "
+                "without type information. See likely_change and review."
+            )
         else:
-            state = "complete_with_dynamic_limitations" if limitations or review else "complete"
+            state = "complete"
             explanation = "All indexed structural candidates were considered."
         return RefactorAnalysis(
             selected=response.selected,
@@ -263,23 +372,25 @@ class ReferenceService:
     def _signature_issue(
         self,
         selected: SelectedDeclaration,
-        reference_id: str,
+        row: ReferenceRecord | None,
+        records: list[ReferenceRecord],
         operation: SignatureChangeOperation,
     ) -> str | None:
-        row = next(
-            (
-                record
-                for record in self.store.list_reference_records(selected.project_id)
-                if record["reference_id"] == reference_id
-            ),
-            None,
-        )
+        # Both the call shape and the declaration shapes come from the caller's
+        # pinned snapshot. Re-querying the live table per hit rescanned the
+        # whole reference table once per call site, and a refresh mid-analysis
+        # could report an incompatible call as compatible.
         if row is None or row["shape_json"] is None:
             return None
         shape = json.loads(row["shape_json"])
         if shape.get("has_positional_spread") or shape.get("has_keyword_spread"):
             return "spread_uncertainty"
-        old_shapes = self.store.declaration_shapes(selected.project_id, selected.qualified_symbol)
+        old_shapes = [
+            record
+            for record in records
+            if record["record_kind"] == "declaration"
+            and record["source_qualified_symbol"] == selected.qualified_symbol
+        ]
         if len(old_shapes) != 1 or old_shapes[0]["shape_json"] is None:
             return "overload_ambiguity" if len(old_shapes) > 1 else None
         old_parameters = json.loads(old_shapes[0]["shape_json"])
@@ -388,7 +499,11 @@ class ReferenceService:
                 or selected_chunk.symbol is None
                 or selected_chunk.qualified_symbol is None
             ):
-                raise ValueError("chunk_id does not identify a declaration")
+                raise CodeIndexingError(
+                    ErrorCode.AMBIGUOUS_SYMBOL,
+                    f"chunk_id {selector.chunk_id} is not a declaration chunk; chunk ids come "
+                    "from find_symbol or search_code results and change when a file is reindexed",
+                )
             return SelectedDeclaration(
                 project_id=selected_chunk.project_id,
                 file_id=selected_chunk.file_id,
@@ -403,16 +518,56 @@ class ReferenceService:
             )
         assert selector.project is not None and selector.path is not None
         assert selector.qualified_symbol is not None
+        indexed = self.store.list_chunks([selector.project])
         chunks = [
             chunk
-            for chunk in self.store.list_chunks([selector.project])
+            for chunk in indexed
             if chunk.path == selector.path and chunk.qualified_symbol == selector.qualified_symbol
         ]
-        if len(chunks) != 1:
-            raise ValueError("selector does not identify exactly one declaration")
+        if len(chunks) > 1:
+            raise CodeIndexingError(
+                ErrorCode.AMBIGUOUS_SYMBOL,
+                f"{selector.qualified_symbol} matches {len(chunks)} declarations in "
+                f"{selector.path}; select one by chunk_id",
+                project=selector.project,
+                candidates=[
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "path": chunk.path,
+                        "qualified_symbol": chunk.qualified_symbol,
+                        "start_line": chunk.start_line,
+                        "end_line": chunk.end_line,
+                    }
+                    for chunk in chunks
+                ],
+            )
+        if not chunks:
+            # Distinguish a typo from a symbol this project genuinely lacks:
+            # "no declaration" and "no references" are different answers.
+            near = sorted(
+                {
+                    chunk.qualified_symbol
+                    for chunk in indexed
+                    if chunk.qualified_symbol is not None
+                    and chunk.qualified_symbol.rsplit(".", 1)[-1]
+                    == selector.qualified_symbol.rsplit(".", 1)[-1]
+                }
+            )
+            raise CodeIndexingError(
+                ErrorCode.AMBIGUOUS_SYMBOL,
+                f"No declaration {selector.qualified_symbol} in {selector.path}",
+                project=selector.project,
+                path=selector.path,
+                candidates=near[:_MAX_LIMITATION_PATHS],
+            )
         located_chunk = chunks[0]
         if located_chunk.symbol is None or located_chunk.qualified_symbol is None:
-            raise ValueError("selector does not identify a declaration")
+            raise CodeIndexingError(
+                ErrorCode.AMBIGUOUS_SYMBOL,
+                f"{selector.qualified_symbol} in {selector.path} is not a declaration",
+                project=selector.project,
+                path=selector.path,
+            )
         return SelectedDeclaration(
             project_id=located_chunk.project_id,
             file_id=located_chunk.file_id,
@@ -457,6 +612,7 @@ class ReferenceService:
     def _lexical_declaration(
         row: ReferenceRecord,
         declarations: list[ReferenceRecord],
+        class_scopes: set[str],
     ) -> ReferenceRecord | None:
         if row["receiver_text"] is not None or row["kind"] not in {"call", "read", "write"}:
             return None
@@ -468,6 +624,13 @@ class ReferenceService:
                 continue
             qualified = declaration["source_qualified_symbol"] or ""
             scope = qualified.rsplit(".", 1)[0] if "." in qualified else ""
+            # Python and JS/TS both leave the class body out of a method's
+            # scope chain: inside `Gate.run`, a bare `helper()` binds to the
+            # module-level `helper`, never to the sibling method `Gate.helper`.
+            # Treating the class as an enclosing scope silently dropped those
+            # call sites from every result.
+            if scope and scope in class_scopes:
+                continue
             if not scope or source == scope or source.startswith(scope + "."):
                 visible.append((scope.count(".") + bool(scope), declaration))
         return max(visible, key=lambda item: item[0])[1] if visible else None
@@ -589,17 +752,105 @@ class ReferenceService:
         candidates.update(normalized / f"index{extension}" for extension in extensions)
         return target in candidates
 
-    def _snippet(self, row: ReferenceRecord) -> str:
-        project = next(
-            (item for item in self.store.list_projects() if item.id == row["project_id"]), None
-        )
-        if project is None or row["start_byte"] is None or row["end_byte"] is None:
-            return ""
-        try:
-            source = (project.root / row["path"]).read_bytes()
-        except OSError:
-            return ""
-        return source[row["start_byte"] : row["end_byte"]].decode("utf-8", errors="replace")
+    @staticmethod
+    def _edit_span(
+        source: bytes, start_byte: int, end_byte: int, name: str, bom: int
+    ) -> tuple[int | None, int | None]:
+        """Locate the identifier to rewrite inside a reference's own range.
+
+        The stored range covers the whole occurrence, which is wider than the
+        name for a qualified call (`auth.authorize`) and for an aliased import
+        (`authorize as check`). Replacing the whole range would drop the module
+        qualifier or the alias, so the exact identifier is located instead and
+        anything ambiguous is left for a human.
+        """
+
+        span = source[start_byte:end_byte]
+        if not span or not name:
+            return None, None
+        matches = list(re.finditer(rf"(?<![\w$]){re.escape(name)}(?![\w$])".encode(), span))
+        if len(matches) != 1:
+            return None, None
+        return start_byte + matches[0].start() + bom, start_byte + matches[0].end() + bom
+
+    def _project_root(self, project_id: str) -> Path | None:
+        project = next((item for item in self.store.list_projects() if item.id == project_id), None)
+        return project.root if project is not None else None
+
+    @staticmethod
+    def _file_bytes(
+        root: Path | None, path: str, cache: dict[str, tuple[bytes, int]]
+    ) -> tuple[bytes, int]:
+        """Return one file's BOM-stripped bytes and the offset that was removed.
+
+        Reads are cached for the life of one query. Resolving a few hundred
+        references used to re-read the same file once per hit.
+        """
+
+        entry = cache.get(path)
+        if entry is None:
+            try:
+                raw = (root / path).read_bytes() if root is not None else b""
+            except OSError:
+                raw = b""
+            offset = len(_BOM) if raw.startswith(_BOM) else 0
+            entry = (raw[offset:], offset)
+            cache[path] = entry
+        return entry
+
+    def _coverage_limitations(
+        self, records: list[ReferenceRecord], backfill: ReferenceBackfillReport | None
+    ) -> list[ReferenceLimitation]:
+        """Report files that hold no structural rows because none could be made.
+
+        Coverage rows prove a file was parsed under the current schema. A file
+        whose language has no reference query still gets one, so without this
+        the caller cannot tell "searched and found nothing" from "never looked".
+        """
+
+        limitations: list[ReferenceLimitation] = []
+        unanalyzed: dict[str, list[str]] = {}
+        for row in records:
+            if row["record_kind"] != "coverage":
+                continue
+            if row["language"] not in STRUCTURAL_LANGUAGES:
+                unanalyzed.setdefault(row["language"], []).append(row["path"])
+        for language, paths in sorted(unanalyzed.items()):
+            limitations.append(
+                ReferenceLimitation(
+                    code="unsupported_language",
+                    explanation=(
+                        f"{len(paths)} {language} file(s) are indexed for search but have no "
+                        "structural reference extraction, so uses of this declaration in them "
+                        f"are invisible here: {self._sample(paths)}"
+                    ),
+                )
+            )
+        if backfill is not None:
+            for code, paths in (
+                ("parse_error", backfill.incomplete_paths),
+                ("stale_file", backfill.stale_paths),
+            ):
+                if not paths:
+                    continue
+                reason = (
+                    "could not be parsed, so their references are missing"
+                    if code == "parse_error"
+                    else "changed after they were indexed, so their references may be stale"
+                )
+                limitations.append(
+                    ReferenceLimitation(
+                        code=code,
+                        explanation=(f"{len(paths)} file(s) {reason}: {self._sample(paths)}"),
+                    )
+                )
+        return limitations
+
+    @staticmethod
+    def _sample(paths: list[str]) -> str:
+        shown = sorted(paths)[:_MAX_LIMITATION_PATHS]
+        remainder = len(paths) - len(shown)
+        return ", ".join(shown) + (f", and {remainder} more" if remainder else "")
 
     @staticmethod
     def _encode_cursor(payload: dict[str, object]) -> str:
