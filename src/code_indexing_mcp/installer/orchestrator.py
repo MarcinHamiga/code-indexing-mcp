@@ -11,6 +11,8 @@ from . import accelerator, harnesses, shell_path, verify
 from .config_files import InstallerError
 from .shell_path import LauncherResult
 
+EMBED_ACCELERATOR_SETTING = "CODE_INDEXING_EMBED_ACCELERATOR"
+
 
 def default_install_directory() -> Path:
     configured = os.environ.get("CODE_INDEXING_MCP_INSTALL_DIR")
@@ -80,6 +82,21 @@ def run_install(
         detail = f"{accelerator_plan.accelerator} ({accelerator_plan.reason})"
         on_event(StepEvent("accelerator", status, detail))
 
+    env_updates = dict(plan.env_updates)
+    if (
+        accelerator_plan is not None
+        and plan.accelerator is not None
+        and EMBED_ACCELERATOR_SETTING not in env_updates
+    ):
+        # The installer choice is also the user's runtime choice. In particular,
+        # an experimental backend is never eligible for runtime ``auto``, so
+        # preparing it without writing this setting silently leaves indexing on
+        # CPU. Record the backend the installer actually resolved (which may be
+        # a deliberate fallback), while ``auto`` removes an older override.
+        env_updates[EMBED_ACCELERATOR_SETTING] = (
+            None if plan.accelerator == "auto" else accelerator_plan.accelerator
+        )
+
     launcher: LauncherResult | None = None
     profiles_updated: tuple[Path, ...] = ()
     if not plan.install_launcher:
@@ -104,7 +121,7 @@ def run_install(
             StepEvent("harnesses", "started", ", ".join(plan.harness_slugs) or "none selected")
         )
         configured, failures = harnesses.configure_selected_harnesses(
-            list(plan.harness_slugs), command, env=plan.env_updates
+            list(plan.harness_slugs), command, env=env_updates
         )
         for slug, path in configured:
             on_event(StepEvent("harnesses", "finished", f"{slug}: {path}"))
