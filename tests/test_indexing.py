@@ -857,3 +857,47 @@ def test_each_changed_file_is_read_once(tmp_path: Path, monkeypatch: pytest.Monk
 
     assert len(reads) == 5
     assert set(reads.values()) == {1}, f"expected one read per file, got {reads}"
+
+
+def test_two_references_over_one_range_survive_a_reindex(tmp_path: Path) -> None:
+    """One byte range can carry two references, and both must be storable.
+
+    A superclass is both `inheritance` and a `read`; a decorator call is both
+    `decorator` and `call`. When the row identity omitted the kind, the pair
+    collided and merge_insert rejected the whole commit, so every incremental
+    index after the first failed permanently and left the project in `error`.
+    """
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "guard.py"
+    source.write_text(
+        "import functools\n"
+        "\n"
+        "class BaseGuard:\n"
+        "    pass\n"
+        "\n"
+        "class Guard(BaseGuard):\n"
+        "    @functools.cache\n"
+        "    def check(self):\n"
+        "        return 1\n"
+    )
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+
+    rows = [
+        row for row in store.list_reference_records(project.id) if row["record_kind"] == "reference"
+    ]
+    inherited = next(row for row in rows if row["kind"] == "inheritance")
+    span = (inherited["start_byte"], inherited["end_byte"])
+    overlapping = [row for row in rows if (row["start_byte"], row["end_byte"]) == span]
+    assert {row["kind"] for row in overlapping} == {"inheritance", "read"}
+    assert len({row["reference_id"] for row in rows}) == len(rows)
+
+    source.write_text(source.read_text() + "\n\ndef extra():\n    return 2\n")
+    report = indexer.index(project)
+
+    assert report.errors == []
+    assert report.indexed_files == 1
+    assert store.project_state(project.id) == "ready"

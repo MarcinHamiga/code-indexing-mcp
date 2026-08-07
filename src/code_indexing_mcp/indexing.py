@@ -60,7 +60,10 @@ CANDIDATE_GROUP_COUNT = 256
 
 # Bump only when the normalized structural-row contract changes. Coverage rows
 # make a new generation discoverable without coupling it to project metadata.
-REFERENCE_SCHEMA_VERSION = 3
+# Version 4 puts the reference kind in the row identity. Bumping it also
+# discards any generation written by version 3, whose colliding ids are what
+# made a project unindexable.
+REFERENCE_SCHEMA_VERSION = 4
 
 # Failures caused by the environment rather than by a file's own content. They
 # abort the run instead of being recorded against whichever file was in flight.
@@ -918,12 +921,21 @@ class Indexer:
 
         rows: list[ReferenceRow] = []
 
-        def identity(record_kind: str, start_byte: int | None, end_byte: int | None) -> str:
+        def identity(
+            record_kind: str, kind: str | None, start_byte: int | None, end_byte: int | None
+        ) -> str:
+            # `kind` belongs in the digest because one byte range legitimately
+            # carries two references: a superclass is both `inheritance` and a
+            # `read`, and a decorator call is both `decorator` and `call`.
+            # Omitting it gave those rows one id, and merge_insert rejects two
+            # source rows matching a single target -- which permanently broke
+            # every later incremental index of the project.
             return _digest(
                 "\0".join(
                     (
                         file.file_id,
                         record_kind,
+                        kind or "",
                         str(start_byte if start_byte is not None else -1),
                         str(end_byte if end_byte is not None else -1),
                         str(REFERENCE_SCHEMA_VERSION),
@@ -934,7 +946,9 @@ class Indexer:
         for reference in references:
             rows.append(
                 ReferenceRow(
-                    reference_id=identity("reference", reference.start_byte, reference.end_byte),
+                    reference_id=identity(
+                        "reference", reference.kind, reference.start_byte, reference.end_byte
+                    ),
                     record_kind="reference",
                     file_id=file.file_id,
                     project_id=project_id,
@@ -965,7 +979,10 @@ class Indexer:
             rows.append(
                 ReferenceRow(
                     reference_id=identity(
-                        "declaration", declaration.start_byte, declaration.end_byte
+                        "declaration",
+                        declaration.kind,
+                        declaration.start_byte,
+                        declaration.end_byte,
                     ),
                     record_kind="declaration",
                     file_id=file.file_id,
@@ -995,7 +1012,7 @@ class Indexer:
             )
         rows.append(
             ReferenceRow(
-                reference_id=identity("coverage", None, None),
+                reference_id=identity("coverage", None, None, None),
                 record_kind="coverage",
                 file_id=file.file_id,
                 project_id=project_id,
