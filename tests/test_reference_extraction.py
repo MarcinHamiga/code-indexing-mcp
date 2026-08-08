@@ -179,7 +179,15 @@ def test_javascript_typescript_and_tsx_extract_structural_syntax() -> None:
         for reference in ts_result.references
     }
     assert ts_by_name["inheritance:Base<T>"].source_qualified_symbol == "Contract"
-    assert ts_by_name["type_use:Contract<string>"].written_name == "Contract<string>"
+    # `type Alias = Contract<string>;` -- the generic head descends to its own
+    # type_use row instead of the whole expression verbatim (E2). `string` is a
+    # predefined_type, not a type_identifier, so it stays out of scope here.
+    assert any(
+        reference.kind == "type_use"
+        and reference.written_name == "Contract"
+        and reference.source_qualified_symbol == "Alias"
+        for reference in ts_result.references
+    )
     assert ts_by_name["call:build"].call_shape is not None
     assert ts_by_name["call:build"].call_shape.type_argument_count == 1
     declaration = next(item for item in ts_result.declarations if item.qualified_symbol == "make")
@@ -418,3 +426,207 @@ def test_js_family_exports_binding_identifiers_and_commented_defaults(
         "Commented",
         "default",
     )
+
+
+@pytest.mark.parametrize("language", ["javascript", "typescript", "tsx"])
+def test_js_family_export_star_and_namespace_export_carry_module_path(language: str) -> None:
+    """E3: barrel re-exports emit an `export` row instead of nothing (or a bogus `read`)."""
+    source = "export * from './x';\nexport * as ns from './x';\n"
+
+    references = _references(source, language)
+    exports = [reference for reference in references if reference.kind == "export"]
+
+    assert len(exports) == 2
+    bare, namespaced = exports
+    assert (bare.target_name, bare.written_name, bare.module_path, bare.alias) == (
+        "*",
+        "*",
+        "./x",
+        None,
+    )
+    assert (namespaced.target_name, namespaced.written_name, namespaced.module_path, namespaced.alias) == (
+        "*",
+        "ns",
+        "./x",
+        "ns",
+    )
+    # The namespace alias must not also surface as a bare `read`.
+    assert not any(reference.kind == "read" and reference.written_name == "ns" for reference in references)
+
+
+@pytest.mark.parametrize("language", ["javascript", "typescript", "tsx"])
+def test_js_family_module_edges_stay_visible(language: str) -> None:
+    """E9: side-effect imports and require()/dynamic import() keep their module path."""
+    source = (
+        "import './polyfill';\n"
+        "const lazy = require('./lazy');\n"
+        "const dynamic = import('./dynamic');\n"
+    )
+
+    references = _references(source, language)
+
+    bare_import = next(reference for reference in references if reference.kind == "import")
+    assert (bare_import.module_path, bare_import.imported_name) == ("./polyfill", None)
+
+    calls = {reference.target_name: reference for reference in references if reference.kind == "call"}
+    assert calls["require"].module_path == "./lazy"
+    assert calls["import"].module_path == "./dynamic"
+
+
+def test_python_member_access_read_and_write_carry_the_receiver() -> None:
+    """E5: attribute assignment/read are no longer swallowed by the `left` exclusion."""
+    source = "config.TIMEOUT = 10\nprint(config.TIMEOUT)\n"
+
+    references = _references(source, "python")
+
+    write = next(reference for reference in references if reference.kind == "write")
+    read = next(
+        reference
+        for reference in references
+        if reference.kind == "read" and reference.written_name == "config.TIMEOUT"
+    )
+    assert (write.target_name, write.written_name, write.receiver_text) == (
+        "config.TIMEOUT",
+        "config.TIMEOUT",
+        "config",
+    )
+    assert (read.target_name, read.written_name, read.receiver_text) == (
+        "config.TIMEOUT",
+        "config.TIMEOUT",
+        "config",
+    )
+    # The bare receiver identifier still surfaces as its own `read` on the read line.
+    assert any(
+        reference.kind == "read" and reference.written_name == "config" for reference in references
+    )
+
+
+@pytest.mark.parametrize("language", ["javascript", "typescript", "tsx"])
+def test_js_family_member_access_read_and_write_carry_the_receiver(language: str) -> None:
+    """E5: member-expression assignment targets and plain reads are recorded."""
+    source = "target.TIMEOUT = 5;\ntarget.TIMEOUT;\n"
+
+    references = _references(source, language)
+
+    write = next(reference for reference in references if reference.kind == "write")
+    read = next(
+        reference
+        for reference in references
+        if reference.kind == "read" and reference.written_name == "target.TIMEOUT"
+    )
+    assert (write.target_name, write.written_name, write.receiver_text) == (
+        "target.TIMEOUT",
+        "target.TIMEOUT",
+        "target",
+    )
+    assert (read.target_name, read.written_name, read.receiver_text) == (
+        "target.TIMEOUT",
+        "target.TIMEOUT",
+        "target",
+    )
+
+
+@pytest.mark.parametrize("language", ["javascript", "typescript", "tsx"])
+def test_js_family_decorators_produce_decorator_references(language: str) -> None:
+    """E6: `@Name`, `@ns.Name`, and `@Factory()` all yield a `decorator` row; the
+    factory call keeps its own additional `call` row."""
+    source = (
+        "@sealed\n"
+        "class Plain {}\n\n"
+        "@ns.sealed\n"
+        "class Namespaced {}\n\n"
+        "@factory()\n"
+        "class Factored {\n"
+        "  @readonly\n"
+        "  handle() {}\n"
+        "}\n"
+    )
+
+    references = _references(source, language)
+
+    by_span = {
+        reference.start_byte: reference
+        for reference in references
+        if reference.kind == "decorator"
+    }
+    plain = by_span[source.index("sealed")]
+    assert (plain.target_name, plain.written_name, plain.source_qualified_symbol) == (
+        "sealed",
+        "sealed",
+        "Plain",
+    )
+    namespaced = by_span[source.index("ns.sealed")]
+    assert (namespaced.target_name, namespaced.source_qualified_symbol) == (
+        "ns.sealed",
+        "Namespaced",
+    )
+    factory_target = source.index("factory()")
+    factory = by_span[factory_target]
+    assert (factory.target_name, factory.source_qualified_symbol) == ("factory", "Factored")
+    # The factory call keeps its own `call` row in addition to the decorator row.
+    assert any(
+        reference.kind == "call" and reference.written_name == "factory" for reference in references
+    )
+    method_decorator = by_span[source.index("readonly")]
+    assert method_decorator.source_qualified_symbol == "Factored.handle"
+
+    # No duplicate `read`/member_access row shares a decorator's span.
+    decorator_spans = {(r.start_byte, r.end_byte) for r in references if r.kind == "decorator"}
+    for reference in references:
+        if reference.kind in {"read", "write"}:
+            assert (reference.start_byte, reference.end_byte) not in decorator_spans
+
+
+@pytest.mark.parametrize("language", ["javascript", "typescript", "tsx"])
+def test_destructured_parameter_is_one_marked_positional_slot(language: str) -> None:
+    """A multi-key destructured parameter (E7) stays one positional slot.
+
+    Expanding to N flat params would corrupt positional matching for every
+    caller, so the extractor instead marks the slot as `destructured` and
+    gives it a synthesized, non-pattern name.
+    """
+    if language == "javascript":
+        source = "function describe({ title, subtitle, footnote }) { return title; }\n"
+    else:
+        source = (
+            "function describe({ title, subtitle, footnote }: "
+            "{ title: string; subtitle: string; footnote: string }) { return title; }\n"
+        )
+    result = TreeSitterExtractor().extract(Path(f"sample.{language}"), language, source.encode())
+    declaration = next(item for item in result.declarations if item.qualified_symbol == "describe")
+
+    assert len(declaration.parameters) == 1
+    parameter = declaration.parameters[0]
+    assert parameter.kind == "positional"
+    assert parameter.position == 0
+    assert parameter.destructured is True
+    assert "{" not in parameter.name and "}" not in parameter.name
+
+
+@pytest.mark.parametrize("language", ["typescript", "tsx"])
+def test_callback_typed_parameter_is_required_not_defaulted(language: str) -> None:
+    """E8: a `=>` inside a parameter's callback type must not misfire the
+    text-based default heuristic and mark the parameter optional."""
+    source = "function bind(handler: (event: Event) => void, retries: number) { return retries; }\n"
+    result = TreeSitterExtractor().extract(Path(f"sample.{language}"), language, source.encode())
+    declaration = next(item for item in result.declarations if item.qualified_symbol == "bind")
+
+    assert [(item.name, item.kind, item.required) for item in declaration.parameters] == [
+        ("handler", "positional", True),
+        ("retries", "positional", True),
+    ]
+
+
+def test_python_member_call_does_not_duplicate_as_member_access() -> None:
+    """A member call keeps its single `call` row -- no extra `read` for the same span."""
+    source = "widget.render()\n"
+
+    references = _references(source, "python")
+
+    matching = [
+        reference
+        for reference in references
+        if reference.start_byte == source.index("widget.render")
+        and reference.end_byte == source.index("widget.render") + len("widget.render")
+    ]
+    assert [reference.kind for reference in matching] == ["call"]

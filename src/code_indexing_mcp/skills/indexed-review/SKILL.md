@@ -36,7 +36,7 @@ This is the core rule of this skill: **use the code-indexing-mcp tools as the pr
 
 - `mcp__code-indexing-mcp__search_code` — semantic natural-language queries to find relevant code for the angle (see playbooks below). Issue several targeted queries, not one broad one.
 - `mcp__code-indexing-mcp__file_outline` — get a file's structure before reading it; decide which parts matter instead of dumping whole files.
-- `mcp__code-indexing-mcp__find_symbol` — trace a function/class to all its definitions and call sites when evaluating impact or correctness.
+- `mcp__code-indexing-mcp__find_symbol` — resolve a function/class name to its definitions when evaluating impact or correctness. It matches declaration names only; use `mcp__code-indexing-mcp__find_references` for call sites.
 - `mcp__code-indexing-mcp__get_chunk` — pull the full body of a chunk returned by search when you need exact code.
 
 Only use Grep when the task genuinely needs a literal match that semantic search cannot express (exact string literals, secret-looking patterns, TODO/FIXME markers) or when the code-indexing-mcp tools are unavailable — and say so when you do.

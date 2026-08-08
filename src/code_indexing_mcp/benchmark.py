@@ -41,9 +41,7 @@ def write_benchmark_corpus(root: Path, *, files: int = 128, functions_per_file: 
     return total
 
 
-def _measure(
-    action: Callable[[], IndexReport], structural_record_count: Callable[[str], int]
-) -> dict[str, Any]:
+def _measure(action: Callable[[], IndexReport]) -> dict[str, Any]:
     started = time.monotonic_ns()
     report = action()
     wall_ms = (time.monotonic_ns() - started) / 1_000_000
@@ -52,18 +50,15 @@ def _measure(
     return {
         "wall_ms": round(wall_ms, 3),
         "chunks_per_second": round(throughput, 3),
-        "structural_records": structural_record_count(report.project_id),
-        "reference_extraction_duration_ms": report.parse_duration_ms or report.parse_ms or 0,
+        # This run's own staged structural rows (T1) -- not a whole-project
+        # table read, which would report the same total for every scenario
+        # regardless of how much work that scenario actually did.
+        "structural_records": report.staged_reference_rows,
+        # Reference extraction's own timing (T1), separate from
+        # `parse_duration_ms`, which also covers parsing and chunking.
+        "reference_extraction_duration_ms": report.reference_extraction_duration_ms or 0,
         "report": report.model_dump(mode="json"),
     }
-
-
-def _structural_record_count(app: IndexBenchmarkApplication, project_id: str) -> int:
-    """Read persisted structural facts; indexing already extracted them in its parse pass."""
-    store = getattr(app, "store", None)
-    if store is None:
-        return 0
-    return len(store.list_reference_records(project_id))
 
 
 def run_index_benchmark(app: IndexBenchmarkApplication, root: Path) -> dict[str, Any]:
@@ -71,21 +66,14 @@ def run_index_benchmark(app: IndexBenchmarkApplication, root: Path) -> dict[str,
     project = app.init_project(root)
     scenarios: dict[str, dict[str, Any]] = {}
 
-    def records(project_id: str) -> int:
-        return _structural_record_count(app, project_id)
-
-    scenarios["cold_start"] = _measure(lambda: app.index_project(project.id, force=True), records)
-    scenarios["warm_index"] = _measure(lambda: app.index_project(project.id, force=True), records)
+    scenarios["cold_start"] = _measure(lambda: app.index_project(project.id, force=True))
+    scenarios["warm_index"] = _measure(lambda: app.index_project(project.id, force=True))
 
     incremental = root / "module_0000.py"
     with incremental.open("a", encoding="utf-8") as stream:
         stream.write("\ndef phase_1_incremental_marker(value: int) -> int:\n    return value + 1\n")
-    scenarios["incremental_index"] = _measure(
-        lambda: app.index_project(project.id, force=False), records
-    )
-    scenarios["forced_reindex"] = _measure(
-        lambda: app.index_project(project.id, force=True), records
-    )
+    scenarios["incremental_index"] = _measure(lambda: app.index_project(project.id, force=False))
+    scenarios["forced_reindex"] = _measure(lambda: app.index_project(project.id, force=True))
     return {"schema_version": 1, "scenarios": scenarios}
 
 

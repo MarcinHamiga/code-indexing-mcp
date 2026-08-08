@@ -197,7 +197,14 @@ def test_rename_validation_uses_the_selected_language(tmp_path: Path) -> None:
     assert javascript_analysis.operation.new_name == "$answer"
 
 
-def test_refactor_analysis_exposes_pagination_and_incomplete_state(tmp_path: Path) -> None:
+def test_refactor_analysis_pagination_is_independent_of_completeness_and_counts(
+    tmp_path: Path,
+) -> None:
+    """A mid-stream page is not a coverage gap: `cursor` alone signals more
+    pages remain, while `completeness.state` and `counts` are computed from
+    the full, unsliced result set and so are identical on every page (R4).
+    """
+
     callers = "".join(f"def caller_{index}():\n    return answer()\n\n" for index in range(501))
     service, project_id = _indexed_service(
         tmp_path,
@@ -208,15 +215,59 @@ def test_refactor_analysis_exposes_pagination_and_incomplete_state(tmp_path: Pat
 
     first = service.analyze_refactor(selector, operation)
     assert first.cursor is not None
-    assert first.completeness.state == "incomplete"
+    # Nothing here is a coverage gap or an unproven candidate, so the
+    # first (mid-stream) page reports the same honest "complete" state as
+    # the last page — the cursor, not completeness, carries the pagination
+    # signal.
+    assert first.completeness.state == "complete"
+    assert first.counts.must_change == 502
+
     second = service.analyze_refactor(selector, operation, cursor=first.cursor)
+    assert second.cursor is None
+    assert second.completeness.state == "complete"
+    # Counts are page-independent: the last page reports the same total as
+    # the first, not just the count of what happens to be on this page.
+    assert second.counts.must_change == 502
+
+
+def test_refactor_cursor_is_bound_to_the_operation_and_page_limit(tmp_path: Path) -> None:
+    """A page-2 cursor is rejected if the caller silently changes the
+    refactor operation or the page size between calls (T2 new gap): neither
+    dimension was bound into the cursor payload, so page 2 could otherwise
+    accept a different `new_name` (or apply a rename's edits under a
+    signature-change operation) or a different page size than page 1 used.
+    """
+
+    callers = "".join(f"def caller_{index}():\n    return answer()\n\n" for index in range(501))
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"lib.py": f"def answer():\n    return 42\n\n{callers}"},
+    )
+    selector = DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+
+    first = service.analyze_refactor(selector, RenameOperation(new_name="result"))
+    assert first.cursor is not None
+
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.analyze_refactor(
+            selector, RenameOperation(new_name="different"), cursor=first.cursor
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_CURSOR
+
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.analyze_refactor(
+            selector, RenameOperation(new_name="result"), cursor=first.cursor, limit=10
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_CURSOR
+
+    # The identical operation and limit are accepted, unaffected by binding.
+    second = service.analyze_refactor(selector, RenameOperation(new_name="result"), cursor=first.cursor)
+    assert second.cursor is None
 
     calls = [
         item for analysis in (first, second) for item in analysis.must_change if item.kind == "call"
     ]
     assert len(calls) == 501
-    assert second.cursor is None
-    assert second.completeness.state == "complete"
 
 
 def test_signature_keyword_satisfies_required_positional_parameter(tmp_path: Path) -> None:
@@ -308,6 +359,115 @@ def test_the_declaration_finding_points_at_its_own_name(tmp_path: Path) -> None:
     assert source[declaration.edit_start_byte : declaration.edit_end_byte] == b"authorize"
 
 
+def test_analyze_refactor_fetches_the_reference_table_only_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """analyze_refactor must reuse find_references' fetch, not re-scan (S4)."""
+    service, project_id = _indexed_service(
+        tmp_path, {"auth.py": "def authorize(user):\n    return user\n"}
+    )
+    calls: list[int | None] = []
+    real_list_reference_records = service.store.list_reference_records
+
+    def counting_list_reference_records(
+        project: str, *, version: int | None = None
+    ) -> list[object]:
+        calls.append(version)
+        return real_list_reference_records(project, version=version)
+
+    monkeypatch.setattr(service.store, "list_reference_records", counting_list_reference_records)
+
+    service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize"),
+        RenameOperation(new_name="permit"),
+    )
+
+    assert len(calls) == 1, f"expected exactly one full-table fetch, got {calls}"
+
+
+def test_rename_of_a_base_method_surfaces_the_subclass_override(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.py": "class Base:\n    def handle(self):\n        return 1\n",
+            "child.py": (
+                "from base import Base\n\n\n"
+                "class Child(Base):\n    def handle(self):\n        return 2\n"
+            ),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="base.py", qualified_symbol="Base.handle"),
+        RenameOperation(new_name="process"),
+    )
+
+    override = next(
+        item
+        for item in analysis.likely_change
+        if item.path == "child.py" and item.reason_code == "override_of_renamed_method"
+    )
+    assert override.resolution == "likely"
+    assert not any(
+        item.path == "child.py" and item.reason_code == "override_of_renamed_method"
+        for item in analysis.must_change
+    )
+
+
+def test_rename_of_a_base_method_surfaces_a_transitive_subclass_override(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.py": "class Base:\n    def handle(self):\n        return 1\n",
+            "mid.py": (
+                "from base import Base\n\n\nclass Mid(Base):\n    def handle(self):\n        return 2\n"
+            ),
+            "leaf.py": (
+                "from mid import Mid\n\n\nclass Leaf(Mid):\n    def handle(self):\n        return 3\n"
+            ),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="base.py", qualified_symbol="Base.handle"),
+        RenameOperation(new_name="process"),
+    )
+
+    override_paths = {
+        item.path
+        for item in analysis.likely_change
+        if item.reason_code == "override_of_renamed_method"
+    }
+    assert override_paths == {"mid.py", "leaf.py"}
+
+
+def test_javascript_rename_of_a_base_method_surfaces_the_subclass_override(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.js": "export class Base {\n  handle() {\n    return 1;\n  }\n}\n",
+            "child.js": (
+                "import { Base } from './base';\n\n"
+                "export class Child extends Base {\n  handle() {\n    return 2;\n  }\n}\n"
+            ),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="base.js", qualified_symbol="Base.handle"),
+        RenameOperation(new_name="process"),
+    )
+
+    override = next(
+        item
+        for item in analysis.likely_change
+        if item.path == "child.js" and item.reason_code == "override_of_renamed_method"
+    )
+    assert override.resolution == "likely"
+
+
 def test_an_unanalyzable_language_makes_the_analysis_incomplete(tmp_path: Path) -> None:
     service, project_id = _indexed_service(
         tmp_path,
@@ -377,3 +537,122 @@ def test_an_ambiguous_selector_names_its_candidates(tmp_path: Path) -> None:
         )
 
     assert raised.value.code is ErrorCode.AMBIGUOUS_SYMBOL
+
+
+def test_a_ts_scope_no_longer_carries_the_blanket_extraction_gaps_limitation(
+    tmp_path: Path,
+) -> None:
+    """Phase 2 covered heritage, generic types, `export *`, member access, and
+    decorators (E1/E2/E3/E5/E6/E9/E10/E11/E12); the corpus-gated cap over
+    those constructs is retired (Task 2.7). A plain TS scope with nothing left
+    uncovered must not claim otherwise."""
+
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.ts": "export function answer(): number { return 42; }\n",
+            "main.ts": "import { answer } from './lib';\nanswer();\n",
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="lib.ts", qualified_symbol="answer"),
+    )
+
+    assert not any(item.code == "extraction_gaps" for item in response.limitations)
+
+
+def test_a_ts_scope_reaches_the_complete_state_for_a_function_rename(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.ts": "export function answer(): number { return 42; }\n",
+            "main.ts": "import { answer } from './lib';\nanswer();\n",
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="lib.ts", qualified_symbol="answer"),
+        RenameOperation(new_name="result"),
+    )
+
+    assert not any(item.code == "extraction_gaps" for item in analysis.limitations)
+    assert analysis.completeness.state == "complete"
+
+
+def test_a_ts_class_rename_finds_the_heritage_reference_and_reaches_complete(
+    tmp_path: Path,
+) -> None:
+    """E1 is fixed: class-heritage extraction now surfaces `extends Base`, so
+    renaming a base class is no longer a known-wrong-answer case."""
+
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.ts": "export class Base {\n  run(): number { return 1; }\n}\n",
+            "child.ts": (
+                "import { Base } from './base';\n\nexport class Child extends Base {}\n"
+            ),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="base.ts", qualified_symbol="Base"),
+        RenameOperation(new_name="Foundation"),
+    )
+
+    findings = analysis.must_change + analysis.likely_change
+    inheritance_hit = next(
+        item for item in findings if item.path == "child.ts" and item.kind == "inheritance"
+    )
+    assert inheritance_hit.resolution in {"exact", "likely"}
+    assert not any(item.code == "extraction_gaps" for item in analysis.limitations)
+    assert analysis.completeness.state != "incomplete"
+
+
+def test_a_tsx_jsx_component_use_resolves_without_a_standing_limitation(
+    tmp_path: Path,
+) -> None:
+    """E14 (JSX component tag references) is fixed: a `<Widget />` use is its
+
+    own `type_use` reference row, so it resolves exactly and a TSX scope no
+    longer needs a narrow limitation naming that gap.
+    """
+
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "widget.tsx": (
+                "export function Widget(): JSX.Element {\n  return <div />;\n}\n"
+            ),
+            "main.tsx": (
+                "import { Widget } from './widget';\n"
+                "export function App(): JSX.Element {\n  return <Widget />;\n}\n"
+            ),
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="widget.tsx", qualified_symbol="Widget"),
+    )
+
+    assert not any(item.code == "extraction_gaps" for item in response.limitations)
+    component_hit = next(
+        item for item in response.hits if item.path == "main.tsx" and item.kind == "type_use"
+    )
+    assert component_hit.resolution == "exact"
+
+
+def test_a_python_only_scope_is_unaffected_by_the_standing_limitation(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"lib.py": "class Base:\n    def run(self):\n        return 1\n"},
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="Base"),
+        RenameOperation(new_name="Foundation"),
+    )
+
+    assert not any(item.code == "extraction_gaps" for item in analysis.limitations)
+    assert analysis.completeness.state == "complete"

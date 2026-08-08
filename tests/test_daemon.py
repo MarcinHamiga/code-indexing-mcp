@@ -107,8 +107,11 @@ def test_broker_forwards_refactor_pagination_parameters(tmp_path: Path) -> None:
         broker.stop()
         thread.join(timeout=2)
 
+    # `cursor` alone carries the pagination signal; `completeness.state` is
+    # computed from the full, unsliced result set and stays "complete" here
+    # since nothing in it is a coverage gap or an unproven candidate (R4).
     assert analysis.cursor is not None
-    assert analysis.completeness.state == "incomplete"
+    assert analysis.completeness.state == "complete"
 
 
 def test_broker_freshness_uses_the_existing_status_rpc(

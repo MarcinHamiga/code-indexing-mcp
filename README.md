@@ -303,11 +303,17 @@ languages, or files that failed to parse. Those are reported as `limitations` wi
 `unsupported_language`, `parse_error`, and `stale_file`, and any of them makes `completeness.state`
 `incomplete`. A single unparseable file degrades the result; it does not disable the tools.
 
+JavaScript, TypeScript, and TSX scopes carry no standing extraction cap: class/interface
+heritage, generic and union/intersection type references, `export *` re-exports, member accesses
+and writes, decorators, and JSX component tag references are fully captured.
+
 `analyze_refactor` accepts a discriminated `operation`: `{"kind":"rename","new_name":"..."}`
 or `{"kind":"signature_change","parameters":[...]}`. It never edits source. Its
 `must_change` items are deterministic, `likely_change` and `review` require inspection, and
-`evidence` includes exact aliases that identify the target but need no spelling change. Signature
-analysis reports spread arguments and ambiguous declaration shapes for review instead of guessing.
+`evidence` includes, for a rename, exact aliases that identify the target but need no spelling
+change; for a signature change, the same bucket holds compatible call sites that need no argument
+edit. Signature analysis reports spread arguments and ambiguous declaration shapes for review
+instead of guessing.
 
 `completeness.state` is `complete` only when every indexed file was analyzed and every candidate was
 proven; a result carrying `likely_change` or `review` entries reports

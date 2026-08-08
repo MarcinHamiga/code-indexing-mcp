@@ -20,6 +20,11 @@ class BenchmarkApplication:
         assert project == "benchmark-project"
         self.force_calls.append(force)
         call = len(self.force_calls)
+        # The incremental scenario (call 3) touches only the one appended
+        # file, so its staged rows and reference-extraction time must be
+        # smaller than a full-corpus run's -- a seeded, distinguishable value
+        # per scenario, not a fake that would report zero either way (T3).
+        staged_rows = 3 if call == 3 else 12
         return IndexReport(
             project_id=project,
             discovered_files=4,
@@ -29,6 +34,8 @@ class BenchmarkApplication:
             duration_ms=100,
             embedding_backend="cpu",
             embedding_batch_size=8,
+            staged_reference_rows=staged_rows,
+            reference_extraction_duration_ms=staged_rows,
         )
 
 
@@ -48,8 +55,16 @@ def test_benchmark_runs_cold_warm_incremental_and_forced_scenarios(tmp_path: Pat
     ]
     assert payload["scenarios"]["incremental_index"]["report"]["indexed_files"] == 1
     assert payload["scenarios"]["warm_index"]["chunks_per_second"] == 80.0
-    assert payload["scenarios"]["cold_start"]["structural_records"] == 0
-    assert payload["scenarios"]["cold_start"]["reference_extraction_duration_ms"] == 0
+    # These read straight off the report's per-run fields, not a whole-project
+    # table scan or a fallback that a renamed attribute could keep green (T1, T3).
+    assert payload["scenarios"]["cold_start"]["structural_records"] == 12
+    assert payload["scenarios"]["cold_start"]["reference_extraction_duration_ms"] == 12
+    assert payload["scenarios"]["incremental_index"]["structural_records"] == 3
+    assert payload["scenarios"]["incremental_index"]["reference_extraction_duration_ms"] == 3
+    assert (
+        payload["scenarios"]["incremental_index"]["structural_records"]
+        != payload["scenarios"]["cold_start"]["structural_records"]
+    )
     assert "phase_1_incremental_marker" in (root / "module_0000.py").read_text()
 
 

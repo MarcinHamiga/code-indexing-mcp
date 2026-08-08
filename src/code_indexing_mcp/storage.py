@@ -262,14 +262,16 @@ class LanceStore:
         tables = self._tables(project_id)
         condition = f"file_id = {_quoted(file_id)}"
         tables.chunks.delete(condition)
-        assert tables.references is not None
+        if tables.references is None:
+            raise RuntimeError("Reference table is missing from an interrupted transaction")
         tables.references.delete(condition)
         tables.files.delete(condition)
 
     def table_versions(self, project_id: str) -> TableVersions:
         """Snapshot every partition table's version before a commit begins."""
         tables = self._tables(project_id)
-        assert tables.references is not None
+        if tables.references is None:
+            raise RuntimeError("Reference table is missing from an interrupted transaction")
         return TableVersions(
             files=tables.files.version,
             chunks=tables.chunks.version,
@@ -306,7 +308,8 @@ class LanceStore:
         tables.files.checkout_latest()
         tables.chunks.checkout_latest()
         if restore_references:
-            assert tables.references is not None
+            if tables.references is None:
+                raise RuntimeError("Reference table is missing from an interrupted transaction")
             tables.references.checkout_latest()
         return True
 
@@ -357,7 +360,8 @@ class LanceStore:
                 )
             else:
                 tables.chunks.delete(condition)
-        assert tables.references is not None
+        if tables.references is None:
+            raise RuntimeError("Reference table is missing from an interrupted transaction")
         wanted_reference_ids = set(replace_reference_file_ids)
         seen_reference_ids: set[str] = set()
         for file_id, references in reference_groups:
@@ -391,8 +395,10 @@ class LanceStore:
         """Return structural rows from the requested immutable table version."""
         return self._reference_rows(project_id, None, version=version)
 
-    def reference_coverage(self, project_id: str) -> list[ReferenceRecord]:
-        return self._reference_rows(project_id, "record_kind = 'coverage'")
+    def reference_coverage(
+        self, project_id: str, *, version: int | None = None
+    ) -> list[ReferenceRecord]:
+        return self._reference_rows(project_id, "record_kind = 'coverage'", version=version)
 
     def reference_version(self, project_id: str) -> int:
         """Return the current structural snapshot without creating a partition."""
@@ -400,6 +406,21 @@ class LanceStore:
         if tables is None or tables.references is None:
             return 0
         return int(tables.references.version)
+
+    def has_reference_table(self, project_id: str) -> bool:
+        """True when the references table exists for *project_id*.
+
+        Distinguishes a legitimately empty reference index (the table
+        exists, `ensure_reference_index` has run, there is simply nothing
+        to report) from one that was never built at all -- a legacy
+        partition indexed before this feature existed, or one whose
+        `ensure_reference_index` was skipped. `_reference_rows` and
+        `reference_version` collapse both cases to `[]`/`0`, so callers
+        that need the distinction (S5) must ask this directly rather than
+        trust an empty result.
+        """
+        tables = self._existing_tables(project_id)
+        return tables is not None and tables.references is not None
 
     def coverage_for_file(
         self, project_id: str, file_id: str, schema_version: int
@@ -412,22 +433,85 @@ class LanceStore:
             f"AND file_id = {_quoted(file_id)} AND schema_version = {schema_version}",
         )
 
-    def declaration_shapes(self, project_id: str, qualified_symbol: str) -> list[ReferenceRecord]:
+    def declaration_shapes(
+        self, project_id: str, qualified_symbol: str, *, version: int | None = None
+    ) -> list[ReferenceRecord]:
         return self._reference_rows(
             project_id,
             "record_kind = 'declaration' "
             f"AND source_qualified_symbol = {_quoted(qualified_symbol)}",
+            version=version,
         )
 
-    def imports_for(self, project_id: str, module_path: str) -> list[ReferenceRecord]:
+    def imports_for(
+        self, project_id: str, module_path: str, *, version: int | None = None
+    ) -> list[ReferenceRecord]:
         return self._reference_rows(
             project_id,
             "record_kind = 'reference' AND kind = 'import' "
             f"AND module_path = {_quoted(module_path)}",
+            version=version,
         )
 
-    def target_name_candidates(self, project_id: str, target_name: str) -> list[ReferenceRecord]:
-        return self._reference_rows(project_id, f"target_name = {_quoted(target_name)}")
+    def target_name_candidates(
+        self,
+        project_id: str,
+        target_name: str,
+        *,
+        record_kind: str | None = None,
+        version: int | None = None,
+    ) -> list[ReferenceRecord]:
+        condition = f"target_name = {_quoted(target_name)}"
+        if record_kind is not None:
+            condition = f"record_kind = {_quoted(record_kind)} AND {condition}"
+        return self._reference_rows(project_id, condition, version=version)
+
+    def declarations_for_files(
+        self, project_id: str, file_ids: Iterable[str], *, version: int | None = None
+    ) -> list[ReferenceRecord]:
+        """Declaration rows for exactly the given files (S4 pushdown).
+
+        `_lexical_declaration`/class-scope resolution only ever compares a
+        declaration against a reference row in the *same* file, so callers
+        that already narrowed to a candidate file set never need the whole
+        project's declaration table.
+        """
+        ids = sorted(set(file_ids))
+        if not ids:
+            return []
+        values = ", ".join(_quoted(file_id) for file_id in ids)
+        return self._reference_rows(
+            project_id,
+            f"record_kind = 'declaration' AND file_id IN ({values})",
+            version=version,
+        )
+
+    def reference_rows_for_files(
+        self,
+        project_id: str,
+        file_ids: Iterable[str],
+        *,
+        kinds: Iterable[str] | None = None,
+        version: int | None = None,
+    ) -> list[ReferenceRecord]:
+        """Reference rows (not declarations/coverage) for exactly the given files.
+
+        `kinds` narrows further (e.g. `("import", "export")` for the
+        import/re-export context `_imports_by_file` needs) so a caller that
+        only wants module edges is not handed every call/read/write row too.
+        """
+        ids = sorted(set(file_ids))
+        if not ids:
+            return []
+        values = ", ".join(_quoted(file_id) for file_id in ids)
+        condition = f"record_kind = 'reference' AND file_id IN ({values})"
+        if kinds is not None:
+            kind_list = sorted(set(kinds))
+            if not kind_list:
+                return []
+            kind_values = ", ".join(_quoted(kind) for kind in kind_list)
+            condition = f"{condition} AND kind IN ({kind_values})"
+        return self._reference_rows(project_id, condition, version=version)
 
     def list_chunks(self, project_ids: Iterable[str] | None = None) -> list[IndexedChunk]:
         ids = list(project_ids or [project.id for project in self.list_projects()])

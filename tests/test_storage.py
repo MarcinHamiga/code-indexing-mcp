@@ -97,6 +97,8 @@ def test_reads_never_materialize_a_partition(tmp_path: Path) -> None:
     assert store.declaration_shapes(project.id, "answer") == []
     assert store.imports_for(project.id, "module") == []
     assert store.target_name_candidates(project.id, "answer") == []
+    assert store.declarations_for_files(project.id, ["file-1"]) == []
+    assert store.reference_rows_for_files(project.id, ["file-1"]) == []
 
     assert not (store.directory / "projects").exists()
 
@@ -221,6 +223,32 @@ def test_reference_read_methods_apply_exact_structural_filters(tmp_path: Path) -
     assert store.declaration_shapes(project.id, "package.answer") == [declaration]
     assert store.imports_for(project.id, "package") == [imported]
     assert store.target_name_candidates(project.id, "answer") == [declaration, imported]
+    # record_kind narrows target_name_candidates to one shape (S4).
+    assert store.target_name_candidates(project.id, "answer", record_kind="declaration") == [
+        declaration
+    ]
+    assert store.target_name_candidates(project.id, "answer", record_kind="reference") == [
+        imported
+    ]
+    # declarations/reference rows restricted to a candidate file set.
+    assert store.declarations_for_files(project.id, ["file-1"]) == [declaration]
+    assert store.declarations_for_files(project.id, ["no-such-file"]) == []
+    assert store.declarations_for_files(project.id, []) == []
+    assert store.reference_rows_for_files(project.id, ["file-1"]) == [imported]
+    assert store.reference_rows_for_files(project.id, ["file-1"], kinds=["import"]) == [imported]
+    assert store.reference_rows_for_files(project.id, ["file-1"], kinds=["call"]) == []
+    assert store.reference_rows_for_files(project.id, []) == []
+    # version kwarg is honored on the same pinned snapshot as list_reference_records.
+    version = store.reference_version(project.id)
+    assert store.declaration_shapes(project.id, "package.answer", version=version) == [
+        declaration
+    ]
+    assert store.imports_for(project.id, "package", version=version) == [imported]
+    assert store.target_name_candidates(project.id, "answer", version=version) == [
+        declaration,
+        imported,
+    ]
+    assert store.reference_coverage(project.id, version=version) == [coverage]
 
 
 @pytest.mark.parametrize("schema_version", [True, "1"])
@@ -467,3 +495,108 @@ def test_stored_chunk_still_carries_its_vector(tmp_path: Path) -> None:
     # Field order matters to nothing in LanceDB, but the schema lists vector last
     # and keeping it there makes the inheritance a pure refactor.
     assert list(StoredChunk.model_fields)[-1] == "vector"
+
+
+def _break_references_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every future `_tables()` call build a partition with no references table.
+
+    `_tables()` normally creates the references table on demand
+    (`exist_ok=True`), so the only way to observe a `None` reference table
+    downstream -- the interrupted-transaction/legacy-partition state the
+    bare asserts guarded against -- is to make table creation itself fail
+    to produce one, the same way an older on-disk partition would.
+    """
+    real_table = LanceStore._table
+
+    def fake_table(database: object, name: str, schema: object) -> object:
+        if name == "references":
+            return None
+        return real_table(database, name, schema)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(LanceStore, "_table", staticmethod(fake_table))
+
+
+def test_remove_file_raises_instead_of_asserting_on_a_missing_reference_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    _break_references_table(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="Reference table is missing"):
+        store.remove_file(project.id, "file-1")
+
+
+def test_table_versions_raises_instead_of_asserting_on_a_missing_reference_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    _break_references_table(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="Reference table is missing"):
+        store.table_versions(project.id)
+
+
+def test_restore_versions_checkout_raises_instead_of_asserting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    versions = store.table_versions(project.id)
+    store._partitions.pop(project.id, None)
+    (store.directory / "projects" / project.id / "references.lance").rename(
+        tmp_path / "references.lance.bak"
+    )
+
+    with pytest.raises(RuntimeError, match="Reference table is missing"):
+        store.restore_versions(project.id, versions)
+
+
+def test_replace_files_from_arrow_raises_instead_of_asserting_on_a_missing_reference_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    _break_references_table(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="Reference table is missing"):
+        store.replace_files_from_arrow(
+            project.id,
+            files=pa.Table.from_pylist([], schema=LanceStore.file_arrow_schema()),
+            chunk_groups=(),
+        )
+
+
+def test_has_reference_table_distinguishes_missing_from_empty(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+
+    # Never indexed: no partition at all, but not what this guard is for --
+    # find_symbol/get_chunk already report "not found" long before a
+    # reference query is reached.
+    assert store.has_reference_table(project.id) is False
+
+    store.upsert_file(stored_file(project.id))
+    assert store.has_reference_table(project.id) is True
+
+    store._partitions.pop(project.id, None)
+    (store.directory / "projects" / project.id / "references.lance").rename(
+        tmp_path / "references.lance.bak"
+    )
+    assert store.has_reference_table(project.id) is False

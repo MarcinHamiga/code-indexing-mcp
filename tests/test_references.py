@@ -3,6 +3,7 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import Indexer
 from code_indexing_mcp.models import DeclarationSelector
@@ -201,6 +202,27 @@ def test_same_file_shadowed_call_does_not_bind_the_selected_declaration(
     assert [(call.start_line, call.resolution) for call in calls] == [(5, "exact")]
 
 
+def test_find_references_reports_a_missing_reference_table_distinctly(tmp_path: Path) -> None:
+    """A legacy/never-built reference index must not read as "no references" (S5)."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"lib.py": "def answer():\n    return 42\n"},
+    )
+    selector = DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    # Sanity: the freshly indexed project answers normally first.
+    assert service.find_references(selector).hits == []
+
+    store = service.store
+    store._partitions.pop(project_id, None)
+    (store.directory / "projects" / project_id / "references.lance").rename(
+        tmp_path / "references.lance.bak"
+    )
+
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.find_references(selector)
+    assert excinfo.value.code == ErrorCode.REFERENCE_INDEX_UNAVAILABLE
+
+
 def test_cursor_is_filter_bound_and_reads_its_original_snapshot(tmp_path: Path) -> None:
     service, project_id = _indexed_service(
         tmp_path,
@@ -218,8 +240,22 @@ def test_cursor_is_filter_bound_and_reads_its_original_snapshot(tmp_path: Path) 
     second = service.find_references(selector, limit=1, cursor=first.cursor)
 
     assert second.hits
-    with pytest.raises(ValueError):
+    # `CodeIndexingError` does not subclass `ValueError` (see errors.py) --
+    # a cursor/filter mismatch is a structured, machine-readable error, not
+    # a bare `ValueError` that would bypass `_with_error_details` and reach
+    # the client as a raw exception message (T2).
+    with pytest.raises(CodeIndexingError) as excinfo:
         service.find_references(selector, kinds={"call"}, cursor=first.cursor)
+    assert excinfo.value.code == ErrorCode.INVALID_CURSOR
+
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.find_references(selector, limit=2, cursor=first.cursor)
+    assert excinfo.value.code == ErrorCode.INVALID_CURSOR
+
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.find_references(selector, limit=1, cursor="not-a-real-cursor")
+    assert excinfo.value.code == ErrorCode.INVALID_CURSOR
+
     file_id = service.store.list_files(project_id)[0].file_id
     service.store.replace_files_from_arrow(
         project_id,

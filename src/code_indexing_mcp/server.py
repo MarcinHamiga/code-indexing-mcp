@@ -1090,8 +1090,9 @@ def create_server(
         description=(
             "Analyze a proposed rename or signature change without editing source files, for a "
             "Python, JavaScript, TypeScript, or TSX declaration. Returns required edits, likely "
-            "changes, dynamic-review findings, and evidence for resolved aliases that need no "
-            "spelling change. Always read `completeness` and `limitations`: only the state "
+            "changes, dynamic-review findings, and evidence: for a rename, resolved aliases that "
+            "need no spelling change; for a signature change, compatible call sites that need no "
+            "argument edit. Always read `completeness` and `limitations`: only the state "
             "'complete' means every indexed file was analyzed, and edits should use "
             "edit_start_byte/edit_end_byte, which cover just the identifier, rather than the "
             "wider reference range."
