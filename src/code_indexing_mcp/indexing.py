@@ -251,6 +251,11 @@ class Indexer:
     def _backfill_references_locked(
         self, project: ProjectInfo, *, progress: ProgressPublisher
     ) -> ReferenceBackfillReport:
+        # Backfill never embeds or re-parses chunks; it must not use its own
+        # (always error-free) run to promote a project past whatever state a
+        # prior full index earned it (S2 -- e.g. "partial" from a failed
+        # index must stay "partial" until a real index run heals it).
+        prior_state = self.store.project_state(project.id)
         existing = {record.path: record for record in self.store.list_files(project.id)}
         coverage = {
             row["file_id"]: ReferenceCoverage(
@@ -310,6 +315,17 @@ class Indexer:
                     files_seen=files_checked,
                     current_path=record.path,
                 )
+                if record.has_errors:
+                    # The files row's content_hash was advanced by a failed
+                    # index run (stage_failure), but the chunk table still
+                    # holds the *previous* generation's content -- parsing
+                    # and committing references for the current on-disk
+                    # source would stage a reference generation the chunk
+                    # table does not actually contain (S1). Leave this file
+                    # uncovered; it heals once a successful index replaces
+                    # both the chunks and the content hash together.
+                    incomplete_paths.append(record.path)
+                    continue
                 try:
                     source = item.absolute_path.read_bytes()
                 except OSError:
@@ -354,18 +370,19 @@ class Indexer:
                 return ReferenceBackfillReport(
                     project_id=project.id,
                     files_checked=files_checked,
+                    files_backfilled=files_backfilled,
                     files_current=len(existing) - len(missing),
                     incomplete_paths=sorted(incomplete_paths),
                     stale_paths=sorted(set(stale_paths)),
                 )
-            if job is not None:
-                self._commit_staged(project, job, errors=[])
             progress.update(
                 phase="committing",
                 files_seen=files_checked,
                 current_path=None,
                 force=True,
             )
+            if job is not None:
+                self._commit_staged(project, job, errors=[], state=prior_state)
             return ReferenceBackfillReport(
                 project_id=project.id,
                 files_checked=files_checked,
@@ -449,6 +466,11 @@ class Indexer:
         pending: list[_PendingFile] = []
         pending_chunks = 0
         pending_chars = 0
+        # T1: this run's own reference-extraction cost and staged row count,
+        # not the whole project's total (which a benchmark comparing scenarios
+        # against the same project would otherwise report unchanged run to run).
+        reference_extraction_ns = 0
+        staged_reference_rows = 0
         process = psutil.Process()
         peak_memory_bytes = 0
 
@@ -614,12 +636,36 @@ class Indexer:
                         rejection = _content_rejection(source)
                         content_hash = _digest(source)
                     if rejection is not None:
-                        # Content rejection is a skip, not a syntax/indexing error.
-                        # Stage removal so an earlier text version disappears only
-                        # when the rest of this indexing transaction commits.
-                        if previous is not None:
-                            with timer.measure("commit"):
-                                staging_job().mark_removed(previous.file_id)
+                        # Content rejection is a skip, not a syntax/indexing error,
+                        # but it must still leave a files row behind (S3): the
+                        # scanner is path-based and never decodes content, so it
+                        # keeps yielding this path on every future scan. Dropping
+                        # the row entirely (as mark_removed would) makes
+                        # current.keys() != existing.keys() true forever, which
+                        # turns every reference query into a full re-index under
+                        # the global lock. Persist a tombstone instead: a files
+                        # row flagged has_errors with no chunks/references, so
+                        # freshness checks see the path and (once size/mtime
+                        # stop changing) treat it as unchanged.
+                        rejected_record = StoredFile(
+                            file_id=_digest(f"{project.id}\0{path}"),
+                            project_id=project.id,
+                            path=path,
+                            language=item.language,
+                            size=item.size,
+                            mtime_ns=item.mtime_ns,
+                            content_hash=content_hash,
+                            has_errors=True,
+                            error=f"rejected: {rejection}",
+                            indexed_at=time.time_ns(),
+                        )
+                        with timer.measure("commit"):
+                            staging_job().stage_file(rejected_record)
+                            if previous is not None:
+                                staging_job().mark_replaced(rejected_record.file_id)
+                                staging_job().mark_references_replaced(
+                                    rejected_record.file_id
+                                )
                         skipped += 1
                         continue
                     if not force and previous is not None and previous.content_hash == content_hash:
@@ -644,6 +690,8 @@ class Indexer:
                     with timer.measure("parse"):
                         extraction = self.extractor.extract(item.path, item.language, source)
                     parsed += 1
+                    reference_extraction_ns += extraction.reference_extraction_ns
+                    staged_reference_rows += len(extraction.references)
                     source_chars = sum(len(chunk.content) for chunk in extraction.chunks)
                     if pending and (
                         len(pending) >= CANDIDATE_GROUP_COUNT
@@ -749,10 +797,17 @@ class Indexer:
             commit_ms=timer.milliseconds("commit"),
             fallback_count=fallback_count,
             peak_memory_bytes=peak_memory_bytes,
+            reference_extraction_duration_ms=reference_extraction_ns // 1_000_000,
+            staged_reference_rows=staged_reference_rows,
         )
 
     def _commit_staged(
-        self, project: ProjectInfo, job: StagingJob, *, errors: list[IndexIssue]
+        self,
+        project: ProjectInfo,
+        job: StagingJob,
+        *,
+        errors: list[IndexIssue],
+        state: str | None = None,
     ) -> None:
         """Apply a fully staged run, rolling the live tables back on any failure.
 
@@ -760,6 +815,12 @@ class Indexer:
         -- before the first live write, so a crash anywhere in this method is
         recoverable: the rollback here handles the live failure, and startup
         recovery handles a process death.
+
+        ``state`` overrides the default ``"partial" if errors else "ready"``
+        computation. A full index run always derives state from its own
+        errors, but a reference backfill commits no chunks or embeddings of
+        its own and must not overwrite a project state (e.g. ``partial`` from
+        a prior failed index) that it did not itself earn (S2).
         """
         versions = self.store.table_versions(project.id)
         job.begin_commit(versions)
@@ -777,7 +838,7 @@ class Indexer:
             self.store.upsert_project(
                 project,
                 model_id=self.embedder.model_id,
-                state="partial" if errors else "ready",
+                state=state if state is not None else ("partial" if errors else "ready"),
             )
         except BaseException:
             try:

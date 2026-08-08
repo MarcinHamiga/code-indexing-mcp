@@ -53,6 +53,60 @@ def fingerprint(result: ExtractionResult) -> list[list[object]]:
     ]
 
 
+def _call_shape_summary(call_shape: object) -> list[object] | None:
+    if call_shape is None:
+        return None
+    return [
+        call_shape.positional_count,
+        call_shape.keywords,
+        call_shape.has_positional_spread,
+        call_shape.has_keyword_spread,
+        call_shape.type_argument_count,
+        call_shape.constructor,
+    ]
+
+
+def reference_fingerprint(result: ExtractionResult) -> list[list[object]]:
+    """Everything a resolver or a rename depends on for one structural reference.
+
+    This is the fingerprint the silent-miss defects (E1-E14) hide behind: a
+    dropped, mis-shaped, or noise-carrying reference row changes nothing about
+    `result.chunks`, so a snapshot gate that only covers chunks lets every one
+    of those defects ship green. Covering `references`/`declarations` here is
+    the whole point of Task 0.1.
+    """
+    return [
+        [
+            reference.kind,
+            reference.target_name,
+            reference.written_name,
+            reference.module_path,
+            reference.imported_name,
+            reference.alias,
+            reference.start_byte,
+            reference.end_byte,
+            reference.source_qualified_symbol,
+            _call_shape_summary(reference.call_shape),
+        ]
+        for reference in result.references
+    ]
+
+
+def declaration_fingerprint(result: ExtractionResult) -> list[list[object]]:
+    """Everything a rename/refactor depends on for one declaration shape."""
+    return [
+        [
+            declaration.qualified_symbol,
+            declaration.kind,
+            [
+                [parameter.name, parameter.kind, parameter.required, parameter.position]
+                for parameter in declaration.parameters
+            ],
+        ]
+        for declaration in result.declarations
+    ]
+
+
 def corpus_fingerprints() -> dict[str, object]:
     extractor = TreeSitterExtractor()
     snapshot: dict[str, object] = {}
@@ -62,6 +116,8 @@ def corpus_fingerprints() -> dict[str, object]:
         snapshot[path.name] = {
             "has_errors": result.has_errors,
             "chunks": fingerprint(result),
+            "references": reference_fingerprint(result),
+            "declarations": declaration_fingerprint(result),
         }
     return snapshot
 

@@ -201,6 +201,45 @@ def test_index_report_splits_duration_into_phases(tmp_path: Path) -> None:
     assert sum(phase or 0 for phase in phases) <= report.duration_ms
 
 
+def test_reference_extraction_duration_is_its_own_phase_not_the_whole_parse(
+    tmp_path: Path,
+) -> None:
+    """T1: `reference_extraction_duration_ms` must time only structural
+
+    reference extraction, and `staged_reference_rows` must count what this
+    run staged, not the whole project's stored total -- otherwise every
+    scenario in a benchmark that touches the same project reports identical
+    numbers regardless of how much work it actually did.
+    """
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "class Base:\n"
+        "    pass\n\n"
+        "class Child(Base):\n"
+        "    def run(self):\n"
+        "        return Base()\n"
+    )
+    project = initialize_project(root)
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+
+    first = indexer.index(project)
+
+    assert first.reference_extraction_duration_ms is not None
+    assert first.reference_extraction_duration_ms >= 0
+    assert first.reference_extraction_duration_ms <= (first.parse_duration_ms or 0)
+    assert first.staged_reference_rows > 0
+
+    (root / "b.py").write_text("def only_one_call():\n    return len([])\n")
+    second = indexer.index(project, force=False)
+
+    # An incremental run that only touches one small new file must not report
+    # the same staged-row count as the first full-project run.
+    assert second.staged_reference_rows != first.staged_reference_rows
+    assert second.staged_reference_rows > 0
+
+
 def test_indexer_batches_chunks_across_changed_files(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
@@ -464,6 +503,157 @@ def test_reference_backfill_retries_an_incomplete_parse(tmp_path: Path) -> None:
     assert incomplete.incomplete_paths == ["main.py"]
     assert retried.files_backfilled == 1
     assert retried.complete is True
+
+
+def _assert_chunk_content_hashes_match_files(store: LanceStore, project_id: str) -> None:
+    """Divergence tripwire (S1): for every file that is *not* in a known-failed
+    state, its committed chunks' content_hash must equal the files row's
+    content_hash. A failed file legitimately keeps stale chunks under an
+    advanced hash (the non-destructive failure path), but a healthy file with
+    mismatched chunk/file hashes is exactly the silent corruption S1 caused --
+    catch it here instead of relying on coverage bookkeeping to self-report it.
+    """
+    files_by_id = {record.file_id: record for record in store.list_files(project_id)}
+    for chunk in store.list_chunks([project_id]):
+        record = files_by_id.get(chunk.file_id)
+        if record is None or record.has_errors:
+            continue
+        assert chunk.content_hash == record.content_hash, (
+            f"chunk {chunk.chunk_id} for {record.path} was staged for content_hash "
+            f"{chunk.content_hash!r} but the files row now reports "
+            f"{record.content_hash!r}"
+        )
+
+
+def test_reference_backfill_does_not_launder_an_embed_failed_file(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    indexer.index(project)
+
+    # Change the file's content in a way that fails embedding. The old chunks
+    # (matching the old content) are kept, but the files row now carries the
+    # *new* content hash -- this is what makes the file look "missing" to a
+    # naive backfill.
+    source.write_text("def RAISE_EMBEDDING():\n    return 43\n")
+    failed = indexer.index(project)
+    assert len(failed.errors) == 1
+    failed_record = store.list_files(project.id)[0]
+    assert failed_record.has_errors is True
+
+    report = indexer.backfill_references(project)
+
+    assert report.incomplete_paths == ["main.py"]
+    assert report.files_backfilled == 0
+    # No reference generation was committed for content the chunk table does
+    # not actually contain.
+    coverage = store.coverage_for_file(
+        project.id, failed_record.file_id, REFERENCE_SCHEMA_VERSION
+    )
+    assert not coverage or coverage[0]["content_hash"] != failed_record.content_hash
+    _assert_chunk_content_hashes_match_files(store, project.id)
+
+    # The failed file heals once it indexes successfully again.
+    source.write_text("def stable():\n    return 44\n")
+    healed = indexer.index(project)
+    assert healed.errors == []
+    healed_record = store.list_files(project.id)[0]
+    assert healed_record.has_errors is False
+
+    # A successful index stages references itself, so the file is already
+    # covered and backfill has nothing left to do for it.
+    healed_report = indexer.backfill_references(project)
+    assert healed_report.files_backfilled == 0
+    assert healed_report.complete is True
+    coverage = store.coverage_for_file(
+        project.id, healed_record.file_id, REFERENCE_SCHEMA_VERSION
+    )
+    assert coverage and coverage[0]["content_hash"] == healed_record.content_hash
+    _assert_chunk_content_hashes_match_files(store, project.id)
+
+
+def test_reference_backfill_preserves_a_partial_project_state(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "good.py").write_text("value = 1\n")
+    (root / "bad.py").write_text("def RAISE_EMBEDDING():\n    return 2\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+
+    failed = indexer.index(project)
+    assert [issue.path for issue in failed.errors] == ["bad.py"]
+    assert store.project_state(project.id) == "partial"
+    _remove_reference_generation(store, project.id)
+
+    # Backfilling references for the file that already succeeded must not
+    # promote the project past what the failed file still says about it.
+    report = indexer.backfill_references(project)
+
+    assert report.files_backfilled == 1
+    assert store.project_state(project.id) == "partial"
+
+
+def test_reference_backfill_publishes_committing_before_it_commits(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("value = 1\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    _remove_reference_generation(store, project.id)
+
+    last_phase: list[str | None] = [None]
+
+    def on_progress(progress: object) -> None:
+        last_phase[0] = progress.phase  # type: ignore[attr-defined]
+
+    phase_when_committed: list[str | None] = []
+    original_commit_staged = indexer._commit_staged
+
+    def recording_commit_staged(*args: object, **kwargs: object) -> None:
+        phase_when_committed.append(last_phase[0])
+        return original_commit_staged(*args, **kwargs)
+
+    with patch.object(indexer, "_commit_staged", side_effect=recording_commit_staged):
+        indexer.backfill_references(project, on_progress=on_progress)
+
+    # The "committing" phase must be visible to a watcher *before* the commit
+    # runs, not published (and immediately erased by progress.clear()) after
+    # the fact (S6).
+    assert phase_when_committed == ["committing"]
+
+
+def test_reference_backfill_stale_report_includes_files_backfilled(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "good.py").write_text("value = 1\n")
+    (root / "stale.py").write_text("value = 2\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    _remove_reference_generation(store, project.id)
+
+    original_read_bytes = Path.read_bytes
+
+    def flaky_read_bytes(path: Path) -> bytes:
+        if path.name == "stale.py":
+            raise OSError("vanished mid-scan")
+        return original_read_bytes(path)
+
+    with patch.object(Path, "read_bytes", flaky_read_bytes):
+        report = indexer.backfill_references(project)
+
+    # The stale-path early return still discards the whole generation (a
+    # partial commit would be dishonest), but the retry loop's cost -- work
+    # parsed for good.py and then thrown away -- must stay visible (S6).
+    assert report.stale_paths == ["stale.py"]
+    assert report.files_backfilled == 1
+    assert store.list_reference_records(project.id) == []
 
 
 def test_global_index_lock_serializes_different_projects(tmp_path: Path) -> None:

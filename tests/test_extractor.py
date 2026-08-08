@@ -68,6 +68,32 @@ def test_extracts_javascript_and_typescript_symbols(
     assert expected <= symbols
 
 
+def test_ts_abstract_class_members_are_qualified_and_the_class_is_selectable() -> None:
+    """E10: abstract classes, abstract method signatures, and class-field arrows
+    used to produce no declaration at all, so members inside an abstract class
+    lost their `Worker.` qualification and the class itself was unselectable."""
+    source = b"""abstract class Worker {
+  abstract run(): number;
+
+  handle = (a: number, b: number): number => a + b;
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("worker.ts"), "typescript", source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert ("class", "Worker") in symbols
+    assert ("method", "Worker.run") in symbols
+    assert ("method", "Worker.handle") in symbols
+
+    body_read = next(
+        reference
+        for reference in result.references
+        if reference.kind == "read" and reference.target_name == "a"
+    )
+    assert body_read.source_qualified_symbol == "Worker.handle"
+
+
 @pytest.mark.parametrize(
     ("language", "path", "source", "expected"),
     [

@@ -19,6 +19,19 @@ def _skill_dirs() -> list[Path]:
     return sorted(path for path in SKILLS_DIR.iterdir() if path.is_dir())
 
 
+def test_no_skill_still_claims_find_symbol_returns_call_sites() -> None:
+    """T6: find_symbol resolves declarations by name only; it has never
+
+    returned call sites. `SERVER_INSTRUCTIONS`, `impact-analysis`, and
+    `feature-dev` already say so correctly -- this is the last stale copy.
+    """
+    for skill_dir in _skill_dirs():
+        text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        assert "definitions and call sites" not in text, (
+            f"{skill_dir.name}/SKILL.md still claims find_symbol returns call sites"
+        )
+
+
 def _skill_dirs_param() -> list[Path]:
     return _skill_dirs() if SKILLS_DIR.is_dir() else []
 
@@ -53,3 +66,21 @@ def test_refactoring_workflows_name_the_structural_analysis_tools(skill_name: st
 
     assert "mcp__code-indexing-mcp__find_references" in text
     assert "mcp__code-indexing-mcp__analyze_refactor" in text
+
+
+@pytest.mark.parametrize("skill_name", ["impact-analysis", "feature-dev"])
+def test_refactoring_workflows_state_language_coverage_and_completeness(skill_name: str) -> None:
+    """T5: a skill that drives find_references/analyze_refactor must tell the
+
+    agent which languages those tools actually cover, what an unsupported
+    language returns, and how to read the completeness contract -- otherwise
+    the agent has no way to know a rename check that came back clean was
+    silently skipped for, say, a Go or Rust file.
+    """
+    text = (SKILLS_DIR / skill_name / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "Python" in text
+    assert "TypeScript" in text
+    assert "TSX" in text
+    assert "UNSUPPORTED_LANGUAGE" in text
+    assert "completeness" in text.lower()

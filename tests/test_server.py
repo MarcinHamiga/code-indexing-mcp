@@ -1497,6 +1497,14 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
     for name, tool in tools.items():
         for parameter, spec in tool.inputSchema.get("properties", {}).items():
             assert "description" in spec, f"{name}.{parameter} has no description"
+        # T4: a top-level parameter can point at a nested model (e.g.
+        # `selector: DeclarationSelector`) whose own fields ship undocumented
+        # in `$defs` even though the outer parameter itself has a description.
+        for def_name, def_schema in tool.inputSchema.get("$defs", {}).items():
+            for field, field_spec in def_schema.get("properties", {}).items():
+                assert "description" in field_spec, (
+                    f"{name}.$defs.{def_name}.{field} has no description"
+                )
 
     limit = tools["search_code"].inputSchema["properties"]["limit"]
     assert (limit["minimum"], limit["maximum"]) == (1, 50)
@@ -1536,6 +1544,29 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
     }
     analyze_limit = analyze_refactor_schema["properties"]["limit"]
     assert (analyze_limit["minimum"], analyze_limit["maximum"]) == (1, 500)
+
+
+@pytest.mark.asyncio
+async def test_analyze_refactor_description_credits_signature_change_evidence(
+    tmp_path: Path,
+) -> None:
+    """T7: `evidence` is described only in the rename sense ("aliases that
+
+    identify the target but need no spelling change") in both the tool
+    description and README.md, but for `signature_change` the same bucket
+    holds compatible call sites that need no argument edit either.
+    """
+    tools = {
+        tool.name: tool
+        for tool in await create_server(_tiny_application(tmp_path), auto_index=False).list_tools()
+    }
+    description = tools["analyze_refactor"].description or ""
+    assert "call sites" in description.lower()
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    anchor = readme.index("`evidence` includes")
+    evidence_paragraph = readme[anchor : readme.index("\n\n", anchor)]
+    assert "call sites" in evidence_paragraph.lower()
 
 
 @pytest.mark.asyncio
