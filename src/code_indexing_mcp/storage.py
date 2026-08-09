@@ -390,10 +390,51 @@ class LanceStore:
             tables.files.delete(condition)
 
     def list_reference_records(
-        self, project_id: str, *, version: int | None = None
+        self,
+        project_id: str,
+        *,
+        version: int | None = None,
+        schema_version: int | None = None,
+        record_kinds: Iterable[str] | None = None,
     ) -> list[ReferenceRecord]:
-        """Return structural rows from the requested immutable table version."""
-        return self._reference_rows(project_id, None, version=version)
+        """Return structural rows from the requested immutable table version.
+
+        `schema_version`, when given, pushes the equality filter into the SQL
+        `WHERE` clause (S4) instead of materializing every historical
+        generation's rows into Python only to discard them there. A partial
+        reindex can leave rows behind under a since-bumped
+        `REFERENCE_SCHEMA_VERSION`, and a real query answer must never include
+        them -- see `reference_service.py`'s caller. Omit it to get every row
+        exactly as before, unfiltered: existing callers (recovery tooling,
+        tests inspecting a partition's raw contents) still rely on that.
+
+        `record_kinds`, when given, pushes a `record_kind IN (...)` predicate
+        into the same `WHERE` clause. `reference_service.py`'s classification
+        pass needs every `reference`/`coverage` row project-wide (S4's E3
+        backlog established that narrowing the reference-row scan itself
+        would need an import-graph precomputation the storage layer cannot
+        safely approximate -- see the module-level note above
+        `declaration_shapes`), but the `declaration` rows it also used to
+        pull in here are fetched separately, narrowed to the files and
+        symbols that actually matter (`declarations_for_files`,
+        `target_name_candidates`, `declaration_shapes`). Passing
+        `record_kinds=("reference", "coverage")` is how a query-time caller
+        opts out of paying for the declaration table it no longer needs from
+        this call. Omit it (as every non-query caller still does) to get
+        every kind, exactly as before.
+        """
+        self._validate_schema_version(schema_version)
+        conditions: list[str] = []
+        if schema_version is not None:
+            conditions.append(f"schema_version = {schema_version}")
+        if record_kinds is not None:
+            kinds = sorted(set(record_kinds))
+            if not kinds:
+                return []
+            values = ", ".join(_quoted(kind) for kind in kinds)
+            conditions.append(f"record_kind IN ({values})")
+        condition = " AND ".join(conditions) if conditions else None
+        return self._reference_rows(project_id, condition, version=version)
 
     def reference_coverage(
         self, project_id: str, *, version: int | None = None
@@ -425,33 +466,64 @@ class LanceStore:
     def coverage_for_file(
         self, project_id: str, file_id: str, schema_version: int
     ) -> list[ReferenceRecord]:
-        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
-            raise ValueError("schema_version must be a non-boolean integer")
+        self._validate_schema_version(schema_version)
         return self._reference_rows(
             project_id,
             "record_kind = 'coverage' "
             f"AND file_id = {_quoted(file_id)} AND schema_version = {schema_version}",
         )
 
+    # S4/E3: `declaration_shapes`, `target_name_candidates`, and
+    # `declarations_for_files` below are the *declaration*-side pushdowns
+    # `reference_service.py` uses to avoid pulling the whole declaration
+    # table into every `find_references`/`analyze_refactor` page --
+    # `declaration_shapes` for an exact `source_qualified_symbol` lookup
+    # (never ambiguous: a declaration's own qualified name is not subject to
+    # aliasing), `target_name_candidates` for `_classify`'s
+    # single-target-name ambiguity check, `declarations_for_files` for
+    # `_lexical_declaration`/class-scope resolution narrowed to the files
+    # that actually hold a candidate reference.
+    #
+    # There is deliberately no equivalent *reference*-side pushdown (an
+    # `imports_for`-shaped "give me the reference rows that could resolve to
+    # this declaration" call). `_may_refer`'s alias branch means a reference
+    # row's own `target_name`/`written_name` can be an arbitrary local
+    # spelling -- `from lib import answer as ans` records the call site's
+    # `target_name` as `"ans"`, not `"answer"` -- so a single-column
+    # `target_name = X` predicate provably misses real hits (confirmed by
+    # constructing exactly this case). A conservative multi-name superset
+    # *can* be computed, since an import/export row's own `target_name`
+    # tracks the name at the *source* of that hop, not the local alias --
+    # but only when no intermediate re-export renames it. A barrel that
+    # does (`pkg/__init__.py: from impl import answer as ans_alias`, then
+    # `from pkg import ans_alias as x2`) changes the next hop's `target_name`
+    # to `"ans_alias"`, which cannot be predicted before that first hop's own
+    # row has already been read -- confirmed by constructing a two-hop
+    # renaming barrel and inspecting the extracted rows. Computing the
+    # candidate set is therefore an iterative, depth-bounded graph walk (like
+    # `_reexport_targets_symbol`, just run forward) requiring several rounds
+    # of querying, not a single predicate over this table -- a materially
+    # different, higher-risk piece of work than the declaration-side
+    # pushdowns below, and out of scope here. Do not re-add an
+    # `imports_for`-shaped helper to "fix" this without that graph walk; it
+    # would either miss hits (single predicate) or require the same
+    # multi-round approach this note describes.
     def declaration_shapes(
-        self, project_id: str, qualified_symbol: str, *, version: int | None = None
+        self,
+        project_id: str,
+        qualified_symbol: str,
+        *,
+        schema_version: int | None = None,
+        version: int | None = None,
     ) -> list[ReferenceRecord]:
-        return self._reference_rows(
-            project_id,
+        self._validate_schema_version(schema_version)
+        condition = (
             "record_kind = 'declaration' "
-            f"AND source_qualified_symbol = {_quoted(qualified_symbol)}",
-            version=version,
+            f"AND source_qualified_symbol = {_quoted(qualified_symbol)}"
         )
-
-    def imports_for(
-        self, project_id: str, module_path: str, *, version: int | None = None
-    ) -> list[ReferenceRecord]:
-        return self._reference_rows(
-            project_id,
-            "record_kind = 'reference' AND kind = 'import' "
-            f"AND module_path = {_quoted(module_path)}",
-            version=version,
-        )
+        if schema_version is not None:
+            condition = f"{condition} AND schema_version = {schema_version}"
+        return self._reference_rows(project_id, condition, version=version)
 
     def target_name_candidates(
         self,
@@ -459,15 +531,24 @@ class LanceStore:
         target_name: str,
         *,
         record_kind: str | None = None,
+        schema_version: int | None = None,
         version: int | None = None,
     ) -> list[ReferenceRecord]:
+        self._validate_schema_version(schema_version)
         condition = f"target_name = {_quoted(target_name)}"
         if record_kind is not None:
             condition = f"record_kind = {_quoted(record_kind)} AND {condition}"
+        if schema_version is not None:
+            condition = f"{condition} AND schema_version = {schema_version}"
         return self._reference_rows(project_id, condition, version=version)
 
     def declarations_for_files(
-        self, project_id: str, file_ids: Iterable[str], *, version: int | None = None
+        self,
+        project_id: str,
+        file_ids: Iterable[str],
+        *,
+        schema_version: int | None = None,
+        version: int | None = None,
     ) -> list[ReferenceRecord]:
         """Declaration rows for exactly the given files (S4 pushdown).
 
@@ -476,41 +557,14 @@ class LanceStore:
         that already narrowed to a candidate file set never need the whole
         project's declaration table.
         """
+        self._validate_schema_version(schema_version)
         ids = sorted(set(file_ids))
         if not ids:
             return []
         values = ", ".join(_quoted(file_id) for file_id in ids)
-        return self._reference_rows(
-            project_id,
-            f"record_kind = 'declaration' AND file_id IN ({values})",
-            version=version,
-        )
-
-    def reference_rows_for_files(
-        self,
-        project_id: str,
-        file_ids: Iterable[str],
-        *,
-        kinds: Iterable[str] | None = None,
-        version: int | None = None,
-    ) -> list[ReferenceRecord]:
-        """Reference rows (not declarations/coverage) for exactly the given files.
-
-        `kinds` narrows further (e.g. `("import", "export")` for the
-        import/re-export context `_imports_by_file` needs) so a caller that
-        only wants module edges is not handed every call/read/write row too.
-        """
-        ids = sorted(set(file_ids))
-        if not ids:
-            return []
-        values = ", ".join(_quoted(file_id) for file_id in ids)
-        condition = f"record_kind = 'reference' AND file_id IN ({values})"
-        if kinds is not None:
-            kind_list = sorted(set(kinds))
-            if not kind_list:
-                return []
-            kind_values = ", ".join(_quoted(kind) for kind in kind_list)
-            condition = f"{condition} AND kind IN ({kind_values})"
+        condition = f"record_kind = 'declaration' AND file_id IN ({values})"
+        if schema_version is not None:
+            condition = f"{condition} AND schema_version = {schema_version}"
         return self._reference_rows(project_id, condition, version=version)
 
     def list_chunks(self, project_ids: Iterable[str] | None = None) -> list[IndexedChunk]:
@@ -913,10 +967,6 @@ class LanceStore:
         return LanceStore._chunk_schema(vector_dimension)
 
     @staticmethod
-    def reference_schema() -> pa.Schema:
-        return LanceStore._reference_schema()
-
-    @staticmethod
     def reference_arrow_schema() -> pa.Schema:
         return LanceStore._reference_schema()
 
@@ -928,6 +978,13 @@ class LanceStore:
             .when_not_matched_insert_all()
             .execute(rows)
         )
+
+    @staticmethod
+    def _validate_schema_version(schema_version: int | None) -> None:
+        if schema_version is not None and (
+            isinstance(schema_version, bool) or not isinstance(schema_version, int)
+        ):
+            raise ValueError("schema_version must be a non-boolean integer")
 
     @staticmethod
     def _rows(table: LanceTable, condition: str | None = None) -> list[dict[str, Any]]:

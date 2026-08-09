@@ -8,10 +8,11 @@ import json
 import keyword as keyword_module
 import re
 from pathlib import Path, PurePosixPath
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, NamedTuple, cast
 
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import STRUCTURAL_LANGUAGES
+from .indexing import REFERENCE_SCHEMA_VERSION
 from .models import (
     CompletenessReport,
     DeclarationSelector,
@@ -55,6 +56,34 @@ _BOM: Final = b"\xef\xbb\xbf"
 _MAX_LIMITATION_PATHS: Final = 10
 
 
+class _ReferenceQuery(NamedTuple):
+    """Everything one pinned-snapshot query produces, for callers that need more than the page.
+
+    `find_references` only wants `response`. `analyze_refactor` (E1) also
+    needs the full record set, the full *unsliced* classified hit list, and
+    the per-file byte cache the classification pass already built -- without
+    this, it used to re-run the whole classification pass (and every file
+    read behind it) a second time just to get an unpaginated view of the same
+    data, which doubled the work on every call and made page-vs-full
+    consistency depend on both passes happening to agree rather than being
+    structurally guaranteed.
+
+    `records` carries only `reference`/`coverage` rows (S4/E3): declarations
+    are fetched separately, narrowed to the files and symbols that actually
+    matter, by `_hits_and_limitations`/`analyze_refactor`/`_override_findings`
+    themselves. Do not add a `record_kind == "declaration"` filter over
+    `records` expecting it to find anything -- see `storage.py`'s note above
+    `declaration_shapes` for why the declaration and reference sides of this
+    pushdown are not symmetric.
+    """
+
+    response: ReferenceResponse
+    records: list[ReferenceRecord]
+    hits: list[ReferenceHit]
+    root: Path | None
+    sources: dict[str, tuple[bytes, int]]
+
+
 class ReferenceService:
     """Resolve only syntax facts that select a declaration unambiguously."""
 
@@ -81,15 +110,14 @@ class ReferenceService:
         way a stale snapshot or a changed filter already is, instead of
         applying page 2's edits under page 1's operation.
         """
-        response, _records = self._find_references_with_records(
+        return self._find_references_with_records(
             selector,
             kinds=kinds,
             limit=limit,
             cursor=cursor,
             backfill=backfill,
             operation_digest=operation_digest,
-        )
-        return response
+        ).response
 
     def _find_references_with_records(
         self,
@@ -100,16 +128,18 @@ class ReferenceService:
         cursor: str | None = None,
         backfill: ReferenceBackfillReport | None = None,
         operation_digest: str | None = None,
-    ) -> tuple[ReferenceResponse, list[ReferenceRecord]]:
-        """`find_references`'s body, also returning the records it fetched.
+    ) -> _ReferenceQuery:
+        """`find_references`'s body, also returning everything it computed along the way.
 
-        `analyze_refactor` needs both the paginated response and the full
-        pinned-snapshot record set (for the declaration/override/signature
-        work below). Fetching through the plain `find_references` and then
-        re-fetching `list_reference_records` at the same
-        `response.snapshot_version` was a second full-table materialization
-        of data already in hand (S4) -- this lets `analyze_refactor` reuse
-        the one fetch made here instead.
+        `analyze_refactor` needs the paginated response, the full
+        pinned-snapshot record set, and the full classified hit list (for the
+        declaration/override/signature work below), not just the page. Fetching
+        through the plain `find_references` and then re-fetching
+        `list_reference_records` at the same `response.snapshot_version` --
+        and separately re-running `_hits_and_limitations` over it -- was a
+        second full-table materialization and a second classification pass
+        over data already in hand (S4/E1); this lets `analyze_refactor` reuse
+        the one fetch and one classification pass made here instead.
         """
         if limit < 1 or limit > 500:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, "limit must be between 1 and 500")
@@ -164,7 +194,28 @@ class ReferenceService:
             version = cast(int, payload["version"])
 
         try:
-            records = self.store.list_reference_records(selected.project_id, version=version)
+            # `schema_version` is pushed into the storage layer's `WHERE`
+            # clause (S4) rather than fetched unfiltered and discarded here:
+            # a stale generation written under an earlier
+            # `REFERENCE_SCHEMA_VERSION` -- left behind because a reindex
+            # could not fully replace it -- would otherwise still be
+            # materialized (and decoded into Python objects) alongside the
+            # current generation's rows under their old, since-discarded id
+            # scheme, just to be thrown away one line later. Only rows at the
+            # current schema version are ever a real answer.
+            #
+            # `record_kinds` likewise drops `declaration` rows from this
+            # fetch (S4/E3): every classification need that reads a
+            # declaration is answered below by a narrower, targeted query
+            # (`declarations_for_files`/`target_name_candidates`) against the
+            # same pinned `version`, so this call no longer has to pull the
+            # whole project's declaration table into every page.
+            records = self.store.list_reference_records(
+                selected.project_id,
+                version=version,
+                schema_version=REFERENCE_SCHEMA_VERSION,
+                record_kinds=("reference", "coverage"),
+            )
         except (FileNotFoundError, ValueError) as error:
             raise CodeIndexingError(
                 ErrorCode.STALE_CURSOR, "Reference cursor snapshot expired"
@@ -172,7 +223,7 @@ class ReferenceService:
         root = self._project_root(selected.project_id)
         sources: dict[str, tuple[bytes, int]] = {}
         hits, limitations = self._hits_and_limitations(
-            selected, kinds, records, root, sources, backfill
+            selected, kinds, records, root, sources, backfill, version
         )
         page = hits[offset : offset + limit]
         next_cursor = None
@@ -202,7 +253,7 @@ class ReferenceService:
             cursor=next_cursor,
             snapshot_version=version,
         )
-        return response, records
+        return _ReferenceQuery(response, records, hits, root, sources)
 
     def _hits_and_limitations(
         self,
@@ -212,6 +263,7 @@ class ReferenceService:
         root: Path | None,
         sources: dict[str, tuple[bytes, int]],
         backfill: ReferenceBackfillReport | None,
+        version: int,
     ) -> tuple[list[ReferenceHit], list[ReferenceLimitation]]:
         """Classify every reference row into a sorted, unsliced hit list.
 
@@ -219,11 +271,55 @@ class ReferenceService:
         result) and `analyze_refactor` (which needs the full, unsliced list
         so counts/completeness reflect the whole result set, not just the
         page currently being returned — R4).
+
+        `records` no longer carries `declaration` rows (S4/E3) -- `version`
+        pins the same snapshot `records` was fetched from, so declarations
+        are fetched here from two narrow, targeted queries instead:
+        `declarations_for_files` for exactly the files that hold a
+        candidate reference (never "every known file" -- that would just
+        add a redundant round trip back to the same data), and
+        `target_name_candidates` for the one target name `_classify`'s
+        ambiguity check ever looks up.
         """
 
-        declarations = [row for row in records if row["record_kind"] == "declaration"]
+        # `_lexical_declaration`/class-scope resolution only ever compares a
+        # declaration against a reference row in the *same* file, so a file
+        # with no `reference`-kind row of its own can never be looked up
+        # below -- narrowing to this set, rather than every known file,
+        # is what makes this a real pushdown instead of a redundant fetch of
+        # data already in `records`.
+        reference_file_ids = {
+            row["file_id"] for row in records if row["record_kind"] == "reference"
+        }
+        declarations = self.store.declarations_for_files(
+            selected.project_id,
+            reference_file_ids,
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+        )
+        # Precomputed once per query instead of scanned per row (E2):
+        # `_lexical_declaration` only ever wants declarations sharing a
+        # row's own `file_id` and bare target name. Filtering `declarations`
+        # fresh for each of the (potentially thousands of) reference rows
+        # made classification O(reference_rows x declaration_rows); grouping
+        # once up front makes each row's lookup O(1) plus the size of its
+        # own bucket.
+        declarations_by_file_target = self._declarations_by_file_target(declarations)
+        # `_classify`'s ambiguity fallback only ever wants declarations
+        # sharing `selected.symbol` as their own name, project-wide, to tell
+        # "exactly one candidate anywhere" from "several" -- fetched
+        # directly instead of grouping the whole declaration table by name
+        # only to read one bucket out of it.
+        target_candidates = self.store.target_name_candidates(
+            selected.project_id,
+            selected.symbol,
+            record_kind="declaration",
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+        )
         imports = self._imports_by_file(records)
         reexport_rows = self._reexport_rows_by_path(records)
+        known_paths = self._known_paths(records)
         # A declaration nested directly in a class body is reachable only
         # through a receiver, so it must not shadow a bare name the way a
         # nested function does.
@@ -236,12 +332,12 @@ class ReferenceService:
         limitations: list[ReferenceLimitation] = self._coverage_limitations(records, backfill)
         for row in records:
             if row["record_kind"] != "reference" or not self._may_refer(
-                row, selected, imports, reexport_rows
+                row, selected, imports, reexport_rows, known_paths
             ):
                 continue
             if kinds is not None and row["kind"] not in kinds:
                 continue
-            lexical = self._lexical_declaration(row, declarations, class_scopes)
+            lexical = self._lexical_declaration(row, declarations_by_file_target, class_scopes)
             if (
                 lexical is not None
                 and row["file_id"] == selected.file_id
@@ -249,7 +345,7 @@ class ReferenceService:
             ):
                 continue
             resolution, reason, explanation = self._classify(
-                row, selected, declarations, imports, reexport_rows
+                row, selected, target_candidates, imports, reexport_rows, known_paths
             )
             if reason in _LIMITATION_REASONS:
                 limitations.append(
@@ -304,16 +400,20 @@ class ReferenceService:
         cursor: str | None = None,
         backfill: ReferenceBackfillReport | None = None,
     ) -> RefactorAnalysis:
-        response, records = self._find_references_with_records(
+        query = self._find_references_with_records(
             selector,
             limit=limit,
             cursor=cursor,
             backfill=backfill,
             operation_digest=self._operation_digest(operation),
         )
+        response, records, root, sources = (
+            query.response,
+            query.records,
+            query.root,
+            query.sources,
+        )
         shapes_by_id = {row["reference_id"]: row for row in records}
-        root = self._project_root(response.selected.project_id)
-        sources: dict[str, tuple[bytes, int]] = {}
         if isinstance(operation, RenameOperation):
             valid_identifier = (
                 operation.new_name.isidentifier()
@@ -332,13 +432,21 @@ class ReferenceService:
         declaration_finding: RefactorFinding | None = None
         override_findings: list[RefactorFinding] = []
         if isinstance(operation, RenameOperation):
+            # `records` no longer carries `declaration` rows (S4/E3); the one
+            # this needs -- the selected symbol's own declaration -- is
+            # fetched directly by its exact `source_qualified_symbol`
+            # instead, from the same pinned snapshot `records` came from.
+            declarations_at_symbol = self.store.declaration_shapes(
+                response.selected.project_id,
+                response.selected.qualified_symbol,
+                version=response.snapshot_version,
+                schema_version=REFERENCE_SCHEMA_VERSION,
+            )
             declaration = next(
                 (
                     row
-                    for row in records
-                    if row["record_kind"] == "declaration"
-                    and row["file_id"] == response.selected.file_id
-                    and row["source_qualified_symbol"] == response.selected.qualified_symbol
+                    for row in declarations_at_symbol
+                    if row["file_id"] == response.selected.file_id
                 ),
                 None,
             )
@@ -374,14 +482,45 @@ class ReferenceService:
                 edit_start_byte=edit_start,
                 edit_end_byte=edit_end,
             )
-            override_findings = self._override_findings(response.selected, records, root, sources)
+            override_findings = self._override_findings(
+                response.selected, records, root, sources, response.snapshot_version
+            )
 
         # Classify the full, unsliced hit list (not just the current page) so
         # counts/completeness are identical no matter which page is fetched
         # (R4). The page's returned findings are a filtered view of the same
-        # classification, guaranteeing the two stay consistent.
-        full_hits, _ = self._hits_and_limitations(
-            response.selected, None, records, root, sources, None
+        # classification, guaranteeing the two stay consistent. This reuses
+        # the classification `_find_references_with_records` already ran to
+        # build `response` -- `kinds` is always `None` on both sides, since
+        # `analyze_refactor` never passes a `kinds` filter through -- instead
+        # of running the whole pass (and every file read behind it) a second
+        # time (E1). `backfill` differs (the reused pass ran with the real
+        # value, this used to pass `None`), but that only changes the
+        # *limitations* `_hits_and_limitations` would return, never `hits`
+        # itself, and this call always discarded its own limitations in favor
+        # of `response.limitations` below -- so reusing `query.hits` here is
+        # not just faster, it is the exact same list the discarded second
+        # call would have produced.
+        full_hits = query.hits
+        # Fetched once and reused for every hit instead of rescanned per hit
+        # (E2): `_signature_issue` only ever wants declarations sharing the
+        # renamed/changed symbol's own `qualified_symbol` -- fetched directly
+        # by that exact name (S4/E3) instead of grouping the whole
+        # declaration table (no longer even present in `records`) by name
+        # just to read one bucket out of it. Only fetched for a
+        # signature-change operation -- a rename never calls
+        # `_signature_issue` at all (see the `isinstance(operation,
+        # RenameOperation)` branch below), so fetching it there would be
+        # pure waste.
+        old_shapes = (
+            []
+            if isinstance(operation, RenameOperation)
+            else self.store.declaration_shapes(
+                response.selected.project_id,
+                response.selected.qualified_symbol,
+                version=response.snapshot_version,
+                schema_version=REFERENCE_SCHEMA_VERSION,
+            )
         )
 
         FindingList = list[RefactorFinding]
@@ -434,7 +573,10 @@ class ReferenceService:
                         bucket_evidence.append(finding)
                     continue
                 issue = self._signature_issue(
-                    response.selected, shapes_by_id.get(hit.reference_id), records, operation
+                    response.selected,
+                    shapes_by_id.get(hit.reference_id),
+                    old_shapes,
+                    operation,
                 )
                 if issue in {"spread_uncertainty", "overload_ambiguity"}:
                     bucket_review.append(
@@ -547,24 +689,23 @@ class ReferenceService:
         self,
         selected: SelectedDeclaration,
         row: ReferenceRecord | None,
-        records: list[ReferenceRecord],
+        old_shapes: list[ReferenceRecord],
         operation: SignatureChangeOperation,
     ) -> str | None:
         # Both the call shape and the declaration shapes come from the caller's
         # pinned snapshot. Re-querying the live table per hit rescanned the
         # whole reference table once per call site, and a refresh mid-analysis
-        # could report an incompatible call as compatible.
+        # could report an incompatible call as compatible. `old_shapes` is
+        # fetched once by the caller (S4/E3: `declaration_shapes`, itself
+        # bound to that same pinned `version`), not re-fetched here, and not
+        # re-fetched per hit -- a single query for the one qualified symbol
+        # every hit in this analysis shares, exactly as safe against both
+        # failure modes as the in-memory grouping it replaced.
         if row is None or row["shape_json"] is None:
             return None
         shape = json.loads(row["shape_json"])
         if shape.get("has_positional_spread") or shape.get("has_keyword_spread"):
             return "spread_uncertainty"
-        old_shapes = [
-            record
-            for record in records
-            if record["record_kind"] == "declaration"
-            and record["source_qualified_symbol"] == selected.qualified_symbol
-        ]
         if len(old_shapes) != 1 or old_shapes[0]["shape_json"] is None:
             return "overload_ambiguity" if len(old_shapes) > 1 else None
         old_parameters = json.loads(old_shapes[0]["shape_json"])
@@ -656,6 +797,7 @@ class ReferenceService:
         records: list[ReferenceRecord],
         root: Path | None,
         sources: dict[str, tuple[bytes, int]],
+        version: int,
     ) -> list[RefactorFinding]:
         """Walk transitive subclasses of a renamed method's owner class.
 
@@ -665,25 +807,34 @@ class ReferenceService:
         and its callers would silently leave the override's name stale.
         Dynamic dispatch means an override can never be proven `exact` from
         syntax alone, so every finding here is `likely_change`.
+
+        `records` no longer carries `declaration` rows (S4/E3): both
+        `base_decl` and each `override_decl` below are looked up by their own
+        exact `source_qualified_symbol` via `declaration_shapes`, from the
+        same pinned `version` `records` was fetched from.
         """
 
         if "." not in selected.qualified_symbol:
             return []
         owner_symbol, method_name = selected.qualified_symbol.rsplit(".", 1)
-        declarations = [row for row in records if row["record_kind"] == "declaration"]
+        owner_declarations = self.store.declaration_shapes(
+            selected.project_id,
+            owner_symbol,
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+        )
         base_decl = next(
             (
                 row
-                for row in declarations
-                if row["file_id"] == selected.file_id
-                and row["source_qualified_symbol"] == owner_symbol
-                and row["kind"] == "class"
+                for row in owner_declarations
+                if row["file_id"] == selected.file_id and row["kind"] == "class"
             ),
             None,
         )
         if base_decl is None:
             return []
         imports = self._imports_by_file(records)
+        known_paths = self._known_paths(records)
         inheritance_rows = [
             row
             for row in records
@@ -696,10 +847,9 @@ class ReferenceService:
             base_file_id, base_qualified, base_path = queue.pop(0)
             base_tail = base_qualified.rsplit(".", 1)[-1]
             for row in inheritance_rows:
-                target_tail = (row["target_name"] or "").rsplit(".", 1)[-1]
-                if target_tail != base_tail:
-                    continue
-                if not self._inheritance_targets(row, base_file_id, base_path, imports):
+                if not self._inheritance_targets(
+                    row, base_file_id, base_tail, base_path, imports, known_paths
+                ):
                     continue
                 subclass_qualified = row["source_qualified_symbol"]
                 if not subclass_qualified:
@@ -710,13 +860,14 @@ class ReferenceService:
                 visited.add(key)
                 queue.append((row["file_id"], subclass_qualified, row["path"]))
                 override_symbol = f"{subclass_qualified}.{method_name}"
+                override_candidates = self.store.declaration_shapes(
+                    selected.project_id,
+                    override_symbol,
+                    version=version,
+                    schema_version=REFERENCE_SCHEMA_VERSION,
+                )
                 override_decl = next(
-                    (
-                        decl
-                        for decl in declarations
-                        if decl["file_id"] == row["file_id"]
-                        and decl["source_qualified_symbol"] == override_symbol
-                    ),
+                    (decl for decl in override_candidates if decl["file_id"] == row["file_id"]),
                     None,
                 )
                 if override_decl is None:
@@ -761,24 +912,42 @@ class ReferenceService:
         self,
         row: ReferenceRecord,
         base_file_id: str,
+        base_tail: str,
         base_path: str,
         imports: dict[str, list[ReferenceRecord]],
+        known_paths: frozenset[str],
     ) -> bool:
         """True if an `inheritance` row's base name binds to the class at hand.
 
-        Same-file references need no import to bind. A cross-file reference
-        must go through an import in the referring file that resolves to the
-        base class's own file, mirroring `_import_targets`.
+        A same-file reference needs no import to bind, but the written name
+        must still be the base class's own name -- otherwise every class in
+        the file would match, not just the ones that actually extend it. A
+        cross-file reference must go through an import in the referring file
+        that resolves to the base class's own file, mirroring
+        `_import_targets`; that import's *local* binding (its alias, when
+        aliased) is what has to equal the written name here, since there is
+        no alias to consult for a same-file reference (no import exists).
         """
 
-        if row["file_id"] == base_file_id:
-            return True
         target = (row["target_name"] or "").rsplit(".", 1)[-1]
         if not target:
             return False
+        if row["file_id"] == base_file_id:
+            return target == base_tail
+        # `target` is the name written at the inheritance site, i.e. the
+        # import's *local* binding (its alias when aliased). Once an import
+        # is found whose local binding is that name, only the module needs
+        # resolving to `base_path` -- calling `_import_targets_symbol` here
+        # instead would wrongly re-check `target` against the import's real
+        # `imported_name`, which differs from the local binding for exactly
+        # the aliased case this is trying to prove (`from base import Base
+        # as B` has `imported_name == "Base"`, not `"B"`).
         return any(
             (item["alias"] or item["written_name"] or item["imported_name"]) == target
-            and self._import_targets_symbol(item, target, base_path)
+            and item["module_path"] is not None
+            and self._module_matches(
+                item["path"], item["language"], item["module_path"], base_path, known_paths
+            )
             for item in imports.get(row["file_id"], [])
         )
 
@@ -896,6 +1065,40 @@ class ReferenceService:
         return result
 
     @staticmethod
+    def _declarations_by_file_target(
+        declarations: list[ReferenceRecord],
+    ) -> dict[tuple[str, str | None], list[ReferenceRecord]]:
+        """Declarations grouped by their own `(file_id, target_name)` (E2).
+
+        `_lexical_declaration` only ever considers declarations sharing a
+        reference row's `file_id` and bare target name -- filtering the full
+        declaration list against those two fields for every reference row
+        made classification O(reference_rows x declaration_rows). Grouping
+        once turns each row's lookup into an O(1) dict access plus however
+        many declarations actually share that file and name (typically very
+        few).
+        """
+        result: dict[tuple[str, str | None], list[ReferenceRecord]] = {}
+        for declaration in declarations:
+            key = (declaration["file_id"], declaration["target_name"])
+            result.setdefault(key, []).append(declaration)
+        return result
+
+    @staticmethod
+    def _known_paths(records: list[ReferenceRecord]) -> frozenset[str]:
+        """Every file path this query's snapshot has at least one row for.
+
+        Used by `_python_package_root` to walk a Python absolute import's
+        `__init__.py` chain and find its real package root (a `src/` layout
+        or another package sub-root) without filesystem access. Every
+        indexed file gets a `coverage` row even when it has zero
+        declarations or references (`_coverage_limitations`), so this is the
+        full universe of paths the resolver can see -- not just the ones
+        with structural content.
+        """
+        return frozenset(row["path"] for row in records)
+
+    @staticmethod
     def _reexport_rows_by_path(records: list[ReferenceRecord]) -> dict[str, list[ReferenceRecord]]:
         """Import/export rows keyed by their own file's path (R2).
 
@@ -918,6 +1121,7 @@ class ReferenceService:
         selected: SelectedDeclaration,
         imports: dict[str, list[ReferenceRecord]],
         reexport_rows: dict[str, list[ReferenceRecord]],
+        known_paths: frozenset[str],
     ) -> bool:
         target_tail = (row["target_name"] or "").rsplit(".", 1)[-1]
         written_tail = (row["written_name"] or "").rsplit(".", 1)[-1]
@@ -929,9 +1133,9 @@ class ReferenceService:
         return any(
             (item["alias"] or item["written_name"] or item["imported_name"]) == spelling
             and (
-                self._import_targets(item, selected)
+                self._import_targets(item, selected, known_paths)
                 or self._reexport_targets_symbol(
-                    item, selected.symbol, selected.path, reexport_rows
+                    item, selected.symbol, selected.path, reexport_rows, known_paths
                 )
             )
             for item in imports.get(row["file_id"], [])
@@ -940,7 +1144,7 @@ class ReferenceService:
     @staticmethod
     def _lexical_declaration(
         row: ReferenceRecord,
-        declarations: list[ReferenceRecord],
+        declarations_by_file_target: dict[tuple[str, str | None], list[ReferenceRecord]],
         class_scopes: set[str],
     ) -> ReferenceRecord | None:
         if row["receiver_text"] is not None or row["kind"] not in {"call", "read", "write"}:
@@ -948,9 +1152,7 @@ class ReferenceService:
         source = row["source_qualified_symbol"] or ""
         target = (row["target_name"] or "").rsplit(".", 1)[-1]
         visible: list[tuple[int, ReferenceRecord]] = []
-        for declaration in declarations:
-            if declaration["file_id"] != row["file_id"] or declaration["target_name"] != target:
-                continue
+        for declaration in declarations_by_file_target.get((row["file_id"], target), []):
             qualified = declaration["source_qualified_symbol"] or ""
             scope = qualified.rsplit(".", 1)[0] if "." in qualified else ""
             # Python and JS/TS both leave the class body out of a method's
@@ -968,9 +1170,10 @@ class ReferenceService:
         self,
         row: ReferenceRecord,
         selected: SelectedDeclaration,
-        declarations: list[ReferenceRecord],
+        target_candidates: list[ReferenceRecord],
         imports: dict[str, list[ReferenceRecord]],
         reexport_rows: dict[str, list[ReferenceRecord]],
+        known_paths: frozenset[str],
     ) -> tuple[str, str, str]:
         source_imports = imports.get(row["file_id"], [])
         if any(
@@ -992,7 +1195,7 @@ class ReferenceService:
                 )
             for item in source_imports:
                 binding = item["alias"] or item["written_name"] or item["imported_name"]
-                if binding == receiver and self._import_targets(item, selected):
+                if binding == receiver and self._import_targets(item, selected, known_paths):
                     return (
                         "exact",
                         "known_namespace_member",
@@ -1008,14 +1211,14 @@ class ReferenceService:
             alias = item["alias"] or item["written_name"] or item["imported_name"]
             if alias != row["written_name"]:
                 continue
-            if self._import_targets(item, selected):
+            if self._import_targets(item, selected, known_paths):
                 return (
                     "exact",
                     "direct_import_alias",
                     "The local alias directly imports this declaration.",
                 )
             if self._reexport_targets_symbol(
-                item, selected.symbol, selected.path, reexport_rows
+                item, selected.symbol, selected.path, reexport_rows, known_paths
             ):
                 return (
                     "exact",
@@ -1034,12 +1237,11 @@ class ReferenceService:
             )
         if row["file_id"] == selected.file_id:
             return "exact", "same_file_symbol", "The call is in the declaration's source file."
-        candidates = [
-            declaration
-            for declaration in declarations
-            if declaration["target_name"] == selected.symbol
-        ]
-        if len(candidates) == 1:
+        # `target_candidates` is already the project-wide set of
+        # declarations sharing `selected.symbol` (fetched once, above, via
+        # `target_name_candidates`), so no further filtering by name is
+        # needed here.
+        if len(target_candidates) == 1:
             return (
                 "likely",
                 "name_only_candidate",
@@ -1051,17 +1253,21 @@ class ReferenceService:
             "Multiple declarations or scopes could bind this name.",
         )
 
-    def _import_targets(self, item: ReferenceRecord, selected: SelectedDeclaration) -> bool:
-        return self._import_targets_symbol(item, selected.symbol, selected.path)
+    def _import_targets(
+        self, item: ReferenceRecord, selected: SelectedDeclaration, known_paths: frozenset[str]
+    ) -> bool:
+        return self._import_targets_symbol(item, selected.symbol, selected.path, known_paths)
 
-    def _import_targets_symbol(self, item: ReferenceRecord, symbol: str, path: str) -> bool:
+    def _import_targets_symbol(
+        self, item: ReferenceRecord, symbol: str, path: str, known_paths: frozenset[str]
+    ) -> bool:
         imported = item["imported_name"]
         if not self._is_namespace_import(item) and imported not in {symbol, "default", None}:
             return False
         module_path = item["module_path"]
         if module_path is None:
             return False
-        return self._module_matches(item["path"], item["language"], module_path, path)
+        return self._module_matches(item["path"], item["language"], module_path, path, known_paths)
 
     def _reexport_targets_symbol(
         self,
@@ -1069,6 +1275,7 @@ class ReferenceService:
         symbol: str,
         path: str,
         rows_by_path: dict[str, list[ReferenceRecord]],
+        known_paths: frozenset[str],
         visited: frozenset[tuple[str, str]] = frozenset(),
         depth: int = 0,
     ) -> bool:
@@ -1086,7 +1293,7 @@ class ReferenceService:
         path + the name being chased there) and `depth` prevent chasing a
         cycle or a pathological fan-out forever.
         """
-        if self._import_targets_symbol(item, symbol, path):
+        if self._import_targets_symbol(item, symbol, path, known_paths):
             return True
         if depth >= _MAX_REEXPORT_DEPTH or self._is_namespace_import(item):
             return False
@@ -1095,7 +1302,9 @@ class ReferenceService:
             return False
         imported = item["imported_name"]
         lookup_name = symbol if imported in (None, "default") else imported
-        for candidate in self._module_candidates(item["path"], item["language"], module_path):
+        for candidate in self._module_candidates(
+            item["path"], item["language"], module_path, known_paths
+        ):
             key = (str(candidate), lookup_name)
             if key in visited:
                 continue
@@ -1105,7 +1314,7 @@ class ReferenceService:
                 if binding != lookup_name:
                     continue
                 if self._reexport_targets_symbol(
-                    hop, symbol, path, rows_by_path, next_visited, depth + 1
+                    hop, symbol, path, rows_by_path, known_paths, next_visited, depth + 1
                 ):
                     return True
         return False
@@ -1126,8 +1335,47 @@ class ReferenceService:
         return bool(owner and (source == owner or source.startswith(owner + ".")))
 
     @staticmethod
+    def _python_package_root(
+        directory: PurePosixPath, known_paths: frozenset[str]
+    ) -> PurePosixPath:
+        """The directory an absolute import from a file in `directory` resolves against.
+
+        Python resolves an absolute import from whatever is on `sys.path`,
+        which this syntax-only index never sees directly -- but the parent of
+        the topmost directory in `directory`'s unbroken `__init__.py` chain
+        (its own package, and its package's package, ...) is exactly that
+        directory for any regular (non-namespace) package, `src/`-layout
+        included: `mypkg/a.py` with `mypkg/__init__.py` anchors at the
+        project root; `src/mypkg/a.py` with both `src/mypkg/__init__.py` and
+        no `src/__init__.py` anchors at `src`.
+
+        A directory with no `__init__.py` at all -- either a flat top-level
+        layout (nothing to walk) or a PEP 420 namespace package (no marker
+        file exists to find) -- falls back to the project root. That is
+        already correct for the flat case, and merely non-exact rather than
+        wrong for a namespace package nested under a further sub-root: it
+        never fabricates a false candidate, which is the property this
+        function exists to protect (S2).
+        """
+        parts = list(directory.parts)
+        if not parts or str(PurePosixPath(*parts, "__init__.py")) not in known_paths:
+            # `directory` itself is not a package (no `__init__.py` of its
+            # own) -- either there is nothing to walk (a flat top-level
+            # layout) or it is a namespace package, which leaves no marker
+            # file to find its boundary from. Root-anchoring is exactly
+            # right for the flat case and a safe non-fabricating fallback
+            # for the namespace one; it must not become `directory` itself,
+            # or this collapses back to the sibling-anchor bug this whole
+            # function exists to fix.
+            return PurePosixPath()
+        boundary = len(parts)
+        while boundary > 0 and str(PurePosixPath(*parts[:boundary], "__init__.py")) in known_paths:
+            boundary -= 1
+        return PurePosixPath(*parts[:boundary])
+
+    @staticmethod
     def _module_candidates(
-        source_path: str, language: str, module_path: str
+        source_path: str, language: str, module_path: str, known_paths: frozenset[str]
     ) -> set[PurePosixPath]:
         """Every file path a relative `module_path` from `source_path` could mean.
 
@@ -1139,15 +1387,44 @@ class ReferenceService:
         if language == "python":
             dots = len(module_path) - len(module_path.lstrip("."))
             suffix = module_path[dots:]
-            base = source.parent
-            for _ in range(max(0, dots - 1)):
-                base = base.parent
             stem = PurePosixPath(*suffix.split(".")) if suffix else PurePosixPath()
+            if dots == 0:
+                # An absolute import is resolved from the package root, not
+                # from the importing file's own directory -- see
+                # `_python_package_root` for how that root is found without
+                # filesystem access (a `src/` layout or another package
+                # sub-root is common, so it is not always the project root).
+                # Blindly anchoring at `source.parent` would let a sibling
+                # file bind falsely (e.g. `mypkg/utils.py` for `from utils
+                # import f` when the real target is the top-level
+                # `utils.py`), which is exactly why this cannot simply walk
+                # every ancestor as an equally-plausible candidate.
+                base = ReferenceService._python_package_root(source.parent, known_paths)
+            else:
+                base = source.parent
+                for _ in range(dots - 1):
+                    base = base.parent
             return {base / f"{stem}.py", base / stem / "__init__.py"}
         if not module_path.startswith("."):
             return set()
-        stem = source.parent / module_path
-        normalized = PurePosixPath(*(part for part in stem.parts if part != "."))
+        # Walk `module_path`'s segments against an explicit stack instead of
+        # simply appending them to `source.parent`: a `..` segment must pop
+        # the last resolved directory, not survive as a literal path
+        # component (`PurePosixPath` never resolves `..` on its own, so
+        # `src/app/../utils` never string-equals `src/utils`). A `..` with
+        # nothing left to pop would escape the project root, which no
+        # in-project target can ever match, so that yields no candidates.
+        parts = list(source.parent.parts)
+        for part in PurePosixPath(module_path).parts:
+            if part == ".":
+                continue
+            if part == "..":
+                if not parts:
+                    return set()
+                parts.pop()
+                continue
+            parts.append(part)
+        normalized = PurePosixPath(*parts)
         extensions = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")
         candidates = {PurePosixPath(f"{normalized}{extension}") for extension in extensions}
         candidates.update(normalized / f"index{extension}" for extension in extensions)
@@ -1155,10 +1432,16 @@ class ReferenceService:
 
     @staticmethod
     def _module_matches(
-        source_path: str, language: str, module_path: str, target_path: str
+        source_path: str,
+        language: str,
+        module_path: str,
+        target_path: str,
+        known_paths: frozenset[str],
     ) -> bool:
         target = PurePosixPath(target_path)
-        return target in ReferenceService._module_candidates(source_path, language, module_path)
+        return target in ReferenceService._module_candidates(
+            source_path, language, module_path, known_paths
+        )
 
     @staticmethod
     def _edit_span(

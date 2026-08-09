@@ -370,10 +370,16 @@ def test_analyze_refactor_fetches_the_reference_table_only_once(
     real_list_reference_records = service.store.list_reference_records
 
     def counting_list_reference_records(
-        project: str, *, version: int | None = None
+        project: str,
+        *,
+        version: int | None = None,
+        schema_version: int | None = None,
+        record_kinds: object = None,
     ) -> list[object]:
         calls.append(version)
-        return real_list_reference_records(project, version=version)
+        return real_list_reference_records(
+            project, version=version, schema_version=schema_version, record_kinds=record_kinds
+        )
 
     monkeypatch.setattr(service.store, "list_reference_records", counting_list_reference_records)
 
@@ -383,6 +389,51 @@ def test_analyze_refactor_fetches_the_reference_table_only_once(
     )
 
     assert len(calls) == 1, f"expected exactly one full-table fetch, got {calls}"
+
+
+def test_analyze_refactor_classifies_the_full_hit_list_only_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """analyze_refactor must reuse find_references' classification pass, not repeat it (E1).
+
+    The full-table fetch was already de-duplicated (see the test above); the
+    remaining, more expensive duplication was the classification pass itself
+    (`_hits_and_limitations`, which walks every reference row and reads every
+    referenced file) running once inside `find_references` and a second time
+    inside `analyze_refactor` to get an unpaginated hit list.
+    """
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "main.py": (
+                "from auth import authorize\n\n\n"
+                "def run():\n    return authorize(1)\n\n\n"
+                "def run_again():\n    return authorize(2)\n"
+            ),
+        },
+    )
+    calls = 0
+    real_hits_and_limitations = service._hits_and_limitations
+
+    def counting_hits_and_limitations(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return real_hits_and_limitations(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_hits_and_limitations", counting_hits_and_limitations)
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize"),
+        RenameOperation(new_name="permit"),
+    )
+
+    assert calls == 1, f"expected exactly one classification pass, got {calls}"
+    # The single pass must still be a correct, consistent result: every call
+    # site is a must_change rename edit, and completeness reflects the whole
+    # (unpaginated) result set, not just whichever page happened to be asked for.
+    assert {item.path for item in analysis.must_change} == {"auth.py", "main.py"}
+    assert analysis.completeness.state == "complete"
 
 
 def test_rename_of_a_base_method_surfaces_the_subclass_override(tmp_path: Path) -> None:
@@ -412,6 +463,44 @@ def test_rename_of_a_base_method_surfaces_the_subclass_override(tmp_path: Path) 
         item.path == "child.py" and item.reason_code == "override_of_renamed_method"
         for item in analysis.must_change
     )
+
+
+def test_rename_of_an_aliased_base_method_surfaces_the_subclass_override(tmp_path: Path) -> None:
+    """Same as the unaliased control above, but the base class is imported
+    under an alias (`from base import Base as B; class C(B): ...`).
+
+    `_inheritance_targets` must consult the same alias-to-imported-name
+    mapping the direct-import path already uses, not just the base class's
+    real name, or the override is silently dropped and completeness lies
+    about having fully accounted for the rename (finding 5).
+    """
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.py": "class Base:\n    def handle(self):\n        return 1\n",
+            "child.py": (
+                "from base import Base as B\n\n\n"
+                "class C(B):\n    def handle(self):\n        return 2\n"
+            ),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="base.py", qualified_symbol="Base.handle"),
+        RenameOperation(new_name="process"),
+    )
+
+    override = next(
+        item
+        for item in analysis.likely_change
+        if item.path == "child.py" and item.reason_code == "override_of_renamed_method"
+    )
+    assert override.resolution == "likely"
+    assert not any(
+        item.path == "child.py" and item.reason_code == "override_of_renamed_method"
+        for item in analysis.must_change
+    )
+    assert analysis.completeness.state == "complete_with_dynamic_limitations"
 
 
 def test_rename_of_a_base_method_surfaces_a_transitive_subclass_override(tmp_path: Path) -> None:
@@ -656,3 +745,100 @@ def test_a_python_only_scope_is_unaffected_by_the_standing_limitation(tmp_path: 
 
     assert not any(item.code == "extraction_gaps" for item in analysis.limitations)
     assert analysis.completeness.state == "complete"
+
+
+def test_analyze_refactor_fetches_declarations_narrowly_not_from_the_full_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`analyze_refactor` looks up declarations by exact qualified symbol (S4/E3).
+
+    The declaration-finding lookup, the transitive-override BFS, and
+    (for a signature change) the old-shape comparison all used to scan
+    `records` for `record_kind == "declaration"` -- `records` no longer
+    carries those rows at all, so this also proves the rename path does not
+    silently fall back to an empty declaration set: the declaration/override
+    findings below still come out correct.
+    """
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.py": "class Base:\n    def handle(self):\n        return 1\n",
+            "mid.py": (
+                "from base import Base\n\n\n"
+                "class Mid(Base):\n    def handle(self):\n        return 2\n"
+            ),
+        },
+    )
+    calls: list[str] = []
+    real_declaration_shapes = service.store.declaration_shapes
+
+    def spy_declaration_shapes(
+        project: str, qualified_symbol: str, **kwargs: object
+    ) -> list[object]:
+        calls.append(qualified_symbol)
+        return real_declaration_shapes(project, qualified_symbol, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service.store, "declaration_shapes", spy_declaration_shapes)
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="base.py", qualified_symbol="Base.handle"),
+        RenameOperation(new_name="process"),
+    )
+
+    # Exactly the qualified symbols this rename actually needed -- the
+    # renamed declaration itself, the owner class for the override walk, and
+    # the one override found while walking it -- never a project-wide fetch.
+    assert set(calls) == {"Base.handle", "Base", "Mid.handle"}
+
+    declaration = next(item for item in analysis.must_change if item.reason_code == "declaration")
+    assert declaration.path == "base.py"
+    override = next(
+        item for item in analysis.likely_change if item.reason_code == "override_of_renamed_method"
+    )
+    assert override.path == "mid.py"
+
+
+def test_analyze_refactor_signature_change_fetches_the_old_shape_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_signature_issue`'s old-shape lookup is a single pinned-version query
+    (S4/E3), not a rescan of the live table per hit -- see the docstring on
+    `_signature_issue` for the regression this must not reintroduce.
+    """
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user, level):\n    return user\n",
+            "main.py": (
+                "from auth import authorize\n\n\n"
+                "def run():\n    return authorize(1, 2)\n\n\n"
+                "def run_again():\n    return authorize(3, 4)\n"
+            ),
+        },
+    )
+    calls: list[str] = []
+    real_declaration_shapes = service.store.declaration_shapes
+
+    def spy_declaration_shapes(
+        project: str, qualified_symbol: str, **kwargs: object
+    ) -> list[object]:
+        calls.append(qualified_symbol)
+        return real_declaration_shapes(project, qualified_symbol, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service.store, "declaration_shapes", spy_declaration_shapes)
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize"),
+        SignatureChangeOperation(
+            parameters=[
+                ParameterShape(name="user", kind="positional", required=True, position=0),
+                ParameterShape(name="level", kind="positional", required=True, position=1),
+                ParameterShape(name="extra", kind="positional", required=True, position=2),
+            ]
+        ),
+    )
+
+    # One fetch total, not one per call site -- two call sites are classified
+    # below, so a per-hit rescan would show up as more than one call here.
+    assert calls == ["authorize"]
+    assert len(analysis.must_change) == 2
