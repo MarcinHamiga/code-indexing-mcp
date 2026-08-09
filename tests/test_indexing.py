@@ -361,6 +361,43 @@ def test_failed_changed_file_preserves_previous_references_on_extraction_failure
     assert store.list_reference_records(project.id) == original_references
 
 
+def test_a_reindex_that_gains_a_syntax_error_retires_its_stale_references(tmp_path: Path) -> None:
+    """A syntax error must not leave references from the *previous* content
+
+    Regression for finding 4: unlike the extraction-failure case above (where
+    the chunk table also keeps the previous generation), a file that still
+    extracts -- just with tree-sitter errors -- gets its chunks and
+    content_hash replaced by the new generation. Leaving its old reference
+    rows in place would serve them at byte offsets from content that no
+    longer exists on disk, which is worse than reporting no references at
+    all.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def foo():\n    return 1\n\ndef caller():\n    return foo()\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    original_references = store.list_reference_records(project.id)
+    assert any(row["record_kind"] == "reference" for row in original_references)
+
+    source.write_text("def foo(:\n    return 1\n")  # moved call, syntax error
+    with patch.object(
+        indexer.extractor,
+        "extract",
+        return_value=ExtractionResult(chunks=[], has_errors=True),
+    ):
+        report = indexer.index(project)
+
+    assert report.errors == []
+    record = store.list_files(project.id)[0]
+    assert record.has_errors is True
+    # The stale generation is gone rather than served against new bytes; the
+    # file is honestly uncovered until a later parse succeeds cleanly.
+    assert store.list_reference_records(project.id) == []
+
+
 def _remove_reference_generation(store: LanceStore, project_id: str) -> None:
     for record in store.list_files(project_id):
         store.replace_files_from_arrow(
@@ -420,6 +457,33 @@ def test_reference_backfill_parses_unchanged_files_without_embedding(tmp_path: P
         store.list_files(project.id)[0].file_id,
         REFERENCE_SCHEMA_VERSION,
     )
+
+
+def test_files_current_agrees_between_the_backfilling_call_and_the_converged_one(
+    tmp_path: Path,
+) -> None:
+    """`files_current` means "files with current coverage after this report",
+
+    not "files that already had coverage before it ran" -- so a call that
+    itself does the backfilling and a later, fully-converged call that finds
+    nothing left to do must report the same total for the same persisted
+    state. This is a general property of the counter, not specific to
+    rejected files (see the rejected-tombstone regression above).
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    _remove_reference_generation(store, project.id)
+
+    first = indexer.backfill_references(project)
+    second = indexer.backfill_references(project)
+
+    assert first.files_backfilled == 1
+    assert second.files_checked == 0
+    assert first.files_current == second.files_current == 1
 
 
 def test_reference_backfill_reports_a_source_hash_mismatch_without_committing(
@@ -654,6 +718,154 @@ def test_reference_backfill_stale_report_includes_files_backfilled(tmp_path: Pat
     assert report.stale_paths == ["stale.py"]
     assert report.files_backfilled == 1
     assert store.list_reference_records(project.id) == []
+
+
+def test_backfill_stops_retrying_a_rejected_tombstone_and_reports_it_correctly(
+    tmp_path: Path,
+) -> None:
+    """Regression for finding 10.
+
+    A deliberately rejected file (binary/undecodable content) is not a parse
+    failure -- it will never parse, by design. Backfill must mark it covered
+    (a coverage-only row) instead of leaving it in the missing set forever,
+    where it would be re-walked on every future call and misreported as
+    `parse_error`.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_bytes(b"\x00binary garbage")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    index_report = indexer.index(project)
+    assert index_report.skipped_files == 1
+    rejected_record = store.list_files(project.id)[0]
+    assert rejected_record.has_errors is True
+    assert rejected_record.error == "rejected: binary"
+
+    report = indexer.backfill_references(project)
+
+    assert report.incomplete_paths == []
+    assert report.files_backfilled == 1
+    assert report.complete is True
+    coverage = store.coverage_for_file(
+        project.id, rejected_record.file_id, REFERENCE_SCHEMA_VERSION
+    )
+    assert coverage and coverage[0]["content_hash"] == rejected_record.content_hash
+
+    # Converged: the file is now known at the current schema, so a later
+    # call does not even need to walk it again.
+    again = indexer.backfill_references(project)
+    assert again.files_checked == 0
+    assert again.files_current == 1
+    # The two reports describe the same converged state, so a counter that
+    # means "files with current coverage" must agree between them regardless
+    # of which call happened to do the covering.
+    assert report.files_current == again.files_current
+
+
+def test_backfill_creates_the_reference_table_even_when_every_file_fails_to_parse(
+    tmp_path: Path,
+) -> None:
+    """Regression for finding 8.
+
+    A legacy pre-feature partition (files/chunks exist, references never
+    did) whose only structural file fails to parse used to leave `job` at
+    None forever, so `_commit_staged` never ran and the references table was
+    never created -- `find_references`/`analyze_refactor` would then raise
+    REFERENCE_INDEX_UNAVAILABLE and tell the caller to run the exact backfill
+    that just ran and can never succeed.
+    """
+    import lancedb
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    assert store.has_reference_table(project.id) is True
+
+    # Simulate a legacy pre-feature partition: files/chunks exist, but the
+    # references table itself was never created. A second LanceStore avoids
+    # the first store's cached table handles.
+    lancedb.connect(tmp_path / "data" / "projects" / project.id).drop_table("references")
+    indexer2, store2 = make_indexer(tmp_path, RecordingEmbedder())
+    assert store2.has_reference_table(project.id) is False
+
+    with patch.object(indexer2.extractor, "extract", side_effect=RuntimeError("broken parser")):
+        report = indexer2.backfill_references(project)
+
+    assert report.incomplete_paths == ["main.py"]
+    # Nothing could be backfilled, but the table itself must still exist.
+    assert store2.has_reference_table(project.id) is True
+
+
+def test_backfill_retires_reference_rows_from_a_retired_schema_version(tmp_path: Path) -> None:
+    """Regression for finding 9 (write side).
+
+    The version bump's comment claims it "discards any generation written by
+    version 3", but nothing walked existing rows to make that true for a file
+    that cannot currently be re-covered. A file stuck in incomplete_paths
+    must not keep serving colliding-id rows from a retired schema forever.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    file_id = store.list_files(project.id)[0].file_id
+
+    stale_version = REFERENCE_SCHEMA_VERSION - 1
+    downgraded = [
+        {**row, "schema_version": stale_version}
+        for row in store.list_reference_records(project.id)
+        if row["file_id"] == file_id
+    ]
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+        chunk_groups=(),
+        reference_groups=[
+            (file_id, pa.Table.from_pylist(downgraded, schema=LanceStore.reference_arrow_schema()))
+        ],
+        replace_reference_file_ids=[file_id],
+    )
+    assert all(
+        row["schema_version"] == stale_version
+        for row in store.list_reference_records(project.id)
+    )
+
+    with patch.object(indexer.extractor, "extract", side_effect=RuntimeError("broken parser")):
+        report = indexer.backfill_references(project)
+
+    assert report.incomplete_paths == ["main.py"]
+    # The stale schema-3 generation must not survive: serving it collides
+    # with the current schema's id scheme, exactly what the bump intended to
+    # prevent.
+    assert store.list_reference_records(project.id) == []
+
+
+def test_backfill_does_not_crash_for_an_unregistered_marker_resolved_project(
+    tmp_path: Path,
+) -> None:
+    """Regression for finding 11.
+
+    A marker-resolved project that was never registered in the store (zero
+    eligible source files, so `index()` was never called to register it; or
+    a data directory wiped while the on-disk marker survived) must not crash
+    `project_state` lookup -- it should behave like any other project with
+    nothing to report.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)  # writes the on-disk marker only
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+
+    report = indexer.backfill_references(project)
+
+    assert report.files_current == 0
+    assert report.complete is True
 
 
 def test_global_index_lock_serializes_different_projects(tmp_path: Path) -> None:
