@@ -159,6 +159,12 @@ def _jsonable(value: Any) -> Any:
         return value.model_dump(mode="json")
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, (set, frozenset)):
+        # Sorted so identical filter sets always encode identically -- the
+        # wire is JSON, which has no set type, and an unstable ordering
+        # would make cursor round-trips (e.g. find_references' `kinds`)
+        # spuriously mismatch on retry.
+        return sorted(_jsonable(item) for item in value)
     if isinstance(value, list):
         return [_jsonable(item) for item in value]
     if isinstance(value, dict):
@@ -330,7 +336,10 @@ class DaemonServer:
             return app.get_chunk(**params)
         if method == "find_references":
             selector = DeclarationSelector.model_validate(params.pop("selector"))
-            return app.find_references(selector, roots=roots, **params)
+            kinds = params.pop("kinds", None)
+            return app.find_references(
+                selector, kinds=set(kinds) if kinds is not None else None, roots=roots, **params
+            )
         if method == "analyze_refactor":
             selector = DeclarationSelector.model_validate(params.pop("selector"))
             operation = _REFACTOR_OPERATION.validate_python(params.pop("operation"))
