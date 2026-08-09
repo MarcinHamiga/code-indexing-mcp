@@ -79,6 +79,21 @@ def _capture_name(source: bytes, node: Node) -> str:
     return name
 
 
+def _first_named_child(node: Node) -> Node | None:
+    """Return *node*'s first named child that is not "extra" trivia (a comment).
+
+    ``node.named_child(0)`` picks whatever sits first in source order, so a
+    comment placed before the real content (`require(/* c */ './mod')`,
+    `import * as /* c */ ns from 'mod'`) is silently mistaken for it instead
+    of being skipped, the same way a comment was mistaken for a positional
+    call argument (finding 7).
+    """
+    for child in node.named_children:
+        if not child.is_extra:
+            return child
+    return None
+
+
 def normalize_identifier(value: str) -> str:
     value = _CAMEL_BOUNDARY_2.sub(r"\1 \2", value)
     value = _CAMEL_BOUNDARY_1.sub(r"\1 \2", value)
@@ -380,7 +395,15 @@ class TreeSitterExtractor:
                 parameter = node
                 while parameter.parent is not None and parameter.parent != parent:
                     parameter = parameter.parent
-                    if contains(parameter.child_by_field_name("value")):
+                    # TS's `required_parameter`/`optional_parameter` wrapper
+                    # exposes a default under a `value` field; bare JS/TS
+                    # `assignment_pattern` (untyped `a = LIMIT`) exposes it
+                    # under `right` instead (mirrors the E8 note on
+                    # `_parameter_shapes` below). Checking only `value` drops
+                    # every identifier read inside a plain JS default.
+                    if contains(parameter.child_by_field_name("value")) or contains(
+                        parameter.child_by_field_name("right")
+                    ):
                         break
                 else:
                     return
@@ -423,7 +446,18 @@ class TreeSitterExtractor:
             }:
                 excluded_fields = ("left", "name")
             elif parent.type in {"arrow_function", "lambda"}:
-                excluded_fields = ("parameter", "parameters")
+                # `parameter` covers a parenless single-identifier arrow param
+                # (`x => x`), which has no `formal_parameters` wrapper of its
+                # own to be caught by the block above. `parameters` is
+                # deliberately NOT excluded here: it names the
+                # `formal_parameters`/`lambda_parameters` node wrapping every
+                # other case, which the parameter-defaults block above has
+                # already walked and decided correctly (including whether an
+                # identifier inside a default value is a real read); blanket-
+                # excluding the whole field here would undo that decision for
+                # every arrow-function/lambda default (`(a = LIMIT) => a`,
+                # `lambda a=LIMIT: a`).
+                excluded_fields = ("parameter",)
             elif parent.type in {"attribute", "member_expression"}:
                 excluded_fields = ("attribute", "property")
             elif parent.type in {"call", "call_expression", "new_expression"}:
@@ -529,7 +563,11 @@ class TreeSitterExtractor:
                 or child.child_by_field_name("pattern")
             )
             if name_node is None:
-                name_node = child.named_child(0)
+                # e.g. a bare `rest_pattern` (`...rest`) -- its identifier is
+                # a plain child, not a named field. A leading comment
+                # (`.../* c */ rest`) must not be mistaken for it (same class
+                # as finding 7/8).
+                name_node = _first_named_child(child)
             if name_node is None:
                 continue
             # A destructured slot (`{ a, b }` / `[a, b]`) collapses to ONE
@@ -605,6 +643,11 @@ class TreeSitterExtractor:
         keyword_spread = False
         if arguments is not None and arguments.type in TreeSitterExtractor._ARGUMENT_LIST_TYPES:
             for argument in arguments.named_children:
+                if argument.is_extra:
+                    # A comment is a named "extra" node inside the argument
+                    # list, not an argument -- `g(1,  # note\n  2)` must count
+                    # 2 positional args, not 3 (E4-adjacent).
+                    continue
                 if argument.type in {"list_splat", "spread_element"}:
                     positional_spread = True
                 elif argument.type == "dictionary_splat":
@@ -632,7 +675,9 @@ class TreeSitterExtractor:
             has_positional_spread=positional_spread,
             has_keyword_spread=keyword_spread,
             type_argument_count=(
-                len(type_arguments.named_children) if type_arguments is not None else None
+                sum(1 for argument in type_arguments.named_children if not argument.is_extra)
+                if type_arguments is not None
+                else None
             ),
             constructor=node.type == "new_expression",
         )
@@ -648,7 +693,10 @@ class TreeSitterExtractor:
         arguments = node.child_by_field_name("arguments")
         if arguments is None:
             return None
-        first = arguments.named_child(0)
+        # A leading comment (`require(/* c */ './mod')`) is a named "extra"
+        # node in source order before the real argument; `named_child(0)`
+        # would grab it instead and silently drop the module edge.
+        first = _first_named_child(arguments)
         if first is None or first.type != "string":
             return None
         return _capture_name(source, first).strip("'\"")
@@ -667,7 +715,10 @@ class TreeSitterExtractor:
             if left is not None:
                 yield from TreeSitterExtractor._binding_identifiers(left)
         elif node.type == "rest_pattern":
-            child = node.named_child(0)
+            # A comment right after `...` (`[.../* c */ rest]`) must not be
+            # mistaken for the bound identifier -- same class of bug as
+            # finding 7/8.
+            child = _first_named_child(node)
             if child is not None:
                 yield from TreeSitterExtractor._binding_identifiers(child)
         elif node.type in {"array_pattern", "object_pattern"}:
@@ -821,7 +872,10 @@ class TreeSitterExtractor:
             module = node.child_by_field_name("module_name")
             module_path = _capture_name(source, module) if module is not None else None
             for child in node.named_children:
-                if child == module:
+                if child == module or child.is_extra:
+                    # A comment among the imported names (`from pkg import (a,
+                    # # note\n b)`) is a named "extra" node too -- without this
+                    # it would fall through as a bogus import of itself.
                     continue
                 imported = (
                     child.child_by_field_name("name") if child.type == "aliased_import" else child
@@ -846,6 +900,8 @@ class TreeSitterExtractor:
                 )
         elif node.type == "import_statement":
             for child in node.named_children:
+                if child.is_extra:
+                    continue
                 imported = (
                     child.child_by_field_name("name") if child.type == "aliased_import" else child
                 )
@@ -882,6 +938,11 @@ class TreeSitterExtractor:
             superclasses = node.child_by_field_name("superclasses")
             if superclasses is not None:
                 for item in superclasses.named_children:
+                    if item.is_extra:
+                        # A comment among the base classes (`class Child(Base,
+                        # # note\n Other):`) is a named "extra" node too, not
+                        # a base class.
+                        continue
                     if item.type == "keyword_argument":
                         # e.g. `metaclass=Meta` -- the value already surfaces as a
                         # `read` via the plain identifier fallback; the clause
@@ -949,6 +1010,12 @@ class TreeSitterExtractor:
             )
             if clause is not None:
                 for item in clause.named_children:
+                    if item.is_extra:
+                        # A comment between clause items (`import Default,
+                        # /* c */ { a } from 'mod'`) is a named "extra" node
+                        # too -- the `else` branch below would otherwise
+                        # mistake it for a bare default-import identifier.
+                        continue
                     if item.type == "named_imports":
                         for specifier in item.named_children:
                             name = specifier.child_by_field_name("name")
@@ -969,7 +1036,7 @@ class TreeSitterExtractor:
                                 alias=alias_text,
                             )
                     elif item.type == "namespace_import":
-                        alias = item.named_child(0)
+                        alias = _first_named_child(item)
                         if alias is not None:
                             add_reference(
                                 "import",
@@ -1028,7 +1095,7 @@ class TreeSitterExtractor:
                     # `export * as ns from './x'` -- the namespace alias lives
                     # under the wrapper node, not as a direct export_statement
                     # child (E3).
-                    alias_node = clause.named_child(0)
+                    alias_node = _first_named_child(clause)
                     alias_text = (
                         _capture_name(source, alias_node) if alias_node is not None else None
                     )
@@ -1096,7 +1163,7 @@ class TreeSitterExtractor:
             # `@Name`, `@ns.Name`, `@Factory()` -- mirrors the Python decorator
             # handler (E6). The factory-call form keeps its own `call` row from
             # the `call_expression` branch; this row is additional.
-            target = node.named_child(0)
+            target = _first_named_child(node)
             if target is not None and target.type == "call_expression":
                 target = target.child_by_field_name("function")
             if target is not None:
@@ -1128,6 +1195,10 @@ class TreeSitterExtractor:
             # (or generic_type, handled by the E2 generic_type branch below) --
             # left untouched, see hardening plan Task 2.1.
             for item in node.named_children:
+                if item.is_extra:
+                    # A comment (`extends /* c */ Base`) is a named "extra"
+                    # node too, not an interface name.
+                    continue
                 add_reference(
                     "inheritance",
                     item,
@@ -1163,7 +1234,10 @@ class TreeSitterExtractor:
             # to the inner type names instead of capturing the whole expression
             # verbatim (E2). A nested generic_type is also matched by its own
             # top-level pattern above; `add_reference` dedupes the identical span.
-            target = node.named_child(0)
+            # A leading comment (`: /* c */ Widget`) is a named "extra" node
+            # too and must not be mistaken for the annotated type -- that
+            # silently dropped the type_use row entirely.
+            target = _first_named_child(node)
             self._emit_type_use_names(target, source, add_reference)
         elif node.type == "member_expression":
             self._emit_member_access(node, source, add_reference)

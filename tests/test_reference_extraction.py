@@ -630,3 +630,250 @@ def test_python_member_call_does_not_duplicate_as_member_access() -> None:
         and reference.end_byte == source.index("widget.render") + len("widget.render")
     ]
     assert [reference.kind for reference in matching] == ["call"]
+
+
+@pytest.mark.parametrize(
+    ("language", "source"),
+    [
+        (
+            "javascript",
+            "const LIMIT = 5;\nfunction f(a = LIMIT) {}\n",
+        ),
+        (
+            "typescript",
+            "const LIMIT = 5;\nfunction f(a = LIMIT) {}\n",
+        ),
+        (
+            "javascript",
+            "const LIMIT = 5;\nconst f = (a = LIMIT) => {};\n",
+        ),
+    ],
+)
+def test_js_family_default_parameter_value_is_a_read(language: str, source: str) -> None:
+    """A plain `assignment_pattern` default (`a = LIMIT`) exposes its value under
+    the `right` field, not `value` -- only TS's typed parameter wrapper uses
+    `value`. Missing the `right` field silently dropped every identifier read
+    inside an untyped JS/TS default parameter (finding 6)."""
+    references = _references(source, language)
+
+    reads = [reference for reference in references if reference.kind == "read"]
+    assert [reference.written_name for reference in reads] == ["LIMIT"]
+    read = reads[0]
+    expected_start = source.rindex("LIMIT")
+    assert (read.start_byte, read.end_byte) == (expected_start, expected_start + len("LIMIT"))
+    # The parameter's own name must stay excluded -- it is a binding, not a read.
+    assert not any(reference.written_name == "a" for reference in references)
+
+
+def test_python_lambda_default_parameter_value_is_a_read() -> None:
+    """Mirrors the JS/TS case above for Python's `lambda a=LIMIT: a` -- the
+    outer `lambda`-level exclusion used to blanket-exclude its whole
+    `parameters` field, undoing the correct decision the parameter-defaults
+    walk already made for the default value."""
+    source = "LIMIT = 5\nf = lambda a=LIMIT: a\n"
+
+    references = _references(source, "python")
+
+    reads = [reference for reference in references if reference.kind == "read"]
+    read_names = [reference.written_name for reference in reads]
+    # `LIMIT` (the default value) and `a` (the body's use of the parameter)
+    # are both genuine reads; the parameter *binding* itself is not.
+    assert read_names.count("LIMIT") == 1
+    assert read_names.count("a") == 1
+    limit_read = next(reference for reference in reads if reference.written_name == "LIMIT")
+    expected_start = source.index("LIMIT", source.index("lambda"))
+    assert (limit_read.start_byte, limit_read.end_byte) == (
+        expected_start,
+        expected_start + len("LIMIT"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("language", "source"),
+    [
+        ("python", "def g(a, b):\n    pass\n\ng(1,  # note\n  2)\n"),
+        ("javascript", "function g(a, b) {}\ng(1, /* c */ 2);\n"),
+        ("typescript", "function g(a: number, b: number) {}\ng(1, /* c */ 2);\n"),
+    ],
+)
+def test_call_shape_does_not_count_comments_as_positional_arguments(
+    language: str, source: str
+) -> None:
+    """A comment is a named "extra" node inside the argument list, not an
+    argument -- `_call_shape` used to fall into the positional-argument
+    else-branch for it, inflating `positional_count` by one per inline
+    comment (finding 7)."""
+    references = _references(source, language)
+    call = next(reference for reference in references if reference.kind == "call")
+
+    assert call.call_shape is not None
+    assert call.call_shape.positional_count == 2
+    assert call.call_shape.keywords == []
+
+
+def test_call_shape_keyword_arguments_with_a_comment_stay_correct() -> None:
+    """A comment between keyword arguments must not be miscounted as either a
+    positional or a keyword argument."""
+    source = "def g(a=None, b=None):\n    pass\n\ng(a=1,  # note\n  b=2)\n"
+
+    references = _references(source, "python")
+    call = next(reference for reference in references if reference.kind == "call")
+
+    assert call.call_shape is not None
+    assert call.call_shape.positional_count == 0
+    assert call.call_shape.keywords == ["a", "b"]
+
+
+def test_module_path_survives_a_leading_comment_in_the_call_arguments() -> None:
+    """Same root cause as the comment/positional-argument bug (finding 7), one
+    level up: `_string_literal_argument` used `named_child(0)` to find the
+    module-path string, so a leading comment (a named "extra" node) was
+    mistaken for it and the module edge was silently dropped."""
+    source = "require(/* c */ './mod');\n"
+
+    references = _references(source, "javascript")
+    call = next(reference for reference in references if reference.kind == "call")
+
+    assert call.module_path == "./mod"
+
+
+@pytest.mark.parametrize(
+    ("language", "source"),
+    [
+        (
+            "python",
+            "from pkg import (\n    a,\n    # comment\n    b,\n)\n",
+        ),
+    ],
+)
+def test_python_import_list_ignores_a_comment_between_names(language: str, source: str) -> None:
+    """A comment among parenthesized `from`-import names is a named "extra"
+    node too -- it used to fall through the `aliased_import` check and
+    produce a bogus `import` reference for the comment text itself."""
+    references = _references(source, language)
+
+    imports = [reference for reference in references if reference.kind == "import"]
+    assert [reference.written_name for reference in imports] == ["a", "b"]
+
+
+def test_python_class_heritage_ignores_a_comment_between_base_classes() -> None:
+    """Mirrors the import-list case for `class Child(Base, # note\\n Other):`
+    -- a comment between base classes must not surface as a bogus
+    `inheritance` reference."""
+    source = "class Child(\n    Base,\n    # comment\n    Other,\n):\n    pass\n"
+
+    references = _references(source, "python")
+
+    inheritance = [reference for reference in references if reference.kind == "inheritance"]
+    assert {reference.written_name for reference in inheritance} == {"Base", "Other"}
+
+
+def test_js_namespace_import_alias_survives_a_leading_comment() -> None:
+    """`import * as /* c */ ns from 'mod'` -- the alias used to resolve via
+    `named_child(0)`, which picked the comment instead of `ns`, corrupting
+    both the alias and the written name."""
+    source = "import * as /* c */ ns from 'mod';\n"
+
+    references = _references(source, "javascript")
+    imported = next(reference for reference in references if reference.kind == "import")
+
+    assert (imported.written_name, imported.alias) == ("ns", "ns")
+
+
+def test_js_namespace_export_alias_survives_a_leading_comment() -> None:
+    """Mirrors the namespace-import case for `export * as /* c */ ns from './x'`."""
+    source = "export * as /* c */ ns from './x';\n"
+
+    references = _references(source, "javascript")
+    exported = next(reference for reference in references if reference.kind == "export")
+
+    assert exported.written_name == "ns"
+
+
+def test_js_decorator_target_survives_a_leading_comment() -> None:
+    """`@/* c */ dec` -- the decorator target used to resolve via
+    `named_child(0)`, which picked the comment instead of `dec`."""
+    source = "class A {\n  @/* c */ dec\n  method() {}\n}\n"
+
+    references = _references(source, "javascript")
+    decorator = next(reference for reference in references if reference.kind == "decorator")
+
+    assert decorator.written_name == "dec"
+
+
+def test_js_default_import_is_not_fabricated_from_a_comment() -> None:
+    """`import Default, /* c */ { a } from 'mod'` -- a comment between clause
+    items used to fall into the "bare identifier" else-branch and produce a
+    bogus second `default` import naming the comment text."""
+    source = "import Default, /* c */ { a } from 'mod';\n"
+
+    references = _references(source, "javascript")
+    imports = [reference for reference in references if reference.kind == "import"]
+
+    assert sorted(reference.written_name for reference in imports) == ["Default", "a"]
+
+
+def test_ts_extends_type_clause_ignores_a_comment() -> None:
+    """`interface I extends /* c */ Base {}` -- a comment must not surface as
+    a bogus `inheritance` reference alongside the real one."""
+    source = "interface I extends /* c */ Base {}\n"
+
+    references = _references(source, "typescript")
+    inheritance = [reference for reference in references if reference.kind == "inheritance"]
+
+    assert [reference.written_name for reference in inheritance] == ["Base"]
+
+
+def test_ts_type_annotation_survives_a_leading_comment() -> None:
+    """`x: /* c */ Widget` -- the annotated type used to resolve via
+    `named_child(0)`, which picked the comment and silently dropped the
+    `type_use` row for `Widget` entirely."""
+    source = "function f(x: /* c */ Widget) {}\n"
+
+    references = _references(source, "typescript")
+    type_uses = [reference for reference in references if reference.kind == "type_use"]
+
+    assert [reference.written_name for reference in type_uses] == ["Widget"]
+
+
+def test_call_shape_type_argument_count_ignores_a_comment() -> None:
+    """A comment among explicit type arguments (`build</* c */ T>(value)`)
+    must not inflate `type_argument_count`."""
+    source = (
+        "function make<T>(value: T): Contract<T> "
+        "{ return build</* c */ T>(value); }\n"
+    )
+
+    references = _references(source, "typescript")
+    call = next(
+        reference
+        for reference in references
+        if reference.kind == "call" and reference.target_name == "build"
+    )
+
+    assert call.call_shape is not None
+    assert call.call_shape.type_argument_count == 1
+
+
+def test_js_rest_parameter_name_survives_a_leading_comment() -> None:
+    """`function f(.../* c */ rest) {}` -- the rest parameter's name used to
+    resolve via `named_child(0)` in `_parameter_shapes`, which picked the
+    comment instead of `rest`."""
+    source = "function f(.../* c */ rest) {}\n"
+
+    result = TreeSitterExtractor().extract(Path("sample.js"), "javascript", source.encode())
+    declaration = next(item for item in result.declarations if item.qualified_symbol == "f")
+
+    assert [(item.name, item.kind) for item in declaration.parameters] == [("rest", "variadic")]
+
+
+def test_js_destructured_rest_binding_survives_a_leading_comment() -> None:
+    """`[.../* c */ rest]` -- `_binding_identifiers`' `rest_pattern` case used
+    `named_child(0)`, which picked a comment placed right after `...` instead
+    of the bound identifier, losing the export's real name."""
+    source = "export const [.../* c */ rest] = arr;\n"
+
+    references = _references(source, "javascript")
+    exported = next(reference for reference in references if reference.kind == "export")
+
+    assert exported.written_name == "rest"
