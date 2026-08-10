@@ -261,7 +261,9 @@ def test_refactor_cursor_is_bound_to_the_operation_and_page_limit(tmp_path: Path
     assert excinfo.value.code == ErrorCode.INVALID_CURSOR
 
     # The identical operation and limit are accepted, unaffected by binding.
-    second = service.analyze_refactor(selector, RenameOperation(new_name="result"), cursor=first.cursor)
+    second = service.analyze_refactor(
+        selector, RenameOperation(new_name="result"), cursor=first.cursor
+    )
     assert second.cursor is None
 
     calls = [
@@ -316,6 +318,48 @@ def test_signature_bound_receiver_does_not_consume_a_call_argument(tmp_path: Pat
     assert call.reason_code == "known_owner_member"
 
 
+@pytest.mark.parametrize(
+    ("source", "qualified_symbol"),
+    [
+        (
+            "abstract class Base {\n"
+            "  abstract run(a: number, b: number): void;\n"
+            "  invoke(): void { this.run(1, 2); }\n"
+            "}\n",
+            "Base.run",
+        ),
+        (
+            "class Service {\n"
+            "  run = (a: number, b: number): number => a + b;\n"
+            "  invoke(): number { return this.run(1, 2); }\n"
+            "}\n",
+            "Service.run",
+        ),
+    ],
+)
+def test_typescript_callable_class_members_keep_parameters_for_signature_analysis(
+    tmp_path: Path, source: str, qualified_symbol: str
+) -> None:
+    service, project_id = _indexed_service(tmp_path, {"service.ts": source})
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(
+            project=project_id,
+            path="service.ts",
+            qualified_symbol=qualified_symbol,
+        ),
+        SignatureChangeOperation(
+            parameters=[
+                ParameterShape(name="b", kind="positional", required=True, position=0),
+                ParameterShape(name="a", kind="positional", required=True, position=1),
+            ]
+        ),
+    )
+
+    call = next(item for item in analysis.must_change if item.kind == "call")
+    assert call.reason_code == "positional_order_change"
+
+
 def test_a_qualified_call_edits_only_the_member_name(tmp_path: Path) -> None:
     """The reference range is wider than the identifier to rewrite.
 
@@ -357,6 +401,26 @@ def test_the_declaration_finding_points_at_its_own_name(tmp_path: Path) -> None:
     declaration = next(item for item in analysis.must_change if item.reason_code == "declaration")
     source = (tmp_path / "repo" / "auth.py").read_bytes()
     assert source[declaration.edit_start_byte : declaration.edit_end_byte] == b"authorize"
+
+
+def test_required_rename_edits_are_deduplicated_by_span(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"models.py": "class Model:\n    pass\n\nclass FrozenModel(Model):\n    pass\n"},
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="models.py", qualified_symbol="Model"),
+        RenameOperation(new_name="Entity"),
+    )
+
+    spans = [
+        (item.path, item.edit_start_byte, item.edit_end_byte)
+        for item in analysis.must_change
+        if item.edit_start_byte is not None and item.edit_end_byte is not None
+    ]
+    assert len(spans) == len(set(spans))
+    assert analysis.counts.must_change == 2
 
 
 def test_analyze_refactor_fetches_the_reference_table_only_once(
@@ -503,16 +567,94 @@ def test_rename_of_an_aliased_base_method_surfaces_the_subclass_override(tmp_pat
     assert analysis.completeness.state == "complete_with_dynamic_limitations"
 
 
+def test_an_unrelated_aliased_import_is_not_treated_as_the_base_class(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.py": (
+                "class Base:\n    def handle(self):\n        return 1\n\n"
+                "class Other:\n    def handle(self):\n        return 2\n"
+            ),
+            "child.py": (
+                "from base import Other as B\n\n"
+                "class Child(B):\n    def handle(self):\n        return 3\n"
+            ),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="base.py", qualified_symbol="Base.handle"),
+        RenameOperation(new_name="process"),
+    )
+
+    assert not any(
+        item.reason_code == "override_of_renamed_method" for item in analysis.likely_change
+    )
+
+
+def test_same_file_namespace_heritage_is_not_bound_to_a_local_namesake(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.py": (
+                "import other\n\n"
+                "class Base:\n    def handle(self):\n        return 1\n\n"
+                "class Child(other.Base):\n    def handle(self):\n        return 2\n"
+            ),
+            "other.py": "class Base:\n    def handle(self):\n        return 3\n",
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="base.py", qualified_symbol="Base.handle"),
+        RenameOperation(new_name="process"),
+    )
+
+    assert not any(
+        item.reason_code == "override_of_renamed_method" for item in analysis.likely_change
+    )
+
+
+def test_a_namespace_imported_base_class_surfaces_the_subclass_override(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.py": "class Base:\n    def handle(self):\n        return 1\n",
+            "child.py": (
+                "import base\n\nclass Child(base.Base):\n    def handle(self):\n        return 2\n"
+            ),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="base.py", qualified_symbol="Base.handle"),
+        RenameOperation(new_name="process"),
+    )
+
+    override = next(
+        item
+        for item in analysis.likely_change
+        if item.path == "child.py" and item.reason_code == "override_of_renamed_method"
+    )
+    assert override.resolution == "likely"
+
+
 def test_rename_of_a_base_method_surfaces_a_transitive_subclass_override(tmp_path: Path) -> None:
     service, project_id = _indexed_service(
         tmp_path,
         {
             "base.py": "class Base:\n    def handle(self):\n        return 1\n",
             "mid.py": (
-                "from base import Base\n\n\nclass Mid(Base):\n    def handle(self):\n        return 2\n"
+                "from base import Base\n\n\n"
+                "class Mid(Base):\n    def handle(self):\n        return 2\n"
             ),
             "leaf.py": (
-                "from mid import Mid\n\n\nclass Leaf(Mid):\n    def handle(self):\n        return 3\n"
+                "from mid import Mid\n\n\n"
+                "class Leaf(Mid):\n    def handle(self):\n        return 3\n"
             ),
         },
     )
@@ -553,6 +695,31 @@ def test_javascript_rename_of_a_base_method_surfaces_the_subclass_override(
         item
         for item in analysis.likely_change
         if item.path == "child.js" and item.reason_code == "override_of_renamed_method"
+    )
+    assert override.resolution == "likely"
+
+
+def test_typescript_namespace_heritage_surfaces_the_subclass_override(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.ts": "export class Base { handle(): void {} }\n",
+            "child.ts": (
+                "import * as ns from './base';\n"
+                "export class Child extends ns.Base { handle(): void {} }\n"
+            ),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="base.ts", qualified_symbol="Base.handle"),
+        RenameOperation(new_name="process"),
+    )
+
+    override = next(
+        item
+        for item in analysis.likely_change
+        if item.path == "child.ts" and item.reason_code == "override_of_renamed_method"
     )
     assert override.resolution == "likely"
 
@@ -679,9 +846,7 @@ def test_a_ts_class_rename_finds_the_heritage_reference_and_reaches_complete(
         tmp_path,
         {
             "base.ts": "export class Base {\n  run(): number { return 1; }\n}\n",
-            "child.ts": (
-                "import { Base } from './base';\n\nexport class Child extends Base {}\n"
-            ),
+            "child.ts": ("import { Base } from './base';\n\nexport class Child extends Base {}\n"),
         },
     )
 
@@ -711,9 +876,7 @@ def test_a_tsx_jsx_component_use_resolves_without_a_standing_limitation(
     service, project_id = _indexed_service(
         tmp_path,
         {
-            "widget.tsx": (
-                "export function Widget(): JSX.Element {\n  return <div />;\n}\n"
-            ),
+            "widget.tsx": ("export function Widget(): JSX.Element {\n  return <div />;\n}\n"),
             "main.tsx": (
                 "import { Widget } from './widget';\n"
                 "export function App(): JSX.Element {\n  return <Widget />;\n}\n"

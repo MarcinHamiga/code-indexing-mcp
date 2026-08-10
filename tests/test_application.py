@@ -257,9 +257,7 @@ def test_a_rejected_file_does_not_make_the_project_permanently_stale(tmp_path: P
     assert app.project_is_stale(project.id) is False
     assert app.project_status(project.id).state in {"ready", "partial"}
 
-    with patch.object(
-        app.indexer, "index", wraps=app.indexer.index
-    ) as index_spy:
+    with patch.object(app.indexer, "index", wraps=app.indexer.index) as index_spy:
         first = app.ensure_reference_index(project.id)
         second = app.ensure_reference_index(project.id)
 

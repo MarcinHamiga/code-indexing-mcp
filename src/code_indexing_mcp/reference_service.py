@@ -603,6 +603,25 @@ class ReferenceService:
 
         full_must, full_likely, full_review, full_evidence = _classify_hits(full_hits)
 
+        def _dedupe_edit_spans(
+            findings: list[RefactorFinding],
+            seen: set[tuple[str, int, int]],
+        ) -> list[RefactorFinding]:
+            deduped: list[RefactorFinding] = []
+            for finding in findings:
+                if finding.edit_start_byte is None or finding.edit_end_byte is None:
+                    deduped.append(finding)
+                    continue
+                key = (finding.path, finding.edit_start_byte, finding.edit_end_byte)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(finding)
+            return deduped
+
+        required_edit_spans: set[tuple[str, int, int]] = set()
+        full_must = _dedupe_edit_spans(full_must, required_edit_spans)
+
         # R3: the synthetic declaration finding and a hit-derived must_change
         # entry (typically an `export` row) can share the exact same edit
         # span — e.g. `export function answer() {}` narrows both the
@@ -625,6 +644,14 @@ class ReferenceService:
                 for finding in full_must
             ):
                 declaration_finding = None
+            else:
+                required_edit_spans.add(dedupe_key)
+
+        # Exact edits win over likely edits at the same location. Synthetic
+        # override findings are considered before hit-derived likely findings
+        # because they carry the more specific override reason.
+        override_findings = _dedupe_edit_spans(override_findings, required_edit_spans)
+        full_likely = _dedupe_edit_spans(full_likely, required_edit_spans)
 
         page_ids = {hit.reference_id for hit in response.hits}
         must_change = [finding for finding in full_must if finding.reference_id in page_ids]
@@ -929,27 +956,30 @@ class ReferenceService:
         no alias to consult for a same-file reference (no import exists).
         """
 
-        target = (row["target_name"] or "").rsplit(".", 1)[-1]
-        if not target:
+        written_target = row["target_name"] or ""
+        target = written_target.rsplit(".", 1)[-1]
+        if not written_target:
             return False
-        if row["file_id"] == base_file_id:
-            return target == base_tail
-        # `target` is the name written at the inheritance site, i.e. the
-        # import's *local* binding (its alias when aliased). Once an import
-        # is found whose local binding is that name, only the module needs
-        # resolving to `base_path` -- calling `_import_targets_symbol` here
-        # instead would wrongly re-check `target` against the import's real
-        # `imported_name`, which differs from the local binding for exactly
-        # the aliased case this is trying to prove (`from base import Base
-        # as B` has `imported_name == "Base"`, not `"B"`).
-        return any(
-            (item["alias"] or item["written_name"] or item["imported_name"]) == target
-            and item["module_path"] is not None
-            and self._module_matches(
-                item["path"], item["language"], item["module_path"], base_path, known_paths
-            )
-            for item in imports.get(row["file_id"], [])
-        )
+        if row["file_id"] == base_file_id and "." not in written_target:
+            return written_target == base_tail
+        for item in imports.get(row["file_id"], []):
+            binding = item["alias"] or item["written_name"] or item["imported_name"]
+            if "." in written_target:
+                receiver, member = written_target.rsplit(".", 1)
+                if (
+                    member != base_tail
+                    or binding != receiver
+                    or not self._is_namespace_import(item)
+                ):
+                    continue
+            elif binding != target or item["imported_name"] not in {base_tail, "default"}:
+                continue
+            module_path = item["module_path"]
+            if module_path is not None and self._module_matches(
+                item["path"], item["language"], module_path, base_path, known_paths
+            ):
+                return True
+        return False
 
     @staticmethod
     def _issue_explanation(issue: str) -> str:
@@ -1223,8 +1253,7 @@ class ReferenceService:
                 return (
                     "exact",
                     "reexport_chain",
-                    "The local alias resolves to the declaration through a chain of "
-                    "re-exports.",
+                    "The local alias resolves to the declaration through a chain of re-exports.",
                 )
             if item["module_path"] is not None:
                 unproven_reexport = True
@@ -1301,7 +1330,7 @@ class ReferenceService:
         if module_path is None:
             return False
         imported = item["imported_name"]
-        lookup_name = symbol if imported in (None, "default") else imported
+        lookup_name = symbol if imported is None or imported == "default" else imported
         for candidate in self._module_candidates(
             item["path"], item["language"], module_path, known_paths
         ):
@@ -1588,9 +1617,7 @@ class ReferenceService:
             padded = cursor + "=" * (-len(cursor) % 4)
             payload = json.loads(base64.urlsafe_b64decode(padded))
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise CodeIndexingError(
-                ErrorCode.INVALID_CURSOR, "invalid reference cursor"
-            ) from exc
+            raise CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid reference cursor") from exc
 
         def invalid() -> CodeIndexingError:
             return CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid reference cursor")

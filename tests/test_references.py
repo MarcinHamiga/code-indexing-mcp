@@ -109,9 +109,7 @@ def test_absolute_import_under_a_src_layout_resolves_exactly(tmp_path: Path) -> 
     )
 
     response = service.find_references(
-        DeclarationSelector(
-            project=project_id, path="src/mypkg/lib.py", qualified_symbol="answer"
-        )
+        DeclarationSelector(project=project_id, path="src/mypkg/lib.py", qualified_symbol="answer")
     )
 
     call = next(hit for hit in response.hits if hit.kind == "call")
@@ -681,9 +679,7 @@ def test_find_references_follows_a_renaming_two_hop_barrel_alias(tmp_path: Path)
         DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
     )
 
-    call_hits = [
-        hit for hit in response.hits if hit.kind == "call" and hit.path == "importer.py"
-    ]
+    call_hits = [hit for hit in response.hits if hit.kind == "call" and hit.path == "importer.py"]
     assert len(call_hits) == 1
     assert call_hits[0].written_name == "x2"
     assert call_hits[0].resolution == "exact"

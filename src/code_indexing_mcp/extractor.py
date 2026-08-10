@@ -497,9 +497,10 @@ class TreeSitterExtractor:
                 # unlike a TS/JS *class* decorator, which the grammar does nest
                 # inside `class_declaration`) -- attribute it to that sibling.
                 sibling = current.next_sibling
-                if sibling is not None and (
-                    declaration := declarations.get(sibling.id)
-                ) is not None:
+                if (
+                    sibling is not None
+                    and (declaration := declarations.get(sibling.id)) is not None
+                ):
                     return declaration.qualified_symbol
             current = current.parent
         return None
@@ -554,7 +555,8 @@ class TreeSitterExtractor:
                 continue
             name_node = (
                 child
-                if child.type in {"identifier", "property_identifier", "object_pattern", "array_pattern"}
+                if child.type
+                in {"identifier", "property_identifier", "object_pattern", "array_pattern"}
                 else None
             )
             name_node = (
@@ -737,14 +739,19 @@ class TreeSitterExtractor:
         `union_type`, `intersection_type`, `array_type`, `function_type` (its
         `return_type` only -- the parameter list is a binding context, not a type
         reference), and `type_arguments`, stopping at `type_identifier`/`identifier`/
-        `predefined_type` (`number`, `string`, `void`, ...) leaves. Anything else
-        (e.g. an object type literal, or a qualified `ns.Base` member expression)
-        yields nothing -- narrower than the verbatim text it replaces, but never
-        wrong, and callers degrade to the plain identifier fallback where one exists.
+        `predefined_type` (`number`, `string`, `void`, ...) leaves. Qualified
+        names such as `ns.Base` stay intact as one resolvable leaf. Anything
+        else (for example an object type literal) yields nothing.
         """
         if node is None:
             return []
-        if node.type in {"type_identifier", "identifier", "predefined_type"}:
+        if node.type in {
+            "type_identifier",
+            "identifier",
+            "predefined_type",
+            "member_expression",
+            "nested_type_identifier",
+        }:
             return [node]
         if node.type == "generic_type":
             names = TreeSitterExtractor._descend_type_names(node.child_by_field_name("name"))
@@ -817,9 +824,7 @@ class TreeSitterExtractor:
         return False
 
     @staticmethod
-    def _emit_member_access(
-        node: Node, source: bytes, add_reference: _ReferenceAdder
-    ) -> None:
+    def _emit_member_access(node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
         """Emit `read`/`write` for a member-access node that is not itself a call.
 
         Handles Python `attribute` and JS/TS `member_expression` (E5). Three
@@ -831,14 +836,20 @@ class TreeSitterExtractor:
         """
         parent = node.parent
         if parent is not None:
+            ancestor: Node | None = parent
+            while ancestor is not None:
+                if ancestor.type in {"class_heritage", "extends_type_clause"}:
+                    return
+                ancestor = ancestor.parent
             if (
                 parent.type in {"call", "call_expression"}
                 and parent.child_by_field_name("function") == node
             ):
                 return
-            if parent.type == "new_expression" and parent.child_by_field_name(
-                "constructor"
-            ) == node:
+            if (
+                parent.type == "new_expression"
+                and parent.child_by_field_name("constructor") == node
+            ):
                 return
             if parent.type == "decorator":
                 return
@@ -856,9 +867,7 @@ class TreeSitterExtractor:
             return
         object_field = node.child_by_field_name("object")
         text = _capture_name(source, node)
-        kind: ReferenceKind = (
-            "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
-        )
+        kind: ReferenceKind = "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
         add_reference(
             kind,
             node,

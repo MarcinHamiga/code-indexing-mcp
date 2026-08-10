@@ -22,6 +22,13 @@
 (jsx_closing_element name: (_) @name) @reference.component
 (function_declaration name: (identifier) @name parameters: (formal_parameters) @declaration.parameters)
 (method_definition name: (_) @name parameters: (formal_parameters) @declaration.parameters)
+(abstract_method_signature name: (_) @name parameters: (formal_parameters) @declaration.parameters)
+(public_field_definition
+  name: (_) @name
+  value: (arrow_function parameters: (formal_parameters) @declaration.parameters))
+(public_field_definition
+  name: (_) @name
+  value: (function_expression parameters: (formal_parameters) @declaration.parameters))
 (variable_declarator
   name: (identifier) @name
   value: (arrow_function parameters: (formal_parameters) @declaration.parameters))

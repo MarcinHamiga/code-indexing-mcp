@@ -4092,7 +4092,20 @@
       [
         "Worker.handle",
         "method",
-        []
+        [
+          [
+            "a",
+            "positional",
+            true,
+            0
+          ],
+          [
+            "b",
+            "positional",
+            true,
+            1
+          ]
+        ]
       ],
       [
         "CardProps",
@@ -4879,7 +4892,20 @@
       [
         "Worker.handle",
         "method",
-        []
+        [
+          [
+            "a",
+            "positional",
+            true,
+            0
+          ],
+          [
+            "b",
+            "positional",
+            true,
+            1
+          ]
+        ]
       ],
       [
         "describe",

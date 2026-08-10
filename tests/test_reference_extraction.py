@@ -215,6 +215,40 @@ def test_javascript_typescript_and_tsx_extract_structural_syntax() -> None:
     assert any(item.qualified_symbol == "Screen" for item in tsx_result.declarations)
 
 
+@pytest.mark.parametrize("language", ["javascript", "typescript", "tsx"])
+def test_qualified_class_heritage_is_an_inheritance_reference(language: str) -> None:
+    source = "class Child extends ns.Base {}\n"
+
+    references = _references(source, language)
+    inheritance = [reference for reference in references if reference.kind == "inheritance"]
+
+    assert [
+        (reference.written_name, reference.source_qualified_symbol) for reference in inheritance
+    ] == [("ns.Base", "Child")]
+    assert not any(
+        reference.kind == "read" and reference.written_name == "ns.Base" for reference in references
+    )
+
+
+@pytest.mark.parametrize("language", ["typescript", "tsx"])
+def test_typescript_callable_class_members_include_parameter_shapes(language: str) -> None:
+    source = (
+        "abstract class Base {\n"
+        "  abstract run(a: number, b: number): void;\n"
+        "  callback = (first: number, second: number): number => first + second;\n"
+        "}\n"
+    )
+
+    result = TreeSitterExtractor().extract(Path(f"sample.{language}"), language, source.encode())
+    declarations = {item.qualified_symbol: item for item in result.declarations}
+
+    for qualified in ("Base.run", "Base.callback"):
+        assert [item.name for item in declarations[qualified].parameters] == [
+            "a" if qualified == "Base.run" else "first",
+            "b" if qualified == "Base.run" else "second",
+        ]
+
+
 @pytest.mark.parametrize(
     ("language", "source"),
     [
@@ -444,14 +478,21 @@ def test_js_family_export_star_and_namespace_export_carry_module_path(language: 
         "./x",
         None,
     )
-    assert (namespaced.target_name, namespaced.written_name, namespaced.module_path, namespaced.alias) == (
+    assert (
+        namespaced.target_name,
+        namespaced.written_name,
+        namespaced.module_path,
+        namespaced.alias,
+    ) == (
         "*",
         "ns",
         "./x",
         "ns",
     )
     # The namespace alias must not also surface as a bare `read`.
-    assert not any(reference.kind == "read" and reference.written_name == "ns" for reference in references)
+    assert not any(
+        reference.kind == "read" and reference.written_name == "ns" for reference in references
+    )
 
 
 @pytest.mark.parametrize("language", ["javascript", "typescript", "tsx"])
@@ -468,7 +509,9 @@ def test_js_family_module_edges_stay_visible(language: str) -> None:
     bare_import = next(reference for reference in references if reference.kind == "import")
     assert (bare_import.module_path, bare_import.imported_name) == ("./polyfill", None)
 
-    calls = {reference.target_name: reference for reference in references if reference.kind == "call"}
+    calls = {
+        reference.target_name: reference for reference in references if reference.kind == "call"
+    }
     assert calls["require"].module_path == "./lazy"
     assert calls["import"].module_path == "./dynamic"
 
@@ -545,9 +588,7 @@ def test_js_family_decorators_produce_decorator_references(language: str) -> Non
     references = _references(source, language)
 
     by_span = {
-        reference.start_byte: reference
-        for reference in references
-        if reference.kind == "decorator"
+        reference.start_byte: reference for reference in references if reference.kind == "decorator"
     }
     plain = by_span[source.index("sealed")]
     assert (plain.target_name, plain.written_name, plain.source_qualified_symbol) == (
@@ -839,10 +880,7 @@ def test_ts_type_annotation_survives_a_leading_comment() -> None:
 def test_call_shape_type_argument_count_ignores_a_comment() -> None:
     """A comment among explicit type arguments (`build</* c */ T>(value)`)
     must not inflate `type_argument_count`."""
-    source = (
-        "function make<T>(value: T): Contract<T> "
-        "{ return build</* c */ T>(value); }\n"
-    )
+    source = "function make<T>(value: T): Contract<T> { return build</* c */ T>(value); }\n"
 
     references = _references(source, "typescript")
     call = next(

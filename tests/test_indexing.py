@@ -215,11 +215,7 @@ def test_reference_extraction_duration_is_its_own_phase_not_the_whole_parse(
     root = tmp_path / "repo"
     root.mkdir()
     (root / "a.py").write_text(
-        "class Base:\n"
-        "    pass\n\n"
-        "class Child(Base):\n"
-        "    def run(self):\n"
-        "        return Base()\n"
+        "class Base:\n    pass\n\nclass Child(Base):\n    def run(self):\n        return Base()\n"
     )
     project = initialize_project(root)
     indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
@@ -323,14 +319,16 @@ def test_failed_changed_file_preserves_previous_chunks(tmp_path: Path) -> None:
     indexer, store = make_indexer(tmp_path, embedder)
     indexer.index(project)
     original = store.list_chunks([project.id])
-    original_references = store.list_reference_records(project.id)
+    assert store.list_reference_records(project.id)
 
     source.write_text("def RAISE_EMBEDDING():\n    return 2\n")
     report = indexer.index(project)
 
     assert len(report.errors) == 1
     assert store.list_chunks([project.id]) == original
-    assert store.list_reference_records(project.id) == original_references
+    # Search chunks can safely retain their own old content, but structural
+    # offsets are applied to the current source file and must be retired.
+    assert store.list_reference_records(project.id) == []
     # A failed file is recorded with its current size/mtime, so subsequent
     # runs skip it instead of re-reading, re-parsing, and re-embedding it.
     batches = len(embedder.passage_batches)
@@ -338,10 +336,10 @@ def test_failed_changed_file_preserves_previous_chunks(tmp_path: Path) -> None:
     assert len(embedder.passage_batches) == batches
     assert second.unchanged_files == 1
     assert store.list_chunks([project.id]) == original
-    assert store.list_reference_records(project.id) == original_references
+    assert store.list_reference_records(project.id) == []
 
 
-def test_failed_changed_file_preserves_previous_references_on_extraction_failure(
+def test_failed_changed_file_retires_previous_references_on_extraction_failure(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "repo"
@@ -351,26 +349,24 @@ def test_failed_changed_file_preserves_previous_references_on_extraction_failure
     project = initialize_project(root)
     indexer, store = make_indexer(tmp_path, RecordingEmbedder())
     indexer.index(project)
-    original_references = store.list_reference_records(project.id)
+    assert store.list_reference_records(project.id)
     source.write_text("def changed():\n    return 2\n")
 
     with patch.object(indexer.extractor, "extract", side_effect=RuntimeError("query failed")):
         report = indexer.index(project)
 
     assert [issue.path for issue in report.errors] == ["main.py"]
-    assert store.list_reference_records(project.id) == original_references
+    assert store.list_reference_records(project.id) == []
 
 
 def test_a_reindex_that_gains_a_syntax_error_retires_its_stale_references(tmp_path: Path) -> None:
     """A syntax error must not leave references from the *previous* content
 
-    Regression for finding 4: unlike the extraction-failure case above (where
-    the chunk table also keeps the previous generation), a file that still
-    extracts -- just with tree-sitter errors -- gets its chunks and
-    content_hash replaced by the new generation. Leaving its old reference
-    rows in place would serve them at byte offsets from content that no
-    longer exists on disk, which is worse than reporting no references at
-    all.
+    Regression for finding 4: a file that still extracts -- just with
+    tree-sitter errors -- gets its chunks and content_hash replaced by the
+    new generation. Leaving its old reference rows in place would serve them
+    at byte offsets from content that no longer exists on disk, which is worse
+    than reporting no references at all.
     """
     root = tmp_path / "repo"
     root.mkdir()
@@ -615,9 +611,7 @@ def test_reference_backfill_does_not_launder_an_embed_failed_file(tmp_path: Path
     assert report.files_backfilled == 0
     # No reference generation was committed for content the chunk table does
     # not actually contain.
-    coverage = store.coverage_for_file(
-        project.id, failed_record.file_id, REFERENCE_SCHEMA_VERSION
-    )
+    coverage = store.coverage_for_file(project.id, failed_record.file_id, REFERENCE_SCHEMA_VERSION)
     assert not coverage or coverage[0]["content_hash"] != failed_record.content_hash
     _assert_chunk_content_hashes_match_files(store, project.id)
 
@@ -633,9 +627,7 @@ def test_reference_backfill_does_not_launder_an_embed_failed_file(tmp_path: Path
     healed_report = indexer.backfill_references(project)
     assert healed_report.files_backfilled == 0
     assert healed_report.complete is True
-    coverage = store.coverage_for_file(
-        project.id, healed_record.file_id, REFERENCE_SCHEMA_VERSION
-    )
+    coverage = store.coverage_for_file(project.id, healed_record.file_id, REFERENCE_SCHEMA_VERSION)
     assert coverage and coverage[0]["content_hash"] == healed_record.content_hash
     _assert_chunk_content_hashes_match_files(store, project.id)
 
@@ -832,8 +824,7 @@ def test_backfill_retires_reference_rows_from_a_retired_schema_version(tmp_path:
         replace_reference_file_ids=[file_id],
     )
     assert all(
-        row["schema_version"] == stale_version
-        for row in store.list_reference_records(project.id)
+        row["schema_version"] == stale_version for row in store.list_reference_records(project.id)
     )
 
     with patch.object(indexer.extractor, "extract", side_effect=RuntimeError("broken parser")):

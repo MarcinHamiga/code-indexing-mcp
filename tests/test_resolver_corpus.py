@@ -23,8 +23,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import Indexer
 from code_indexing_mcp.models import (
@@ -118,9 +116,7 @@ def test_e1_ts_class_heritage_finds_the_base_class_reference(tmp_path: Path) -> 
 
 
 def test_e2_ts_generic_argument_is_a_separate_type_use(tmp_path: Path) -> None:
-    service, project_id = _indexed_service(
-        tmp_path, CORPUS_ROOT / "typescript" / "e2_generic_type"
-    )
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "typescript" / "e2_generic_type")
 
     response = service.find_references(
         DeclarationSelector(project=project_id, path="box.ts", qualified_symbol="Item")
@@ -137,24 +133,18 @@ def test_e2_ts_generic_argument_is_a_separate_type_use(tmp_path: Path) -> None:
 
 
 def test_e3_bare_export_star_emits_a_barrel_export_row(tmp_path: Path) -> None:
-    service, project_id = _indexed_service(
-        tmp_path, CORPUS_ROOT / "typescript" / "e3_export_star"
-    )
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "typescript" / "e3_export_star")
 
     rows = service.store.list_reference_records(project_id)
     row = next(
-        item
-        for item in rows
-        if item["path"] == "index.ts" and item["record_kind"] == "reference"
+        item for item in rows if item["path"] == "index.ts" and item["record_kind"] == "reference"
     )
     assert row["kind"] == "export"
     assert row["module_path"] == "./lib"
 
 
 def test_e3_namespace_export_star_keeps_its_module_path(tmp_path: Path) -> None:
-    service, project_id = _indexed_service(
-        tmp_path, CORPUS_ROOT / "typescript" / "e3_export_star"
-    )
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "typescript" / "e3_export_star")
 
     rows = service.store.list_reference_records(project_id)
     row = next(
@@ -220,9 +210,7 @@ def test_e4_js_new_without_parens_is_a_call(tmp_path: Path) -> None:
 
 
 def test_e5_python_member_write_and_read_are_recorded(tmp_path: Path) -> None:
-    service, project_id = _indexed_service(
-        tmp_path, CORPUS_ROOT / "python" / "e5_member_write"
-    )
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "python" / "e5_member_write")
 
     rows = service.store.list_reference_records(project_id)
     main_rows = [
@@ -243,9 +231,7 @@ def test_e5_python_member_write_and_read_are_recorded(tmp_path: Path) -> None:
 
 
 def test_e5_js_shorthand_property_is_a_read(tmp_path: Path) -> None:
-    service, project_id = _indexed_service(
-        tmp_path, CORPUS_ROOT / "javascript" / "e5_shorthand"
-    )
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "javascript" / "e5_shorthand")
 
     response = service.find_references(
         DeclarationSelector(project=project_id, path="widget.js", qualified_symbol="onSave")
@@ -306,9 +292,7 @@ def test_e9_module_edges_stay_visible(tmp_path: Path) -> None:
         row for row in rows if row["path"] == "main.js" and row["record_kind"] == "reference"
     ]
     bare_import = next(
-        row
-        for row in main_rows
-        if row["kind"] == "import" and row["module_path"] == "./polyfill"
+        row for row in main_rows if row["kind"] == "import" and row["module_path"] == "./polyfill"
     )
     require_call = next(
         row for row in main_rows if row["kind"] == "call" and row["target_name"] == "require"
@@ -344,9 +328,7 @@ def test_r1_python_override_is_a_likely_change(tmp_path: Path) -> None:
 
 
 def test_r2_reexport_chain_resolves_exactly(tmp_path: Path) -> None:
-    service, project_id = _indexed_service(
-        tmp_path, CORPUS_ROOT / "python" / "r2_reexport_chain"
-    )
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "python" / "r2_reexport_chain")
 
     response = service.find_references(
         DeclarationSelector(project=project_id, path="pkg/impl.py", qualified_symbol="b")

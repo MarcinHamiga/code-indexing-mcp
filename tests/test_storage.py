@@ -225,18 +225,14 @@ def test_reference_read_methods_apply_exact_structural_filters(tmp_path: Path) -
     assert store.target_name_candidates(project.id, "answer", record_kind="declaration") == [
         declaration
     ]
-    assert store.target_name_candidates(project.id, "answer", record_kind="reference") == [
-        imported
-    ]
+    assert store.target_name_candidates(project.id, "answer", record_kind="reference") == [imported]
     # declarations restricted to a candidate file set (S4).
     assert store.declarations_for_files(project.id, ["file-1"]) == [declaration]
     assert store.declarations_for_files(project.id, ["no-such-file"]) == []
     assert store.declarations_for_files(project.id, []) == []
     # list_reference_records' record_kinds narrows the same way (S4/E3): a
     # query-time caller can drop declaration rows from the fetch entirely.
-    assert store.list_reference_records(project.id, record_kinds=("declaration",)) == [
-        declaration
-    ]
+    assert store.list_reference_records(project.id, record_kinds=("declaration",)) == [declaration]
     assert store.list_reference_records(project.id, record_kinds=("reference", "coverage")) == [
         coverage,
         imported,
@@ -244,9 +240,7 @@ def test_reference_read_methods_apply_exact_structural_filters(tmp_path: Path) -
     assert store.list_reference_records(project.id, record_kinds=()) == []
     # version kwarg is honored on the same pinned snapshot as list_reference_records.
     version = store.reference_version(project.id)
-    assert store.declaration_shapes(project.id, "package.answer", version=version) == [
-        declaration
-    ]
+    assert store.declaration_shapes(project.id, "package.answer", version=version) == [declaration]
     assert store.target_name_candidates(project.id, "answer", version=version) == [
         declaration,
         imported,

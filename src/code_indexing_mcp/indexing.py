@@ -359,17 +359,13 @@ class Indexer:
                         continue
                     # The files row's content_hash was advanced by a failed
                     # index run (stage_failure), but the chunk table still
-                    # holds the *previous* generation's content -- parsing
-                    # and committing references for the current on-disk
-                    # source would stage a reference generation the chunk
-                    # table does not actually contain (S1). Leave this file
-                    # uncovered; it heals once a successful index replaces
-                    # both the chunks and the content hash together. Any
-                    # rows it still carries from a retired schema version are
-                    # not protected by that reasoning -- those are simply
-                    # wrong regardless of chunk consistency -- so retire them.
-                    if record.file_id in stale_schema_file_ids:
-                        staging_job().mark_references_replaced(record.file_id)
+                    # holds the previous generation's content. References
+                    # cannot receive the same treatment: their byte offsets
+                    # are applied to the current source file, so any surviving
+                    # generation could target unrelated text. Retire it and
+                    # leave the file honestly uncovered until a successful
+                    # index replaces chunks and references together.
+                    staging_job().mark_references_replaced(record.file_id)
                     incomplete_paths.append(record.path)
                     continue
                 try:
@@ -577,7 +573,8 @@ class Indexer:
 
         def stage_failure(record: StoredFile, exc: Exception) -> None:
             errors.append(IndexIssue(path=record.path, message=str(exc)))
-            staging_job().stage_file(
+            job = staging_job()
+            job.stage_file(
                 record.model_copy(
                     update={
                         "has_errors": True,
@@ -586,6 +583,9 @@ class Indexer:
                     }
                 )
             )
+            previous = existing.get(record.path)
+            if previous is not None and previous.content_hash != record.content_hash:
+                job.mark_references_replaced(record.file_id)
 
         def flush_pending() -> None:
             nonlocal indexed, embedded, fallback_count, pending_chunks, pending_chars
@@ -755,9 +755,7 @@ class Indexer:
                             staging_job().stage_file(rejected_record)
                             if previous is not None:
                                 staging_job().mark_replaced(rejected_record.file_id)
-                                staging_job().mark_references_replaced(
-                                    rejected_record.file_id
-                                )
+                                staging_job().mark_references_replaced(rejected_record.file_id)
                         skipped += 1
                         continue
                     if not force and previous is not None and previous.content_hash == content_hash:

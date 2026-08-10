@@ -332,7 +332,8 @@ class DeclarationSelector(FrozenModel):
         ),
     )
     project: str | None = Field(
-        default=None, description="Project id, name, or path. Required with path and qualified_symbol."
+        default=None,
+        description="Project id, name, or path. Required with path and qualified_symbol.",
     )
     path: str | None = Field(
         default=None,

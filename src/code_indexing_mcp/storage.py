@@ -518,8 +518,7 @@ class LanceStore:
     ) -> list[ReferenceRecord]:
         self._validate_schema_version(schema_version)
         condition = (
-            "record_kind = 'declaration' "
-            f"AND source_qualified_symbol = {_quoted(qualified_symbol)}"
+            f"record_kind = 'declaration' AND source_qualified_symbol = {_quoted(qualified_symbol)}"
         )
         if schema_version is not None:
             condition = f"{condition} AND schema_version = {schema_version}"
