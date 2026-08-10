@@ -12,6 +12,15 @@ This document records what the review found and the hotfix deliberately did
 design: each item states the defect, how it fails, and where it lives. It does
 not prescribe the fix.
 
+> **Plan:** `2026-08-07-reference-index-hardening-plan.md` prescribes the fixes,
+> phasing, and acceptance gates. Every claim below was re-verified against
+> `hotfix/reference-index` HEAD on 2026-08-07 (the E-items empirically, by
+> running the extractor) and all hold; note that this file's `indexing.py`,
+> `application.py`, and `reference_service.py` line references are pre-hotfix
+> coordinates — the plan carries the corrected ones, plus refinements (E1, E5,
+> E10, S5, S6) and newly found gaps (JSX component references, cursors not
+> binding the refactor operation).
+
 Severity is about consequence to a caller acting on the output, not effort.
 A "silent miss" — a real reference the tool does not report while claiming
 completeness — is the worst class, because an agent renames and ships a broken

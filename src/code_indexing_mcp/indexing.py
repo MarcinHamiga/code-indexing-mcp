@@ -251,7 +251,27 @@ class Indexer:
     def _backfill_references_locked(
         self, project: ProjectInfo, *, progress: ProgressPublisher
     ) -> ReferenceBackfillReport:
+        # Backfill never embeds or re-parses chunks; it must not use its own
+        # (always error-free) run to promote a project past whatever state a
+        # prior full index earned it (S2 -- e.g. "partial" from a failed
+        # index must stay "partial" until a real index run heals it).
+        try:
+            prior_state = self.store.project_state(project.id)
+        except CodeIndexingError as exc:
+            if exc.code is not ErrorCode.PROJECT_NOT_FOUND:
+                raise
+            # A marker-resolved project that was never registered -- e.g. it
+            # has zero eligible source files, so `_project_is_stale` never
+            # called `index()` to register it, or the data directory was
+            # wiped while the on-disk marker survived (S11) -- has no prior
+            # run to protect. `existing` below reads the same per-project
+            # partition this lookup just proved absent, so it comes back
+            # empty and the early "nothing missing" return fires before this
+            # value would ever be read; it exists only so a future change to
+            # that invariant fails safe instead of crashing.
+            prior_state = "ready"
         existing = {record.path: record for record in self.store.list_files(project.id)}
+        coverage_rows = self.store.reference_coverage(project.id)
         coverage = {
             row["file_id"]: ReferenceCoverage(
                 file_id=row["file_id"],
@@ -259,8 +279,19 @@ class Indexer:
                 content_hash=row["content_hash"],
                 schema_version=row["schema_version"],
             )
-            for row in self.store.reference_coverage(project.id)
+            for row in coverage_rows
             if row["schema_version"] == REFERENCE_SCHEMA_VERSION
+        }
+        # Files that still carry rows from a schema version below the current
+        # one. The version 4 bump was supposed to discard every generation
+        # version 3 wrote (its colliding ids made a project unindexable), but
+        # a file routed to `incomplete_paths` -- never re-covered -- kept its
+        # old rows forever. Retire them below wherever such a file surfaces,
+        # independent of whether its current content can be parsed at all.
+        stale_schema_file_ids = {
+            row["file_id"]
+            for row in coverage_rows
+            if row["schema_version"] != REFERENCE_SCHEMA_VERSION
         }
         missing = {
             record.file_id: record
@@ -310,6 +341,33 @@ class Indexer:
                     files_seen=files_checked,
                     current_path=record.path,
                 )
+                if record.has_errors:
+                    if record.error is not None and record.error.startswith("rejected:"):
+                        # Deliberate content rejection (binary/minified) will
+                        # never parse -- it is not a parse failure, it is a
+                        # permanent, intentional exclusion. A coverage-only
+                        # row (zero references, current schema) is durable
+                        # proof of that decision, so this file stops showing
+                        # up as "missing" -- and being misreported as
+                        # `parse_error` -- on every future backfill and query
+                        # (S10).
+                        staging_job().stage_references(
+                            self._reference_rows(project.id, record, [], [])
+                        )
+                        staging_job().mark_references_replaced(record.file_id)
+                        files_backfilled += 1
+                        continue
+                    # The files row's content_hash was advanced by a failed
+                    # index run (stage_failure), but the chunk table still
+                    # holds the previous generation's content. References
+                    # cannot receive the same treatment: their byte offsets
+                    # are applied to the current source file, so any surviving
+                    # generation could target unrelated text. Retire it and
+                    # leave the file honestly uncovered until a successful
+                    # index replaces chunks and references together.
+                    staging_job().mark_references_replaced(record.file_id)
+                    incomplete_paths.append(record.path)
+                    continue
                 try:
                     source = item.absolute_path.read_bytes()
                 except OSError:
@@ -324,11 +382,25 @@ class Indexer:
                     raise
                 except Exception:
                     # A broken parser/query must not erase a prior structural
-                    # generation. Leave this file uncovered so the next
-                    # backfill retries it after the extractor is healthy.
+                    # generation -- it says nothing about whether this file's
+                    # own content is valid. Leave this file uncovered so the
+                    # next backfill retries it after the extractor is
+                    # healthy, but still retire a retired-schema generation:
+                    # that is wrong on its own terms, independent of whether
+                    # today's extractor run succeeded.
+                    if record.file_id in stale_schema_file_ids:
+                        staging_job().mark_references_replaced(record.file_id)
                     incomplete_paths.append(record.path)
                     continue
                 if extraction.has_errors:
+                    # The bytes just read are confirmed (above) to match this
+                    # file's current content_hash, so any reference rows
+                    # already on file for it -- current schema or not -- are
+                    # from a different generation than the one just proven
+                    # invalid. Retire them: serving stale byte offsets against
+                    # today's bytes is a wrong-edit hazard (S4), strictly
+                    # worse than the honest "missing" this file already is.
+                    staging_job().mark_references_replaced(record.file_id)
                     incomplete_paths.append(record.path)
                     continue
                 staging_job().stage_references(
@@ -354,23 +426,44 @@ class Indexer:
                 return ReferenceBackfillReport(
                     project_id=project.id,
                     files_checked=files_checked,
+                    files_backfilled=files_backfilled,
                     files_current=len(existing) - len(missing),
                     incomplete_paths=sorted(incomplete_paths),
                     stale_paths=sorted(set(stale_paths)),
                 )
-            if job is not None:
-                self._commit_staged(project, job, errors=[])
             progress.update(
                 phase="committing",
                 files_seen=files_checked,
                 current_path=None,
                 force=True,
             )
+            if job is None:
+                # Every file in `missing` errored or was rejected without
+                # ever staging anything (a legacy pre-feature partition whose
+                # only structural files fail to parse is exactly this case).
+                # `has_reference_table` is only ever made true by a commit,
+                # so without one it stays false forever and every future
+                # `find_references`/`analyze_refactor` call is told to run
+                # the exact backfill that just ran and cannot help (S8). An
+                # otherwise-empty commit still creates the table.
+                job = staging_job()
+            self._commit_staged(project, job, errors=[], state=prior_state)
             return ReferenceBackfillReport(
                 project_id=project.id,
                 files_checked=files_checked,
                 files_backfilled=files_backfilled,
-                files_current=len(existing) - len(missing),
+                # `files_current` describes state *after* this report, not
+                # work done *during* it, so a file this run just backfilled
+                # counts the same as one that was already covered coming in
+                # -- otherwise this call and the next idempotent one (which
+                # sees it already covered and short-circuits before ever
+                # computing `missing`) would report different totals for the
+                # same converged project. Every file in `missing` reached
+                # this point via either a successful backfill or
+                # `incomplete_paths` (the only other outcome, `stale_paths`,
+                # already returned above), so `existing` minus the latter is
+                # exactly the files with current coverage now.
+                files_current=len(existing) - len(incomplete_paths),
                 incomplete_paths=sorted(incomplete_paths),
             )
         except BaseException:
@@ -449,6 +542,11 @@ class Indexer:
         pending: list[_PendingFile] = []
         pending_chunks = 0
         pending_chars = 0
+        # T1: this run's own reference-extraction cost and staged row count,
+        # not the whole project's total (which a benchmark comparing scenarios
+        # against the same project would otherwise report unchanged run to run).
+        reference_extraction_ns = 0
+        staged_reference_rows = 0
         process = psutil.Process()
         peak_memory_bytes = 0
 
@@ -475,7 +573,8 @@ class Indexer:
 
         def stage_failure(record: StoredFile, exc: Exception) -> None:
             errors.append(IndexIssue(path=record.path, message=str(exc)))
-            staging_job().stage_file(
+            job = staging_job()
+            job.stage_file(
                 record.model_copy(
                     update={
                         "has_errors": True,
@@ -484,6 +583,9 @@ class Indexer:
                     }
                 )
             )
+            previous = existing.get(record.path)
+            if previous is not None and previous.content_hash != record.content_hash:
+                job.mark_references_replaced(record.file_id)
 
         def flush_pending() -> None:
             nonlocal indexed, embedded, fallback_count, pending_chunks, pending_chars
@@ -550,11 +652,23 @@ class Indexer:
                         continue
                     staging_job().stage_file(target.record)
                     staging_job().mark_replaced(target.record.file_id)
-                    # Structural records become visible only alongside the
-                    # fully embedded replacement. A failed embed/windowing
-                    # pass therefore leaves the prior reference generation
-                    # untouched, just like it leaves prior chunks untouched.
-                    if not target.record.has_errors:
+                    if target.record.has_errors:
+                        # Extraction ran and produced chunks (best-effort,
+                        # even with syntax errors), and those chunks --
+                        # together with the file row's content_hash -- were
+                        # just replaced above. The structural rows it would
+                        # also produce are not trustworthy enough to stage,
+                        # but leaving the *previous* generation's rows in
+                        # place is worse: they would be served against bytes
+                        # and a content_hash that no longer match what
+                        # produced them, at whatever byte offsets the file
+                        # happened to have before this edit (S4 -- a
+                        # wrong-edit hazard for a caller like
+                        # `analyze_refactor` that trusts those offsets).
+                        # Retire them; the file heals once a later parse
+                        # succeeds cleanly.
+                        staging_job().mark_references_replaced(target.record.file_id)
+                    else:
                         staging_job().stage_references(
                             self._reference_rows(
                                 project.id,
@@ -614,12 +728,34 @@ class Indexer:
                         rejection = _content_rejection(source)
                         content_hash = _digest(source)
                     if rejection is not None:
-                        # Content rejection is a skip, not a syntax/indexing error.
-                        # Stage removal so an earlier text version disappears only
-                        # when the rest of this indexing transaction commits.
-                        if previous is not None:
-                            with timer.measure("commit"):
-                                staging_job().mark_removed(previous.file_id)
+                        # Content rejection is a skip, not a syntax/indexing error,
+                        # but it must still leave a files row behind (S3): the
+                        # scanner is path-based and never decodes content, so it
+                        # keeps yielding this path on every future scan. Dropping
+                        # the row entirely (as mark_removed would) makes
+                        # current.keys() != existing.keys() true forever, which
+                        # turns every reference query into a full re-index under
+                        # the global lock. Persist a tombstone instead: a files
+                        # row flagged has_errors with no chunks/references, so
+                        # freshness checks see the path and (once size/mtime
+                        # stop changing) treat it as unchanged.
+                        rejected_record = StoredFile(
+                            file_id=_digest(f"{project.id}\0{path}"),
+                            project_id=project.id,
+                            path=path,
+                            language=item.language,
+                            size=item.size,
+                            mtime_ns=item.mtime_ns,
+                            content_hash=content_hash,
+                            has_errors=True,
+                            error=f"rejected: {rejection}",
+                            indexed_at=time.time_ns(),
+                        )
+                        with timer.measure("commit"):
+                            staging_job().stage_file(rejected_record)
+                            if previous is not None:
+                                staging_job().mark_replaced(rejected_record.file_id)
+                                staging_job().mark_references_replaced(rejected_record.file_id)
                         skipped += 1
                         continue
                     if not force and previous is not None and previous.content_hash == content_hash:
@@ -644,6 +780,8 @@ class Indexer:
                     with timer.measure("parse"):
                         extraction = self.extractor.extract(item.path, item.language, source)
                     parsed += 1
+                    reference_extraction_ns += extraction.reference_extraction_ns
+                    staged_reference_rows += len(extraction.references)
                     source_chars = sum(len(chunk.content) for chunk in extraction.chunks)
                     if pending and (
                         len(pending) >= CANDIDATE_GROUP_COUNT
@@ -749,10 +887,17 @@ class Indexer:
             commit_ms=timer.milliseconds("commit"),
             fallback_count=fallback_count,
             peak_memory_bytes=peak_memory_bytes,
+            reference_extraction_duration_ms=reference_extraction_ns // 1_000_000,
+            staged_reference_rows=staged_reference_rows,
         )
 
     def _commit_staged(
-        self, project: ProjectInfo, job: StagingJob, *, errors: list[IndexIssue]
+        self,
+        project: ProjectInfo,
+        job: StagingJob,
+        *,
+        errors: list[IndexIssue],
+        state: str | None = None,
     ) -> None:
         """Apply a fully staged run, rolling the live tables back on any failure.
 
@@ -760,6 +905,12 @@ class Indexer:
         -- before the first live write, so a crash anywhere in this method is
         recoverable: the rollback here handles the live failure, and startup
         recovery handles a process death.
+
+        ``state`` overrides the default ``"partial" if errors else "ready"``
+        computation. A full index run always derives state from its own
+        errors, but a reference backfill commits no chunks or embeddings of
+        its own and must not overwrite a project state (e.g. ``partial`` from
+        a prior failed index) that it did not itself earn (S2).
         """
         versions = self.store.table_versions(project.id)
         job.begin_commit(versions)
@@ -777,7 +928,7 @@ class Indexer:
             self.store.upsert_project(
                 project,
                 model_id=self.embedder.model_id,
-                state="partial" if errors else "ready",
+                state=state if state is not None else ("partial" if errors else "ready"),
             )
         except BaseException:
             try:

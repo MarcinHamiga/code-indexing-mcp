@@ -233,6 +233,38 @@ def test_deleted_source_marks_an_index_stale(tmp_path: Path) -> None:
     assert app.project_is_stale(project.id) is True
 
 
+def test_a_rejected_file_does_not_make_the_project_permanently_stale(tmp_path: Path) -> None:
+    """A NUL-byte file used to vanish from storage while the scanner kept
+
+    yielding it, so `current.keys() != existing.keys()` was true forever and
+    every reference query triggered a full re-index under the global lock
+    (S3). The file must instead persist as a tombstone row, so freshness
+    settles once its size/mtime stop changing.
+    """
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    (root / "garbage.py").write_bytes(b"def broken(\x00):\n    pass\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    assert app.project_is_stale(project.id) is False
+    assert app.project_status(project.id).state in {"ready", "partial"}
+
+    with patch.object(app.indexer, "index", wraps=app.indexer.index) as index_spy:
+        first = app.ensure_reference_index(project.id)
+        second = app.ensure_reference_index(project.id)
+
+    assert index_spy.call_count == 0
+    assert first.files_current == second.files_current
+
+
 def test_init_project_defaults_to_the_single_client_root(tmp_path: Path) -> None:
     root = tmp_path / "client-root"
     root.mkdir()

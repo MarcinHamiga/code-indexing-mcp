@@ -235,10 +235,27 @@ class CallShape(FrozenModel):
 
 
 class ParameterShape(FrozenModel):
-    name: str
-    kind: ParameterKind
-    required: bool
-    position: int
+    name: str = Field(description="Parameter name.")
+    kind: ParameterKind = Field(
+        description=(
+            "One of positional_only, positional, keyword_only, variadic (*args-style), "
+            "or keyword_variadic (**kwargs-style)."
+        )
+    )
+    required: bool = Field(description="Whether this parameter has no default value.")
+    position: int = Field(description="Zero-based position among this signature's parameters.")
+    # True when this slot is a destructured pattern (`{ a, b }` / `[a, b]`)
+    # collapsed to one positional parameter (E7). `name` is a synthesized,
+    # non-authoritative label in that case -- signature comparisons that
+    # depend on matching it by name must route to `review` instead of
+    # trusting it as a real keyword/identifier.
+    destructured: bool = Field(
+        default=False,
+        description=(
+            "Whether this slot is a destructured pattern (e.g. `{ a, b }`) collapsed to one "
+            "positional parameter; if true, `name` is a synthesized label, not authoritative."
+        ),
+    )
 
 
 class ExtractedReference(FrozenModel):
@@ -273,6 +290,11 @@ class ExtractionResult(FrozenModel):
     references: list[ExtractedReference] = Field(default_factory=list)
     declarations: list[ExtractedDeclarationShape] = Field(default_factory=list)
     has_errors: bool = False
+    # Wall time spent specifically on structural reference extraction (the
+    # `_structural_records` pass), separate from parsing and chunking, so a
+    # caller can report reference-extraction cost without mislabeling the
+    # whole parse phase as it (T1).
+    reference_extraction_ns: int = 0
 
 
 class ReferenceCoverage(FrozenModel):
@@ -302,10 +324,31 @@ class ReferenceBackfillReport(FrozenModel):
 class DeclarationSelector(FrozenModel):
     """One declaration identity, by chunk id or its stable source location."""
 
-    chunk_id: str | None = None
-    project: str | None = None
-    path: str | None = None
-    qualified_symbol: str | None = None
+    chunk_id: str | None = Field(
+        default=None,
+        description=(
+            "Chunk id from a search_code or find_symbol hit. Cannot be combined with "
+            "project, path, or qualified_symbol -- provide this alone, or all three of them."
+        ),
+    )
+    project: str | None = Field(
+        default=None,
+        description="Project id, name, or path. Required with path and qualified_symbol.",
+    )
+    path: str | None = Field(
+        default=None,
+        description=(
+            "Repo-relative POSIX path to the file holding the declaration "
+            "(forward slashes, relative to the project root). Required with project and "
+            "qualified_symbol."
+        ),
+    )
+    qualified_symbol: str | None = Field(
+        default=None,
+        description=(
+            "Dotted qualified symbol name, e.g. 'Outer.method'. Required with project and path."
+        ),
+    )
 
     @model_validator(mode="after")
     def _one_selector_mode(self) -> "DeclarationSelector":
@@ -372,13 +415,17 @@ class ReferenceResponse(FrozenModel):
 
 
 class RenameOperation(FrozenModel):
-    kind: Literal["rename"] = "rename"
-    new_name: str
+    kind: Literal["rename"] = Field(default="rename", description="Discriminator; always 'rename'.")
+    new_name: str = Field(description="The declaration's new name.")
 
 
 class SignatureChangeOperation(FrozenModel):
-    kind: Literal["signature_change"] = "signature_change"
-    parameters: list[ParameterShape]
+    kind: Literal["signature_change"] = Field(
+        default="signature_change", description="Discriminator; always 'signature_change'."
+    )
+    parameters: list[ParameterShape] = Field(
+        description="The declaration's proposed new full parameter list, in order."
+    )
 
 
 RefactorOperation = Annotated[
@@ -543,6 +590,11 @@ class IndexReport(FrozenModel):
     embedded_characters: int | None = None
     embedding_crossover_characters: int | None = None
     embedding_selection_reason: str | None = None
+    # T1: reference extraction's own timing and this run's own staged row
+    # count, distinct from `parse_duration_ms` (parsing + chunking +
+    # reference extraction together) and from a whole-project table read.
+    reference_extraction_duration_ms: int | None = None
+    staged_reference_rows: int = 0
 
 
 class ModelStatus(FrozenModel):

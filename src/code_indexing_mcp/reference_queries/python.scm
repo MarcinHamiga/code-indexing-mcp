@@ -41,13 +41,35 @@
 (class_definition
   superclasses: (argument_list (_) @name)) @reference.inheritance
 
-(call function: (_) @name arguments: (argument_list) @arguments) @reference.call
+(assignment
+  left: (identifier) @name
+  right: (list) @value
+  (#eq? @name "__all__")) @reference.export
+
+(assignment
+  left: (identifier) @name
+  right: (tuple) @value
+  (#eq? @name "__all__")) @reference.export
+
+(augmented_assignment
+  left: (identifier) @name
+  right: (list) @value
+  (#eq? @name "__all__")) @reference.export
+
+(augmented_assignment
+  left: (identifier) @name
+  right: (tuple) @value
+  (#eq? @name "__all__")) @reference.export
+
+(call function: (_) @name arguments: (_) @arguments) @reference.call
 
 (call
   function: (attribute object: (_) @receiver attribute: (_) @name)
-  arguments: (argument_list) @arguments) @reference.call
+  arguments: (_) @arguments) @reference.call
 
 (type (_) @name) @reference.type_use
+
+(attribute) @reference.member_access
 
 (function_definition
   name: (identifier) @name

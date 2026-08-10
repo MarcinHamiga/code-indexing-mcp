@@ -93,10 +93,11 @@ def test_reads_never_materialize_a_partition(tmp_path: Path) -> None:
     assert store.outline_chunks("module.py", project.id) == []
     assert store.find_symbol_chunks("answer", project.id, match="exact", kinds=None, limit=5) == []
     assert store.list_reference_records(project.id) == []
+    assert store.list_reference_records(project.id, record_kinds=("reference",)) == []
     assert store.reference_coverage(project.id) == []
     assert store.declaration_shapes(project.id, "answer") == []
-    assert store.imports_for(project.id, "module") == []
     assert store.target_name_candidates(project.id, "answer") == []
+    assert store.declarations_for_files(project.id, ["file-1"]) == []
 
     assert not (store.directory / "projects").exists()
 
@@ -219,8 +220,94 @@ def test_reference_read_methods_apply_exact_structural_filters(tmp_path: Path) -
 
     assert store.coverage_for_file(project.id, "file-1", 1) == [coverage]
     assert store.declaration_shapes(project.id, "package.answer") == [declaration]
-    assert store.imports_for(project.id, "package") == [imported]
     assert store.target_name_candidates(project.id, "answer") == [declaration, imported]
+    # record_kind narrows target_name_candidates to one shape (S4).
+    assert store.target_name_candidates(project.id, "answer", record_kind="declaration") == [
+        declaration
+    ]
+    assert store.target_name_candidates(project.id, "answer", record_kind="reference") == [imported]
+    # declarations restricted to a candidate file set (S4).
+    assert store.declarations_for_files(project.id, ["file-1"]) == [declaration]
+    assert store.declarations_for_files(project.id, ["no-such-file"]) == []
+    assert store.declarations_for_files(project.id, []) == []
+    # list_reference_records' record_kinds narrows the same way (S4/E3): a
+    # query-time caller can drop declaration rows from the fetch entirely.
+    assert store.list_reference_records(project.id, record_kinds=("declaration",)) == [declaration]
+    assert store.list_reference_records(project.id, record_kinds=("reference", "coverage")) == [
+        coverage,
+        imported,
+    ]
+    assert store.list_reference_records(project.id, record_kinds=()) == []
+    # version kwarg is honored on the same pinned snapshot as list_reference_records.
+    version = store.reference_version(project.id)
+    assert store.declaration_shapes(project.id, "package.answer", version=version) == [declaration]
+    assert store.target_name_candidates(project.id, "answer", version=version) == [
+        declaration,
+        imported,
+    ]
+    assert store.declarations_for_files(project.id, ["file-1"], version=version) == [declaration]
+    assert store.reference_coverage(project.id, version=version) == [coverage]
+    # schema_version pushes the same filter as list_reference_records' (S4/E3):
+    # a stale-schema row must not survive any of these three narrower reads
+    # either, or the regression `list_reference_records`' own schema_version
+    # test guards against would resurface through these instead.
+    assert store.declaration_shapes(
+        project.id, "package.answer", schema_version=declaration["schema_version"]
+    ) == [declaration]
+    assert store.declaration_shapes(project.id, "package.answer", schema_version=999) == []
+    assert store.target_name_candidates(
+        project.id, "answer", schema_version=imported["schema_version"]
+    ) == [declaration, imported]
+    assert store.target_name_candidates(project.id, "answer", schema_version=999) == []
+    assert store.declarations_for_files(
+        project.id, ["file-1"], schema_version=declaration["schema_version"]
+    ) == [declaration]
+    assert store.declarations_for_files(project.id, ["file-1"], schema_version=999) == []
+
+
+def test_list_reference_records_schema_version_pushes_the_filter_into_sql(
+    tmp_path: Path,
+) -> None:
+    """`schema_version` narrows via the storage-layer `WHERE` clause (E3/S4).
+
+    Omitting it must still return every row unfiltered -- `find_references`'s
+    stale-schema-version regression test (finding 9) and several other
+    callers pin their assertions to `list_reference_records(project_id)`
+    returning the *whole* table regardless of schema generation.
+    """
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    record = stored_file(project.id)
+    current = reference_record(project.id, record.file_id, reference_id="current", schema_version=4)
+    stale = reference_record(project.id, record.file_id, reference_id="stale", schema_version=3)
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_groups=(),
+        reference_groups=[("file-1", reference_table(current, stale))],
+        replace_reference_file_ids=["file-1"],
+    )
+
+    assert {row["reference_id"] for row in store.list_reference_records(project.id)} == {
+        "current",
+        "stale",
+    }
+    assert store.list_reference_records(project.id, schema_version=4) == [current]
+    assert store.list_reference_records(project.id, schema_version=3) == [stale]
+    assert store.list_reference_records(project.id, schema_version=5) == []
+
+
+@pytest.mark.parametrize("schema_version", [True, "1"])
+def test_list_reference_records_rejects_non_integer_schema_versions(
+    tmp_path: Path, schema_version: object
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+
+    with pytest.raises(ValueError, match="schema_version"):
+        store.list_reference_records("project-1", schema_version=schema_version)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("schema_version", [True, "1"])
@@ -231,6 +318,22 @@ def test_coverage_for_file_rejects_non_integer_schema_versions(
 
     with pytest.raises(ValueError, match="schema_version"):
         store.coverage_for_file("project-1", "file-1", schema_version)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("schema_version", [True, "1"])
+def test_declaration_side_pushdowns_reject_non_integer_schema_versions(
+    tmp_path: Path, schema_version: object
+) -> None:
+    """`declaration_shapes`/`target_name_candidates`/`declarations_for_files` share
+    `list_reference_records`'s schema_version validation (S4/E3)."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+
+    with pytest.raises(ValueError, match="schema_version"):
+        store.declaration_shapes("project-1", "answer", schema_version=schema_version)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="schema_version"):
+        store.target_name_candidates("project-1", "answer", schema_version=schema_version)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="schema_version"):
+        store.declarations_for_files("project-1", ["file-1"], schema_version=schema_version)  # type: ignore[arg-type]
 
 
 def test_reference_indexes_cover_every_exact_filter(tmp_path: Path) -> None:
@@ -467,3 +570,108 @@ def test_stored_chunk_still_carries_its_vector(tmp_path: Path) -> None:
     # Field order matters to nothing in LanceDB, but the schema lists vector last
     # and keeping it there makes the inheritance a pure refactor.
     assert list(StoredChunk.model_fields)[-1] == "vector"
+
+
+def _break_references_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every future `_tables()` call build a partition with no references table.
+
+    `_tables()` normally creates the references table on demand
+    (`exist_ok=True`), so the only way to observe a `None` reference table
+    downstream -- the interrupted-transaction/legacy-partition state the
+    bare asserts guarded against -- is to make table creation itself fail
+    to produce one, the same way an older on-disk partition would.
+    """
+    real_table = LanceStore._table
+
+    def fake_table(database: object, name: str, schema: object) -> object:
+        if name == "references":
+            return None
+        return real_table(database, name, schema)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(LanceStore, "_table", staticmethod(fake_table))
+
+
+def test_remove_file_raises_instead_of_asserting_on_a_missing_reference_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    _break_references_table(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="Reference table is missing"):
+        store.remove_file(project.id, "file-1")
+
+
+def test_table_versions_raises_instead_of_asserting_on_a_missing_reference_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    _break_references_table(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="Reference table is missing"):
+        store.table_versions(project.id)
+
+
+def test_restore_versions_checkout_raises_instead_of_asserting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    versions = store.table_versions(project.id)
+    store._partitions.pop(project.id, None)
+    (store.directory / "projects" / project.id / "references.lance").rename(
+        tmp_path / "references.lance.bak"
+    )
+
+    with pytest.raises(RuntimeError, match="Reference table is missing"):
+        store.restore_versions(project.id, versions)
+
+
+def test_replace_files_from_arrow_raises_instead_of_asserting_on_a_missing_reference_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    _break_references_table(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="Reference table is missing"):
+        store.replace_files_from_arrow(
+            project.id,
+            files=pa.Table.from_pylist([], schema=LanceStore.file_arrow_schema()),
+            chunk_groups=(),
+        )
+
+
+def test_has_reference_table_distinguishes_missing_from_empty(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+
+    # Never indexed: no partition at all, but not what this guard is for --
+    # find_symbol/get_chunk already report "not found" long before a
+    # reference query is reached.
+    assert store.has_reference_table(project.id) is False
+
+    store.upsert_file(stored_file(project.id))
+    assert store.has_reference_table(project.id) is True
+
+    store._partitions.pop(project.id, None)
+    (store.directory / "projects" / project.id / "references.lance").rename(
+        tmp_path / "references.lance.bak"
+    )
+    assert store.has_reference_table(project.id) is False

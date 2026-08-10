@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import stat
@@ -42,6 +43,20 @@ class TinyEmbedder:
 
     def embed_query(self, text: str) -> list[float]:
         return [1.0, 0.0, 0.0, float(len(text))]
+
+
+def test_jsonable_encodes_sets_as_sorted_lists() -> None:
+    """`kinds` on `find_references` is a `set[str]`; the wire only carries JSON.
+
+    `_jsonable` used to have no branch for `set`/`frozenset`, so `json.dumps`
+    raised `TypeError: Object of type set is not JSON serializable` for any
+    kinds-filtered call. Sorting also keeps identical filter sets encoding
+    identically regardless of the set's internal iteration order, which
+    matters because the cursor embeds this same value.
+    """
+    encoded = daemon._jsonable({"kinds": {"call", "import"}, "limit": 100})
+    assert encoded == {"kinds": ["call", "import"], "limit": 100}
+    assert json.dumps(encoded)  # does not raise
 
 
 def test_length_prefixed_json_frame_round_trip() -> None:
@@ -107,8 +122,52 @@ def test_broker_forwards_refactor_pagination_parameters(tmp_path: Path) -> None:
         broker.stop()
         thread.join(timeout=2)
 
+    # `cursor` alone carries the pagination signal; `completeness.state` is
+    # computed from the full, unsliced result set and stays "complete" here
+    # since nothing in it is a coverage gap or an unproven candidate (R4).
     assert analysis.cursor is not None
-    assert analysis.completeness.state == "incomplete"
+    assert analysis.completeness.state == "complete"
+
+
+@requires_local_sockets
+def test_broker_forwards_kinds_filter_for_find_references(tmp_path: Path) -> None:
+    """Regression test: a kinds-filtered `find_references` used to crash the
+    default daemon/broker mode with `TypeError: Object of type set is not
+    JSON serializable`, because `Application.find_references` takes `kinds`
+    as a `set[str]` but `_jsonable` had no branch for `set` before it reached
+    `json.dumps` in `send_frame`. Only `--direct` mode, which never crosses
+    the socket, was unaffected.
+    """
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text(
+        "def answer():\n    return 42\n\ncallback = answer\n\ndef caller():\n    return answer()\n"
+    )
+    application = Application(paths, embedder=TinyEmbedder(), cwd=root)
+    project = application.init_project(root)
+    application.index_project(project.id)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=root)
+
+    try:
+        response = broker.find_references(
+            DeclarationSelector(
+                project=project.id,
+                path="main.py",
+                qualified_symbol="answer",
+            ),
+            kinds={"call"},
+        )
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+    assert response.hits
+    assert all(hit.kind == "call" for hit in response.hits)
 
 
 def test_broker_freshness_uses_the_existing_status_rpc(
