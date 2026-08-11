@@ -777,14 +777,17 @@ async def test_server_shutdown_waits_for_active_startup_index(tmp_path: Path) ->
             await leave.wait()
 
     session = asyncio.create_task(open_session())
-    await asyncio.wait_for(entered.wait(), timeout=2)
+    # Generous bounds: the startup index must reach the embedding phase and
+    # then complete after release, and a cold CI runner (Windows especially)
+    # can take far longer than a locally-observed 2s to get there.
+    await asyncio.wait_for(entered.wait(), timeout=30)
     try:
         leave.set()
         await asyncio.sleep(0.05)
         assert not session.done()
     finally:
         embedder.release.set()
-        await asyncio.wait_for(session, timeout=2)
+        await asyncio.wait_for(session, timeout=30)
 
     assert app.project_status(roots=[root]).state == "ready"
 
@@ -820,8 +823,10 @@ async def test_server_shutdown_cancels_startup_job_waiting_for_index_lock(
             assert await asyncio.to_thread(attempted.wait, 5)
 
     lock = FileLock(paths.data / "locks" / f"{project.id}.lock")
+    # Generous bound: a cold CI runner can take far longer to reach the
+    # attempted-index signal than the locally-observed 2s.
     with lock:
-        await asyncio.wait_for(open_session(), timeout=2)
+        await asyncio.wait_for(open_session(), timeout=30)
 
     for _ in range(50):
         if app.project_status(project.id).state == "ready":
