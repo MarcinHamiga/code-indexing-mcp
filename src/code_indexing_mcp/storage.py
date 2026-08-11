@@ -1244,9 +1244,7 @@ class LanceStore:
         except (ValueError, RuntimeError):
             versions = []
         timestamps = [
-            str(version.get("timestamp", ""))
-            for version in versions
-            if version.get("timestamp")
+            str(version.get("timestamp", "")) for version in versions if version.get("timestamp")
         ]
         indexes: list[IndexStorageStats] = []
         try:
