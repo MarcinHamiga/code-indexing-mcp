@@ -236,6 +236,21 @@ class LanceStore:
             return []
         return [StoredFile.model_validate(row) for row in self._rows(tables.files)]
 
+    def has_file_errors(self, project_id: str) -> bool:
+        """Whether any stored file row records a genuine indexing error.
+
+        Rejection tombstones ("rejected: ...") are deliberate, permanent skips,
+        not errors, so they do not count. Reads only the error rows instead of
+        materializing every file in the project.
+        """
+        tables = self._existing_tables(project_id)
+        if tables is None:
+            return False
+        return any(
+            not str(row["error"] or "").startswith("rejected:")
+            for row in self._rows(tables.files, "has_errors = true")
+        )
+
     def upsert_file(self, record: StoredFile) -> None:
         self._merge(
             self._tables(record.project_id).files,
@@ -750,7 +765,8 @@ class LanceStore:
         # zero age: searches run concurrently from the daemon and from direct
         # CLI processes, so versions in active use must not be reaped.
         chunks.optimize(cleanup_older_than=timedelta(days=1) if compact else None)
-        assert tables.references is not None
+        if tables.references is None:
+            raise RuntimeError("Reference table is missing from an interrupted transaction")
         reference_indices = list(tables.references.list_indices())
         indexed_reference_columns = {
             column for index in reference_indices for column in index.columns

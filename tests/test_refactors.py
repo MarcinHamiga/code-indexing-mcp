@@ -1005,3 +1005,33 @@ def test_analyze_refactor_signature_change_fetches_the_old_shape_once(
     # below, so a per-hit rescan would show up as more than one call here.
     assert calls == ["authorize"]
     assert len(analysis.must_change) == 2
+
+
+def test_analyze_refactor_suppresses_edit_spans_from_a_stale_file(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "consumer.py": (
+                "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+            ),
+        },
+    )
+    # consumer.py changed on disk without a reindex: its stored offsets
+    # describe bytes that no longer exist, so no edit may be derived from
+    # them -- the wrong-edit hazard the serve-time hash gate exists for.
+    (tmp_path / "repo" / "consumer.py").write_text(
+        "from auth import authorize\n\n\ndef run(user):\n    return authorize(user)\n"
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize"),
+        RenameOperation(new_name="validate"),
+    )
+
+    assert all(item.path != "consumer.py" for item in analysis.must_change)
+    assert any(
+        item.code == "stale_file" and "consumer.py" in item.explanation
+        for item in analysis.limitations
+    )
+    assert analysis.completeness.state == "incomplete"

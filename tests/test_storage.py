@@ -637,6 +637,20 @@ def test_restore_versions_checkout_raises_instead_of_asserting(
         store.restore_versions(project.id, versions)
 
 
+def test_ensure_indexes_raises_instead_of_asserting_on_a_missing_reference_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    _break_references_table(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="Reference table is missing"):
+        store.ensure_indexes(project.id)
+
+
 def test_replace_files_from_arrow_raises_instead_of_asserting_on_a_missing_reference_table(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -675,3 +689,28 @@ def test_has_reference_table_distinguishes_missing_from_empty(tmp_path: Path) ->
         tmp_path / "references.lance.bak"
     )
     assert store.has_reference_table(project.id) is False
+
+
+def test_has_file_errors(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+
+    # Never indexed: no partition at all.
+    assert store.has_file_errors(project.id) is False
+
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_file(stored_file(project.id))
+    assert store.has_file_errors(project.id) is False
+
+    # A rejection tombstone is a deliberate skip, not an error.
+    store.upsert_file(
+        stored_file(project.id).model_copy(update={"has_errors": True, "error": "rejected: binary"})
+    )
+    assert store.has_file_errors(project.id) is False
+
+    store.upsert_file(
+        stored_file(project.id).model_copy(update={"has_errors": True, "error": "embedding failed"})
+    )
+    assert store.has_file_errors(project.id) is True

@@ -727,3 +727,59 @@ def test_known_paths_completeness_lets_absolute_imports_skip_a_sibling_decoy(
     )
     decoy_hit = next(hit for hit in decoy_response.hits if hit.path == "mypkg/other.py")
     assert decoy_hit.resolution != "exact"
+
+
+def test_references_from_a_file_changed_since_extraction_are_suppressed_as_stale(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "main.py": "from lib import answer\n\ndef caller():\n    return answer()\n",
+        },
+    )
+    # The file changes on disk without a reindex: its stored rows now describe
+    # bytes that no longer exist, so their offsets must not be served against
+    # the new content.
+    (tmp_path / "repo" / "main.py").write_text(
+        "from lib import answer\n\n\ndef caller():\n    return answer()\n"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    )
+
+    assert response.hits == []
+    limitation = next(item for item in response.limitations if item.code == "stale_file")
+    assert "main.py" in limitation.explanation
+
+
+def test_references_return_once_a_stale_file_is_reindexed(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "lib.py").write_text("def answer():\n    return 42\n")
+    (root / "main.py").write_text("from lib import answer\n\ndef caller():\n    return answer()\n")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    indexer = Indexer(
+        store=store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=TinyEmbedder(),
+        lock_directory=tmp_path / "locks",
+    )
+    indexer.index(project)
+    # Same divergence as above, then a real index run heals it.
+    (root / "main.py").write_text(
+        "from lib import answer\n\n\ndef caller():\n    return answer()\n"
+    )
+    service = ReferenceService(store)
+    selector = DeclarationSelector(project=project.id, path="lib.py", qualified_symbol="answer")
+    assert service.find_references(selector).hits == []
+
+    indexer.index(project)
+
+    healed = service.find_references(selector)
+    assert any(hit.path == "main.py" and hit.kind == "call" for hit in healed.hits)
+    assert all(item.code != "stale_file" for item in healed.limitations)
