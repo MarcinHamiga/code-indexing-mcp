@@ -723,3 +723,77 @@ class ProjectStatus(FrozenModel):
 class RemovalReport(FrozenModel):
     project_id: str
     removed: bool
+
+
+class FragmentLengthStats(FrozenModel):
+    """Fragment-size distribution as reported by Lance's table statistics."""
+
+    min: int | None = None
+    max: int | None = None
+    mean: float | None = None
+    p25: int | None = None
+    p50: int | None = None
+    p75: int | None = None
+    p99: int | None = None
+
+
+class FragmentStats(FrozenModel):
+    num_fragments: int = 0
+    num_small_fragments: int = 0
+    lengths: FragmentLengthStats | None = None
+
+
+class IndexStorageStats(FrozenModel):
+    name: str
+    index_type: str
+    columns: list[str]
+    indexed_rows: int = 0
+    unindexed_rows: int = 0
+    size_bytes: int = 0
+
+
+class TableStorageStats(FrozenModel):
+    """One Lance table's storage snapshot, collected read-only."""
+
+    name: str
+    current_version: int = 0
+    row_count: int = 0
+    # Lance-reported logical bytes for the table's live data.
+    logical_bytes: int = 0
+    # Filesystem-reported physical bytes, measured without following symlinks.
+    physical_bytes: int = 0
+    fragment_stats: FragmentStats = Field(default_factory=FragmentStats)
+    retained_version_count: int = 0
+    # ISO-8601 timestamps of the oldest and newest retained versions.
+    oldest_version_at: str | None = None
+    newest_version_at: str | None = None
+    indexes: list[IndexStorageStats] = Field(default_factory=list)
+
+
+class ProjectStorageStats(FrozenModel):
+    """One project partition's storage snapshot."""
+
+    project: ProjectInfo
+    snapshot_at: str
+    tables: list[TableStorageStats] = Field(default_factory=list)
+    # Sum of the partition's table directories on disk.
+    partition_physical_bytes: int = 0
+    # False when a table version changed while the snapshot was collected, or
+    # when the partition exists but its tables could not be opened.
+    consistent: bool = True
+    # True when the partition directory exists but its tables could not be
+    # opened (a damaged or mid-mutation store), so no table statistics exist.
+    partition_open_failed: bool = False
+
+
+class StorageStatus(FrozenModel):
+    """Installation-wide read-only storage statistics."""
+
+    schema_version: int = 1
+    snapshot_at: str
+    registry: TableStorageStats
+    projects: list[ProjectStorageStats] = Field(default_factory=list)
+    physical_bytes_total: int = 0
+    consistent: bool = True
+    overlap_warnings: list[str] = Field(default_factory=list)
+    worktree_warnings: list[str] = Field(default_factory=list)

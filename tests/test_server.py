@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import subprocess
 import threading
@@ -126,6 +127,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "init_project",
         "index_project",
         "project_status",
+        "index_storage_status",
         "list_projects",
         "remove_project",
         "search_code",
@@ -136,7 +138,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 12
+    assert len(tools) == 13
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -776,14 +778,17 @@ async def test_server_shutdown_waits_for_active_startup_index(tmp_path: Path) ->
             await leave.wait()
 
     session = asyncio.create_task(open_session())
-    await asyncio.wait_for(entered.wait(), timeout=2)
+    # Generous bounds: the startup index must reach the embedding phase and
+    # then complete after release, and a cold CI runner (Windows especially)
+    # can take far longer than a locally-observed 2s to get there.
+    await asyncio.wait_for(entered.wait(), timeout=30)
     try:
         leave.set()
         await asyncio.sleep(0.05)
         assert not session.done()
     finally:
         embedder.release.set()
-        await asyncio.wait_for(session, timeout=2)
+        await asyncio.wait_for(session, timeout=30)
 
     assert app.project_status(roots=[root]).state == "ready"
 
@@ -819,8 +824,10 @@ async def test_server_shutdown_cancels_startup_job_waiting_for_index_lock(
             assert await asyncio.to_thread(attempted.wait, 5)
 
     lock = FileLock(paths.data / "locks" / f"{project.id}.lock")
+    # Generous bound: a cold CI runner can take far longer to reach the
+    # attempted-index signal than the locally-observed 2s.
     with lock:
-        await asyncio.wait_for(open_session(), timeout=2)
+        await asyncio.wait_for(open_session(), timeout=30)
 
     for _ in range(50):
         if app.project_status(project.id).state == "ready":
@@ -1378,6 +1385,7 @@ READ_ONLY_TOOLS = frozenset({"list_projects", "get_chunk"})
 AUTO_REGISTERING_TOOLS = frozenset(
     {
         "project_status",
+        "index_storage_status",
         "search_code",
         "search_across_projects",
         "find_symbol",
@@ -1636,3 +1644,47 @@ async def test_index_project_reports_file_counts_while_it_runs(
     assert any("files" in (message or "") for _, _, message in reports[1:-1]), reports
     assert [value for value, _, _ in reports] == sorted(value for value, _, _ in reports)
     assert "chunks embedded" in (reports[-1][2] or "")
+
+
+@pytest.mark.asyncio
+async def test_index_storage_status_tool_reports_installation_statistics(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    # Indexed before the tool runs: the tool auto-registers a root but does not
+    # index it, and a registered-but-unindexed project correctly reports no
+    # partition at all -- which would make every statistic below trivially zero.
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        scoped = await client.call_tool("index_storage_status", {"project": str(root)})
+        installation = await client.call_tool("index_storage_status", {})
+
+    assert not scoped.isError
+    assert not installation.isError
+
+    # Assert against what the tool actually returned. Re-deriving the numbers
+    # from a fresh app.storage_status() call would re-test the application
+    # layer and leave the tool free to serialize an empty or malformed body.
+    for result in (scoped, installation):
+        payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
+        assert payload["schema_version"] == 1
+        assert payload["registry"]["name"] == "projects"
+        assert payload["registry"]["row_count"] == 1
+        assert payload["registry"]["logical_bytes"] > 0
+        assert payload["physical_bytes_total"] > 0
+        assert [entry["project"]["id"] for entry in payload["projects"]] == [project.id]
+        entry = payload["projects"][0]
+        assert entry["consistent"] is True
+        assert entry["partition_open_failed"] is False
+        assert entry["partition_physical_bytes"] > 0
+        assert {table["name"] for table in entry["tables"]} == {"files", "chunks", "references"}

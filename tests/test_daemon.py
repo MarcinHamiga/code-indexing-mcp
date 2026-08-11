@@ -503,3 +503,31 @@ def test_the_broker_reads_the_progress_the_indexing_process_publishes(tmp_path: 
 
     assert "scanning" in seen
     assert broker.index_progress(project.id) is None
+
+
+@requires_local_sockets
+def test_broker_application_dispatches_storage_status(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    daemon = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=daemon.serve, daemon=True)
+    thread.start()
+    assert daemon.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    project = broker.init_project(root)
+
+    status = broker.storage_status(project.id)
+
+    assert status.schema_version == 1
+    assert status.registry.row_count == 1
+    assert [entry.project.id for entry in status.projects] == [project.id]
+    assert status.projects[0].consistent is True
+
+    installation = broker.storage_status()
+    assert [entry.project.id for entry in installation.projects] == [project.id]
+    broker.stop()
+    thread.join(timeout=2)
+    assert not thread.is_alive()

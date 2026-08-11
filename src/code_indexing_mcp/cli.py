@@ -29,7 +29,7 @@ from .server import create_server
 from .settings import IndexSettings
 
 # Commands a human runs and reads: the only place an update notice belongs.
-_NOTIFY_COMMANDS = frozenset({"init", "index", "status", "projects", "model"})
+_NOTIFY_COMMANDS = frozenset({"init", "index", "status", "projects", "model", "storage"})
 
 
 class _VersionAction(argparse.Action):
@@ -71,6 +71,12 @@ def _parser() -> argparse.ArgumentParser:
     index.add_argument("--force", action="store_true")
     status = commands.add_parser("status", help="Show project index status")
     status.add_argument("project", nargs="?")
+    storage = commands.add_parser("storage", help="Inspect index storage statistics")
+    storage_commands = storage.add_subparsers(dest="storage_command", required=True)
+    storage_status = storage_commands.add_parser("status", help="Show storage statistics")
+    storage_status.add_argument(
+        "project", nargs="?", help="Project id, name, or path; omit for the whole installation"
+    )
     projects = commands.add_parser("projects", help="Manage registered projects")
     project_commands = projects.add_subparsers(dest="projects_command", required=True)
     project_commands.add_parser("list")
@@ -376,6 +382,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 printer.clear()
         elif args.command == "status":
             result = app.project_status(args.project)
+        elif args.command == "storage" and args.storage_command == "status":
+            result = app.storage_status(args.project)
         elif args.command == "projects" and args.projects_command == "list":
             result = app.list_projects()
         elif args.command == "projects" and args.projects_command == "remove":

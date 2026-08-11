@@ -2,23 +2,32 @@
 
 from __future__ import annotations
 
+import statistics
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol
 
+from . import update_check
 from .application import Application, RuntimePaths
 from .errors import CodeIndexingError, ErrorCode
-from .models import IndexReport, ProjectInfo
+from .models import IndexReport, ProjectInfo, StorageStatus
 from .settings import IndexSettings
+
+# The repeated_edits scenario applies this many consecutive edits to one file,
+# indexing after each one, so per-edit write amplification shows up as version
+# growth over a meaningful sample.
+REPEATED_EDITS = 100
 
 
 class IndexBenchmarkApplication(Protocol):
     def init_project(self, path: Path) -> ProjectInfo: ...
 
     def index_project(self, project: str, *, force: bool = False) -> IndexReport: ...
+
+    def storage_status(self, project: str | None = None) -> StorageStatus: ...
 
 
 def write_benchmark_corpus(root: Path, *, files: int = 128, functions_per_file: int = 2) -> int:
@@ -41,15 +50,36 @@ def write_benchmark_corpus(root: Path, *, files: int = 128, functions_per_file: 
     return total
 
 
-def _measure(action: Callable[[], IndexReport]) -> dict[str, Any]:
+def _storage_snapshot(app: IndexBenchmarkApplication, project_id: str) -> dict[str, Any]:
+    """Return *project_id*'s storage statistics as a JSON-ready dict."""
+    status = app.storage_status(project_id)
+    entry = next((stats for stats in status.projects if stats.project.id == project_id), None)
+    return entry.model_dump(mode="json") if entry is not None else {}
+
+
+def _measure(
+    action: Callable[[], IndexReport],
+    *,
+    snapshot_after: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     started = time.monotonic_ns()
     report = action()
     wall_ms = (time.monotonic_ns() - started) / 1_000_000
-    measured_ms = float(report.duration_ms) if report.duration_ms > 0 else max(wall_ms, 0.001)
-    throughput = report.embedded_chunks * 1_000 / measured_ms
-    return {
+    # Throughput is computed from the indexer's own duration and nothing else.
+    # Falling back to wall time would publish one field name against two
+    # different clocks, so runs that report no duration report no throughput --
+    # a null a consumer can skip, rather than a number it would wrongly compare.
+    reported_ms = int(report.duration_ms)
+    result: dict[str, Any] = {
         "wall_ms": round(wall_ms, 3),
-        "chunks_per_second": round(throughput, 3),
+        "reported_duration_ms": reported_ms,
+        # Pipeline throughput, not embedding throughput: `duration_ms` covers
+        # scanning, parsing, embedding and committing, so an incremental
+        # scenario that scans the whole corpus to embed one file's chunks is
+        # dominated by scan overhead.
+        "chunks_per_second": (
+            round(report.embedded_chunks * 1_000 / reported_ms, 3) if reported_ms > 0 else None
+        ),
         # This run's own staged structural rows (T1) -- not a whole-project
         # table read, which would report the same total for every scenario
         # regardless of how much work that scenario actually did.
@@ -59,22 +89,140 @@ def _measure(action: Callable[[], IndexReport]) -> dict[str, Any]:
         "reference_extraction_duration_ms": report.reference_extraction_duration_ms or 0,
         "report": report.model_dump(mode="json"),
     }
+    if snapshot_after is not None:
+        result["storage_after"] = snapshot_after()
+    return result
+
+
+def _duration_summary(samples: Sequence[float]) -> dict[str, Any]:
+    """Summarize per-iteration durations, in milliseconds.
+
+    A single total cannot distinguish a constant per-iteration cost from one
+    that grows as versions accumulate, so the distribution is reported and the
+    head and tail means are reported next to it: a last decile well above the
+    first is write amplification, not noise.
+    """
+    if not samples:
+        return {"count": 0}
+    ordered = sorted(samples)
+    decile = max(1, len(samples) // 10)
+    # Nearest-rank p95, which for small samples is the honest choice:
+    # interpolation would invent a value between two observations.
+    p95_index = min(len(ordered) - 1, -(-95 * len(ordered) // 100) - 1)
+    return {
+        "count": len(ordered),
+        "total_ms": round(sum(ordered), 3),
+        "min_ms": round(ordered[0], 3),
+        "median_ms": round(statistics.median(ordered), 3),
+        "p95_ms": round(ordered[p95_index], 3),
+        "max_ms": round(ordered[-1], 3),
+        "first_decile_mean_ms": round(statistics.fmean(samples[:decile]), 3),
+        "last_decile_mean_ms": round(statistics.fmean(samples[-decile:]), 3),
+    }
 
 
 def run_index_benchmark(app: IndexBenchmarkApplication, root: Path) -> dict[str, Any]:
-    """Run the four Phase 1 scenarios against one isolated application."""
+    """Run the storage-growth scenarios against one isolated application.
+
+    Every scenario records the project's storage statistics after it finishes,
+    so table-version deltas and physical growth are observable per scenario
+    (contract version 2). ``post_maintenance`` currently captures the
+    post-deletion snapshot; the maintenance release extends it with real
+    cleanup work without changing the JSON contract.
+
+    The storage figures are deterministic and single-run comparison is sound.
+    The timings are not: apart from ``repeated_edits``, every scenario runs
+    once, so ``wall_ms`` is a point estimate that carries no distribution and
+    should be read as indicative rather than compared run-to-run on small
+    differences. ``repeated_edits`` is the exception and reports ``per_edit_ms``
+    order statistics over its 100 iterations.
+    """
     project = app.init_project(root)
     scenarios: dict[str, dict[str, Any]] = {}
 
-    scenarios["cold_start"] = _measure(lambda: app.index_project(project.id, force=True))
-    scenarios["warm_index"] = _measure(lambda: app.index_project(project.id, force=True))
+    def snapshot() -> dict[str, Any]:
+        return _storage_snapshot(app, project.id)
 
-    incremental = root / "module_0000.py"
-    with incremental.open("a", encoding="utf-8") as stream:
-        stream.write("\ndef phase_1_incremental_marker(value: int) -> int:\n    return value + 1\n")
-    scenarios["incremental_index"] = _measure(lambda: app.index_project(project.id, force=False))
-    scenarios["forced_reindex"] = _measure(lambda: app.index_project(project.id, force=True))
-    return {"schema_version": 1, "scenarios": scenarios}
+    storage_baseline = snapshot()
+
+    scenarios["cold_start"] = _measure(
+        lambda: app.index_project(project.id, force=True), snapshot_after=snapshot
+    )
+    # The first index in a fresh application loads the embedding model, so this
+    # scenario's timings are indexing plus one-time warmup. Flagged rather than
+    # subtracted: a warmup regression is worth seeing, just not worth silently
+    # charging to indexing.
+    scenarios["cold_start"]["includes_embedder_warmup"] = True
+    scenarios["no_op"] = _measure(
+        lambda: app.index_project(project.id, force=False), snapshot_after=snapshot
+    )
+
+    edited = root / "module_0000.py"
+    with edited.open("a", encoding="utf-8") as stream:
+        stream.write("\ndef phase_2_single_edit_marker(value: int) -> int:\n    return value + 1\n")
+    scenarios["single_file_edit"] = _measure(
+        lambda: app.index_project(project.id, force=False), snapshot_after=snapshot
+    )
+
+    repeated_started = time.monotonic_ns()
+    per_edit_ms: list[float] = []
+    for edit_index in range(REPEATED_EDITS):
+        with edited.open("a", encoding="utf-8") as stream:
+            stream.write(
+                f"\ndef repeated_edit_marker_{edit_index:04d}(value: int) -> int:\n"
+                f"    return value + {edit_index}\n"
+            )
+        edit_started = time.monotonic_ns()
+        app.index_project(project.id, force=False)
+        per_edit_ms.append((time.monotonic_ns() - edit_started) / 1_000_000)
+    scenarios["repeated_edits"] = {
+        "wall_ms": round((time.monotonic_ns() - repeated_started) / 1_000_000, 3),
+        "edits": REPEATED_EDITS,
+        # The one scenario with a real sample size, so it reports a
+        # distribution rather than only its total.
+        "per_edit_ms": _duration_summary(per_edit_ms),
+        "storage_after": snapshot(),
+    }
+
+    scenarios["forced_reindex"] = _measure(
+        lambda: app.index_project(project.id, force=True), snapshot_after=snapshot
+    )
+
+    removed_single = _unlink_if_present(root / "module_0001.py")
+    scenarios["single_file_deletion"] = _measure(
+        lambda: app.index_project(project.id, force=False), snapshot_after=snapshot
+    )
+    scenarios["single_file_deletion"]["removed_files"] = removed_single
+
+    removed_group = 0
+    for deleted_index in range(2, 10):
+        removed_group += _unlink_if_present(root / f"module_{deleted_index:04d}.py")
+    scenarios["many_file_deletions"] = _measure(
+        lambda: app.index_project(project.id, force=False), snapshot_after=snapshot
+    )
+    scenarios["many_file_deletions"]["removed_files"] = removed_group
+
+    # No maintenance work runs yet, so there is nothing to time: the field is
+    # null rather than the ~0ms it would take to time an empty block, which a
+    # dashboard would chart as a real measurement.
+    scenarios["post_maintenance"] = {
+        "wall_ms": None,
+        "storage_after": snapshot(),
+    }
+    return {
+        "schema_version": 2,
+        "storage_baseline": storage_baseline,
+        "scenarios": scenarios,
+    }
+
+
+def _unlink_if_present(path: Path) -> int:
+    """Delete *path*, returning 1 when it existed. Bounds a deletion group to the corpus."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return 0
+    return 1
 
 
 def _run_in_workspace(
@@ -109,6 +257,7 @@ def _run_in_workspace(
                 "functions_per_file": functions_per_file,
                 "source_bytes": source_bytes,
             },
+            "revision": update_check.checkout_head(Path(__file__).resolve().parents[2]),
         }
     )
     return result
