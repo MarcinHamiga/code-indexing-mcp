@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import subprocess
 import threading
@@ -1652,6 +1653,11 @@ async def test_index_storage_status_tool_reports_installation_statistics(tmp_pat
     (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
     (root / "main.py").write_text("def answer():\n    return 42\n")
     app = _tiny_application(tmp_path)
+    # Indexed before the tool runs: the tool auto-registers a root but does not
+    # index it, and a registered-but-unindexed project correctly reports no
+    # partition at all -- which would make every statistic below trivially zero.
+    project = app.init_project(root)
+    app.index_project(project.id)
     server = create_server(app)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
@@ -1665,11 +1671,20 @@ async def test_index_storage_status_tool_reports_installation_statistics(tmp_pat
 
     assert not scoped.isError
     assert not installation.isError
-    project = app.list_projects()[0]
-    # The scoped form reports exactly the resolved project.
-    status = app.storage_status(project.id)
-    assert len(status.projects) == 1
-    assert status.projects[0].project.id == project.id
-    assert status.registry.row_count == 1
-    assert status.registry.logical_bytes > 0
-    assert status.projects[0].consistent is True
+
+    # Assert against what the tool actually returned. Re-deriving the numbers
+    # from a fresh app.storage_status() call would re-test the application
+    # layer and leave the tool free to serialize an empty or malformed body.
+    for result in (scoped, installation):
+        payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
+        assert payload["schema_version"] == 1
+        assert payload["registry"]["name"] == "projects"
+        assert payload["registry"]["row_count"] == 1
+        assert payload["registry"]["logical_bytes"] > 0
+        assert payload["physical_bytes_total"] > 0
+        assert [entry["project"]["id"] for entry in payload["projects"]] == [project.id]
+        entry = payload["projects"][0]
+        assert entry["consistent"] is True
+        assert entry["partition_open_failed"] is False
+        assert entry["partition_physical_bytes"] > 0
+        assert {table["name"] for table in entry["tables"]} == {"files", "chunks", "references"}

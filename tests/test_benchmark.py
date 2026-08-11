@@ -2,7 +2,12 @@ from pathlib import Path
 
 import benchmark_index_memory
 
-from code_indexing_mcp.benchmark import REPEATED_EDITS, run_index_benchmark, write_benchmark_corpus
+from code_indexing_mcp.benchmark import (
+    REPEATED_EDITS,
+    _duration_summary,
+    run_index_benchmark,
+    write_benchmark_corpus,
+)
 from code_indexing_mcp.models import (
     IndexReport,
     ProjectInfo,
@@ -14,8 +19,9 @@ from code_indexing_mcp.settings import IndexSettings
 
 
 class BenchmarkApplication:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, duration_ms: int = 100) -> None:
         self.root = root
+        self.duration_ms = duration_ms
         self.force_calls: list[bool] = []
         self.storage_calls: list[str] = []
 
@@ -32,7 +38,7 @@ class BenchmarkApplication:
             indexed_files=1,
             parsed_files=1,
             embedded_chunks=8,
-            duration_ms=100,
+            duration_ms=self.duration_ms,
             embedding_backend="cpu",
             embedding_batch_size=8,
             staged_reference_rows=12,
@@ -102,6 +108,10 @@ def test_benchmark_runs_the_storage_growth_scenarios(tmp_path: Path) -> None:
         assert after["partition_physical_bytes"] > 0
         assert after["consistent"] is True
     assert payload["scenarios"]["repeated_edits"]["edits"] == REPEATED_EDITS
+    # No maintenance work runs yet, so the scenario reports no timing rather
+    # than the ~0ms it would take to time an empty block.
+    assert payload["scenarios"]["post_maintenance"]["wall_ms"] is None
+    assert payload["scenarios"]["cold_start"]["includes_embedder_warmup"] is True
     # Storage is snapshotted once per scenario; the 100 edits index but do not
     # each get their own snapshot, so the counter stays proportional to the
     # scenario count rather than the edit count.
@@ -115,6 +125,84 @@ def test_benchmark_runs_the_storage_growth_scenarios(tmp_path: Path) -> None:
     assert not (root / "module_0001.py").exists()
     for deleted_index in range(2, 10):
         assert not (root / f"module_{deleted_index:04d}.py").exists()
+
+
+def test_the_benchmark_derives_the_numbers_it_publishes(tmp_path: Path) -> None:
+    """The reported metrics must be the arithmetic they claim, not just present.
+
+    Scenario ordering can be right while every published number is wrong: a
+    swapped numerator or a milliseconds-to-seconds slip is invisible unless the
+    derived values are pinned against the report they came from.
+    """
+    root = tmp_path / "corpus"
+    write_benchmark_corpus(root, files=8, functions_per_file=2)
+
+    payload = run_index_benchmark(BenchmarkApplication(root), root)
+
+    for name in ("cold_start", "no_op", "single_file_edit", "forced_reindex"):
+        scenario = payload["scenarios"][name]
+        # 8 chunks over the report's own 100 ms is 80 chunks/second.
+        assert scenario["reported_duration_ms"] == 100
+        assert scenario["chunks_per_second"] == 80.0
+        # Structural rows are this run's staged rows, not a whole-table count.
+        assert scenario["structural_records"] == 12
+        assert scenario["reference_extraction_duration_ms"] == 12
+        # Wall time is measured independently of the report's own duration, so
+        # a fake that never sleeps must not inherit the reported 100 ms.
+        assert 0 <= scenario["wall_ms"] < 100
+        assert scenario["report"]["embedded_chunks"] == 8
+
+
+def test_throughput_is_null_when_the_indexer_reports_no_duration(tmp_path: Path) -> None:
+    """Wall time must not stand in for the indexer's own clock.
+
+    Substituting it would publish one field name computed two different ways,
+    so runs would be compared against each other on different measurements.
+    """
+    root = tmp_path / "corpus"
+    write_benchmark_corpus(root, files=4, functions_per_file=1)
+
+    payload = run_index_benchmark(BenchmarkApplication(root, duration_ms=0), root)
+
+    scenario = payload["scenarios"]["cold_start"]
+    assert scenario["reported_duration_ms"] == 0
+    assert scenario["chunks_per_second"] is None
+    assert scenario["wall_ms"] >= 0
+
+
+def test_repeated_edits_reports_a_distribution_not_only_a_total(tmp_path: Path) -> None:
+    """100 edits is a real sample; the total alone cannot show per-edit drift."""
+    root = tmp_path / "corpus"
+    write_benchmark_corpus(root, files=4, functions_per_file=1)
+
+    payload = run_index_benchmark(BenchmarkApplication(root), root)
+
+    summary = payload["scenarios"]["repeated_edits"]["per_edit_ms"]
+    assert summary["count"] == REPEATED_EDITS
+    assert summary["min_ms"] <= summary["median_ms"] <= summary["p95_ms"] <= summary["max_ms"]
+    # Head and tail means make write amplification visible: a last decile well
+    # above the first is growth, which the aggregate total hides entirely.
+    assert summary["first_decile_mean_ms"] >= 0
+    assert summary["last_decile_mean_ms"] >= 0
+    # The summary covers the indexing inside the scenario's own wall time; the
+    # tolerance absorbs per-sample rounding, not a real discrepancy.
+    assert summary["total_ms"] <= payload["scenarios"]["repeated_edits"]["wall_ms"] + 0.1
+
+
+def test_duration_summary_computes_order_statistics() -> None:
+    """Pin the summary arithmetic directly, free of any timing jitter."""
+    summary = _duration_summary([float(value) for value in range(1, 21)])
+
+    assert summary["count"] == 20
+    assert summary["total_ms"] == 210.0
+    assert summary["min_ms"] == 1.0
+    assert summary["max_ms"] == 20.0
+    assert summary["median_ms"] == 10.5
+    # Nearest-rank p95 of 20 ordered samples is the 19th.
+    assert summary["p95_ms"] == 19.0
+    assert summary["first_decile_mean_ms"] == 1.5
+    assert summary["last_decile_mean_ms"] == 19.5
+    assert _duration_summary([]) == {"count": 0}
 
 
 def test_benchmark_corpus_is_deterministic(tmp_path: Path) -> None:

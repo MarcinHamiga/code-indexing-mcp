@@ -8,6 +8,7 @@ import lancedb
 import pyarrow as pa
 import pytest
 
+from code_indexing_mcp import storage as storage_module
 from code_indexing_mcp.models import ProjectInfo, StoredChunk, StoredFile
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.storage import LanceStore, overlap_warnings, worktree_warnings
@@ -738,14 +739,15 @@ def test_storage_stats_reports_table_level_metrics(tmp_path: Path) -> None:
     assert report.partition_physical_bytes > 0
     # No indexes are created by default, so nothing claims rows are indexed.
     assert by_name["chunks"].indexes == []
-    # Values are non-negative and Lance's logical bytes for one table never
-    # exceed the partition's physical footprint under this test layout.
+    # Every table reports non-negative counts and at least its own version.
+    # Deliberately no logical-vs-physical inequality: Lance's total_bytes is
+    # uncompressed-logical, so relating it to on-disk bytes would encode this
+    # release's storage layout as if it were an invariant.
     for table in report.tables:
         assert table.row_count >= 0
         assert table.logical_bytes >= 0
         assert table.physical_bytes >= 0
         assert table.retained_version_count >= 1
-        assert table.logical_bytes <= report.partition_physical_bytes
 
 
 def test_storage_stats_reports_indexes_after_ensure_indexes(tmp_path: Path) -> None:
@@ -801,9 +803,7 @@ def test_storage_stats_flags_a_partition_that_fails_to_open(tmp_path: Path) -> N
     """
     store, project_id, _ = _store_with_one_chunk(tmp_path)
     store._partitions.pop(project_id, None)
-    (store.directory / "projects" / project_id / "files.lance").rename(
-        tmp_path / "files.lance.bak"
-    )
+    (store.directory / "projects" / project_id / "files.lance").rename(tmp_path / "files.lance.bak")
 
     report = store.storage_stats(project_id)
 
@@ -814,17 +814,27 @@ def test_storage_stats_flags_a_partition_that_fails_to_open(tmp_path: Path) -> N
 
 
 def test_physical_byte_accounting_does_not_follow_symlinks(tmp_path: Path) -> None:
+    """Adding a symlink must change the reported bytes by exactly nothing.
+
+    Comparing against the link target's size instead would only prove the
+    partition is smaller than the target -- true here by accident of the
+    fixture, and silently weaker as the partition grows.
+    """
     store, project_id, _ = _store_with_one_chunk(tmp_path)
+    partition = store.directory / "projects" / project_id
+    before = store.storage_stats(project_id)
+
     outside = tmp_path / "outside.bin"
     outside.write_bytes(b"x" * 1_000_000)
-    partition = store.directory / "projects" / project_id
     (partition / "linked-file").symlink_to(outside)
+    (partition / "chunks.lance" / "linked-dir").symlink_to(tmp_path, target_is_directory=True)
 
-    report = store.storage_stats(project_id)
+    after = store.storage_stats(project_id)
 
-    assert report.partition_physical_bytes < outside.stat().st_size
-    chunks = next(table for table in report.tables if table.name == "chunks")
-    assert chunks.physical_bytes < outside.stat().st_size
+    assert after.partition_physical_bytes == before.partition_physical_bytes
+    chunks_before = next(table for table in before.tables if table.name == "chunks")
+    chunks_after = next(table for table in after.tables if table.name == "chunks")
+    assert chunks_after.physical_bytes == chunks_before.physical_bytes
 
 
 def test_concurrent_mutation_marks_storage_stats_inconsistent(tmp_path: Path) -> None:
@@ -844,6 +854,32 @@ def test_concurrent_mutation_marks_storage_stats_inconsistent(tmp_path: Path) ->
         return stats
 
     with patch.object(LanceStore, "_table_storage_stats", mutate_mid_collection):
+        report = store.storage_stats(project_id)
+
+    assert report.consistent is False
+
+
+def test_mutation_during_the_physical_byte_walk_marks_stats_inconsistent(
+    tmp_path: Path,
+) -> None:
+    """The byte walk must sit inside the consistency window too.
+
+    A commit landing while the partition is being measured yields byte counts
+    that disagree with the table statistics collected just before them. If the
+    walk ran after the closing version snapshot, that disagreement would be
+    reported as a consistent observation.
+    """
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+    original = storage_module._directory_bytes
+    partition = store.directory / "projects" / project_id
+
+    def mutate_mid_walk(directory: Path) -> int:
+        total = original(directory)
+        if directory == partition:
+            store.upsert_file(stored_file(project_id, file_id="file-2"))
+        return total
+
+    with patch.object(storage_module, "_directory_bytes", mutate_mid_walk):
         report = store.storage_stats(project_id)
 
     assert report.consistent is False

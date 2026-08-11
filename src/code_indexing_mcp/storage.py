@@ -1195,6 +1195,11 @@ class LanceStore:
                         physical_directory=partition / "references.lance",
                     )
                 )
+        # Walked before the closing version snapshot so it falls inside the
+        # consistency window: a commit landing during the walk must make the
+        # report inconsistent, not yield byte counts that silently disagree
+        # with the table statistics collected above.
+        partition_physical_bytes = _directory_bytes(partition)
         after = self._partition_versions(tables)
         # The partition directory exists but its tables could not be opened
         # (a damaged or mid-mutation store is exactly what status is for); a
@@ -1206,7 +1211,7 @@ class LanceStore:
             project=project,
             snapshot_at=datetime.now(UTC).isoformat(),
             tables=collected,
-            partition_physical_bytes=_directory_bytes(partition),
+            partition_physical_bytes=partition_physical_bytes,
             consistent=before == after and not open_failed,
             partition_open_failed=open_failed,
         )
