@@ -59,7 +59,7 @@ def _storage_snapshot(app: IndexBenchmarkApplication, project_id: str) -> dict[s
 def _measure(
     action: Callable[[], IndexReport],
     *,
-    storage_after: dict[str, Any] | None = None,
+    snapshot_after: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic_ns()
     report = action()
@@ -78,8 +78,8 @@ def _measure(
         "reference_extraction_duration_ms": report.reference_extraction_duration_ms or 0,
         "report": report.model_dump(mode="json"),
     }
-    if storage_after is not None:
-        result["storage_after"] = storage_after
+    if snapshot_after is not None:
+        result["storage_after"] = snapshot_after()
     return result
 
 
@@ -101,17 +101,17 @@ def run_index_benchmark(app: IndexBenchmarkApplication, root: Path) -> dict[str,
     storage_baseline = snapshot()
 
     scenarios["cold_start"] = _measure(
-        lambda: app.index_project(project.id, force=True), storage_after=snapshot()
+        lambda: app.index_project(project.id, force=True), snapshot_after=snapshot
     )
     scenarios["no_op"] = _measure(
-        lambda: app.index_project(project.id, force=False), storage_after=snapshot()
+        lambda: app.index_project(project.id, force=False), snapshot_after=snapshot
     )
 
     edited = root / "module_0000.py"
     with edited.open("a", encoding="utf-8") as stream:
         stream.write("\ndef phase_2_single_edit_marker(value: int) -> int:\n    return value + 1\n")
     scenarios["single_file_edit"] = _measure(
-        lambda: app.index_project(project.id, force=False), storage_after=snapshot()
+        lambda: app.index_project(project.id, force=False), snapshot_after=snapshot
     )
 
     repeated_started = time.monotonic_ns()
@@ -129,12 +129,12 @@ def run_index_benchmark(app: IndexBenchmarkApplication, root: Path) -> dict[str,
     }
 
     scenarios["forced_reindex"] = _measure(
-        lambda: app.index_project(project.id, force=True), storage_after=snapshot()
+        lambda: app.index_project(project.id, force=True), snapshot_after=snapshot
     )
 
     removed_single = _unlink_if_present(root / "module_0001.py")
     scenarios["single_file_deletion"] = _measure(
-        lambda: app.index_project(project.id, force=False), storage_after=snapshot()
+        lambda: app.index_project(project.id, force=False), snapshot_after=snapshot
     )
     scenarios["single_file_deletion"]["removed_files"] = removed_single
 
@@ -142,7 +142,7 @@ def run_index_benchmark(app: IndexBenchmarkApplication, root: Path) -> dict[str,
     for deleted_index in range(2, 10):
         removed_group += _unlink_if_present(root / f"module_{deleted_index:04d}.py")
     scenarios["many_file_deletions"] = _measure(
-        lambda: app.index_project(project.id, force=False), storage_after=snapshot()
+        lambda: app.index_project(project.id, force=False), snapshot_after=snapshot
     )
     scenarios["many_file_deletions"]["removed_files"] = removed_group
 

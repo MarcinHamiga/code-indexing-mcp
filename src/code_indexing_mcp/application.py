@@ -657,15 +657,16 @@ class Application:
         """
         snapshot_at = datetime.now(UTC).isoformat()
         registry_before = self.store.registry_stats()
+        registered = self.list_projects()
         if project is not None:
             resolved = self._resolve(project, roots)
-            projects = [self.store.storage_stats(resolved.id)]
+            projects = [self.store.storage_stats_for(resolved)]
         else:
             projects = [
-                self.store.storage_stats(registered.id) for registered in self.list_projects()
+                self.store.storage_stats_for(registered_project)
+                for registered_project in registered
             ]
         registry_after = self.store.registry_stats()
-        registered = self.list_projects()
         return StorageStatus(
             snapshot_at=snapshot_at,
             registry=registry_after,

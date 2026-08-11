@@ -788,8 +788,29 @@ def test_storage_stats_works_for_a_registered_project_without_a_partition(tmp_pa
     assert report.tables == []
     assert report.partition_physical_bytes == 0
     assert report.consistent is True
+    assert report.partition_open_failed is False
     # Statistics are read-only: they must not materialize a partition.
     assert not (store.directory / "projects").exists()
+
+
+def test_storage_stats_flags_a_partition_that_fails_to_open(tmp_path: Path) -> None:
+    """A partition that exists but cannot be opened is not an unindexed project.
+
+    The failure must be reported explicitly and the snapshot marked unusable,
+    so a damaged store is distinguishable from one that was never indexed.
+    """
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+    store._partitions.pop(project_id, None)
+    (store.directory / "projects" / project_id / "files.lance").rename(
+        tmp_path / "files.lance.bak"
+    )
+
+    report = store.storage_stats(project_id)
+
+    assert report.tables == []
+    assert report.partition_open_failed is True
+    assert report.consistent is False
+    assert report.partition_physical_bytes > 0
 
 
 def test_physical_byte_accounting_does_not_follow_symlinks(tmp_path: Path) -> None:
@@ -937,6 +958,39 @@ def test_relative_git_common_directories_resolve_against_the_toplevel(
             return str(worktree_root)
         if cwd == main_root:
             return ".git"
+        return str(common)
+
+    warnings = worktree_warnings(projects, _run=fake_git)
+
+    assert len(warnings) == 1
+    assert str(common) in warnings[0]
+
+
+def test_relative_git_common_directories_resolve_against_the_registered_root(
+    tmp_path: Path,
+) -> None:
+    """--git-common-dir is relative to the query cwd, which is the registered root.
+
+    A registered root that is a subdirectory of a checkout reports '../.git';
+    it must be joined against that root, not against the repository toplevel,
+    or two subdirectory roots of one repository would look like different
+    common directories.
+    """
+    main_root = tmp_path / "repo"
+    worktree_root = tmp_path / "worktree"
+    (main_root / "sub").mkdir(parents=True)
+    (worktree_root / "sub").mkdir(parents=True)
+    common = main_root / ".git"
+    projects = [
+        ProjectInfo(id="a", name="a", root=main_root / "sub"),
+        ProjectInfo(id="b", name="b", root=worktree_root / "sub"),
+    ]
+
+    def fake_git(command: list[str], cwd: Path) -> str | None:
+        if command[-1] == "--show-toplevel":
+            return str(main_root) if cwd == projects[0].root else str(worktree_root)
+        if cwd == projects[0].root:
+            return "../.git"
         return str(common)
 
     warnings = worktree_warnings(projects, _run=fake_git)

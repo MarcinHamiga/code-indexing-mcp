@@ -778,8 +778,12 @@ class ProjectStorageStats(FrozenModel):
     tables: list[TableStorageStats] = Field(default_factory=list)
     # Sum of the partition's table directories on disk.
     partition_physical_bytes: int = 0
-    # False when a table version changed while the snapshot was collected.
+    # False when a table version changed while the snapshot was collected, or
+    # when the partition exists but its tables could not be opened.
     consistent: bool = True
+    # True when the partition directory exists but its tables could not be
+    # opened (a damaged or mid-mutation store), so no table statistics exist.
+    partition_open_failed: bool = False
 
 
 class StorageStatus(FrozenModel):

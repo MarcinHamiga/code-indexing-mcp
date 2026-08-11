@@ -107,12 +107,12 @@ def _quoted(value: str) -> str:
 
 
 def _nullable_int(value: Any) -> int | None:
-    """Coerce a fragment-length statistic, tolerating None and NaN-like noise."""
+    """Coerce a fragment-length statistic, tolerating None and non-finite noise."""
     if value is None:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -223,7 +223,10 @@ def worktree_warnings(
             continue
         common_path = Path(common)
         if not common_path.is_absolute():
-            common_path = Path(toplevel) / common_path
+            # --git-common-dir is relative to the query cwd, which is the
+            # registered root itself, not the repository toplevel: a root that
+            # is a subdirectory of a checkout reports '../.git'.
+            common_path = (Path(project.root) / common_path).resolve()
         repositories.append((project, Path(toplevel), common_path))
     warnings: list[str] = []
     for (left, left_top, left_common), (right, right_top, right_common) in itertools.combinations(
@@ -1160,19 +1163,28 @@ class LanceStore:
         project = next((p for p in self.list_projects() if p.id == project_id), None)
         if project is None:
             raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {project_id}")
-        tables = self._existing_tables(project_id)
+        return self.storage_stats_for(project)
+
+    def storage_stats_for(self, project: ProjectInfo) -> ProjectStorageStats:
+        """Collect read-only storage statistics for an already-resolved project.
+
+        Unlike ``storage_stats``, this does not re-scan the registry, so an
+        installation-wide report can resolve every project once and then
+        collect each partition without N+1 registry reads.
+        """
+        tables = self._existing_tables(project.id)
+        partition = self.directory / "projects" / project.id
         before = self._partition_versions(tables)
         collected: list[TableStorageStats] = []
         if tables is not None:
-            directory = self.directory / "projects" / project_id
             collected.append(
                 self._table_storage_stats(
-                    tables.files, "files", physical_directory=directory / "files.lance"
+                    tables.files, "files", physical_directory=partition / "files.lance"
                 )
             )
             collected.append(
                 self._table_storage_stats(
-                    tables.chunks, "chunks", physical_directory=directory / "chunks.lance"
+                    tables.chunks, "chunks", physical_directory=partition / "chunks.lance"
                 )
             )
             if tables.references is not None:
@@ -1180,16 +1192,23 @@ class LanceStore:
                     self._table_storage_stats(
                         tables.references,
                         "references",
-                        physical_directory=directory / "references.lance",
+                        physical_directory=partition / "references.lance",
                     )
                 )
         after = self._partition_versions(tables)
+        # The partition directory exists but its tables could not be opened
+        # (a damaged or mid-mutation store is exactly what status is for); a
+        # project that was never indexed has no directory at all. The two must
+        # not be conflated: report the failure explicitly and treat the
+        # snapshot as unusable.
+        open_failed = tables is None and partition.is_dir()
         return ProjectStorageStats(
             project=project,
             snapshot_at=datetime.now(UTC).isoformat(),
             tables=collected,
-            partition_physical_bytes=_directory_bytes(self.directory / "projects" / project_id),
-            consistent=before == after,
+            partition_physical_bytes=_directory_bytes(partition),
+            consistent=before == after and not open_failed,
+            partition_open_failed=open_failed,
         )
 
     @staticmethod

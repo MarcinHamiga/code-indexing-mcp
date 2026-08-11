@@ -80,6 +80,13 @@ def test_benchmark_runs_the_storage_growth_scenarios(tmp_path: Path) -> None:
     # its own post-run storage snapshot, so version deltas and physical growth
     # are computable per scenario from the contract alone.
     assert payload["storage_baseline"]["partition_physical_bytes"] == 1
+    # The snapshot must be taken after the scenario's index work: cold_start's
+    # storage_after is exactly one collection newer than the pre-index baseline,
+    # not equal to it (the baseline and a pre-action snapshot would be the same).
+    assert (
+        payload["scenarios"]["cold_start"]["storage_after"]["partition_physical_bytes"]
+        == payload["storage_baseline"]["partition_physical_bytes"] + 1
+    )
     for name in (
         "cold_start",
         "no_op",
