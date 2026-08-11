@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import gc
+import itertools
 import logging
+import os
 import shutil
+import subprocess
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
@@ -25,10 +28,15 @@ from .errors import CodeIndexingError, ErrorCode
 from .models import (
     ChunkPreview,
     CodeChunk,
+    FragmentLengthStats,
+    FragmentStats,
     IndexedChunk,
+    IndexStorageStats,
     ProjectInfo,
+    ProjectStorageStats,
     StoredChunk,
     StoredFile,
+    TableStorageStats,
 )
 from .projects import existing_marker_path, same_project_root
 
@@ -96,6 +104,139 @@ INDEXED_CHUNK_COLUMNS = [
 
 def _quoted(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _nullable_int(value: Any) -> int | None:
+    """Coerce a fragment-length statistic, tolerating None and NaN-like noise."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_timestamp(value: str) -> str:
+    """Normalize a Lance version timestamp string to ISO-8601."""
+    try:
+        return datetime.fromisoformat(value).isoformat()
+    except ValueError:
+        return value
+
+
+# Git inspection for storage-status worktree warnings is best-effort and must
+# never make the status command fail. A short timeout keeps a hung repository
+# from holding the command hostage.
+_GIT_TIMEOUT_SECONDS = 5.0
+_GitRunner = Callable[[list[str], Path], str | None]
+
+
+def _run_git_quietly(command: list[str], cwd: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout.strip()
+
+
+def _directory_bytes(directory: Path) -> int:
+    """Sum the file bytes under *directory* without following symlinks.
+
+    A symlinked directory or file inside a partition is a deliberate escape
+    hatch, not storage the index owns, so its target's bytes must not be
+    counted as physical index storage.
+    """
+    total = 0
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                total += _directory_bytes(Path(entry.path))
+            elif entry.is_file(follow_symlinks=False):
+                total += entry.stat(follow_symlinks=False).st_size
+        except OSError:
+            continue
+    return total
+
+
+def overlap_warnings(projects: Iterable[ProjectInfo]) -> list[str]:
+    """Warn about registered roots that duplicate or nest one another.
+
+    Read-only detection: rejecting new overlaps is a later-phase registration
+    concern, but status must already say when two registrations point at the
+    same or a contained directory.
+    """
+    warnings: list[str] = []
+    for left, right in itertools.combinations(list(projects), 2):
+        if same_project_root(left.root, right.root):
+            warnings.append(
+                f"Projects {left.id!r} and {right.id!r} register the same root: {left.root}"
+            )
+            continue
+        left_resolved = left.root.expanduser().resolve()
+        right_resolved = right.root.expanduser().resolve()
+        try:
+            left_resolved.relative_to(right_resolved)
+        except ValueError:
+            try:
+                right_resolved.relative_to(left_resolved)
+            except ValueError:
+                continue
+            warnings.append(
+                f"Project {left.id!r} root {left_resolved} contains the root of project "
+                f"{right.id!r} ({right_resolved})"
+            )
+        else:
+            warnings.append(
+                f"Project {left.id!r} root {left_resolved} is nested inside the root of "
+                f"project {right.id!r} ({right_resolved})"
+            )
+    return warnings
+
+
+def worktree_warnings(
+    projects: Iterable[ProjectInfo], *, _run: _GitRunner | None = None
+) -> list[str]:
+    """Warn about registered roots that are checkouts of one Git repository.
+
+    Two roots whose ``--show-toplevel`` differs but whose Git common directory
+    is the same are worktrees (or a main checkout and a worktree) of one
+    repository, which is a likely duplicate registration. All failures are
+    swallowed: this is advisory information only.
+    """
+    runner = _run or _run_git_quietly
+    repositories: list[tuple[ProjectInfo, Path, Path]] = []
+    for project in projects:
+        toplevel = runner(["git", "rev-parse", "--show-toplevel"], project.root)
+        common = runner(["git", "rev-parse", "--git-common-dir"], project.root)
+        if toplevel is None or common is None:
+            continue
+        common_path = Path(common)
+        if not common_path.is_absolute():
+            common_path = Path(toplevel) / common_path
+        repositories.append((project, Path(toplevel), common_path))
+    warnings: list[str] = []
+    for (left, left_top, left_common), (right, right_top, right_common) in itertools.combinations(
+        repositories, 2
+    ):
+        if same_project_root(left_common, right_common) and not same_project_root(
+            left_top, right_top
+        ):
+            warnings.append(
+                f"Projects {left.id!r} and {right.id!r} share Git common directory "
+                f"{left_common} from different checkouts (possible worktrees of one repository)"
+            )
+    return warnings
 
 
 def _symbol_matches(chunk: ChunkPreview, name: str, match: str) -> bool:
@@ -1000,6 +1141,140 @@ class LanceStore:
             isinstance(schema_version, bool) or not isinstance(schema_version, int)
         ):
             raise ValueError("schema_version must be a non-boolean integer")
+
+    def registry_stats(self) -> TableStorageStats:
+        """Snapshot the project registry table's storage statistics."""
+        return self._table_storage_stats(
+            self._projects, "projects", physical_directory=self.directory / "registry"
+        )
+
+    def storage_stats(self, project_id: str) -> ProjectStorageStats:
+        """Collect read-only storage statistics for one project partition.
+
+        A registered project with no partition yields zeroed tables rather than
+        materializing storage (reads never create partitions). ``consistent``
+        is False when any table's version changed between the initial snapshot
+        and the end of collection, meaning the observations do not form one
+        atomic snapshot.
+        """
+        project = next((p for p in self.list_projects() if p.id == project_id), None)
+        if project is None:
+            raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {project_id}")
+        tables = self._existing_tables(project_id)
+        before = self._partition_versions(tables)
+        collected: list[TableStorageStats] = []
+        if tables is not None:
+            directory = self.directory / "projects" / project_id
+            collected.append(
+                self._table_storage_stats(
+                    tables.files, "files", physical_directory=directory / "files.lance"
+                )
+            )
+            collected.append(
+                self._table_storage_stats(
+                    tables.chunks, "chunks", physical_directory=directory / "chunks.lance"
+                )
+            )
+            if tables.references is not None:
+                collected.append(
+                    self._table_storage_stats(
+                        tables.references,
+                        "references",
+                        physical_directory=directory / "references.lance",
+                    )
+                )
+        after = self._partition_versions(tables)
+        return ProjectStorageStats(
+            project=project,
+            snapshot_at=datetime.now(UTC).isoformat(),
+            tables=collected,
+            partition_physical_bytes=_directory_bytes(self.directory / "projects" / project_id),
+            consistent=before == after,
+        )
+
+    @staticmethod
+    def _partition_versions(tables: _ProjectTables | None) -> tuple[int, int, int]:
+        """Snapshot the three partition table versions, 0 for a missing references table."""
+        if tables is None:
+            return (0, 0, 0)
+        references = 0 if tables.references is None else int(tables.references.version)
+        return (int(tables.files.version), int(tables.chunks.version), references)
+
+    @staticmethod
+    def _table_storage_stats(
+        table: LanceTable,
+        name: str,
+        *,
+        physical_directory: Path,
+    ) -> TableStorageStats:
+        """Collect one Lance table's storage snapshot.
+
+        Introspection is best-effort: a table whose statistics cannot be read
+        (a damaged or mid-mutation store is exactly what status is for) reports
+        its version and nothing else rather than failing the whole report.
+        """
+        try:
+            stats = cast(dict[str, Any], cast(object, table.stats()))
+        except (ValueError, RuntimeError):
+            stats = {}
+        try:
+            num_rows = max(0, int(stats.get("num_rows", 0)))
+            logical_bytes = max(0, int(stats.get("total_bytes", 0)))
+        except (TypeError, ValueError):
+            num_rows = 0
+            logical_bytes = 0
+        fragments: dict[str, Any] = stats.get("fragment_stats") or {}
+        lengths: dict[str, Any] | None = fragments.get("lengths")
+        try:
+            fragment_stats = FragmentStats(
+                num_fragments=max(0, int(fragments.get("num_fragments", 0))),
+                num_small_fragments=max(0, int(fragments.get("num_small_fragments", 0))),
+                lengths=(
+                    FragmentLengthStats(
+                        **{key: _nullable_int(value) for key, value in lengths.items()}
+                    )
+                    if lengths
+                    else None
+                ),
+            )
+        except (TypeError, ValueError):
+            fragment_stats = FragmentStats()
+        try:
+            versions = cast(list[dict[str, Any]], table.list_versions())
+        except (ValueError, RuntimeError):
+            versions = []
+        timestamps = [
+            str(version.get("timestamp", ""))
+            for version in versions
+            if version.get("timestamp")
+        ]
+        indexes: list[IndexStorageStats] = []
+        try:
+            for index in table.list_indices():
+                indexes.append(
+                    IndexStorageStats(
+                        name=index.name,
+                        index_type=index.index_type,
+                        columns=list(index.columns),
+                        indexed_rows=max(0, int(getattr(index, "num_indexed_rows", 0) or 0)),
+                        unindexed_rows=max(0, int(getattr(index, "num_unindexed_rows", 0) or 0)),
+                        size_bytes=max(0, int(getattr(index, "size_bytes", 0) or 0)),
+                    )
+                )
+        except (ValueError, RuntimeError):
+            indexes = []
+        return TableStorageStats(
+            name=name,
+            current_version=int(table.version),
+            row_count=num_rows,
+            logical_bytes=logical_bytes,
+            physical_bytes=_directory_bytes(physical_directory),
+            fragment_stats=fragment_stats,
+            retained_version_count=len(versions),
+            oldest_version_at=_normalized_timestamp(timestamps[0]) if timestamps else None,
+            newest_version_at=_normalized_timestamp(timestamps[-1]) if timestamps else None,
+            indexes=indexes,
+        )
 
     @staticmethod
     def _rows(table: LanceTable, condition: str | None = None) -> list[dict[str, Any]]:

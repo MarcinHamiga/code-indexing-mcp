@@ -6,6 +6,7 @@ import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
@@ -46,6 +47,7 @@ from .models import (
     ScanConfig,
     ScannedFile,
     SearchResponse,
+    StorageStatus,
     StoredFile,
     SymbolResponse,
 )
@@ -65,7 +67,7 @@ from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
 from .staging import recover_staged_commits
-from .storage import LanceStore
+from .storage import LanceStore, overlap_warnings, worktree_warnings
 from .token_batching import max_token_product_for
 from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
@@ -642,6 +644,38 @@ class Application:
             state=state,
             file_count=len(files),
             chunk_count=self.store.count_chunks([resolved.id]),
+        )
+
+    def storage_status(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> StorageStatus:
+        """Read-only storage statistics for one project or the whole installation.
+
+        Never mutates the index: a registered project with no partition reports
+        zeroed tables instead of materializing one. Root-overlap and shared-Git
+        worktree warnings are advisory and best-effort.
+        """
+        snapshot_at = datetime.now(UTC).isoformat()
+        registry_before = self.store.registry_stats()
+        if project is not None:
+            resolved = self._resolve(project, roots)
+            projects = [self.store.storage_stats(resolved.id)]
+        else:
+            projects = [
+                self.store.storage_stats(registered.id) for registered in self.list_projects()
+            ]
+        registry_after = self.store.registry_stats()
+        registered = self.list_projects()
+        return StorageStatus(
+            snapshot_at=snapshot_at,
+            registry=registry_after,
+            projects=projects,
+            physical_bytes_total=registry_after.physical_bytes
+            + sum(stats.partition_physical_bytes for stats in projects),
+            consistent=registry_before.current_version == registry_after.current_version
+            and all(stats.consistent for stats in projects),
+            overlap_warnings=overlap_warnings(registered),
+            worktree_warnings=worktree_warnings(registered),
         )
 
     def project_is_stale(

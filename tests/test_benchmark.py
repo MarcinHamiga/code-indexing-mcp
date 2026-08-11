@@ -2,8 +2,14 @@ from pathlib import Path
 
 import benchmark_index_memory
 
-from code_indexing_mcp.benchmark import run_index_benchmark, write_benchmark_corpus
-from code_indexing_mcp.models import IndexReport, ProjectInfo
+from code_indexing_mcp.benchmark import REPEATED_EDITS, run_index_benchmark, write_benchmark_corpus
+from code_indexing_mcp.models import (
+    IndexReport,
+    ProjectInfo,
+    ProjectStorageStats,
+    StorageStatus,
+    TableStorageStats,
+)
 from code_indexing_mcp.settings import IndexSettings
 
 
@@ -11,6 +17,7 @@ class BenchmarkApplication:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.force_calls: list[bool] = []
+        self.storage_calls: list[str] = []
 
     def init_project(self, path: Path) -> ProjectInfo:
         assert path == self.root
@@ -19,53 +26,88 @@ class BenchmarkApplication:
     def index_project(self, project: str, *, force: bool = False) -> IndexReport:
         assert project == "benchmark-project"
         self.force_calls.append(force)
-        call = len(self.force_calls)
-        # The incremental scenario (call 3) touches only the one appended
-        # file, so its staged rows and reference-extraction time must be
-        # smaller than a full-corpus run's -- a seeded, distinguishable value
-        # per scenario, not a fake that would report zero either way (T3).
-        staged_rows = 3 if call == 3 else 12
         return IndexReport(
             project_id=project,
             discovered_files=4,
-            indexed_files=1 if call == 3 else 4,
-            parsed_files=1 if call == 3 else 4,
-            embedded_chunks=2 if call == 3 else 8,
+            indexed_files=1,
+            parsed_files=1,
+            embedded_chunks=8,
             duration_ms=100,
             embedding_backend="cpu",
             embedding_batch_size=8,
-            staged_reference_rows=staged_rows,
-            reference_extraction_duration_ms=staged_rows,
+            staged_reference_rows=12,
+            reference_extraction_duration_ms=12,
+        )
+
+    def storage_status(self, project: str | None = None) -> StorageStatus:
+        self.storage_calls.append(project or "")
+        entry = ProjectStorageStats(
+            project=ProjectInfo(id="benchmark-project", name="benchmark", root=self.root),
+            snapshot_at="2026-08-11T00:00:00+00:00",
+            tables=[],
+            # A distinguishable value per call, so a scenario that forgets to
+            # snapshot cannot pass for one that did (T3).
+            partition_physical_bytes=len(self.storage_calls),
+            consistent=True,
+        )
+        return StorageStatus(
+            snapshot_at="2026-08-11T00:00:00+00:00",
+            registry=TableStorageStats(name="projects"),
+            projects=[entry],
         )
 
 
-def test_benchmark_runs_cold_warm_incremental_and_forced_scenarios(tmp_path: Path) -> None:
+def test_benchmark_runs_the_storage_growth_scenarios(tmp_path: Path) -> None:
     root = tmp_path / "corpus"
-    write_benchmark_corpus(root, files=4, functions_per_file=2)
+    write_benchmark_corpus(root, files=8, functions_per_file=2)
     app = BenchmarkApplication(root)
 
     payload = run_index_benchmark(app, root)
 
-    assert app.force_calls == [True, True, False, True]
+    assert app.force_calls == [True, False, False] + [False] * 100 + [True, False, False]
     assert list(payload["scenarios"]) == [
         "cold_start",
-        "warm_index",
-        "incremental_index",
+        "no_op",
+        "single_file_edit",
+        "repeated_edits",
         "forced_reindex",
+        "single_file_deletion",
+        "many_file_deletions",
+        "post_maintenance",
     ]
-    assert payload["scenarios"]["incremental_index"]["report"]["indexed_files"] == 1
-    assert payload["scenarios"]["warm_index"]["chunks_per_second"] == 80.0
-    # These read straight off the report's per-run fields, not a whole-project
-    # table scan or a fallback that a renamed attribute could keep green (T1, T3).
-    assert payload["scenarios"]["cold_start"]["structural_records"] == 12
-    assert payload["scenarios"]["cold_start"]["reference_extraction_duration_ms"] == 12
-    assert payload["scenarios"]["incremental_index"]["structural_records"] == 3
-    assert payload["scenarios"]["incremental_index"]["reference_extraction_duration_ms"] == 3
-    assert (
-        payload["scenarios"]["incremental_index"]["structural_records"]
-        != payload["scenarios"]["cold_start"]["structural_records"]
-    )
-    assert "phase_1_incremental_marker" in (root / "module_0000.py").read_text()
+    assert payload["schema_version"] == 2
+    # The baseline is captured before any index work and every scenario records
+    # its own post-run storage snapshot, so version deltas and physical growth
+    # are computable per scenario from the contract alone.
+    assert payload["storage_baseline"]["partition_physical_bytes"] == 1
+    for name in (
+        "cold_start",
+        "no_op",
+        "single_file_edit",
+        "repeated_edits",
+        "forced_reindex",
+        "single_file_deletion",
+        "many_file_deletions",
+        "post_maintenance",
+    ):
+        after = payload["scenarios"][name]["storage_after"]
+        assert after["project"]["id"] == "benchmark-project"
+        assert after["partition_physical_bytes"] > 0
+        assert after["consistent"] is True
+    assert payload["scenarios"]["repeated_edits"]["edits"] == REPEATED_EDITS
+    # Storage is snapshotted once per scenario; the 100 edits index but do not
+    # each get their own snapshot, so the counter stays proportional to the
+    # scenario count rather than the edit count.
+    assert len(app.storage_calls) == 9
+    # The corpus mutations the scenarios make are real files on disk: the
+    # edit markers land in module_0000.py, and each deletion scenario removes
+    # its bounded group.
+    edited = (root / "module_0000.py").read_text()
+    assert "phase_2_single_edit_marker" in edited
+    assert "repeated_edit_marker_0099" in edited
+    assert not (root / "module_0001.py").exists()
+    for deleted_index in range(2, 10):
+        assert not (root / f"module_{deleted_index:04d}.py").exists()
 
 
 def test_benchmark_corpus_is_deterministic(tmp_path: Path) -> None:

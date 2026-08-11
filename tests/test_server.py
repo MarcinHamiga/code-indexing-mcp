@@ -126,6 +126,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "init_project",
         "index_project",
         "project_status",
+        "index_storage_status",
         "list_projects",
         "remove_project",
         "search_code",
@@ -136,7 +137,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 12
+    assert len(tools) == 13
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -1378,6 +1379,7 @@ READ_ONLY_TOOLS = frozenset({"list_projects", "get_chunk"})
 AUTO_REGISTERING_TOOLS = frozenset(
     {
         "project_status",
+        "index_storage_status",
         "search_code",
         "search_across_projects",
         "find_symbol",
@@ -1636,3 +1638,33 @@ async def test_index_project_reports_file_counts_while_it_runs(
     assert any("files" in (message or "") for _, _, message in reports[1:-1]), reports
     assert [value for value, _, _ in reports] == sorted(value for value, _, _ in reports)
     assert "chunks embedded" in (reports[-1][2] or "")
+
+
+@pytest.mark.asyncio
+async def test_index_storage_status_tool_reports_installation_statistics(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        scoped = await client.call_tool("index_storage_status", {"project": str(root)})
+        installation = await client.call_tool("index_storage_status", {})
+
+    assert not scoped.isError
+    assert not installation.isError
+    project = app.list_projects()[0]
+    # The scoped form reports exactly the resolved project.
+    status = app.storage_status(project.id)
+    assert len(status.projects) == 1
+    assert status.projects[0].project.id == project.id
+    assert status.registry.row_count == 1
+    assert status.registry.logical_bytes > 0
+    assert status.projects[0].consistent is True

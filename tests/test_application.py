@@ -19,6 +19,7 @@ from code_indexing_mcp.embedding_worker import default_launcher
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.models import (
     DeclarationSelector,
+    ProjectInfo,
     ReferenceBackfillReport,
     RenameOperation,
 )
@@ -762,3 +763,70 @@ def test_a_record_offers_only_the_accelerator_it_was_probed_for(tmp_path: Path) 
     assert Application(
         paths, embedder=TinyEmbedder(), cwd=tmp_path
     ).backend_selection.accelerator is (Accelerator.CUDA)
+
+
+def test_storage_status_reports_registry_project_and_totals(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def locate_feature():\n    return True\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    status = app.storage_status()
+
+    assert status.schema_version == 1
+    assert status.consistent is True
+    assert status.overlap_warnings == []
+    assert status.worktree_warnings == []
+    assert status.registry.name == "projects"
+    assert status.registry.row_count == 1
+    assert status.registry.logical_bytes > 0
+    assert len(status.projects) == 1
+    project_stats = status.projects[0]
+    assert project_stats.project.id == project.id
+    assert {table.name for table in project_stats.tables} == {"files", "chunks", "references"}
+    assert project_stats.partition_physical_bytes > 0
+    assert project_stats.consistent is True
+    assert status.physical_bytes_total >= (
+        status.registry.physical_bytes + project_stats.partition_physical_bytes
+    )
+
+    scoped = app.storage_status(project.id)
+
+    assert [entry.project.id for entry in scoped.projects] == [project.id]
+
+
+def test_storage_status_reports_registered_root_overlaps(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    first = tmp_path / "first"
+    first.mkdir()
+    app.init_project(first)
+    nested = first / "nested"
+    nested.mkdir()
+    app.store.upsert_project(
+        ProjectInfo(id="nested-id", name="nested", root=nested), model_id="test/model"
+    )
+
+    status = app.storage_status()
+
+    assert any("nested" in warning for warning in status.overlap_warnings)
+    assert len(status.projects) == 2
+
+
+def test_storage_status_raises_for_an_unknown_project(tmp_path: Path) -> None:
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+
+    with pytest.raises(CodeIndexingError) as raised:
+        app.storage_status("no-such-project")
+
+    assert raised.value.code is ErrorCode.PROJECT_NOT_FOUND

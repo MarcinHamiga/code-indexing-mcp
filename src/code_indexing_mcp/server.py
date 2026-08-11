@@ -41,6 +41,7 @@ from .models import (
     ReferenceResponse,
     RemovalReport,
     SearchResponse,
+    StorageStatus,
     SymbolResponse,
 )
 from .projects import same_project_root
@@ -785,6 +786,35 @@ def create_server(
     ) -> ProjectStatus:
         roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(app.project_status, project, roots=roots)
+
+    @mcp.tool(
+        title="Index storage status",
+        description=(
+            "Read-only storage statistics for one project or the whole installation — current "
+            "table versions, row counts, Lance-reported logical bytes, filesystem-reported "
+            "physical bytes, fragment and retained-version counts, index coverage, and an "
+            "installation total — plus advisory warnings for overlapping registered roots and "
+            "Git worktrees that share one repository. Never mutates the index: a registered "
+            "project with no partition reports zeroed tables instead of materializing one."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def index_storage_status(
+        ctx: ServerContext,
+        project: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Project id, name, or path. Defaults to the active MCP root or the nearest "
+                    ".ci-mcp/project.toml when exactly one project is in scope; omit for the "
+                    "whole installation."
+                )
+            ),
+        ] = None,
+    ) -> StorageStatus:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(app.storage_status, project, roots=roots)
 
     @mcp.tool(
         title="List projects",

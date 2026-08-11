@@ -353,3 +353,49 @@ def test_a_terminal_gets_one_status_line_that_is_cleaned_up_afterwards() -> None
     # Whatever the last line was, the cursor ends on a blank line so the JSON
     # report is not printed on top of it.
     assert written.rstrip("\r").endswith(" " * len("Scanning 2 files"))
+
+
+def test_cli_reports_storage_status_as_json(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        cli,
+        "Application",
+        lambda paths, cwd: Application(paths, embedder=_TinyEmbedder(), cwd=cwd),
+    )
+
+    assert main(["init", str(root)]) == 0
+    assert main(["index", str(root)]) == 0
+    capsys.readouterr()
+    assert main(["storage", "status", str(root)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
+    assert payload["registry"]["row_count"] == 1
+    assert len(payload["projects"]) == 1
+    assert payload["projects"][0]["consistent"] is True
+    assert payload["projects"][0]["partition_physical_bytes"] > 0
+    assert payload["physical_bytes_total"] > 0
+
+
+def test_cli_storage_status_defaults_to_the_whole_installation(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        cli,
+        "Application",
+        lambda paths, cwd: Application(paths, embedder=_TinyEmbedder(), cwd=cwd),
+    )
+
+    assert main(["storage", "status"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["registry"]["row_count"] == 0
+    assert payload["projects"] == []

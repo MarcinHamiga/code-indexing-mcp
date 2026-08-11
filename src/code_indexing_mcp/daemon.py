@@ -37,6 +37,7 @@ from .models import (
     ReferenceResponse,
     RemovalReport,
     SearchResponse,
+    StorageStatus,
     SymbolResponse,
 )
 from .progress import IndexProgress, read_progress
@@ -318,6 +319,8 @@ class DaemonServer:
             return app.index_project(roots=roots, **params)
         if method == "project_status":
             return app.project_status(roots=roots, **params)
+        if method == "storage_status":
+            return app.storage_status(roots=roots, **params)
         if method == "list_projects":
             return app.list_projects()
         if method == "remove_project":
@@ -483,6 +486,13 @@ class BrokerApplication:
     ) -> ProjectStatus:
         return ProjectStatus.model_validate(
             self._call("project_status", project=project, roots=roots or [])
+        )
+
+    def storage_status(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> StorageStatus:
+        return StorageStatus.model_validate(
+            self._call("storage_status", project=project, roots=roots or [])
         )
 
     def project_is_stale(

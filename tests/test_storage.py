@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import lancedb
 import pyarrow as pa
@@ -9,7 +10,7 @@ import pytest
 
 from code_indexing_mcp.models import ProjectInfo, StoredChunk, StoredFile
 from code_indexing_mcp.projects import initialize_project
-from code_indexing_mcp.storage import LanceStore
+from code_indexing_mcp.storage import LanceStore, overlap_warnings, worktree_warnings
 
 
 def reference_record(
@@ -714,3 +715,231 @@ def test_has_file_errors(tmp_path: Path) -> None:
         stored_file(project.id).model_copy(update={"has_errors": True, "error": "embedding failed"})
     )
     assert store.has_file_errors(project.id) is True
+
+
+def test_storage_stats_reports_table_level_metrics(tmp_path: Path) -> None:
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+
+    report = store.storage_stats(project_id)
+
+    assert report.project.id == project_id
+    assert report.consistent is True
+    by_name = {table.name: table for table in report.tables}
+    assert set(by_name) == {"files", "chunks", "references"}
+    assert by_name["files"].row_count == 1
+    assert by_name["chunks"].row_count == 1
+    assert by_name["chunks"].current_version >= 1
+    assert by_name["chunks"].logical_bytes > 0
+    assert by_name["chunks"].physical_bytes > 0
+    assert by_name["chunks"].retained_version_count >= 1
+    assert by_name["chunks"].oldest_version_at is not None
+    assert by_name["chunks"].newest_version_at is not None
+    assert by_name["chunks"].newest_version_at >= by_name["chunks"].oldest_version_at
+    assert report.partition_physical_bytes > 0
+    # No indexes are created by default, so nothing claims rows are indexed.
+    assert by_name["chunks"].indexes == []
+    # Values are non-negative and Lance's logical bytes for one table never
+    # exceed the partition's physical footprint under this test layout.
+    for table in report.tables:
+        assert table.row_count >= 0
+        assert table.logical_bytes >= 0
+        assert table.physical_bytes >= 0
+        assert table.retained_version_count >= 1
+        assert table.logical_bytes <= report.partition_physical_bytes
+
+
+def test_storage_stats_reports_indexes_after_ensure_indexes(tmp_path: Path) -> None:
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+    store.ensure_indexes(project_id)
+
+    report = store.storage_stats(project_id)
+
+    chunks = next(table for table in report.tables if table.name == "chunks")
+    assert {index.index_type for index in chunks.indexes} == {"FTS", "BTree"}
+    fts = next(index for index in chunks.indexes if index.index_type == "FTS")
+    assert fts.columns == ["search_text"]
+    assert fts.indexed_rows == 1
+    assert fts.unindexed_rows == 0
+    assert fts.size_bytes > 0
+
+
+def test_storage_stats_works_without_the_references_table(tmp_path: Path) -> None:
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+    store._partitions.pop(project_id, None)
+    (store.directory / "projects" / project_id / "references.lance").rename(
+        tmp_path / "references.lance.bak"
+    )
+
+    report = store.storage_stats(project_id)
+
+    assert {table.name for table in report.tables} == {"files", "chunks"}
+    assert report.consistent is True
+
+
+def test_storage_stats_works_for_a_registered_project_without_a_partition(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model", state="pending")
+
+    report = store.storage_stats(project.id)
+
+    assert report.tables == []
+    assert report.partition_physical_bytes == 0
+    assert report.consistent is True
+    # Statistics are read-only: they must not materialize a partition.
+    assert not (store.directory / "projects").exists()
+
+
+def test_physical_byte_accounting_does_not_follow_symlinks(tmp_path: Path) -> None:
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"x" * 1_000_000)
+    partition = store.directory / "projects" / project_id
+    (partition / "linked-file").symlink_to(outside)
+
+    report = store.storage_stats(project_id)
+
+    assert report.partition_physical_bytes < outside.stat().st_size
+    chunks = next(table for table in report.tables if table.name == "chunks")
+    assert chunks.physical_bytes < outside.stat().st_size
+
+
+def test_concurrent_mutation_marks_storage_stats_inconsistent(tmp_path: Path) -> None:
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+    original = LanceStore._table_storage_stats
+
+    def mutate_mid_collection(
+        self: LanceStore,
+        table: object,
+        name: str,
+        *,
+        physical_directory: Path,
+    ) -> object:
+        stats = original(table, name, physical_directory=physical_directory)
+        if name == "chunks":
+            store.upsert_file(stored_file(project_id, file_id="file-2"))
+        return stats
+
+    with patch.object(LanceStore, "_table_storage_stats", mutate_mid_collection):
+        report = store.storage_stats(project_id)
+
+    assert report.consistent is False
+
+
+def test_registry_stats_report_the_project_registry(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model", state="pending")
+
+    stats = store.registry_stats()
+
+    assert stats.name == "projects"
+    assert stats.row_count == 1
+    assert stats.current_version >= 1
+    assert stats.logical_bytes > 0
+    assert stats.physical_bytes > 0
+    assert stats.retained_version_count >= 1
+    assert stats.oldest_version_at is not None
+    assert stats.newest_version_at is not None
+
+
+def test_overlap_warnings_detect_duplicate_and_nested_roots(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    nested = root / "src"
+    other = tmp_path / "other"
+    root.mkdir(parents=True)
+    other.mkdir()
+
+    def project(project_id: str, path: Path) -> ProjectInfo:
+        return ProjectInfo(id=project_id, name=project_id, root=path)
+
+    assert overlap_warnings([project("a", root), project("b", root)]) == [
+        f"Projects 'a' and 'b' register the same root: {root}"
+    ]
+    nested_warnings = overlap_warnings([project("a", root), project("b", nested)])
+    assert len(nested_warnings) == 1
+    assert "nested inside" in nested_warnings[0] or "contains the root" in nested_warnings[0]
+    assert overlap_warnings([project("a", root), project("b", other)]) == []
+
+
+def test_worktree_warnings_share_a_git_common_directory(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    common = tmp_path / ".git"
+    projects = [
+        ProjectInfo(id="a", name="a", root=first),
+        ProjectInfo(id="b", name="b", root=second),
+    ]
+
+    def fake_git(command: list[str], cwd: Path) -> str | None:
+        assert command[:2] == ["git", "rev-parse"]
+        if command[-1] == "--show-toplevel":
+            return str(cwd.resolve())
+        return str(common)
+
+    warnings = worktree_warnings(projects, _run=fake_git)
+
+    assert len(warnings) == 1
+    assert "common directory" in warnings[0]
+    assert "a" in warnings[0] and "b" in warnings[0]
+
+
+def test_worktree_warnings_stay_silent_without_a_shared_common_directory(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    projects = [
+        ProjectInfo(id="a", name="a", root=first),
+        ProjectInfo(id="b", name="b", root=second),
+    ]
+
+    def distinct_commons(command: list[str], cwd: Path) -> str | None:
+        if command[-1] == "--show-toplevel":
+            return str(cwd.resolve())
+        return str(cwd / ".git")
+
+    assert worktree_warnings(projects, _run=distinct_commons) == []
+    # Git being unavailable is a swallowed failure, not a hard error.
+    assert worktree_warnings(projects, _run=lambda command, cwd: None) == []
+
+
+def test_relative_git_common_directories_resolve_against_the_toplevel(
+    tmp_path: Path,
+) -> None:
+    """A main checkout reports a relative --git-common-dir ('.git').
+
+    A linked worktree reports the same directory in absolute form; the two must
+    be recognized as one common directory.
+    """
+    main_root = tmp_path / "repo"
+    worktree_root = tmp_path / "worktree"
+    main_root.mkdir()
+    worktree_root.mkdir()
+    common = main_root / ".git"
+    projects = [
+        ProjectInfo(id="a", name="a", root=main_root),
+        ProjectInfo(id="b", name="b", root=worktree_root),
+    ]
+
+    def fake_git(command: list[str], cwd: Path) -> str | None:
+        if cwd == main_root and command[-1] == "--show-toplevel":
+            return str(main_root)
+        if cwd == worktree_root and command[-1] == "--show-toplevel":
+            return str(worktree_root)
+        if cwd == main_root:
+            return ".git"
+        return str(common)
+
+    warnings = worktree_warnings(projects, _run=fake_git)
+
+    assert len(warnings) == 1
+    assert str(common) in warnings[0]
