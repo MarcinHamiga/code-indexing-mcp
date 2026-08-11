@@ -637,6 +637,20 @@ def test_restore_versions_checkout_raises_instead_of_asserting(
         store.restore_versions(project.id, versions)
 
 
+def test_ensure_indexes_raises_instead_of_asserting_on_a_missing_reference_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    _break_references_table(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="Reference table is missing"):
+        store.ensure_indexes(project.id)
+
+
 def test_replace_files_from_arrow_raises_instead_of_asserting_on_a_missing_reference_table(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

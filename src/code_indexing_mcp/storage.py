@@ -750,7 +750,8 @@ class LanceStore:
         # zero age: searches run concurrently from the daemon and from direct
         # CLI processes, so versions in active use must not be reaped.
         chunks.optimize(cleanup_older_than=timedelta(days=1) if compact else None)
-        assert tables.references is not None
+        if tables.references is None:
+            raise RuntimeError("Reference table is missing from an interrupted transaction")
         reference_indices = list(tables.references.list_indices())
         indexed_reference_columns = {
             column for index in reference_indices for column in index.columns

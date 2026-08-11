@@ -309,7 +309,7 @@ def test_indexer_replaces_changed_files_and_removes_deleted_files(tmp_path: Path
     assert store.list_reference_records(project.id) == []
 
 
-def test_failed_changed_file_preserves_previous_chunks(tmp_path: Path) -> None:
+def test_failed_changed_file_preserves_previous_generation(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
     source = root / "main.py"
@@ -318,28 +318,38 @@ def test_failed_changed_file_preserves_previous_chunks(tmp_path: Path) -> None:
     embedder = RecordingEmbedder()
     indexer, store = make_indexer(tmp_path, embedder)
     indexer.index(project)
-    original = store.list_chunks([project.id])
-    assert store.list_reference_records(project.id)
+    original_chunks = store.list_chunks([project.id])
+    original_references = store.list_reference_records(project.id)
+    original_hash = store.list_files(project.id)[0].content_hash
+    assert original_references
 
     source.write_text("def RAISE_EMBEDDING():\n    return 2\n")
     report = indexer.index(project)
 
     assert len(report.errors) == 1
-    assert store.list_chunks([project.id]) == original
-    # Search chunks can safely retain their own old content, but structural
-    # offsets are applied to the current source file and must be retired.
-    assert store.list_reference_records(project.id) == []
+    # A failed replacement keeps the previous generation live: the retained
+    # chunks, references, and file row all describe the same (old) content
+    # hash, so nothing is served against bytes it was never extracted from.
+    assert store.list_chunks([project.id]) == original_chunks
+    assert store.list_reference_records(project.id) == original_references
+    failed = store.list_files(project.id)[0]
+    assert failed.content_hash == original_hash
+    assert failed.has_errors is True
+    assert store.project_state(project.id) == "partial"
     # A failed file is recorded with its current size/mtime, so subsequent
     # runs skip it instead of re-reading, re-parsing, and re-embedding it.
     batches = len(embedder.passage_batches)
     second = indexer.index(project)
     assert len(embedder.passage_batches) == batches
     assert second.unchanged_files == 1
-    assert store.list_chunks([project.id]) == original
-    assert store.list_reference_records(project.id) == []
+    assert second.errors == []
+    assert store.list_chunks([project.id]) == original_chunks
+    assert store.list_reference_records(project.id) == original_references
+    # The no-op run must not clear the error it did not heal.
+    assert store.list_files(project.id)[0].has_errors is True
 
 
-def test_failed_changed_file_retires_previous_references_on_extraction_failure(
+def test_failed_changed_file_retains_previous_references_on_extraction_failure(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "repo"
@@ -349,14 +359,20 @@ def test_failed_changed_file_retires_previous_references_on_extraction_failure(
     project = initialize_project(root)
     indexer, store = make_indexer(tmp_path, RecordingEmbedder())
     indexer.index(project)
-    assert store.list_reference_records(project.id)
+    original_references = store.list_reference_records(project.id)
+    original_hash = store.list_files(project.id)[0].content_hash
+    assert original_references
     source.write_text("def changed():\n    return 2\n")
 
     with patch.object(indexer.extractor, "extract", side_effect=RuntimeError("query failed")):
         report = indexer.index(project)
 
     assert [issue.path for issue in report.errors] == ["main.py"]
-    assert store.list_reference_records(project.id) == []
+    # An extraction failure is a failed replacement too: the previous
+    # generation stays live and internally consistent, so its references are
+    # retained rather than retired.
+    assert store.list_reference_records(project.id) == original_references
+    assert store.list_files(project.id)[0].content_hash == original_hash
 
 
 def test_a_reindex_that_gains_a_syntax_error_retires_its_stale_references(tmp_path: Path) -> None:
@@ -594,25 +610,34 @@ def test_reference_backfill_does_not_launder_an_embed_failed_file(tmp_path: Path
     embedder = RecordingEmbedder()
     indexer, store = make_indexer(tmp_path, embedder)
     indexer.index(project)
+    original_hash = store.list_files(project.id)[0].content_hash
+    original_references = store.list_reference_records(project.id)
+    assert original_references
 
-    # Change the file's content in a way that fails embedding. The old chunks
-    # (matching the old content) are kept, but the files row now carries the
-    # *new* content hash -- this is what makes the file look "missing" to a
-    # naive backfill.
+    # Change the file's content in a way that fails embedding. The previous
+    # generation -- chunks, references, and the file row -- stays live and
+    # internally consistent: the row keeps the old content hash rather than
+    # advancing to the (never-embedded) new one.
     source.write_text("def RAISE_EMBEDDING():\n    return 43\n")
     failed = indexer.index(project)
     assert len(failed.errors) == 1
     failed_record = store.list_files(project.id)[0]
     assert failed_record.has_errors is True
+    assert failed_record.content_hash == original_hash
+    assert store.list_reference_records(project.id) == original_references
 
     report = indexer.backfill_references(project)
 
-    assert report.incomplete_paths == ["main.py"]
+    # The file is still honestly covered by its retained generation, so
+    # backfill has nothing to write for it -- it neither launders references
+    # for content the chunk table does not contain nor re-parses a file it
+    # already describes.
+    assert report.incomplete_paths == []
     assert report.files_backfilled == 0
-    # No reference generation was committed for content the chunk table does
-    # not actually contain.
+    assert report.complete is True
     coverage = store.coverage_for_file(project.id, failed_record.file_id, REFERENCE_SCHEMA_VERSION)
-    assert not coverage or coverage[0]["content_hash"] != failed_record.content_hash
+    assert coverage and coverage[0]["content_hash"] == failed_record.content_hash
+    assert store.list_reference_records(project.id) == original_references
     _assert_chunk_content_hashes_match_files(store, project.id)
 
     # The failed file heals once it indexes successfully again.
@@ -913,6 +938,50 @@ def test_force_reindexes_previously_failed_file(tmp_path: Path) -> None:
     assert forced.errors == []
     assert forced.indexed_files == 1
     assert store.list_files(project.id)[0].has_errors is False
+
+
+def test_a_later_source_edit_retries_and_clears_the_error_after_success(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def RAISE_EMBEDDING():\n    return 2\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    indexer.index(project)
+    assert store.list_files(project.id)[0].has_errors is True
+
+    # A later source edit changes size/mtime, so the failed file is retried
+    # without force; once the edit succeeds, its stored error is cleared.
+    source.write_text("def stable():\n    return 3\n")
+    healed = indexer.index(project)
+
+    assert healed.errors == []
+    assert healed.unchanged_files == 0
+    assert store.list_files(project.id)[0].has_errors is False
+    assert store.project_state(project.id) == "ready"
+
+
+def test_a_noop_run_cannot_promote_a_partial_project_with_stored_errors_to_ready(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def RAISE_EMBEDDING():\n    return 2\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    assert store.project_state(project.id) == "partial"
+    assert store.list_files(project.id)[0].has_errors is True
+
+    # Nothing changed, so this is a no-op run with no fresh errors -- but the
+    # stored file error still says the project is partial.
+    noop = indexer.index(project)
+
+    assert noop.errors == []
+    assert noop.unchanged_files == 1
+    assert store.project_state(project.id) == "partial"
 
 
 def test_unexpected_index_failure_marks_project_error(tmp_path: Path) -> None:

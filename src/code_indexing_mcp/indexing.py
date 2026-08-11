@@ -357,14 +357,17 @@ class Indexer:
                         staging_job().mark_references_replaced(record.file_id)
                         files_backfilled += 1
                         continue
-                    # The files row's content_hash was advanced by a failed
-                    # index run (stage_failure), but the chunk table still
-                    # holds the previous generation's content. References
-                    # cannot receive the same treatment: their byte offsets
-                    # are applied to the current source file, so any surviving
-                    # generation could target unrelated text. Retire it and
-                    # leave the file honestly uncovered until a successful
-                    # index replaces chunks and references together.
+                    # This file carries has_errors yet has no current coverage:
+                    # it never produced a successful generation (a first-time
+                    # failure, whose row keeps its own content_hash) or its
+                    # coverage is otherwise absent. There is nothing trustworthy
+                    # to keep -- any surviving rows would be from an unknown
+                    # generation and could target unrelated text at their old
+                    # byte offsets. Retire them and leave the file honestly
+                    # uncovered until a successful index replaces chunks and
+                    # references together. A *changed* file whose replacement
+                    # failed keeps its previous content_hash and live
+                    # references, so it never reaches this branch (S2).
                     staging_job().mark_references_replaced(record.file_id)
                     incomplete_paths.append(record.path)
                     continue
@@ -574,18 +577,28 @@ class Indexer:
         def stage_failure(record: StoredFile, exc: Exception) -> None:
             errors.append(IndexIssue(path=record.path, message=str(exc)))
             job = staging_job()
+            previous = existing.get(record.path)
+            # A failed replacement keeps the previous generation live: the
+            # chunks and references that remain in the tables describe the
+            # previous content_hash, so the file row must keep describing them
+            # too. Advancing the row to the new (failed) hash would leave the
+            # row, chunks, and references on different generations -- the
+            # internal divergence S1 tripped over. Only the latest observed
+            # size/mtime and the error state advance.
             job.stage_file(
                 record.model_copy(
                     update={
+                        "content_hash": (
+                            previous.content_hash
+                            if previous is not None
+                            else record.content_hash
+                        ),
                         "has_errors": True,
                         "error": str(exc),
                         "indexed_at": time.time_ns(),
                     }
                 )
             )
-            previous = existing.get(record.path)
-            if previous is not None and previous.content_hash != record.content_hash:
-                job.mark_references_replaced(record.file_id)
 
         def flush_pending() -> None:
             nonlocal indexed, embedded, fallback_count, pending_chunks, pending_chars
@@ -853,7 +866,7 @@ class Indexer:
                     self.store.upsert_project(
                         project,
                         model_id=self.embedder.model_id,
-                        state="partial" if errors else "ready",
+                        state=self._derive_index_state(project.id, errors),
                     )
         except BaseException:
             # A run that never reached the commit phase has not touched the
@@ -890,6 +903,25 @@ class Indexer:
             reference_extraction_duration_ms=reference_extraction_ns // 1_000_000,
             staged_reference_rows=staged_reference_rows,
         )
+
+    def _derive_index_state(self, project_id: str, errors: list[IndexIssue]) -> str:
+        """A project is partial while *this* run errored or any stored file row
+        still records a genuine error.
+
+        The stored rows are checked after the commit, so a file that failed
+        this run is already visible there; the important case is the reverse:
+        a no-op run with no fresh errors must not promote a project that still
+        has stored file errors back to "ready" (it earned "partial" and only a
+        real index run that heals every failed file may clear it). Rejection
+        tombstones are skips, not errors, so they do not keep a project
+        partial.
+        """
+        if errors:
+            return "partial"
+        for record in self.store.list_files(project_id):
+            if record.has_errors and not (record.error or "").startswith("rejected:"):
+                return "partial"
+        return "ready"
 
     def _commit_staged(
         self,
@@ -928,7 +960,7 @@ class Indexer:
             self.store.upsert_project(
                 project,
                 model_id=self.embedder.model_id,
-                state=state if state is not None else ("partial" if errors else "ready"),
+                state=state if state is not None else self._derive_index_state(project.id, errors),
             )
         except BaseException:
             try:
