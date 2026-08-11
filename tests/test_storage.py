@@ -7,6 +7,7 @@ from unittest.mock import patch
 import lancedb
 import pyarrow as pa
 import pytest
+from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
 from code_indexing_mcp.models import ProjectInfo, StoredChunk, StoredFile
@@ -115,17 +116,16 @@ def test_reference_rows_are_replaced_independently_from_chunk_rows(tmp_path: Pat
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=[("file-1", reference_table(reference_record(project.id, "file-1")))],
-        replace_reference_file_ids=["file-1"],
+        chunk_batches=(),
+        reference_batches=[(["file-1"], reference_table(reference_record(project.id, "file-1")))],
     )
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=[
+        chunk_batches=(),
+        reference_batches=[
             (
-                "file-1",
+                ["file-1"],
                 reference_table(
                     reference_record(
                         project.id,
@@ -136,7 +136,6 @@ def test_reference_rows_are_replaced_independently_from_chunk_rows(tmp_path: Pat
                 ),
             )
         ],
-        replace_reference_file_ids=["file-1"],
     )
 
     records = store.list_reference_records(project.id)
@@ -154,17 +153,16 @@ def test_removing_a_file_deletes_its_reference_rows(tmp_path: Path) -> None:
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=[
+        chunk_batches=[
             (
-                record.file_id,
+                [record.file_id],
                 pa.Table.from_pylist(
                     [_stored_chunks(project.id, 1)[0].model_dump()],
                     schema=LanceStore.chunk_arrow_schema(store.vector_dimension),
                 ),
             )
         ],
-        reference_groups=[("file-1", reference_table(reference_record(project.id, "file-1")))],
-        replace_reference_file_ids=["file-1"],
+        reference_batches=[(["file-1"], reference_table(reference_record(project.id, "file-1")))],
     )
 
     assert store.count_chunks([project.id]) == 1
@@ -215,9 +213,8 @@ def test_reference_read_methods_apply_exact_structural_filters(tmp_path: Path) -
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=[("file-1", reference_table(coverage, declaration, imported))],
-        replace_reference_file_ids=["file-1"],
+        chunk_batches=(),
+        reference_batches=[(["file-1"], reference_table(coverage, declaration, imported))],
     )
 
     assert store.coverage_for_file(project.id, "file-1", 1) == [coverage]
@@ -288,9 +285,8 @@ def test_list_reference_records_schema_version_pushes_the_filter_into_sql(
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=[("file-1", reference_table(current, stale))],
-        replace_reference_file_ids=["file-1"],
+        chunk_batches=(),
+        reference_batches=[(["file-1"], reference_table(current, stale))],
     )
 
     assert {row["reference_id"] for row in store.list_reference_records(project.id)} == {
@@ -667,7 +663,7 @@ def test_replace_files_from_arrow_raises_instead_of_asserting_on_a_missing_refer
         store.replace_files_from_arrow(
             project.id,
             files=pa.Table.from_pylist([], schema=LanceStore.file_arrow_schema()),
-            chunk_groups=(),
+            chunk_batches=(),
         )
 
 
@@ -1033,3 +1029,299 @@ def test_relative_git_common_directories_resolve_against_the_registered_root(
 
     assert len(warnings) == 1
     assert str(common) in warnings[0]
+
+
+def _chunk_table(project_id: str, file_id: str, count: int) -> pa.Table:
+    return pa.Table.from_pylist(
+        [
+            {
+                "chunk_id": f"{file_id}:chunk-{index}",
+                "file_id": file_id,
+                "project_id": project_id,
+                "path": "module.py",
+                "language": "python",
+                "kind": "function",
+                "symbol": f"symbol_{index}",
+                "qualified_symbol": f"symbol_{index}",
+                "parent_symbol": None,
+                "start_byte": 0,
+                "end_byte": 1,
+                "start_line": index + 1,
+                "end_line": index + 1,
+                "content": "pass",
+                "embedding_text": "pass",
+                "search_text": "pass",
+                "content_hash": "hash",
+                "part_index": 0,
+                "vector": [0.0, 0.0, 0.0, 1.0],
+            }
+            for index in range(count)
+        ],
+        schema=LanceStore.chunk_arrow_schema(4),
+    )
+
+
+def test_batched_chunk_merge_commits_every_file_in_the_predicate(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    files = pa.Table.from_pylist(
+        [
+            stored_file(project.id, file_id="file-a").model_dump(),
+            stored_file(project.id, file_id="file-b").model_dump(),
+        ],
+        schema=LanceStore.file_arrow_schema(),
+    )
+
+    store.replace_files_from_arrow(
+        project.id,
+        files=files,
+        chunk_batches=[
+            (
+                ["file-a", "file-b"],
+                pa.concat_tables(
+                    [_chunk_table(project.id, "file-a", 2), _chunk_table(project.id, "file-b", 2)]
+                ),
+            )
+        ],
+    )
+
+    chunks = store.list_chunks([project.id])
+    assert len(chunks) == 4
+    assert {chunk.file_id for chunk in chunks} == {"file-a", "file-b"}
+
+
+def test_an_entirely_empty_batch_deletes_its_files_previous_chunks(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    file_id = "file-1"
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id).model_dump()], schema=LanceStore.file_arrow_schema()
+        ),
+        chunk_batches=[([file_id], _chunk_table(project.id, file_id, 2))],
+    )
+    assert store.count_chunks([project.id]) == 2
+
+    empty = pa.Table.from_batches([], schema=LanceStore.chunk_arrow_schema(4))
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id).model_dump()], schema=LanceStore.file_arrow_schema()
+        ),
+        chunk_batches=[([file_id], empty)],
+    )
+
+    assert store.count_chunks([project.id]) == 0
+
+
+def test_a_zero_chunk_file_is_covered_by_a_sibling_batch_predicate(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    for file_id in ("file-a", "file-b"):
+        store.replace_files_from_arrow(
+            project.id,
+            files=pa.Table.from_pylist(
+                [stored_file(project.id, file_id=file_id).model_dump()],
+                schema=LanceStore.file_arrow_schema(),
+            ),
+            chunk_batches=[([file_id], _chunk_table(project.id, file_id, 1))],
+        )
+    assert store.count_chunks([project.id]) == 2
+
+    # file-b now extracts to nothing while file-a still has one chunk; they
+    # share one batch, so the merge's predicate must retire file-b's rows.
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id, file_id="file-a").model_dump()],
+            schema=LanceStore.file_arrow_schema(),
+        ),
+        chunk_batches=[
+            (
+                ["file-a", "file-b"],
+                pa.concat_tables([_chunk_table(project.id, "file-a", 1)]),
+            )
+        ],
+    )
+
+    chunks = store.list_chunks([project.id])
+    assert [chunk.file_id for chunk in chunks] == ["file-a"]
+
+
+def test_removed_files_are_deleted_in_one_batched_predicate_per_table(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    for index in range(3):
+        file_id = f"file-{index}"
+        store.replace_files_from_arrow(
+            project.id,
+            files=pa.Table.from_pylist(
+                [stored_file(project.id, file_id=file_id).model_dump()],
+                schema=LanceStore.file_arrow_schema(),
+            ),
+            chunk_batches=[([file_id], _chunk_table(project.id, file_id, 1))],
+        )
+    assert store.count_chunks([project.id]) == 3
+
+    original_delete = LanceTable.delete
+    calls: dict[str, int] = {}
+
+    def counting_delete(self: LanceTable, predicate: str) -> None:
+        calls[self.name] = calls.get(self.name, 0) + 1
+        original_delete(self, predicate)
+
+    with patch.object(LanceTable, "delete", counting_delete):
+        store.replace_files_from_arrow(
+            project.id,
+            files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+            chunk_batches=(),
+            removed_file_ids=["file-0", "file-1", "file-2"],
+        )
+
+    assert calls == {"chunks": 1, "references": 1, "files": 1}
+    assert store.count_chunks([project.id]) == 0
+    assert store.list_files(project.id) == []
+
+
+def test_replacement_ids_win_over_removal_ids(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    file_id = "file-a"
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id, file_id=file_id).model_dump()],
+            schema=LanceStore.file_arrow_schema(),
+        ),
+        chunk_batches=[([file_id], _chunk_table(project.id, file_id, 1))],
+    )
+
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id, file_id=file_id).model_dump()],
+            schema=LanceStore.file_arrow_schema(),
+        ),
+        chunk_batches=[([file_id], _chunk_table(project.id, file_id, 2))],
+        removed_file_ids=[file_id],
+    )
+
+    assert store.count_chunks([project.id]) == 2
+    assert [record.file_id for record in store.list_files(project.id)] == [file_id]
+
+
+def test_five_hundred_files_commit_in_eight_data_batches_per_table(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    file_ids = [f"file-{index}" for index in range(500)]
+    chunk_batches = []
+    reference_batches = []
+    for offset in range(0, 500, 64):
+        batch_ids = file_ids[offset : offset + 64]
+        chunk_batches.append(
+            (
+                batch_ids,
+                pa.concat_tables([_chunk_table(project.id, file_id, 1) for file_id in batch_ids]),
+            )
+        )
+        reference_batches.append(
+            (
+                batch_ids,
+                pa.concat_tables(
+                    [
+                        reference_table(
+                            reference_record(
+                                project.id,
+                                file_id,
+                                reference_id=f"{file_id}:reference",
+                            )
+                        )
+                        for file_id in batch_ids
+                    ]
+                ),
+            )
+        )
+    files = pa.Table.from_pylist(
+        [stored_file(project.id, file_id=file_id).model_dump() for file_id in file_ids],
+        schema=LanceStore.file_arrow_schema(),
+    )
+
+    original_merge = LanceTable.merge_insert
+    merges: dict[str, int] = {}
+
+    def counting_merge(self: LanceTable, key: str) -> object:
+        merges[self.name] = merges.get(self.name, 0) + 1
+        return original_merge(self, key)
+
+    with patch.object(LanceTable, "merge_insert", counting_merge):
+        store.replace_files_from_arrow(
+            project.id,
+            files=files,
+            chunk_batches=chunk_batches,
+            reference_batches=reference_batches,
+        )
+
+    assert merges["chunks"] == 8
+    assert merges["references"] == 8
+    assert merges["files"] == 1
+    assert store.count_chunks([project.id]) == 500
+    assert len(store.list_reference_records(project.id)) == 500
+
+
+def test_upsert_project_skips_a_noop_registry_write(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    version_after_first = store.registry_stats().current_version
+
+    store.upsert_project(project, model_id="test/model")
+
+    assert store.registry_stats().current_version == version_after_first
+
+
+def test_upsert_project_writes_when_the_state_changes(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model", state="pending")
+    version_after_first = store.registry_stats().current_version
+
+    store.upsert_project(project, model_id="test/model", state="ready")
+
+    assert store.registry_stats().current_version == version_after_first + 1
+
+
+def test_mark_project_state_skips_when_the_state_is_unchanged(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model", state="pending")
+    store.mark_project_state(project.id, "error")
+    version_after_error = store.registry_stats().current_version
+
+    assert store.mark_project_state(project.id, "error") is True
+
+    assert store.registry_stats().current_version == version_after_error

@@ -8,8 +8,10 @@ from unittest.mock import patch
 import pyarrow as pa
 import pytest
 from filelock import FileLock
+from lancedb.table import LanceTable
 from test_token_batching import fake_encode
 
+from code_indexing_mcp import staging as staging_module
 from code_indexing_mcp.embedding import (
     EmbeddedSegment,
     PassageCandidate,
@@ -415,14 +417,13 @@ def _remove_reference_generation(store: LanceStore, project_id: str) -> None:
         store.replace_files_from_arrow(
             project_id,
             files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
-            chunk_groups=(),
-            reference_groups=[
+            chunk_batches=(),
+            reference_batches=[
                 (
-                    record.file_id,
+                    [record.file_id],
                     pa.Table.from_batches([], schema=LanceStore.reference_arrow_schema()),
                 )
             ],
-            replace_reference_file_ids=[record.file_id],
         )
 
 
@@ -437,14 +438,15 @@ def _remove_reference_coverage(store: LanceStore, project_id: str) -> None:
         store.replace_files_from_arrow(
             project_id,
             files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
-            chunk_groups=(),
-            reference_groups=[
+            chunk_batches=(),
+            reference_batches=[
                 (
-                    record.file_id,
-                    pa.Table.from_pylist(remaining, schema=LanceStore.reference_arrow_schema()),
+                    [record.file_id],
+                    pa.Table.from_pylist(
+                        remaining, schema=LanceStore.reference_arrow_schema()
+                    ),
                 )
             ],
-            replace_reference_file_ids=[record.file_id],
         )
 
 
@@ -842,11 +844,13 @@ def test_backfill_retires_reference_rows_from_a_retired_schema_version(tmp_path:
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=[
-            (file_id, pa.Table.from_pylist(downgraded, schema=LanceStore.reference_arrow_schema()))
+        chunk_batches=(),
+        reference_batches=[
+            (
+                [file_id],
+                pa.Table.from_pylist(downgraded, schema=LanceStore.reference_arrow_schema()),
+            )
         ],
-        replace_reference_file_ids=[file_id],
     )
     assert all(
         row["schema_version"] == stale_version for row in store.list_reference_records(project.id)
@@ -1363,3 +1367,93 @@ def test_two_references_over_one_range_survive_a_reindex(tmp_path: Path) -> None
     assert report.errors == []
     assert report.indexed_files == 1
     assert store.project_state(project.id) == "ready"
+
+
+def test_a_noop_run_creates_zero_partition_mutations(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def stable():\n    return 1\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    versions_before = store.table_versions(project.id)
+
+    noop = indexer.index(project)
+
+    assert noop.errors == []
+    assert noop.unchanged_files == 1
+    assert store.table_versions(project.id) == versions_before
+
+
+def test_five_hundred_changed_files_commit_in_bounded_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    for index in range(500):
+        (root / f"file_{index}.py").write_text(f"def function_{index}():\n    return {index}\n")
+    monkeypatch.setattr(staging_module, "COMMIT_BATCH_MAX_FILES", 64)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+
+    original_merge = LanceTable.merge_insert
+    merges: dict[str, int] = {}
+
+    def counting_merge(self: LanceTable, key: str) -> object:
+        merges[self.name] = merges.get(self.name, 0) + 1
+        return original_merge(self, key)
+
+    with patch.object(LanceTable, "merge_insert", counting_merge):
+        report = indexer.index(project)
+
+    assert report.errors == []
+    assert merges["chunks"] == 8
+    assert merges["references"] == 8
+    assert merges["files"] == 1
+    assert store.count_chunks([project.id]) == 500
+
+
+def test_a_failure_mid_commit_restores_all_three_tables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def first():\n    return 1\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    files_before = store.list_files(project.id)
+    chunks_before = store.list_chunks([project.id])
+    references_before = store.list_reference_records(project.id)
+
+    (root / "main.py").write_text("def renamed():\n    return 43\n")
+    (root / "second.py").write_text("def other():\n    return 2\n")
+    # One file per batch, so the second chunk batch fails after the first
+    # batch already mutated the live tables.
+    monkeypatch.setattr(staging_module, "COMMIT_BATCH_MAX_FILES", 1)
+    original_merge = LanceTable.merge_insert
+    calls = {"count": 0}
+
+    def failing_merge(self: LanceTable, key: str) -> object:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("simulated failure on the second chunk batch")
+        return original_merge(self, key)
+
+    with (
+        patch.object(LanceTable, "merge_insert", failing_merge),
+        pytest.raises(RuntimeError, match="second chunk batch"),
+    ):
+        indexer.index(project)
+
+    assert store.list_files(project.id) == files_before
+    assert store.list_chunks([project.id]) == chunks_before
+    assert store.list_reference_records(project.id) == references_before
+    assert store.project_state(project.id) == "error"
+
+    healed = indexer.index(project)
+    assert healed.errors == []
+    assert {chunk.qualified_symbol for chunk in store.list_chunks([project.id])} == {
+        "renamed",
+        "other",
+    }

@@ -106,6 +106,11 @@ def _quoted(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _file_ids_condition(file_ids: Iterable[str]) -> str:
+    """A predicate matching every file in *file_ids* with one IN list."""
+    return f"file_id IN ({', '.join(_quoted(file_id) for file_id in file_ids)})"
+
+
 def _nullable_int(value: Any) -> int | None:
     """Coerce a fragment-length statistic, tolerating None and non-finite noise."""
     if value is None:
@@ -361,6 +366,15 @@ class LanceStore:
             "state": state,
             "updated_at": time.time_ns(),
         }
+        # A no-op upsert -- project discovery, a status check, a state that did
+        # not change -- must not churn registry versions. The comparison
+        # excludes updated_at so a real mutation still stamps it fresh.
+        if existing and all(
+            str(existing[0][column]) == str(row[column])
+            for column in row
+            if column != "updated_at"
+        ):
+            return
         self._merge(self._projects, "id", [row])
 
     def list_projects(self) -> list[ProjectInfo]:
@@ -482,6 +496,8 @@ class LanceStore:
         rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
         if not rows:
             return False
+        if str(rows[0]["state"]) == state:
+            return True
         row = dict(rows[0])
         row["state"] = state
         row["updated_at"] = time.time_ns()
@@ -493,22 +509,27 @@ class LanceStore:
         project_id: str,
         *,
         files: pa.Table,
-        chunk_groups: Iterable[tuple[str, pa.Table]],
-        reference_groups: Iterable[tuple[str, pa.Table]] = (),
-        replace_reference_file_ids: Iterable[str] = (),
+        chunk_batches: Iterable[tuple[list[str], pa.Table]],
+        reference_batches: Iterable[tuple[list[str], pa.Table]] = (),
         removed_file_ids: Iterable[str] = (),
     ) -> None:
         """Commit staged Arrow batches without materializing chunk objects.
 
-        *chunk_groups* yields one ``(file_id, table)`` pair per replaced file,
-        so at most one file's chunks are live in Arrow form at a time; the
-        vector columns stay fixed-size-list float32 arrays end to end. A group
-        with zero rows means the file now extracts to no chunks, so its
-        previous chunks are deleted.
+        Each batch carries its full affected ``file_ids`` predicate: one
+        ``merge_insert`` runs per non-empty batch (one batched ``delete`` when
+        the whole batch has no rows), so table versions scale with O(batches)
+        rather than O(files). ``when_not_matched_by_source_delete`` removes a
+        file's previous rows both when its ids changed and when the file now
+        extracts to nothing, since every file in the predicate is either
+        present in the source or intentionally empty. Replacement ids win over
+        removal ids, and removed files are deleted in one predicate per table.
+        The vector columns stay fixed-size-list float32 arrays end to end.
         """
         tables = self._tables(project_id)
-        for file_id, chunks in chunk_groups:
-            condition = f"file_id = {_quoted(file_id)}"
+        replacement_ids: list[str] = []
+        for file_ids, chunks in chunk_batches:
+            replacement_ids.extend(file_ids)
+            condition = _file_ids_condition(file_ids)
             if chunks.num_rows:
                 (
                     tables.chunks.merge_insert("chunk_id")
@@ -521,12 +542,9 @@ class LanceStore:
                 tables.chunks.delete(condition)
         if tables.references is None:
             raise RuntimeError("Reference table is missing from an interrupted transaction")
-        wanted_reference_ids = set(replace_reference_file_ids)
-        seen_reference_ids: set[str] = set()
-        for file_id, references in reference_groups:
-            if file_id not in wanted_reference_ids:
-                continue
-            condition = f"file_id = {_quoted(file_id)}"
+        for file_ids, references in reference_batches:
+            replacement_ids.extend(file_ids)
+            condition = _file_ids_condition(file_ids)
             if references.num_rows:
                 (
                     tables.references.merge_insert("reference_id")
@@ -537,13 +555,12 @@ class LanceStore:
                 )
             else:
                 tables.references.delete(condition)
-            seen_reference_ids.add(file_id)
-        for file_id in wanted_reference_ids - seen_reference_ids:
-            tables.references.delete(f"file_id = {_quoted(file_id)}")
         if files.num_rows:
             self._merge(tables.files, "file_id", files)
-        for file_id in removed_file_ids:
-            condition = f"file_id = {_quoted(file_id)}"
+        replaced = set(replacement_ids)
+        removed = [file_id for file_id in removed_file_ids if file_id not in replaced]
+        if removed:
+            condition = _file_ids_condition(removed)
             tables.chunks.delete(condition)
             tables.references.delete(condition)
             tables.files.delete(condition)
