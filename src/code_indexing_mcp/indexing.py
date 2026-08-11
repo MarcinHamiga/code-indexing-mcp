@@ -589,9 +589,7 @@ class Indexer:
                 record.model_copy(
                     update={
                         "content_hash": (
-                            previous.content_hash
-                            if previous is not None
-                            else record.content_hash
+                            previous.content_hash if previous is not None else record.content_hash
                         ),
                         "has_errors": True,
                         "error": str(exc),
@@ -918,9 +916,8 @@ class Indexer:
         """
         if errors:
             return "partial"
-        for record in self.store.list_files(project_id):
-            if record.has_errors and not (record.error or "").startswith("rejected:"):
-                return "partial"
+        if self.store.has_file_errors(project_id):
+            return "partial"
         return "ready"
 
     def _commit_staged(

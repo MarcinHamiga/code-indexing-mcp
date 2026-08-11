@@ -12,7 +12,7 @@ from typing import Any, Final, Literal, NamedTuple, cast
 
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import STRUCTURAL_LANGUAGES
-from .indexing import REFERENCE_SCHEMA_VERSION
+from .indexing import REFERENCE_SCHEMA_VERSION, _digest
 from .models import (
     CompletenessReport,
     DeclarationSelector,
@@ -330,6 +330,19 @@ class ReferenceService:
         }
         hits: list[ReferenceHit] = []
         limitations: list[ReferenceLimitation] = self._coverage_limitations(records, backfill)
+        # Serve-time staleness gate: coverage rows carry the content hash the
+        # structural rows were extracted from, and offsets are applied to the
+        # file as it sits on disk. A file whose bytes changed since extraction
+        # (e.g. a failed replacement that retained its previous generation)
+        # would otherwise have those old offsets served against text they
+        # never described -- a wrong-edit hazard for callers that trust them.
+        coverage_hashes = {
+            row["path"]: row["content_hash"]
+            for row in records
+            if row["record_kind"] == "coverage" and row["content_hash"]
+        }
+        digests: dict[str, str] = {}
+        stale_paths: set[str] = set()
         for row in records:
             if row["record_kind"] != "reference" or not self._may_refer(
                 row, selected, imports, reexport_rows, known_paths
@@ -352,6 +365,9 @@ class ReferenceService:
                     ReferenceLimitation(code=reason, explanation=explanation, path=row["path"])
                 )
             source, bom = self._file_bytes(root, row["path"], sources)
+            if not self._matches_coverage(row["path"], coverage_hashes, source, bom, digests):
+                stale_paths.add(row["path"])
+                continue
             start_byte = row["start_byte"] or 0
             end_byte = row["end_byte"] or 0
             hits.append(
@@ -386,6 +402,22 @@ class ReferenceService:
                     resolution=cast(Literal["exact", "likely", "unresolved"], resolution),
                     reason_code=reason,
                     explanation=explanation,
+                )
+            )
+        selected_source, selected_bom = self._file_bytes(root, selected.path, sources)
+        if not self._matches_coverage(
+            selected.path, coverage_hashes, selected_source, selected_bom, digests
+        ):
+            stale_paths.add(selected.path)
+        if stale_paths:
+            limitations.append(
+                ReferenceLimitation(
+                    code="stale_file",
+                    explanation=(
+                        f"{len(stale_paths)} file(s) changed on disk after their structural "
+                        "rows were extracted, so offsets stored for them were suppressed as "
+                        f"stale: {self._sample(sorted(stale_paths))}"
+                    ),
                 )
             )
         hits.sort(key=lambda hit: (hit.path, hit.start_line, hit.start_byte, hit.reference_id))
@@ -862,6 +894,12 @@ class ReferenceService:
             return []
         imports = self._imports_by_file(records)
         known_paths = self._known_paths(records)
+        coverage_hashes = {
+            row["path"]: row["content_hash"]
+            for row in records
+            if row["record_kind"] == "coverage" and row["content_hash"]
+        }
+        digests: dict[str, str] = {}
         inheritance_rows = [
             row
             for row in records
@@ -900,6 +938,8 @@ class ReferenceService:
                 if override_decl is None:
                     continue
                 source, bom = self._file_bytes(root, row["path"], sources)
+                if not self._matches_coverage(row["path"], coverage_hashes, source, bom, digests):
+                    continue
                 start_byte = (override_decl["start_byte"] or 0) + bom
                 end_byte = (override_decl["end_byte"] or 0) + bom
                 edit_start, edit_end = self._edit_span(
@@ -1496,6 +1536,36 @@ class ReferenceService:
     def _project_root(self, project_id: str) -> Path | None:
         project = next((item for item in self.store.list_projects() if item.id == project_id), None)
         return project.root if project is not None else None
+
+    @staticmethod
+    def _matches_coverage(
+        path: str,
+        coverage_hashes: dict[str, str],
+        source: bytes,
+        bom: int,
+        digests: dict[str, str],
+    ) -> bool:
+        """Whether a file's current bytes still match what its rows were extracted from.
+
+        Reference offsets are applied to the file as it sits on disk, so rows
+        whose extraction hash no longer matches those bytes would be served
+        against text they never described -- a wrong-edit hazard for callers
+        that trust the offsets (a failed replacement deliberately retains its
+        previous generation's rows). Digests are memoized per path because a
+        file can hold many candidate rows. A file with no coverage row has
+        nothing to validate against and is trusted. `source` is BOM-stripped,
+        so the marker is added back before hashing: extraction hashed the raw
+        bytes, marker included.
+        """
+        expected = coverage_hashes.get(path)
+        if expected is None:
+            return True
+        digest = digests.get(path)
+        if digest is None:
+            raw = (_BOM + source) if bom else source
+            digest = _digest(raw)
+            digests[path] = digest
+        return digest == expected
 
     @staticmethod
     def _file_bytes(

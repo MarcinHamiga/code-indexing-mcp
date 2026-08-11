@@ -689,3 +689,28 @@ def test_has_reference_table_distinguishes_missing_from_empty(tmp_path: Path) ->
         tmp_path / "references.lance.bak"
     )
     assert store.has_reference_table(project.id) is False
+
+
+def test_has_file_errors(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+
+    # Never indexed: no partition at all.
+    assert store.has_file_errors(project.id) is False
+
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_file(stored_file(project.id))
+    assert store.has_file_errors(project.id) is False
+
+    # A rejection tombstone is a deliberate skip, not an error.
+    store.upsert_file(
+        stored_file(project.id).model_copy(update={"has_errors": True, "error": "rejected: binary"})
+    )
+    assert store.has_file_errors(project.id) is False
+
+    store.upsert_file(
+        stored_file(project.id).model_copy(update={"has_errors": True, "error": "embedding failed"})
+    )
+    assert store.has_file_errors(project.id) is True
