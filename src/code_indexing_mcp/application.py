@@ -123,9 +123,7 @@ def _write_maintenance_timestamp(path: Path) -> None:
 
 def _estimate_reclaimable(stats: ProjectStorageStats) -> int:
     """Estimate bytes a table could reclaim: physical minus logical, floor zero."""
-    return sum(
-        max(0, table.physical_bytes - table.logical_bytes) for table in stats.tables
-    )
+    return sum(max(0, table.physical_bytes - table.logical_bytes) for table in stats.tables)
 
 
 def _versions_removed(before: ProjectStorageStats, after: ProjectStorageStats) -> int:
@@ -753,8 +751,9 @@ class Application:
         Runs under the same global and per-project writer locks indexing uses,
         so a pass never races a commit. Automatic passes attempt the locks
         without waiting and record busy projects as skipped; manual passes wait
-        them out. A dry run collects before/after statistics and an estimate of
-        reclaimable bytes but mutates nothing and takes no locks.
+        them out. A dry run collects the before statistics, a reclaimable-bytes
+        estimate, and no after statistics (``after`` stays null) but mutates
+        nothing and takes no locks.
 
         ``trigger`` labels the pass as ``manual`` or ``scheduled`` for audit
         purposes. The registry is maintained once under the global lock; when an
@@ -809,7 +808,11 @@ class Application:
             global_lock = FileLock(lock_directory / "index-global.lock")
             project_lock = FileLock(lock_directory / f"{registered_project.id}.lock")
             try:
-                if not acquire(global_lock) or not acquire(project_lock):
+                global_acquired = acquire(global_lock)
+                project_acquired = global_acquired and acquire(project_lock)
+                if not project_acquired:
+                    if global_acquired:
+                        global_lock.release()
                     results.append(
                         MaintenanceProjectResult(
                             project=registered_project,
@@ -820,9 +823,7 @@ class Application:
                     )
                     continue
                 try:
-                    self.store.maintain_project(
-                        registered_project.id, cleanup_older_than=retention
-                    )
+                    self.store.maintain_project(registered_project.id, cleanup_older_than=retention)
                 finally:
                     global_lock.release()
                     project_lock.release()
@@ -866,8 +867,7 @@ class Application:
                 registry_after = self.store.registry_stats()
                 registry_versions_removed = max(
                     0,
-                    registry_before.retained_version_count
-                    - registry_after.retained_version_count,
+                    registry_before.retained_version_count - registry_after.retained_version_count,
                 )
                 registry_bytes_reclaimed = max(
                     0, registry_before.physical_bytes - registry_after.physical_bytes
@@ -915,7 +915,9 @@ class Application:
         24 hours, using the timestamp of the last successful pass. Runs in any
         indexing mode: maintenance never scans source files or creates a new
         logical generation, so lazy, eager, and manual modes are all eligible.
-        Busy projects are skipped, not waited on.
+        Busy projects are skipped, not waited on; a pass that maintained nothing
+        because every project was busy leaves the stamp stale so the next
+        startup retries it.
         """
         if not self.settings.auto_maintenance:
             return None
@@ -923,10 +925,12 @@ class Application:
         last = _read_maintenance_timestamp(timestamp_path)
         if last is not None and datetime.now(UTC) - last < MAINTENANCE_CHECK_INTERVAL:
             return None
-        report = self.maintain_storage(
-            dry_run=False, wait_for_lock=False, trigger="scheduled"
-        )
+        report = self.maintain_storage(dry_run=False, wait_for_lock=False, trigger="scheduled")
         if report.failed_projects:
+            return report
+        # A pass where every project was busy maintained nothing: leaving the
+        # stamp stale retries it at the next startup instead of waiting 24 hours.
+        if report.busy_projects and not any(result.status == "ok" for result in report.projects):
             return report
         _write_maintenance_timestamp(timestamp_path)
         return report

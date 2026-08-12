@@ -917,6 +917,49 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_startup_maintenance_defers_to_startup_indexing(tmp_path: Path) -> None:
+    """Scheduled maintenance never competes with the initial index build.
+
+    Regression test for the Windows 3.13 CI timeout: an eager server previously
+    ran its maintenance pass at startup, racing the blocked startup index for
+    the writer lock and optimizing tables that a tight-timeout query was about
+    to read.
+    """
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+
+    embedder = BlockingEmbedder()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=embedder,
+        cwd=tmp_path,
+    )
+    server = create_server(app, auto_index=True)
+    timestamp_path = app.paths.data / "maintenance.json"
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    try:
+        async with create_connected_server_and_client_session(
+            server, list_roots_callback=list_roots
+        ) as client:
+            await client.list_tools()
+            assert await asyncio.to_thread(embedder.started.wait, 5)
+            await asyncio.sleep(0.3)
+            assert not timestamp_path.exists()
+            embedder.release.set()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not timestamp_path.exists():
+                await asyncio.sleep(0.05)
+            assert timestamp_path.exists()
+    finally:
+        embedder.release.set()
+
+
+@pytest.mark.asyncio
 async def test_explicit_code_query_ignores_unrelated_startup_failure(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
     ready_root.mkdir()

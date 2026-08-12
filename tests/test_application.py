@@ -865,6 +865,7 @@ def test_maintenance_preserves_data_through_the_full_application_path(tmp_path: 
     assert entry.bytes_reclaimed >= 0
     assert entry.reclaimable_bytes_estimate >= 0
     assert report.registry_after is not None
+
     # Maintenance must not change what searches return. Relevance scores can
     # shift fractionally when optimize merges the FTS index, so compare the
     # hit identities, not the scores.
@@ -923,6 +924,59 @@ def test_busy_projects_are_skipped_in_automatic_maintenance(tmp_path: Path) -> N
     assert report.registry_after is not None
 
 
+def test_maintenance_releases_the_global_lock_when_a_project_is_busy(tmp_path: Path) -> None:
+    """A busy project must not leave the global writer lock held behind it.
+
+    The scheduled pass acquires the global lock before the per-project lock; if
+    the project is busy the global lock is released before skipping, so later
+    maintenance and indexing in this process can re-acquire it immediately.
+    (CPython's refcounting masks a leaked FileLock at function exit, which is
+    why the probe and the follow-up pass assert the observable contract.)
+    """
+    from filelock import FileLock
+
+    app, project = _indexed_app(tmp_path)
+    competing = FileLock(app.paths.data / "locks" / f"{project.id}.lock")
+    competing.acquire()
+    try:
+        report = app.maintain_storage(wait_for_lock=False)
+    finally:
+        competing.release()
+
+    assert project.id in report.busy_projects
+    probe = FileLock(app.paths.data / "locks" / "index-global.lock")
+    assert probe.acquire(timeout=0)
+    probe.release()
+
+    rerun = app.maintain_storage(wait_for_lock=False)
+    by_id = {result.project.id: result for result in rerun.projects}
+    assert by_id[project.id].status == "ok"
+    assert rerun.registry_after is not None
+
+
+def test_maybe_run_maintenance_retries_an_all_busy_pass(tmp_path: Path) -> None:
+    """A pass that maintained nothing must leave the timestamp stale for retry."""
+    from filelock import FileLock
+
+    app, project = _indexed_app(tmp_path)
+    competing = FileLock(app.paths.data / "locks" / "index-global.lock")
+    competing.acquire()
+    try:
+        report = app.maybe_run_maintenance()
+    finally:
+        competing.release()
+
+    assert report is not None
+    assert project.id in report.busy_projects
+    timestamp_path = app.paths.data / "maintenance.json"
+    assert not timestamp_path.exists()
+    # Still due: the next startup retries instead of waiting out 24 hours.
+    retried = app.maybe_run_maintenance()
+    assert retried is not None
+    assert any(result.status == "ok" for result in retried.projects)
+    assert timestamp_path.exists()
+
+
 class _ExplodingEmbedder:
     model_id = "test/tiny"
     dimension = 4
@@ -979,9 +1033,7 @@ def test_maybe_run_maintenance_respects_the_24h_cadence_and_persists(
 
     # An overdue timestamp (or a missing one) makes the next check run again.
     overdue = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
-    timestamp_path.write_text(
-        json.dumps({"schema_version": 1, "last_maintenance_at": overdue})
-    )
+    timestamp_path.write_text(json.dumps({"schema_version": 1, "last_maintenance_at": overdue}))
     again = app.maybe_run_maintenance()
     assert again is not None
     assert json.loads(timestamp_path.read_text())["last_maintenance_at"] != first

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
@@ -131,6 +130,7 @@ class StartupCoordinator:
         self._monitors: dict[Path, asyncio.Queue[None]] = {}
         self._lock = asyncio.Lock()
         self._limiter = anyio.CapacityLimiter(1)
+        self._first_schedule: asyncio.Event = asyncio.Event()
 
     async def schedule(self, roots: list[Path], *, indexes: bool) -> None:
         if self.mode is IndexMode.MANUAL:
@@ -159,6 +159,22 @@ class StartupCoordinator:
                 job_root = registered_root or root
                 self._jobs[job_root] = job
                 self.task_group.start_soon(self._run, job_root, job)
+        self._first_schedule.set()
+
+    async def wait_for_startup_settled(self) -> None:
+        """Return once startup scheduling has begun and its index jobs have settled.
+
+        Scheduled maintenance waits here so its optimize pass never competes
+        with the initial index build for the same tables; a job that blocks
+        forever simply defers maintenance to the next process start.
+        """
+        await self._first_schedule.wait()
+        while True:
+            async with self._lock:
+                pending = any(job.indexes and not job.ready.is_set() for job in self._jobs.values())
+            if not pending:
+                return
+            await asyncio.sleep(0.25)
 
     async def _is_stale(self, project_id: str) -> bool:
         return await anyio.to_thread.run_sync(
@@ -577,36 +593,48 @@ class AutoIndexingMCP(FastMCP):
     async def _lifespan(self, _: FastMCP) -> AsyncIterator[StartupCoordinator]:
         async with anyio.create_task_group() as task_group:
             try:
-                self._schedule_startup_maintenance()
-                yield StartupCoordinator(
+                coordinator = StartupCoordinator(
                     self.application,
                     task_group,
                     mode=self.mode,
                     wait_seconds=self.wait_seconds,
                 )
+                if not isinstance(self.application, BrokerApplication):
+                    task_group.start_soon(self._run_startup_maintenance, coordinator)
+                yield coordinator
             finally:
                 # Lock waiters are cancellable between non-blocking attempts. A worker
                 # that has acquired the index lock remains owned until its write
                 # finishes because run_sync is not abandoned on cancellation.
                 task_group.cancel_scope.cancel()
 
-    def _schedule_startup_maintenance(self) -> None:
-        """Run overdue scheduled maintenance once, in the background, in any index mode.
+    async def _run_startup_maintenance(self, coordinator: StartupCoordinator) -> None:
+        """Run overdue scheduled maintenance once, after startup indexing settles.
 
         Direct MCP processes are long-lived enough to owe the same 24-hour
-        maintenance cadence the daemon owes. When serving through the daemon,
-        the daemon itself runs startup maintenance, so only a real
-        ``Application`` schedules here. The pass never scans source files or
-        loads the embedding model, so it runs regardless of the indexing mode;
-        it attempts the writer locks without waiting and skips busy projects.
+        maintenance cadence the daemon owes. The pass never scans source files
+        or loads the embedding model, so it runs regardless of the indexing
+        mode; it attempts the writer locks without waiting and skips busy
+        projects. When serving through the daemon, the daemon itself runs
+        startup maintenance, so only a real ``Application`` schedules here.
+
+        The pass is deferred until the startup index jobs have settled so its
+        optimize pass never competes with the initial index build on the same
+        tables; an index that never settles simply defers maintenance to the
+        next process start. Manual mode never indexes at startup, so there is
+        nothing to wait for there.
         """
-        if isinstance(self.application, BrokerApplication):
-            return
-        threading.Thread(
-            target=self.application.maybe_run_maintenance,
-            name="code-indexing-mcp-maintenance",
-            daemon=True,
-        ).start()
+        try:
+            if isinstance(self.application, BrokerApplication):
+                return
+            if coordinator.mode is not IndexMode.MANUAL:
+                await coordinator.wait_for_startup_settled()
+            await anyio.to_thread.run_sync(
+                self.application.maybe_run_maintenance,
+                abandon_on_cancel=False,
+            )
+        except Exception:
+            logger.exception("Scheduled maintenance after server startup failed")
 
     async def list_tools(self) -> list[MCPTool]:
         tools = await super().list_tools()
@@ -841,10 +869,11 @@ def create_server(
         title="Index storage maintenance",
         description=(
             "Compact tables and remove verified old Lance versions for one project or the whole "
-            "installation. Returns before and after storage statistics, versions removed, bytes "
-            "reclaimed, duration, skipped projects, and busy projects; pre-cleanup reclaimable "
-            "bytes are labelled an estimate. Dry-run by default: only an explicit "
-            "dry_run=false performs cleanup. Never uses zero-age retention or delete_unverified."
+            "installation. Dry-run by default: it reports the before statistics and a labelled "
+            "reclaimable-bytes estimate, leaving the after statistics null; only an explicit "
+            "dry_run=false performs cleanup and reports the after statistics, versions removed, "
+            "bytes reclaimed, duration, skipped projects, and busy projects. Never uses zero-age "
+            "retention or delete_unverified."
         ),
         annotations=_READS_AND_REGISTERS,
     )

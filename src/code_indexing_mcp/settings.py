@@ -25,8 +25,8 @@ MAX_CROSSOVER_CHARACTERS = 1024**3
 # Automatic maintenance reclaims verified versions older than this by default.
 # The lower bound of one hour keeps zero-age cleanup unreachable from
 # configuration: concurrent readers must never have live versions reaped under
-# them, and an operator who wants everything gone has the explicit storage
-# vacuum command instead.
+# them. The manual storage vacuum command performs the same bounded cleanup
+# on demand rather than unlocking a lower floor.
 DEFAULT_VERSION_RETENTION_HOURS = 24
 MAX_VERSION_RETENTION_HOURS = 24 * 30
 
