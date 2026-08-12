@@ -336,8 +336,14 @@ def test_concurrent_clients_share_one_model_and_one_indexing_job(
     (root / "main.py").write_text("def answer():\n    return 42\n")
     # in-process execution keeps embedding on the daemon's own FastEmbedder,
     # which is where the shared model lives; the worker path would spawn a real
-    # process and load the real model.
-    settings = IndexSettings.from_environment({"CODE_INDEXING_INDEX_EXECUTION": "in-process"})
+    # process and load the real model. Startup maintenance is disabled: its
+    # background pass would race the barrier clients for the global lock.
+    settings = IndexSettings.from_environment(
+        {
+            "CODE_INDEXING_INDEX_EXECUTION": "in-process",
+            "CODE_INDEXING_AUTO_MAINTENANCE": "0",
+        }
+    )
     application = Application(
         paths,
         embedder=FastEmbedder(paths.cache / "models", offline=True),
@@ -616,7 +622,12 @@ def test_daemon_idle_timeout_waits_for_startup_maintenance(tmp_path: Path) -> No
 
 
 @requires_local_sockets
-def test_broker_application_dispatches_maintain_storage(tmp_path: Path) -> None:
+def test_broker_application_dispatches_maintain_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The daemon's startup-maintenance thread would race this test's direct
+    # calls for the global lock; the scheduled pass is orthogonal here.
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
     daemon = DaemonServer(paths, application=application, idle_timeout_seconds=60)
