@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -434,7 +435,7 @@ def _store_with_one_chunk(tmp_path: Path) -> tuple[LanceStore, str, str]:
     return store, project.id, chunks[0].chunk_id
 
 
-def test_compaction_keeps_recent_versions_readable(tmp_path: Path) -> None:
+def test_maintenance_keeps_recent_versions_readable(tmp_path: Path) -> None:
     """Concurrent readers must survive the maintenance pass after deletions."""
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
     root = tmp_path / "repo"
@@ -456,11 +457,193 @@ def test_compaction_keeps_recent_versions_readable(tmp_path: Path) -> None:
     store.ensure_indexes(project.id)
 
     store.remove_file(project.id, "file-1")
-    store.ensure_indexes(project.id, compact=True)
+    store.maintain_project(project.id, cleanup_older_than=timedelta(hours=24))
 
     # A version reaped mid-read would surface here as a Lance IO failure.
     assert store.count_chunks([project.id]) == 0
     assert store.list_files(project.id) == []
+
+
+def test_maintenance_preserves_rows_and_search_results(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id).model_dump()], schema=LanceStore.file_arrow_schema()
+        ),
+        chunk_batches=[(["file-1"], _chunk_table(project.id, "file-1", 2))],
+        reference_batches=[(["file-1"], reference_table())],
+    )
+    store.ensure_indexes(project.id)
+    files_before = store.list_files(project.id)
+    chunks_before = store.list_chunks([project.id])
+    references_before = store.list_reference_records(project.id)
+
+    store.maintain_project(project.id, cleanup_older_than=timedelta(hours=24))
+
+    assert store.list_files(project.id) == files_before
+    assert store.list_chunks([project.id]) == chunks_before
+    assert store.list_reference_records(project.id) == references_before
+    rows = store.hybrid_search("pass", [1.0, 0.0, 0.0, 0.0], [project.id], None, 5)
+    assert {row["chunk_id"] for row in rows} == {chunk.chunk_id for chunk in chunks_before}
+
+
+def test_maintenance_keeps_versions_inside_the_retention_window(tmp_path: Path) -> None:
+    """Fresh versions survive a pass: nothing older than the window is removed."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    for index in range(3):
+        file_id = f"file-{index}"
+        store.replace_files_from_arrow(
+            project.id,
+            files=pa.Table.from_pylist(
+                [stored_file(project.id, file_id=file_id).model_dump()],
+                schema=LanceStore.file_arrow_schema(),
+            ),
+            chunk_batches=[([file_id], _chunk_table(project.id, file_id, 1))],
+        )
+    before = store.storage_stats(project.id)
+    chunks_before = next(table for table in before.tables if table.name == "chunks")
+
+    store.maintain_project(project.id, cleanup_older_than=timedelta(hours=24))
+
+    after = store.storage_stats(project.id)
+    chunks_after = next(table for table in after.tables if table.name == "chunks")
+    # Compaction writes a fresh merged version and keeps every younger version,
+    # so the retained set only grows; nothing inside the window was removed.
+    assert chunks_after.retained_version_count >= chunks_before.retained_version_count
+    assert store.count_chunks([project.id]) == 3
+
+
+def test_maintenance_removes_verified_versions_outside_the_retention_window(
+    tmp_path: Path,
+) -> None:
+    """Verified versions older than the window are removed; current rows survive."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    for index in range(3):
+        file_id = f"file-{index}"
+        store.replace_files_from_arrow(
+            project.id,
+            files=pa.Table.from_pylist(
+                [stored_file(project.id, file_id=file_id).model_dump()],
+                schema=LanceStore.file_arrow_schema(),
+            ),
+            chunk_batches=[([file_id], _chunk_table(project.id, file_id, 1))],
+        )
+    before = store.storage_stats(project.id)
+    chunks_before = next(table for table in before.tables if table.name == "chunks")
+    assert chunks_before.retained_version_count >= 3
+
+    store.maintain_project(project.id, cleanup_older_than=timedelta(seconds=0))
+
+    after = store.storage_stats(project.id)
+    chunks_after = next(table for table in after.tables if table.name == "chunks")
+    # The zero window is the deterministic test stand-in for "older than the
+    # window": every version is older than now, so only the freshly compacted
+    # current version remains.
+    assert chunks_after.retained_version_count == 1
+    assert store.count_chunks([project.id]) == 3
+    assert {file.file_id for file in store.list_files(project.id)} == {
+        "file-0",
+        "file-1",
+        "file-2",
+    }
+
+
+def test_maintenance_covers_every_partition_table_and_the_registry(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id).model_dump()], schema=LanceStore.file_arrow_schema()
+        ),
+        chunk_batches=[(["file-1"], _chunk_table(project.id, "file-1", 1))],
+        reference_batches=[(["file-1"], reference_table())],
+    )
+
+    optimized: list[str] = []
+    original_optimize = LanceTable.optimize
+
+    def counting_optimize(self: LanceTable, **kwargs: object) -> None:
+        optimized.append(self.name)
+        original_optimize(self, **kwargs)
+
+    with patch.object(LanceTable, "optimize", counting_optimize):
+        store.maintain_project(project.id, cleanup_older_than=timedelta(hours=24))
+        store.maintain_registry(cleanup_older_than=timedelta(hours=24))
+
+    assert optimized == ["files", "chunks", "references", "projects"]
+
+
+def test_maintenance_never_passes_delete_unverified(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id).model_dump()], schema=LanceStore.file_arrow_schema()
+        ),
+        chunk_batches=[(["file-1"], _chunk_table(project.id, "file-1", 1))],
+    )
+
+    seen: list[dict[str, object]] = []
+    original_optimize = LanceTable.optimize
+
+    def recording_optimize(self: LanceTable, **kwargs: object) -> None:
+        seen.append(kwargs)
+        original_optimize(self, **kwargs)
+
+    with patch.object(LanceTable, "optimize", recording_optimize):
+        store.maintain_project(project.id, cleanup_older_than=timedelta(hours=24))
+
+    assert seen
+    # delete_unverified may be omitted (False) but must never be passed True.
+    assert all(kwargs.get("delete_unverified") is not True for kwargs in seen)
+
+
+def test_maintenance_skips_a_registered_project_without_a_partition(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model", state="pending")
+
+    assert store.maintain_project(project.id, cleanup_older_than=timedelta(hours=24)) is False
+    # Maintenance is not a write path: it must not materialize a partition.
+    assert not (store.directory / "projects").exists()
+
+
+def test_ensure_indexes_no_longer_optimizes(tmp_path: Path) -> None:
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+    optimized: list[str] = []
+    original_optimize = LanceTable.optimize
+
+    def counting_optimize(self: LanceTable, **kwargs: object) -> None:
+        optimized.append(self.name)
+        original_optimize(self, **kwargs)
+
+    with patch.object(LanceTable, "optimize", counting_optimize):
+        store.ensure_indexes(project_id)
+
+    assert optimized == []
 
 
 def test_get_chunk_does_not_read_the_vector_column(tmp_path: Path) -> None:

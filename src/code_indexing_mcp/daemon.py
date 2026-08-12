@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import socket
@@ -28,6 +29,7 @@ from .models import (
     CodeChunk,
     DeclarationSelector,
     IndexReport,
+    MaintenanceReport,
     ModelStatus,
     OutlineResponse,
     ProjectInfo,
@@ -42,6 +44,8 @@ from .models import (
 )
 from .progress import IndexProgress, read_progress
 from .settings import IndexSettings
+
+logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 16 * 1024**2
@@ -190,9 +194,11 @@ class DaemonServer:
         self._stop = threading.Event()
         self._last_activity = time.monotonic()
         self._active_requests = 0
+        self._maintenance_active = False
         self._activity_lock = threading.Lock()
         self._token = ""
         self._listener: socket.socket | None = None
+        self._maintenance_thread: threading.Thread | None = None
 
     def serve(self) -> None:
         self.paths.data.mkdir(parents=True, exist_ok=True)
@@ -217,10 +223,26 @@ class DaemonServer:
             listener.listen(32)
             listener.settimeout(0.5)
             self.ready.set()
+            maintenance_thread = threading.Thread(
+                target=self._run_startup_maintenance,
+                name="code-indexing-mcp-daemon-maintenance",
+                daemon=True,
+            )
+            self._maintenance_thread = maintenance_thread
+            with self._activity_lock:
+                self._maintenance_active = True
+            try:
+                maintenance_thread.start()
+            except BaseException:
+                with self._activity_lock:
+                    self._maintenance_active = False
+                self._maintenance_thread = None
+                raise
             while not self._stop.is_set():
                 with self._activity_lock:
                     idle = (
                         self._active_requests == 0
+                        and not self._maintenance_active
                         and time.monotonic() - self._last_activity >= self.idle_timeout_seconds
                     )
                 if idle:
@@ -248,11 +270,34 @@ class DaemonServer:
                     raise
         finally:
             listener.close()
+            if self._maintenance_thread is not None:
+                self._maintenance_thread.join()
+                self._maintenance_thread = None
             self._listener = None
             if self.endpoint.exists():
                 self.endpoint.unlink()
             lifetime_lock.release()
             self.ready.set()
+
+    def _run_startup_maintenance(self) -> None:
+        """Run overdue scheduled maintenance after startup, without blocking serving.
+
+        Maintenance needs the writer locks an index run would hold, and it is
+        checked at most once per 24 hours, so a failure here only delays
+        cleanup. The daemon's idle timer counts the pass as active and shutdown
+        joins its thread, so neither idle reaping nor an explicit stop can cut
+        maintenance off midway.
+        """
+        try:
+            with self._activity_lock:
+                self._last_activity = time.monotonic()
+            self.application.maybe_run_maintenance()
+        except Exception:
+            logger.exception("Scheduled maintenance after daemon startup failed")
+        finally:
+            with self._activity_lock:
+                self._maintenance_active = False
+                self._last_activity = time.monotonic()
 
     def _handle(self, connection: socket.socket) -> None:
         with connection:
@@ -321,6 +366,8 @@ class DaemonServer:
             return app.project_status(roots=roots, **params)
         if method == "storage_status":
             return app.storage_status(roots=roots, **params)
+        if method == "maintain_storage":
+            return app.maintain_storage(roots=roots, **params)
         if method == "list_projects":
             return app.list_projects()
         if method == "remove_project":
@@ -493,6 +540,24 @@ class BrokerApplication:
     ) -> StorageStatus:
         return StorageStatus.model_validate(
             self._call("storage_status", project=project, roots=roots or [])
+        )
+
+    def maintain_storage(
+        self,
+        project: str | None = None,
+        *,
+        roots: list[Path] | None = None,
+        dry_run: bool = False,
+        wait_for_lock: bool = True,
+    ) -> MaintenanceReport:
+        return MaintenanceReport.model_validate(
+            self._call(
+                "maintain_storage",
+                project=project,
+                roots=roots or [],
+                dry_run=dry_run,
+                wait_for_lock=wait_for_lock,
+            )
         )
 
     def project_is_stale(

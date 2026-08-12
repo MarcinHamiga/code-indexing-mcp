@@ -13,7 +13,7 @@ from typing import Any, Protocol
 from . import update_check
 from .application import Application, RuntimePaths
 from .errors import CodeIndexingError, ErrorCode
-from .models import IndexReport, ProjectInfo, StorageStatus
+from .models import IndexReport, MaintenanceReport, ProjectInfo, StorageStatus
 from .settings import IndexSettings
 
 # The repeated_edits scenario applies this many consecutive edits to one file,
@@ -28,6 +28,10 @@ class IndexBenchmarkApplication(Protocol):
     def index_project(self, project: str, *, force: bool = False) -> IndexReport: ...
 
     def storage_status(self, project: str | None = None) -> StorageStatus: ...
+
+    def maintain_storage(
+        self, project: str | None = None, *, wait_for_lock: bool = False
+    ) -> MaintenanceReport: ...
 
 
 def write_benchmark_corpus(root: Path, *, files: int = 128, functions_per_file: int = 2) -> int:
@@ -126,9 +130,8 @@ def run_index_benchmark(app: IndexBenchmarkApplication, root: Path) -> dict[str,
 
     Every scenario records the project's storage statistics after it finishes,
     so table-version deltas and physical growth are observable per scenario
-    (contract version 2). ``post_maintenance`` currently captures the
-    post-deletion snapshot; the maintenance release extends it with real
-    cleanup work without changing the JSON contract.
+    (contract version 2). ``post_maintenance`` times real cleanup and captures
+    the resulting storage snapshot without changing the JSON contract.
 
     The storage figures are deterministic and single-run comparison is sound.
     The timings are not: apart from ``repeated_edits``, every scenario runs
@@ -202,11 +205,11 @@ def run_index_benchmark(app: IndexBenchmarkApplication, root: Path) -> dict[str,
     )
     scenarios["many_file_deletions"]["removed_files"] = removed_group
 
-    # No maintenance work runs yet, so there is nothing to time: the field is
-    # null rather than the ~0ms it would take to time an empty block, which a
-    # dashboard would chart as a real measurement.
+    maintenance_started = time.monotonic_ns()
+    maintenance = app.maintain_storage(project.id, wait_for_lock=True)
     scenarios["post_maintenance"] = {
-        "wall_ms": None,
+        "wall_ms": round((time.monotonic_ns() - maintenance_started) / 1_000_000, 3),
+        "report": maintenance.model_dump(mode="json"),
         "storage_after": snapshot(),
     }
     return {

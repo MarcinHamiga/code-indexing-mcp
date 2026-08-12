@@ -10,6 +10,7 @@ from code_indexing_mcp.benchmark import (
 )
 from code_indexing_mcp.models import (
     IndexReport,
+    MaintenanceReport,
     ProjectInfo,
     ProjectStorageStats,
     StorageStatus,
@@ -24,6 +25,7 @@ class BenchmarkApplication:
         self.duration_ms = duration_ms
         self.force_calls: list[bool] = []
         self.storage_calls: list[str] = []
+        self.maintenance_calls: list[tuple[str | None, bool]] = []
 
     def init_project(self, path: Path) -> ProjectInfo:
         assert path == self.root
@@ -60,6 +62,20 @@ class BenchmarkApplication:
             snapshot_at="2026-08-11T00:00:00+00:00",
             registry=TableStorageStats(name="projects"),
             projects=[entry],
+        )
+
+    def maintain_storage(
+        self, project: str | None = None, *, wait_for_lock: bool = False
+    ) -> MaintenanceReport:
+        self.maintenance_calls.append((project, wait_for_lock))
+        return MaintenanceReport(
+            trigger="manual",
+            dry_run=False,
+            retention_hours=24,
+            started_at="2026-08-11T00:00:00+00:00",
+            finished_at="2026-08-11T00:00:01+00:00",
+            duration_ms=1_000,
+            registry_status="ok",
         )
 
 
@@ -108,9 +124,10 @@ def test_benchmark_runs_the_storage_growth_scenarios(tmp_path: Path) -> None:
         assert after["partition_physical_bytes"] > 0
         assert after["consistent"] is True
     assert payload["scenarios"]["repeated_edits"]["edits"] == REPEATED_EDITS
-    # No maintenance work runs yet, so the scenario reports no timing rather
-    # than the ~0ms it would take to time an empty block.
-    assert payload["scenarios"]["post_maintenance"]["wall_ms"] is None
+    maintenance = payload["scenarios"]["post_maintenance"]
+    assert maintenance["wall_ms"] >= 0
+    assert maintenance["report"]["duration_ms"] == 1_000
+    assert app.maintenance_calls == [("benchmark-project", True)]
     assert payload["scenarios"]["cold_start"]["includes_embedder_warmup"] is True
     # Storage is snapshotted once per scenario; the 100 edits index but do not
     # each get their own snapshot, so the counter stays proportional to the

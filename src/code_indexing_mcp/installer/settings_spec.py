@@ -214,6 +214,26 @@ SETTINGS: tuple[Setting, ...] = (
         "auto",
         choices=("auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml"),
     ),
+    Setting(
+        "CODE_INDEXING_AUTO_MAINTENANCE",
+        "Maintenance",
+        "Automatic maintenance",
+        "Compacts tables and removes verified versions older than the retention window on a "
+        "schedule; never uses zero-age cleanup.",
+        "bool",
+        "1",
+    ),
+    Setting(
+        "CODE_INDEXING_VERSION_RETENTION_HOURS",
+        "Maintenance",
+        "Version retention (hours)",
+        "How long old Lance versions are kept before verified cleanup; the floor of one hour "
+        "keeps concurrent readers safe.",
+        "int",
+        "24",
+        minimum=1,
+        maximum=24 * 30,
+    ),
 )
 
 BY_NAME: dict[str, Setting] = {setting.name: setting for setting in SETTINGS}

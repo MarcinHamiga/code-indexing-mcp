@@ -992,7 +992,17 @@ class LanceStore:
         )
         return [ChunkPreview.model_validate(row) for row in rows]
 
-    def ensure_indexes(self, project_id: str, *, compact: bool = False) -> None:
+    def ensure_indexes(self, project_id: str) -> None:
+        """Create missing search indexes on the write path.
+
+        Index *existence* is a correctness requirement for search, so missing
+        FTS and BTree indexes are created after a commit. Compaction, index
+        optimization, and old-version cleanup are deliberately not part of this
+        method: they run only in ``maintain_project`` on a schedule, so an
+        incremental commit stops paying for a full optimize pass. Searches
+        combine indexed rows with the unindexed tail until maintenance folds
+        that tail into the indexes.
+        """
         tables = self._tables(project_id)
         chunks = tables.chunks
         indices = list(chunks.list_indices())
@@ -1016,10 +1026,6 @@ class LanceStore:
                 config=HnswSq(distance_type="cosine"),
                 replace=False,
             )
-        # Reclaim space after deletions, but never with delete_unverified or a
-        # zero age: searches run concurrently from the daemon and from direct
-        # CLI processes, so versions in active use must not be reaped.
-        chunks.optimize(cleanup_older_than=timedelta(days=1) if compact else None)
         if tables.references is None:
             raise RuntimeError("Reference table is missing from an interrupted transaction")
         reference_indices = list(tables.references.list_indices())
@@ -1037,7 +1043,28 @@ class LanceStore:
         ):
             if column not in indexed_reference_columns:
                 tables.references.create_index(column, config=BTree(), replace=False)
-        tables.references.optimize(cleanup_older_than=timedelta(days=1) if compact else None)
+
+    def maintain_project(self, project_id: str, *, cleanup_older_than: timedelta) -> bool:
+        """Compact and clean *project_id*'s partition, returning whether it ran.
+
+        Optimizes the files, chunks, and references tables, reclaiming space
+        after deletions. Versions older than ``cleanup_older_than`` are removed
+        once verified; ``delete_unverified`` is never set, and a zero age must
+        never be passed by an automatic path. A registered project with no
+        partition is left untouched (``False``) rather than materialized.
+        """
+        tables = self._existing_tables(project_id)
+        if tables is None:
+            return False
+        tables.files.optimize(cleanup_older_than=cleanup_older_than)
+        tables.chunks.optimize(cleanup_older_than=cleanup_older_than)
+        if tables.references is not None:
+            tables.references.optimize(cleanup_older_than=cleanup_older_than)
+        return True
+
+    def maintain_registry(self, *, cleanup_older_than: timedelta) -> None:
+        """Compact and clean the project registry table."""
+        self._projects.optimize(cleanup_older_than=cleanup_older_than)
 
     def remove_project(self, project_id: str) -> bool:
         existed = bool(self._rows(self._projects, f"id = {_quoted(project_id)}"))

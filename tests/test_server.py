@@ -128,6 +128,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "index_project",
         "project_status",
         "index_storage_status",
+        "index_storage_maintenance",
         "list_projects",
         "remove_project",
         "search_code",
@@ -138,7 +139,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 13
+    assert len(tools) == 14
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -916,6 +917,76 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_startup_maintenance_defers_to_startup_indexing(tmp_path: Path) -> None:
+    """Scheduled maintenance never competes with the initial index build.
+
+    Regression test for the Windows 3.13 CI timeout: an eager server previously
+    ran its maintenance pass at startup, racing the blocked startup index for
+    the writer lock and optimizing tables that a tight-timeout query was about
+    to read.
+    """
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+
+    embedder = BlockingEmbedder()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=embedder,
+        cwd=tmp_path,
+    )
+    server = create_server(app, auto_index=True)
+    timestamp_path = app.paths.data / "maintenance.json"
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    try:
+        async with create_connected_server_and_client_session(
+            server, list_roots_callback=list_roots
+        ) as client:
+            await client.list_tools()
+            assert await asyncio.to_thread(embedder.started.wait, 5)
+            await asyncio.sleep(0.3)
+            assert not timestamp_path.exists()
+            embedder.release.set()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not timestamp_path.exists():
+                await asyncio.sleep(0.05)
+            assert timestamp_path.exists()
+    finally:
+        embedder.release.set()
+
+
+@pytest.mark.asyncio
+async def test_lazy_server_runs_startup_maintenance_before_root_scheduling(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+    timestamp_path = app.paths.data / "maintenance.json"
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        await _wait_until(timestamp_path.exists)
+
+    assert timestamp_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_explicit_code_query_ignores_unrelated_startup_failure(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
     ready_root.mkdir()
@@ -1409,7 +1480,9 @@ def _tiny_application(tmp_path: Path) -> Application:
 async def test_every_tool_declares_description_title_and_annotations(tmp_path: Path) -> None:
     tools = await create_server(_tiny_application(tmp_path), auto_index=False).list_tools()
 
-    assert {tool.name for tool in tools} == READ_ONLY_TOOLS | AUTO_REGISTERING_TOOLS | WRITE_TOOLS
+    assert {tool.name for tool in tools} == (
+        READ_ONLY_TOOLS | AUTO_REGISTERING_TOOLS | WRITE_TOOLS | {"index_storage_maintenance"}
+    )
     for tool in tools:
         assert tool.description, f"{tool.name} has no description"
         assert len(tool.description) > 60, f"{tool.name} description is a stub"
@@ -1688,3 +1761,70 @@ async def test_index_storage_status_tool_reports_installation_statistics(tmp_pat
         assert entry["partition_open_failed"] is False
         assert entry["partition_physical_bytes"] > 0
         assert {table["name"] for table in entry["tables"]} == {"files", "chunks", "references"}
+
+
+@pytest.mark.asyncio
+async def test_index_storage_maintenance_tool_defaults_to_dry_run(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        scoped = await client.call_tool("index_storage_maintenance", {"project": str(root)})
+        installation = await client.call_tool("index_storage_maintenance", {})
+
+    assert not scoped.isError
+    assert not installation.isError
+    for result in (scoped, installation):
+        payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
+        assert payload["schema_version"] == 1
+        assert payload["dry_run"] is True
+        assert payload["trigger"] == "manual"
+        assert payload["retention_hours"] == 24
+        entry = payload["projects"][0]
+        assert entry["status"] == "skipped"
+        assert entry["after"] is None
+        assert entry["before"]["partition_physical_bytes"] > 0
+
+
+@pytest.mark.asyncio
+async def test_index_storage_maintenance_tool_can_execute_cleanup(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "index_storage_maintenance", {"project": str(root), "dry_run": False}
+        )
+
+    assert not result.isError
+    payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
+    assert payload["dry_run"] is False
+    entry = payload["projects"][0]
+    assert entry["status"] == "ok"
+    assert entry["after"] is not None
+    assert payload["registry_after"] is not None
+    # The project remains fully usable after maintenance.
+    status = app.project_status(project.id)
+    assert status.state == "ready"

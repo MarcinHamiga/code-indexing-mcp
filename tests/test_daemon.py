@@ -531,3 +531,117 @@ def test_broker_application_dispatches_storage_status(tmp_path: Path) -> None:
     broker.stop()
     thread.join(timeout=2)
     assert not thread.is_alive()
+
+
+@requires_local_sockets
+def test_daemon_startup_runs_overdue_maintenance(tmp_path: Path) -> None:
+    """The daemon owes the 24-hour maintenance cadence even before any query."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = application.init_project(root)
+    application.index_project(project.id)
+    daemon = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=daemon.serve, daemon=True)
+    thread.start()
+    assert daemon.ready.wait(timeout=2)
+    try:
+        timestamp = paths.data / "maintenance.json"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not timestamp.exists():
+            time.sleep(0.05)
+        assert timestamp.exists()
+        payload = json.loads(timestamp.read_text())
+        assert "last_maintenance_at" in payload
+        # The pass ran and the project rows survived it.
+        status = application.project_status(project.id)
+        assert status.state == "ready"
+    finally:
+        broker = BrokerApplication(paths, cwd=tmp_path)
+        broker.stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
+@requires_local_sockets
+def test_daemon_startup_maintenance_respects_the_disable_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    daemon = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=daemon.serve, daemon=True)
+    thread.start()
+    assert daemon.ready.wait(timeout=2)
+    try:
+        time.sleep(0.3)
+        assert not (paths.data / "maintenance.json").exists()
+    finally:
+        broker = BrokerApplication(paths, cwd=tmp_path)
+        broker.stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
+@requires_local_sockets
+def test_daemon_idle_timeout_waits_for_startup_maintenance(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_maintenance() -> None:
+        started.set()
+        assert release.wait(timeout=5)
+
+    application.maybe_run_maintenance = blocking_maintenance  # type: ignore[method-assign]
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=0)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    try:
+        assert started.wait(timeout=2)
+        # The listener wakes every 0.5s, comfortably beyond this idle timeout.
+        time.sleep(0.7)
+        assert thread.is_alive()
+    finally:
+        release.set()
+        thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert not server.endpoint.exists()
+
+
+@requires_local_sockets
+def test_broker_application_dispatches_maintain_storage(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    daemon = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=daemon.serve, daemon=True)
+    thread.start()
+    assert daemon.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+
+    project = broker.init_project(root)
+    application.index_project(project.id)
+
+    report = broker.maintain_storage(project.id, dry_run=True)
+
+    assert report.dry_run is True
+    entry = next(result for result in report.projects if result.project.id == project.id)
+    assert entry.before is not None
+    assert entry.after is None
+
+    executed = broker.maintain_storage(project.id)
+    assert executed.dry_run is False
+    entry = next(result for result in executed.projects if result.project.id == project.id)
+    assert entry.status == "ok"
+    broker.stop()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
