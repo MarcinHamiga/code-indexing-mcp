@@ -442,9 +442,7 @@ def _remove_reference_coverage(store: LanceStore, project_id: str) -> None:
             reference_batches=[
                 (
                     [record.file_id],
-                    pa.Table.from_pylist(
-                        remaining, schema=LanceStore.reference_arrow_schema()
-                    ),
+                    pa.Table.from_pylist(remaining, schema=LanceStore.reference_arrow_schema()),
                 )
             ],
         )

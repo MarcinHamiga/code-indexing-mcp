@@ -17,6 +17,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
+    # The full suite takes ~10 minutes on the slowest runner; a hung test must
+    # not burn the default 6-hour cap.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -28,24 +31,28 @@ jobs:
         # checks need it too: without it the wizard's tests cannot import and
         # mypy cannot see the widgets they subclass.
         run: uv sync --all-groups --extra cpu --extra tui --locked
-      - name: Test
-        run: uv run pytest
-      # Lint and type checks are independent of the tests, so a failing test
-      # must not hide them: a red run should report every problem at once
-      # rather than one per push. They still skip when the environment itself
-      # could not be built, where their output would only be noise.
-      - name: Lint
-        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
-        run: uv run ruff check .
+      # Cheap deterministic checks run first so a format or lint slip fails in
+      # seconds instead of after the full test suite; every step still runs
+      # (`!cancelled()`), so a red run reports all problems at once rather than
+      # one per push. They skip when the environment itself could not be built,
+      # where their output would only be noise.
       - name: Format
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run ruff format --check .
+      - name: Lint
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff check .
       - name: Types
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run mypy src
       - name: Types (scripts)
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run mypy scripts/benchmark_index_memory.py
+      - name: Test
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        # pytest-xdist shortens the suite ~2.6x on multi-core runners (locally
+        # 225s -> 86s); the suite is worker-safe (tmp_path isolation).
+        run: uv run pytest -n auto
 
   # The real-model memory gate downloads ~640 MB and takes minutes, so it is
   # manually dispatched rather than run on every push. Normal CI still checks
@@ -53,6 +60,9 @@ jobs:
   memory:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # The model download plus benchmark at the dispatched corpus scale can run
+    # long; cap it so a runaway corpus size cannot burn the default cap.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

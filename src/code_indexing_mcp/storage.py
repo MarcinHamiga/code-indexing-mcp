@@ -527,34 +527,46 @@ class LanceStore:
         """
         tables = self._tables(project_id)
         replacement_ids: list[str] = []
-        for file_ids, chunks in chunk_batches:
-            replacement_ids.extend(file_ids)
-            condition = _file_ids_condition(file_ids)
-            if chunks.num_rows:
-                (
-                    tables.chunks.merge_insert("chunk_id")
-                    .when_matched_update_all()
-                    .when_not_matched_insert_all()
-                    .when_not_matched_by_source_delete(condition)
-                    .execute(chunks)
-                )
-            else:
-                tables.chunks.delete(condition)
+        chunk_iter = iter(chunk_batches)
+        try:
+            for file_ids, chunks in chunk_iter:
+                replacement_ids.extend(file_ids)
+                condition = _file_ids_condition(file_ids)
+                if chunks.num_rows:
+                    (
+                        tables.chunks.merge_insert("chunk_id")
+                        .when_matched_update_all()
+                        .when_not_matched_insert_all()
+                        .when_not_matched_by_source_delete(condition)
+                        .execute(chunks)
+                    )
+                else:
+                    tables.chunks.delete(condition)
+        finally:
+            close = getattr(chunk_iter, "close", None)
+            if close is not None:
+                close()
         if tables.references is None:
             raise RuntimeError("Reference table is missing from an interrupted transaction")
-        for file_ids, references in reference_batches:
-            replacement_ids.extend(file_ids)
-            condition = _file_ids_condition(file_ids)
-            if references.num_rows:
-                (
-                    tables.references.merge_insert("reference_id")
-                    .when_matched_update_all()
-                    .when_not_matched_insert_all()
-                    .when_not_matched_by_source_delete(condition)
-                    .execute(references)
-                )
-            else:
-                tables.references.delete(condition)
+        reference_iter = iter(reference_batches)
+        try:
+            for file_ids, references in reference_iter:
+                replacement_ids.extend(file_ids)
+                condition = _file_ids_condition(file_ids)
+                if references.num_rows:
+                    (
+                        tables.references.merge_insert("reference_id")
+                        .when_matched_update_all()
+                        .when_not_matched_insert_all()
+                        .when_not_matched_by_source_delete(condition)
+                        .execute(references)
+                    )
+                else:
+                    tables.references.delete(condition)
+        finally:
+            close = getattr(reference_iter, "close", None)
+            if close is not None:
+                close()
         if files.num_rows:
             self._merge(tables.files, "file_id", files)
         replaced = set(replacement_ids)

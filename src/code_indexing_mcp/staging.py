@@ -402,43 +402,43 @@ class StagingJob:
             batch_tables.append(table)
             return True
 
-        reader = pa.ipc.open_file(path)
-        for index in range(reader.num_record_batches):
-            batch = reader.get_batch(index)
-            file_id = cast(str, batch.column("file_id")[0].as_py())
-            if file_id != current_file_id:
-                if file_batches:
-                    assert current_file_id is not None
-                    seen.add(current_file_id)
-                    table = pa.Table.from_batches(file_batches, schema=schema)
-                    file_batches = []
-                    if not add_file(current_file_id, table):
-                        released = release_batch()
-                        if released is not None:
-                            yield released
-                        add_file(current_file_id, table)
-                current_file_id = file_id
-            if file_id in wanted:
-                file_batches.append(batch)
-        if file_batches:
-            assert current_file_id is not None
-            seen.add(current_file_id)
-            table = pa.Table.from_batches(file_batches, schema=schema)
-            if not add_file(current_file_id, table):
-                released = release_batch()
-                if released is not None:
-                    yield released
-                add_file(current_file_id, table)
-        empty = pa.Table.from_batches([], schema=schema)
-        for file_id in wanted_ids:
-            if file_id not in seen and not add_file(file_id, empty):
-                released = release_batch()
-                if released is not None:
-                    yield released
-                add_file(file_id, empty)
-        released = release_batch()
-        if released is not None:
-            yield released
+        with pa.ipc.open_file(path) as reader:
+            for index in range(reader.num_record_batches):
+                batch = reader.get_batch(index)
+                file_id = cast(str, batch.column("file_id")[0].as_py())
+                if file_id != current_file_id:
+                    if file_batches:
+                        assert current_file_id is not None
+                        seen.add(current_file_id)
+                        table = pa.Table.from_batches(file_batches, schema=schema)
+                        file_batches = []
+                        if not add_file(current_file_id, table):
+                            released = release_batch()
+                            if released is not None:
+                                yield released
+                            add_file(current_file_id, table)
+                    current_file_id = file_id
+                if file_id in wanted:
+                    file_batches.append(batch)
+            if file_batches:
+                assert current_file_id is not None
+                seen.add(current_file_id)
+                table = pa.Table.from_batches(file_batches, schema=schema)
+                if not add_file(current_file_id, table):
+                    released = release_batch()
+                    if released is not None:
+                        yield released
+                    add_file(current_file_id, table)
+            empty = pa.Table.from_batches([], schema=schema)
+            for file_id in wanted_ids:
+                if file_id not in seen and not add_file(file_id, empty):
+                    released = release_batch()
+                    if released is not None:
+                        yield released
+                    add_file(file_id, empty)
+            released = release_batch()
+            if released is not None:
+                yield released
 
     def complete(self) -> None:
         """Mark the commit successful and remove the staged directory."""
