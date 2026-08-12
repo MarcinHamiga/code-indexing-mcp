@@ -28,7 +28,7 @@ import tree_sitter_typescript
 import tree_sitter_yaml
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
 from tree_sitter import Query as StructuralQuery
-from tree_sitter_language_pack import get_language
+from tree_sitter_language_pack import DownloadError, get_language
 
 from .models import (
     CallShape,
@@ -60,6 +60,8 @@ _CONTAINER_KINDS: Final = frozenset(
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 _QUOTE_CHARACTERS: Final = ("'", '"')
 STRUCTURAL_LANGUAGES: Final = frozenset({"python", "javascript", "typescript", "tsx"})
+_PACK_DOWNLOAD_ATTEMPTS: Final = 6
+_PACK_DOWNLOAD_BACKOFF_SECONDS: Final = 1.0
 _ReferenceAdder = Callable[..., None]
 
 
@@ -100,6 +102,27 @@ def normalize_identifier(value: str) -> str:
     return " ".join(_NON_WORD.sub(" ", value).lower().split())
 
 
+def _pack_language(name: str) -> Language:
+    """Resolve a language the pack downloads on first use, retrying transiently.
+
+    The pack fetches its manifest and parsers from a GitHub release the first
+    time a language is resolved, then caches the result on disk. That endpoint
+    has transient outages (503s, dropped connections) that can outlast a
+    couple of quick retries -- CI observed one dropping every connection for
+    tens of seconds -- so the backoff window (1+2+4+8+16s) is sized to ride
+    out such a window rather than just a single failed request.
+    """
+
+    for attempt in range(_PACK_DOWNLOAD_ATTEMPTS):
+        try:
+            return get_language(name)
+        except DownloadError:
+            if attempt == _PACK_DOWNLOAD_ATTEMPTS - 1:
+                raise
+            time.sleep(_PACK_DOWNLOAD_BACKOFF_SECONDS * (2**attempt))
+    raise AssertionError("unreachable")
+
+
 def _languages() -> dict[str, Language]:
     return {
         "python": Language(tree_sitter_python.language()),
@@ -119,9 +142,9 @@ def _languages() -> dict[str, Language]:
         # is the only packaged source. It already returns a Language, not a
         # PyCapsule, so it is not wrapped like the others. The two sibling Godot
         # formats come from the same pack for the same reason.
-        "gdscript": get_language("gdscript"),
-        "gdshader": get_language("gdshader"),
-        "godot_resource": get_language("godot_resource"),
+        "gdscript": _pack_language("gdscript"),
+        "gdshader": _pack_language("gdshader"),
+        "godot_resource": _pack_language("godot_resource"),
         "yaml": Language(tree_sitter_yaml.language()),
         "json": Language(tree_sitter_json.language()),
     }

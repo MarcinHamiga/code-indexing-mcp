@@ -1,5 +1,6 @@
 import itertools
 import os
+import sqlite3
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -21,6 +22,7 @@ from code_indexing_mcp.embedding import (
 )
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
+from code_indexing_mcp.history import HistoryStore
 from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
 from code_indexing_mcp.models import ExtractionResult
 from code_indexing_mcp.projects import initialize_project
@@ -56,7 +58,11 @@ class SessionEmbedder(RecordingEmbedder):
 
 
 def make_indexer(
-    tmp_path: Path, embedder: RecordingEmbedder, *, batch_size: int = 1
+    tmp_path: Path,
+    embedder: RecordingEmbedder,
+    *,
+    batch_size: int = 1,
+    history: HistoryStore | None = None,
 ) -> tuple[Indexer, LanceStore]:
     store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
     return (
@@ -67,6 +73,7 @@ def make_indexer(
             embedder=embedder,
             lock_directory=tmp_path / "locks",
             batch_size=batch_size,
+            history=history,
         ),
         store,
     )
@@ -1455,3 +1462,149 @@ def test_a_failure_mid_commit_restores_all_three_tables(
         "renamed",
         "other",
     }
+
+
+def test_a_completed_run_is_recorded_in_the_audit_history(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    (root / "notes.txt").write_text("unsupported")
+    project = initialize_project(root)
+    history = HistoryStore(tmp_path / "history")
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder(), history=history)
+
+    report = indexer.index(project, trigger="watcher")
+
+    assert report.run_id is not None
+    page = history.list_runs(project.id)
+    assert len(page.runs) == 1
+    run = page.runs[0]
+    assert run.run_id == report.run_id
+    assert run.trigger == "watcher"
+    assert run.state == "completed"
+    assert run.model_id == indexer.embedder.model_id
+    assert run.schema_version >= 1
+    assert run.scan_config_hash
+    assert run.server_version
+    assert run.force is False
+    assert run.eligible_files == 1
+    assert run.changed_files == 1
+    assert run.parsed_files == 1
+    assert run.skipped_total == 1
+    assert run.skip_reasons == {"unsupported": 1}
+    assert run.chunks_embedded == report.embedded_chunks
+    assert run.phase_durations
+    assert run.finished_at is not None
+    assert run.storage_after
+
+
+def test_a_failed_run_is_recorded_as_failed_and_reports_its_reason(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def stable():\n    return 1\n")
+    project = initialize_project(root)
+    history = HistoryStore(tmp_path / "history")
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder(), history=history)
+    indexer.index(project)
+
+    source.write_text("def RAISE_EMBEDDING():\n    return 2\n")
+    report = indexer.index(project)
+
+    assert report.failed_files == 1
+    # A failure is not a skip: it must not leak into the skip pair, which
+    # would break skipped_total == sum(skip_reasons).
+    assert report.skip_reasons == {}
+    assert report.skipped_files == 0
+    assert report.skipped_samples == []
+    page = history.list_runs(project.id)
+    failed = next(run for run in page.runs if run.run_id == report.run_id)
+    assert failed.state == "completed"
+    assert failed.failed_files == 1
+    assert failed.skip_reasons == {}
+    assert failed.skipped_total == 0
+    assert failed.errors and failed.errors[0].path == "main.py"
+    assert store.project_state(project.id) == "partial"
+
+
+def test_an_unexpected_run_failure_is_recorded_as_failed(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    history = HistoryStore(tmp_path / "history")
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder(), history=history)
+
+    with (
+        patch.object(indexer.scanner, "iter_scan", side_effect=RuntimeError("simulated crash")),
+        pytest.raises(RuntimeError, match="simulated crash"),
+    ):
+        indexer.index(project)
+
+    page = history.list_runs(project.id)
+    assert len(page.runs) == 1
+    assert page.runs[0].state == "failed"
+    assert page.runs[0].finished_at is not None
+
+
+def test_an_audit_write_failure_never_fails_a_run_that_committed(tmp_path: Path) -> None:
+    """The audit trail follows the progress-publishing rule: a full disk or a
+    runs.sqlite locked past its busy timeout costs the audit row, not the run."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    history = HistoryStore(tmp_path / "history")
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder(), history=history)
+
+    locked = sqlite3.OperationalError("database is locked")
+    with (
+        patch.object(history, "begin", side_effect=locked),
+        patch.object(history, "finish", side_effect=locked),
+    ):
+        report = indexer.index(project)
+
+    assert report.indexed_files == 1
+    assert store.project_state(project.id) == "ready"
+    assert history.list_runs(project.id).runs == []
+
+
+def test_a_reference_backfill_is_audited_with_its_own_trigger(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    history = HistoryStore(tmp_path / "history")
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder(), history=history)
+    indexer.index(project)
+    _remove_reference_generation(store, project.id)
+
+    history.mark_interrupted()
+    indexer.backfill_references(project)
+
+    page = history.list_runs(project.id)
+    assert len(page.runs) == 2
+    backfill = page.runs[0]
+    assert backfill.trigger == "reference-backfill"
+    assert backfill.state == "completed"
+    assert backfill.changed_files == 1
+    assert backfill.eligible_files == 1
+
+
+def test_a_backfill_with_nothing_missing_leaves_no_audit_row(tmp_path: Path) -> None:
+    """Reference tools run a backfill on every query; a no-op must not write a
+    durable row, or ordinary reference queries would evict genuine index runs
+    from the bounded per-project history window."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    history = HistoryStore(tmp_path / "history")
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder(), history=history)
+    indexer.index(project)
+
+    report = indexer.backfill_references(project)
+
+    assert report.files_backfilled == 0
+    page = history.list_runs(project.id)
+    assert [run.trigger for run in page.runs] == ["manual"]

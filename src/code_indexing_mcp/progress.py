@@ -18,63 +18,21 @@ import os
 import tempfile
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+# IndexProgress lives in models.py (ProjectStatus embeds it); it is re-exported
+# here because this module owns everything else about progress. Nothing in this
+# module may be imported by models.py, or the import cycle this layout removed
+# comes back.
+from .models import IndexProgress as IndexProgress
+from .models import IndexTrigger as IndexTrigger
 
 # How long a snapshot stays trustworthy without a refresh. Comfortably above the
 # publish interval, and above the pauses a single slow file can cause between
 # updates, so a live run is never mistaken for a dead one.
 STALE_AFTER_SECONDS = 60.0
 PUBLISH_INTERVAL_SECONDS = 0.25
-
-
-class IndexProgress(BaseModel):
-    """A point-in-time snapshot of one project's indexing run."""
-
-    project_id: str
-    phase: str = "scanning"
-    files_seen: int = 0
-    # None until a run knows better than to guess: the scanner streams, so on a
-    # first index there is no total to compare against.
-    files_total: int | None = None
-    files_indexed: int = 0
-    files_unchanged: int = 0
-    chunks_embedded: int = 0
-    current_path: str | None = None
-    started_at: float = 0.0
-    updated_at: float = 0.0
-    pid: int = Field(default_factory=os.getpid)
-
-    @property
-    def fraction(self) -> float | None:
-        """Completion in ``[0, 1]``, or None when the total is unknown."""
-
-        if not self.files_total:
-            return None
-        return min(1.0, self.files_seen / self.files_total)
-
-    def describe(self) -> str:
-        """Render a one-line status suitable for a progress bar or a log line."""
-
-        if self.phase == "committing":
-            return "Committing the index"
-        if self.phase == "extracting_references":
-            return "Extracting structural references"
-        if not self.files_seen:
-            return "Scanning for changed files"
-        if self.files_total:
-            scanned = f"{self.files_seen}/~{self.files_total} files"
-        else:
-            scanned = f"{self.files_seen} files"
-        parts = [f"{self.phase.capitalize()} {scanned}"]
-        if self.files_indexed:
-            parts.append(f"{self.files_indexed} indexed")
-        if self.files_unchanged:
-            parts.append(f"{self.files_unchanged} unchanged")
-        if self.chunks_embedded:
-            parts.append(f"{self.chunks_embedded} chunks embedded")
-        return ", ".join(parts)
 
 
 def progress_path(directory: Path, project_id: str) -> Path:
@@ -88,6 +46,8 @@ class ProgressPublisher:
         self,
         project_id: str,
         *,
+        run_id: str = "",
+        trigger: IndexTrigger = "manual",
         directory: Path | None = None,
         listener: Callable[[IndexProgress], None] | None = None,
         interval_seconds: float = PUBLISH_INTERVAL_SECONDS,
@@ -98,7 +58,13 @@ class ProgressPublisher:
         self.interval_seconds = interval_seconds
         self._clock = clock
         self._last_published: float | None = None
-        self.state = IndexProgress(project_id=project_id, started_at=time.time())
+        self.state = IndexProgress(
+            project_id=project_id,
+            run_id=run_id,
+            trigger=trigger,
+            started_at=time.time(),
+            phase_started_at=self._clock(),
+        )
 
     @property
     def enabled(self) -> bool:
@@ -113,7 +79,19 @@ class ProgressPublisher:
 
         if not self.enabled:
             return
-        self.state = self.state.model_copy(update=fields)
+        phase = fields.get("phase")
+        if phase is not None and phase != self.state.phase:
+            # Anchor the new phase strictly after the previous one: clocks with
+            # coarse granularity (some Windows runners read milliseconds) can
+            # return the same tick twice, which would make the anchor not
+            # advance and phase durations collapse to zero.
+            fields["phase_started_at"] = max(self._clock(), self.state.phase_started_at + 1e-6)
+        # Deep-copy the merged fields: model_copy never copies the update
+        # mapping's values, and a published snapshot must not share a nested
+        # value (e.g. the skipped_by_reason dict) with a caller that keeps
+        # mutating it. Every retained snapshot stays a true point-in-time
+        # picture.
+        self.state = self.state.model_copy(update=deepcopy(fields))
         now = self._clock()
         if (
             not force

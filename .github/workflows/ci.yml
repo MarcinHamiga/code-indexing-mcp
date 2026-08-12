@@ -48,6 +48,32 @@ jobs:
       - name: Types (scripts)
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run mypy scripts/benchmark_index_memory.py
+      # The Godot grammars come from a GitHub release the pack downloads on
+      # first use; every test worker resolving them concurrently turned a
+      # transient release outage into four failed tests. Resolve the download
+      # once, serialized and retried, before pytest starts: with the parsers
+      # on disk the pack loads them without touching the network at all. The
+      # cache dir is versioned by the pack itself, so a pack upgrade simply
+      # misses and repopulates.
+      - name: Locate the tree-sitter pack cache
+        id: ts-pack
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        shell: bash
+        run: |
+          echo "dir=$(uv run python -c 'import tree_sitter_language_pack as p; print(p.cache_dir())')" >> "$GITHUB_OUTPUT"
+          echo "version=$(uv run python -c 'from importlib.metadata import version; print(version("tree-sitter-language-pack"))')" >> "$GITHUB_OUTPUT"
+      - name: Restore the tree-sitter pack cache
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.ts-pack.outputs.dir }}
+          key: tree-sitter-pack-${{ runner.os }}-${{ steps.ts-pack.outputs.version }}
+      - name: Populate the tree-sitter pack cache
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: >-
+          uv run python -c
+          "from code_indexing_mcp.extractor import _pack_language;
+          [_pack_language(n) for n in ('gdscript', 'gdshader', 'godot_resource')]"
       - name: Test
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         # pytest-xdist shortens the suite ~2.6x on multi-core runners (locally
@@ -79,6 +105,22 @@ jobs:
         env:
           CODE_INDEXING_CACHE_DIR: ${{ github.workspace }}/.model-cache
         run: uv run code-indexing-mcp model pull
+      - name: Locate the tree-sitter pack cache
+        id: ts-pack
+        shell: bash
+        run: |
+          echo "dir=$(uv run python -c 'import tree_sitter_language_pack as p; print(p.cache_dir())')" >> "$GITHUB_OUTPUT"
+          echo "version=$(uv run python -c 'from importlib.metadata import version; print(version("tree-sitter-language-pack"))')" >> "$GITHUB_OUTPUT"
+      - name: Restore the tree-sitter pack cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.ts-pack.outputs.dir }}
+          key: tree-sitter-pack-${{ runner.os }}-${{ steps.ts-pack.outputs.version }}
+      - name: Populate the tree-sitter pack cache
+        run: >-
+          uv run python -c
+          "from code_indexing_mcp.extractor import _pack_language;
+          [_pack_language(n) for n in ('gdscript', 'gdshader', 'godot_resource')]"
       - name: Run the memory gate
         env:
           CODE_INDEXING_MODEL_TEST_CACHE: ${{ github.workspace }}/.model-cache

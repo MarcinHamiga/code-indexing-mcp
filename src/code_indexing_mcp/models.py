@@ -1,5 +1,6 @@
 """Immutable domain models."""
 
+import os
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -166,6 +167,19 @@ LanguageName = Literal[
 
 class FrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True)
+
+
+# Why an indexing run started. ``schema-rebuild`` and ``maintenance`` are
+# reserved for later releases; every current run is one of the other five.
+IndexTrigger = Literal[
+    "manual",
+    "startup",
+    "watcher",
+    "lazy-query",
+    "reference-backfill",
+    "schema-rebuild",
+    "maintenance",
+]
 
 
 class ScanConfig(FrozenModel):
@@ -595,6 +609,20 @@ class IndexReport(FrozenModel):
     # reference extraction together) and from a whole-project table read.
     reference_extraction_duration_ms: int | None = None
     staged_reference_rows: int = 0
+    # Durable run identity and why it ran. Optional so older clients keep
+    # validating reports and older stored reports keep validating.
+    run_id: str | None = None
+    trigger: IndexTrigger = "manual"
+    # Counter contract for the audit record: skip reasons are broken out by
+    # cause, failed files are parse/embedding failures, and the byte/chunk
+    # counters track what the run actually read, extracted, and staged.
+    failed_files: int = 0
+    skip_reasons: dict[str, int] = Field(default_factory=dict)
+    skipped_samples: list[str] = Field(default_factory=list)
+    bytes_read: int = 0
+    chunks_extracted: int = 0
+    chunks_staged: int = 0
+    staged_bytes: int = 0
 
 
 class ModelStatus(FrozenModel):
@@ -713,11 +741,179 @@ class CodeChunk(FrozenModel):
     part_index: int = 0
 
 
+# Why an indexing run started. ``schema-rebuild`` and ``maintenance`` are
+# reserved for later releases; every current run is one of the other five.
+
+
+class RunAudit(FrozenModel):
+    """One durable audit record of an indexing or backfill run.
+
+    Values are bounded before they are written: at most ``MAX_ERROR_SAMPLES``
+    error details and ``MAX_SKIPPED_SAMPLES`` skipped-path samples are kept,
+    so a pathological run cannot grow the history database without bound.
+    """
+
+    run_id: str
+    project_id: str
+    trigger: IndexTrigger
+    server_version: str = ""
+    git_revision: str | None = None
+    model_id: str = ""
+    schema_version: int = 0
+    scan_config_hash: str = ""
+    force: bool = False
+    # Owning process, so startup can tell a crashed run from one another live
+    # process is still executing.
+    pid: int = Field(default_factory=os.getpid)
+    started_at: str = ""
+    finished_at: str | None = None
+    # running, completed, failed, or interrupted.
+    state: str = "running"
+    phase_durations: dict[str, int] = Field(default_factory=dict)
+    eligible_files: int = 0
+    changed_files: int = 0
+    unchanged_files: int = 0
+    parsed_files: int = 0
+    failed_files: int = 0
+    removed_files: int = 0
+    skipped_total: int = 0
+    chunks_extracted: int = 0
+    chunks_embedded: int = 0
+    chunks_staged: int = 0
+    staged_bytes: int = 0
+    bytes_read: int = 0
+    skip_reasons: dict[str, int] = Field(default_factory=dict)
+    errors: list[IndexIssue] = Field(default_factory=list)
+    skipped_samples: list[str] = Field(default_factory=list)
+    embedding_backend: str = "cpu"
+    embedding_fallback_reason: str | None = None
+    worker_used: bool = False
+    # Best-effort storage table versions around the run, not full partition
+    # traversals: audit recording must stay inexpensive on any repository.
+    storage_before: dict[str, int] = Field(default_factory=dict)
+    storage_after: dict[str, int] = Field(default_factory=dict)
+
+
+class RunSummary(FrozenModel):
+    """Compact summary of one completed run for status surfaces."""
+
+    run_id: str
+    trigger: IndexTrigger
+    state: str
+    started_at: str
+    finished_at: str | None = None
+    duration_ms: int = 0
+    eligible_files: int = 0
+    changed_files: int = 0
+    failed_files: int = 0
+    skipped_total: int = 0
+    chunks_embedded: int = 0
+
+
+class HistoryPage(FrozenModel):
+    """One page of a project's indexing history."""
+
+    schema_version: int = 1
+    project: ProjectInfo | None = None
+    runs: list[RunAudit] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class IndexProgress(BaseModel):
+    """A point-in-time snapshot of one project's indexing run.
+
+    Every counter's name matches what it counts: ``candidates_*`` cover every
+    path the scanner examined, ``eligible_files`` the files that passed the
+    scan, and the ``*_files`` counters the eligible ones. Totals stay unset
+    while the scanner streams and the run genuinely does not know them, and a
+    candidate count is never compared with an eligible-file total.
+
+    Defined here rather than in progress.py so progress.py stays a plain
+    consumer of this module: it used to be the other way around, and the
+    resulting models/progress cycle made the package import-order dependent.
+    """
+
+    project_id: str
+    run_id: str = ""
+    trigger: IndexTrigger = "manual"
+    phase: str = "scanning"
+    # Every path the scanner examined, whether it became eligible or was
+    # skipped. A first index has no honest candidates_total: the scanner
+    # streams, so the total is only known once the walk has finished.
+    candidates_seen: int = 0
+    candidates_total: int | None = None
+    eligible_files: int = 0
+    unchanged_files: int = 0
+    changed_files: int = 0
+    parsed_files: int = 0
+    failed_files: int = 0
+    skipped_total: int = 0
+    skipped_by_reason: dict[str, int] = Field(default_factory=dict)
+    bytes_read: int = 0
+    chunks_extracted: int = 0
+    chunks_embedded: int = 0
+    chunks_staged: int = 0
+    staged_bytes: int = 0
+    current_path: str | None = None
+    started_at: float = 0.0
+    updated_at: float = 0.0
+    # Monotonic anchor for phase durations, never a wall-clock timestamp:
+    # it must strictly advance across phase changes on every platform.
+    phase_started_at: float = 0.0
+    pid: int = Field(default_factory=os.getpid)
+
+    @property
+    def fraction(self) -> float | None:
+        """Completion in ``[0, 1]``, or None when the total is unknown.
+
+        Only candidate counts may feed this: comparing candidates seen with an
+        eligible-file total would overstate (or understate) progress whenever
+        the repository contains skipped paths.
+        """
+
+        if not self.candidates_total:
+            return None
+        return min(1.0, self.candidates_seen / self.candidates_total)
+
+    def describe(self) -> str:
+        """Render a one-line status suitable for a progress bar or a log line."""
+
+        if self.phase == "committing":
+            return "Committing the index"
+        if self.phase == "extracting_references":
+            return "Extracting structural references"
+        if not self.candidates_seen:
+            return "Scanning for changed files"
+        if self.candidates_total:
+            scanned = f"{self.candidates_seen}/~{self.candidates_total} candidates"
+        else:
+            scanned = f"{self.candidates_seen} candidates"
+        parts = [f"{self.phase.capitalize()} {scanned}"]
+        if self.eligible_files:
+            parts.append(f"{self.eligible_files} eligible")
+        if self.changed_files:
+            parts.append(f"{self.changed_files} changed")
+        if self.unchanged_files:
+            parts.append(f"{self.unchanged_files} unchanged")
+        if self.failed_files:
+            parts.append(f"{self.failed_files} failed")
+        if self.skipped_total:
+            parts.append(f"{self.skipped_total} skipped")
+        if self.chunks_embedded:
+            parts.append(f"{self.chunks_embedded} chunks embedded")
+        return ", ".join(parts)
+
+
 class ProjectStatus(FrozenModel):
     project: ProjectInfo
     state: str
     file_count: int
     chunk_count: int
+    # Live progress of whichever process is indexing this project right now,
+    # and the compact summary of its most recent completed run. Never the
+    # full history: status stays inexpensive.
+    progress: IndexProgress | None = None
+    last_run: RunSummary | None = None
 
 
 class RemovalReport(FrozenModel):

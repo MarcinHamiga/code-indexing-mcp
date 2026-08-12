@@ -37,26 +37,49 @@ def test_indexing_reports_file_counts_as_it_goes(tmp_path: Path) -> None:
     assert report.indexed_files == 3
     assert seen, "an index that takes any work must report progress"
     assert [progress.project_id for progress in seen] == [project.id] * len(seen)
-    assert max(progress.files_seen for progress in seen) == 3
-    assert max(progress.files_indexed for progress in seen) == 3
+    assert [progress.run_id for progress in seen] == [seen[0].run_id] * len(seen)
+    assert max(progress.candidates_seen for progress in seen) == 3
+    assert max(progress.eligible_files for progress in seen) == 3
+    assert max(progress.changed_files for progress in seen) == 3
     assert max(progress.chunks_embedded for progress in seen) > 0
     assert seen[-1].phase == "committing"
-    # File counts are a running total, never a per-update delta.
-    assert [progress.files_seen for progress in seen] == sorted(
-        progress.files_seen for progress in seen
+    assert seen[-1].candidates_total == 3
+    assert seen[-1].parsed_files == 3
+    assert seen[-1].failed_files == 0
+    assert seen[-1].bytes_read > 0
+    assert seen[-1].chunks_extracted > 0
+    # Counts are a running total, never a per-update delta.
+    assert [progress.candidates_seen for progress in seen] == sorted(
+        progress.candidates_seen for progress in seen
+    )
+    # A candidate count is never compared with an eligible-file total: the
+    # denominator of a progress fraction is always candidate-scoped.
+    assert all(progress.fraction is None or progress.fraction <= 1.0 for progress in seen)
+
+
+def test_observed_119_eligible_plus_1367_skipped_never_reads_as_1486_over_119() -> None:
+    """The review-measured case: 119 eligible files, 1,367 skipped candidates.
+
+    The old contract counted every candidate in the seen counter and only the
+    eligible files in the total, so describe() could print ``1486/~119``.
+    """
+    progress = IndexProgress(
+        project_id="p",
+        run_id="r",
+        candidates_seen=1486,
+        candidates_total=1486,
+        eligible_files=119,
+        skipped_total=1367,
     )
 
-
-def test_a_second_run_knows_roughly_how_many_files_to_expect(tmp_path: Path) -> None:
-    project = initialize_project(_repo(tmp_path))
-    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
-    indexer.index(project)
-    seen: list[IndexProgress] = []
-
-    indexer.index(project, on_progress=lambda progress: seen.append(progress.model_copy()))
-
-    assert seen[0].files_total == 3
-    assert seen[0].fraction is not None
+    description = progress.describe()
+    assert "/~119" not in description
+    assert progress.fraction == 1.0
+    # Without a candidate total the fraction must stay unknown rather than
+    # falling back to an eligible-file denominator.
+    ambiguous = progress.model_copy(update={"candidates_total": None})
+    assert ambiguous.fraction is None
+    assert "1486 candidates, 119 eligible" in ambiguous.describe()
 
 
 def test_the_first_run_admits_it_has_no_total(tmp_path: Path) -> None:
@@ -66,9 +89,27 @@ def test_the_first_run_admits_it_has_no_total(tmp_path: Path) -> None:
 
     indexer.index(project, on_progress=lambda progress: seen.append(progress.model_copy()))
 
-    assert seen[0].files_total is None
+    assert seen[0].candidates_total is None
     assert seen[0].fraction is None
-    assert "files" in seen[0].describe()
+    counting = next(progress for progress in seen if progress.candidates_seen)
+    assert "candidates" in counting.describe()
+
+
+def test_skipped_candidates_are_aggregated_by_reason(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    (root / "notes.txt").write_text("unsupported")
+    (root / "binary.py").write_bytes(b"a\x00b")
+    project = initialize_project(root)
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+    seen: list[IndexProgress] = []
+
+    indexer.index(project, on_progress=lambda progress: seen.append(progress.model_copy()))
+
+    last = seen[-1]
+    assert last.skipped_total == 2
+    assert last.skipped_by_reason == {"unsupported": 1, "binary": 1}
 
 
 def test_reference_extraction_has_a_distinct_progress_description() -> None:
@@ -105,21 +146,61 @@ def test_another_process_can_read_the_snapshot_and_it_is_gone_afterwards(tmp_pat
 
 
 def test_updates_are_throttled_but_the_forced_ones_always_land(tmp_path: Path) -> None:
-    clock = iter([0.0, 0.05, 0.10, 0.15])
+    # The first tick is consumed for the initial phase anchor.
+    clock = iter([0.0, 0.05, 0.10, 0.15, 0.20])
     seen: list[int] = []
     publisher = ProgressPublisher(
         "project",
-        listener=lambda progress: seen.append(progress.files_seen),
+        listener=lambda progress: seen.append(progress.candidates_seen),
         interval_seconds=1.0,
         clock=lambda: next(clock),
     )
 
-    publisher.update(files_seen=1)
-    publisher.update(files_seen=2)
-    publisher.update(files_seen=3)
-    publisher.update(files_seen=4, force=True)
+    publisher.update(candidates_seen=1)
+    publisher.update(candidates_seen=2)
+    publisher.update(candidates_seen=3)
+    publisher.update(candidates_seen=4, force=True)
 
     assert seen == [1, 4]
+
+
+def test_a_phase_change_stamps_phase_started_at_and_publishes_immediately() -> None:
+    publisher = ProgressPublisher("project", listener=lambda _: None, interval_seconds=1.0)
+    before = publisher.state.phase_started_at
+
+    publisher.update(phase="embedding", candidates_seen=1, force=True)
+
+    assert publisher.state.phase == "embedding"
+    assert publisher.state.phase_started_at > before
+
+
+def test_every_run_carries_a_run_id_and_trigger(tmp_path: Path) -> None:
+    project = initialize_project(_repo(tmp_path))
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+    seen: list[IndexProgress] = []
+
+    indexer.index(
+        project,
+        trigger="watcher",
+        on_progress=lambda progress: seen.append(progress.model_copy()),
+    )
+
+    assert seen
+    assert all(progress.run_id for progress in seen)
+    assert [progress.trigger for progress in seen] == ["watcher"] * len(seen)
+
+
+def test_retained_snapshots_do_not_change_when_the_source_dict_is_mutated() -> None:
+    publisher = ProgressPublisher("project", listener=lambda _: None, interval_seconds=0.0)
+    reasons = {"binary": 1}
+    publisher.update(skipped_by_reason=reasons, force=True)
+    snapshot = publisher.state.model_copy()
+
+    reasons["binary"] = 99
+    publisher.update(skipped_by_reason=reasons, force=True)
+
+    assert snapshot.skipped_by_reason == {"binary": 1}
+    assert publisher.state.skipped_by_reason == {"binary": 99}
 
 
 def test_a_snapshot_left_behind_by_a_dead_process_is_ignored(tmp_path: Path) -> None:
@@ -140,9 +221,9 @@ def test_a_corrupt_snapshot_is_treated_as_absent(tmp_path: Path) -> None:
 def test_the_snapshot_is_replaced_atomically(tmp_path: Path) -> None:
     publisher = ProgressPublisher("abc", directory=tmp_path)
 
-    publisher.update(files_seen=1, force=True)
-    publisher.update(files_seen=2, force=True)
+    publisher.update(candidates_seen=1, force=True)
+    publisher.update(candidates_seen=2, force=True)
 
     payload = json.loads(progress_path(tmp_path, "abc").read_text())
-    assert payload["files_seen"] == 2
+    assert payload["candidates_seen"] == 2
     assert list(tmp_path.iterdir()) == [progress_path(tmp_path, "abc")]
