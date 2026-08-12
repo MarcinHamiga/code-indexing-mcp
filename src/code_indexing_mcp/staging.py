@@ -21,7 +21,7 @@ import logging
 import os
 import shutil
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -53,6 +53,16 @@ JOURNAL_FORMAT_VERSION = 2
 # survives long enough can name a version that no longer exists. Retry a few
 # times to ride out transient I/O, then give up loudly.
 MAX_RECOVERY_ATTEMPTS = 3
+
+# Bounded commit batches: the commit runs one Lance mutation per batch rather
+# than one per changed file, so an unchanged run creates no mutations and a
+# run with N changed files creates O(batches) table versions. These are
+# conservative starting points to tune from benchmark evidence. A single
+# file's rows are never split across batches, so one file alone may exceed
+# the row and byte bounds.
+COMMIT_BATCH_MAX_FILES = 64
+COMMIT_BATCH_MAX_ROWS = 20_000
+COMMIT_BATCH_MAX_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -169,6 +179,8 @@ class StagingJob:
         self.replace_reference_file_ids: list[str] = []
         self._reference_file_ids: set[str] = set()
         self._last_reference_file_id: str | None = None
+        self._chunk_file_ids: set[str] = set()
+        self._last_chunk_file_id: str | None = None
         self.removed_file_ids: list[str] = []
         self._journal: dict[str, Any] = {}
         self._files_sink: Any = None
@@ -205,12 +217,25 @@ class StagingJob:
         self._files_writer.write_batch(batch)
 
     def stage_chunks(self, rows: list[ChunkRow]) -> None:
-        """Stage one embedding group's chunk rows as a single record batch."""
+        """Stage one embedding group's chunk rows as a single record batch.
+
+        Calls for a file may be repeated while contiguous, but once another
+        file is staged that file is closed for this job. The commit's batch
+        grouping relies on each file's rows being contiguous in the staged
+        stream: a non-contiguous repeat would look like a new file group and
+        split the file across batches, whose later predicate would silently
+        delete the earlier group's rows.
+        """
         assert self._chunks_writer is not None
         if not rows:
             return
-        if any(row.file_id != rows[0].file_id for row in rows[1:]):
+        file_id = rows[0].file_id
+        if any(row.file_id != file_id for row in rows[1:]):
             raise ValueError("A staged chunk batch must contain rows from one file")
+        if file_id in self._chunk_file_ids and file_id != self._last_chunk_file_id:
+            raise ValueError("Staged chunk batches for a file must be contiguous")
+        self._chunk_file_ids.add(file_id)
+        self._last_chunk_file_id = file_id
         vector_type = self._chunk_schema.field("vector").type
         dimension = vector_type.list_size
         columns: list[pa.Array] = []
@@ -260,7 +285,8 @@ class StagingJob:
             self.replace_reference_file_ids.append(file_id)
 
     def mark_removed(self, file_id: str) -> None:
-        self.removed_file_ids.append(file_id)
+        if file_id not in self.removed_file_ids:
+            self.removed_file_ids.append(file_id)
 
     def begin_commit(self, versions: TableVersions) -> None:
         """Finalize the payloads and record the versions a rollback restores."""
@@ -282,74 +308,154 @@ class StagingJob:
         """Read back every staged file record. One row per file; small."""
         return pa.ipc.open_file(self.directory / FILES_NAME).read_all()
 
-    def iter_chunk_groups(self) -> Iterator[tuple[str, pa.Table]]:
-        """Yield ``(file_id, table)`` for each replaced file, one at a time.
+    def iter_chunk_batches(
+        self,
+        *,
+        max_files: int | None = None,
+        max_rows: int | None = None,
+        max_bytes: int | None = None,
+    ) -> Iterator[tuple[list[str], pa.Table]]:
+        """Yield bounded ``(file_ids, table)`` commit batches for chunks.
 
-        Staged rows for files absent from ``replace_file_ids`` -- files that
-        failed mid-run -- are skipped, and a replaced file with no staged rows
-        yields an empty table so the commit deletes its previous chunks.
+        Complete file groups are combined into batches of at most ``max_files``
+        files, ``max_rows`` rows, or ``max_bytes`` of Arrow data, with one
+        exception: a file's rows are never split across batches, so one file
+        alone may exceed the row and byte bounds. Staged rows
+        for files absent from ``replace_file_ids`` -- files that failed
+        mid-run -- are skipped, and every replaced file appears in exactly one
+        batch's ``file_ids`` even when it has no staged rows, so the commit's
+        predicate removes its previous chunks.
         """
-        wanted = set(self.replace_file_ids)
+        yield from self._iter_batches(
+            self.directory / CHUNKS_NAME,
+            self._chunk_schema,
+            self.replace_file_ids,
+            max_files=COMMIT_BATCH_MAX_FILES if max_files is None else max_files,
+            max_rows=COMMIT_BATCH_MAX_ROWS if max_rows is None else max_rows,
+            max_bytes=COMMIT_BATCH_MAX_BYTES if max_bytes is None else max_bytes,
+        )
+
+    def iter_reference_batches(
+        self,
+        *,
+        max_files: int | None = None,
+        max_rows: int | None = None,
+        max_bytes: int | None = None,
+    ) -> Iterator[tuple[list[str], pa.Table]]:
+        """Yield bounded ``(file_ids, table)`` commit batches for references.
+
+        Same contract as :meth:`iter_chunk_batches`, over the staged reference
+        rows and ``replace_reference_file_ids``. :meth:`stage_references`
+        enforces one file per contiguous batch, so only the current file's
+        Arrow batches are retained while streaming the staged IPC file back
+        into the commit.
+        """
+        yield from self._iter_batches(
+            self.directory / REFERENCES_NAME,
+            self._reference_schema,
+            self.replace_reference_file_ids,
+            max_files=COMMIT_BATCH_MAX_FILES if max_files is None else max_files,
+            max_rows=COMMIT_BATCH_MAX_ROWS if max_rows is None else max_rows,
+            max_bytes=COMMIT_BATCH_MAX_BYTES if max_bytes is None else max_bytes,
+        )
+
+    def _iter_batches(
+        self,
+        path: Path,
+        schema: pa.Schema,
+        wanted_ids: Iterable[str],
+        *,
+        max_files: int,
+        max_rows: int,
+        max_bytes: int,
+    ) -> Iterator[tuple[list[str], pa.Table]]:
+        """Stream complete per-file groups combined into bounded batches.
+
+        ``wanted_ids`` is the full affected set: every wanted file lands in
+        exactly one batch, whether or not it has staged rows, so a batch's
+        ``file_ids`` is its complete delete predicate. A file's rows are never
+        split across batches, and each yielded table is released (replaced by
+        the consumer's next pull) before the next batch is assembled.
+        """
+        wanted = set(wanted_ids)
         seen: set[str] = set()
         current_file_id: str | None = None
-        batches: list[pa.RecordBatch] = []
-        reader = pa.ipc.open_file(self.directory / CHUNKS_NAME)
-        for index in range(reader.num_record_batches):
-            batch = reader.get_batch(index)
-            file_id = cast(str, batch.column("file_id")[0].as_py())
-            if file_id != current_file_id:
-                if batches:
-                    assert current_file_id is not None
-                    seen.add(current_file_id)
-                    yield current_file_id, pa.Table.from_batches(batches, schema=self._chunk_schema)
-                    batches = []
-                current_file_id = file_id
-            if file_id in wanted:
-                batches.append(batch)
-        if batches:
-            assert current_file_id is not None
-            seen.add(current_file_id)
-            yield current_file_id, pa.Table.from_batches(batches, schema=self._chunk_schema)
-        empty = pa.Table.from_batches([], schema=self._chunk_schema)
-        for file_id in self.replace_file_ids:
-            if file_id not in seen:
-                yield file_id, empty
+        file_batches: list[pa.RecordBatch] = []
+        batch_file_ids: list[str] = []
+        batch_tables: list[pa.Table] = []
+        batch_rows = 0
+        batch_bytes = 0
 
-    def iter_reference_groups(self) -> Iterator[tuple[str, pa.Table]]:
-        """Yield one complete staged structural table per replaced file.
+        def release_batch() -> tuple[list[str], pa.Table] | None:
+            """Return the accumulated batch and reset, or None when empty."""
+            nonlocal batch_file_ids, batch_tables, batch_rows, batch_bytes
+            if not batch_file_ids:
+                return None
+            ids, batch_file_ids = batch_file_ids, []
+            if len(batch_tables) == 1:
+                table, batch_tables = batch_tables[0], []
+            else:
+                table, batch_tables = pa.concat_tables(batch_tables), []
+            batch_rows, batch_bytes = 0, 0
+            return ids, table
 
-        :meth:`stage_references` enforces one file per contiguous batch, so
-        only the current file's Arrow batches are retained while streaming the
-        staged IPC file back into the commit.
-        """
-        wanted = set(self.replace_reference_file_ids)
-        seen: set[str] = set()
-        current_file_id: str | None = None
-        batches: list[pa.RecordBatch] = []
-        reader = pa.ipc.open_file(self.directory / REFERENCES_NAME)
-        for index in range(reader.num_record_batches):
-            batch = reader.get_batch(index)
-            file_id = cast(str, batch.column("file_id")[0].as_py())
-            if file_id != current_file_id:
-                if batches:
-                    assert current_file_id is not None
-                    seen.add(current_file_id)
-                    yield (
-                        current_file_id,
-                        pa.Table.from_batches(batches, schema=self._reference_schema),
-                    )
-                    batches = []
-                current_file_id = file_id
-            if file_id in wanted:
-                batches.append(batch)
-        if batches:
-            assert current_file_id is not None
-            seen.add(current_file_id)
-            yield current_file_id, pa.Table.from_batches(batches, schema=self._reference_schema)
-        empty = pa.Table.from_batches([], schema=self._reference_schema)
-        for file_id in self.replace_reference_file_ids:
-            if file_id not in seen:
-                yield file_id, empty
+        def add_file(file_id: str, table: pa.Table) -> bool:
+            """Add one complete file group to the current batch.
+
+            Returns False when it does not fit and must start a new batch;
+            the caller flushes the current batch and retries.
+            """
+            nonlocal batch_rows, batch_bytes
+            if batch_file_ids and len(batch_file_ids) >= max_files:
+                return False
+            if table.num_rows:
+                if batch_file_ids and (
+                    batch_rows + table.num_rows > max_rows or batch_bytes + table.nbytes > max_bytes
+                ):
+                    return False
+                batch_rows += table.num_rows
+                batch_bytes += table.nbytes
+            batch_file_ids.append(file_id)
+            batch_tables.append(table)
+            return True
+
+        with pa.ipc.open_file(path) as reader:
+            for index in range(reader.num_record_batches):
+                batch = reader.get_batch(index)
+                file_id = cast(str, batch.column("file_id")[0].as_py())
+                if file_id != current_file_id:
+                    if file_batches:
+                        assert current_file_id is not None
+                        seen.add(current_file_id)
+                        table = pa.Table.from_batches(file_batches, schema=schema)
+                        file_batches = []
+                        if not add_file(current_file_id, table):
+                            released = release_batch()
+                            if released is not None:
+                                yield released
+                            add_file(current_file_id, table)
+                    current_file_id = file_id
+                if file_id in wanted:
+                    file_batches.append(batch)
+            if file_batches:
+                assert current_file_id is not None
+                seen.add(current_file_id)
+                table = pa.Table.from_batches(file_batches, schema=schema)
+                if not add_file(current_file_id, table):
+                    released = release_batch()
+                    if released is not None:
+                        yield released
+                    add_file(current_file_id, table)
+            empty = pa.Table.from_batches([], schema=schema)
+            for file_id in wanted_ids:
+                if file_id not in seen and not add_file(file_id, empty):
+                    released = release_batch()
+                    if released is not None:
+                        yield released
+                    add_file(file_id, empty)
+            released = release_batch()
+            if released is not None:
+                yield released
 
     def complete(self) -> None:
         """Mark the commit successful and remove the staged directory."""

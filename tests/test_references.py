@@ -404,11 +404,10 @@ def test_cursor_is_filter_bound_and_reads_its_original_snapshot(tmp_path: Path) 
     service.store.replace_files_from_arrow(
         project_id,
         files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=[
-            (file_id, pa.Table.from_batches([], schema=LanceStore.reference_arrow_schema()))
+        chunk_batches=(),
+        reference_batches=[
+            ([file_id], pa.Table.from_batches([], schema=LanceStore.reference_arrow_schema()))
         ],
-        replace_reference_file_ids=[file_id],
     )
     original_snapshot = service.find_references(selector, limit=1, cursor=first.cursor)
     assert original_snapshot.hits
@@ -454,9 +453,8 @@ def test_stale_schema_version_rows_are_not_served(tmp_path: Path) -> None:
     store.replace_files_from_arrow(
         project_id,
         files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=[(main_file_id, table)],
-        replace_reference_file_ids=[main_file_id],
+        chunk_batches=(),
+        reference_batches=[([main_file_id], table)],
     )
 
     after = service.find_references(selector)

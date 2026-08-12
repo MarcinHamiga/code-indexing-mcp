@@ -8,6 +8,7 @@ behind the ``memory`` marker.
 from __future__ import annotations
 
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -20,6 +21,14 @@ from benchmark_index_memory import (
     run_benchmark,
     write_corpus,
 )
+
+from code_indexing_mcp.staging import (
+    COMMIT_BATCH_MAX_BYTES,
+    COMMIT_BATCH_MAX_FILES,
+    ChunkRow,
+    StagingJob,
+)
+from code_indexing_mcp.storage import LanceStore, TableVersions
 
 CEILING = 2048 * MIB
 
@@ -215,3 +224,67 @@ def test_a_minified_file_stays_within_its_ceiling(tmp_path: Path) -> None:
     assert run.report["token_windowing"] is True
     assert run.report["embedded_tokens"] > 0
     assert run.report["embedded_segments"] > 0
+
+
+def test_commit_batches_stay_bounded_far_below_the_memory_ceiling(tmp_path: Path) -> None:
+    """The commit path's live Arrow bytes are bounded by the batch limits.
+
+    A staged corpus far beyond the byte bound still commits in batches of at
+    most ``COMMIT_BATCH_MAX_FILES`` files whose Arrow data stays at or under
+    ``COMMIT_BATCH_MAX_BYTES`` (a single file's rows are never split, so one
+    file alone may exceed the byte bound), so peak commit memory stays an
+    order of magnitude below the 2048 MiB combined ceiling instead of scaling
+    with the run.
+    """
+    job = StagingJob(
+        tmp_path / "staging",
+        "project-1",
+        file_schema=LanceStore.file_arrow_schema(),
+        chunk_schema=LanceStore.chunk_arrow_schema(4),
+        reference_schema=LanceStore.reference_arrow_schema(),
+    )
+    job.begin()
+    # Each file carries ~512 KiB across content + embedding_text, so the
+    # default file-count bound (64) dominates the byte bound (64 MiB) and the
+    # batch shape below is deterministic.
+    content = "x" * (256 * 1024)
+    vector = struct.pack("<4f", 0.0, 0.0, 0.0, 1.0)
+    for index in range(200):
+        file_id = f"file-{index}"
+        job.stage_chunks(
+            [
+                ChunkRow(
+                    chunk_id=f"chunk-{index}",
+                    file_id=file_id,
+                    project_id="project-1",
+                    path=f"file_{index}.py",
+                    language="python",
+                    kind="function",
+                    symbol="symbol",
+                    qualified_symbol="symbol",
+                    parent_symbol=None,
+                    start_byte=0,
+                    end_byte=len(content),
+                    start_line=1,
+                    end_line=1,
+                    content=content,
+                    embedding_text=content,
+                    search_text="",
+                    content_hash="hash",
+                    part_index=0,
+                    vector=vector,
+                )
+            ]
+        )
+        job.mark_replaced(file_id)
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    batches = list(job.iter_chunk_batches())
+
+    assert [len(file_ids) for file_ids, _ in batches] == [64, 64, 64, 8]
+    assert all(len(file_ids) <= COMMIT_BATCH_MAX_FILES for file_ids, _ in batches)
+    assert all(table.nbytes <= COMMIT_BATCH_MAX_BYTES for _, table in batches)
+    # One bounded batch against the 2048 MiB combined ceiling: the commit
+    # path is far below the acceptance limit by construction.
+    assert COMMIT_BATCH_MAX_BYTES <= CEILING // 16
+    job.discard()

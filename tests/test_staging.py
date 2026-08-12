@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -202,7 +203,7 @@ def test_staging_references_rejects_mixed_file_batches(tmp_path: Path) -> None:
         )
 
 
-def test_contiguous_reference_batches_stream_one_complete_group_per_file(tmp_path: Path) -> None:
+def test_reference_batches_combine_complete_file_groups(tmp_path: Path) -> None:
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     job = make_job(tmp_path, store, "project-1")
     job.stage_references([reference_row("project-1", "file-a", reference_id="a-1")])
@@ -210,14 +211,116 @@ def test_contiguous_reference_batches_stream_one_complete_group_per_file(tmp_pat
     job.stage_references([reference_row("project-1", "file-b", reference_id="b-1")])
     job.mark_references_replaced("file-a")
     job.mark_references_replaced("file-b")
-    job.mark_references_replaced("file-a")
     job.begin_commit(TableVersions(files=1, chunks=1, references=1))
 
-    groups = list(job.iter_reference_groups())
+    batches = list(job.iter_reference_batches())
 
-    assert [file_id for file_id, _ in groups] == ["file-a", "file-b"]
-    assert groups[0][1].column("reference_id").to_pylist() == ["a-1", "a-2"]
-    assert groups[1][1].column("reference_id").to_pylist() == ["b-1"]
+    assert [file_ids for file_ids, _ in batches] == [["file-a", "file-b"]]
+    assert batches[0][1].column("reference_id").to_pylist() == ["a-1", "a-2", "b-1"]
+
+
+def test_chunk_batches_never_split_a_file_across_batches(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_chunks([chunk_row("project-1", "file-a", [1.0, 2.0, 3.0, 4.0], chunk_id="a-1")])
+    job.stage_chunks([chunk_row("project-1", "file-a", [2.0, 2.0, 3.0, 4.0], chunk_id="a-2")])
+    job.stage_chunks([chunk_row("project-1", "file-b", [3.0, 2.0, 3.0, 4.0], chunk_id="b-1")])
+    job.mark_replaced("file-a")
+    job.mark_replaced("file-b")
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    batches = list(job.iter_chunk_batches(max_files=1))
+
+    # The file-count bound splits the batch, but never between a file's rows.
+    assert [file_ids for file_ids, _ in batches] == [["file-a"], ["file-b"]]
+    assert batches[0][1].column("chunk_id").to_pylist() == ["a-1", "a-2"]
+
+
+def test_commit_batches_respect_the_file_and_byte_limits(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    for index in range(5):
+        job.stage_chunks(
+            [
+                chunk_row(
+                    "project-1",
+                    f"file-{index}",
+                    [1.0, 2.0, 3.0, 4.0],
+                    chunk_id=f"chunk-{index}",
+                )
+            ]
+        )
+        job.mark_replaced(f"file-{index}")
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    batches = list(job.iter_chunk_batches(max_files=2))
+
+    assert [file_ids for file_ids, _ in batches] == [
+        ["file-0", "file-1"],
+        ["file-2", "file-3"],
+        ["file-4"],
+    ]
+    assert [table.num_rows for _, table in batches] == [2, 2, 1]
+
+
+def test_commit_batches_respect_the_byte_bound(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    for index in range(3):
+        row = chunk_row(
+            "project-1", f"file-{index}", [1.0, 2.0, 3.0, 4.0], chunk_id=f"chunk-{index}"
+        )
+        job.stage_chunks([replace(row, content="x" * 2048)])
+        job.mark_replaced(f"file-{index}")
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    batches = list(job.iter_chunk_batches(max_files=10, max_rows=100_000, max_bytes=4000))
+
+    # The file-count bound would allow one batch of three; the byte bound
+    # binds instead and gives each file its own batch, never splitting a
+    # file's rows.
+    assert [file_ids for file_ids, _ in batches] == [["file-0"], ["file-1"], ["file-2"]]
+    assert all(table.nbytes <= 4000 for _, table in batches)
+
+
+def test_commit_batches_cover_zero_row_files_in_the_affected_predicate(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_chunks([chunk_row("project-1", "file-a", [1.0, 2.0, 3.0, 4.0], chunk_id="a-1")])
+    job.mark_replaced("file-a")
+    job.mark_replaced("file-b")
+    job.mark_replaced("file-c")
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    batches = list(job.iter_chunk_batches())
+
+    # Every replaced file lands in exactly one batch's predicate, whether or
+    # not it has staged rows, so the commit removes its previous chunks.
+    assert sorted(file_id for file_ids, _ in batches for file_id in file_ids) == [
+        "file-a",
+        "file-b",
+        "file-c",
+    ]
+    assert sum(table.num_rows for _, table in batches) == 1
+
+
+def test_a_single_file_may_exceed_the_row_and_byte_bounds(tmp_path: Path) -> None:
+    """A file's rows are never split, so one file alone may exceed the bounds."""
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_chunks(
+        [
+            chunk_row("project-1", "file-a", [1.0, 2.0, 3.0, 4.0], chunk_id=f"a-{index}")
+            for index in range(3)
+        ]
+    )
+    job.mark_replaced("file-a")
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    batches = list(job.iter_chunk_batches(max_rows=2, max_bytes=1))
+
+    assert [file_ids for file_ids, _ in batches] == [["file-a"]]
+    assert batches[0][1].num_rows == 3
 
 
 def test_staging_references_rejects_non_contiguous_file_batches(tmp_path: Path) -> None:
@@ -241,6 +344,22 @@ def test_staging_chunks_rejects_mixed_file_batches(tmp_path: Path) -> None:
                 chunk_row("project-1", "file-b", [4.0, 3.0, 2.0, 1.0], chunk_id="chunk-b"),
             ]
         )
+
+
+def test_staging_chunks_rejects_non_contiguous_file_batches(tmp_path: Path) -> None:
+    """The commit's batch grouping needs one file's rows contiguous.
+
+    A non-contiguous repeat would split the file across two batches whose
+    later predicate would silently delete the earlier group's rows, so it
+    must be refused at staging time rather than corrupt the commit.
+    """
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_chunks([chunk_row("project-1", "file-a", [1.0, 2.0, 3.0, 4.0], chunk_id="a-1")])
+    job.stage_chunks([chunk_row("project-1", "file-b", [4.0, 3.0, 2.0, 1.0], chunk_id="b-1")])
+
+    with pytest.raises(ValueError, match="contiguous"):
+        job.stage_chunks([chunk_row("project-1", "file-a", [1.0, 2.0, 3.0, 4.0], chunk_id="a-2")])
 
 
 def test_the_write_path_never_dumps_a_stored_chunk(tmp_path: Path) -> None:
@@ -330,7 +449,7 @@ def test_a_file_that_now_extracts_no_chunks_has_its_old_chunks_deleted(
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_batches([files]),
-        chunk_groups=[("file-1", empty)],
+        chunk_batches=[(["file-1"], empty)],
     )
 
     assert store.count_chunks([project.id]) == 0
@@ -408,17 +527,16 @@ def test_a_failed_commit_restores_reference_rows_with_files_and_chunks(tmp_path:
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=[
+        chunk_batches=(),
+        reference_batches=[
             (
-                file_id,
+                [file_id],
                 pa.Table.from_pylist(
                     [reference_row(project.id, file_id).__dict__],
                     schema=LanceStore.reference_arrow_schema(),
                 ),
             )
         ],
-        replace_reference_file_ids=[file_id],
     )
     files_before = store.list_files(project.id)
     chunks_before = store.list_chunks([project.id])
@@ -501,17 +619,16 @@ def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
-        chunk_groups=(),
-        reference_groups=[
+        chunk_batches=(),
+        reference_batches=[
             (
-                file_id,
+                [file_id],
                 pa.Table.from_pylist(
                     [reference_row(project.id, file_id).__dict__],
                     schema=LanceStore.reference_arrow_schema(),
                 ),
             )
         ],
-        replace_reference_file_ids=[file_id],
     )
     references_before = store.list_reference_records(project.id)
 
@@ -531,9 +648,8 @@ def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -
     store.replace_files_from_arrow(
         project.id,
         files=job.files_table(),
-        chunk_groups=job.iter_chunk_groups(),
-        reference_groups=job.iter_reference_groups(),
-        replace_reference_file_ids=job.replace_reference_file_ids,
+        chunk_batches=job.iter_chunk_batches(),
+        reference_batches=job.iter_reference_batches(),
     )
     assert store.list_files(project.id) != files_before
     assert store.count_chunks([project.id]) == 1

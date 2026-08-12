@@ -947,9 +947,8 @@ class Indexer:
             self.store.replace_files_from_arrow(
                 project.id,
                 files=job.files_table(),
-                chunk_groups=job.iter_chunk_groups(),
-                reference_groups=job.iter_reference_groups(),
-                replace_reference_file_ids=job.replace_reference_file_ids,
+                chunk_batches=job.iter_chunk_batches(),
+                reference_batches=job.iter_reference_batches(),
                 removed_file_ids=job.removed_file_ids,
             )
             if job.replace_file_ids or job.replace_reference_file_ids or job.removed_file_ids:
