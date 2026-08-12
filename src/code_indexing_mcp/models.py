@@ -1,5 +1,6 @@
 """Immutable domain models."""
 
+import os
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -761,6 +762,9 @@ class RunAudit(FrozenModel):
     schema_version: int = 0
     scan_config_hash: str = ""
     force: bool = False
+    # Owning process, so startup can tell a crashed run from one another live
+    # process is still executing.
+    pid: int = Field(default_factory=os.getpid)
     started_at: str = ""
     finished_at: str | None = None
     # running, completed, failed, or interrupted.

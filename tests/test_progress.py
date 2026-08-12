@@ -44,15 +44,17 @@ def test_indexing_reports_file_counts_as_it_goes(tmp_path: Path) -> None:
     assert max(progress.chunks_embedded for progress in seen) > 0
     assert seen[-1].phase == "committing"
     assert seen[-1].candidates_total == 3
+    assert seen[-1].parsed_files == 3
+    assert seen[-1].failed_files == 0
+    assert seen[-1].bytes_read > 0
+    assert seen[-1].chunks_extracted > 0
     # Counts are a running total, never a per-update delta.
     assert [progress.candidates_seen for progress in seen] == sorted(
         progress.candidates_seen for progress in seen
     )
     # A candidate count is never compared with an eligible-file total: the
     # denominator of a progress fraction is always candidate-scoped.
-    assert all(
-        progress.fraction is None or progress.fraction <= 1.0 for progress in seen
-    )
+    assert all(progress.fraction is None or progress.fraction <= 1.0 for progress in seen)
 
 
 def test_observed_119_eligible_plus_1367_skipped_never_reads_as_1486_over_119() -> None:
@@ -162,9 +164,7 @@ def test_updates_are_throttled_but_the_forced_ones_always_land(tmp_path: Path) -
 
 
 def test_a_phase_change_stamps_phase_started_at_and_publishes_immediately() -> None:
-    publisher = ProgressPublisher(
-        "project", listener=lambda _: None, interval_seconds=1.0
-    )
+    publisher = ProgressPublisher("project", listener=lambda _: None, interval_seconds=1.0)
     before = publisher.state.phase_started_at
 
     publisher.update(phase="embedding", candidates_seen=1, force=True)
@@ -187,6 +187,19 @@ def test_every_run_carries_a_run_id_and_trigger(tmp_path: Path) -> None:
     assert seen
     assert all(progress.run_id for progress in seen)
     assert [progress.trigger for progress in seen] == ["watcher"] * len(seen)
+
+
+def test_retained_snapshots_do_not_change_when_the_source_dict_is_mutated() -> None:
+    publisher = ProgressPublisher("project", listener=lambda _: None, interval_seconds=0.0)
+    reasons = {"binary": 1}
+    publisher.update(skipped_by_reason=reasons, force=True)
+    snapshot = publisher.state.model_copy()
+
+    reasons["binary"] = 99
+    publisher.update(skipped_by_reason=reasons, force=True)
+
+    assert snapshot.skipped_by_reason == {"binary": 1}
+    assert publisher.state.skipped_by_reason == {"binary": 99}
 
 
 def test_a_snapshot_left_behind_by_a_dead_process_is_ignored(tmp_path: Path) -> None:

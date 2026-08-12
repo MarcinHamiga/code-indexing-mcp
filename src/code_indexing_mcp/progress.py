@@ -18,6 +18,7 @@ import os
 import tempfile
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -157,7 +158,12 @@ class ProgressPublisher:
         phase = fields.get("phase")
         if phase is not None and phase != self.state.phase:
             fields["phase_started_at"] = time.time()
-        self.state = self.state.model_copy(update=fields)
+        # Deep-copy the merged fields: model_copy never copies the update
+        # mapping's values, and a published snapshot must not share a nested
+        # value (e.g. the skipped_by_reason dict) with a caller that keeps
+        # mutating it. Every retained snapshot stays a true point-in-time
+        # picture.
+        self.state = self.state.model_copy(update=deepcopy(fields))
         now = self._clock()
         if (
             not force

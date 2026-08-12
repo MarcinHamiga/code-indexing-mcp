@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import psutil
 
 from .models import HistoryPage, IndexIssue, ProjectInfo, RunAudit, RunSummary
 
@@ -43,6 +46,7 @@ CREATE TABLE IF NOT EXISTS runs (
     schema_version INTEGER NOT NULL DEFAULT 0,
     scan_config_hash TEXT NOT NULL DEFAULT '',
     force INTEGER NOT NULL DEFAULT 0,
+    pid INTEGER NOT NULL DEFAULT 0,
     started_at TEXT NOT NULL,
     finished_at TEXT,
     state TEXT NOT NULL DEFAULT 'running',
@@ -144,6 +148,11 @@ class HistoryStore:
         directory.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
+            # Databases created before pid tracking have no owner column;
+            # ALTER is cheap and idempotent because of the guard above.
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+            if "pid" not in columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN pid INTEGER NOT NULL DEFAULT 0")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_SECONDS)
@@ -160,8 +169,9 @@ class HistoryStore:
                 """
                 INSERT OR REPLACE INTO runs (
                     run_id, project_id, trigger, server_version, git_revision,
-                    model_id, schema_version, scan_config_hash, force, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model_id, schema_version, scan_config_hash, force, pid,
+                    started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     audit.run_id,
@@ -173,6 +183,7 @@ class HistoryStore:
                     audit.schema_version,
                     audit.scan_config_hash,
                     int(audit.force),
+                    int(audit.pid),
                     audit.started_at,
                 ),
             )
@@ -184,6 +195,8 @@ class HistoryStore:
         serialized to JSON, and scalar counts are coerced to integers.
         """
 
+        if not updates:
+            raise ValueError("finish requires at least one field to record")
         unknown = set(updates) - _FINISH_COLUMNS
         if unknown:
             raise ValueError(f"unknown audit finish fields: {sorted(unknown)}")
@@ -201,9 +214,7 @@ class HistoryStore:
             values.append(value)
         values.append(run_id)
         with self._connect() as connection:
-            connection.execute(
-                f"UPDATE runs SET {', '.join(assignments)} WHERE run_id = ?", values
-            )
+            connection.execute(f"UPDATE runs SET {', '.join(assignments)} WHERE run_id = ?", values)
             connection.execute(
                 """
                 DELETE FROM runs WHERE project_id = (
@@ -223,17 +234,30 @@ class HistoryStore:
             )
 
     def mark_interrupted(self) -> None:
-        """Mark every ``running`` row interrupted; called once at process start.
+        """Mark every ``running`` row of a dead process interrupted.
 
-        A process that died mid-run leaves its row in ``running`` forever
-        otherwise; the next start of any Application is the moment the history
-        learns the run never finished.
+        Called once at process start. A process that died mid-run leaves its
+        row in ``running`` forever otherwise. The rows' owning pids separate
+        those crashed runs from runs another live process is executing right
+        now, which must not be touched; a pid of 0 predates pid tracking and
+        cannot be verified, so it is treated as dead.
         """
 
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE runs SET state = 'interrupted' WHERE state = 'running'"
-            )
+            rows = connection.execute(
+                "SELECT run_id, pid FROM runs WHERE state = 'running'"
+            ).fetchall()
+            interrupted = [
+                row["run_id"]
+                for row in rows
+                if row["pid"] == 0 or not psutil.pid_exists(row["pid"])
+            ]
+            if interrupted:
+                placeholders = ", ".join("?" for _ in interrupted)
+                connection.execute(
+                    f"UPDATE runs SET state = 'interrupted' WHERE run_id IN ({placeholders})",
+                    interrupted,
+                )
 
     def list_runs(
         self,
@@ -251,22 +275,24 @@ class HistoryStore:
         conditions = ["project_id = ?"]
         parameters: list[Any] = [project_id]
         if cursor is not None:
-            started_at, run_id = cursor.split("|", 1)
+            parts = cursor.split("|", 1)
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                raise ValueError("invalid history cursor")
+            started_at, run_id = parts
             conditions.append(
                 "(started_at, rowid) < (?, (SELECT rowid FROM runs WHERE run_id = ?))"
             )
             parameters.extend([started_at, run_id])
-        rows = list(
-            self._connect()
-            .execute(
-                f"""
-                SELECT * FROM runs WHERE {' AND '.join(conditions)}
-                ORDER BY started_at DESC, rowid DESC LIMIT ?
-                """,
-                [*parameters, limit + 1],
+        with closing(self._connect()) as connection:
+            rows = list(
+                connection.execute(
+                    f"""
+                    SELECT * FROM runs WHERE {" AND ".join(conditions)}
+                    ORDER BY started_at DESC, rowid DESC LIMIT ?
+                    """,
+                    [*parameters, limit + 1],
+                ).fetchall()
             )
-            .fetchall()
-        )
         audits = [_row_to_audit(row) for row in rows[:limit]]
         next_cursor = None
         if len(rows) > limit and audits:
@@ -281,13 +307,14 @@ class HistoryStore:
         status, which runs on every freshness check.
         """
 
-        row = self._connect().execute(
-            """
-            SELECT * FROM runs WHERE project_id = ?
-            ORDER BY started_at DESC, rowid DESC LIMIT 1
-            """,
-            (project_id,),
-        ).fetchone()
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM runs WHERE project_id = ?
+                ORDER BY started_at DESC, rowid DESC LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
         if row is None:
             return None
         return _row_to_summary(row)
@@ -307,6 +334,7 @@ def _row_to_audit(row: sqlite3.Row) -> RunAudit:
         schema_version=row["schema_version"],
         scan_config_hash=row["scan_config_hash"],
         force=bool(row["force"]),
+        pid=row["pid"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         state=row["state"],

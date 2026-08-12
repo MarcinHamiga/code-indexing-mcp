@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -364,10 +365,11 @@ class Indexer:
             git_revision=checkout_head(Path(__file__).resolve().parents[2]),
             model_id=self.embedder.model_id,
             schema_version=SCHEMA_VERSION,
-            scan_config_hash=hashlib.sha256(
-                project.scan.model_dump_json().encode()
-            ).hexdigest()[:16],
+            scan_config_hash=hashlib.sha256(project.scan.model_dump_json().encode()).hexdigest()[
+                :16
+            ],
             force=force,
+            pid=os.getpid(),
             started_at=datetime.now(UTC).isoformat(),
         )
 
@@ -1031,6 +1033,10 @@ class Indexer:
                 candidates_total=candidates_seen,
                 eligible_files=len(current_paths),
                 unchanged_files=unchanged,
+                parsed_files=parsed,
+                failed_files=len(errors),
+                bytes_read=bytes_read,
+                chunks_extracted=chunks_extracted,
                 skipped_total=skipped,
                 skipped_by_reason=skipped_by_reason,
                 current_path=None,

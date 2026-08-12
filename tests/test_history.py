@@ -1,10 +1,14 @@
 """Durable audit history: bounded SQLite storage for indexing runs."""
 
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import psutil
 import pytest
 
 from code_indexing_mcp.history import (
@@ -15,7 +19,15 @@ from code_indexing_mcp.history import (
 from code_indexing_mcp.models import IndexIssue, RunAudit
 
 
-def _audit(run_id: str, started_at: str | None = None) -> RunAudit:
+def _dead_pid() -> int:
+    """A pid that existed but whose process has certainly exited."""
+    process = subprocess.Popen([sys.executable, "-c", ""])
+    process.wait()
+    assert not psutil.pid_exists(process.pid)
+    return process.pid
+
+
+def _audit(run_id: str, started_at: str | None = None, *, pid: int | None = None) -> RunAudit:
     return RunAudit(
         run_id=run_id,
         project_id="project-1",
@@ -26,6 +38,7 @@ def _audit(run_id: str, started_at: str | None = None) -> RunAudit:
         schema_version=2,
         scan_config_hash="feedface",
         force=True,
+        pid=os.getpid() if pid is None else pid,
         started_at=started_at or datetime.now(UTC).isoformat(),
     )
 
@@ -86,7 +99,7 @@ def test_a_completed_run_round_trips_all_audit_fields(tmp_path: Path) -> None:
     assert run.storage_before == {"files": 1, "chunks": 2, "references": 3}
     assert run.storage_after == {"files": 2, "chunks": 4, "references": 5}
     assert run.project_id == "project-1"
-    assert not (store.path / "-wal").exists() or (store.path / "-wal").stat().st_size >= 0
+    assert run.pid == os.getpid()
 
 
 def test_unknown_finish_fields_are_rejected(tmp_path: Path) -> None:
@@ -95,6 +108,22 @@ def test_unknown_finish_fields_are_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="unknown audit finish fields"):
         store.finish("run-1", made_up_column=1)
+
+
+def test_finish_with_no_updates_is_rejected(tmp_path: Path) -> None:
+    store = HistoryStore(tmp_path / "history")
+    store.begin(_audit("run-1"))
+
+    with pytest.raises(ValueError, match="at least one field"):
+        store.finish("run-1")
+
+
+def test_a_malformed_cursor_is_rejected(tmp_path: Path) -> None:
+    store = HistoryStore(tmp_path / "history")
+    store.begin(_audit("run-1"))
+
+    with pytest.raises(ValueError, match="invalid history cursor"):
+        store.list_runs("project-1", cursor="not-a-cursor")
 
 
 def test_history_is_pruned_to_a_bounded_window_per_project(tmp_path: Path) -> None:
@@ -148,7 +177,7 @@ def test_a_killed_process_leaves_a_running_row_that_startup_marks_interrupted(
     tmp_path: Path,
 ) -> None:
     store = HistoryStore(tmp_path / "history")
-    store.begin(_audit("run-1"))
+    store.begin(_audit("run-1", pid=_dead_pid()))
     assert store.list_runs("project-1").runs[0].state == "running"
 
     # A fresh store instance stands in for the next process start.
@@ -156,6 +185,31 @@ def test_a_killed_process_leaves_a_running_row_that_startup_marks_interrupted(
     restarted.mark_interrupted()
 
     assert store.list_runs("project-1").runs[0].state == "interrupted"
+
+
+def test_mark_interrupted_never_touches_runs_owned_by_live_processes(
+    tmp_path: Path,
+) -> None:
+    store = HistoryStore(tmp_path / "history")
+    store.begin(_audit("live-run", pid=os.getpid()))
+
+    # A fresh store instance stands in for a second process starting while
+    # the first process's run is still in flight.
+    restarted = HistoryStore(tmp_path / "history")
+    restarted.mark_interrupted()
+
+    assert store.list_runs("project-1").runs[0].state == "running"
+
+
+def test_mark_interrupted_distinguishes_dead_and_live_owners(tmp_path: Path) -> None:
+    store = HistoryStore(tmp_path / "history")
+    store.begin(_audit("dead-run", pid=_dead_pid()))
+    store.begin(_audit("live-run", pid=os.getpid()))
+
+    store.mark_interrupted()
+
+    states = {run.run_id: run.state for run in store.list_runs("project-1").runs}
+    assert states == {"dead-run": "interrupted", "live-run": "running"}
 
 
 def test_recent_returns_a_compact_summary_and_nothing_else(tmp_path: Path) -> None:

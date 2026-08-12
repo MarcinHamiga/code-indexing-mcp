@@ -738,9 +738,7 @@ class Application:
         """
 
         resolved = self._resolve(project, roots)
-        return self.history.list_runs(
-            resolved.id, cursor=cursor, limit=limit, project=resolved
-        )
+        return self.history.list_runs(resolved.id, cursor=cursor, limit=limit, project=resolved)
 
     def storage_status(
         self, project: str | None = None, *, roots: list[Path] | None = None

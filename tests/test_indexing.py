@@ -1529,9 +1529,10 @@ def test_an_unexpected_run_failure_is_recorded_as_failed(tmp_path: Path) -> None
     history = HistoryStore(tmp_path / "history")
     indexer, _ = make_indexer(tmp_path, RecordingEmbedder(), history=history)
 
-    with patch.object(
-        indexer.scanner, "iter_scan", side_effect=RuntimeError("simulated crash")
-    ), pytest.raises(RuntimeError, match="simulated crash"):
+    with (
+        patch.object(indexer.scanner, "iter_scan", side_effect=RuntimeError("simulated crash")),
+        pytest.raises(RuntimeError, match="simulated crash"),
+    ):
         indexer.index(project)
 
     page = history.list_runs(project.id)
