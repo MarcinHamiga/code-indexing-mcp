@@ -645,3 +645,33 @@ def test_broker_application_dispatches_maintain_storage(tmp_path: Path) -> None:
     broker.stop()
     thread.join(timeout=2)
     assert not thread.is_alive()
+
+
+@requires_local_sockets
+def test_broker_forwards_the_index_trigger_and_serves_history(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=root)
+    project = application.init_project(root)
+    application.index_project(project.id)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=root)
+
+    try:
+        report = broker.index_project(project.id, trigger="watcher", wait_for_lock=True)
+        page = broker.index_history(project.id, limit=10)
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+    assert report.trigger == "watcher"
+    assert page.project is not None
+    assert page.project.id == project.id
+    assert any(run.run_id == report.run_id for run in page.runs)
+    # Both runs are visible: the seed run (manual) and the triggered one.
+    assert {run.trigger for run in page.runs} == {"manual", "watcher"}

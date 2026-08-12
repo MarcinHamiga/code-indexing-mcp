@@ -33,11 +33,14 @@ from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
+from .history import HistoryStore
 from .indexing import Indexer
 from .models import (
     CodeChunk,
     DeclarationSelector,
+    HistoryPage,
     IndexReport,
+    IndexTrigger,
     MaintenanceProjectResult,
     MaintenanceReport,
     ModelStatus,
@@ -201,6 +204,11 @@ class Application:
             vector_dimension=embedder.dimension,
             vector_index=self.settings.vector_index,
         )
+        # Durable audit history for indexing runs. A process that died
+        # mid-run left its row in "running"; every new process start is the
+        # moment history learns that run never finished.
+        self.history = HistoryStore(paths.data / "history")
+        self.history.mark_interrupted()
         # Roll back any commit interrupted by a crash before queries are
         # accepted, so a half-written project never becomes searchable. The
         # global index lock keeps recovery from running underneath a commit
@@ -282,6 +290,7 @@ class Application:
             passage_session_factory=passage_session_factory,
             staging_directory=paths.data / "staging",
             progress_directory=paths.data / "progress",
+            history=self.history,
         )
         self.search = SearchService(self.store, embedder)
         self.references = ReferenceService(self.store)
@@ -651,12 +660,14 @@ class Application:
         force: bool = False,
         wait_for_lock: bool = False,
         on_progress: Callable[[IndexProgress], None] | None = None,
+        trigger: IndexTrigger = "manual",
     ) -> IndexReport:
         return self.indexer.index(
             self._resolve(project, roots),
             force=force,
             wait_for_lock=wait_for_lock,
             on_progress=on_progress,
+            trigger=trigger,
         )
 
     def index_progress(self, project_id: str) -> IndexProgress | None:
@@ -682,11 +693,15 @@ class Application:
 
         resolved = self._resolve(project, roots)
         if self._project_is_stale(resolved):
-            self.indexer.index(resolved, wait_for_lock=True)
-        report = self.indexer.backfill_references(resolved, wait_for_lock=True)
+            self.indexer.index(resolved, wait_for_lock=True, trigger="lazy-query")
+        report = self.indexer.backfill_references(
+            resolved, wait_for_lock=True, trigger="reference-backfill"
+        )
         if report.stale_paths:
-            self.indexer.index(resolved, wait_for_lock=True)
-            report = self.indexer.backfill_references(resolved, wait_for_lock=True)
+            self.indexer.index(resolved, wait_for_lock=True, trigger="lazy-query")
+            report = self.indexer.backfill_references(
+                resolved, wait_for_lock=True, trigger="reference-backfill"
+            )
         return report
 
     def project_status(
@@ -704,6 +719,27 @@ class Application:
             state=state,
             file_count=len(files),
             chunk_count=self.store.count_chunks([resolved.id]),
+            progress=self.index_progress(resolved.id),
+            last_run=self.history.recent(resolved.id),
+        )
+
+    def index_history(
+        self,
+        project: str | None = None,
+        *,
+        roots: list[Path] | None = None,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> HistoryPage:
+        """One page of a project's durable indexing history, newest first.
+
+        Deliberately bounded: never more than ``MAX_RUNS_PER_PROJECT`` rows are
+        retained, and this reads at most *limit* + 1 of them.
+        """
+
+        resolved = self._resolve(project, roots)
+        return self.history.list_runs(
+            resolved.id, cursor=cursor, limit=limit, project=resolved
         )
 
     def storage_status(

@@ -28,7 +28,9 @@ from .errors import CodeIndexingError, ErrorCode
 from .models import (
     CodeChunk,
     DeclarationSelector,
+    HistoryPage,
     IndexReport,
+    IndexTrigger,
     MaintenanceReport,
     ModelStatus,
     OutlineResponse,
@@ -364,6 +366,8 @@ class DaemonServer:
             return app.index_project(roots=roots, **params)
         if method == "project_status":
             return app.project_status(roots=roots, **params)
+        if method == "index_history":
+            return app.index_history(roots=roots, **params)
         if method == "storage_status":
             return app.storage_status(roots=roots, **params)
         if method == "maintain_storage":
@@ -508,6 +512,7 @@ class BrokerApplication:
         roots: list[Path] | None = None,
         force: bool = False,
         wait_for_lock: bool = False,
+        trigger: IndexTrigger = "manual",
     ) -> IndexReport:
         return IndexReport.model_validate(
             self._call(
@@ -516,6 +521,7 @@ class BrokerApplication:
                 roots=roots or [],
                 force=force,
                 wait_for_lock=wait_for_lock,
+                trigger=trigger,
             )
         )
 
@@ -533,6 +539,24 @@ class BrokerApplication:
     ) -> ProjectStatus:
         return ProjectStatus.model_validate(
             self._call("project_status", project=project, roots=roots or [])
+        )
+
+    def index_history(
+        self,
+        project: str | None = None,
+        *,
+        roots: list[Path] | None = None,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> HistoryPage:
+        return HistoryPage.model_validate(
+            self._call(
+                "index_history",
+                project=project,
+                roots=roots or [],
+                cursor=cursor,
+                limit=limit,
+            )
         )
 
     def storage_status(

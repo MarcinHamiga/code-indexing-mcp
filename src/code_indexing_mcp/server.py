@@ -30,7 +30,9 @@ from .models import (
     ChunkKind,
     CodeChunk,
     DeclarationSelector,
+    HistoryPage,
     IndexReport,
+    IndexTrigger,
     LanguageName,
     MaintenanceReport,
     OutlineResponse,
@@ -107,6 +109,7 @@ class _StartupJob:
     discovery_error: BaseException | None = None
     indexing_error: BaseException | None = None
     indexes: bool = False
+    trigger: IndexTrigger = "startup"
 
     @property
     def failed(self) -> bool:
@@ -132,7 +135,9 @@ class StartupCoordinator:
         self._limiter = anyio.CapacityLimiter(1)
         self._first_schedule: asyncio.Event = asyncio.Event()
 
-    async def schedule(self, roots: list[Path], *, indexes: bool) -> None:
+    async def schedule(
+        self, roots: list[Path], *, indexes: bool, trigger: IndexTrigger = "startup"
+    ) -> None:
         if self.mode is IndexMode.MANUAL:
             return
         async with self._lock:
@@ -155,7 +160,7 @@ class StartupCoordinator:
                             and not await self._is_stale(existing.project_id)
                         ):
                             continue
-                job = _StartupJob(indexes=indexes)
+                job = _StartupJob(indexes=indexes, trigger=trigger)
                 job_root = registered_root or root
                 self._jobs[job_root] = job
                 self.task_group.start_soon(self._run, job_root, job)
@@ -236,7 +241,7 @@ class StartupCoordinator:
                 logger.info("Skipping automatic indexing for non-project root: %s", root)
                 return
             await self._ensure_monitor(root, project.id)
-            report = await self._index_when_free(project.id)
+            report = await self._index_when_free(project.id, trigger=job.trigger)
             logger.info(
                 "Automatic indexing complete for %s: %s files indexed",
                 project.root,
@@ -301,12 +306,14 @@ class StartupCoordinator:
                 # the periodic reconciliation needs only its one stat pass.
                 passes = 1 if reconcile.cancel_called else 2
                 for _ in range(passes):
-                    await self.schedule([root], indexes=True)
+                    await self.schedule([root], indexes=True, trigger="watcher")
                     await self.wait_for_ready([root], {project_id})
             except Exception:
                 logger.exception("Automatic refresh after a file change failed for %s", root)
 
-    async def _index_when_free(self, project_id: str) -> IndexReport:
+    async def _index_when_free(
+        self, project_id: str, *, trigger: IndexTrigger = "startup"
+    ) -> IndexReport:
         """Index *project_id* once the machine is free, within ``wait_seconds``.
 
         Two separate things make a job wait: another root queued ahead of it in
@@ -318,7 +325,9 @@ class StartupCoordinator:
         deadline = started + self.wait_seconds
         await self._acquire_slot(deadline, started=started)
         try:
-            return await self._index_with_backoff(project_id, deadline=deadline, started=started)
+            return await self._index_with_backoff(
+                project_id, deadline=deadline, started=started, trigger=trigger
+            )
         finally:
             self._limiter.release()
 
@@ -337,7 +346,12 @@ class StartupCoordinator:
         raise self._busy(time.monotonic() - started)
 
     async def _index_with_backoff(
-        self, project_id: str, *, deadline: float, started: float
+        self,
+        project_id: str,
+        *,
+        deadline: float,
+        started: float,
+        trigger: IndexTrigger = "startup",
     ) -> IndexReport:
         """Index *project_id*, waiting out a competing process up to *deadline*.
 
@@ -350,7 +364,7 @@ class StartupCoordinator:
         while True:
             try:
                 return await anyio.to_thread.run_sync(
-                    partial(self.application.index_project, project_id),
+                    partial(self.application.index_project, project_id, trigger=trigger),
                     abandon_on_cancel=False,
                 )
             except CodeIndexingError as exc:
@@ -445,8 +459,10 @@ class _ProgressStream:
             )
             if snapshot is None:
                 continue
-            self.highest = max(self.highest, float(snapshot.files_seen))
-            await self.ctx.report_progress(self.highest, snapshot.files_total, snapshot.describe())
+            self.highest = max(self.highest, float(snapshot.candidates_seen))
+            await self.ctx.report_progress(
+                self.highest, snapshot.candidates_total, snapshot.describe()
+            )
 
     async def finish(self, message: str) -> None:
         """Close the bar out at 100%, whatever scale it reached."""
@@ -504,7 +520,7 @@ async def _wait_for_startup_projects(
         for project, status in zip(projects, statuses, strict=True)
         if status.state not in {"ready", "partial"}
     ]
-    await coordinator.schedule(refresh_roots, indexes=True)
+    await coordinator.schedule(refresh_roots, indexes=True, trigger="lazy-query")
     await coordinator.wait_for_discovery(selected_roots)
     wanted = set(project_ids)
     # A lazy query blocks on any refresh its selected scope needs. Report
@@ -834,6 +850,44 @@ def create_server(
     ) -> ProjectStatus:
         roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(app.project_status, project, roots=roots)
+
+    @mcp.tool(
+        title="Indexing history",
+        description=(
+            "One page of a project's durable indexing history — each run's id, trigger, server "
+            "and schema version, embedding model, force flag, start/finish timestamps, final "
+            "state, phase durations, file and chunk counts, skip counts by reason, bounded "
+            "error details, and storage table versions before and after. Newest first, "
+            "paginated with an opaque cursor; at most 100 runs per project are retained and "
+            "history is never loaded wholesale into project status."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def index_history(
+        ctx: ServerContext,
+        project: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Project id, name, or path. Defaults to the active MCP root or the nearest "
+                    ".ci-mcp/project.toml."
+                )
+            ),
+        ] = None,
+        cursor: Annotated[
+            str | None,
+            Field(description="Opaque cursor from a previous page; omit for the first page."),
+        ] = None,
+        limit: Annotated[
+            int,
+            Field(description="Maximum runs per page, up to 100.", ge=1, le=100),
+        ] = 20,
+    ) -> HistoryPage:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(
+            app.index_history, project, roots=roots, cursor=cursor, limit=limit
+        )
 
     @mcp.tool(
         title="Index storage status",

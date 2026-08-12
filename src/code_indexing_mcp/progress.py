@@ -22,6 +22,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from .models import IndexTrigger
+
 # How long a snapshot stays trustworthy without a refresh. Comfortably above the
 # publish interval, and above the pauses a single slow file can cause between
 # updates, so a live run is never mistaken for a dead one.
@@ -30,29 +32,54 @@ PUBLISH_INTERVAL_SECONDS = 0.25
 
 
 class IndexProgress(BaseModel):
-    """A point-in-time snapshot of one project's indexing run."""
+    """A point-in-time snapshot of one project's indexing run.
+
+    Every counter's name matches what it counts: ``candidates_*`` cover every
+    path the scanner examined, ``eligible_files`` the files that passed the
+    scan, and the ``*_files`` counters the eligible ones. Totals stay unset
+    while the scanner streams and the run genuinely does not know them, and a
+    candidate count is never compared with an eligible-file total.
+    """
 
     project_id: str
+    run_id: str = ""
+    trigger: IndexTrigger = "manual"
     phase: str = "scanning"
-    files_seen: int = 0
-    # None until a run knows better than to guess: the scanner streams, so on a
-    # first index there is no total to compare against.
-    files_total: int | None = None
-    files_indexed: int = 0
-    files_unchanged: int = 0
+    # Every path the scanner examined, whether it became eligible or was
+    # skipped. A first index has no honest candidates_total: the scanner
+    # streams, so the total is only known once the walk has finished.
+    candidates_seen: int = 0
+    candidates_total: int | None = None
+    eligible_files: int = 0
+    unchanged_files: int = 0
+    changed_files: int = 0
+    parsed_files: int = 0
+    failed_files: int = 0
+    skipped_total: int = 0
+    skipped_by_reason: dict[str, int] = Field(default_factory=dict)
+    bytes_read: int = 0
+    chunks_extracted: int = 0
     chunks_embedded: int = 0
+    chunks_staged: int = 0
+    staged_bytes: int = 0
     current_path: str | None = None
     started_at: float = 0.0
     updated_at: float = 0.0
+    phase_started_at: float = 0.0
     pid: int = Field(default_factory=os.getpid)
 
     @property
     def fraction(self) -> float | None:
-        """Completion in ``[0, 1]``, or None when the total is unknown."""
+        """Completion in ``[0, 1]``, or None when the total is unknown.
 
-        if not self.files_total:
+        Only candidate counts may feed this: comparing candidates seen with an
+        eligible-file total would overstate (or understate) progress whenever
+        the repository contains skipped paths.
+        """
+
+        if not self.candidates_total:
             return None
-        return min(1.0, self.files_seen / self.files_total)
+        return min(1.0, self.candidates_seen / self.candidates_total)
 
     def describe(self) -> str:
         """Render a one-line status suitable for a progress bar or a log line."""
@@ -61,17 +88,23 @@ class IndexProgress(BaseModel):
             return "Committing the index"
         if self.phase == "extracting_references":
             return "Extracting structural references"
-        if not self.files_seen:
+        if not self.candidates_seen:
             return "Scanning for changed files"
-        if self.files_total:
-            scanned = f"{self.files_seen}/~{self.files_total} files"
+        if self.candidates_total:
+            scanned = f"{self.candidates_seen}/~{self.candidates_total} candidates"
         else:
-            scanned = f"{self.files_seen} files"
+            scanned = f"{self.candidates_seen} candidates"
         parts = [f"{self.phase.capitalize()} {scanned}"]
-        if self.files_indexed:
-            parts.append(f"{self.files_indexed} indexed")
-        if self.files_unchanged:
-            parts.append(f"{self.files_unchanged} unchanged")
+        if self.eligible_files:
+            parts.append(f"{self.eligible_files} eligible")
+        if self.changed_files:
+            parts.append(f"{self.changed_files} changed")
+        if self.unchanged_files:
+            parts.append(f"{self.unchanged_files} unchanged")
+        if self.failed_files:
+            parts.append(f"{self.failed_files} failed")
+        if self.skipped_total:
+            parts.append(f"{self.skipped_total} skipped")
         if self.chunks_embedded:
             parts.append(f"{self.chunks_embedded} chunks embedded")
         return ", ".join(parts)
@@ -88,6 +121,8 @@ class ProgressPublisher:
         self,
         project_id: str,
         *,
+        run_id: str = "",
+        trigger: IndexTrigger = "manual",
         directory: Path | None = None,
         listener: Callable[[IndexProgress], None] | None = None,
         interval_seconds: float = PUBLISH_INTERVAL_SECONDS,
@@ -98,7 +133,13 @@ class ProgressPublisher:
         self.interval_seconds = interval_seconds
         self._clock = clock
         self._last_published: float | None = None
-        self.state = IndexProgress(project_id=project_id, started_at=time.time())
+        self.state = IndexProgress(
+            project_id=project_id,
+            run_id=run_id,
+            trigger=trigger,
+            started_at=time.time(),
+            phase_started_at=time.time(),
+        )
 
     @property
     def enabled(self) -> bool:
@@ -113,6 +154,9 @@ class ProgressPublisher:
 
         if not self.enabled:
             return
+        phase = fields.get("phase")
+        if phase is not None and phase != self.state.phase:
+            fields["phase_started_at"] = time.time()
         self.state = self.state.model_copy(update=fields)
         now = self._clock()
         if (

@@ -71,6 +71,12 @@ def _parser() -> argparse.ArgumentParser:
     index.add_argument("--force", action="store_true")
     status = commands.add_parser("status", help="Show project index status")
     status.add_argument("project", nargs="?")
+    history = commands.add_parser(
+        "history", help="Show a project's durable indexing history, newest first"
+    )
+    history.add_argument("project", nargs="?")
+    history.add_argument("--limit", type=int, default=20)
+    history.add_argument("--cursor", default=None)
     storage = commands.add_parser(
         "storage", help="Inspect index storage statistics and maintenance"
     )
@@ -395,6 +401,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 printer.clear()
         elif args.command == "status":
             result = app.project_status(args.project)
+        elif args.command == "history":
+            result = app.index_history(args.project, cursor=args.cursor, limit=args.limit)
         elif args.command == "storage" and args.storage_command == "status":
             result = app.storage_status(args.project)
         elif args.command == "storage" and args.storage_command == "vacuum":

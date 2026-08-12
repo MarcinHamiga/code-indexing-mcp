@@ -168,6 +168,19 @@ class FrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True)
 
 
+# Why an indexing run started. ``schema-rebuild`` and ``maintenance`` are
+# reserved for later releases; every current run is one of the other five.
+IndexTrigger = Literal[
+    "manual",
+    "startup",
+    "watcher",
+    "lazy-query",
+    "reference-backfill",
+    "schema-rebuild",
+    "maintenance",
+]
+
+
 class ScanConfig(FrozenModel):
     include: list[str] = Field(default_factory=lambda: list(DEFAULT_INCLUDES))
     exclude: list[str] = Field(default_factory=list)
@@ -595,6 +608,20 @@ class IndexReport(FrozenModel):
     # reference extraction together) and from a whole-project table read.
     reference_extraction_duration_ms: int | None = None
     staged_reference_rows: int = 0
+    # Durable run identity and why it ran. Optional so older clients keep
+    # validating reports and older stored reports keep validating.
+    run_id: str | None = None
+    trigger: IndexTrigger = "manual"
+    # Counter contract for the audit record: skip reasons are broken out by
+    # cause, failed files are parse/embedding failures, and the byte/chunk
+    # counters track what the run actually read, extracted, and staged.
+    failed_files: int = 0
+    skip_reasons: dict[str, int] = Field(default_factory=dict)
+    skipped_samples: list[str] = Field(default_factory=list)
+    bytes_read: int = 0
+    chunks_extracted: int = 0
+    chunks_staged: int = 0
+    staged_bytes: int = 0
 
 
 class ModelStatus(FrozenModel):
@@ -713,11 +740,98 @@ class CodeChunk(FrozenModel):
     part_index: int = 0
 
 
+# Why an indexing run started. ``schema-rebuild`` and ``maintenance`` are
+# reserved for later releases; every current run is one of the other five.
+
+
+class RunAudit(FrozenModel):
+    """One durable audit record of an indexing or backfill run.
+
+    Values are bounded before they are written: at most ``MAX_ERROR_SAMPLES``
+    error details and ``MAX_SKIPPED_SAMPLES`` skipped-path samples are kept,
+    so a pathological run cannot grow the history database without bound.
+    """
+
+    run_id: str
+    project_id: str
+    trigger: IndexTrigger
+    server_version: str = ""
+    git_revision: str | None = None
+    model_id: str = ""
+    schema_version: int = 0
+    scan_config_hash: str = ""
+    force: bool = False
+    started_at: str = ""
+    finished_at: str | None = None
+    # running, completed, failed, or interrupted.
+    state: str = "running"
+    phase_durations: dict[str, int] = Field(default_factory=dict)
+    eligible_files: int = 0
+    changed_files: int = 0
+    unchanged_files: int = 0
+    parsed_files: int = 0
+    failed_files: int = 0
+    removed_files: int = 0
+    skipped_total: int = 0
+    chunks_extracted: int = 0
+    chunks_embedded: int = 0
+    chunks_staged: int = 0
+    staged_bytes: int = 0
+    bytes_read: int = 0
+    skip_reasons: dict[str, int] = Field(default_factory=dict)
+    errors: list[IndexIssue] = Field(default_factory=list)
+    skipped_samples: list[str] = Field(default_factory=list)
+    embedding_backend: str = "cpu"
+    embedding_fallback_reason: str | None = None
+    worker_used: bool = False
+    # Best-effort storage table versions around the run, not full partition
+    # traversals: audit recording must stay inexpensive on any repository.
+    storage_before: dict[str, int] = Field(default_factory=dict)
+    storage_after: dict[str, int] = Field(default_factory=dict)
+
+
+class RunSummary(FrozenModel):
+    """Compact summary of one completed run for status surfaces."""
+
+    run_id: str
+    trigger: IndexTrigger
+    state: str
+    started_at: str
+    finished_at: str | None = None
+    duration_ms: int = 0
+    eligible_files: int = 0
+    changed_files: int = 0
+    failed_files: int = 0
+    skipped_total: int = 0
+    chunks_embedded: int = 0
+
+
+class HistoryPage(FrozenModel):
+    """One page of a project's indexing history."""
+
+    schema_version: int = 1
+    project: ProjectInfo | None = None
+    runs: list[RunAudit] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+# Imported here rather than at the top of the module: progress.py imports
+# IndexTrigger from this module, and ProjectStatus is the first consumer of
+# IndexProgress, so loading it after the trigger alias exists avoids the
+# circular import while keeping the type checked.
+from .progress import IndexProgress  # noqa: E402
+
+
 class ProjectStatus(FrozenModel):
     project: ProjectInfo
     state: str
     file_count: int
     chunk_count: int
+    # Live progress of whichever process is indexing this project right now,
+    # and the compact summary of its most recent completed run. Never the
+    # full history: status stays inexpensive.
+    progress: IndexProgress | None = None
+    last_run: RunSummary | None = None
 
 
 class RemovalReport(FrozenModel):

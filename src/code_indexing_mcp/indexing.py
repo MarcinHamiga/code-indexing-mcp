@@ -7,14 +7,17 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 import psutil
 from filelock import FileLock, Timeout
 
+from . import __version__
 from .embedding import (
     EmbeddedSegment,
     Embedder,
@@ -28,15 +31,18 @@ from .embedding import (
 from .embedding_worker import TelemetrySource
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
+from .history import HistoryStore
 from .models import (
     ExtractedChunk,
     ExtractedDeclarationShape,
     ExtractedReference,
     IndexIssue,
     IndexReport,
+    IndexTrigger,
     ProjectInfo,
     ReferenceBackfillReport,
     ReferenceCoverage,
+    RunAudit,
     ScannedFile,
     SkippedFile,
     StoredFile,
@@ -44,7 +50,8 @@ from .models import (
 from .progress import IndexProgress, ProgressPublisher
 from .scanner import SourceScanner
 from .staging import ChunkRow, ReferenceRow, StagingJob
-from .storage import LanceStore
+from .storage import SCHEMA_VERSION, LanceStore
+from .update_check import checkout_head
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +177,7 @@ class Indexer:
         | None = None,
         staging_directory: Path | None = None,
         progress_directory: Path | None = None,
+        history: HistoryStore | None = None,
     ) -> None:
         self.store = store
         self.scanner = scanner
@@ -181,6 +189,7 @@ class Indexer:
         self.passage_session_factory = passage_session_factory
         self.staging_directory = staging_directory or lock_directory.parent / "staging"
         self.progress_directory = progress_directory or lock_directory.parent / "progress"
+        self.history = history
 
     def index(
         self,
@@ -189,13 +198,19 @@ class Indexer:
         force: bool = False,
         wait_for_lock: bool = False,
         on_progress: Callable[[IndexProgress], None] | None = None,
+        trigger: IndexTrigger = "manual",
     ) -> IndexReport:
         started = time.monotonic_ns()
+        run_id = uuid.uuid4().hex
         self.lock_directory.mkdir(parents=True, exist_ok=True)
         global_lock = FileLock(self.lock_directory / "index-global.lock")
         project_lock = FileLock(self.lock_directory / f"{project.id}.lock")
         progress = ProgressPublisher(
-            project.id, directory=self.progress_directory, listener=on_progress
+            project.id,
+            run_id=run_id,
+            trigger=trigger,
+            directory=self.progress_directory,
+            listener=on_progress,
         )
         try:
             with (
@@ -203,7 +218,54 @@ class Indexer:
                 project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
             ):
                 try:
-                    report = self._index_locked(project, force=force, progress=progress)
+                    if self.history is not None:
+                        self.history.begin(self._run_audit(project, run_id, trigger, force))
+                    storage_before = self._storage_snapshot(project.id)
+                    try:
+                        report = self._index_locked(project, force=force, progress=progress)
+                    except BaseException:
+                        if self.history is not None:
+                            self.history.finish(
+                                run_id,
+                                state="failed",
+                                finished_at=datetime.now(UTC).isoformat(),
+                                storage_after=self._storage_snapshot(project.id),
+                            )
+                        raise
+                    report = report.model_copy(
+                        update={
+                            "run_id": run_id,
+                            "trigger": trigger,
+                            "failed_files": len(report.errors),
+                        }
+                    )
+                    if self.history is not None:
+                        self.history.finish(
+                            run_id,
+                            state="completed",
+                            finished_at=datetime.now(UTC).isoformat(),
+                            phase_durations=self._phase_durations(report),
+                            eligible_files=report.discovered_files,
+                            changed_files=report.indexed_files,
+                            unchanged_files=report.unchanged_files,
+                            parsed_files=report.parsed_files,
+                            failed_files=report.failed_files,
+                            removed_files=report.removed_files,
+                            skipped_total=report.skipped_files,
+                            chunks_extracted=report.chunks_extracted,
+                            chunks_embedded=report.embedded_chunks,
+                            chunks_staged=report.chunks_staged,
+                            staged_bytes=report.staged_bytes,
+                            bytes_read=report.bytes_read,
+                            skip_reasons=report.skip_reasons,
+                            errors=report.errors[:20],
+                            skipped_samples=report.skipped_samples[:20],
+                            embedding_backend=report.embedding_backend,
+                            embedding_fallback_reason=report.embedding_fallback_reason,
+                            worker_used=report.worker_used,
+                            storage_before=storage_before,
+                            storage_after=self._storage_snapshot(project.id),
+                        )
                 finally:
                     # Only the run that holds the lock owns the snapshot, so
                     # clearing here can never delete another process's progress.
@@ -223,14 +285,20 @@ class Indexer:
         *,
         wait_for_lock: bool = False,
         on_progress: Callable[[IndexProgress], None] | None = None,
+        trigger: IndexTrigger = "reference-backfill",
     ) -> ReferenceBackfillReport:
         """Parse missing structural generations without embedding source chunks."""
 
         self.lock_directory.mkdir(parents=True, exist_ok=True)
+        run_id = uuid.uuid4().hex
         global_lock = FileLock(self.lock_directory / "index-global.lock")
         project_lock = FileLock(self.lock_directory / f"{project.id}.lock")
         progress = ProgressPublisher(
-            project.id, directory=self.progress_directory, listener=on_progress
+            project.id,
+            run_id=run_id,
+            trigger=trigger,
+            directory=self.progress_directory,
+            listener=on_progress,
         )
         try:
             with (
@@ -238,7 +306,42 @@ class Indexer:
                 project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
             ):
                 try:
-                    return self._backfill_references_locked(project, progress=progress)
+                    if self.history is not None:
+                        self.history.begin(self._run_audit(project, run_id, trigger, False))
+                    storage_before = self._storage_snapshot(project.id)
+                    try:
+                        report = self._backfill_references_locked(project, progress=progress)
+                    except BaseException:
+                        if self.history is not None:
+                            self.history.finish(
+                                run_id,
+                                state="failed",
+                                finished_at=datetime.now(UTC).isoformat(),
+                                storage_after=self._storage_snapshot(project.id),
+                            )
+                        raise
+                    if self.history is not None:
+                        self.history.finish(
+                            run_id,
+                            state="completed",
+                            finished_at=datetime.now(UTC).isoformat(),
+                            eligible_files=report.files_current,
+                            changed_files=report.files_backfilled,
+                            failed_files=len(report.incomplete_paths),
+                            skipped_total=len(report.stale_paths),
+                            skip_reasons={
+                                "incomplete": len(report.incomplete_paths),
+                                "stale": len(report.stale_paths),
+                            },
+                            errors=[
+                                IndexIssue(path=path, message="reference extraction incomplete")
+                                for path in report.incomplete_paths[:20]
+                            ],
+                            skipped_samples=report.stale_paths[:20],
+                            storage_before=storage_before,
+                            storage_after=self._storage_snapshot(project.id),
+                        )
+                    return report
                 finally:
                     progress.clear()
         except Timeout as exc:
@@ -247,6 +350,48 @@ class Indexer:
                 f"Another indexing job is already active: {project.name}",
                 project=project.id,
             ) from exc
+
+    def _run_audit(
+        self, project: ProjectInfo, run_id: str, trigger: IndexTrigger, force: bool
+    ) -> RunAudit:
+        """The start-of-run audit row: identity and environment, nothing counted yet."""
+
+        return RunAudit(
+            run_id=run_id,
+            project_id=project.id,
+            trigger=trigger,
+            server_version=__version__,
+            git_revision=checkout_head(Path(__file__).resolve().parents[2]),
+            model_id=self.embedder.model_id,
+            schema_version=SCHEMA_VERSION,
+            scan_config_hash=hashlib.sha256(
+                project.scan.model_dump_json().encode()
+            ).hexdigest()[:16],
+            force=force,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+
+    @staticmethod
+    def _phase_durations(report: IndexReport) -> dict[str, int]:
+        durations: dict[str, int] = {}
+        for phase in ("scan", "parse", "embed", "commit"):
+            value = getattr(report, f"{phase}_ms")
+            if value is not None:
+                durations[phase] = value
+        return durations
+
+    def _storage_snapshot(self, project_id: str) -> dict[str, int]:
+        """Best-effort pre/post table versions; empty when there is no partition yet."""
+
+        with contextlib.suppress(Exception):
+            if (self.store.directory / "projects" / project_id).exists():
+                versions = self.store.table_versions(project_id)
+                return {
+                    "files": versions.files,
+                    "chunks": versions.chunks,
+                    "references": versions.references,
+                }
+        return {}
 
     def _backfill_references_locked(
         self, project: ProjectInfo, *, progress: ProgressPublisher
@@ -304,7 +449,7 @@ class Indexer:
 
         progress.update(
             phase="extracting_references",
-            files_total=len(missing),
+            candidates_total=len(missing),
             force=True,
         )
         job: StagingJob | None = None
@@ -338,7 +483,8 @@ class Indexer:
                 files_checked += 1
                 progress.update(
                     phase="extracting_references",
-                    files_seen=files_checked,
+                    candidates_seen=files_checked,
+                    eligible_files=len(existing),
                     current_path=record.path,
                 )
                 if record.has_errors:
@@ -436,7 +582,9 @@ class Indexer:
                 )
             progress.update(
                 phase="committing",
-                files_seen=files_checked,
+                candidates_seen=files_checked,
+                candidates_total=files_checked,
+                eligible_files=len(existing),
                 current_path=None,
                 force=True,
             )
@@ -529,16 +677,20 @@ class Indexer:
         timer = _PhaseTimer()
         with timer.measure("scan"):
             existing = {record.path: record for record in self.store.list_files(project.id)}
-        # The scanner streams, so the only honest total before the walk finishes
-        # is what the last run saw. A first index reports a bare count instead.
-        progress.update(
-            phase="scanning",
-            files_total=len(existing) or None,
-            force=True,
-        )
+        # The scanner streams, so no total exists before the walk finishes: a
+        # first run and a no-op run both start with candidates_total unset, and
+        # progress never compares candidate counts with the previous run's
+        # eligible-file total.
+        progress.update(phase="scanning", force=True)
         current_paths: set[str] = set()
         indexed = parsed = embedded = unchanged = metadata_only = removed = skipped = 0
-        files_seen = 0
+        candidates_seen = 0
+        bytes_read = 0
+        chunks_extracted = 0
+        chunks_staged = 0
+        staged_bytes = 0
+        skipped_by_reason: dict[str, int] = {}
+        skipped_samples: list[str] = []
         fallback_count = 0
         errors: list[IndexIssue] = []
         job: StagingJob | None = None
@@ -574,8 +726,11 @@ class Indexer:
                 job.begin()
             return job
 
-        def stage_failure(record: StoredFile, exc: Exception) -> None:
+        def stage_failure(record: StoredFile, exc: Exception, *, reason: str = "parse") -> None:
             errors.append(IndexIssue(path=record.path, message=str(exc)))
+            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+            if len(skipped_samples) < 20:
+                skipped_samples.append(record.path)
             job = staging_job()
             previous = existing.get(record.path)
             # A failed replacement keeps the previous generation live: the
@@ -600,6 +755,7 @@ class Indexer:
 
         def flush_pending() -> None:
             nonlocal indexed, embedded, fallback_count, pending_chunks, pending_chars
+            nonlocal chunks_staged, staged_bytes
             if not pending:
                 return
             candidates = [
@@ -646,6 +802,10 @@ class Indexer:
                 with timer.measure("commit"):
                     for owner in sorted(staged_rows):
                         staging_job().stage_chunks(staged_rows[owner])
+                        chunks_staged += len(staged_rows[owner])
+                        staged_bytes += sum(
+                            len(row.content.encode("utf-8")) for row in staged_rows[owner]
+                        )
 
             with timer.measure("commit"):
                 for target in pending:
@@ -659,7 +819,7 @@ class Indexer:
                             f"{SEGMENT_TEXT_GROWTH_LIMIT}x limit"
                         )
                     if target.error is not None:
-                        stage_failure(target.record, target.error)
+                        stage_failure(target.record, target.error, reason="embedding")
                         continue
                     staging_job().stage_file(target.record)
                     staging_job().mark_replaced(target.record.file_id)
@@ -692,7 +852,12 @@ class Indexer:
                     indexed += 1
                     embedded += target.embedded_chunks
             progress.update(
-                phase="embedding", files_indexed=indexed, chunks_embedded=embedded, force=True
+                phase="embedding",
+                changed_files=indexed,
+                chunks_embedded=embedded,
+                chunks_staged=chunks_staged,
+                staged_bytes=staged_bytes,
+                force=True,
             )
             pending.clear()
             pending_chunks = 0
@@ -705,19 +870,29 @@ class Indexer:
                     item = next(stream, None)
                 if item is None:
                     break
-                files_seen += 1
+                candidates_seen += 1
                 if isinstance(item, SkippedFile):
                     skipped += 1
-                    progress.update(phase="scanning", files_seen=files_seen, current_path=None)
+                    skipped_by_reason[item.reason] = skipped_by_reason.get(item.reason, 0) + 1
+                    if len(skipped_samples) < 20:
+                        skipped_samples.append(item.path.as_posix())
+                    progress.update(
+                        phase="scanning",
+                        candidates_seen=candidates_seen,
+                        skipped_total=skipped,
+                        skipped_by_reason=skipped_by_reason,
+                        current_path=None,
+                    )
                     continue
                 path = item.path.as_posix()
+                current_paths.add(path)
                 progress.update(
                     phase="scanning",
-                    files_seen=files_seen,
-                    files_unchanged=unchanged,
+                    candidates_seen=candidates_seen,
+                    eligible_files=len(current_paths),
+                    unchanged_files=unchanged,
                     current_path=path,
                 )
-                current_paths.add(path)
                 previous = existing.get(path)
                 if (
                     not force
@@ -736,6 +911,7 @@ class Indexer:
                             if item.content is not None
                             else item.absolute_path.read_bytes()
                         )
+                        bytes_read += len(source)
                         rejection = _content_rejection(source)
                         content_hash = _digest(source)
                     if rejection is not None:
@@ -768,6 +944,9 @@ class Indexer:
                                 staging_job().mark_replaced(rejected_record.file_id)
                                 staging_job().mark_references_replaced(rejected_record.file_id)
                         skipped += 1
+                        skipped_by_reason[rejection] = skipped_by_reason.get(rejection, 0) + 1
+                        if len(skipped_samples) < 20:
+                            skipped_samples.append(path)
                         continue
                     if not force and previous is not None and previous.content_hash == content_hash:
                         with timer.measure("commit"):
@@ -791,6 +970,7 @@ class Indexer:
                     with timer.measure("parse"):
                         extraction = self.extractor.extract(item.path, item.language, source)
                     parsed += 1
+                    chunks_extracted += len(extraction.chunks)
                     reference_extraction_ns += extraction.reference_extraction_ns
                     staged_reference_rows += len(extraction.references)
                     source_chars = sum(len(chunk.content) for chunk in extraction.chunks)
@@ -847,9 +1027,12 @@ class Indexer:
             flush_pending()
             progress.update(
                 phase="committing",
-                files_seen=files_seen,
-                files_total=len(current_paths) or None,
-                files_unchanged=unchanged,
+                candidates_seen=candidates_seen,
+                candidates_total=candidates_seen,
+                eligible_files=len(current_paths),
+                unchanged_files=unchanged,
+                skipped_total=skipped,
+                skipped_by_reason=skipped_by_reason,
                 current_path=None,
                 force=True,
             )
@@ -900,6 +1083,13 @@ class Indexer:
             peak_memory_bytes=peak_memory_bytes,
             reference_extraction_duration_ms=reference_extraction_ns // 1_000_000,
             staged_reference_rows=staged_reference_rows,
+            failed_files=len(errors),
+            skip_reasons=skipped_by_reason,
+            skipped_samples=skipped_samples,
+            bytes_read=bytes_read,
+            chunks_extracted=chunks_extracted,
+            chunks_staged=chunks_staged,
+            staged_bytes=staged_bytes,
         )
 
     def _derive_index_state(self, project_id: str, errors: list[IndexIssue]) -> str:

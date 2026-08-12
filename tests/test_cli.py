@@ -343,16 +343,16 @@ def test_a_terminal_gets_one_status_line_that_is_cleaned_up_afterwards() -> None
     stream = Terminal()
     printer = cli._ProgressPrinter(stream)
 
-    printer(IndexProgress(project_id="abc", files_seen=1, phase="scanning"))
-    printer(IndexProgress(project_id="abc", files_seen=2, phase="scanning"))
+    printer(IndexProgress(project_id="abc", candidates_seen=1, phase="scanning"))
+    printer(IndexProgress(project_id="abc", candidates_seen=2, phase="scanning"))
     printer.clear()
 
     written = stream.getvalue()
     assert written.count("\n") == 0, "a status line must not scroll the terminal"
-    assert "Scanning 2 files" in written
+    assert "Scanning 2 candidates" in written
     # Whatever the last line was, the cursor ends on a blank line so the JSON
     # report is not printed on top of it.
-    assert written.rstrip("\r").endswith(" " * len("Scanning 2 files"))
+    assert written.rstrip("\r").endswith(" " * len("Scanning 2 candidates"))
 
 
 def test_cli_reports_storage_status_as_json(  # type: ignore[no-untyped-def]
@@ -455,3 +455,31 @@ def test_cli_storage_vacuum_requires_the_execute_flag_to_mutate(  # type: ignore
     assert entry["status"] == "ok"
     assert entry["after"] is not None
     assert payload["registry_after"] is not None
+
+
+def test_cli_reports_indexing_history_as_json(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        cli,
+        "Application",
+        lambda paths, cwd: Application(paths, embedder=_TinyEmbedder(), cwd=cwd),
+    )
+
+    assert main(["init", str(root)]) == 0
+    assert main(["index", str(root)]) == 0
+    capsys.readouterr()
+    assert main(["history", str(root)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
+    assert payload["project"]["id"]
+    assert len(payload["runs"]) == 1
+    assert payload["runs"][0]["trigger"] == "manual"
+    assert payload["runs"][0]["state"] == "completed"
+    assert payload["runs"][0]["chunks_embedded"] >= 1

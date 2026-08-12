@@ -127,6 +127,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "init_project",
         "index_project",
         "project_status",
+        "index_history",
         "index_storage_status",
         "index_storage_maintenance",
         "list_projects",
@@ -139,7 +140,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 14
+    assert len(tools) == 15
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -1456,6 +1457,7 @@ READ_ONLY_TOOLS = frozenset({"list_projects", "get_chunk"})
 AUTO_REGISTERING_TOOLS = frozenset(
     {
         "project_status",
+        "index_history",
         "index_storage_status",
         "search_code",
         "search_across_projects",
@@ -1828,3 +1830,60 @@ async def test_index_storage_maintenance_tool_can_execute_cleanup(tmp_path: Path
     # The project remains fully usable after maintenance.
     status = app.project_status(project.id)
     assert status.state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_index_history_tool_reports_paginated_runs(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool("index_history", {"project": str(root), "limit": 1})
+
+    assert not result.isError
+    payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
+    assert payload["schema_version"] == 1
+    assert payload["project"]["id"] == project.id
+    assert len(payload["runs"]) == 1
+    assert payload["runs"][0]["state"] == "completed"
+    assert payload["runs"][0]["trigger"] == "manual"
+    assert payload["runs"][0]["run_id"]
+    assert payload["runs"][0]["chunks_embedded"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_project_status_includes_progress_and_last_run(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool("project_status", {"project": str(root)})
+
+    assert not result.isError
+    payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
+    assert payload["last_run"]["state"] == "completed"
+    assert payload["last_run"]["trigger"] == "manual"
+    assert payload["last_run"]["eligible_files"] == 1
+    assert payload["progress"] is None

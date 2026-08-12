@@ -1253,3 +1253,81 @@ def test_maybe_run_maintenance_does_not_persist_after_errors(
     assert report is not None
     assert project.id in report.failed_projects
     assert not timestamp_path.exists()
+
+
+def test_project_status_includes_the_last_run_summary_and_live_progress(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+
+    before = app.project_status(project.id)
+    assert before.last_run is None
+    assert before.progress is None
+
+    app.index_project(project.id)
+
+    status = app.project_status(project.id)
+    assert status.last_run is not None
+    assert status.last_run.state == "completed"
+    assert status.last_run.trigger == "manual"
+    assert status.last_run.eligible_files == 1
+    assert status.last_run.changed_files == 1
+    assert status.progress is None
+    assert status.chunk_count > 0
+
+
+def test_index_history_is_paginated_and_never_returns_more_than_asked(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    for _ in range(3):
+        app.index_project(project.id)
+
+    first = app.index_history(project.id, limit=2)
+    assert first.project is not None
+    assert first.project.id == project.id
+    assert len(first.runs) == 2
+    assert first.next_cursor is not None
+
+    second = app.index_history(project.id, limit=2, cursor=first.next_cursor)
+    assert len(second.runs) == 1
+    assert second.next_cursor is None
+    assert first.runs[0].run_id != second.runs[0].run_id
+
+
+def test_reference_tool_path_uses_the_lazy_query_and_backfill_triggers(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    report = app.ensure_reference_index(project.id)
+    assert report.files_current == 1
+
+    page = app.index_history(project.id, limit=10)
+    triggers = {run.trigger for run in page.runs}
+    assert "reference-backfill" in triggers
