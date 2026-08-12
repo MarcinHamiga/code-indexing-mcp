@@ -60,7 +60,7 @@ _CONTAINER_KINDS: Final = frozenset(
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 _QUOTE_CHARACTERS: Final = ("'", '"')
 STRUCTURAL_LANGUAGES: Final = frozenset({"python", "javascript", "typescript", "tsx"})
-_PACK_DOWNLOAD_ATTEMPTS: Final = 3
+_PACK_DOWNLOAD_ATTEMPTS: Final = 6
 _PACK_DOWNLOAD_BACKOFF_SECONDS: Final = 1.0
 _ReferenceAdder = Callable[..., None]
 
@@ -107,9 +107,10 @@ def _pack_language(name: str) -> Language:
 
     The pack fetches its manifest and parsers from a GitHub release the first
     time a language is resolved, then caches the result on disk. That endpoint
-    has transient outages (503s, dropped connections), so a single failed
-    download must not fail the whole index run for a machine that merely
-    caught a bad moment.
+    has transient outages (503s, dropped connections) that can outlast a
+    couple of quick retries -- CI observed one dropping every connection for
+    tens of seconds -- so the backoff window (1+2+4+8+16s) is sized to ride
+    out such a window rather than just a single failed request.
     """
 
     for attempt in range(_PACK_DOWNLOAD_ATTEMPTS):
