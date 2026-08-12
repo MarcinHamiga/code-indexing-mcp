@@ -22,6 +22,7 @@ from code_indexing_mcp.models import (
     ProjectInfo,
     ReferenceBackfillReport,
     RenameOperation,
+    SearchHit,
 )
 from code_indexing_mcp.settings import IndexSettings
 from code_indexing_mcp.token_batching import DEFAULT_MAX_TOKEN_PRODUCT, REFERENCE_MEMORY_BYTES
@@ -830,3 +831,171 @@ def test_storage_status_raises_for_an_unknown_project(tmp_path: Path) -> None:
         app.storage_status("no-such-project")
 
     assert raised.value.code is ErrorCode.PROJECT_NOT_FOUND
+
+
+def _indexed_app(tmp_path: Path, name: str = "repo") -> tuple[Application, ProjectInfo]:
+    root = tmp_path / name
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    return app, project
+
+
+def test_maintenance_preserves_data_through_the_full_application_path(tmp_path: Path) -> None:
+    app, project = _indexed_app(tmp_path)
+    (tmp_path / "repo" / "main.py").write_text("def renamed_answer():\n    return 43\n")
+    app.index_project(project.id)
+    before_search = app.search_code("answer", projects=[project.id])
+
+    report = app.maintain_storage(wait_for_lock=True)
+
+    assert report.trigger == "manual"
+    assert report.dry_run is False
+    assert report.duration_ms >= 0
+    entry = next(result for result in report.projects if result.project.id == project.id)
+    assert entry.status == "ok"
+    assert entry.after is not None
+    assert entry.versions_removed >= 0
+    assert entry.bytes_reclaimed >= 0
+    assert entry.reclaimable_bytes_estimate >= 0
+    assert report.registry_after is not None
+    # Maintenance must not change what searches return. Relevance scores can
+    # shift fractionally when optimize merges the FTS index, so compare the
+    # hit identities, not the scores.
+    def identity(hits: list[SearchHit]) -> list[tuple[str | None, str, int, int]]:
+        return [(hit.symbol, hit.path, hit.start_line, hit.end_line) for hit in hits]
+
+    after_search = app.search_code("answer", projects=[project.id])
+    assert identity(after_search.hits) == identity(before_search.hits)
+    assert app.project_status(project.id).state == "ready"
+
+
+def test_maintenance_dry_run_mutates_nothing(tmp_path: Path) -> None:
+    from unittest.mock import patch as mock_patch
+
+    from lancedb.table import LanceTable
+
+    app, project = _indexed_app(tmp_path)
+    optimized: list[str] = []
+    original_optimize = LanceTable.optimize
+
+    def counting_optimize(self: LanceTable, **kwargs: object) -> None:
+        optimized.append(self.name)
+        original_optimize(self, **kwargs)
+
+    with mock_patch.object(LanceTable, "optimize", counting_optimize):
+        report = app.maintain_storage(dry_run=True)
+
+    assert report.dry_run is True
+    assert optimized == []
+    entry = next(result for result in report.projects if result.project.id == project.id)
+    assert entry.status == "skipped"
+    assert entry.before is not None
+    assert entry.after is None
+    assert entry.reclaimable_bytes_estimate >= 0
+    assert app.project_status(project.id).state == "ready"
+
+
+def test_busy_projects_are_skipped_in_automatic_maintenance(tmp_path: Path) -> None:
+    from filelock import FileLock
+
+    app, first = _indexed_app(tmp_path, "first")
+    _, second = _indexed_app(tmp_path, "second")
+    competing = FileLock(app.paths.data / "locks" / f"{first.id}.lock")
+    competing.acquire()
+    try:
+        report = app.maintain_storage(wait_for_lock=False)
+    finally:
+        competing.release()
+
+    assert first.id in report.busy_projects
+    by_id = {result.project.id: result for result in report.projects}
+    assert by_id[first.id].status == "skipped"
+    assert by_id[first.id].skip_reason == "busy"
+    assert by_id[second.id].status == "ok"
+    # The registry was reachable even though one project was busy.
+    assert report.registry_after is not None
+
+
+class _ExplodingEmbedder:
+    model_id = "test/tiny"
+    dimension = 4
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        raise AssertionError("maintenance must never embed passages")
+
+    def embed_query(self, text: str) -> list[float]:
+        raise AssertionError("maintenance must never embed a query")
+
+
+def test_automatic_maintenance_never_loads_the_embedding_model(tmp_path: Path) -> None:
+    app, _ = _indexed_app(tmp_path)
+    app.embedder = _ExplodingEmbedder()
+
+    report = app.maybe_run_maintenance()
+
+    assert report is not None
+    assert report.trigger == "scheduled"
+    assert any(result.status == "ok" for result in report.projects)
+
+
+def test_maybe_run_maintenance_is_disabled_by_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+
+    assert app.maybe_run_maintenance() is None
+    assert not (app.paths.data / "maintenance.json").exists()
+
+
+def test_maybe_run_maintenance_respects_the_24h_cadence_and_persists(
+    tmp_path: Path,
+) -> None:
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    app, _ = _indexed_app(tmp_path)
+    timestamp_path = app.paths.data / "maintenance.json"
+
+    report = app.maybe_run_maintenance()
+
+    assert report is not None and report.trigger == "scheduled"
+    assert timestamp_path.exists()
+    first = json.loads(timestamp_path.read_text())["last_maintenance_at"]
+
+    # A fresh timestamp means the next check is not due.
+    assert app.maybe_run_maintenance() is None
+
+    # An overdue timestamp (or a missing one) makes the next check run again.
+    overdue = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    timestamp_path.write_text(
+        json.dumps({"schema_version": 1, "last_maintenance_at": overdue})
+    )
+    again = app.maybe_run_maintenance()
+    assert again is not None
+    assert json.loads(timestamp_path.read_text())["last_maintenance_at"] != first
+
+
+def test_maybe_run_maintenance_does_not_persist_after_errors(
+    tmp_path: Path,
+) -> None:
+    app, project = _indexed_app(tmp_path)
+    timestamp_path = app.paths.data / "maintenance.json"
+
+    with patch.object(app.store, "maintain_project", side_effect=RuntimeError("boom")):
+        report = app.maybe_run_maintenance()
+
+    assert report is not None
+    assert project.id in report.failed_projects
+    assert not timestamp_path.exists()

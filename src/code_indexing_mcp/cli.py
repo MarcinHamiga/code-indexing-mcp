@@ -71,11 +71,24 @@ def _parser() -> argparse.ArgumentParser:
     index.add_argument("--force", action="store_true")
     status = commands.add_parser("status", help="Show project index status")
     status.add_argument("project", nargs="?")
-    storage = commands.add_parser("storage", help="Inspect index storage statistics")
+    storage = commands.add_parser(
+        "storage", help="Inspect index storage statistics and maintenance"
+    )
     storage_commands = storage.add_subparsers(dest="storage_command", required=True)
     storage_status = storage_commands.add_parser("status", help="Show storage statistics")
     storage_status.add_argument(
         "project", nargs="?", help="Project id, name, or path; omit for the whole installation"
+    )
+    storage_vacuum = storage_commands.add_parser(
+        "vacuum", help="Compact tables and remove verified old versions (dry-run by default)"
+    )
+    storage_vacuum.add_argument(
+        "project", nargs="?", help="Project id, name, or path; omit for the whole installation"
+    )
+    storage_vacuum.add_argument(
+        "--execute",
+        action="store_true",
+        help="perform the cleanup; without it the command only estimates what could be reclaimed",
     )
     projects = commands.add_parser("projects", help="Manage registered projects")
     project_commands = projects.add_subparsers(dest="projects_command", required=True)
@@ -384,6 +397,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = app.project_status(args.project)
         elif args.command == "storage" and args.storage_command == "status":
             result = app.storage_status(args.project)
+        elif args.command == "storage" and args.storage_command == "vacuum":
+            # Cleanup needs the writer locks; a human asked for it, so wait them
+            # out rather than skipping busy projects. The command still requires
+            # the explicit --execute flag for any mutation.
+            result = app.maintain_storage(
+                args.project, dry_run=not args.execute, wait_for_lock=True
+            )
         elif args.command == "projects" and args.projects_command == "list":
             result = app.list_projects()
         elif args.command == "projects" and args.projects_command == "remove":

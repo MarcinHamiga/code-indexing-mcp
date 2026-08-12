@@ -128,6 +128,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "index_project",
         "project_status",
         "index_storage_status",
+        "index_storage_maintenance",
         "list_projects",
         "remove_project",
         "search_code",
@@ -138,7 +139,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 13
+    assert len(tools) == 14
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -1409,7 +1410,9 @@ def _tiny_application(tmp_path: Path) -> Application:
 async def test_every_tool_declares_description_title_and_annotations(tmp_path: Path) -> None:
     tools = await create_server(_tiny_application(tmp_path), auto_index=False).list_tools()
 
-    assert {tool.name for tool in tools} == READ_ONLY_TOOLS | AUTO_REGISTERING_TOOLS | WRITE_TOOLS
+    assert {tool.name for tool in tools} == (
+        READ_ONLY_TOOLS | AUTO_REGISTERING_TOOLS | WRITE_TOOLS | {"index_storage_maintenance"}
+    )
     for tool in tools:
         assert tool.description, f"{tool.name} has no description"
         assert len(tool.description) > 60, f"{tool.name} description is a stub"
@@ -1688,3 +1691,70 @@ async def test_index_storage_status_tool_reports_installation_statistics(tmp_pat
         assert entry["partition_open_failed"] is False
         assert entry["partition_physical_bytes"] > 0
         assert {table["name"] for table in entry["tables"]} == {"files", "chunks", "references"}
+
+
+@pytest.mark.asyncio
+async def test_index_storage_maintenance_tool_defaults_to_dry_run(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        scoped = await client.call_tool("index_storage_maintenance", {"project": str(root)})
+        installation = await client.call_tool("index_storage_maintenance", {})
+
+    assert not scoped.isError
+    assert not installation.isError
+    for result in (scoped, installation):
+        payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
+        assert payload["schema_version"] == 1
+        assert payload["dry_run"] is True
+        assert payload["trigger"] == "manual"
+        assert payload["retention_hours"] == 24
+        entry = payload["projects"][0]
+        assert entry["status"] == "skipped"
+        assert entry["after"] is None
+        assert entry["before"]["partition_physical_bytes"] > 0
+
+
+@pytest.mark.asyncio
+async def test_index_storage_maintenance_tool_can_execute_cleanup(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "index_storage_maintenance", {"project": str(root), "dry_run": False}
+        )
+
+    assert not result.isError
+    payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
+    assert payload["dry_run"] is False
+    entry = payload["projects"][0]
+    assert entry["status"] == "ok"
+    assert entry["after"] is not None
+    assert payload["registry_after"] is not None
+    # The project remains fully usable after maintenance.
+    status = app.project_status(project.id)
+    assert status.state == "ready"

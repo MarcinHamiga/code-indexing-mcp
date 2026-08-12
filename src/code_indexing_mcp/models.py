@@ -797,3 +797,51 @@ class StorageStatus(FrozenModel):
     consistent: bool = True
     overlap_warnings: list[str] = Field(default_factory=list)
     worktree_warnings: list[str] = Field(default_factory=list)
+
+
+class MaintenanceProjectResult(FrozenModel):
+    """One project partition's outcome of a maintenance pass.
+
+    ``status`` is one of ``ok``, ``skipped``, or ``error``. A skipped project
+    carries a ``skip_reason`` (``busy`` when its writer lock was held, or
+    ``not-indexed`` when it has no partition to maintain). ``before`` and
+    ``after`` hold full storage snapshots when they could be collected, so the
+    deltas stay auditable rather than being reduced to counters.
+    """
+
+    project: ProjectInfo
+    status: str = "skipped"
+    skip_reason: str | None = None
+    error: str | None = None
+    before: ProjectStorageStats | None = None
+    after: ProjectStorageStats | None = None
+    # Retained versions removed and physical bytes reclaimed by the pass.
+    versions_removed: int = 0
+    bytes_reclaimed: int = 0
+    # Pre-cleanup estimate of reclaimable bytes (physical minus logical): an
+    # estimate, never a claim about what cleanup will actually free.
+    reclaimable_bytes_estimate: int = 0
+
+
+class MaintenanceReport(FrozenModel):
+    """Outcome of one storage maintenance pass, manual or scheduled."""
+
+    schema_version: int = 1
+    # "manual" or "scheduled".
+    trigger: str
+    dry_run: bool
+    retention_hours: int
+    started_at: str
+    finished_at: str
+    duration_ms: int
+    projects: list[MaintenanceProjectResult] = Field(default_factory=list)
+    registry_before: TableStorageStats | None = None
+    registry_after: TableStorageStats | None = None
+    registry_versions_removed: int = 0
+    registry_bytes_reclaimed: int = 0
+    versions_removed_total: int = 0
+    bytes_reclaimed_total: int = 0
+    reclaimable_bytes_estimate_total: int = 0
+    skipped_projects: list[str] = Field(default_factory=list)
+    busy_projects: list[str] = Field(default_factory=list)
+    failed_projects: list[str] = Field(default_factory=list)

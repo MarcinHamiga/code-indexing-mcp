@@ -22,6 +22,13 @@ MAX_BATCH_SIZE = 256
 # A gigabyte of source in one run is already far past any measured crossover, so
 # a larger figure is a mistyped setting rather than a policy.
 MAX_CROSSOVER_CHARACTERS = 1024**3
+# Automatic maintenance reclaims verified versions older than this by default.
+# The lower bound of one hour keeps zero-age cleanup unreachable from
+# configuration: concurrent readers must never have live versions reaped under
+# them, and an operator who wants everything gone has the explicit storage
+# vacuum command instead.
+DEFAULT_VERSION_RETENTION_HOURS = 24
+MAX_VERSION_RETENTION_HOURS = 24 * 30
 
 
 class IndexMode(StrEnum):
@@ -148,6 +155,11 @@ class IndexSettings:
     # requested accelerator fails with BACKEND_UNAVAILABLE instead of quietly
     # indexing more slowly than the caller asked for.
     embedding_strict: bool = False
+    # Automatic maintenance compacts tables and removes verified versions older
+    # than ``version_retention_hours``. It never uses zero-age cleanup and never
+    # sets delete_unverified, regardless of configuration.
+    auto_maintenance: bool = True
+    version_retention_hours: int = DEFAULT_VERSION_RETENTION_HOURS
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> IndexSettings:
@@ -227,4 +239,14 @@ class IndexSettings:
             index_memory_bytes=_memory_bytes(environment, default_memory_mb),
             index_execution=execution,
             broker_mode=broker_mode,
+            auto_maintenance=_boolean(environment, "CODE_INDEXING_AUTO_MAINTENANCE", True),
+            # One hour floor: configuration must never be able to reap versions
+            # that concurrent searches could still be reading.
+            version_retention_hours=_integer(
+                environment,
+                "CODE_INDEXING_VERSION_RETENTION_HOURS",
+                DEFAULT_VERSION_RETENTION_HOURS,
+                1,
+                MAX_VERSION_RETENTION_HOURS,
+            ),
         )

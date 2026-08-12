@@ -34,12 +34,14 @@ def test_catalog_covers_exactly_the_documented_settings() -> None:
         "CODE_INDEXING_EMBED_CALIBRATE",
         "CODE_INDEXING_EMBED_STRICT",
         "CODE_INDEXING_EMBED_ACCELERATOR",
+        "CODE_INDEXING_AUTO_MAINTENANCE",
+        "CODE_INDEXING_VERSION_RETENTION_HOURS",
     }
 
 
 def test_every_setting_has_display_metadata_and_a_group() -> None:
     for setting in SETTINGS:
-        assert setting.group in {"Indexing", "Embedding"}
+        assert setting.group in {"Indexing", "Embedding", "Maintenance"}
         assert setting.label and setting.help
 
 

@@ -399,3 +399,59 @@ def test_cli_storage_status_defaults_to_the_whole_installation(  # type: ignore[
     payload = json.loads(capsys.readouterr().out)
     assert payload["registry"]["row_count"] == 0
     assert payload["projects"] == []
+
+
+def test_cli_storage_vacuum_is_dry_run_by_default(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        cli,
+        "Application",
+        lambda paths, cwd: Application(paths, embedder=_TinyEmbedder(), cwd=cwd),
+    )
+
+    assert main(["init", str(root)]) == 0
+    assert main(["index", str(root)]) == 0
+    capsys.readouterr()
+    assert main(["storage", "vacuum", str(root)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
+    assert payload["dry_run"] is True
+    assert payload["trigger"] == "manual"
+    entry = payload["projects"][0]
+    assert entry["status"] == "skipped"
+    assert entry["before"]["partition_physical_bytes"] > 0
+    assert entry["after"] is None
+
+
+def test_cli_storage_vacuum_requires_the_execute_flag_to_mutate(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        cli,
+        "Application",
+        lambda paths, cwd: Application(paths, embedder=_TinyEmbedder(), cwd=cwd),
+    )
+
+    assert main(["init", str(root)]) == 0
+    assert main(["index", str(root)]) == 0
+    capsys.readouterr()
+    assert main(["storage", "vacuum", str(root), "--execute"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is False
+    entry = payload["projects"][0]
+    assert entry["status"] == "ok"
+    assert entry["after"] is not None
+    assert payload["registry_after"] is not None

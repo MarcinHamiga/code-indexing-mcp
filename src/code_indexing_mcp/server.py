@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
@@ -32,6 +33,7 @@ from .models import (
     DeclarationSelector,
     IndexReport,
     LanguageName,
+    MaintenanceReport,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
@@ -575,6 +577,7 @@ class AutoIndexingMCP(FastMCP):
     async def _lifespan(self, _: FastMCP) -> AsyncIterator[StartupCoordinator]:
         async with anyio.create_task_group() as task_group:
             try:
+                self._schedule_startup_maintenance()
                 yield StartupCoordinator(
                     self.application,
                     task_group,
@@ -586,6 +589,24 @@ class AutoIndexingMCP(FastMCP):
                 # that has acquired the index lock remains owned until its write
                 # finishes because run_sync is not abandoned on cancellation.
                 task_group.cancel_scope.cancel()
+
+    def _schedule_startup_maintenance(self) -> None:
+        """Run overdue scheduled maintenance once, in the background, in any index mode.
+
+        Direct MCP processes are long-lived enough to owe the same 24-hour
+        maintenance cadence the daemon owes. When serving through the daemon,
+        the daemon itself runs startup maintenance, so only a real
+        ``Application`` schedules here. The pass never scans source files or
+        loads the embedding model, so it runs regardless of the indexing mode;
+        it attempts the writer locks without waiting and skips busy projects.
+        """
+        if isinstance(self.application, BrokerApplication):
+            return
+        threading.Thread(
+            target=self.application.maybe_run_maintenance,
+            name="code-indexing-mcp-maintenance",
+            daemon=True,
+        ).start()
 
     async def list_tools(self) -> list[MCPTool]:
         tools = await super().list_tools()
@@ -815,6 +836,49 @@ def create_server(
     ) -> StorageStatus:
         roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(app.storage_status, project, roots=roots)
+
+    @mcp.tool(
+        title="Index storage maintenance",
+        description=(
+            "Compact tables and remove verified old Lance versions for one project or the whole "
+            "installation. Returns before and after storage statistics, versions removed, bytes "
+            "reclaimed, duration, skipped projects, and busy projects; pre-cleanup reclaimable "
+            "bytes are labelled an estimate. Dry-run by default: only an explicit "
+            "dry_run=false performs cleanup. Never uses zero-age retention or delete_unverified."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def index_storage_maintenance(
+        ctx: ServerContext,
+        project: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Project id, name, or path. Defaults to the active MCP root or the nearest "
+                    ".ci-mcp/project.toml when exactly one project is in scope; omit for the "
+                    "whole installation."
+                )
+            ),
+        ] = None,
+        dry_run: Annotated[
+            bool,
+            Field(
+                description=(
+                    "True (default) reports statistics and a reclaimable-bytes estimate without "
+                    "mutating the index; false performs the cleanup."
+                )
+            ),
+        ] = True,
+    ) -> MaintenanceReport:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(
+            app.maintain_storage,
+            project,
+            roots=roots,
+            dry_run=dry_run,
+            wait_for_lock=True,
+        )
 
     @mcp.tool(
         title="List projects",

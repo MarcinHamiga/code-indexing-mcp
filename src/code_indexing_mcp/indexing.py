@@ -952,7 +952,7 @@ class Indexer:
                 removed_file_ids=job.removed_file_ids,
             )
             if job.replace_file_ids or job.replace_reference_file_ids or job.removed_file_ids:
-                self.store.ensure_indexes(project.id, compact=bool(job.removed_file_ids))
+                self.store.ensure_indexes(project.id)
             self.store.upsert_project(
                 project,
                 model_id=self.embedder.model_id,

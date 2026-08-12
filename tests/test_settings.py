@@ -219,3 +219,42 @@ def test_an_exported_but_empty_memory_variable_does_not_shadow_the_legacy_name()
     )
 
     assert settings.index_memory_bytes == 1536 * 1024 * 1024
+
+
+def test_maintenance_defaults_to_enabled_with_24h_retention() -> None:
+    settings = IndexSettings.from_environment({})
+
+    assert settings.auto_maintenance is True
+    assert settings.version_retention_hours == 24
+
+
+def test_maintenance_is_configurable() -> None:
+    settings = IndexSettings.from_environment(
+        {"CODE_INDEXING_AUTO_MAINTENANCE": "off", "CODE_INDEXING_VERSION_RETENTION_HOURS": "48"}
+    )
+
+    assert settings.auto_maintenance is False
+    assert settings.version_retention_hours == 48
+
+
+def test_version_retention_never_reaches_zero_hours(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero-hour automatic retention would reap versions concurrent readers use."""
+    monkeypatch.setenv("CODE_INDEXING_VERSION_RETENTION_HOURS", "0")
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment()
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+
+    monkeypatch.setenv("CODE_INDEXING_VERSION_RETENTION_HOURS", "-1")
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment()
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+
+
+def test_version_retention_has_a_bounded_maximum(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODE_INDEXING_VERSION_RETENTION_HOURS", "100000")
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment()
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
