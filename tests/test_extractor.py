@@ -849,3 +849,47 @@ def test_line_index_handles_empty_and_newline_only_sources() -> None:
 
     assert _LineIndex(b"").line_at(0) == 1
     assert _LineIndex(b"\n\n\n").line_at(3) == 4
+
+
+def test_pack_language_retries_a_transient_download_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single 503 from the pack's release download must not fail the run."""
+    import tree_sitter_python
+    from tree_sitter import Language
+    from tree_sitter_language_pack import DownloadError
+
+    import code_indexing_mcp.extractor as extractor_module
+
+    language = Language(tree_sitter_python.language())
+    attempts = 0
+
+    def flaky(name: str) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts < extractor_module._PACK_DOWNLOAD_ATTEMPTS:
+            raise DownloadError("transient outage")
+        return language
+
+    monkeypatch.setattr(extractor_module, "get_language", flaky)
+    monkeypatch.setattr(extractor_module, "_PACK_DOWNLOAD_BACKOFF_SECONDS", 0.0)
+
+    assert extractor_module._pack_language("gdscript") is language
+    assert attempts == extractor_module._PACK_DOWNLOAD_ATTEMPTS
+
+
+def test_pack_language_gives_up_when_the_download_keeps_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tree_sitter_language_pack import DownloadError
+
+    import code_indexing_mcp.extractor as extractor_module
+
+    def always_fails(name: str) -> object:
+        raise DownloadError("down")
+
+    monkeypatch.setattr(extractor_module, "get_language", always_fails)
+    monkeypatch.setattr(extractor_module, "_PACK_DOWNLOAD_BACKOFF_SECONDS", 0.0)
+
+    with pytest.raises(DownloadError):
+        extractor_module._pack_language("gdscript")
