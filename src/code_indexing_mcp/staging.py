@@ -270,7 +270,8 @@ class StagingJob:
             self.replace_reference_file_ids.append(file_id)
 
     def mark_removed(self, file_id: str) -> None:
-        self.removed_file_ids.append(file_id)
+        if file_id not in self.removed_file_ids:
+            self.removed_file_ids.append(file_id)
 
     def begin_commit(self, versions: TableVersions) -> None:
         """Finalize the payloads and record the versions a rollback restores."""
@@ -302,7 +303,9 @@ class StagingJob:
         """Yield bounded ``(file_ids, table)`` commit batches for chunks.
 
         Complete file groups are combined into batches of at most ``max_files``
-        files, ``max_rows`` rows, or ``max_bytes`` of Arrow data. Staged rows
+        files, ``max_rows`` rows, or ``max_bytes`` of Arrow data, with one
+        exception: a file's rows are never split across batches, so one file
+        alone may exceed the row and byte bounds. Staged rows
         for files absent from ``replace_file_ids`` -- files that failed
         mid-run -- are skipped, and every replaced file appears in exactly one
         batch's ``file_ids`` even when it has no staged rows, so the commit's
@@ -392,8 +395,7 @@ class StagingJob:
                 return False
             if table.num_rows:
                 if batch_file_ids and (
-                    batch_rows + table.num_rows > max_rows
-                    or batch_bytes + table.nbytes > max_bytes
+                    batch_rows + table.num_rows > max_rows or batch_bytes + table.nbytes > max_bytes
                 ):
                     return False
                 batch_rows += table.num_rows

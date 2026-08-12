@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -260,6 +261,26 @@ def test_commit_batches_respect_the_file_and_byte_limits(tmp_path: Path) -> None
         ["file-4"],
     ]
     assert [table.num_rows for _, table in batches] == [2, 2, 1]
+
+
+def test_commit_batches_respect_the_byte_bound(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    for index in range(3):
+        row = chunk_row(
+            "project-1", f"file-{index}", [1.0, 2.0, 3.0, 4.0], chunk_id=f"chunk-{index}"
+        )
+        job.stage_chunks([replace(row, content="x" * 2048)])
+        job.mark_replaced(f"file-{index}")
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    batches = list(job.iter_chunk_batches(max_files=10, max_rows=100_000, max_bytes=4000))
+
+    # The file-count bound would allow one batch of three; the byte bound
+    # binds instead and gives each file its own batch, never splitting a
+    # file's rows.
+    assert [file_ids for file_ids, _ in batches] == [["file-0"], ["file-1"], ["file-2"]]
+    assert all(table.nbytes <= 4000 for _, table in batches)
 
 
 def test_commit_batches_cover_zero_row_files_in_the_affected_predicate(tmp_path: Path) -> None:

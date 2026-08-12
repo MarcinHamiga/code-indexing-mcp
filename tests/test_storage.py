@@ -7,6 +7,8 @@ from unittest.mock import patch
 import lancedb
 import pyarrow as pa
 import pytest
+from lancedb.expr import Expr
+from lancedb.merge import LanceMergeInsertBuilder
 from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
@@ -1325,3 +1327,30 @@ def test_mark_project_state_skips_when_the_state_is_unchanged(tmp_path: Path) ->
     assert store.mark_project_state(project.id, "error") is True
 
     assert store.registry_stats().current_version == version_after_error
+
+
+def test_merge_semantics_probe_passes_on_the_installed_lancedb() -> None:
+    # A future lancedb that regresses when_not_matched_by_source_delete to the
+    # all-or-nothing gate behavior fails this probe, and with it every
+    # LanceStore construction, instead of silently deleting unrelated rows.
+    assert storage_module._probe_batched_merge_semantics() is True
+    assert storage_module._batched_merge_semantics_ok() is True
+
+
+def test_merge_semantics_probe_rejects_all_or_nothing_gate_semantics() -> None:
+    original_merge = LanceTable.merge_insert
+
+    def gated_merge(self: LanceTable, key: str) -> LanceMergeInsertBuilder:
+        builder = original_merge(self, key)
+
+        def gate_only(condition: str | Expr | None = None) -> LanceMergeInsertBuilder:
+            builder._when_not_matched_by_source_delete = True
+            builder._when_not_matched_by_source_condition = None
+            builder._when_not_matched_by_source_condition_expr = None
+            return builder
+
+        builder.when_not_matched_by_source_delete = gate_only  # type: ignore[method-assign]
+        return builder
+
+    with patch.object(LanceTable, "merge_insert", gated_merge):
+        assert storage_module._probe_batched_merge_semantics() is False

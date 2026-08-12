@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -109,6 +110,68 @@ def _quoted(value: str) -> str:
 def _file_ids_condition(file_ids: Iterable[str]) -> str:
     """A predicate matching every file in *file_ids* with one IN list."""
     return f"file_id IN ({', '.join(_quoted(file_id) for file_id in file_ids)})"
+
+
+# The batched commit replaces each file's rows with one merge_insert whose
+# ``when_not_matched_by_source_delete("file_id IN (...)")`` predicate must
+# delete only the predicate's unmatched target rows, never rows of untouched
+# files. Every in-range lancedb release 0.25.0..0.34.0 filters per row, but a
+# regression to the older all-or-nothing gate behavior would silently delete
+# every untouched file's rows on a multi-file project's second run, so the
+# store refuses to start unless a cheap scratch-table probe confirms the
+# semantics. See docs/plans/2026-07-27-review-followups-index.md.
+_batched_merge_semantics_cache: bool | None = None
+_batched_merge_semantics_lock = threading.Lock()
+
+
+def _probe_batched_merge_semantics() -> bool:
+    """Return whether the installed lancedb filters source-deletes per row.
+
+    Mirrors the real commit shape: one merge on the key with a predicate that
+    also covers a sibling whose rows are absent from the source. Per-row
+    semantics leave the untouched file's row and delete the predicate's
+    unmatched rows; gate semantics leave only the matched replacement.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            database = lancedb.connect(directory)
+            table = database.create_table(
+                "probe",
+                pa.table(
+                    {
+                        "file_id": ["a", "b", "c"],
+                        "chunk_id": ["a1", "b1", "c1"],
+                        "vector": [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                    }
+                ),
+            )
+            source = pa.table({"file_id": ["a"], "chunk_id": ["a2"], "vector": [[0.0, 0.0]]})
+            (
+                table.merge_insert("chunk_id")
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .when_not_matched_by_source_delete("file_id IN ('a', 'b')")
+                .execute(source)
+            )
+            surviving = sorted(row["chunk_id"] for row in table.search().to_list())
+            return surviving == ["a2", "c1"]
+    except Exception:
+        logger.exception("Merge-insert semantics probe failed")
+        return False
+
+
+def _batched_merge_semantics_ok() -> bool:
+    """Cached :func:`_probe_batched_merge_semantics`, once per process."""
+    global _batched_merge_semantics_cache
+    if _batched_merge_semantics_cache is None:
+        with _batched_merge_semantics_lock:
+            if _batched_merge_semantics_cache is None:
+                _batched_merge_semantics_cache = _probe_batched_merge_semantics()
+                logger.debug(
+                    "Batched merge-insert semantics verified on lancedb %s",
+                    getattr(lancedb, "__version__", "unknown"),
+                )
+    return _batched_merge_semantics_cache
 
 
 def _nullable_int(value: Any) -> int | None:
@@ -306,6 +369,14 @@ class LanceStore:
         vector_dimension: int = 768,
         vector_index: str = "exact",
     ) -> None:
+        if not _batched_merge_semantics_ok():
+            raise CodeIndexingError(
+                ErrorCode.UNSUPPORTED_RUNTIME,
+                "The installed lancedb version does not filter "
+                "when_not_matched_by_source_delete rows the way batched commits "
+                "require; refusing to run because a commit could delete rows of "
+                "untouched files. Upgrade lancedb and retry.",
+            )
         self.directory = directory
         self.vector_dimension = vector_dimension
         self.vector_index = vector_index
@@ -370,9 +441,7 @@ class LanceStore:
         # not change -- must not churn registry versions. The comparison
         # excludes updated_at so a real mutation still stamps it fresh.
         if existing and all(
-            str(existing[0][column]) == str(row[column])
-            for column in row
-            if column != "updated_at"
+            str(existing[0][column]) == str(row[column]) for column in row if column != "updated_at"
         ):
             return
         self._merge(self._projects, "id", [row])

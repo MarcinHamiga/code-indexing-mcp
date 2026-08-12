@@ -230,9 +230,11 @@ def test_commit_batches_stay_bounded_far_below_the_memory_ceiling(tmp_path: Path
     """The commit path's live Arrow bytes are bounded by the batch limits.
 
     A staged corpus far beyond the byte bound still commits in batches of at
-    most ``COMMIT_BATCH_MAX_FILES`` files and ``COMMIT_BATCH_MAX_BYTES`` of
-    Arrow data, so peak commit memory stays an order of magnitude below the
-    2048 MiB combined ceiling instead of scaling with the run.
+    most ``COMMIT_BATCH_MAX_FILES`` files whose Arrow data stays at or under
+    ``COMMIT_BATCH_MAX_BYTES`` (a single file's rows are never split, so one
+    file alone may exceed the byte bound), so peak commit memory stays an
+    order of magnitude below the 2048 MiB combined ceiling instead of scaling
+    with the run.
     """
     job = StagingJob(
         tmp_path / "staging",

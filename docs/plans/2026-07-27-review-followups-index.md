@@ -37,7 +37,10 @@ These apply to every plan; individual plans do not repeat them.
 - **Python** `>=3.12,<3.14`. Target 3.12 syntax — the repo runs 3.12.13 locally.
 - **Pinned dependency ranges** must not change: `mcp>=1.27,<2`, `lancedb>=0.25,<1`,
   `pydantic>=2.11,<3`. Verified behaviour below was measured on `mcp` 1.x, `lancedb` 0.34.0,
-  `pydantic` 2.13.4.
+  `pydantic` 2.13.4. Batched-commit merge semantics — `when_not_matched_by_source_delete`
+  filtering per target row rather than acting as an all-or-nothing gate — were probed on every
+  lancedb release 0.25.0–0.34.0 and are enforced at runtime by the startup probe
+  `storage._batched_merge_semantics_ok`, which refuses to start on a regression.
 - **No new runtime dependencies.** Every plan is implementable with what is already in
   `pyproject.toml`.
 - **Run the tools the repo already configures** — `ruff`, `mypy`, `pytest` — from `.venv/bin/`.
