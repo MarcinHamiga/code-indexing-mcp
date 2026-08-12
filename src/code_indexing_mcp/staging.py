@@ -149,6 +149,39 @@ def _sync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def has_pending_recovery(staging_root: Path, project_id: str) -> bool:
+    """Return whether maintenance must preserve *project_id*'s old versions.
+
+    A committing journal names the exact table versions crash recovery must
+    restore. An unreadable or unknown journal is treated conservatively because
+    it may carry the same dependency; maintenance can retry after startup
+    recovery either consumes or retires it.
+    """
+    project_root = staging_root / project_id
+    if not project_root.is_dir():
+        return False
+    try:
+        jobs = list(project_root.iterdir())
+    except OSError:
+        return True
+    known_phases = {PHASE_STAGING, PHASE_COMMITTING, PHASE_COMPLETE, PHASE_ROLLED_BACK}
+    for job in jobs:
+        try:
+            if not job.is_dir():
+                continue
+            payload = json.loads((job / JOURNAL_NAME).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, json.JSONDecodeError):
+            return True
+        if not isinstance(payload, dict):
+            return True
+        phase = payload.get("phase")
+        if phase == PHASE_COMMITTING or phase not in known_phases:
+            return True
+    return False
+
+
 class StagingJob:
     """One index run's staged output and its journal.
 

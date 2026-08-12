@@ -194,9 +194,11 @@ class DaemonServer:
         self._stop = threading.Event()
         self._last_activity = time.monotonic()
         self._active_requests = 0
+        self._maintenance_active = False
         self._activity_lock = threading.Lock()
         self._token = ""
         self._listener: socket.socket | None = None
+        self._maintenance_thread: threading.Thread | None = None
 
     def serve(self) -> None:
         self.paths.data.mkdir(parents=True, exist_ok=True)
@@ -221,15 +223,26 @@ class DaemonServer:
             listener.listen(32)
             listener.settimeout(0.5)
             self.ready.set()
-            threading.Thread(
+            maintenance_thread = threading.Thread(
                 target=self._run_startup_maintenance,
                 name="code-indexing-mcp-daemon-maintenance",
                 daemon=True,
-            ).start()
+            )
+            self._maintenance_thread = maintenance_thread
+            with self._activity_lock:
+                self._maintenance_active = True
+            try:
+                maintenance_thread.start()
+            except BaseException:
+                with self._activity_lock:
+                    self._maintenance_active = False
+                self._maintenance_thread = None
+                raise
             while not self._stop.is_set():
                 with self._activity_lock:
                     idle = (
                         self._active_requests == 0
+                        and not self._maintenance_active
                         and time.monotonic() - self._last_activity >= self.idle_timeout_seconds
                     )
                 if idle:
@@ -257,6 +270,9 @@ class DaemonServer:
                     raise
         finally:
             listener.close()
+            if self._maintenance_thread is not None:
+                self._maintenance_thread.join()
+                self._maintenance_thread = None
             self._listener = None
             if self.endpoint.exists():
                 self.endpoint.unlink()
@@ -268,9 +284,9 @@ class DaemonServer:
 
         Maintenance needs the writer locks an index run would hold, and it is
         checked at most once per 24 hours, so a failure here only delays
-        cleanup. The daemon's idle timer is marked active for the pass so a
-        short idle timeout cannot reap the process mid-maintenance; a pass cut
-        off by shutdown is safe because optimize commits are atomic per table.
+        cleanup. The daemon's idle timer counts the pass as active and shutdown
+        joins its thread, so neither idle reaping nor an explicit stop can cut
+        maintenance off midway.
         """
         try:
             with self._activity_lock:
@@ -280,6 +296,7 @@ class DaemonServer:
             logger.exception("Scheduled maintenance after daemon startup failed")
         finally:
             with self._activity_lock:
+                self._maintenance_active = False
                 self._last_activity = time.monotonic()
 
     def _handle(self, connection: socket.socket) -> None:

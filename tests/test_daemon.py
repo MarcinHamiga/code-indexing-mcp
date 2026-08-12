@@ -587,6 +587,35 @@ def test_daemon_startup_maintenance_respects_the_disable_flag(
 
 
 @requires_local_sockets
+def test_daemon_idle_timeout_waits_for_startup_maintenance(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_maintenance() -> None:
+        started.set()
+        assert release.wait(timeout=5)
+
+    application.maybe_run_maintenance = blocking_maintenance  # type: ignore[method-assign]
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=0)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    try:
+        assert started.wait(timeout=2)
+        # The listener wakes every 0.5s, comfortably beyond this idle timeout.
+        time.sleep(0.7)
+        assert thread.is_alive()
+    finally:
+        release.set()
+        thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert not server.endpoint.exists()
+
+
+@requires_local_sockets
 def test_broker_application_dispatches_maintain_storage(tmp_path: Path) -> None:
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)

@@ -618,16 +618,15 @@ class AutoIndexingMCP(FastMCP):
         projects. When serving through the daemon, the daemon itself runs
         startup maintenance, so only a real ``Application`` schedules here.
 
-        The pass is deferred until the startup index jobs have settled so its
-        optimize pass never competes with the initial index build on the same
-        tables; an index that never settles simply defers maintenance to the
-        next process start. Manual mode never indexes at startup, so there is
-        nothing to wait for there.
+        Eager mode defers the pass until startup index jobs have settled so
+        optimize never competes with the initial build. Lazy mode runs it
+        immediately because indexing is intentionally deferred until a query;
+        manual mode has no startup indexing to wait for.
         """
         try:
             if isinstance(self.application, BrokerApplication):
                 return
-            if coordinator.mode is not IndexMode.MANUAL:
+            if coordinator.mode is IndexMode.EAGER:
                 await coordinator.wait_for_startup_settled()
             await anyio.to_thread.run_sync(
                 self.application.maybe_run_maintenance,

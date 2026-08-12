@@ -803,10 +803,10 @@ class MaintenanceProjectResult(FrozenModel):
     """One project partition's outcome of a maintenance pass.
 
     ``status`` is one of ``ok``, ``skipped``, or ``error``. A skipped project
-    carries a ``skip_reason`` (``busy`` when its writer lock was held, or
-    ``not-indexed`` when it has no partition to maintain). ``before`` and
-    ``after`` hold full storage snapshots when they could be collected, so the
-    deltas stay auditable rather than being reduced to counters.
+    carries a ``skip_reason`` such as ``busy``, ``not-indexed``, ``dry-run``,
+    or ``recovery-pending``. ``before`` and ``after`` hold full storage
+    snapshots when they could be collected, so the deltas stay auditable
+    rather than being reduced to counters.
     """
 
     project: ProjectInfo
@@ -837,6 +837,9 @@ class MaintenanceReport(FrozenModel):
     projects: list[MaintenanceProjectResult] = Field(default_factory=list)
     registry_before: TableStorageStats | None = None
     registry_after: TableStorageStats | None = None
+    registry_status: str = "skipped"
+    registry_skip_reason: str | None = None
+    registry_error: str | None = None
     registry_versions_removed: int = 0
     registry_bytes_reclaimed: int = 0
     versions_removed_total: int = 0

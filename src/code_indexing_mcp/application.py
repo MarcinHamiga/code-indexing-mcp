@@ -73,7 +73,7 @@ from .reference_service import ReferenceService
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
-from .staging import recover_staged_commits
+from .staging import has_pending_recovery, recover_staged_commits
 from .storage import LanceStore, overlap_warnings, worktree_warnings
 from .token_batching import max_token_product_for
 from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
@@ -90,13 +90,15 @@ RECOVERY_LOCK_TIMEOUT_SECONDS = 5.0
 MAINTENANCE_CHECK_INTERVAL = timedelta(hours=24)
 
 MAINTENANCE_TIMESTAMP_FILE = "maintenance.json"
+MAINTENANCE_LOCK_FILE = "maintenance-schedule.lock"
 
 
 def _read_maintenance_timestamp(path: Path) -> datetime | None:
     """Return the last successful maintenance time, or None when unreadable."""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return datetime.fromisoformat(payload["last_maintenance_at"])
+        timestamp = datetime.fromisoformat(payload["last_maintenance_at"])
+        return timestamp if timestamp.utcoffset() is not None else None
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -784,49 +786,112 @@ class Application:
 
         results: list[MaintenanceProjectResult] = []
         for registered_project in scope:
-            before = self.store.storage_stats_for(registered_project)
-            estimate = _estimate_reclaimable(before)
-            if not before.tables:
-                results.append(
-                    MaintenanceProjectResult(
-                        project=registered_project,
-                        before=before,
-                        skip_reason="not-indexed",
-                        reclaimable_bytes_estimate=estimate,
-                    )
-                )
-                continue
+            before: ProjectStorageStats | None = None
+            estimate = 0
             if dry_run:
-                results.append(
-                    MaintenanceProjectResult(
-                        project=registered_project,
-                        before=before,
-                        reclaimable_bytes_estimate=estimate,
+                try:
+                    before = self.store.storage_stats_for(registered_project)
+                    estimate = _estimate_reclaimable(before)
+                    if before.partition_open_failed:
+                        results.append(
+                            MaintenanceProjectResult(
+                                project=registered_project,
+                                before=before,
+                                status="error",
+                                error="Partition exists but its tables could not be opened",
+                                reclaimable_bytes_estimate=estimate,
+                            )
+                        )
+                    else:
+                        results.append(
+                            MaintenanceProjectResult(
+                                project=registered_project,
+                                before=before,
+                                skip_reason="not-indexed" if not before.tables else "dry-run",
+                                reclaimable_bytes_estimate=estimate,
+                            )
+                        )
+                except Exception as exc:
+                    results.append(
+                        MaintenanceProjectResult(
+                            project=registered_project,
+                            status="error",
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
                     )
-                )
                 continue
+
             global_lock = FileLock(lock_directory / "index-global.lock")
             project_lock = FileLock(lock_directory / f"{registered_project.id}.lock")
+            global_acquired = False
+            project_acquired = False
             try:
                 global_acquired = acquire(global_lock)
-                project_acquired = global_acquired and acquire(project_lock)
+                if not global_acquired:
+                    results.append(
+                        MaintenanceProjectResult(
+                            project=registered_project,
+                            skip_reason="busy",
+                        )
+                    )
+                    continue
+                project_acquired = acquire(project_lock)
                 if not project_acquired:
-                    if global_acquired:
-                        global_lock.release()
+                    results.append(
+                        MaintenanceProjectResult(
+                            project=registered_project,
+                            skip_reason="busy",
+                        )
+                    )
+                    continue
+                if has_pending_recovery(self.paths.data / "staging", registered_project.id):
+                    results.append(
+                        MaintenanceProjectResult(
+                            project=registered_project,
+                            skip_reason="recovery-pending",
+                        )
+                    )
+                    continue
+                before = self.store.storage_stats_for(registered_project)
+                estimate = _estimate_reclaimable(before)
+                if before.partition_open_failed:
                     results.append(
                         MaintenanceProjectResult(
                             project=registered_project,
                             before=before,
-                            skip_reason="busy",
+                            status="error",
+                            error="Partition exists but its tables could not be opened",
                             reclaimable_bytes_estimate=estimate,
                         )
                     )
                     continue
-                try:
-                    self.store.maintain_project(registered_project.id, cleanup_older_than=retention)
-                finally:
-                    global_lock.release()
-                    project_lock.release()
+                if not before.tables:
+                    results.append(
+                        MaintenanceProjectResult(
+                            project=registered_project,
+                            before=before,
+                            skip_reason="not-indexed",
+                            reclaimable_bytes_estimate=estimate,
+                        )
+                    )
+                    continue
+                self.store.maintain_project(registered_project.id, cleanup_older_than=retention)
+                after = self.store.storage_stats_for(registered_project)
+                if after.partition_open_failed or not after.tables:
+                    raise RuntimeError("Partition became unreadable during maintenance")
+                results.append(
+                    MaintenanceProjectResult(
+                        project=registered_project,
+                        before=before,
+                        after=after,
+                        status="ok",
+                        versions_removed=_versions_removed(before, after),
+                        bytes_reclaimed=max(
+                            0, before.partition_physical_bytes - after.partition_physical_bytes
+                        ),
+                        reclaimable_bytes_estimate=estimate,
+                    )
+                )
             except Exception as exc:  # one project must not abort the pass
                 results.append(
                     MaintenanceProjectResult(
@@ -837,48 +902,54 @@ class Application:
                         reclaimable_bytes_estimate=estimate,
                     )
                 )
-                continue
-            after = self.store.storage_stats_for(registered_project)
-            results.append(
-                MaintenanceProjectResult(
-                    project=registered_project,
-                    before=before,
-                    after=after,
-                    status="ok",
-                    versions_removed=_versions_removed(before, after),
-                    bytes_reclaimed=max(
-                        0, before.partition_physical_bytes - after.partition_physical_bytes
-                    ),
-                    reclaimable_bytes_estimate=estimate,
-                )
-            )
+            finally:
+                if project_acquired:
+                    project_lock.release()
+                if global_acquired:
+                    global_lock.release()
 
-        registry_before = self.store.registry_stats()
+        registry_before: TableStorageStats | None = None
         registry_after: TableStorageStats | None = None
+        registry_status = "skipped"
+        registry_skip_reason: str | None = "dry-run" if dry_run else None
+        registry_error: str | None = None
         registry_versions_removed = 0
         registry_bytes_reclaimed = 0
-        if not dry_run and any(result.status == "ok" for result in results):
+        if dry_run:
+            registry_before = self.store.registry_stats()
+        else:
             global_lock = FileLock(lock_directory / "index-global.lock")
-            if acquire(global_lock):
-                try:
+            global_acquired = False
+            try:
+                global_acquired = acquire(global_lock)
+                if not global_acquired:
+                    registry_skip_reason = "busy"
+                else:
+                    registry_before = self.store.registry_stats()
                     self.store.maintain_registry(cleanup_older_than=retention)
-                finally:
+                    registry_after = self.store.registry_stats()
+                    registry_status = "ok"
+                    registry_versions_removed = max(
+                        0,
+                        registry_before.retained_version_count
+                        - registry_after.retained_version_count,
+                    )
+                    registry_bytes_reclaimed = max(
+                        0, registry_before.physical_bytes - registry_after.physical_bytes
+                    )
+            except Exception as exc:
+                registry_status = "error"
+                registry_error = f"{type(exc).__name__}: {exc}"
+            finally:
+                if global_acquired:
                     global_lock.release()
-                registry_after = self.store.registry_stats()
-                registry_versions_removed = max(
-                    0,
-                    registry_before.retained_version_count - registry_after.retained_version_count,
-                )
-                registry_bytes_reclaimed = max(
-                    0, registry_before.physical_bytes - registry_after.physical_bytes
-                )
 
         finished_at = datetime.now(UTC).isoformat()
         duration_ms = (time.monotonic_ns() - started) // 1_000_000
         skipped = [
             result.project.id
             for result in results
-            if result.status == "skipped" and result.skip_reason == "not-indexed"
+            if result.status == "skipped" and result.skip_reason != "busy"
         ]
         busy = [
             result.project.id
@@ -896,6 +967,9 @@ class Application:
             projects=results,
             registry_before=registry_before,
             registry_after=registry_after,
+            registry_status=registry_status,
+            registry_skip_reason=registry_skip_reason,
+            registry_error=registry_error,
             registry_versions_removed=registry_versions_removed,
             registry_bytes_reclaimed=registry_bytes_reclaimed,
             versions_removed_total=sum(result.versions_removed for result in results),
@@ -912,28 +986,39 @@ class Application:
         """Run scheduled maintenance when it is due, persisting the last-run stamp.
 
         Gated by ``CODE_INDEXING_AUTO_MAINTENANCE`` and checked at most once per
-        24 hours, using the timestamp of the last successful pass. Runs in any
+        24 hours, using the timestamp of the last complete pass. Runs in any
         indexing mode: maintenance never scans source files or creates a new
         logical generation, so lazy, eager, and manual modes are all eligible.
-        Busy projects are skipped, not waited on; a pass that maintained nothing
-        because every project was busy leaves the stamp stale so the next
-        startup retries it.
+        Busy, damaged, or recovery-dependent projects leave the stamp stale so
+        a later startup retries them instead of waiting another 24 hours.
         """
         if not self.settings.auto_maintenance:
             return None
         timestamp_path = self.paths.data / MAINTENANCE_TIMESTAMP_FILE
-        last = _read_maintenance_timestamp(timestamp_path)
-        if last is not None and datetime.now(UTC) - last < MAINTENANCE_CHECK_INTERVAL:
+        lock_directory = self.paths.data / "locks"
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        schedule_lock = FileLock(lock_directory / MAINTENANCE_LOCK_FILE)
+        try:
+            schedule_lock.acquire(timeout=0)
+        except Timeout:
             return None
-        report = self.maintain_storage(dry_run=False, wait_for_lock=False, trigger="scheduled")
-        if report.failed_projects:
+        try:
+            # Re-check after acquiring the cross-process lock: another startup
+            # may have completed the overdue pass while this process waited to run.
+            last = _read_maintenance_timestamp(timestamp_path)
+            if last is not None and datetime.now(UTC) - last < MAINTENANCE_CHECK_INTERVAL:
+                return None
+            report = self.maintain_storage(dry_run=False, wait_for_lock=False, trigger="scheduled")
+            projects_complete = all(
+                result.status == "ok"
+                or (result.status == "skipped" and result.skip_reason == "not-indexed")
+                for result in report.projects
+            )
+            if report.registry_status == "ok" and projects_complete:
+                _write_maintenance_timestamp(timestamp_path)
             return report
-        # A pass where every project was busy maintained nothing: leaving the
-        # stamp stale retries it at the next startup instead of waiting 24 hours.
-        if report.busy_projects and not any(result.status == "ok" for result in report.projects):
-            return report
-        _write_maintenance_timestamp(timestamp_path)
-        return report
+        finally:
+            schedule_lock.release()
 
     def project_is_stale(
         self, project: str | None = None, *, roots: list[Path] | None = None

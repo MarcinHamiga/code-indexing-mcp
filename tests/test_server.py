@@ -960,6 +960,33 @@ async def test_startup_maintenance_defers_to_startup_indexing(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_lazy_server_runs_startup_maintenance_before_root_scheduling(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+    timestamp_path = app.paths.data / "maintenance.json"
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        await _wait_until(timestamp_path.exists)
+
+    assert timestamp_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_explicit_code_query_ignores_unrelated_startup_failure(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
     ready_root.mkdir()
