@@ -179,6 +179,8 @@ class StagingJob:
         self.replace_reference_file_ids: list[str] = []
         self._reference_file_ids: set[str] = set()
         self._last_reference_file_id: str | None = None
+        self._chunk_file_ids: set[str] = set()
+        self._last_chunk_file_id: str | None = None
         self.removed_file_ids: list[str] = []
         self._journal: dict[str, Any] = {}
         self._files_sink: Any = None
@@ -215,12 +217,25 @@ class StagingJob:
         self._files_writer.write_batch(batch)
 
     def stage_chunks(self, rows: list[ChunkRow]) -> None:
-        """Stage one embedding group's chunk rows as a single record batch."""
+        """Stage one embedding group's chunk rows as a single record batch.
+
+        Calls for a file may be repeated while contiguous, but once another
+        file is staged that file is closed for this job. The commit's batch
+        grouping relies on each file's rows being contiguous in the staged
+        stream: a non-contiguous repeat would look like a new file group and
+        split the file across batches, whose later predicate would silently
+        delete the earlier group's rows.
+        """
         assert self._chunks_writer is not None
         if not rows:
             return
-        if any(row.file_id != rows[0].file_id for row in rows[1:]):
+        file_id = rows[0].file_id
+        if any(row.file_id != file_id for row in rows[1:]):
             raise ValueError("A staged chunk batch must contain rows from one file")
+        if file_id in self._chunk_file_ids and file_id != self._last_chunk_file_id:
+            raise ValueError("Staged chunk batches for a file must be contiguous")
+        self._chunk_file_ids.add(file_id)
+        self._last_chunk_file_id = file_id
         vector_type = self._chunk_schema.field("vector").type
         dimension = vector_type.list_size
         columns: list[pa.Array] = []

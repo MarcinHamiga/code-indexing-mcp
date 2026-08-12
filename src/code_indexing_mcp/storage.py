@@ -118,8 +118,11 @@ def _file_ids_condition(file_ids: Iterable[str]) -> str:
 # files. Every in-range lancedb release 0.25.0..0.34.0 filters per row, but a
 # regression to the older all-or-nothing gate behavior would silently delete
 # every untouched file's rows on a multi-file project's second run, so the
-# store refuses to start unless a cheap scratch-table probe confirms the
-# semantics. See docs/plans/2026-07-27-review-followups-index.md.
+# store refuses to commit unless a cheap scratch-table probe confirms the
+# semantics. The probe is checked on the first batched commit, not on store
+# construction: read-only processes (status checks, searches, metrics) never
+# run the merge and must not pay for it. See
+# docs/plans/2026-07-27-review-followups-index.md.
 _batched_merge_semantics_cache: bool | None = None
 _batched_merge_semantics_lock = threading.Lock()
 
@@ -155,8 +158,12 @@ def _probe_batched_merge_semantics() -> bool:
             )
             surviving = sorted(row["chunk_id"] for row in table.search().to_list())
             return surviving == ["a2", "c1"]
-    except Exception:
-        logger.exception("Merge-insert semantics probe failed")
+    except Exception as exc:
+        logger.warning(
+            "Merge-insert semantics probe failed (%s); batched commits are refused",
+            exc,
+        )
+        logger.debug("Merge-insert semantics probe failure details", exc_info=True)
         return False
 
 
@@ -369,14 +376,6 @@ class LanceStore:
         vector_dimension: int = 768,
         vector_index: str = "exact",
     ) -> None:
-        if not _batched_merge_semantics_ok():
-            raise CodeIndexingError(
-                ErrorCode.UNSUPPORTED_RUNTIME,
-                "The installed lancedb version does not filter "
-                "when_not_matched_by_source_delete rows the way batched commits "
-                "require; refusing to run because a commit could delete rows of "
-                "untouched files. Upgrade lancedb and retry.",
-            )
         self.directory = directory
         self.vector_dimension = vector_dimension
         self.vector_index = vector_index
@@ -439,9 +438,11 @@ class LanceStore:
         }
         # A no-op upsert -- project discovery, a status check, a state that did
         # not change -- must not churn registry versions. The comparison
-        # excludes updated_at so a real mutation still stamps it fresh.
+        # excludes updated_at so a real mutation still stamps it fresh. It is
+        # a typed comparison, not a string coercion, so a stored null can
+        # never be mistaken for the literal string "None".
         if existing and all(
-            str(existing[0][column]) == str(row[column]) for column in row if column != "updated_at"
+            existing[0][column] == row[column] for column in row if column != "updated_at"
         ):
             return
         self._merge(self._projects, "id", [row])
@@ -593,7 +594,19 @@ class LanceStore:
         present in the source or intentionally empty. Replacement ids win over
         removal ids, and removed files are deleted in one predicate per table.
         The vector columns stay fixed-size-list float32 arrays end to end.
+
+        Refuses to commit when the installed lancedb fails the batched
+        merge-insert semantics probe, because a regression would delete rows
+        of untouched files rather than fail loudly.
         """
+        if not _batched_merge_semantics_ok():
+            raise CodeIndexingError(
+                ErrorCode.UNSUPPORTED_RUNTIME,
+                "The installed lancedb version does not filter "
+                "when_not_matched_by_source_delete rows the way batched commits "
+                "require; refusing to commit because it could delete rows of "
+                "untouched files. Upgrade lancedb and retry.",
+            )
         tables = self._tables(project_id)
         replacement_ids: list[str] = []
         chunk_iter = iter(chunk_batches)

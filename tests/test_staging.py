@@ -304,6 +304,25 @@ def test_commit_batches_cover_zero_row_files_in_the_affected_predicate(tmp_path:
     assert sum(table.num_rows for _, table in batches) == 1
 
 
+def test_a_single_file_may_exceed_the_row_and_byte_bounds(tmp_path: Path) -> None:
+    """A file's rows are never split, so one file alone may exceed the bounds."""
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_chunks(
+        [
+            chunk_row("project-1", "file-a", [1.0, 2.0, 3.0, 4.0], chunk_id=f"a-{index}")
+            for index in range(3)
+        ]
+    )
+    job.mark_replaced("file-a")
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    batches = list(job.iter_chunk_batches(max_rows=2, max_bytes=1))
+
+    assert [file_ids for file_ids, _ in batches] == [["file-a"]]
+    assert batches[0][1].num_rows == 3
+
+
 def test_staging_references_rejects_non_contiguous_file_batches(tmp_path: Path) -> None:
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     job = make_job(tmp_path, store, "project-1")
@@ -325,6 +344,22 @@ def test_staging_chunks_rejects_mixed_file_batches(tmp_path: Path) -> None:
                 chunk_row("project-1", "file-b", [4.0, 3.0, 2.0, 1.0], chunk_id="chunk-b"),
             ]
         )
+
+
+def test_staging_chunks_rejects_non_contiguous_file_batches(tmp_path: Path) -> None:
+    """The commit's batch grouping needs one file's rows contiguous.
+
+    A non-contiguous repeat would split the file across two batches whose
+    later predicate would silently delete the earlier group's rows, so it
+    must be refused at staging time rather than corrupt the commit.
+    """
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_chunks([chunk_row("project-1", "file-a", [1.0, 2.0, 3.0, 4.0], chunk_id="a-1")])
+    job.stage_chunks([chunk_row("project-1", "file-b", [4.0, 3.0, 2.0, 1.0], chunk_id="b-1")])
+
+    with pytest.raises(ValueError, match="contiguous"):
+        job.stage_chunks([chunk_row("project-1", "file-a", [1.0, 2.0, 3.0, 4.0], chunk_id="a-2")])
 
 
 def test_the_write_path_never_dumps_a_stored_chunk(tmp_path: Path) -> None:

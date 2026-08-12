@@ -1315,6 +1315,34 @@ def test_upsert_project_writes_when_the_state_changes(tmp_path: Path) -> None:
     assert store.registry_stats().current_version == version_after_first + 1
 
 
+def test_upsert_project_does_not_mistake_a_null_for_the_string_none(
+    tmp_path: Path,
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    row = {
+        "id": project.id,
+        "name": project.name,
+        "root": str(project.root.resolve()),
+        "payload": project.model_dump_json(),
+        "model_id": "test/model",
+        "vector_dimension": 4,
+        "schema_version": storage_module.SCHEMA_VERSION,
+        "state": None,
+        "updated_at": 0,
+    }
+    store._merge(store._projects, "id", [row])
+    version_before = store.registry_stats().current_version
+
+    store.upsert_project(project, model_id="test/model", state="None")
+
+    # A stored null differs from the literal string "None": the typed
+    # comparison must not treat it as a no-op and drop the state update.
+    assert store.registry_stats().current_version == version_before + 1
+
+
 def test_mark_project_state_skips_when_the_state_is_unchanged(tmp_path: Path) -> None:
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
     root = tmp_path / "repo"
@@ -1331,8 +1359,8 @@ def test_mark_project_state_skips_when_the_state_is_unchanged(tmp_path: Path) ->
 
 def test_merge_semantics_probe_passes_on_the_installed_lancedb() -> None:
     # A future lancedb that regresses when_not_matched_by_source_delete to the
-    # all-or-nothing gate behavior fails this probe, and with it every
-    # LanceStore construction, instead of silently deleting unrelated rows.
+    # all-or-nothing gate behavior fails this probe, and with it every batched
+    # commit, instead of silently deleting unrelated rows.
     assert storage_module._probe_batched_merge_semantics() is True
     assert storage_module._batched_merge_semantics_ok() is True
 
@@ -1354,3 +1382,26 @@ def test_merge_semantics_probe_rejects_all_or_nothing_gate_semantics() -> None:
 
     with patch.object(LanceTable, "merge_insert", gated_merge):
         assert storage_module._probe_batched_merge_semantics() is False
+
+
+def test_a_failed_probe_refuses_the_batched_commit(tmp_path: Path) -> None:
+    """The semantics probe gates the commit, not store construction."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    files = pa.Table.from_pylist([], schema=LanceStore.file_arrow_schema())
+
+    with (
+        patch.object(storage_module, "_batched_merge_semantics_ok", return_value=False),
+        pytest.raises(storage_module.CodeIndexingError) as excinfo,
+    ):
+        store.replace_files_from_arrow(
+            project.id,
+            files=files,
+            chunk_batches=[],
+        )
+
+    assert excinfo.value.code == storage_module.ErrorCode.UNSUPPORTED_RUNTIME
+    assert store.list_chunks([project.id]) == []
