@@ -241,6 +241,30 @@ def test_recent_returns_a_compact_summary_and_nothing_else(tmp_path: Path) -> No
     assert summary.duration_ms >= 0
 
 
+def test_recent_skips_running_and_interrupted_stubs(tmp_path: Path) -> None:
+    """``last_run`` is the most recent *finished* run: a newer in-flight row
+    (covered by live progress) or a crash's interrupted stub, both carrying
+    only zeroed counters, must not hide the completed run's summary."""
+    store = HistoryStore(tmp_path / "history")
+    store.begin(_audit("run-1"))
+    store.finish(
+        "run-1",
+        state="completed",
+        finished_at=datetime.now(UTC).isoformat(),
+        eligible_files=7,
+    )
+
+    later = (datetime.now(UTC) + timedelta(seconds=1)).isoformat()
+    store.begin(_audit("run-2", later))
+    summary = store.recent("project-1")
+    assert summary is not None and summary.run_id == "run-1"
+
+    store.begin(_audit("run-3", later, pid=_dead_pid()))
+    store.mark_interrupted()
+    summary = store.recent("project-1")
+    assert summary is not None and summary.run_id == "run-1"
+
+
 def test_concurrent_writers_do_not_corrupt_history(tmp_path: Path) -> None:
     store = HistoryStore(tmp_path / "history")
     errors: list[Exception] = []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -49,7 +50,11 @@ from .settings import IndexSettings
 
 logger = logging.getLogger(__name__)
 
-PROTOCOL_VERSION = 1
+# Bumped whenever the RPC surface changes shape (version 2 added the `trigger`
+# parameter to index_project): a long-lived daemon from a previous release must
+# reject requests it cannot dispatch instead of failing inside them, and the
+# mismatch is what tells ensure_daemon to retire it and start a current one.
+PROTOCOL_VERSION = 2
 MAX_FRAME_BYTES = 16 * 1024**2
 _REFACTOR_OPERATION: TypeAdapter[RefactorOperation] = TypeAdapter(RefactorOperation)
 
@@ -433,7 +438,7 @@ class BrokerApplication:
     def from_environment(cls, *, cwd: Path | None = None) -> BrokerApplication:
         return cls(RuntimePaths.from_environment(), cwd=cwd)
 
-    def _call_once(self, method: str, **params: Any) -> Any:
+    def _call_once(self, method: str, *, _protocol: int = PROTOCOL_VERSION, **params: Any) -> Any:
         token = self.token_path.read_text().strip()
         with _local_socket() as connection:
             connection.settimeout(5)
@@ -442,7 +447,7 @@ class BrokerApplication:
             send_frame(
                 connection,
                 {
-                    "protocol": PROTOCOL_VERSION,
+                    "protocol": _protocol,
                     "id": uuid.uuid4().hex,
                     "token": token,
                     "method": method,
@@ -648,7 +653,16 @@ class BrokerApplication:
 def daemon_status(paths: RuntimePaths) -> dict[str, Any]:
     try:
         return {"running": True, **BrokerApplication(paths)._ping_once()}
-    except (EOFError, OSError, CodeIndexingError):
+    except CodeIndexingError as exc:
+        # A daemon from another release rejects even the ping, but its error
+        # names the protocol version it speaks. Report it as running with that
+        # version so ensure_daemon can retire it instead of treating it as
+        # absent and then timing out against the socket it still holds.
+        expected = exc.details.get("expected")
+        if exc.code is ErrorCode.INVALID_CONFIGURATION and isinstance(expected, int):
+            return {"running": True, "protocol": expected}
+        return {"running": False}
+    except (EOFError, OSError):
         # EOFError is what a daemon shutting down mid-ping looks like: the
         # connect and the send both succeed, and the socket closes before the
         # reply arrives. It is not an OSError, so it used to escape a question
@@ -657,17 +671,38 @@ def daemon_status(paths: RuntimePaths) -> dict[str, Any]:
         return {"running": False}
 
 
+def _retire_stale_daemon(paths: RuntimePaths, protocol: int) -> None:
+    """Ask a daemon from another release to exit so a current one can bind.
+
+    The stale daemon rejects every frame that does not carry its own protocol
+    version, so the stop request is sent speaking it; ``stop`` has existed in
+    every protocol version. Best-effort: if the daemon does not go away within
+    the wait, startup proceeds and surfaces its usual timeout error.
+    """
+    broker = BrokerApplication(paths)
+    with contextlib.suppress(EOFError, OSError, CodeIndexingError):
+        broker._call_once("stop", _protocol=protocol)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not daemon_status(paths)["running"]:
+            return
+        time.sleep(0.05)
+
+
 def ensure_daemon(paths: RuntimePaths, *, timeout_seconds: float = 10) -> BrokerApplication:
     require_daemon_support()
     status = daemon_status(paths)
-    if status["running"]:
+    if status["running"] and status.get("protocol") == PROTOCOL_VERSION:
         return BrokerApplication(paths)
     paths.data.mkdir(parents=True, exist_ok=True)
     (paths.data / "locks").mkdir(parents=True, exist_ok=True)
     log_path = paths.data / "daemon.log"
     with FileLock(paths.data / "locks" / "daemon-start.lock"):
-        if daemon_status(paths)["running"]:
-            return BrokerApplication(paths)
+        status = daemon_status(paths)
+        if status["running"]:
+            if status.get("protocol") == PROTOCOL_VERSION:
+                return BrokerApplication(paths)
+            _retire_stale_daemon(paths, int(status.get("protocol") or 0))
         # Keep the child's stderr: a daemon that dies during startup is otherwise
         # indistinguishable from a slow one, and surfaces only as a timeout.
         with log_path.open("a") as log:

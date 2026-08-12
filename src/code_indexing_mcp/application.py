@@ -738,7 +738,15 @@ class Application:
         """
 
         resolved = self._resolve(project, roots)
-        return self.history.list_runs(resolved.id, cursor=cursor, limit=limit, project=resolved)
+        if limit < 1:
+            raise CodeIndexingError(ErrorCode.INVALID_FILTER, "history limit must be at least 1")
+        try:
+            return self.history.list_runs(resolved.id, cursor=cursor, limit=limit, project=resolved)
+        except ValueError as exc:
+            # Cursors are opaque, user-supplied tokens that legitimately go
+            # stale or arrive mangled; that is a structured client error, not
+            # a traceback.
+            raise CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid history cursor") from exc
 
     def storage_status(
         self, project: str | None = None, *, roots: list[Path] | None = None

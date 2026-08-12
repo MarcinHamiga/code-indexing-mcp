@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from test_indexing import _remove_reference_generation
 
 from code_indexing_mcp.accelerator_env import (
     RECORD_FILENAME,
@@ -1311,6 +1312,31 @@ def test_index_history_is_paginated_and_never_returns_more_than_asked(
     assert first.runs[0].run_id != second.runs[0].run_id
 
 
+def test_history_rejects_bad_limits_and_cursors_with_structured_errors(
+    tmp_path: Path,
+) -> None:
+    """Cursors are opaque user-supplied tokens and limits arrive from the CLI
+    unguarded; both must surface as CodeIndexingError, never a traceback."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    with pytest.raises(CodeIndexingError) as caught:
+        app.index_history(project.id, cursor="garbage")
+    assert caught.value.code is ErrorCode.INVALID_CURSOR
+
+    with pytest.raises(CodeIndexingError) as caught:
+        app.index_history(project.id, limit=0)
+    assert caught.value.code is ErrorCode.INVALID_FILTER
+
+
 def test_reference_tool_path_uses_the_lazy_query_and_backfill_triggers(
     tmp_path: Path,
 ) -> None:
@@ -1324,10 +1350,21 @@ def test_reference_tool_path_uses_the_lazy_query_and_backfill_triggers(
     )
     project = app.init_project(root)
     app.index_project(project.id)
+    # Drop the reference generation so the backfill has real work to do: a
+    # no-op backfill deliberately records nothing (reference tools run one on
+    # every query, and durable no-op rows would evict genuine index runs from
+    # the bounded history window).
+    _remove_reference_generation(app.store, project.id)
 
     report = app.ensure_reference_index(project.id)
     assert report.files_current == 1
+    assert report.files_backfilled == 1
 
     page = app.index_history(project.id, limit=10)
     triggers = {run.trigger for run in page.runs}
     assert "reference-backfill" in triggers
+
+    # The converged retry finds nothing missing and leaves no new row behind.
+    app.ensure_reference_index(project.id)
+    page = app.index_history(project.id, limit=10)
+    assert [run.trigger for run in page.runs].count("reference-backfill") == 1

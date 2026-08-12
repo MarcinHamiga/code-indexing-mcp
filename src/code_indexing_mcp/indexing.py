@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -163,6 +164,69 @@ class _PhaseTimer:
         return self.totals.get(phase, 0) // 1_000_000
 
 
+class _RunRecord:
+    """The audit trail of one indexing or backfill run.
+
+    Owns the whole row lifecycle: the ``running`` insert and pre-run storage
+    snapshot on ``start``, and the ``completed``/``failed`` finish with the
+    post-run snapshot. A deferred record is started by the run itself once it
+    knows real work is about to happen, so a no-op backfill never leaves a
+    durable row behind to evict genuine runs from the bounded history window.
+
+    Audit writes are never allowed to break an index (the same rule progress
+    publishing follows): a full disk or a runs.sqlite locked past its busy
+    timeout costs the audit row, not the run.
+    """
+
+    def __init__(
+        self,
+        *,
+        history: HistoryStore | None,
+        run_id: str,
+        audit: Callable[[], RunAudit],
+        snapshot: Callable[[], dict[str, int]],
+    ) -> None:
+        self._history = history
+        self._run_id = run_id
+        self._audit = audit
+        self._snapshot = snapshot
+        self._started = False
+        self._storage_before: dict[str, int] = {}
+
+    def start(self) -> None:
+        if self._started or self._history is None:
+            return
+        self._started = True
+        self._write(self._history.begin, self._audit())
+        self._storage_before = self._snapshot()
+
+    def complete(self, **counters: object) -> None:
+        self._finish(state="completed", **counters)
+
+    def fail(self) -> None:
+        self._finish(state="failed")
+
+    def _finish(self, *, state: str, **counters: object) -> None:
+        if not self._started or self._history is None:
+            return
+        self._write(
+            self._history.finish,
+            self._run_id,
+            state=state,
+            finished_at=datetime.now(UTC).isoformat(),
+            storage_before=self._storage_before,
+            storage_after=self._snapshot(),
+            **counters,
+        )
+
+    @staticmethod
+    def _write(operation: Callable[..., None], *args: object, **kwargs: object) -> None:
+        try:
+            operation(*args, **kwargs)
+        except (sqlite3.Error, OSError):
+            logger.warning("Recording audit history failed; the run is unaffected", exc_info=True)
+
+
 class Indexer:
     def __init__(
         self,
@@ -217,60 +281,42 @@ class Indexer:
             with (
                 global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
                 project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
+                self._recorded_run(project, run_id, trigger, force=force) as record,
             ):
                 try:
-                    if self.history is not None:
-                        self.history.begin(self._run_audit(project, run_id, trigger, force))
-                    storage_before = self._storage_snapshot(project.id)
-                    try:
-                        report = self._index_locked(project, force=force, progress=progress)
-                    except BaseException:
-                        if self.history is not None:
-                            self.history.finish(
-                                run_id,
-                                state="failed",
-                                finished_at=datetime.now(UTC).isoformat(),
-                                storage_after=self._storage_snapshot(project.id),
-                            )
-                        raise
-                    report = report.model_copy(
-                        update={
-                            "run_id": run_id,
-                            "trigger": trigger,
-                            "failed_files": len(report.errors),
-                        }
-                    )
-                    if self.history is not None:
-                        self.history.finish(
-                            run_id,
-                            state="completed",
-                            finished_at=datetime.now(UTC).isoformat(),
-                            phase_durations=self._phase_durations(report),
-                            eligible_files=report.discovered_files,
-                            changed_files=report.indexed_files,
-                            unchanged_files=report.unchanged_files,
-                            parsed_files=report.parsed_files,
-                            failed_files=report.failed_files,
-                            removed_files=report.removed_files,
-                            skipped_total=report.skipped_files,
-                            chunks_extracted=report.chunks_extracted,
-                            chunks_embedded=report.embedded_chunks,
-                            chunks_staged=report.chunks_staged,
-                            staged_bytes=report.staged_bytes,
-                            bytes_read=report.bytes_read,
-                            skip_reasons=report.skip_reasons,
-                            errors=report.errors[:20],
-                            skipped_samples=report.skipped_samples[:20],
-                            embedding_backend=report.embedding_backend,
-                            embedding_fallback_reason=report.embedding_fallback_reason,
-                            worker_used=report.worker_used,
-                            storage_before=storage_before,
-                            storage_after=self._storage_snapshot(project.id),
-                        )
+                    report = self._index_locked(project, force=force, progress=progress)
                 finally:
                     # Only the run that holds the lock owns the snapshot, so
                     # clearing here can never delete another process's progress.
                     progress.clear()
+                report = report.model_copy(
+                    update={
+                        "run_id": run_id,
+                        "trigger": trigger,
+                        "failed_files": len(report.errors),
+                    }
+                )
+                record.complete(
+                    phase_durations=self._phase_durations(report),
+                    eligible_files=report.discovered_files,
+                    changed_files=report.indexed_files,
+                    unchanged_files=report.unchanged_files,
+                    parsed_files=report.parsed_files,
+                    failed_files=report.failed_files,
+                    removed_files=report.removed_files,
+                    skipped_total=report.skipped_files,
+                    chunks_extracted=report.chunks_extracted,
+                    chunks_embedded=report.embedded_chunks,
+                    chunks_staged=report.chunks_staged,
+                    staged_bytes=report.staged_bytes,
+                    bytes_read=report.bytes_read,
+                    skip_reasons=report.skip_reasons,
+                    errors=report.errors[:20],
+                    skipped_samples=report.skipped_samples[:20],
+                    embedding_backend=report.embedding_backend,
+                    embedding_fallback_reason=report.embedding_fallback_reason,
+                    worker_used=report.worker_used,
+                )
         except Timeout as exc:
             raise CodeIndexingError(
                 ErrorCode.INDEX_BUSY,
@@ -305,52 +351,71 @@ class Indexer:
             with (
                 global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
                 project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
+                # Deferred: reference tools run a backfill on every query, and
+                # the overwhelmingly common outcome is "nothing missing". Only
+                # a backfill that actually starts work earns an audit row.
+                self._recorded_run(project, run_id, trigger, deferred=True) as record,
             ):
                 try:
-                    if self.history is not None:
-                        self.history.begin(self._run_audit(project, run_id, trigger, False))
-                    storage_before = self._storage_snapshot(project.id)
-                    try:
-                        report = self._backfill_references_locked(project, progress=progress)
-                    except BaseException:
-                        if self.history is not None:
-                            self.history.finish(
-                                run_id,
-                                state="failed",
-                                finished_at=datetime.now(UTC).isoformat(),
-                                storage_after=self._storage_snapshot(project.id),
-                            )
-                        raise
-                    if self.history is not None:
-                        self.history.finish(
-                            run_id,
-                            state="completed",
-                            finished_at=datetime.now(UTC).isoformat(),
-                            eligible_files=report.files_current,
-                            changed_files=report.files_backfilled,
-                            failed_files=len(report.incomplete_paths),
-                            skipped_total=len(report.stale_paths),
-                            skip_reasons={
-                                "incomplete": len(report.incomplete_paths),
-                                "stale": len(report.stale_paths),
-                            },
-                            errors=[
-                                IndexIssue(path=path, message="reference extraction incomplete")
-                                for path in report.incomplete_paths[:20]
-                            ],
-                            skipped_samples=report.stale_paths[:20],
-                            storage_before=storage_before,
-                            storage_after=self._storage_snapshot(project.id),
-                        )
-                    return report
+                    report = self._backfill_references_locked(
+                        project, progress=progress, run_record=record
+                    )
                 finally:
                     progress.clear()
+                record.complete(
+                    eligible_files=report.files_current,
+                    changed_files=report.files_backfilled,
+                    failed_files=len(report.incomplete_paths),
+                    # Failures live in failed_files and errors; the skip pair
+                    # stays in lockstep (skipped_total == sum of the reasons).
+                    skipped_total=len(report.stale_paths),
+                    skip_reasons=({"stale": len(report.stale_paths)} if report.stale_paths else {}),
+                    errors=[
+                        IndexIssue(path=path, message="reference extraction incomplete")
+                        for path in report.incomplete_paths[:20]
+                    ],
+                    skipped_samples=report.stale_paths[:20],
+                )
+                return report
         except Timeout as exc:
             raise CodeIndexingError(
                 ErrorCode.INDEX_BUSY,
                 f"Another indexing job is already active: {project.name}",
                 project=project.id,
             ) from exc
+
+    @contextlib.contextmanager
+    def _recorded_run(
+        self,
+        project: ProjectInfo,
+        run_id: str,
+        trigger: IndexTrigger,
+        *,
+        force: bool = False,
+        deferred: bool = False,
+    ) -> Iterator[_RunRecord]:
+        """Record one run's audit trail around the body of a locked run.
+
+        Entered after the writer locks are acquired, so a run that never got
+        to start (INDEX_BUSY) records nothing. The body calls ``complete`` with
+        its counters; any escaping exception marks the run ``failed`` before
+        propagating. With ``deferred=True`` nothing is written until the body
+        calls ``record.start()``, which it does when real work begins.
+        """
+
+        record = _RunRecord(
+            history=self.history,
+            run_id=run_id,
+            audit=lambda: self._run_audit(project, run_id, trigger, force),
+            snapshot=lambda: self._storage_snapshot(project.id),
+        )
+        if not deferred:
+            record.start()
+        try:
+            yield record
+        except BaseException:
+            record.fail()
+            raise
 
     def _run_audit(
         self, project: ProjectInfo, run_id: str, trigger: IndexTrigger, force: bool
@@ -396,7 +461,7 @@ class Indexer:
         return {}
 
     def _backfill_references_locked(
-        self, project: ProjectInfo, *, progress: ProgressPublisher
+        self, project: ProjectInfo, *, progress: ProgressPublisher, run_record: _RunRecord
     ) -> ReferenceBackfillReport:
         # Backfill never embeds or re-parses chunks; it must not use its own
         # (always error-free) run to promote a project past whatever state a
@@ -449,6 +514,9 @@ class Indexer:
         if not missing:
             return ReferenceBackfillReport(project_id=project.id, files_current=len(existing))
 
+        # Real work is about to start; only now does this run earn its audit
+        # row. The storage snapshot inside start() still precedes every write.
+        run_record.start()
         progress.update(
             phase="extracting_references",
             candidates_total=len(missing),
@@ -728,11 +796,11 @@ class Indexer:
                 job.begin()
             return job
 
-        def stage_failure(record: StoredFile, exc: Exception, *, reason: str = "parse") -> None:
+        def stage_failure(record: StoredFile, exc: Exception) -> None:
+            # A failure is not a skip: it is carried by failed_files and errors,
+            # and keeping it out of the skip pair keeps skipped_total equal to
+            # the sum of skipped_by_reason in progress and in the audit row.
             errors.append(IndexIssue(path=record.path, message=str(exc)))
-            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
-            if len(skipped_samples) < 20:
-                skipped_samples.append(record.path)
             job = staging_job()
             previous = existing.get(record.path)
             # A failed replacement keeps the previous generation live: the
@@ -821,7 +889,7 @@ class Indexer:
                             f"{SEGMENT_TEXT_GROWTH_LIMIT}x limit"
                         )
                     if target.error is not None:
-                        stage_failure(target.record, target.error, reason="embedding")
+                        stage_failure(target.record, target.error)
                         continue
                     staging_job().stage_file(target.record)
                     staging_job().mark_replaced(target.record.file_id)

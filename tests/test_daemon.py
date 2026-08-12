@@ -686,3 +686,58 @@ def test_broker_forwards_the_index_trigger_and_serves_history(tmp_path: Path) ->
     assert any(run.run_id == report.run_id for run in page.runs)
     # Both runs are visible: the seed run (manual) and the triggered one.
     assert {run.trigger for run in page.runs} == {"manual", "watcher"}
+
+
+@requires_local_sockets
+def test_a_stale_daemon_is_reported_running_and_retired(tmp_path: Path) -> None:
+    """A daemon left running by a previous release speaks an older protocol.
+
+    It rejects every current-version frame (including the ping), so it must be
+    reported as running with its own version -- not as absent, since it still
+    holds the socket a replacement would need -- and retiring it means asking
+    it to stop in the protocol version it does accept.
+    """
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    paths.data.mkdir(parents=True)
+    (paths.data / "daemon.token").write_text("shared-token")
+    endpoint = daemon_endpoint(paths)
+    old_protocol = daemon.PROTOCOL_VERSION - 1
+
+    def old_daemon() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(endpoint))
+            server.listen()
+            while True:
+                connection, _ = server.accept()
+                with connection:
+                    request = receive_frame(connection)
+                    if request.get("protocol") != old_protocol:
+                        send_frame(
+                            connection,
+                            {
+                                "id": request.get("id"),
+                                "error": {
+                                    "code": ErrorCode.INVALID_CONFIGURATION.value,
+                                    "message": "Incompatible local daemon protocol",
+                                    "details": {"expected": old_protocol},
+                                },
+                            },
+                        )
+                        continue
+                    send_frame(connection, {"id": request.get("id"), "result": {"stopping": True}})
+                    if request.get("method") == "stop":
+                        break
+        endpoint.unlink()
+
+    thread = threading.Thread(target=old_daemon, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while not endpoint.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert daemon.daemon_status(paths) == {"running": True, "protocol": old_protocol}
+
+    daemon._retire_stale_daemon(paths, old_protocol)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert daemon.daemon_status(paths)["running"] is False

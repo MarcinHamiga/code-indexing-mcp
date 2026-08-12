@@ -301,16 +301,20 @@ class HistoryStore:
         return HistoryPage(project=project, runs=audits, next_cursor=next_cursor)
 
     def recent(self, project_id: str) -> RunSummary | None:
-        """Return the most recent run for *project_id*, or None.
+        """Return the most recent finished run for *project_id*, or None.
 
         One row, one index probe -- deliberately cheap enough for project
-        status, which runs on every freshness check.
+        status, which runs on every freshness check. Rows without a
+        ``finished_at`` are excluded: an in-flight run is covered by the live
+        progress snapshot, and a crashed run's ``interrupted`` stub carries
+        only zeroed counters -- surfacing either would hide the last completed
+        run's summary that ``last_run`` is documented to be.
         """
 
         with closing(self._connect()) as connection:
             row = connection.execute(
                 """
-                SELECT * FROM runs WHERE project_id = ?
+                SELECT * FROM runs WHERE project_id = ? AND finished_at IS NOT NULL
                 ORDER BY started_at DESC, rowid DESC LIMIT 1
                 """,
                 (project_id,),
