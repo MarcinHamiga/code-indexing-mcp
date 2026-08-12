@@ -146,7 +146,8 @@ def test_another_process_can_read_the_snapshot_and_it_is_gone_afterwards(tmp_pat
 
 
 def test_updates_are_throttled_but_the_forced_ones_always_land(tmp_path: Path) -> None:
-    clock = iter([0.0, 0.05, 0.10, 0.15])
+    # The first tick is consumed for the initial phase anchor.
+    clock = iter([0.0, 0.05, 0.10, 0.15, 0.20])
     seen: list[int] = []
     publisher = ProgressPublisher(
         "project",

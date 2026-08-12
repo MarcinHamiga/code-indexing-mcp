@@ -66,6 +66,8 @@ class IndexProgress(BaseModel):
     current_path: str | None = None
     started_at: float = 0.0
     updated_at: float = 0.0
+    # Monotonic anchor for phase durations, never a wall-clock timestamp:
+    # it must strictly advance across phase changes on every platform.
     phase_started_at: float = 0.0
     pid: int = Field(default_factory=os.getpid)
 
@@ -139,7 +141,7 @@ class ProgressPublisher:
             run_id=run_id,
             trigger=trigger,
             started_at=time.time(),
-            phase_started_at=time.time(),
+            phase_started_at=self._clock(),
         )
 
     @property
@@ -157,7 +159,7 @@ class ProgressPublisher:
             return
         phase = fields.get("phase")
         if phase is not None and phase != self.state.phase:
-            fields["phase_started_at"] = time.time()
+            fields["phase_started_at"] = self._clock()
         # Deep-copy the merged fields: model_copy never copies the update
         # mapping's values, and a published snapshot must not share a nested
         # value (e.g. the skipped_by_reason dict) with a caller that keeps
