@@ -159,7 +159,11 @@ class ProgressPublisher:
             return
         phase = fields.get("phase")
         if phase is not None and phase != self.state.phase:
-            fields["phase_started_at"] = self._clock()
+            # Anchor the new phase strictly after the previous one: clocks with
+            # coarse granularity (some Windows runners read milliseconds) can
+            # return the same tick twice, which would make the anchor not
+            # advance and phase durations collapse to zero.
+            fields["phase_started_at"] = max(self._clock(), self.state.phase_started_at + 1e-6)
         # Deep-copy the merged fields: model_copy never copies the update
         # mapping's values, and a published snapshot must not share a nested
         # value (e.g. the skipped_by_reason dict) with a caller that keeps
