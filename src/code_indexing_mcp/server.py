@@ -43,6 +43,7 @@ from .models import (
     ReferenceKind,
     ReferenceResponse,
     RemovalReport,
+    ScanInspectionPage,
     SearchResponse,
     StorageStatus,
     SymbolResponse,
@@ -131,6 +132,15 @@ class StartupCoordinator:
         self.wait_seconds = wait_seconds
         self._jobs: dict[Path, _StartupJob] = {}
         self._monitors: dict[Path, asyncio.Queue[None]] = {}
+        # Roots whose filesystem watcher has seen an event that no index pass
+        # has reconciled yet. A dirty root is known-changed without any scan,
+        # so scheduling skips its freshness walk and queries treat it as stale.
+        self._dirty_roots: set[Path] = set()
+        # One generation counter per dirty root: only the refresh iteration
+        # that observed the event's generation may clear the mark, so an event
+        # landing while a refresh is in flight keeps the root dirty for the
+        # next iteration instead of being wiped by the previous one's clear.
+        self._dirty_generation: dict[Path, int] = {}
         self._lock = asyncio.Lock()
         self._limiter = anyio.CapacityLimiter(1)
         self._first_schedule: asyncio.Event = asyncio.Event()
@@ -157,6 +167,7 @@ class StartupCoordinator:
                         if (
                             existing.indexes
                             and existing.project_id is not None
+                            and (registered_root or root) not in self._dirty_roots
                             and not await self._is_stale(existing.project_id)
                         ):
                             continue
@@ -267,13 +278,15 @@ class StartupCoordinator:
             dirty: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
             # The watch backend takes its first filesystem snapshot when its
             # task begins. Seed one freshness pass so an edit made between
-            # project discovery and that snapshot cannot be missed.
+            # project discovery and that snapshot cannot be missed. The seed is
+            # not a watcher event, so it is not marked dirty: its one freshness
+            # walk is the startup correctness pass.
             dirty.put_nowait(None)
             self._monitors[root] = dirty
-            self.task_group.start_soon(self._watch_root, root, dirty)
+            self.task_group.start_soon(self._watch_root, root, project_id, dirty)
             self.task_group.start_soon(self._refresh_dirty_root, root, project_id, dirty)
 
-    async def _watch_root(self, root: Path, dirty: asyncio.Queue[None]) -> None:
+    async def _watch_root(self, root: Path, project_id: str, dirty: asyncio.Queue[None]) -> None:
         retry_seconds = WATCH_RETRY_INITIAL_SECONDS
         while True:
             try:
@@ -285,6 +298,16 @@ class StartupCoordinator:
                     ignore_permission_denied=True,
                 ):
                     retry_seconds = WATCH_RETRY_INITIAL_SECONDS
+                    # Mark the root known-changed before anything is scheduled:
+                    # a query arriving now must treat it as stale without paying
+                    # for a freshness walk, and scheduling must not skip it via
+                    # a cached clean answer. Drop the cached clean answer the
+                    # moment the event lands too, so even the status tool cannot
+                    # report a stale "ready" while the refresh is pending.
+                    self._dirty_roots.add(root)
+                    self._dirty_generation[root] = self._dirty_generation.get(root, 0) + 1
+                    if isinstance(self.application, Application):
+                        self.application.invalidate_freshness(project_id)
                     with suppress(asyncio.QueueFull):
                         dirty.put_nowait(None)
                 logger.warning("Filesystem monitor stopped for %s; restarting", root)
@@ -299,6 +322,12 @@ class StartupCoordinator:
         while True:
             with anyio.move_on_after(EAGER_RECONCILE_SECONDS) as reconcile:
                 await dirty.get()
+            # A cached clean answer would let project_status report "ready"
+            # while the refresh is still pending; the dirty mark is the source
+            # of truth for queries, but the status tool reads the application.
+            if isinstance(self.application, Application):
+                self.application.invalidate_freshness(project_id)
+            generation = self._dirty_generation.get(root, 0)
             try:
                 # The first pass either starts a refresh or waits for one that
                 # was already active. Event-driven refreshes make a second pass
@@ -308,6 +337,16 @@ class StartupCoordinator:
                 for _ in range(passes):
                     await self.schedule([root], indexes=True, trigger="watcher")
                     await self.wait_for_ready([root], {project_id})
+                # The dirty mark survives until the index job and its
+                # race-closing second pass have both succeeded, so a query in
+                # that window still sees the project as changed. Only this
+                # iteration may clear it: if an event landed while the refresh
+                # was in flight its generation bumped, the mark stays, and the
+                # next iteration -- which has that event's sentinel queued --
+                # reconciles it while scheduling still skips the freshness walk.
+                if self._dirty_generation.get(root, 0) == generation:
+                    self._dirty_roots.discard(root)
+                    self._dirty_generation.pop(root, None)
             except Exception:
                 logger.exception("Automatic refresh after a file change failed for %s", root)
 
@@ -515,10 +554,15 @@ async def _wait_for_startup_projects(
             for project in projects
         )
     )
+    # A root the eager watcher has marked dirty is known-changed even if a
+    # cached status check says otherwise, so it must be refreshed before the
+    # query is answered.
+    dirty_roots = set(coordinator._dirty_roots)
     refresh_roots = [
         project.root
         for project, status in zip(projects, statuses, strict=True)
         if status.state not in {"ready", "partial"}
+        or any(same_project_root(dirty, project.root) for dirty in dirty_roots)
     ]
     await coordinator.schedule(refresh_roots, indexes=True, trigger="lazy-query")
     await coordinator.wait_for_discovery(selected_roots)
@@ -887,6 +931,64 @@ def create_server(
         roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(
             app.index_history, project, roots=roots, cursor=cursor, limit=limit
+        )
+
+    @mcp.tool(
+        title="Inspect scan",
+        description=(
+            "One page of a stat-only dry-run scan of a project: what an index run would find, "
+            "before anything is embedded or written. Each item carries a repository-relative "
+            "path with the outcome ('eligible' with its language, or 'skipped' with its reason "
+            "and explanation). Filter by outcome or skip reason and paginate with the opaque "
+            "cursor. Read-only: never mutates the index and never persists a scan manifest."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def inspect_scan(
+        ctx: ServerContext,
+        project: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Project id, name, or path. Defaults to the active MCP root or the nearest "
+                    ".ci-mcp/project.toml."
+                )
+            ),
+        ] = None,
+        outcome: Annotated[
+            str | None,
+            Field(
+                description="Keep only 'eligible' or 'skipped' items; omit for both.",
+            ),
+        ] = None,
+        reason: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Keep only skipped items with this reason: unsupported, ignored, symlink, "
+                    "oversized, or unreadable."
+                )
+            ),
+        ] = None,
+        cursor: Annotated[
+            str | None,
+            Field(description="Opaque cursor from a previous page; omit for the first page."),
+        ] = None,
+        limit: Annotated[
+            int,
+            Field(description="Maximum items per page, up to 200.", ge=1, le=200),
+        ] = 50,
+    ) -> ScanInspectionPage:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(
+            app.inspect_scan,
+            project,
+            roots=roots,
+            outcome=outcome,
+            reason=reason,
+            cursor=cursor,
+            limit=limit,
         )
 
     @mcp.tool(

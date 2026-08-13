@@ -14,13 +14,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
         python: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     # The full suite takes ~10 minutes on the slowest runner; a hung test must
     # not burn the default 6-hour cap.
     timeout-minutes: 40
-    steps:
+    steps: &test-steps
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
@@ -79,6 +79,20 @@ jobs:
         # pytest-xdist shortens the suite ~2.6x on multi-core runners (locally
         # 225s -> 86s); the suite is worker-safe (tmp_path isolation).
         run: uv run pytest -n auto
+
+  # macOS is the most expensive runner by far, and a developer with a Mac can
+  # run these exact checks locally, so it no longer runs on every push. It is
+  # kept as a manual-dispatch job for the rare case where a darwin-only
+  # regression is suspected and worth paying for one run.
+  test-macos:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps: *test-steps
 
   # The real-model memory gate downloads ~640 MB and takes minutes, so it is
   # manually dispatched rather than run on every push. Normal CI still checks

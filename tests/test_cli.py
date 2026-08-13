@@ -483,3 +483,32 @@ def test_cli_reports_indexing_history_as_json(  # type: ignore[no-untyped-def]
     assert payload["runs"][0]["trigger"] == "manual"
     assert payload["runs"][0]["state"] == "completed"
     assert payload["runs"][0]["chunks_embedded"] >= 1
+
+
+def test_cli_reports_scan_inspection_as_json(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    (root / "notes.md").write_text("not source\n")
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        cli,
+        "Application",
+        lambda paths, cwd: Application(paths, embedder=_TinyEmbedder(), cwd=cwd),
+    )
+
+    assert main(["init", str(root)]) == 0
+    assert main(["index", str(root)]) == 0
+    capsys.readouterr()
+    assert main(["scan", str(root), "--outcome", "eligible"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
+    assert payload["project"]["id"]
+    assert [item["path"] for item in payload["items"]] == ["main.py"]
+    assert payload["items"][0]["language"] == "python"
+    assert payload["items"][0]["outcome"] == "eligible"
+    assert payload["next_cursor"] is None

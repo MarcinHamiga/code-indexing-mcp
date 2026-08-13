@@ -77,6 +77,18 @@ def _parser() -> argparse.ArgumentParser:
     history.add_argument("project", nargs="?")
     history.add_argument("--limit", type=int, default=20)
     history.add_argument("--cursor", default=None)
+    scan = commands.add_parser(
+        "scan", help="Dry-run scan inspection: what an index run would find, without writing"
+    )
+    scan.add_argument("project", nargs="?")
+    scan.add_argument("--outcome", choices=["eligible", "skipped"], default=None)
+    scan.add_argument(
+        "--reason",
+        choices=["unsupported", "ignored", "symlink", "oversized", "unreadable"],
+        default=None,
+    )
+    scan.add_argument("--limit", type=int, default=50)
+    scan.add_argument("--cursor", default=None)
     storage = commands.add_parser(
         "storage", help="Inspect index storage statistics and maintenance"
     )
@@ -403,6 +415,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = app.project_status(args.project)
         elif args.command == "history":
             result = app.index_history(args.project, cursor=args.cursor, limit=args.limit)
+        elif args.command == "scan":
+            result = app.inspect_scan(
+                args.project,
+                outcome=args.outcome,
+                reason=args.reason,
+                cursor=args.cursor,
+                limit=args.limit,
+            )
         elif args.command == "storage" and args.storage_command == "status":
             result = app.storage_status(args.project)
         elif args.command == "storage" and args.storage_command == "vacuum":

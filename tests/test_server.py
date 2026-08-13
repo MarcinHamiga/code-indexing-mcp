@@ -128,6 +128,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "index_project",
         "project_status",
         "index_history",
+        "inspect_scan",
         "index_storage_status",
         "index_storage_maintenance",
         "list_projects",
@@ -140,7 +141,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 15
+    assert len(tools) == 16
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -728,15 +729,15 @@ async def test_first_automatic_index_materializes_project_tree_once(
         cwd=tmp_path,
     )
     server = create_server(app)
-    walks = 0
-    original_walk = app.indexer.scanner._walk
+    scans = 0
+    original_scan = app.indexer.scanner.iter_scan
 
-    def counted_walk(path: Path) -> tuple[list[Path], list[Path]]:
-        nonlocal walks
-        walks += 1
-        return original_walk(path)
+    def counted_scan(*args, **kwargs):
+        nonlocal scans
+        scans += 1
+        return original_scan(*args, **kwargs)
 
-    monkeypatch.setattr(app.indexer.scanner, "_walk", counted_walk)
+    monkeypatch.setattr(app.indexer.scanner, "iter_scan", counted_scan)
 
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
         return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
@@ -748,7 +749,7 @@ async def test_first_automatic_index_materializes_project_tree_once(
         result = await client.call_tool("search_code", {"query": "answer"})
 
     assert not result.isError
-    assert walks == 1
+    assert scans == 1
 
 
 @pytest.mark.asyncio
@@ -1458,6 +1459,7 @@ AUTO_REGISTERING_TOOLS = frozenset(
     {
         "project_status",
         "index_history",
+        "inspect_scan",
         "index_storage_status",
         "search_code",
         "search_across_projects",
@@ -1887,3 +1889,122 @@ async def test_project_status_includes_progress_and_last_run(tmp_path: Path) -> 
     assert payload["last_run"]["trigger"] == "manual"
     assert payload["last_run"]["eligible_files"] == 1
     assert payload["progress"] is None
+
+
+@pytest.mark.asyncio
+async def test_inspect_scan_tool_returns_paginated_filtered_results(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    (root / "notes.md").write_text("not source\n")
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    app.index_project(project.id)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        first = await client.call_tool("inspect_scan", {"project": str(root), "limit": 1})
+        second = await client.call_tool(
+            "inspect_scan",
+            {"project": str(root), "limit": 1, "cursor": cursor(first)},
+        )
+        eligible = await client.call_tool(
+            "inspect_scan", {"project": str(root), "outcome": "eligible"}
+        )
+
+    assert not first.isError
+    assert not second.isError
+    assert not eligible.isError
+
+    first_payload = json.loads(first.content[0].text)  # type: ignore[union-attr]
+    assert first_payload["schema_version"] == 1
+    assert first_payload["project"]["id"] == project.id
+    assert len(first_payload["items"]) == 1
+    assert first_payload["next_cursor"]
+
+    second_payload = json.loads(second.content[0].text)  # type: ignore[union-attr]
+    assert len(second_payload["items"]) == 1
+    assert second_payload["items"][0]["path"] != first_payload["items"][0]["path"]
+
+    eligible_payload = json.loads(eligible.content[0].text)  # type: ignore[union-attr]
+    assert [item["path"] for item in eligible_payload["items"]] == ["main.py"]
+    assert eligible_payload["items"][0]["outcome"] == "eligible"
+    assert eligible_payload["items"][0]["language"] == "python"
+    assert eligible_payload["items"][0]["size"] is not None
+
+
+def cursor(result) -> str:
+    payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
+    assert payload["next_cursor"] is not None
+    return payload["next_cursor"]
+
+
+@pytest.mark.asyncio
+async def test_eager_watcher_marks_the_root_dirty_without_a_freshness_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real filesystem event marks the root dirty immediately; the
+    event-driven refresh then schedules and reconciles without running a
+    freshness walk, and the mark is cleared once it succeeds."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    source = root / "main.py"
+    source.write_text("def before_change():\n    return 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    stale_checks = 0
+    original_is_stale = app.project_is_stale
+
+    def counted_is_stale(*args, **kwargs):
+        nonlocal stale_checks
+        stale_checks += 1
+        return original_is_stale(*args, **kwargs)
+
+    monkeypatch.setattr(app, "project_is_stale", counted_is_stale)
+    seed_refresh_finished = _observe_freshness_check(app, monkeypatch)
+    change = asyncio.Event()
+
+    async def one_shot_watch(*args: object, **kwargs: object):
+        del args, kwargs
+        await change.wait()
+        yield {(2, str(source))}
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(server_module, "awatch", one_shot_watch)
+    monkeypatch.setattr(server_module, "EAGER_RECONCILE_SECONDS", 3600.0)
+    server = create_server(app, auto_index=True)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        await client.call_tool("find_symbol", {"name": "before_change"})
+        project = app.list_projects()[0]
+        # The seeded startup pass may legitimately run one freshness walk;
+        # every check after it belongs to the event-driven refresh.
+        assert await asyncio.to_thread(seed_refresh_finished.wait, 5)
+        baseline = stale_checks
+
+        _write_with_later_mtime(source, "def after_change():\n    return 2\n")
+        change.set()
+        await _wait_until(lambda: bool(app.find_symbol("after_change", project.id).hits))
+
+    # The watcher-driven refresh needed no freshness walk: the dirty mark
+    # carried the change signal for both scheduling and the query readiness
+    # path.
+    assert stale_checks == baseline

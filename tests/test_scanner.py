@@ -3,10 +3,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from pathspec import GitIgnoreSpec
 
 from code_indexing_mcp.models import DEFAULT_INCLUDES, ScanConfig
 from code_indexing_mcp.projects import initialize_project
-from code_indexing_mcp.scanner import LANGUAGES, SourceScanner
+from code_indexing_mcp.scanner import LANGUAGES, SourceScanner, _GitEnumerationError
 
 
 def test_scanner_honors_languages_gitignore_and_hard_exclusions(tmp_path: Path) -> None:
@@ -43,7 +44,295 @@ def test_scanner_honors_git_info_exclude(tmp_path: Path) -> None:
     result = SourceScanner().scan(project)
 
     assert [item.path.as_posix() for item in result.files] == ["main.py"]
-    assert any(item.path.as_posix() == "local_only.py" for item in result.skipped)
+    # Git's own enumeration applies info/exclude before the scanner sees the
+    # file, so an excluded file is absent from both files and skipped.
+    assert not any(item.path.as_posix() == "local_only.py" for item in result.skipped)
+
+
+def test_git_repo_scan_mixes_tracked_and_untracked_files(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    (root / "tracked.py").write_text("tracked = True\n")
+    (root / "untracked.ts").write_text("export const x = 1\n")
+    (root / "notes.md").write_text("not source\n")
+    subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["tracked.py", "untracked.ts"]
+    assert any(
+        item.path.as_posix() == "notes.md" and item.reason == "unsupported"
+        for item in result.skipped
+    )
+
+
+def test_tracked_but_ignored_file_stays_eligible(tmp_path: Path) -> None:
+    """Git's own rule is that the index wins: a file that is ignored but was
+    force-added stays tracked, so Git enumerates it and the scanner indexes it.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    (root / ".gitignore").write_text("ignored.py\n")
+    (root / "ignored.py").write_text("value = 1\n")
+    (root / "main.py").write_text("value = 2\n")
+    subprocess.run(["git", "add", "main.py"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-f", "ignored.py"], cwd=root, check=True)
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["ignored.py", "main.py"]
+
+
+def test_git_submodule_and_nested_repository_are_opaque(tmp_path: Path) -> None:
+    """Submodules (gitlinks) and nested repositories are single non-file entries
+    in Git's enumeration, so their contents are not indexed from the parent.
+    """
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    subprocess.run(["git", "init", "-q", str(outer)], check=True)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    (sub / "sub.py").write_text("def sub_symbol():\n    return 1\n")
+    subprocess.run(["git", "add", "sub.py"], cwd=sub, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "sub"],
+        cwd=sub,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            str(sub),
+            "vendor/sub",
+        ],
+        cwd=outer,
+        check=True,
+    )
+    nested = outer / "nested"
+    nested.mkdir()
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    (nested / "nested.py").write_text("def nested_symbol():\n    return 2\n")
+    (outer / "main.py").write_text("def main_symbol():\n    return 3\n")
+    project = initialize_project(outer)
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["main.py"]
+    assert not any("vendor/sub" in item.path.as_posix() for item in result.files)
+    assert not any("nested" in item.path.as_posix() for item in result.files)
+
+
+def test_git_worktree_is_scanned_as_a_normal_checkout(tmp_path: Path) -> None:
+    main_root = tmp_path / "repo"
+    main_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(main_root)], check=True)
+    (main_root / "main.py").write_text("value = 1\n")
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "main.py"],
+        cwd=main_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=main_root,
+        check=True,
+    )
+    worktree = tmp_path / "wt"
+    subprocess.run(["git", "worktree", "add", "-q", str(worktree)], cwd=main_root, check=True)
+    project = initialize_project(worktree)
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["main.py"]
+
+
+def test_git_enumeration_order_is_deterministic(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    for name in ("c.py", "a.py", "b.py"):
+        (root / name).write_text("value = 1\n")
+
+    first = SourceScanner().scan(project)
+    second = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in first.files] == ["a.py", "b.py", "c.py"]
+    assert [item.path.as_posix() for item in first.files] == [
+        item.path.as_posix() for item in second.files
+    ]
+
+
+def test_scan_stats_only_files_whose_suffix_is_supported(tmp_path: Path) -> None:
+    """A repository dominated by unsupported files must not pay a stat per file
+    (the 100,000-file gate, at small scale): only pre-filtered candidates reach
+    the filesystem. Git mode never even passes unsupported paths to Git.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    for index in range(100):
+        (root / f"doc{index:03d}.md").write_text("not source\n")
+    for index in range(5):
+        (root / f"module{index}.py").write_text("value = 1\n")
+    statted: list[Path] = []
+    original_stat = Path.stat
+
+    def counting_stat(path: Path, *args, **kwargs):
+        statted.append(path)
+        return original_stat(path, *args, **kwargs)
+
+    with patch.object(Path, "stat", counting_stat):
+        result = SourceScanner().scan(project)
+
+    assert len(result.files) == 5
+    # Only supported-suffix files are ever statted (the root directory itself
+    # is statted once by resolve(), which is not a per-file cost).
+    assert not any(path.suffix == ".md" for path in statted)
+
+
+def test_walk_mode_streams_per_directory_in_deterministic_order(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "a").mkdir(parents=True)
+    (root / "b").mkdir()
+    project = initialize_project(root)
+    (root / "a" / "z.py").write_text("value = 1\n")
+    (root / "b" / "a.py").write_text("value = 2\n")
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["a/z.py", "b/a.py"]
+
+
+def test_walk_batches_stay_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    for index in range(10):
+        (root / f"file{index:02d}.py").write_text("value = 1\n")
+    monkeypatch.setattr("code_indexing_mcp.scanner.GIT_IGNORE_DISCOVERY_BATCH_SIZE", 4)
+    include_spec = GitIgnoreSpec.from_lines(project.scan.include)
+
+    batches = list(SourceScanner()._iter_walk_batches(root, include_spec))
+
+    sizes = [len(batch) for batch in batches if isinstance(batch, list)]
+    assert sizes == [4, 4, 2]
+
+
+def test_walk_mode_treats_nested_repositories_as_opaque(tmp_path: Path) -> None:
+    """A non-Git walk must not descend into a directory carrying a ``.git``
+    entry: a nested repository or submodule is opaque, matching what
+    ``git ls-files`` reports on the git path.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    nested = root / "nested"
+    nested.mkdir()
+    (nested / ".git").write_text("gitdir: ../.git/modules/nested\n")
+    (nested / "nested.py").write_text("def nested_symbol():\n    return 2\n")
+    (root / "main.py").write_text("def main_symbol():\n    return 3\n")
+    project = initialize_project(root)
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["main.py"]
+    assert not any("nested" in item.path.as_posix() for item in result.files)
+
+
+def test_walk_fallback_keeps_tracked_but_ignored_files_eligible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk fallback inside a worktree consults the index (no
+    ``--no-index``), so a force-added file that is both tracked and ignored
+    stays eligible exactly as on the git path: the index wins.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    (root / ".gitignore").write_text("ignored.py\n")
+    (root / "ignored.py").write_text("value = 1\n")
+    (root / "main.py").write_text("value = 2\n")
+    subprocess.run(["git", "add", "main.py"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-f", "ignored.py"], cwd=root, check=True)
+    scanner = SourceScanner()
+
+    def failing_enumeration(_: Path):
+        raise _GitEnumerationError("simulated git failure")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(scanner, "_iter_git_batches", failing_enumeration)
+
+    result = scanner.scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["ignored.py", "main.py"]
+
+
+def test_failed_git_enumeration_falls_back_to_the_streaming_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    (root / "main.py").write_text("value = 1\n")
+    scanner = SourceScanner()
+
+    def broken_enumeration(_: Path):
+        raise _GitEnumerationError("simulated git failure")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(scanner, "_iter_git_batches", broken_enumeration)
+
+    result = scanner.scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["main.py"]
+
+
+def test_walk_mode_passes_only_supported_files_to_check_ignore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rare walk-inside-a-worktree fallback must not hand unsupported
+    files to `git check-ignore`: the pre-filter happens before the batch.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    for index in range(20):
+        (root / f"doc{index:03d}.md").write_text("not source\n")
+    for index in range(5):
+        (root / f"module{index}.py").write_text("value = 1\n")
+    scanner = SourceScanner()
+    batches: list[list[Path]] = []
+
+    def recording_ignored(_: Path, candidates: list[Path]) -> set[Path]:
+        batches.append(candidates)
+        return set()
+
+    def failing_enumeration(_: Path):
+        raise _GitEnumerationError("simulated git failure")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(scanner, "_git_ignored_paths", recording_ignored)
+    monkeypatch.setattr(scanner, "_in_git_worktree", lambda _: True)
+    monkeypatch.setattr(scanner, "_iter_git_batches", failing_enumeration)
+
+    result = scanner.scan(project)
+
+    assert len(result.files) == 5
+    assert batches and all(path.suffix == ".py" for batch in batches for path in batch)
 
 
 def test_default_includes_and_the_extension_map_describe_the_same_languages() -> None:

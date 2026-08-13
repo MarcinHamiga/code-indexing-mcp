@@ -41,6 +41,7 @@ from .models import (
     RefactorOperation,
     ReferenceResponse,
     RemovalReport,
+    ScanInspectionPage,
     SearchResponse,
     StorageStatus,
     SymbolResponse,
@@ -373,6 +374,8 @@ class DaemonServer:
             return app.project_status(roots=roots, **params)
         if method == "index_history":
             return app.index_history(roots=roots, **params)
+        if method == "inspect_scan":
+            return app.inspect_scan(roots=roots, **params)
         if method == "storage_status":
             return app.storage_status(roots=roots, **params)
         if method == "maintain_storage":
@@ -559,6 +562,28 @@ class BrokerApplication:
                 "index_history",
                 project=project,
                 roots=roots or [],
+                cursor=cursor,
+                limit=limit,
+            )
+        )
+
+    def inspect_scan(
+        self,
+        project: str | None = None,
+        *,
+        roots: list[Path] | None = None,
+        outcome: str | None = None,
+        reason: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> ScanInspectionPage:
+        return ScanInspectionPage.model_validate(
+            self._call(
+                "inspect_scan",
+                project=project,
+                roots=roots or [],
+                outcome=outcome,
+                reason=reason,
                 cursor=cursor,
                 limit=limit,
             )
