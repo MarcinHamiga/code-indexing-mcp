@@ -180,6 +180,40 @@ def test_reference_query_reports_an_incomplete_structural_index(tmp_path: Path) 
     assert analysis.completeness.state == "incomplete"
 
 
+def test_reference_queries_prepare_selectors_once(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    chunk_id = app.find_symbol("answer", project.id).hits[0].chunk_id
+    selectors = [
+        DeclarationSelector(chunk_id=chunk_id),
+        DeclarationSelector(
+            project=str(root),
+            path="main.py",
+            qualified_symbol="answer",
+        ),
+    ]
+
+    with patch.object(
+        app, "ensure_reference_index", wraps=app.ensure_reference_index
+    ) as ensure_reference_index:
+        for selector in selectors:
+            response = app.find_references(selector)
+            analysis = app.analyze_refactor(selector, RenameOperation(new_name="result"))
+
+            assert response.selected.qualified_symbol == "answer"
+            assert analysis.selected.qualified_symbol == "answer"
+    assert ensure_reference_index.call_count == 4
+    assert {call.args[0] for call in ensure_reference_index.call_args_list} == {project.id}
+
+
 def test_modified_source_marks_an_index_stale(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
