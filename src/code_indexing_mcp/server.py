@@ -136,6 +136,11 @@ class StartupCoordinator:
         # has reconciled yet. A dirty root is known-changed without any scan,
         # so scheduling skips its freshness walk and queries treat it as stale.
         self._dirty_roots: set[Path] = set()
+        # One generation counter per dirty root: only the refresh iteration
+        # that observed the event's generation may clear the mark, so an event
+        # landing while a refresh is in flight keeps the root dirty for the
+        # next iteration instead of being wiped by the previous one's clear.
+        self._dirty_generation: dict[Path, int] = {}
         self._lock = asyncio.Lock()
         self._limiter = anyio.CapacityLimiter(1)
         self._first_schedule: asyncio.Event = asyncio.Event()
@@ -300,6 +305,7 @@ class StartupCoordinator:
                     # moment the event lands too, so even the status tool cannot
                     # report a stale "ready" while the refresh is pending.
                     self._dirty_roots.add(root)
+                    self._dirty_generation[root] = self._dirty_generation.get(root, 0) + 1
                     if isinstance(self.application, Application):
                         self.application.invalidate_freshness(project_id)
                     with suppress(asyncio.QueueFull):
@@ -321,6 +327,7 @@ class StartupCoordinator:
             # of truth for queries, but the status tool reads the application.
             if isinstance(self.application, Application):
                 self.application.invalidate_freshness(project_id)
+            generation = self._dirty_generation.get(root, 0)
             try:
                 # The first pass either starts a refresh or waits for one that
                 # was already active. Event-driven refreshes make a second pass
@@ -332,8 +339,14 @@ class StartupCoordinator:
                     await self.wait_for_ready([root], {project_id})
                 # The dirty mark survives until the index job and its
                 # race-closing second pass have both succeeded, so a query in
-                # that window still sees the project as changed.
-                self._dirty_roots.discard(root)
+                # that window still sees the project as changed. Only this
+                # iteration may clear it: if an event landed while the refresh
+                # was in flight its generation bumped, the mark stays, and the
+                # next iteration -- which has that event's sentinel queued --
+                # reconciles it while scheduling still skips the freshness walk.
+                if self._dirty_generation.get(root, 0) == generation:
+                    self._dirty_roots.discard(root)
+                    self._dirty_generation.pop(root, None)
             except Exception:
                 logger.exception("Automatic refresh after a file change failed for %s", root)
 
