@@ -33,17 +33,15 @@ from .storage import LanceStore, ReferenceRecord
 # Reason codes that describe something the syntax-only index could not see.
 # They are surfaced as limitations whatever resolution level they carry, so a
 # caller never reads an empty limitation list as proof of full coverage.
-# `unproven_reexport` is included deliberately (unlike `name_only_candidate`,
-# which is not): a barrel import gives concrete module-edge evidence that a
-# chain exists but could not be walked to proof, a stronger and more
-# actionable signal than an unqualified bare name (R2).
+# `unproven_reexport` is included deliberately (unlike `name_only_candidate`):
+# a barrel import proves a module edge exists even when the chain cannot be
+# resolved fully, which is stronger evidence than an unqualified bare name.
 _LIMITATION_REASONS: Final = frozenset(
     {"wildcard_import", "unknown_receiver", "ambiguous_symbol", "unproven_reexport"}
 )
 
-# Depth cap for following a re-export/barrel-import chain (R2). A handful of
-# hops covers every realistic barrel layout; beyond that a chain is treated
-# as unproven rather than walked indefinitely.
+# Bound re-export traversal so malformed or unusually deep barrel chains are
+# reported as unproven rather than walked indefinitely.
 _MAX_REEXPORT_DEPTH: Final = 4
 
 # Limitations that mean whole files were never analyzed. Any of them forces the
@@ -57,24 +55,11 @@ _MAX_LIMITATION_PATHS: Final = 10
 
 
 class _ReferenceQuery(NamedTuple):
-    """Everything one pinned-snapshot query produces, for callers that need more than the page.
+    """Pinned-snapshot data shared by reference and refactor responses.
 
-    `find_references` only wants `response`. `analyze_refactor` (E1) also
-    needs the full record set, the full *unsliced* classified hit list, and
-    the per-file byte cache the classification pass already built -- without
-    this, it used to re-run the whole classification pass (and every file
-    read behind it) a second time just to get an unpaginated view of the same
-    data, which doubled the work on every call and made page-vs-full
-    consistency depend on both passes happening to agree rather than being
-    structurally guaranteed.
-
-    `records` carries only `reference`/`coverage` rows (S4/E3): declarations
-    are fetched separately, narrowed to the files and symbols that actually
-    matter, by `_hits_and_limitations`/`analyze_refactor`/`_override_findings`
-    themselves. Do not add a `record_kind == "declaration"` filter over
-    `records` expecting it to find anything -- see `storage.py`'s note above
-    `declaration_shapes` for why the declaration and reference sides of this
-    pushdown are not symmetric.
+    The full hit list and source cache let refactor analysis compute page-independent
+    counts without repeating classification. Records contain reference and coverage
+    rows; declarations are fetched separately through narrowed queries.
     """
 
     response: ReferenceResponse
@@ -82,6 +67,31 @@ class _ReferenceQuery(NamedTuple):
     hits: list[ReferenceHit]
     root: Path | None
     sources: dict[str, tuple[bytes, int]]
+
+
+class _ClassifiedFindings(NamedTuple):
+    must_change: list[RefactorFinding]
+    likely_change: list[RefactorFinding]
+    review: list[RefactorFinding]
+    evidence: list[RefactorFinding]
+
+
+def _dedupe_edit_spans(
+    findings: list[RefactorFinding],
+    seen: set[tuple[str, int, int]],
+) -> list[RefactorFinding]:
+    """Return findings whose concrete edit spans have not already been seen."""
+    deduped: list[RefactorFinding] = []
+    for finding in findings:
+        if finding.edit_start_byte is None or finding.edit_end_byte is None:
+            deduped.append(finding)
+            continue
+        key = (finding.path, finding.edit_start_byte, finding.edit_end_byte)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(finding)
+    return deduped
 
 
 class ReferenceService:
@@ -102,13 +112,8 @@ class ReferenceService:
     ) -> ReferenceResponse:
         """Resolve references for `selector`, one page at a time.
 
-        `operation_digest` is not part of the plain `find_references`
-        surface -- it exists so `analyze_refactor` can bind the refactor
-        operation (rename `new_name`, signature shape, ...) into the
-        cursor it hands back (T2): passing it through here means a page-2
-        request under a silently different operation is rejected the same
-        way a stale snapshot or a changed filter already is, instead of
-        applying page 2's edits under page 1's operation.
+        `operation_digest` is internal to `analyze_refactor`; it binds the
+        operation to the cursor so later pages cannot silently change it.
         """
         return self._find_references_with_records(
             selector,
@@ -445,105 +450,22 @@ class ReferenceService:
             query.root,
             query.sources,
         )
-        shapes_by_id = {row["reference_id"]: row for row in records}
         if isinstance(operation, RenameOperation):
-            valid_identifier = (
-                operation.new_name.isidentifier()
-                and not keyword_module.iskeyword(operation.new_name)
-                if response.selected.language == "python"
-                else bool(re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", operation.new_name))
-            )
-            if not valid_identifier:
-                raise CodeIndexingError(ErrorCode.INVALID_REFACTOR, "Invalid identifier for rename")
-        # The synthetic declaration finding and any subclass-override findings
-        # are not tied to the hit list's pagination at all — they are computed
-        # once per rename regardless of which page is requested, so that
-        # counts stay identical across pages (R4). They are only *displayed*
-        # on the first page (cursor is None) to avoid repeating them on every
-        # subsequent page fetch.
+            self._validate_rename(response.selected, operation)
+
         declaration_finding: RefactorFinding | None = None
         override_findings: list[RefactorFinding] = []
         if isinstance(operation, RenameOperation):
-            # `records` no longer carries `declaration` rows (S4/E3); the one
-            # this needs -- the selected symbol's own declaration -- is
-            # fetched directly by its exact `source_qualified_symbol`
-            # instead, from the same pinned snapshot `records` came from.
-            declarations_at_symbol = self.store.declaration_shapes(
-                response.selected.project_id,
-                response.selected.qualified_symbol,
-                version=response.snapshot_version,
-                schema_version=REFERENCE_SCHEMA_VERSION,
-            )
-            declaration = next(
-                (
-                    row
-                    for row in declarations_at_symbol
-                    if row["file_id"] == response.selected.file_id
-                ),
-                None,
-            )
-            start_byte, end_byte = 0, 0
-            edit_start, edit_end = None, None
-            if declaration is not None:
-                source, bom = self._file_bytes(root, response.selected.path, sources)
-                start_byte = (declaration["start_byte"] or 0) + bom
-                end_byte = (declaration["end_byte"] or 0) + bom
-                edit_start, edit_end = self._edit_span(
-                    source,
-                    declaration["start_byte"] or 0,
-                    declaration["end_byte"] or 0,
-                    response.selected.symbol,
-                    bom,
-                )
-            declaration_finding = RefactorFinding(
-                reference_id=f"declaration:{response.selected.file_id}",
-                project_id=response.selected.project_id,
-                path=response.selected.path,
-                language=response.selected.language,
-                kind="write",
-                start_line=response.selected.start_line,
-                end_line=response.selected.end_line,
-                start_byte=start_byte,
-                end_byte=end_byte,
-                snippet=response.selected.symbol,
-                resolution="exact",
-                reason_code="declaration",
-                explanation="The selected declaration must be renamed.",
-                written_name=response.selected.symbol,
-                edit_required=True,
-                edit_start_byte=edit_start,
-                edit_end_byte=edit_end,
-            )
-            override_findings = self._override_findings(
-                response.selected, records, root, sources, response.snapshot_version
+            declaration_finding, override_findings = self._rename_findings(
+                response.selected,
+                records,
+                root,
+                sources,
+                response.snapshot_version,
             )
 
-        # Classify the full, unsliced hit list (not just the current page) so
-        # counts/completeness are identical no matter which page is fetched
-        # (R4). The page's returned findings are a filtered view of the same
-        # classification, guaranteeing the two stay consistent. This reuses
-        # the classification `_find_references_with_records` already ran to
-        # build `response` -- `kinds` is always `None` on both sides, since
-        # `analyze_refactor` never passes a `kinds` filter through -- instead
-        # of running the whole pass (and every file read behind it) a second
-        # time (E1). `backfill` differs (the reused pass ran with the real
-        # value, this used to pass `None`), but that only changes the
-        # *limitations* `_hits_and_limitations` would return, never `hits`
-        # itself, and this call always discarded its own limitations in favor
-        # of `response.limitations` below -- so reusing `query.hits` here is
-        # not just faster, it is the exact same list the discarded second
-        # call would have produced.
-        full_hits = query.hits
-        # Fetched once and reused for every hit instead of rescanned per hit
-        # (E2): `_signature_issue` only ever wants declarations sharing the
-        # renamed/changed symbol's own `qualified_symbol` -- fetched directly
-        # by that exact name (S4/E3) instead of grouping the whole
-        # declaration table (no longer even present in `records`) by name
-        # just to read one bucket out of it. Only fetched for a
-        # signature-change operation -- a rename never calls
-        # `_signature_issue` at all (see the `isinstance(operation,
-        # RenameOperation)` branch below), so fetching it there would be
-        # pure waste.
+        # Signature shapes are fetched once from the same pinned snapshot and reused
+        # for every call-site classification.
         old_shapes = (
             []
             if isinstance(operation, RenameOperation)
@@ -554,113 +476,26 @@ class ReferenceService:
                 schema_version=REFERENCE_SCHEMA_VERSION,
             )
         )
-
-        FindingList = list[RefactorFinding]
-        ClassifiedHits = tuple[FindingList, FindingList, FindingList, FindingList]
-
-        def _classify_hits(hit_list: list[ReferenceHit]) -> ClassifiedHits:
-            bucket_must: list[RefactorFinding] = []
-            bucket_likely: list[RefactorFinding] = []
-            bucket_review: list[RefactorFinding] = []
-            bucket_evidence: list[RefactorFinding] = []
-            for hit in hit_list:
-                finding = RefactorFinding(**hit.model_dump(), edit_required=False)
-                if hit.resolution == "unresolved":
-                    bucket_review.append(finding)
-                    continue
-                if hit.resolution == "likely":
-                    bucket_likely.append(finding.model_copy(update={"edit_required": True}))
-                    continue
-                if isinstance(operation, RenameOperation):
-                    # The indexed spelling, not the snippet: re-reading the
-                    # file to decide whether an edit is needed turns an
-                    # unreadable file or a byte-order mark into a silently
-                    # skipped call site.
-                    written = hit.written_name or hit.snippet
-                    needs_edit = written.rsplit(".", 1)[
-                        -1
-                    ] == response.selected.symbol or hit.kind in {
-                        "import",
-                        "export",
-                    }
-                    if needs_edit:
-                        source, bom = self._file_bytes(root, hit.path, sources)
-                        edit_start, edit_end = self._edit_span(
-                            source,
-                            hit.start_byte - bom,
-                            hit.end_byte - bom,
-                            response.selected.symbol,
-                            bom,
-                        )
-                        bucket_must.append(
-                            finding.model_copy(
-                                update={
-                                    "edit_required": True,
-                                    "edit_start_byte": edit_start,
-                                    "edit_end_byte": edit_end,
-                                }
-                            )
-                        )
-                    else:
-                        bucket_evidence.append(finding)
-                    continue
-                issue = self._signature_issue(
-                    response.selected,
-                    shapes_by_id.get(hit.reference_id),
-                    old_shapes,
-                    operation,
-                )
-                if issue in {"spread_uncertainty", "overload_ambiguity"}:
-                    bucket_review.append(
-                        finding.model_copy(
-                            update={
-                                "reason_code": issue,
-                                "explanation": self._issue_explanation(issue),
-                            }
-                        )
-                    )
-                elif issue is not None:
-                    bucket_must.append(
-                        finding.model_copy(
-                            update={
-                                "edit_required": True,
-                                "reason_code": issue,
-                                "explanation": self._issue_explanation(issue),
-                            }
-                        )
-                    )
-                else:
-                    bucket_evidence.append(finding)
-            return bucket_must, bucket_likely, bucket_review, bucket_evidence
-
-        full_must, full_likely, full_review, full_evidence = _classify_hits(full_hits)
-
-        def _dedupe_edit_spans(
-            findings: list[RefactorFinding],
-            seen: set[tuple[str, int, int]],
-        ) -> list[RefactorFinding]:
-            deduped: list[RefactorFinding] = []
-            for finding in findings:
-                if finding.edit_start_byte is None or finding.edit_end_byte is None:
-                    deduped.append(finding)
-                    continue
-                key = (finding.path, finding.edit_start_byte, finding.edit_end_byte)
-                if key in seen:
-                    continue
-                seen.add(key)
-                deduped.append(finding)
-            return deduped
+        shapes_by_id = {row["reference_id"]: row for row in records}
+        classified = self._classify_refactor_hits(
+            response.selected,
+            operation,
+            query.hits,
+            shapes_by_id,
+            old_shapes,
+            root,
+            sources,
+        )
+        full_must = classified.must_change
+        full_likely = classified.likely_change
+        full_review = classified.review
+        full_evidence = classified.evidence
 
         required_edit_spans: set[tuple[str, int, int]] = set()
         full_must = _dedupe_edit_spans(full_must, required_edit_spans)
 
-        # R3: the synthetic declaration finding and a hit-derived must_change
-        # entry (typically an `export` row) can share the exact same edit
-        # span — e.g. `export function answer() {}` narrows both the
-        # declaration's and the export's edit span to the same `answer`
-        # token. Suppress the synthetic duplicate, but never treat two
-        # `(None, None)` spans (an edit location the resolver could not
-        # locate uniquely) as the same edit.
+        # A declaration and export row may point at the same identifier. Keep one
+        # concrete edit, but never merge findings whose edit location is unknown.
         if (
             declaration_finding is not None
             and declaration_finding.edit_start_byte is not None
@@ -696,30 +531,6 @@ class ReferenceService:
             likely_change = [*override_findings, *likely_change]
 
         limitations = response.limitations
-        coverage_gaps = [item for item in limitations if item.code in _COVERAGE_GAP_CODES]
-        # `cursor` (below) is the sole pagination signal: more pages remain
-        # iff it is non-null. `completeness.state` reflects only genuine
-        # coverage/proof gaps in the full result set, computed the same way
-        # on every page, so a mid-stream page is never mislabeled
-        # "incomplete" and a last page is never falsely labeled "complete"
-        # while earlier pages held unproven candidates (R4).
-        if coverage_gaps:
-            state = "incomplete"
-            explanation = (
-                "Some files could not be analyzed, so this list may omit real uses. "
-                "See limitations."
-            )
-        elif limitations or full_review or full_likely or override_findings:
-            # "likely" is unproven by definition, so a result carrying any is
-            # not the same as one the resolver could fully account for.
-            state = "complete_with_dynamic_limitations"
-            explanation = (
-                "Every indexed file was analyzed, but some uses could not be proven "
-                "without type information. See likely_change and review."
-            )
-        else:
-            state = "complete"
-            explanation = "All indexed structural candidates were considered."
         counts = RefactorCounts(
             must_change=len(full_must) + (1 if declaration_finding is not None else 0),
             likely_change=len(full_likely) + len(override_findings),
@@ -736,12 +547,181 @@ class ReferenceService:
             limitations=limitations,
             counts=counts,
             cursor=response.cursor,
-            completeness=CompletenessReport(
-                state=cast(
-                    Literal["complete", "complete_with_dynamic_limitations", "incomplete"], state
-                ),
-                explanation=explanation,
+            completeness=self._completeness_report(
+                limitations,
+                full_review,
+                full_likely,
+                override_findings,
             ),
+        )
+
+    @staticmethod
+    def _validate_rename(selected: SelectedDeclaration, operation: RenameOperation) -> None:
+        valid_identifier = (
+            operation.new_name.isidentifier() and not keyword_module.iskeyword(operation.new_name)
+            if selected.language == "python"
+            else bool(re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", operation.new_name))
+        )
+        if not valid_identifier:
+            raise CodeIndexingError(ErrorCode.INVALID_REFACTOR, "Invalid identifier for rename")
+
+    def _rename_findings(
+        self,
+        selected: SelectedDeclaration,
+        records: list[ReferenceRecord],
+        root: Path | None,
+        sources: dict[str, tuple[bytes, int]],
+        snapshot_version: int,
+    ) -> tuple[RefactorFinding, list[RefactorFinding]]:
+        declarations = self.store.declaration_shapes(
+            selected.project_id,
+            selected.qualified_symbol,
+            version=snapshot_version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+        )
+        declaration = next(
+            (row for row in declarations if row["file_id"] == selected.file_id),
+            None,
+        )
+        start_byte, end_byte = 0, 0
+        edit_start, edit_end = None, None
+        if declaration is not None:
+            source, bom = self._file_bytes(root, selected.path, sources)
+            start_byte = (declaration["start_byte"] or 0) + bom
+            end_byte = (declaration["end_byte"] or 0) + bom
+            edit_start, edit_end = self._edit_span(
+                source,
+                declaration["start_byte"] or 0,
+                declaration["end_byte"] or 0,
+                selected.symbol,
+                bom,
+            )
+        finding = RefactorFinding(
+            reference_id=f"declaration:{selected.file_id}",
+            project_id=selected.project_id,
+            path=selected.path,
+            language=selected.language,
+            kind="write",
+            start_line=selected.start_line,
+            end_line=selected.end_line,
+            start_byte=start_byte,
+            end_byte=end_byte,
+            snippet=selected.symbol,
+            resolution="exact",
+            reason_code="declaration",
+            explanation="The selected declaration must be renamed.",
+            written_name=selected.symbol,
+            edit_required=True,
+            edit_start_byte=edit_start,
+            edit_end_byte=edit_end,
+        )
+        overrides = self._override_findings(selected, records, root, sources, snapshot_version)
+        return finding, overrides
+
+    def _classify_refactor_hits(
+        self,
+        selected: SelectedDeclaration,
+        operation: RefactorOperation,
+        hits: list[ReferenceHit],
+        shapes_by_id: dict[str, ReferenceRecord],
+        old_shapes: list[ReferenceRecord],
+        root: Path | None,
+        sources: dict[str, tuple[bytes, int]],
+    ) -> _ClassifiedFindings:
+        must_change: list[RefactorFinding] = []
+        likely_change: list[RefactorFinding] = []
+        review: list[RefactorFinding] = []
+        evidence: list[RefactorFinding] = []
+        for hit in hits:
+            finding = RefactorFinding(**hit.model_dump(), edit_required=False)
+            if hit.resolution == "unresolved":
+                review.append(finding)
+                continue
+            if hit.resolution == "likely":
+                likely_change.append(finding.model_copy(update={"edit_required": True}))
+                continue
+            if isinstance(operation, RenameOperation):
+                written = hit.written_name or hit.snippet
+                needs_edit = written.rsplit(".", 1)[-1] == selected.symbol or hit.kind in {
+                    "import",
+                    "export",
+                }
+                if not needs_edit:
+                    evidence.append(finding)
+                    continue
+                source, bom = self._file_bytes(root, hit.path, sources)
+                edit_start, edit_end = self._edit_span(
+                    source,
+                    hit.start_byte - bom,
+                    hit.end_byte - bom,
+                    selected.symbol,
+                    bom,
+                )
+                must_change.append(
+                    finding.model_copy(
+                        update={
+                            "edit_required": True,
+                            "edit_start_byte": edit_start,
+                            "edit_end_byte": edit_end,
+                        }
+                    )
+                )
+                continue
+            issue = self._signature_issue(
+                selected,
+                shapes_by_id.get(hit.reference_id),
+                old_shapes,
+                operation,
+            )
+            if issue in {"spread_uncertainty", "overload_ambiguity"}:
+                review.append(
+                    finding.model_copy(
+                        update={
+                            "reason_code": issue,
+                            "explanation": self._issue_explanation(issue),
+                        }
+                    )
+                )
+            elif issue is not None:
+                must_change.append(
+                    finding.model_copy(
+                        update={
+                            "edit_required": True,
+                            "reason_code": issue,
+                            "explanation": self._issue_explanation(issue),
+                        }
+                    )
+                )
+            else:
+                evidence.append(finding)
+        return _ClassifiedFindings(must_change, likely_change, review, evidence)
+
+    @staticmethod
+    def _completeness_report(
+        limitations: list[ReferenceLimitation],
+        review: list[RefactorFinding],
+        likely_change: list[RefactorFinding],
+        override_findings: list[RefactorFinding],
+    ) -> CompletenessReport:
+        if any(item.code in _COVERAGE_GAP_CODES for item in limitations):
+            return CompletenessReport(
+                state="incomplete",
+                explanation=(
+                    "Some files could not be analyzed, so this list may omit real uses. "
+                    "See limitations."
+                ),
+            )
+        if limitations or review or likely_change or override_findings:
+            return CompletenessReport(
+                state="complete_with_dynamic_limitations",
+                explanation=(
+                    "Every indexed file was analyzed, but some uses could not be proven "
+                    "without type information. See likely_change and review."
+                ),
+            )
+        return CompletenessReport(
+            state="complete",
+            explanation="All indexed structural candidates were considered.",
         )
 
     def _signature_issue(
@@ -751,15 +731,8 @@ class ReferenceService:
         old_shapes: list[ReferenceRecord],
         operation: SignatureChangeOperation,
     ) -> str | None:
-        # Both the call shape and the declaration shapes come from the caller's
-        # pinned snapshot. Re-querying the live table per hit rescanned the
-        # whole reference table once per call site, and a refresh mid-analysis
-        # could report an incompatible call as compatible. `old_shapes` is
-        # fetched once by the caller (S4/E3: `declaration_shapes`, itself
-        # bound to that same pinned `version`), not re-fetched here, and not
-        # re-fetched per hit -- a single query for the one qualified symbol
-        # every hit in this analysis shares, exactly as safe against both
-        # failure modes as the in-memory grouping it replaced.
+        # Call and declaration shapes come from one pinned snapshot. The caller
+        # fetches `old_shapes` once and reuses them for every hit.
         if row is None or row["shape_json"] is None:
             return None
         shape = json.loads(row["shape_json"])

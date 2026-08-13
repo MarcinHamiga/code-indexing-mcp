@@ -669,29 +669,10 @@ class LanceStore:
     ) -> list[ReferenceRecord]:
         """Return structural rows from the requested immutable table version.
 
-        `schema_version`, when given, pushes the equality filter into the SQL
-        `WHERE` clause (S4) instead of materializing every historical
-        generation's rows into Python only to discard them there. A partial
-        reindex can leave rows behind under a since-bumped
-        `REFERENCE_SCHEMA_VERSION`, and a real query answer must never include
-        them -- see `reference_service.py`'s caller. Omit it to get every row
-        exactly as before, unfiltered: existing callers (recovery tooling,
-        tests inspecting a partition's raw contents) still rely on that.
-
-        `record_kinds`, when given, pushes a `record_kind IN (...)` predicate
-        into the same `WHERE` clause. `reference_service.py`'s classification
-        pass needs every `reference`/`coverage` row project-wide (S4's E3
-        backlog established that narrowing the reference-row scan itself
-        would need an import-graph precomputation the storage layer cannot
-        safely approximate -- see the module-level note above
-        `declaration_shapes`), but the `declaration` rows it also used to
-        pull in here are fetched separately, narrowed to the files and
-        symbols that actually matter (`declarations_for_files`,
-        `target_name_candidates`, `declaration_shapes`). Passing
-        `record_kinds=("reference", "coverage")` is how a query-time caller
-        opts out of paying for the declaration table it no longer needs from
-        this call. Omit it (as every non-query caller still does) to get
-        every kind, exactly as before.
+        Optional schema and record-kind filters are pushed into the table query.
+        Omitting them deliberately returns every row for recovery and raw-storage
+        callers. Reference classification requests reference and coverage rows;
+        declarations are fetched separately through narrower methods below.
         """
         self._validate_schema_version(schema_version)
         conditions: list[str] = []
@@ -727,8 +708,8 @@ class LanceStore:
         partition indexed before this feature existed, or one whose
         `ensure_reference_index` was skipped. `_reference_rows` and
         `reference_version` collapse both cases to `[]`/`0`, so callers
-        that need the distinction (S5) must ask this directly rather than
-        trust an empty result.
+        that need the distinction must ask this directly rather than trust an
+        empty result.
         """
         tables = self._existing_tables(project_id)
         return tables is not None and tables.references is not None
@@ -743,41 +724,10 @@ class LanceStore:
             f"AND file_id = {_quoted(file_id)} AND schema_version = {schema_version}",
         )
 
-    # S4/E3: `declaration_shapes`, `target_name_candidates`, and
-    # `declarations_for_files` below are the *declaration*-side pushdowns
-    # `reference_service.py` uses to avoid pulling the whole declaration
-    # table into every `find_references`/`analyze_refactor` page --
-    # `declaration_shapes` for an exact `source_qualified_symbol` lookup
-    # (never ambiguous: a declaration's own qualified name is not subject to
-    # aliasing), `target_name_candidates` for `_classify`'s
-    # single-target-name ambiguity check, `declarations_for_files` for
-    # `_lexical_declaration`/class-scope resolution narrowed to the files
-    # that actually hold a candidate reference.
-    #
-    # There is deliberately no equivalent *reference*-side pushdown (an
-    # `imports_for`-shaped "give me the reference rows that could resolve to
-    # this declaration" call). `_may_refer`'s alias branch means a reference
-    # row's own `target_name`/`written_name` can be an arbitrary local
-    # spelling -- `from lib import answer as ans` records the call site's
-    # `target_name` as `"ans"`, not `"answer"` -- so a single-column
-    # `target_name = X` predicate provably misses real hits (confirmed by
-    # constructing exactly this case). A conservative multi-name superset
-    # *can* be computed, since an import/export row's own `target_name`
-    # tracks the name at the *source* of that hop, not the local alias --
-    # but only when no intermediate re-export renames it. A barrel that
-    # does (`pkg/__init__.py: from impl import answer as ans_alias`, then
-    # `from pkg import ans_alias as x2`) changes the next hop's `target_name`
-    # to `"ans_alias"`, which cannot be predicted before that first hop's own
-    # row has already been read -- confirmed by constructing a two-hop
-    # renaming barrel and inspecting the extracted rows. Computing the
-    # candidate set is therefore an iterative, depth-bounded graph walk (like
-    # `_reexport_targets_symbol`, just run forward) requiring several rounds
-    # of querying, not a single predicate over this table -- a materially
-    # different, higher-risk piece of work than the declaration-side
-    # pushdowns below, and out of scope here. Do not re-add an
-    # `imports_for`-shaped helper to "fix" this without that graph walk; it
-    # would either miss hits (single predicate) or require the same
-    # multi-round approach this note describes.
+    # Declarations can be narrowed by exact symbol, target name, or candidate
+    # file. References cannot be narrowed the same way: aliases and renamed
+    # re-exports give downstream rows arbitrary local target names, so finding a
+    # conservative subset requires an iterative module-graph walk.
     def declaration_shapes(
         self,
         project_id: str,
@@ -819,7 +769,7 @@ class LanceStore:
         schema_version: int | None = None,
         version: int | None = None,
     ) -> list[ReferenceRecord]:
-        """Declaration rows for exactly the given files (S4 pushdown).
+        """Return declaration rows for exactly the given files.
 
         `_lexical_declaration`/class-scope resolution only ever compares a
         declaration against a reference row in the *same* file, so callers

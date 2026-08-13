@@ -1141,6 +1141,19 @@ class Application:
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         return self.search.get_chunk(chunk_id)
 
+    def _prepare_reference_query(
+        self,
+        selector: DeclarationSelector,
+        roots: list[Path] | None,
+    ) -> tuple[DeclarationSelector, ReferenceBackfillReport]:
+        if selector.project is not None:
+            resolved = self._resolve(selector.project, roots)
+            selector = selector.model_copy(update={"project": resolved.id})
+            project_id = resolved.id
+        else:
+            project_id = self.search.get_chunk(selector.chunk_id or "").project_id
+        return selector, self.ensure_reference_index(project_id, roots=roots)
+
     def find_references(
         self,
         selector: DeclarationSelector,
@@ -1150,13 +1163,7 @@ class Application:
         cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> ReferenceResponse:
-        if selector.project is not None:
-            resolved = self._resolve(selector.project, roots)
-            selector = selector.model_copy(update={"project": resolved.id})
-            project_id = resolved.id
-        else:
-            project_id = self.search.get_chunk(selector.chunk_id or "").project_id
-        report = self.ensure_reference_index(project_id, roots=roots)
+        selector, report = self._prepare_reference_query(selector, roots)
         return self.references.find_references(
             selector, kinds=kinds, limit=limit, cursor=cursor, backfill=report
         )
@@ -1170,13 +1177,7 @@ class Application:
         cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> RefactorAnalysis:
-        if selector.project is not None:
-            resolved = self._resolve(selector.project, roots)
-            selector = selector.model_copy(update={"project": resolved.id})
-            project_id = resolved.id
-        else:
-            project_id = self.search.get_chunk(selector.chunk_id or "").project_id
-        report = self.ensure_reference_index(project_id, roots=roots)
+        selector, report = self._prepare_reference_query(selector, roots)
         return self.references.analyze_refactor(
             selector, operation, limit=limit, cursor=cursor, backfill=report
         )
