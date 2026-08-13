@@ -218,6 +218,37 @@ class ScanResult(FrozenModel):
     skipped: list[SkippedFile]
 
 
+# The skip reasons the scanner itself can attach to a file. Content-level
+# rejections (binary, encoding, parse, embedding) belong to the indexer and
+# never appear in a scan inspection.
+SCAN_SKIP_REASONS = frozenset({"unsupported", "ignored", "symlink", "oversized", "unreadable"})
+
+
+class ScanInspectionItem(FrozenModel):
+    """One repository-relative scan outcome, without source contents."""
+
+    path: SerializablePath
+    outcome: Literal["eligible", "skipped"]
+    language: str | None = None
+    reason: str | None = None
+    detail: str | None = None
+    size: int | None = None
+    mtime_ns: int | None = None
+
+
+class ScanInspectionPage(FrozenModel):
+    """One page of a dry-run scan inspection.
+
+    The page is a stat-only view of what an index run would do: it never
+    embeds, mutates the index, or persists a complete manifest.
+    """
+
+    schema_version: int = 1
+    project: ProjectInfo | None = None
+    items: list[ScanInspectionItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
 class ExtractedChunk(FrozenModel):
     kind: str
     symbol: str | None = None

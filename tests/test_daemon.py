@@ -741,3 +741,35 @@ def test_a_stale_daemon_is_reported_running_and_retired(tmp_path: Path) -> None:
     thread.join(timeout=2)
     assert not thread.is_alive()
     assert daemon.daemon_status(paths)["running"] is False
+
+
+@requires_local_sockets
+def test_broker_forwards_scan_inspection(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    (root / "notes.md").write_text("not source\n")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=root)
+    project = application.init_project(root)
+    application.index_project(project.id)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=root)
+
+    try:
+        first = broker.inspect_scan(project.id, limit=1)
+        second = broker.inspect_scan(project.id, limit=1, cursor=first.next_cursor)
+        eligible = broker.inspect_scan(project.id, outcome="eligible")
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+    assert first.project is not None and first.project.id == project.id
+    assert len(first.items) == 1
+    assert first.next_cursor is not None
+    assert len(second.items) == 1
+    assert second.items[0].path != first.items[0].path
+    assert {item.path.as_posix() for item in eligible.items} == {"main.py"}

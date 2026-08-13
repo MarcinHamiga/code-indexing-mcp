@@ -36,6 +36,7 @@ from .extractor import TreeSitterExtractor
 from .history import HistoryStore
 from .indexing import Indexer
 from .models import (
+    SCAN_SKIP_REASONS,
     CodeChunk,
     DeclarationSelector,
     HistoryPage,
@@ -54,8 +55,11 @@ from .models import (
     ReferenceResponse,
     RemovalReport,
     ScanConfig,
+    ScanInspectionItem,
+    ScanInspectionPage,
     ScannedFile,
     SearchResponse,
+    SkippedFile,
     StorageStatus,
     StoredFile,
     SymbolResponse,
@@ -91,6 +95,14 @@ RECOVERY_LOCK_TIMEOUT_SECONDS = 5.0
 # Automatic maintenance repeats its overdue check at most this often. The check
 # itself is gated by the persisted last-successful-maintenance timestamp.
 MAINTENANCE_CHECK_INTERVAL = timedelta(hours=24)
+
+# Negative freshness answers are cached briefly so a burst of tool calls in one
+# agent interaction does not walk the same clean repository once per call. The
+# window is short enough that an external edit surfaces on the next check, and
+# watcher events, indexing, and registration invalidate it immediately.
+FRESHNESS_CACHE_SECONDS = 5.0
+
+SCAN_INSPECTION_MAX_LIMIT = 200
 
 MAINTENANCE_TIMESTAMP_FILE = "maintenance.json"
 MAINTENANCE_LOCK_FILE = "maintenance-schedule.lock"
@@ -249,6 +261,9 @@ class Application:
         # run in a long-lived daemon would re-spawn a known-dead backend and
         # reload its model onto the device before giving up again.
         self._runtime_fallback: BackendSelection | None = None
+        # Negative freshness results, keyed by project id: the monotonic
+        # deadline and the scan-config fingerprint the answer was computed for.
+        self._clean_freshness_until: dict[str, tuple[float, str]] = {}
         self.embedding_batch_size = self.settings.embedding_batch_size
         self.batch_calibration = "explicit"
         if self.settings.embedding_batch_auto:
@@ -634,6 +649,7 @@ class Application:
         with self._root_lock(root):
             project = initialize_project(root, name=name, force_new_id=force_new_id)
             self._register_project(project)
+            self.invalidate_freshness(project.id)
         return project
 
     def discover_project(self, root: Path) -> ProjectInfo | None:
@@ -650,6 +666,7 @@ class Application:
                     return None
                 project = initialize_project(root)
             self._register_project(project)
+            self.invalidate_freshness(project.id)
             return project
 
     def index_project(
@@ -662,13 +679,19 @@ class Application:
         on_progress: Callable[[IndexProgress], None] | None = None,
         trigger: IndexTrigger = "manual",
     ) -> IndexReport:
-        return self.indexer.index(
-            self._resolve(project, roots),
-            force=force,
-            wait_for_lock=wait_for_lock,
-            on_progress=on_progress,
-            trigger=trigger,
-        )
+        resolved = self._resolve(project, roots)
+        try:
+            return self.indexer.index(
+                resolved,
+                force=force,
+                wait_for_lock=wait_for_lock,
+                on_progress=on_progress,
+                trigger=trigger,
+            )
+        finally:
+            # Whether the run changed anything or failed, a cached clean answer
+            # must not outlive the state it was computed against.
+            self.invalidate_freshness(resolved.id)
 
     def index_progress(self, project_id: str) -> IndexProgress | None:
         """Return the live progress of whichever process is indexing *project_id*."""
@@ -702,6 +725,7 @@ class Application:
             report = self.indexer.backfill_references(
                 resolved, wait_for_lock=True, trigger="reference-backfill"
             )
+        self.invalidate_freshness(resolved.id)
         return report
 
     def project_status(
@@ -710,10 +734,23 @@ class Application:
         resolved = self._resolve(project, roots)
         files = self.store.list_files(resolved.id)
         state = self.store.project_state(resolved.id)
-        if state in {"ready", "partial"} and self._project_is_stale(
-            resolved, {record.path: record for record in files}
-        ):
-            state = "stale"
+        if state in {"ready", "partial"}:
+            fingerprint = resolved.scan.model_dump_json()
+            cached = self._clean_freshness_until.get(resolved.id)
+            if cached is not None and cached[1] == fingerprint and cached[0] > time.monotonic():
+                # A recent check found this exact scan configuration clean;
+                # do not walk the repository again for this call.
+                pass
+            elif self._project_is_stale(
+                resolved, {record.path: record for record in files}
+            ):
+                self._clean_freshness_until.pop(resolved.id, None)
+                state = "stale"
+            else:
+                self._clean_freshness_until[resolved.id] = (
+                    time.monotonic() + FRESHNESS_CACHE_SECONDS,
+                    fingerprint,
+                )
         return ProjectStatus(
             project=resolved,
             state=state,
@@ -722,6 +759,15 @@ class Application:
             progress=self.index_progress(resolved.id),
             last_run=self.history.recent(resolved.id),
         )
+
+    def invalidate_freshness(self, project_id: str) -> None:
+        """Forget a cached clean answer, forcing the next status check to scan.
+
+        Called after anything that changes what the index holds -- registration,
+        a completed index or reference backfill, removal -- and by eager-mode
+        watchers the moment a file system event lands.
+        """
+        self._clean_freshness_until.pop(project_id, None)
 
     def index_history(
         self,
@@ -1087,11 +1133,96 @@ class Application:
             for path, item in current.items()
         )
 
+    def inspect_scan(
+        self,
+        project: str | None = None,
+        *,
+        roots: list[Path] | None = None,
+        outcome: str | None = None,
+        reason: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> ScanInspectionPage:
+        """Dry-run scan inspection: what an index run would find, page by page.
+
+        Read-only and stat-only: no file is read for content, nothing is
+        embedded, the index is not mutated, and no manifest is persisted. The
+        cursor is an opaque offset into the *matched* stream; a page re-scans
+        from the start, which keeps the tool stateless at the cost of walking
+        the project again for every page.
+        """
+        resolved = self._resolve(project, roots)
+        if limit < 1 or limit > SCAN_INSPECTION_MAX_LIMIT:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                f"scan limit must be between 1 and {SCAN_INSPECTION_MAX_LIMIT}",
+            )
+        if outcome not in {None, "eligible", "skipped"}:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER, "scan outcome must be 'eligible' or 'skipped'"
+            )
+        if reason is not None and reason not in SCAN_SKIP_REASONS:
+            raise CodeIndexingError(ErrorCode.INVALID_FILTER, f"unknown scan skip reason: {reason}")
+        if cursor is not None:
+            try:
+                skip = int(cursor)
+            except ValueError:
+                raise CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid scan cursor") from None
+            if skip < 0:
+                raise CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid scan cursor")
+        else:
+            skip = 0
+        items: list[ScanInspectionItem] = []
+        stream = self.indexer.scanner.iter_scan(resolved, read_contents=False)
+        try:
+            next_cursor: str | None = None
+            matched = 0
+            for item in stream:
+                if outcome == "eligible" and not isinstance(item, ScannedFile):
+                    continue
+                if outcome == "skipped" and not isinstance(item, SkippedFile):
+                    continue
+                if reason is not None and (
+                    not isinstance(item, SkippedFile) or item.reason != reason
+                ):
+                    continue
+                matched += 1
+                if matched <= skip:
+                    continue
+                if len(items) >= limit:
+                    next_cursor = str(skip + len(items))
+                    break
+                if isinstance(item, ScannedFile):
+                    items.append(
+                        ScanInspectionItem(
+                            path=item.path,
+                            outcome="eligible",
+                            language=item.language,
+                            size=item.size,
+                            mtime_ns=item.mtime_ns,
+                        )
+                    )
+                else:
+                    items.append(
+                        ScanInspectionItem(
+                            path=item.path,
+                            outcome="skipped",
+                            reason=item.reason,
+                            detail=item.detail,
+                        )
+                    )
+            return ScanInspectionPage(project=resolved, items=items, next_cursor=next_cursor)
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+
     def list_projects(self) -> list[ProjectInfo]:
         return sorted(self.store.list_projects(), key=lambda project: (project.name, project.id))
 
     def remove_project(self, project: str) -> RemovalReport:
         resolved = self._resolve(project, [])
+        self._clean_freshness_until.pop(resolved.id, None)
         return RemovalReport(
             project_id=resolved.id,
             removed=self.store.remove_project(resolved.id),

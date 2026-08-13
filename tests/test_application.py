@@ -1402,3 +1402,236 @@ def test_reference_tool_path_uses_the_lazy_query_and_backfill_triggers(
     app.ensure_reference_index(project.id)
     page = app.index_history(project.id, limit=10)
     assert [run.trigger for run in page.runs].count("reference-backfill") == 1
+
+
+def _counted_scanner_scans(app: Application, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Wrap the application scanner's iter_scan, returning a shared counter."""
+    counter: list[int] = [0]
+    original = app.indexer.scanner.iter_scan
+
+    def counted(*args, **kwargs):
+        counter[0] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(app.indexer.scanner, "iter_scan", counted)
+    return counter
+
+
+def test_project_status_caches_a_clean_freshness_answer_briefly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated status calls in one interaction must not walk a clean project
+    once per call; a brief negative cache covers them."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    scans = _counted_scanner_scans(app, monkeypatch)
+    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 60.0)
+
+    assert app.project_status(project.id).state == "ready"
+    assert app.project_status(project.id).state == "ready"
+    assert app.project_status(project.id).state == "ready"
+
+    assert scans[0] == 1
+
+
+def test_project_status_rechecks_after_the_cache_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    scans = _counted_scanner_scans(app, monkeypatch)
+    # A zero-length window means every status call re-checks the tree.
+    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 0.0)
+
+    assert app.project_status(project.id).state == "ready"
+    assert app.project_status(project.id).state == "ready"
+
+    assert scans[0] == 2
+
+
+def test_indexing_invalidates_the_cached_freshness_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    scans = _counted_scanner_scans(app, monkeypatch)
+    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 60.0)
+
+    assert app.project_status(project.id).state == "ready"
+    assert scans[0] == 1
+
+    # Whatever invalidates the entry -- an index run, a reference backfill,
+    # registration, removal -- the next status check must re-scan.
+    app.invalidate_freshness(project.id)
+    assert app.project_status(project.id).state == "ready"
+    assert scans[0] == 2
+
+
+def test_scan_config_changes_invalidate_the_cached_freshness_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    (root / "excluded.py").write_text("value = 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    scans = _counted_scanner_scans(app, monkeypatch)
+    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 60.0)
+
+    assert app.project_status(project.id).state == "ready"
+    assert scans[0] == 1
+
+    # A scan-config change makes the cached answer inapplicable; the next
+    # status must re-check the tree instead of trusting the old fingerprint.
+    # Excluding a file that the index still holds is a genuine difference, so
+    # the re-check truthfully reports the project stale.
+    changed = project.model_copy(
+        update={"scan": project.scan.model_copy(update={"exclude": ["excluded.py"]})}
+    )
+    app.store.upsert_project(changed, model_id="test/tiny", state="ready")
+
+    assert app.project_status(project.id).state == "stale"
+    assert scans[0] == 2
+
+
+def test_edits_are_detected_on_the_next_status_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative cache never outlives an edit: it expires within its brief
+    window, and the honest primitive (project_is_stale) is never cached."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def before():\n    return 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 60.0)
+
+    assert app.project_status(project.id).state == "ready"
+
+    source.write_text("def after():\n    return 2\n")
+
+    # project_is_stale is never cached: the edit is visible immediately.
+    assert app.project_is_stale(project.id) is True
+
+    # The status answer comes from the cache until it expires -- that is the
+    # accepted brief staleness of the negative cache -- and once the entry is
+    # gone the next check re-scans and reports the edit.
+    assert app.project_status(project.id).state == "ready"
+    app.invalidate_freshness(project.id)
+    assert app.project_status(project.id).state == "stale"
+
+
+def test_inspect_scan_paginates_and_filters(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / ".gitignore").write_text("ignored.py\n")
+    (root / "ignored.py").write_text("value = 0\n")
+    (root / "notes.md").write_text("not source\n")
+    for name in ("a.py", "b.py", "c.py"):
+        (root / name).write_text("def symbol():\n    return 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    # Deterministic per-directory order: unsupported files are yielded at
+    # their sorted position, eligible candidates when their batch flushes.
+    first = app.inspect_scan(project.id, limit=2)
+    assert first.project is not None and first.project.id == project.id
+    assert [item.path.as_posix() for item in first.items] == [".gitignore", "notes.md"]
+    assert first.items[0].outcome == "skipped"
+    assert first.items[0].reason == "unsupported"
+    assert first.next_cursor is not None
+
+    second = app.inspect_scan(project.id, limit=2, cursor=first.next_cursor)
+    assert [item.path.as_posix() for item in second.items] == ["a.py", "b.py"]
+    assert second.items[0].outcome == "eligible"
+    assert second.items[0].language == "python"
+    assert second.items[0].size is not None
+    assert second.next_cursor is not None
+
+    third = app.inspect_scan(project.id, limit=2, cursor=second.next_cursor)
+    assert [item.path.as_posix() for item in third.items] == ["c.py", "ignored.py"]
+    assert third.items[1].reason == "ignored"
+    assert third.next_cursor is None
+
+    eligible = app.inspect_scan(project.id, outcome="eligible")
+    assert [item.path.as_posix() for item in eligible.items] == ["a.py", "b.py", "c.py"]
+
+    skipped = app.inspect_scan(project.id, outcome="skipped")
+    assert {item.path.as_posix() for item in skipped.items} == {
+        ".gitignore",
+        "ignored.py",
+        "notes.md",
+    }
+
+    ignored_only = app.inspect_scan(project.id, reason="ignored")
+    assert [item.path.as_posix() for item in ignored_only.items] == ["ignored.py"]
+
+
+def test_inspect_scan_rejects_unknown_filters_and_cursors(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    with pytest.raises(CodeIndexingError) as outcome_error:
+        app.inspect_scan(project.id, outcome="maybe")
+    assert outcome_error.value.code is ErrorCode.INVALID_FILTER
+
+    with pytest.raises(CodeIndexingError) as reason_error:
+        app.inspect_scan(project.id, reason="exploded")
+    assert reason_error.value.code is ErrorCode.INVALID_FILTER
+
+    with pytest.raises(CodeIndexingError) as cursor_error:
+        app.inspect_scan(project.id, cursor="not-a-number")
+    assert cursor_error.value.code is ErrorCode.INVALID_CURSOR
+
+    with pytest.raises(CodeIndexingError) as limit_error:
+        app.inspect_scan(project.id, limit=0)
+    assert limit_error.value.code is ErrorCode.INVALID_FILTER
