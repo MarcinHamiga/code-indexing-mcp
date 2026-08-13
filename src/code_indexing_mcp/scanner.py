@@ -20,8 +20,9 @@ Two enumeration strategies share one classification pipeline:
 from __future__ import annotations
 
 import os
-import select
+import queue
 import subprocess
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import suppress
@@ -97,6 +98,10 @@ GIT_IGNORE_DISCOVERY_BATCH_SIZE = 256
 GIT_CHECK_IGNORE_TIMEOUT_SECONDS = 10
 GIT_LS_FILES_TIMEOUT_SECONDS = 10
 SCAN_STREAM_READ_SIZE = 65536
+# Bound the reader thread's staging queue: at most this many chunk reads sit
+# ahead of the consumer, so candidate memory stays proportional to a few
+# chunks plus the current batch even while the consumer is busy.
+GIT_LS_FILES_QUEUE_CHUNKS = 8
 
 
 class _GitEnumerationError(Exception):
@@ -249,9 +254,8 @@ class SourceScanner:
             relative = absolute.relative_to(root)
             if SourceScanner._in_hard_excluded_directory(relative):
                 continue
-            if (
-                LANGUAGES.get(absolute.suffix.lower()) is None
-                or not include_spec.match_file(relative.as_posix())
+            if LANGUAGES.get(absolute.suffix.lower()) is None or not include_spec.match_file(
+                relative.as_posix()
             ):
                 yield SkippedFile(path=relative, reason="unsupported")
                 continue
@@ -265,9 +269,13 @@ class SourceScanner:
         """Stream the non-Git tree in deterministic per-directory order.
 
         Nested ``.gitignore`` files are loaded as the walk reaches their
-        directory, so only the directories on the current path are ever held.
-        Candidates are pre-filtered by suffix and include pattern before any
-        stat or ignore work; batches stay bounded in memory.
+        directory; a visited directory's entry is released as soon as its
+        subtree is entered, so memory stays proportional to the traversal
+        frontier rather than the whole tree. Directories that are their own
+        repository (submodules, nested repositories) are opaque, matching what
+        ``git ls-files`` reports for the git path. Candidates are pre-filtered
+        by suffix and include pattern before any stat or ignore work; batches
+        stay bounded in memory.
         """
         inherited_specs: dict[Path, list[tuple[Path, GitIgnoreSpec]]] = {root: []}
         batch: list[tuple[Path, list[tuple[Path, GitIgnoreSpec]]]] = []
@@ -276,7 +284,9 @@ class SourceScanner:
             dirnames[:] = sorted(
                 name
                 for name in dirnames
-                if name not in HARD_EXCLUDED_DIRECTORIES and not (base / name).is_symlink()
+                if name not in HARD_EXCLUDED_DIRECTORIES
+                and not (base / name).is_symlink()
+                and not SourceScanner._is_repository_worktree(base / name)
             )
             ignore_specs = inherited_specs.get(base, [])
             if ".gitignore" in filenames:
@@ -292,9 +302,8 @@ class SourceScanner:
                 relative = absolute.relative_to(root)
                 if SourceScanner._in_hard_excluded_directory(relative):
                     continue
-                if (
-                    LANGUAGES.get(absolute.suffix.lower()) is None
-                    or not include_spec.match_file(relative.as_posix())
+                if LANGUAGES.get(absolute.suffix.lower()) is None or not include_spec.match_file(
+                    relative.as_posix()
                 ):
                     yield SkippedFile(path=relative, reason="unsupported")
                     continue
@@ -302,8 +311,22 @@ class SourceScanner:
                 if len(batch) >= GIT_IGNORE_DISCOVERY_BATCH_SIZE:
                     yield batch
                     batch = []
+            inherited_specs.pop(base, None)
         if batch:
             yield batch
+
+    @staticmethod
+    def _is_repository_worktree(path: Path) -> bool:
+        """Return whether *path* is its own repository checkout.
+
+        Git treats a directory carrying a ``.git`` entry (a submodule or a
+        nested repository) as a single opaque non-file, so the walk must not
+        descend into it: the parent repository has no claim on those files.
+        """
+        try:
+            return (path / ".git").exists()
+        except OSError:
+            return False
 
     @staticmethod
     def _in_git_worktree(root: Path) -> bool:
@@ -330,10 +353,13 @@ class SourceScanner:
     def _iter_git_batches(root: Path) -> Iterator[list[Path]]:
         """Stream ``git ls-files`` output in bounded, sorted batches.
 
-        Reads are chunked so candidate memory stays proportional to one batch,
-        and the whole enumeration has a hard deadline so a hung git process
-        cannot wedge a scan. A non-zero exit (which cannot normally happen for
-        a worktree the probe just accepted) falls back to the walk.
+        A daemon reader thread drains stdout into a staging queue so the hard
+        deadline is enforceable on every platform: ``select`` cannot wait on a
+        pipe on Windows, so a blocking read with a select-driven timeout would
+        make every Windows scan fall back to the streaming walk. Reads are
+        chunked so candidate memory stays proportional to one batch, and a hung
+        git process cannot wedge a scan. A non-zero exit (which cannot normally
+        happen for a worktree the probe just accepted) falls back to the walk.
         """
         try:
             process = subprocess.Popen(
@@ -352,7 +378,25 @@ class SourceScanner:
             )
         except OSError as exc:
             raise _GitEnumerationError(str(exc)) from exc
-        assert process.stdout is not None
+        stdout = process.stdout
+        assert stdout is not None
+        chunks: queue.Queue[bytes | None | OSError] = queue.Queue(maxsize=GIT_LS_FILES_QUEUE_CHUNKS)
+
+        def _drain() -> None:
+            try:
+                while True:
+                    chunk = stdout.read(SCAN_STREAM_READ_SIZE)
+                    if not chunk:
+                        chunks.put(None)
+                        return
+                    chunks.put(chunk)
+            except OSError as exc:
+                chunks.put(exc)
+            finally:
+                stdout.close()
+
+        reader = threading.Thread(target=_drain, daemon=True)
+        reader.start()
         batch: list[Path] = []
         buffer = bytearray()
         start = 0
@@ -362,11 +406,13 @@ class SourceScanner:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise _GitEnumerationError("git ls-files timed out")
-                readable, _, _ = select.select([process.stdout], [], [], remaining)
-                if not readable:
+                try:
+                    chunk = chunks.get(timeout=remaining)
+                except queue.Empty:
                     continue
-                chunk = process.stdout.read(SCAN_STREAM_READ_SIZE)
-                if not chunk:
+                if isinstance(chunk, OSError):
+                    raise _GitEnumerationError(str(chunk)) from chunk
+                if chunk is None:
                     break
                 buffer.extend(chunk)
                 while True:
@@ -391,10 +437,16 @@ class SourceScanner:
             raise _GitEnumerationError(str(exc)) from exc
         finally:
             # A consumer that stops early or an exception path must not leave
-            # the process running; an already-exited process makes kill a no-op.
+            # the process or its reader thread running; an already-exited
+            # process makes kill a no-op.
             with suppress(ProcessLookupError):
                 process.kill()
-            process.stdout.close()
+            # Drain the staging queue so a reader blocked on a full queue can
+            # reach EOF once the process is dead instead of waiting forever.
+            with suppress(queue.Empty):
+                while True:
+                    chunks.get_nowait()
+            reader.join(timeout=GIT_LS_FILES_TIMEOUT_SECONDS)
             process.wait()
         if batch:
             batch.sort()
@@ -428,7 +480,13 @@ class SourceScanner:
                 absolute,
                 include_spec=include_spec,
                 config_excludes=config_excludes,
-                ignore_specs=ignore_specs,
+                # On the worktree fallback, ``git check-ignore`` is the
+                # authoritative ignore source (it applies ``.gitignore``,
+                # ``info/exclude``, and global excludes) and knows the index:
+                # the in-process ``.gitignore`` specs must not second-guess it,
+                # or a tracked-but-ignored file would be dropped as "ignored"
+                # instead of staying eligible (the index wins).
+                ignore_specs=[] if run_check_ignore else ignore_specs,
                 standard_ignored=relative in ignored_paths,
             )
             if language is None:
@@ -510,10 +568,13 @@ class SourceScanner:
     def _git_ignored_paths(root: Path, candidates: list[Path]) -> set[Path]:
         """Return paths ignored by Git's complete standard exclude stack.
 
-        ``git check-ignore`` applies nested ``.gitignore`` files, the repository's
-        ``info/exclude``, and the user's configured global excludes in one batch.
-        Non-Git projects and environments without Git keep using the in-process
-        ``.gitignore`` fallback loaded by :meth:`_load_ignore_specs`.
+        ``git check-ignore`` applies nested ``.gitignore`` files, the
+        repository's ``info/exclude``, and the user's configured global
+        excludes in one batch. The index is consulted (no ``--no-index``), so a
+        tracked-but-ignored file is never reported, matching ``git ls-files``
+        semantics where the index wins. Non-Git projects and environments
+        without Git keep using the in-process ``.gitignore`` fallback loaded by
+        :meth:`_load_ignore_specs`.
         """
         relative = [path.relative_to(root) for path in candidates]
         if not relative:
@@ -521,7 +582,7 @@ class SourceScanner:
         payload = b"\0".join(os.fsencode(path.as_posix()) for path in relative) + b"\0"
         try:
             result = subprocess.run(
-                ["git", "-C", str(root), "check-ignore", "--no-index", "--stdin", "-z"],
+                ["git", "-C", str(root), "check-ignore", "--stdin", "-z"],
                 input=payload,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,

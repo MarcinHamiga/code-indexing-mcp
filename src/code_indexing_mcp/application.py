@@ -741,9 +741,7 @@ class Application:
                 # A recent check found this exact scan configuration clean;
                 # do not walk the repository again for this call.
                 pass
-            elif self._project_is_stale(
-                resolved, {record.path: record for record in files}
-            ):
+            elif self._project_is_stale(resolved, {record.path: record for record in files}):
                 self._clean_freshness_until.pop(resolved.id, None)
                 state = "stale"
             else:

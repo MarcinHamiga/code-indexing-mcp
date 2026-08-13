@@ -278,10 +278,10 @@ class StartupCoordinator:
             # walk is the startup correctness pass.
             dirty.put_nowait(None)
             self._monitors[root] = dirty
-            self.task_group.start_soon(self._watch_root, root, dirty)
+            self.task_group.start_soon(self._watch_root, root, project_id, dirty)
             self.task_group.start_soon(self._refresh_dirty_root, root, project_id, dirty)
 
-    async def _watch_root(self, root: Path, dirty: asyncio.Queue[None]) -> None:
+    async def _watch_root(self, root: Path, project_id: str, dirty: asyncio.Queue[None]) -> None:
         retry_seconds = WATCH_RETRY_INITIAL_SECONDS
         while True:
             try:
@@ -296,8 +296,12 @@ class StartupCoordinator:
                     # Mark the root known-changed before anything is scheduled:
                     # a query arriving now must treat it as stale without paying
                     # for a freshness walk, and scheduling must not skip it via
-                    # a cached clean answer.
+                    # a cached clean answer. Drop the cached clean answer the
+                    # moment the event lands too, so even the status tool cannot
+                    # report a stale "ready" while the refresh is pending.
                     self._dirty_roots.add(root)
+                    if isinstance(self.application, Application):
+                        self.application.invalidate_freshness(project_id)
                     with suppress(asyncio.QueueFull):
                         dirty.put_nowait(None)
                 logger.warning("Filesystem monitor stopped for %s; restarting", root)

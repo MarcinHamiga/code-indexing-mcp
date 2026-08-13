@@ -215,9 +215,7 @@ def test_walk_mode_streams_per_directory_in_deterministic_order(tmp_path: Path) 
     assert [item.path.as_posix() for item in result.files] == ["a/z.py", "b/a.py"]
 
 
-def test_walk_batches_stay_bounded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_walk_batches_stay_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "repo"
     root.mkdir()
     project = initialize_project(root)
@@ -230,6 +228,55 @@ def test_walk_batches_stay_bounded(
 
     sizes = [len(batch) for batch in batches if isinstance(batch, list)]
     assert sizes == [4, 4, 2]
+
+
+def test_walk_mode_treats_nested_repositories_as_opaque(tmp_path: Path) -> None:
+    """A non-Git walk must not descend into a directory carrying a ``.git``
+    entry: a nested repository or submodule is opaque, matching what
+    ``git ls-files`` reports on the git path.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    nested = root / "nested"
+    nested.mkdir()
+    (nested / ".git").write_text("gitdir: ../.git/modules/nested\n")
+    (nested / "nested.py").write_text("def nested_symbol():\n    return 2\n")
+    (root / "main.py").write_text("def main_symbol():\n    return 3\n")
+    project = initialize_project(root)
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["main.py"]
+    assert not any("nested" in item.path.as_posix() for item in result.files)
+
+
+def test_walk_fallback_keeps_tracked_but_ignored_files_eligible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk fallback inside a worktree consults the index (no
+    ``--no-index``), so a force-added file that is both tracked and ignored
+    stays eligible exactly as on the git path: the index wins.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    (root / ".gitignore").write_text("ignored.py\n")
+    (root / "ignored.py").write_text("value = 1\n")
+    (root / "main.py").write_text("value = 2\n")
+    subprocess.run(["git", "add", "main.py"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-f", "ignored.py"], cwd=root, check=True)
+    scanner = SourceScanner()
+
+    def failing_enumeration(_: Path):
+        raise _GitEnumerationError("simulated git failure")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(scanner, "_iter_git_batches", failing_enumeration)
+
+    result = scanner.scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["ignored.py", "main.py"]
 
 
 def test_failed_git_enumeration_falls_back_to_the_streaming_walk(
