@@ -537,8 +537,9 @@ class IndexedChunk(FrozenModel):
     Read paths that only need chunk text and offsets use this so a whole project's
     768-float vectors are not decoded into Python lists for no consumer.
 
-    Mirrors the chunk row: project_id is not stored on it (the owning
-    partition knows it) and content_hash lives on the files table.
+    Mirrors the chunk row: project_id is not stored on it because the owning
+    partition knows it. content_hash stays on the row so a chunk response is
+    always one coherent generation, even while a files-table update commits.
     """
 
     chunk_id: str
@@ -556,6 +557,7 @@ class IndexedChunk(FrozenModel):
     content: str
     identifier_terms: str
     part_index: int = 0
+    content_hash: str = ""
 
 
 class StoredChunk(IndexedChunk):

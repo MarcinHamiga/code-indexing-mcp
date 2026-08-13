@@ -368,7 +368,9 @@ class Indexer:
                 global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
                 project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
             ):
-                rebuild_reason = self._prepare_rebuild(project)
+                rebuild_reason = self.store.incompatibility_reason(
+                    project.id, self.embedder.model_id
+                )
                 effective_trigger = trigger if rebuild_reason is None else "schema-rebuild"
                 with self._recorded_run(
                     project,
@@ -377,6 +379,8 @@ class Indexer:
                     force=force,
                     rebuild_reason=rebuild_reason,
                 ) as record:
+                    if rebuild_reason is not None:
+                        self._prepare_rebuild(project, rebuild_reason)
                     try:
                         report = self._index_locked(project, force=force, progress=progress)
                     finally:
@@ -442,12 +446,10 @@ class Indexer:
                 on_progress=on_progress,
                 trigger="schema-rebuild",
             )
-            files = self.store.list_files(project.id)
-            return ReferenceBackfillReport(
-                project_id=project.id,
-                files_checked=len(files),
-                files_current=len(files),
-            )
+            # A full rebuild can leave syntax-error files structurally
+            # uncovered. Continue through normal backfill accounting so the
+            # caller sees those coverage limitations instead of a false clean
+            # report.
 
         self.lock_directory.mkdir(parents=True, exist_ok=True)
         run_id = uuid.uuid4().hex
@@ -563,23 +565,18 @@ class Indexer:
             rebuild_reason=rebuild_reason,
         )
 
-    def _prepare_rebuild(self, project: ProjectInfo) -> str | None:
+    def _prepare_rebuild(self, project: ProjectInfo, reason: str) -> None:
         """Delete *project*'s partition when its generation is incompatible.
 
-        Called under the writer locks, before the run's audit row is written.
-        Returns the reason the partition was replaced, or None when the
-        stored generation still matches this build. The registry row and the
+        Called under the writer locks after the run's audit row is written.
+        The caller records the reason before calling this method. The registry row and the
         ``.ci-mcp/project.toml`` marker survive the deletion, so a rebuild
         that fails or crashes leaves a registered, re-indexable project; the
         registry row is re-stamped to the current generation because no rows
         remain for the old generation's claim to describe.
         """
-        reason = self.store.incompatibility_reason(project.id, self.embedder.model_id)
-        if reason is None:
-            return None
         self.store.delete_partition(project.id, model_id=self.embedder.model_id)
         logger.warning("Rebuilding incompatible index for %s: %s", project.id, reason)
-        return reason
 
     @staticmethod
     def _phase_durations(report: IndexReport) -> dict[str, int]:
@@ -1567,6 +1564,7 @@ class Indexer:
         identity = "\0".join(
             [
                 file.file_id,
+                file.content_hash,
                 chunk.kind,
                 chunk.qualified_symbol or "",
                 str(chunk.start_byte),
@@ -1597,4 +1595,5 @@ class Indexer:
             identifier_terms=chunk.search_suffix,
             part_index=chunk.part_index,
             vector=vector,
+            content_hash=file.content_hash,
         )

@@ -266,9 +266,7 @@ def test_indexer_batches_chunks_across_changed_files(tmp_path: Path) -> None:
     assert all(row["identifier_terms"] for row in rows)
     # The embedding text is transient (never persisted); the committed vectors
     # must still be the embedder's own output for the texts it was given.
-    embedded_first = {
-        float(len(text) % 7) for batch in embedder.passage_batches for text in batch
-    }
+    embedded_first = {float(len(text) % 7) for batch in embedder.passage_batches for text in batch}
     stored_first = {row["vector"][0] for row in rows}
     assert stored_first == embedded_first
 
@@ -363,6 +361,28 @@ def test_failed_changed_file_preserves_previous_generation(tmp_path: Path) -> No
     assert store.list_reference_records(project.id) == original_references
     # The no-op run must not clear the error it did not heal.
     assert store.list_files(project.id)[0].has_errors is True
+
+
+def test_reindexing_changed_content_retires_the_previous_chunk_id(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    previous = store.list_chunks([project.id])[0]
+
+    # Keep offsets stable so content identity is the only reason the stale id
+    # must be retired.
+    source.write_text("def answer():\n    return 43\n")
+    indexer.index(project)
+
+    current = store.list_chunks([project.id])[0]
+    assert current.chunk_id != previous.chunk_id
+    assert store.get_chunk(previous.chunk_id) is None
+    fetched = store.get_chunk(current.chunk_id)
+    assert fetched is not None and fetched.content.endswith("43")
 
 
 def test_failed_changed_file_retains_previous_references_on_extraction_failure(
@@ -1719,9 +1739,7 @@ def test_a_rebuild_records_its_reason_and_trigger_in_the_audit_history(
     history = HistoryStore(tmp_path / "history")
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     first = make_indexer_on(tmp_path, store, RecordingEmbedder())
-    second = make_indexer_on(
-        tmp_path, store, OtherModelEmbedder(), history=history
-    )
+    second = make_indexer_on(tmp_path, store, OtherModelEmbedder(), history=history)
     first.index(project)
 
     second.index(project)
@@ -1779,9 +1797,7 @@ def test_backfill_delegates_a_rebuild_for_an_incompatible_partition(
     history = HistoryStore(tmp_path / "history")
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     first = make_indexer_on(tmp_path, store, RecordingEmbedder())
-    second = make_indexer_on(
-        tmp_path, store, OtherModelEmbedder(), history=history
-    )
+    second = make_indexer_on(tmp_path, store, OtherModelEmbedder(), history=history)
     first.index(project)
 
     report = second.backfill_references(project)
@@ -1792,3 +1808,20 @@ def test_backfill_delegates_a_rebuild_for_an_incompatible_partition(
     assert store.incompatibility_reason(project.id, "test/other") is None
     page = history.list_runs(project.id)
     assert any(run.trigger == "schema-rebuild" for run in page.runs)
+
+
+def test_rebuild_backfill_reports_unparseable_files_as_incomplete(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "valid.py").write_text("def answer():\n    return 42\n")
+    (root / "broken.py").write_text("def broken(:\n    pass\n")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    first = make_indexer_on(tmp_path, store, RecordingEmbedder())
+    second = make_indexer_on(tmp_path, store, OtherModelEmbedder())
+    first.index(project)
+
+    report = second.backfill_references(project)
+
+    assert report.files_current == 1
+    assert report.incomplete_paths == ["broken.py"]

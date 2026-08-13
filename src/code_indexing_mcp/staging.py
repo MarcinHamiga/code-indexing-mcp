@@ -71,9 +71,9 @@ class ChunkRow:
 
     ``vector`` is contiguous little-endian float32 bytes exactly as the
     embedding worker returned them, so the write path never materializes a
-    list of Python floats per chunk. project_id is deliberately absent: it
-    belongs to the owning partition, and content_hash belongs to the files
-    table, so neither is stored on chunk rows.
+    list of Python floats per chunk. project_id is deliberately absent because
+    it belongs to the owning partition. content_hash stays with the chunk so
+    get_chunk never combines separately committed table generations.
     """
 
     chunk_id: str
@@ -92,6 +92,7 @@ class ChunkRow:
     identifier_terms: str
     part_index: int
     vector: bytes
+    content_hash: str = ""
 
 
 @dataclass(frozen=True)

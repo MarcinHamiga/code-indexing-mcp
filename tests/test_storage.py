@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -751,6 +752,38 @@ def test_get_chunk_resolves_the_routing_prefix_to_the_owning_partition(
     assert from_second.content_hash == "hash"
 
 
+def test_get_chunk_reads_its_own_generation_content_hash(tmp_path: Path) -> None:
+    store, project_id, chunk_id = _store_with_one_chunk(tmp_path)
+    tables = store._existing_tables(project_id)
+    assert tables is not None
+    tables.files.delete("file_id = 'file-1'")
+    tables.files.add(
+        [stored_file(project_id).model_copy(update={"content_hash": "new-hash"}).model_dump()]
+    )
+
+    chunk = store.get_chunk(chunk_id)
+
+    assert chunk is not None
+    assert chunk.content_hash == "hash"
+
+
+def test_partition_deletion_waits_for_active_reader(tmp_path: Path) -> None:
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+    finished = threading.Event()
+
+    def delete() -> None:
+        store.delete_partition(project_id, model_id="test/other")
+        finished.set()
+
+    with store.partition_access(project_id):
+        thread = threading.Thread(target=delete)
+        thread.start()
+        assert not finished.wait(timeout=0.1)
+    thread.join(timeout=5)
+
+    assert finished.is_set()
+
+
 def test_get_chunk_rejects_malformed_unknown_and_pre_migration_ids(tmp_path: Path) -> None:
     store, project_id, _ = _store_with_one_chunk(tmp_path)
 
@@ -1347,6 +1380,7 @@ def _chunk_table(project_id: str, file_id: str, count: int) -> pa.Table:
                 "end_line": index + 1,
                 "content": "pass",
                 "identifier_terms": "symbol module py",
+                "content_hash": "hash",
                 "part_index": 0,
                 "vector": [0.0, 0.0, 0.0, 1.0],
             }

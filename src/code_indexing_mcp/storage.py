@@ -12,7 +12,8 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -43,7 +44,7 @@ from .projects import existing_marker_path, same_project_root
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Symbol lookups over-fetch because the LIKE pushdown over-matches; these bound
 # how many rows are scanned before the exact filter and the caller's limit apply.
@@ -60,9 +61,8 @@ MAX_CACHED_PARTITIONS = 16
 # Columns get_chunk reads. The vector and the identifier-terms column are
 # excluded: nothing outside indexing and ranking can use them, and reading them
 # made a single-chunk fetch an order of magnitude larger than the code it
-# returned. project_id and content_hash are no longer stored on chunk rows at
-# all: project_id belongs to the partition itself and content_hash comes from
-# the files table, so both are injected by the read paths that need them.
+# returned. project_id is injected from the owning partition. content_hash
+# remains on the chunk row so a read cannot combine separate commit generations.
 CHUNK_PAYLOAD_COLUMNS = [
     "chunk_id",
     "file_id",
@@ -77,6 +77,7 @@ CHUNK_PAYLOAD_COLUMNS = [
     "start_line",
     "end_line",
     "content",
+    "content_hash",
     "part_index",
 ]
 
@@ -97,6 +98,7 @@ INDEXED_CHUNK_COLUMNS = [
     "end_line",
     "content",
     "identifier_terms",
+    "content_hash",
     "part_index",
 ]
 
@@ -331,6 +333,7 @@ class _ProjectTables:
     files: LanceTable
     chunks: LanceTable
     references: LanceTable | None
+    generation: int
 
 
 class ReferenceRecord(TypedDict):
@@ -395,19 +398,6 @@ class LanceStore:
 
     def upsert_project(self, project: ProjectInfo, *, model_id: str, state: str = "ready") -> None:
         existing = self._rows(self._projects, f"id = {_quoted(project.id)}")
-        if (
-            existing
-            and str(existing[0]["state"]) != "pending"
-            and self.incompatibility_reason(project.id, model_id) is not None
-        ):
-            # A reconstructable generation mismatch (different embedding
-            # model, vector dimension, or index schema version) marks the
-            # partition for automatic rebuild instead of raising
-            # INDEX_INCOMPATIBLE. The stored generation fields are left
-            # untouched: they describe the rows still live in the
-            # partition until the rebuild deletes and re-stamps them.
-            self.mark_rebuild_required(project.id)
-            return
         if existing:
             registered_root = Path(str(existing[0]["root"])).resolve()
             incoming_root = project.root.resolve()
@@ -422,6 +412,19 @@ class LanceStore:
                 )
             if same_root:
                 project = project.model_copy(update={"root": registered_root})
+        if (
+            existing
+            and str(existing[0]["state"]) != "pending"
+            and self.incompatibility_reason(project.id, model_id) is not None
+        ):
+            # A reconstructable generation mismatch (different embedding
+            # model, vector dimension, or index schema version) marks the
+            # partition for automatic rebuild instead of raising
+            # INDEX_INCOMPATIBLE. The stored generation fields are left
+            # untouched: they describe the rows still live in the
+            # partition until the rebuild deletes and re-stamps them.
+            self.mark_rebuild_required(project.id)
+            return
         row = {
             "id": project.id,
             "name": project.name,
@@ -500,22 +503,24 @@ class LanceStore:
         to be written by the calling run. Returns False when the project is
         not registered.
         """
-        with self._partitions_lock:
-            self._partitions.pop(project_id, None)
-        partition = self.directory / "projects" / project_id
-        if partition.exists():
-            shutil.rmtree(partition)
-        rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
-        if not rows:
-            return False
-        row = dict(rows[0])
-        row["model_id"] = model_id
-        row["vector_dimension"] = self.vector_dimension
-        row["schema_version"] = SCHEMA_VERSION
-        row["state"] = "indexing"
-        row["updated_at"] = time.time_ns()
-        self._merge(self._projects, "id", [row])
-        return True
+        with self.partition_access(project_id):
+            self._advance_partition_generation(project_id)
+            with self._partitions_lock:
+                self._partitions.pop(project_id, None)
+            partition = self.directory / "projects" / project_id
+            if partition.exists():
+                shutil.rmtree(partition)
+            rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
+            if not rows:
+                return False
+            row = dict(rows[0])
+            row["model_id"] = model_id
+            row["vector_dimension"] = self.vector_dimension
+            row["schema_version"] = SCHEMA_VERSION
+            row["state"] = "indexing"
+            row["updated_at"] = time.time_ns()
+            self._merge(self._projects, "id", [row])
+            return True
 
     def list_projects(self) -> list[ProjectInfo]:
         return [
@@ -559,6 +564,18 @@ class LanceStore:
     def replace_file(self, record: StoredFile, chunks: list[StoredChunk]) -> None:
         tables = self._tables(record.project_id)
         condition = f"file_id = {_quoted(record.file_id)}"
+        chunks = [
+            chunk
+            if chunk.content_hash
+            else chunk.model_copy(update={"content_hash": record.content_hash})
+            for chunk in chunks
+        ]
+        chunks = [
+            chunk
+            if chunk.content_hash
+            else chunk.model_copy(update={"content_hash": record.content_hash})
+            for chunk in chunks
+        ]
         if chunks:
             (
                 tables.chunks.merge_insert("chunk_id")
@@ -896,7 +913,6 @@ class LanceStore:
             return None
         row = dict(rows[0])
         row["project_id"] = project_id
-        row["content_hash"] = self._chunk_content_hash(tables, str(row["file_id"]))
         return CodeChunk.model_validate(row)
 
     @staticmethod
@@ -922,18 +938,6 @@ class LanceStore:
         if (self.directory / "projects" / prefix).is_dir():
             return prefix
         return None
-
-    @staticmethod
-    def _chunk_content_hash(tables: _ProjectTables, file_id: str) -> str:
-        """The files row's content hash for *file_id*, or '' when none exists."""
-        rows = cast(
-            list[dict[str, Any]],
-            tables.files.search()
-            .where(f"file_id = {_quoted(file_id)}")
-            .select(["content_hash"])
-            .to_list(),
-        )
-        return str(rows[0]["content_hash"]) if rows else ""
 
     def count_chunks(self, project_ids: Iterable[str] | None = None) -> int:
         ids = list(project_ids or [project.id for project in self.list_projects()])
@@ -1220,6 +1224,7 @@ class LanceStore:
                 # symbol, path, and qualified-name queries match without
                 # storing a second full copy of the source text.
                 ("identifier_terms", pa.string()),
+                ("content_hash", pa.string()),
                 ("part_index", pa.int32()),
                 (
                     "vector",
@@ -1264,6 +1269,22 @@ class LanceStore:
                 self._partitions.move_to_end(project_id)
             return cached
 
+    @contextmanager
+    def partition_access(self, project_id: str) -> Iterator[None]:
+        """Prevent a destructive rebuild from invalidating an active query."""
+        directory = self.directory.parent / "locks"
+        directory.mkdir(parents=True, exist_ok=True)
+        with FileLock(directory / f"partition-{project_id}.lock"):
+            yield
+
+    @contextmanager
+    def partitions_access(self, project_ids: Iterable[str]) -> Iterator[None]:
+        """Hold partition locks in a stable order for a multi-project query."""
+        with ExitStack() as stack:
+            for project_id in sorted(set(project_ids)):
+                stack.enter_context(self.partition_access(project_id))
+            yield
+
     def _remember(self, project_id: str, tables: _ProjectTables) -> _ProjectTables:
         """Cache *tables*, evicting the least recently used partition past the bound.
 
@@ -1287,7 +1308,11 @@ class LanceStore:
     def _tables(self, project_id: str) -> _ProjectTables:
         """Open *project_id*'s partition, creating it. For write paths only."""
         cached = self._cached(project_id)
-        if cached is not None and cached.references is not None:
+        if (
+            cached is not None
+            and cached.references is not None
+            and cached.generation == self._partition_generation(project_id)
+        ):
             return cached
         database = lancedb.connect(
             self.directory / "projects" / project_id,
@@ -1301,6 +1326,7 @@ class LanceStore:
                 self._chunk_schema(self.vector_dimension),
             ),
             references=self._table(database, "references", self._reference_schema()),
+            generation=self._partition_generation(project_id),
         )
         if cached is not None:
             return self._replace_cached(project_id, tables)
@@ -1322,9 +1348,13 @@ class LanceStore:
         directory behind for each project that has never been indexed.
         """
         cached = self._cached(project_id)
-        if cached is not None:
-            return cached
         directory = self.directory / "projects" / project_id
+        generation = self._partition_generation(project_id)
+        if cached is not None:
+            if directory.is_dir() and cached.generation == generation:
+                return cached
+            with self._partitions_lock:
+                self._partitions.pop(project_id, None)
         if not directory.is_dir():
             return None
         database = lancedb.connect(directory, read_consistency_interval=timedelta(0))
@@ -1333,10 +1363,25 @@ class LanceStore:
                 files=cast(LanceTable, database.open_table("files")),
                 chunks=cast(LanceTable, database.open_table("chunks")),
                 references=self._open_optional_table(database, "references"),
+                generation=generation,
             )
         except (ValueError, FileNotFoundError):
             return None
         return self._remember(project_id, tables)
+
+    def _partition_generation(self, project_id: str) -> int:
+        path = self.directory / "partition-generations" / project_id
+        try:
+            return int(path.read_text())
+        except (OSError, ValueError):
+            return 0
+
+    def _advance_partition_generation(self, project_id: str) -> None:
+        path = self.directory / "partition-generations" / project_id
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(str(self._partition_generation(project_id) + 1))
+        os.replace(temporary, path)
 
     @staticmethod
     def _table(database: Any, name: str, schema: pa.Schema) -> LanceTable:
