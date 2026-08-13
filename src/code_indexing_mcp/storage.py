@@ -22,7 +22,7 @@ import lancedb
 import pyarrow as pa
 from filelock import FileLock
 from lancedb.index import FTS, BTree, HnswSq
-from lancedb.query import ColumnOrdering
+from lancedb.query import ColumnOrdering, FullTextOperator, MultiMatchQuery
 from lancedb.table import LanceTable
 
 from .errors import CodeIndexingError, ErrorCode
@@ -43,7 +43,7 @@ from .projects import existing_marker_path, same_project_root
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Symbol lookups over-fetch because the LIKE pushdown over-matches; these bound
 # how many rows are scanned before the exact filter and the caller's limit apply.
@@ -57,13 +57,15 @@ MINIMUM_OVERFETCH = 200
 # keeping the ceiling independent of how many they have registered.
 MAX_CACHED_PARTITIONS = 16
 
-# Columns get_chunk reads. The vector and the two derived text columns are excluded:
-# nothing outside indexing and ranking can use them, and reading them made a
-# single-chunk fetch an order of magnitude larger than the code it returned.
+# Columns get_chunk reads. The vector and the identifier-terms column are
+# excluded: nothing outside indexing and ranking can use them, and reading them
+# made a single-chunk fetch an order of magnitude larger than the code it
+# returned. project_id and content_hash are no longer stored on chunk rows at
+# all: project_id belongs to the partition itself and content_hash comes from
+# the files table, so both are injected by the read paths that need them.
 CHUNK_PAYLOAD_COLUMNS = [
     "chunk_id",
     "file_id",
-    "project_id",
     "path",
     "language",
     "kind",
@@ -75,7 +77,6 @@ CHUNK_PAYLOAD_COLUMNS = [
     "start_line",
     "end_line",
     "content",
-    "content_hash",
     "part_index",
 ]
 
@@ -84,7 +85,6 @@ CHUNK_PAYLOAD_COLUMNS = [
 INDEXED_CHUNK_COLUMNS = [
     "chunk_id",
     "file_id",
-    "project_id",
     "path",
     "language",
     "kind",
@@ -96,9 +96,7 @@ INDEXED_CHUNK_COLUMNS = [
     "start_line",
     "end_line",
     "content",
-    "embedding_text",
-    "search_text",
-    "content_hash",
+    "identifier_terms",
     "part_index",
 ]
 
@@ -115,7 +113,7 @@ def _file_ids_condition(file_ids: Iterable[str]) -> str:
 # The batched commit replaces each file's rows with one merge_insert whose
 # ``when_not_matched_by_source_delete("file_id IN (...)")`` predicate must
 # delete only the predicate's unmatched target rows, never rows of untouched
-# files. Every in-range lancedb release 0.25.0..0.34.0 filters per row, but a
+# files. Every supported lancedb release (0.34.0 and up) filters per row, but a
 # regression to the older all-or-nothing gate behavior would silently delete
 # every untouched file's rows on a multi-file project's second run, so the
 # store refuses to commit unless a cheap scratch-table probe confirms the
@@ -400,17 +398,16 @@ class LanceStore:
         if (
             existing
             and str(existing[0]["state"]) != "pending"
-            and (
-                existing[0]["model_id"] != model_id
-                or int(existing[0]["vector_dimension"]) != self.vector_dimension
-                or int(existing[0]["schema_version"]) != SCHEMA_VERSION
-            )
+            and self.incompatibility_reason(project.id, model_id) is not None
         ):
-            raise CodeIndexingError(
-                ErrorCode.INDEX_INCOMPATIBLE,
-                "Project index uses an incompatible schema or embedding model",
-                project=project.id,
-            )
+            # A reconstructable generation mismatch (different embedding
+            # model, vector dimension, or index schema version) marks the
+            # partition for automatic rebuild instead of raising
+            # INDEX_INCOMPATIBLE. The stored generation fields are left
+            # untouched: they describe the rows still live in the
+            # partition until the rebuild deletes and re-stamps them.
+            self.mark_rebuild_required(project.id)
+            return
         if existing:
             registered_root = Path(str(existing[0]["root"])).resolve()
             incoming_root = project.root.resolve()
@@ -446,6 +443,79 @@ class LanceStore:
         ):
             return
         self._merge(self._projects, "id", [row])
+
+    def incompatibility_reason(self, project_id: str, model_id: str) -> str | None:
+        """Return why *project_id*'s stored generation must be rebuilt, or None.
+
+        A stored embedding model, vector dimension, or index schema version
+        that differs from this store's current values describes rows this
+        build cannot serve coherently. Rebuilding -- deleting the partition
+        and re-indexing -- recovers it, so the mismatch is returned as a
+        reason rather than raised as the hard ``INDEX_INCOMPATIBLE`` failure
+        it used to be. A pending registration has no live rows to describe,
+        so it is never incompatible.
+        """
+        rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
+        if not rows:
+            return None
+        row = rows[0]
+        if str(row["state"]) == "pending":
+            return None
+        differences: list[str] = []
+        if str(row["model_id"]) != model_id:
+            differences.append(f"embedding model {row['model_id']!r} -> {model_id!r}")
+        if int(row["vector_dimension"]) != self.vector_dimension:
+            differences.append(
+                f"vector dimension {row['vector_dimension']} -> {self.vector_dimension}"
+            )
+        if int(row["schema_version"]) != SCHEMA_VERSION:
+            differences.append(f"index schema version {row['schema_version']} -> {SCHEMA_VERSION}")
+        return "; ".join(differences) if differences else None
+
+    def mark_rebuild_required(self, project_id: str) -> None:
+        """Stamp *project_id*'s registry state ``rebuild_required``.
+
+        Read-only callers keep working -- the state surfaces through status
+        and queries -- but nothing serves the partition again until an index
+        run rebuilds it. The stored generation fields are not touched: they
+        describe the rows still live in the partition.
+        """
+        rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
+        if not rows:
+            return
+        if str(rows[0]["state"]) == "rebuild_required":
+            return
+        row = dict(rows[0])
+        row["state"] = "rebuild_required"
+        row["updated_at"] = time.time_ns()
+        self._merge(self._projects, "id", [row])
+
+    def delete_partition(self, project_id: str, *, model_id: str) -> bool:
+        """Delete *project_id*'s partition while preserving its registration.
+
+        Evicts the cached table handles before removing the partition
+        directory. The registry row is re-stamped to the current generation
+        and ``indexing`` state: with the partition gone, no rows remain for
+        the old generation's claim to describe, and the replacement is about
+        to be written by the calling run. Returns False when the project is
+        not registered.
+        """
+        with self._partitions_lock:
+            self._partitions.pop(project_id, None)
+        partition = self.directory / "projects" / project_id
+        if partition.exists():
+            shutil.rmtree(partition)
+        rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
+        if not rows:
+            return False
+        row = dict(rows[0])
+        row["model_id"] = model_id
+        row["vector_dimension"] = self.vector_dimension
+        row["schema_version"] = SCHEMA_VERSION
+        row["state"] = "indexing"
+        row["updated_at"] = time.time_ns()
+        self._merge(self._projects, "id", [row])
+        return True
 
     def list_projects(self) -> list[ProjectInfo]:
         return [
@@ -793,33 +863,77 @@ class LanceStore:
             tables = self._existing_tables(project_id)
             if tables is None:
                 continue
-            rows = cast(
-                list[dict[str, Any]],
-                tables.chunks.search().select(INDEXED_CHUNK_COLUMNS).to_list(),
+            chunks.extend(
+                IndexedChunk.model_validate(row)
+                for row in cast(
+                    list[dict[str, Any]],
+                    tables.chunks.search().select(INDEXED_CHUNK_COLUMNS).to_list(),
+                )
             )
-            chunks.extend(IndexedChunk.model_validate(row) for row in rows)
         return chunks
 
     def get_chunk(self, chunk_id: str) -> CodeChunk | None:
-        # chunk_id is a one-way digest of file_id, which is itself a digest of
-        # the project id and path, so the owning project cannot be recovered
-        # from the id. Scanning every project is inherent without an id-format
-        # change and a full re-index; do not "fix" it by narrowing the loop.
-        # The partitions open read-only so the scan leaves nothing behind.
-        for project in self.list_projects():
-            tables = self._existing_tables(project.id)
-            if tables is None:
-                continue
-            rows = cast(
-                list[dict[str, Any]],
-                tables.chunks.search()
-                .where(f"chunk_id = {_quoted(chunk_id)}")
-                .select(CHUNK_PAYLOAD_COLUMNS)
-                .to_list(),
-            )
-            if rows:
-                return CodeChunk.model_validate(rows[0])
+        # New-format ids carry a project-routing prefix
+        # ("<project-id>:<digest>"), so the owning partition is opened directly
+        # instead of scanning every registered project. A malformed id, one
+        # whose prefix names no partition, or one from a pre-migration
+        # generation is treated as unknown -- consistent with the existing
+        # contract that chunk ids change when a file is re-indexed.
+        project_id = self._chunk_project_id(chunk_id)
+        if project_id is None:
+            return None
+        tables = self._existing_tables(project_id)
+        if tables is None:
+            return None
+        rows = cast(
+            list[dict[str, Any]],
+            tables.chunks.search()
+            .where(f"chunk_id = {_quoted(chunk_id)}")
+            .select(CHUNK_PAYLOAD_COLUMNS)
+            .to_list(),
+        )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        row["project_id"] = project_id
+        row["content_hash"] = self._chunk_content_hash(tables, str(row["file_id"]))
+        return CodeChunk.model_validate(row)
+
+    @staticmethod
+    def _chunk_id_prefix(chunk_id: str) -> str | None:
+        """The project-routing prefix of a chunk id, or None when malformed."""
+        if ":" not in chunk_id:
+            return None
+        prefix, _, remainder = chunk_id.partition(":")
+        if not prefix or not remainder:
+            return None
+        return prefix
+
+    def _chunk_project_id(self, chunk_id: str) -> str | None:
+        """Resolve a chunk id's routing prefix to its partition's project id.
+
+        The prefix is the project id itself, and the partition directory is
+        named by it, so resolution is a single directory probe -- no registry
+        scan, and no partition is materialized for an unknown id.
+        """
+        prefix = self._chunk_id_prefix(chunk_id)
+        if prefix is None:
+            return None
+        if (self.directory / "projects" / prefix).is_dir():
+            return prefix
         return None
+
+    @staticmethod
+    def _chunk_content_hash(tables: _ProjectTables, file_id: str) -> str:
+        """The files row's content hash for *file_id*, or '' when none exists."""
+        rows = cast(
+            list[dict[str, Any]],
+            tables.files.search()
+            .where(f"file_id = {_quoted(file_id)}")
+            .select(["content_hash"])
+            .to_list(),
+        )
+        return str(rows[0]["content_hash"]) if rows else ""
 
     def count_chunks(self, project_ids: Iterable[str] | None = None) -> int:
         ids = list(project_ids or [project.id for project in self.list_projects()])
@@ -839,10 +953,20 @@ class LanceStore:
             tables = self._existing_tables(project_id)
             if tables is None:
                 continue
+            # MultiMatchQuery spans the two single-column FTS indexes (content
+            # and identifier_terms); a plain string would silently search only
+            # one of them whenever both exist.
             query = (
                 tables.chunks.search(query_type="hybrid", vector_column_name="vector")
                 .vector(vector)
-                .text(query_text)
+                .text(
+                    MultiMatchQuery(
+                        query_text,
+                        ["content", "identifier_terms"],
+                        boosts=None,
+                        operator=FullTextOperator.OR,
+                    )
+                )
             )
             if condition:
                 query = query.where(condition, prefilter=True)
@@ -851,7 +975,6 @@ class LanceStore:
                 .select(
                     [
                         "chunk_id",
-                        "project_id",
                         "path",
                         "language",
                         "kind",
@@ -867,7 +990,12 @@ class LanceStore:
             )
             if self.vector_index == "exact":
                 query = query.bypass_vector_index()
-            rows.extend(cast(list[dict[str, Any]], query.to_list()))
+            # project_id is not stored on chunk rows; it belongs to the
+            # partition being searched, so it is injected per project.
+            query_rows = cast(list[dict[str, Any]], query.to_list())
+            for row in query_rows:
+                row["project_id"] = project_id
+            rows.extend(query_rows)
         rows.sort(key=lambda row: float(row.get("_relevance_score", 0.0)), reverse=True)
         return rows[:limit]
 
@@ -909,6 +1037,8 @@ class LanceStore:
             content=True,
             order_by=["path", "start_line", "kind"],
         )
+        for row in rows:
+            row["project_id"] = project_id
         if len(rows) == scan_limit:
             # The pre-filter filled the scan window, so real matches sorting
             # after it were never seen. Silent truncation is otherwise
@@ -940,6 +1070,8 @@ class LanceStore:
             limit=None,
             content=False,
         )
+        for row in rows:
+            row["project_id"] = project_id
         return [ChunkPreview.model_validate(row) for row in rows]
 
     def ensure_indexes(self, project_id: str) -> None:
@@ -957,12 +1089,19 @@ class LanceStore:
         chunks = tables.chunks
         indices = list(chunks.list_indices())
         indexed_columns = {column for index in indices for column in index.columns}
-        if "search_text" not in indexed_columns:
-            chunks.create_index(
-                "search_text",
-                config=FTS(lower_case=True, stem=False, remove_stop_words=False),
-                replace=False,
-            )
+        # Native FTS in the supported lancedb range indexes one field per
+        # index, so the persisted source content and the compact normalized
+        # identifier terms get one FTS index each and searches use a
+        # MultiMatchQuery spanning both. That covers code-text keywords and
+        # camelCase/snake_case symbol and path names without storing a second
+        # full copy of the text.
+        for fts_column in ("content", "identifier_terms"):
+            if fts_column not in indexed_columns:
+                chunks.create_index(
+                    fts_column,
+                    config=FTS(lower_case=True, stem=False, remove_stop_words=False),
+                    replace=False,
+                )
         for column in ("file_id", "language", "path", "symbol"):
             if column not in indexed_columns:
                 chunks.create_index(column, config=BTree(), replace=False)
@@ -1065,7 +1204,6 @@ class LanceStore:
             [
                 ("chunk_id", pa.string()),
                 ("file_id", pa.string()),
-                ("project_id", pa.string()),
                 ("path", pa.string()),
                 ("language", pa.string()),
                 ("kind", pa.string()),
@@ -1077,9 +1215,11 @@ class LanceStore:
                 ("start_line", pa.int32()),
                 ("end_line", pa.int32()),
                 ("content", pa.string()),
-                ("embedding_text", pa.string()),
-                ("search_text", pa.string()),
-                ("content_hash", pa.string()),
+                # Compact normalized identifier terms (camelCase and snake_case
+                # split apart) that FTS searches alongside ``content``, so
+                # symbol, path, and qualified-name queries match without
+                # storing a second full copy of the source text.
+                ("identifier_terms", pa.string()),
                 ("part_index", pa.int32()),
                 (
                     "vector",
@@ -1434,9 +1574,10 @@ class LanceStore:
         content: bool,
         order_by: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        # project_id is deliberately absent: it is not stored on chunk rows
+        # and belongs to the owning partition, so callers inject it.
         columns = [
             "chunk_id",
-            "project_id",
             "path",
             "language",
             "kind",

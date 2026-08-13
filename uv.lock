@@ -227,7 +227,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mlx'", specifier = ">=1,<2" },
     { name = "huggingface-hub", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'webgpu') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'webgpu') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'webgpu')", specifier = ">=1,<2" },
     { name = "huggingface-hub", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'migraphx'", specifier = ">=1,<2" },
-    { name = "lancedb", specifier = ">=0.25,<1" },
+    { name = "lancedb", specifier = ">=0.34,<1" },
     { name = "mcp", specifier = ">=1.27,<2" },
     { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mlx'", specifier = "==0.32.0" },
     { name = "numpy", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mlx'", specifier = ">=2,<3" },

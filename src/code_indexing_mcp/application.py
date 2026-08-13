@@ -1329,8 +1329,10 @@ class Application:
         A brand-new project starts in the "pending" state. An already-known
         project keeps its current state (e.g. "ready" is not reset back to
         "pending"), but the upsert still runs so LanceStore.upsert_project can
-        apply its compatibility checks (incompatible embedding model/schema,
-        or a project id already active at another root).
+        apply its compatibility checks. A project whose stored generation was
+        written by an incompatible embedding model or schema version is marked
+        "rebuild_required" rather than rejected: registration and discovery
+        keep working, and the next index run rebuilds the partition.
         """
         known = {existing.id for existing in self.store.list_projects()}
         state = self.store.project_state(project.id) if project.id in known else "pending"

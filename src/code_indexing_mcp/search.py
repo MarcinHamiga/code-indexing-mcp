@@ -14,7 +14,6 @@ from .models import (
     OutlineResponse,
     SearchHit,
     SearchResponse,
-    StoredChunk,
     SymbolResponse,
 )
 from .path_filter import path_condition
@@ -157,7 +156,7 @@ class SearchService:
         return f"{column} IN ({', '.join(_quoted(value) for value in values)})"
 
     @staticmethod
-    def _hit(chunk: StoredChunk | ChunkPreview, names: dict[str, str], score: float) -> SearchHit:
+    def _hit(chunk: ChunkPreview, names: dict[str, str], score: float) -> SearchHit:
         snippet = chunk.content[:4_000]
         return SearchHit(
             chunk_id=chunk.chunk_id,

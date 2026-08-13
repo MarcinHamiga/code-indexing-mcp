@@ -367,42 +367,50 @@ class Indexer:
             with (
                 global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
                 project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
-                self._recorded_run(project, run_id, trigger, force=force) as record,
             ):
-                try:
-                    report = self._index_locked(project, force=force, progress=progress)
-                finally:
-                    # Only the run that holds the lock owns the snapshot, so
-                    # clearing here can never delete another process's progress.
-                    progress.clear()
-                report = report.model_copy(
-                    update={
-                        "run_id": run_id,
-                        "trigger": trigger,
-                        "failed_files": len(report.errors),
-                    }
-                )
-                record.complete(
-                    phase_durations=self._phase_durations(report),
-                    eligible_files=report.discovered_files,
-                    changed_files=report.indexed_files,
-                    unchanged_files=report.unchanged_files,
-                    parsed_files=report.parsed_files,
-                    failed_files=report.failed_files,
-                    removed_files=report.removed_files,
-                    skipped_total=report.skipped_files,
-                    chunks_extracted=report.chunks_extracted,
-                    chunks_embedded=report.embedded_chunks,
-                    chunks_staged=report.chunks_staged,
-                    staged_bytes=report.staged_bytes,
-                    bytes_read=report.bytes_read,
-                    skip_reasons=report.skip_reasons,
-                    errors=report.errors[:20],
-                    skipped_samples=report.skipped_samples[:20],
-                    embedding_backend=report.embedding_backend,
-                    embedding_fallback_reason=report.embedding_fallback_reason,
-                    worker_used=report.worker_used,
-                )
+                rebuild_reason = self._prepare_rebuild(project)
+                effective_trigger = trigger if rebuild_reason is None else "schema-rebuild"
+                with self._recorded_run(
+                    project,
+                    run_id,
+                    effective_trigger,
+                    force=force,
+                    rebuild_reason=rebuild_reason,
+                ) as record:
+                    try:
+                        report = self._index_locked(project, force=force, progress=progress)
+                    finally:
+                        # Only the run that holds the lock owns the snapshot, so
+                        # clearing here can never delete another process's progress.
+                        progress.clear()
+                    report = report.model_copy(
+                        update={
+                            "run_id": run_id,
+                            "trigger": effective_trigger,
+                            "failed_files": len(report.errors),
+                        }
+                    )
+                    record.complete(
+                        phase_durations=self._phase_durations(report),
+                        eligible_files=report.discovered_files,
+                        changed_files=report.indexed_files,
+                        unchanged_files=report.unchanged_files,
+                        parsed_files=report.parsed_files,
+                        failed_files=report.failed_files,
+                        removed_files=report.removed_files,
+                        skipped_total=report.skipped_files,
+                        chunks_extracted=report.chunks_extracted,
+                        chunks_embedded=report.embedded_chunks,
+                        chunks_staged=report.chunks_staged,
+                        staged_bytes=report.staged_bytes,
+                        bytes_read=report.bytes_read,
+                        skip_reasons=report.skip_reasons,
+                        errors=report.errors[:20],
+                        skipped_samples=report.skipped_samples[:20],
+                        embedding_backend=report.embedding_backend,
+                        embedding_fallback_reason=report.embedding_fallback_reason,
+                        worker_used=report.worker_used,
+                    )
         except Timeout as exc:
             raise CodeIndexingError(
                 ErrorCode.INDEX_BUSY,
@@ -421,6 +429,25 @@ class Indexer:
         trigger: IndexTrigger = "reference-backfill",
     ) -> ReferenceBackfillReport:
         """Parse missing structural generations without embedding source chunks."""
+
+        if self.store.incompatibility_reason(project.id, self.embedder.model_id) is not None:
+            # An incompatible partition cannot be healed by a parse-only
+            # backfill: its rows were written by an older model or schema.
+            # Rebuild it with a full embedding run (recorded as its own
+            # schema-rebuild audit row), then report every file current so
+            # the caller proceeds to serve queries against the fresh index.
+            self.index(
+                project,
+                wait_for_lock=wait_for_lock,
+                on_progress=on_progress,
+                trigger="schema-rebuild",
+            )
+            files = self.store.list_files(project.id)
+            return ReferenceBackfillReport(
+                project_id=project.id,
+                files_checked=len(files),
+                files_current=len(files),
+            )
 
         self.lock_directory.mkdir(parents=True, exist_ok=True)
         run_id = uuid.uuid4().hex
@@ -479,6 +506,7 @@ class Indexer:
         *,
         force: bool = False,
         deferred: bool = False,
+        rebuild_reason: str | None = None,
     ) -> Iterator[_RunRecord]:
         """Record one run's audit trail around the body of a locked run.
 
@@ -487,12 +515,16 @@ class Indexer:
         its counters; any escaping exception marks the run ``failed`` before
         propagating. With ``deferred=True`` nothing is written until the body
         calls ``record.start()``, which it does when real work begins.
+        ``rebuild_reason`` names why the partition was replaced, so the audit
+        row explains a schema-rebuild run without mislabeling its trigger.
         """
 
         record = _RunRecord(
             history=self.history,
             run_id=run_id,
-            audit=lambda: self._run_audit(project, run_id, trigger, force),
+            audit=lambda: self._run_audit(
+                project, run_id, trigger, force, rebuild_reason=rebuild_reason
+            ),
             snapshot=lambda: self._storage_snapshot(project.id),
         )
         if not deferred:
@@ -504,7 +536,13 @@ class Indexer:
             raise
 
     def _run_audit(
-        self, project: ProjectInfo, run_id: str, trigger: IndexTrigger, force: bool
+        self,
+        project: ProjectInfo,
+        run_id: str,
+        trigger: IndexTrigger,
+        force: bool,
+        *,
+        rebuild_reason: str | None = None,
     ) -> RunAudit:
         """The start-of-run audit row: identity and environment, nothing counted yet."""
 
@@ -522,7 +560,26 @@ class Indexer:
             force=force,
             pid=os.getpid(),
             started_at=datetime.now(UTC).isoformat(),
+            rebuild_reason=rebuild_reason,
         )
+
+    def _prepare_rebuild(self, project: ProjectInfo) -> str | None:
+        """Delete *project*'s partition when its generation is incompatible.
+
+        Called under the writer locks, before the run's audit row is written.
+        Returns the reason the partition was replaced, or None when the
+        stored generation still matches this build. The registry row and the
+        ``.ci-mcp/project.toml`` marker survive the deletion, so a rebuild
+        that fails or crashes leaves a registered, re-indexable project; the
+        registry row is re-stamped to the current generation because no rows
+        remain for the old generation's claim to describe.
+        """
+        reason = self.store.incompatibility_reason(project.id, self.embedder.model_id)
+        if reason is None:
+            return None
+        self.store.delete_partition(project.id, model_id=self.embedder.model_id)
+        logger.warning("Rebuilding incompatible index for %s: %s", project.id, reason)
+        return reason
 
     @staticmethod
     def _phase_durations(report: IndexReport) -> dict[str, int]:
@@ -1356,6 +1413,9 @@ class Indexer:
         start_byte = chunk.start_byte + len(head.encode("utf-8"))
         start_line = chunk.start_line + head.count("\n")
         embedding_text = compose_passage(chunk.embedding_prefix, content)
+        # search_suffix (the normalized identifier terms) is deliberately not
+        # recomputed per window: it derives from the path and qualified name,
+        # which are the same for every window of the chunk.
         return chunk.model_copy(
             update={
                 "start_byte": start_byte,
@@ -1364,7 +1424,6 @@ class Indexer:
                 "end_line": start_line + content.count("\n"),
                 "content": content,
                 "embedding_text": embedding_text,
-                "search_text": f"{embedding_text}\n{chunk.search_suffix}",
             }
         )
 
@@ -1515,10 +1574,12 @@ class Indexer:
                 str(chunk.part_index),
             ]
         )
+        # The project-id prefix routes get_chunk to the owning partition; the
+        # digest keeps the id content-derived, so it still changes whenever
+        # the file is re-indexed.
         return ChunkRow(
-            chunk_id=_digest(identity),
+            chunk_id=f"{project_id}:{_digest(identity)}",
             file_id=file.file_id,
-            project_id=project_id,
             path=file.path,
             language=file.language,
             kind=chunk.kind,
@@ -1530,9 +1591,10 @@ class Indexer:
             start_line=chunk.start_line,
             end_line=chunk.end_line,
             content=chunk.content,
-            embedding_text=chunk.embedding_text,
-            search_text=chunk.search_text,
-            content_hash=file.content_hash,
+            # The normalized identifier terms are the compact search payload:
+            # they replace the persisted search_text without copying the
+            # source content a second time.
+            identifier_terms=chunk.search_suffix,
             part_index=chunk.part_index,
             vector=vector,
         )

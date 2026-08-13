@@ -468,14 +468,17 @@ def test_reregistering_a_known_project_preserves_state_and_still_validates_compa
     app.discover_project(root)
     assert app.project_status(project.id).state == "ready"
 
+    # A different embedding model makes the stored generation incompatible.
+    # That is reconstructable, so registration marks the project for rebuild
+    # instead of failing, and the next index run rebuilds it back to ready.
     other_app = Application(paths, embedder=OtherModelTinyEmbedder(), cwd=root)
-    with pytest.raises(CodeIndexingError) as raised_init:
-        other_app.init_project(root)
-    assert raised_init.value.code is ErrorCode.INDEX_INCOMPATIBLE
+    other_project = other_app.init_project(root)
+    assert other_project.id == project.id
+    assert other_app.project_status(project.id).state == "rebuild_required"
 
-    with pytest.raises(CodeIndexingError) as raised_discover:
-        other_app.discover_project(root)
-    assert raised_discover.value.code is ErrorCode.INDEX_INCOMPATIBLE
+    rebuilt = other_app.index_project(project.id)
+    assert rebuilt.indexed_files >= 1
+    assert other_app.project_status(project.id).state == "ready"
 
 
 def test_the_application_resolves_a_backend_and_reports_it(tmp_path: Path) -> None:

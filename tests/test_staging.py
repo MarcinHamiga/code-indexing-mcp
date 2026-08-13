@@ -76,7 +76,6 @@ def chunk_row(
     return ChunkRow(
         chunk_id=chunk_id,
         file_id=file_id,
-        project_id=project_id,
         path="main.py",
         language="python",
         kind="function",
@@ -88,9 +87,7 @@ def chunk_row(
         start_line=1,
         end_line=2,
         content="def answer():\n    return 42\n",
-        embedding_text="embedding",
-        search_text="search",
-        content_hash="hash",
+        identifier_terms="answer main py",
         part_index=0,
         vector=pack_vector(vector),
     )
@@ -388,9 +385,9 @@ def test_staged_chunks_round_trip_through_the_store(tmp_path: Path) -> None:
     assert len(chunks) == 1
     tables = store._existing_tables(project.id)
     assert tables is not None
-    stored = tables.chunks.search().select(["embedding_text", "vector"]).to_list()[0]
-    expected = len(stored["embedding_text"]) % 7
-    assert stored["vector"] == [float(expected), 1.0, 2.0, 3.0]
+    stored = tables.chunks.search().select(["identifier_terms", "vector"]).to_list()[0]
+    assert stored["identifier_terms"]
+    assert len(stored["vector"]) == 4
 
     fetched = store.get_chunk(chunks[0].chunk_id)
     assert fetched is not None
@@ -420,7 +417,7 @@ def test_a_file_that_now_extracts_no_chunks_has_its_old_chunks_deleted(
         record,
         [
             StoredChunk(
-                chunk_id="chunk-1",
+                chunk_id=f"{project.id}:chunk-1",
                 file_id="file-1",
                 project_id=project.id,
                 path="main.py",
@@ -434,9 +431,7 @@ def test_a_file_that_now_extracts_no_chunks_has_its_old_chunks_deleted(
                 start_line=1,
                 end_line=2,
                 content="def answer():\n    return 42\n",
-                embedding_text="embedding",
-                search_text="search",
-                content_hash="hash",
+                identifier_terms="answer main py",
                 part_index=0,
                 vector=[0.0, 0.0, 0.0, 1.0],
             )
@@ -665,6 +660,86 @@ def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -
     assert list((tmp_path / "staging").glob("*/*/")) == []
 
 
+def test_recovery_of_a_rebuild_journal_discards_a_deleted_partition(
+    tmp_path: Path,
+) -> None:
+    """A crash mid-rebuild names versions of a partition the rebuild deleted.
+
+    Restoring those versions is impossible by design (the old generation was
+    intentionally discarded), so recovery must retire the journal and leave
+    the registered project empty and re-indexable -- never error or spin.
+    """
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    file_id = "file-1"
+    record = StoredFile(
+        file_id=file_id,
+        project_id=project.id,
+        path="main.py",
+        language="python",
+        size=4,
+        mtime_ns=1,
+        content_hash="hash",
+        indexed_at=1,
+    )
+    store.replace_file(record, _staged_chunks_for_recovery(project.id, file_id))
+
+    # "Crash" after the rebuild deleted the partition but before the new
+    # generation committed: the journal names versions that no longer exist.
+    store.delete_partition(project.id, model_id="test/model")
+    directory = tmp_path / "staging" / project.id / "rebuild-job"
+    directory.mkdir(parents=True)
+    (directory / JOURNAL_NAME).write_text(
+        json.dumps(
+            {
+                "version": JOURNAL_FORMAT_VERSION,
+                "job_id": "rebuild-job",
+                "project_id": project.id,
+                "phase": PHASE_COMMITTING,
+                "files_version": 7,
+                "chunks_version": 9,
+                "references_version": 11,
+                "replace_file_ids": [],
+                "removed_file_ids": [],
+            }
+        )
+    )
+
+    recovered = recover_staged_commits(tmp_path / "staging", store)
+
+    assert recovered == 0
+    assert store.list_projects() == [project]
+    assert store.list_chunks([project.id]) == []
+    assert store.count_chunks([project.id]) == 0
+    assert list((tmp_path / "staging").glob("*/*/")) == []
+
+
+def _staged_chunks_for_recovery(project_id: str, file_id: str) -> list[StoredChunk]:
+    return [
+        StoredChunk(
+            chunk_id=f"{project_id}:chunk-1",
+            file_id=file_id,
+            path="main.py",
+            language="python",
+            kind="function",
+            symbol="answer",
+            qualified_symbol="answer",
+            parent_symbol=None,
+            start_byte=0,
+            end_byte=26,
+            start_line=1,
+            end_line=2,
+            content="def answer():\n    return 42\n",
+            identifier_terms="answer main py",
+            part_index=0,
+            vector=[0.0, 0.0, 0.0, 1.0],
+        )
+    ]
+
+
 def test_repeated_recovery_is_idempotent(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     project = make_project(root)
@@ -750,7 +825,7 @@ def test_upgrade_recovery_rolls_back_a_legacy_two_table_journal(tmp_path: Path) 
     files.delete("file_id = 'file-1'")
     files.add([original_file.model_copy(update={"mtime_ns": 2}).model_dump()])
     chunks.delete("file_id = 'file-1'")
-    chunks.add([{**original_chunk, "content": "new", "content_hash": "new"}])
+    chunks.add([{**original_chunk, "content": "new"}])
     directory = tmp_path / "staging" / project.id / "legacy-job"
     directory.mkdir(parents=True)
     (directory / JOURNAL_NAME).write_text(

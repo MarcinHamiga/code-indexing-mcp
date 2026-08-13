@@ -871,11 +871,11 @@ def create_server(
     @mcp.tool(
         title="Project status",
         description=(
-            "Report one project's index state — pending, indexing, ready, partial, stale, or "
-            "error — with its indexed file count and chunk count. Compares eligible source "
-            "metadata with the index but does not rebuild it; index_project does that. A root "
-            "that is not registered yet is registered first, which writes its "
-            ".ci-mcp/project.toml marker."
+            "Report one project's index state — pending, indexing, ready, partial, stale, "
+            "rebuild_required, or error — with its indexed file count and chunk count. Compares "
+            "eligible source metadata with the index but does not rebuild it; index_project does "
+            "that, including rebuilding a rebuild_required partition. A root that is not "
+            "registered yet is registered first, which writes its .ci-mcp/project.toml marker."
         ),
         annotations=_READS_AND_REGISTERS,
     )

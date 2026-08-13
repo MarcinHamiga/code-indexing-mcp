@@ -11,7 +11,11 @@ readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "filelock>=3.18,<4",
-    "lancedb>=0.25,<1",
+    # The FTS/BTree config API used by ensure_indexes landed in 0.34.0
+    # (verified: every earlier release from 0.25.0 up rejects the config=
+    # keyword), so the floor is raised to the first release that can express
+    # the index-management behavior the write path requires.
+    "lancedb>=0.34,<1",
     "mcp>=1.27,<2",
     "pathspec>=0.12,<1",
     "platformdirs>=4.3,<5",
