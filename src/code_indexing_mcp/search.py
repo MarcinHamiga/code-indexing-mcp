@@ -14,7 +14,6 @@ from .models import (
     OutlineResponse,
     SearchHit,
     SearchResponse,
-    StoredChunk,
     SymbolResponse,
 )
 from .path_filter import path_condition
@@ -69,13 +68,14 @@ class SearchService:
                 _FALLBACK_FETCH_ROWS,
             )
         fetch = _FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5)
-        rows = self.store.hybrid_search(
-            query,
-            self.embedder.embed_query(query),
-            project_ids,
-            " AND ".join(conditions) if conditions else None,
-            fetch,
-        )
+        with self.store.partitions_access(project_ids):
+            rows = self.store.hybrid_search(
+                query,
+                self.embedder.embed_query(query),
+                project_ids,
+                " AND ".join(conditions) if conditions else None,
+                fetch,
+            )
         names = {project.id: project.name for project in self.store.list_projects()}
         hits: list[SearchHit] = []
         seen: set[tuple[str, str, int, int]] = set()
@@ -105,9 +105,10 @@ class SearchService:
         if match not in {"exact", "prefix", "contains"}:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, f"Invalid symbol match mode: {match}")
         limit = max(1, min(limit, 50))
-        candidates = self.store.find_symbol_chunks(
-            name, project_id, match=match, kinds=kinds, limit=limit
-        )
+        with self.store.partition_access(project_id):
+            candidates = self.store.find_symbol_chunks(
+                name, project_id, match=match, kinds=kinds, limit=limit
+            )
         names = {project.id: project.name for project in self.store.list_projects()}
 
         selected = sorted(
@@ -119,10 +120,9 @@ class SearchService:
     def file_outline(self, path: str, project_id: str) -> OutlineResponse:
         items: list[OutlineItem] = []
         seen: set[tuple[str, str]] = set()
-        for chunk in sorted(
-            self.store.outline_chunks(path, project_id),
-            key=lambda item: (item.path, item.start_line),
-        ):
+        with self.store.partition_access(project_id):
+            chunks = self.store.outline_chunks(path, project_id)
+        for chunk in sorted(chunks, key=lambda item: (item.path, item.start_line)):
             if chunk.path != path or not chunk.symbol or not chunk.qualified_symbol:
                 continue
             key = (chunk.kind.removesuffix("_part"), chunk.qualified_symbol)
@@ -142,7 +142,12 @@ class SearchService:
         return OutlineResponse(project_id=project_id, path=path, items=items)
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
-        chunk = self.store.get_chunk(chunk_id)
+        project_id = self.store._chunk_project_id(chunk_id)
+        if project_id is None:
+            chunk = None
+        else:
+            with self.store.partition_access(project_id):
+                chunk = self.store.get_chunk(chunk_id)
         if chunk is None:
             raise CodeIndexingError(
                 ErrorCode.CHUNK_NOT_FOUND,
@@ -157,7 +162,7 @@ class SearchService:
         return f"{column} IN ({', '.join(_quoted(value) for value in values)})"
 
     @staticmethod
-    def _hit(chunk: StoredChunk | ChunkPreview, names: dict[str, str], score: float) -> SearchHit:
+    def _hit(chunk: ChunkPreview, names: dict[str, str], score: float) -> SearchHit:
         snippet = chunk.content[:4_000]
         return SearchHit(
             chunk_id=chunk.chunk_id,

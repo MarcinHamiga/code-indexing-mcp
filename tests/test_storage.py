@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -85,7 +86,7 @@ def test_storage_uses_one_partition_per_project(tmp_path: Path) -> None:
 
 
 def test_reads_never_materialize_a_partition(tmp_path: Path) -> None:
-    """get_chunk scans every project; a registered-but-unindexed one stays empty."""
+    """Reads on a registered-but-unindexed project leave it empty on disk."""
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
     root = tmp_path / "repo"
     root.mkdir()
@@ -399,8 +400,7 @@ def test_v1_store_is_backed_up_and_registered_for_lazy_rebuild(tmp_path: Path) -
 def _stored_chunks(project_id: str, count: int) -> list[StoredChunk]:
     return [
         StoredChunk(
-            chunk_id=f"chunk-{index}",
-            project_id=project_id,
+            chunk_id=f"{project_id}:chunk-{index}",
             file_id="file-1",
             path="module.py",
             language="python",
@@ -413,9 +413,7 @@ def _stored_chunks(project_id: str, count: int) -> list[StoredChunk]:
             start_line=index + 1,
             end_line=index + 1,
             content="pass",
-            embedding_text="pass",
-            search_text="pass",
-            content_hash="hash",
+            identifier_terms="symbol module py",
             part_index=0,
             vector=[0.0, 0.0, 0.0, 1.0],
         )
@@ -490,6 +488,71 @@ def test_maintenance_preserves_rows_and_search_results(tmp_path: Path) -> None:
     assert store.list_reference_records(project.id) == references_before
     rows = store.hybrid_search("pass", [1.0, 0.0, 0.0, 0.0], [project.id], None, 5)
     assert {row["chunk_id"] for row in rows} == {chunk.chunk_id for chunk in chunks_before}
+
+
+def test_hybrid_search_spans_content_and_identifier_terms(tmp_path: Path) -> None:
+    """Keyword search must match both FTS indexes.
+
+    Native FTS is single-column, so content and identifier_terms get one index
+    each and hybrid search spans them with a MultiMatchQuery. A query that
+    appears only in the normalized identifier terms (never in the code text)
+    must still hit; so must one that appears only in the content.
+    """
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    chunk_terms_only = StoredChunk(
+        chunk_id=f"{project.id}:terms-only",
+        file_id="file-terms",
+        path="loader.py",
+        language="python",
+        kind="function",
+        symbol="load",
+        qualified_symbol="load",
+        parent_symbol=None,
+        start_byte=0,
+        end_byte=1,
+        start_line=1,
+        end_line=1,
+        content="def x(): pass",
+        identifier_terms="zoo keeper config",
+        part_index=0,
+        vector=[0.0, 0.0, 0.0, 1.0],
+    )
+    chunk_content_only = StoredChunk(
+        chunk_id=f"{project.id}:content-only",
+        file_id="file-content",
+        path="other.py",
+        language="python",
+        kind="function",
+        symbol="y",
+        qualified_symbol="y",
+        parent_symbol=None,
+        start_byte=0,
+        end_byte=1,
+        start_line=1,
+        end_line=1,
+        content="def get_http(): pass",
+        identifier_terms="other py",
+        part_index=0,
+        vector=[1.0, 1.0, 1.0, 1.0],
+    )
+    record = stored_file(project.id, file_id="file-terms")
+    record2 = stored_file(project.id, file_id="file-content")
+    store.replace_file(record, [chunk_terms_only])
+    store.replace_file(record2, [chunk_content_only])
+    store.ensure_indexes(project.id)
+
+    terms_hit = store.hybrid_search("keeper", [0.0, 0.0, 0.0, 0.0], [project.id], None, 5)
+    content_hit = store.hybrid_search("http", [0.9, 0.9, 0.9, 0.9], [project.id], None, 5)
+
+    # "keeper" appears only in the identifier-terms index, and "http" only in
+    # the content index; the query vectors favor the *other* chunk, so an FTS
+    # miss would leave the FTS-matched chunk behind. It must rank first.
+    assert terms_hit[0]["chunk_id"] == chunk_terms_only.chunk_id
+    assert content_hit[0]["chunk_id"] == chunk_content_only.chunk_id
 
 
 def test_maintenance_keeps_versions_inside_the_retention_window(tmp_path: Path) -> None:
@@ -658,8 +721,85 @@ def test_get_chunk_does_not_read_the_vector_column(tmp_path: Path) -> None:
     assert store.get_chunk("no-such-chunk") is None
 
 
+def test_get_chunk_resolves_the_routing_prefix_to_the_owning_partition(
+    tmp_path: Path,
+) -> None:
+    """The project-id prefix routes get_chunk to one partition and back.
+
+    The response's project_id is injected from the partition and its
+    content_hash comes from the files table, not the chunk row.
+    """
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    first_root = tmp_path / "first"
+    first_root.mkdir()
+    first = initialize_project(first_root)
+    store.upsert_project(first, model_id="test/model")
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second = initialize_project(second_root)
+    store.upsert_project(second, model_id="test/model")
+    first_chunk = _stored_chunks(first.id, 1)[0]
+    second_chunk = _stored_chunks(second.id, 1)[0]
+    store.replace_file(stored_file(first.id), [first_chunk])
+    store.replace_file(stored_file(second.id), [second_chunk])
+
+    from_first = store.get_chunk(first_chunk.chunk_id)
+    from_second = store.get_chunk(second_chunk.chunk_id)
+
+    assert from_first is not None and from_first.project_id == first.id
+    assert from_second is not None and from_second.project_id == second.id
+    assert from_first.content_hash == "hash"
+    assert from_second.content_hash == "hash"
+
+
+def test_get_chunk_reads_its_own_generation_content_hash(tmp_path: Path) -> None:
+    store, project_id, chunk_id = _store_with_one_chunk(tmp_path)
+    tables = store._existing_tables(project_id)
+    assert tables is not None
+    tables.files.delete("file_id = 'file-1'")
+    tables.files.add(
+        [stored_file(project_id).model_copy(update={"content_hash": "new-hash"}).model_dump()]
+    )
+
+    chunk = store.get_chunk(chunk_id)
+
+    assert chunk is not None
+    assert chunk.content_hash == "hash"
+
+
+def test_partition_deletion_waits_for_active_reader(tmp_path: Path) -> None:
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+    finished = threading.Event()
+
+    def delete() -> None:
+        store.delete_partition(project_id, model_id="test/other")
+        finished.set()
+
+    with store.partition_access(project_id):
+        thread = threading.Thread(target=delete)
+        thread.start()
+        assert not finished.wait(timeout=0.1)
+    thread.join(timeout=5)
+
+    assert finished.is_set()
+
+
+def test_get_chunk_rejects_malformed_unknown_and_pre_migration_ids(tmp_path: Path) -> None:
+    store, project_id, _ = _store_with_one_chunk(tmp_path)
+
+    # A pre-migration id has no routing prefix; a malformed one has an empty
+    # prefix or digest; an unknown prefix names no partition. All are
+    # deliberately indistinguishable from "not found", and none of them
+    # materialize storage.
+    assert store.get_chunk("chunk-1") is None
+    assert store.get_chunk(":digest") is None
+    assert store.get_chunk(f"{project_id}:") is None
+    assert store.get_chunk("no-such-project:digest") is None
+    assert not (store.directory / "projects" / "no-such-project").exists()
+
+
 def test_partition_cache_evicts_least_recently_used(tmp_path: Path) -> None:
-    """The daemon is long-lived and get_chunk faults in every project's partition.
+    """The daemon is long-lived; partition handles must not accumulate without bound.
 
     Without a bound, two open LanceTable handles per project accumulate for the life
     of the process.
@@ -738,7 +878,7 @@ def test_list_chunks_does_not_materialize_vectors(tmp_path: Path) -> None:
     assert all(isinstance(chunk, IndexedChunk) for chunk in chunks)
     assert not any(hasattr(chunk, "vector") for chunk in chunks)
     # The fields the tests actually read must survive the projection.
-    assert chunks[0].search_text
+    assert chunks[0].identifier_terms
     assert chunks[0].content
     assert chunks[0].chunk_id
 
@@ -939,11 +1079,17 @@ def test_storage_stats_reports_indexes_after_ensure_indexes(tmp_path: Path) -> N
 
     chunks = next(table for table in report.tables if table.name == "chunks")
     assert {index.index_type for index in chunks.indexes} == {"FTS", "BTree"}
-    fts = next(index for index in chunks.indexes if index.index_type == "FTS")
-    assert fts.columns == ["search_text"]
-    assert fts.indexed_rows == 1
-    assert fts.unindexed_rows == 0
-    assert fts.size_bytes > 0
+    fts = [index for index in chunks.indexes if index.index_type == "FTS"]
+    # Native FTS indexes one field each; content and the identifier terms are
+    # searched together with a MultiMatchQuery.
+    assert {column for index in fts for column in index.columns} == {
+        "content",
+        "identifier_terms",
+    }
+    for index in fts:
+        assert index.indexed_rows == 1
+        assert index.unindexed_rows == 0
+        assert index.size_bytes > 0
 
 
 def test_storage_stats_works_without_the_references_table(tmp_path: Path) -> None:
@@ -1220,9 +1366,8 @@ def _chunk_table(project_id: str, file_id: str, count: int) -> pa.Table:
     return pa.Table.from_pylist(
         [
             {
-                "chunk_id": f"{file_id}:chunk-{index}",
+                "chunk_id": f"{project_id}:{file_id}:chunk-{index}",
                 "file_id": file_id,
-                "project_id": project_id,
                 "path": "module.py",
                 "language": "python",
                 "kind": "function",
@@ -1234,8 +1379,7 @@ def _chunk_table(project_id: str, file_id: str, count: int) -> pa.Table:
                 "start_line": index + 1,
                 "end_line": index + 1,
                 "content": "pass",
-                "embedding_text": "pass",
-                "search_text": "pass",
+                "identifier_terms": "symbol module py",
                 "content_hash": "hash",
                 "part_index": 0,
                 "vector": [0.0, 0.0, 0.0, 1.0],
@@ -1538,6 +1682,111 @@ def test_mark_project_state_skips_when_the_state_is_unchanged(tmp_path: Path) ->
     assert store.mark_project_state(project.id, "error") is True
 
     assert store.registry_stats().current_version == version_after_error
+
+
+def test_an_incompatible_generation_is_marked_for_rebuild_not_rejected(
+    tmp_path: Path,
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_file(stored_file(project.id), _stored_chunks(project.id, 1))
+
+    # A different embedding model is reconstructable: registration must mark
+    # the project for rebuild, not raise INDEX_INCOMPATIBLE, and must leave
+    # the stored generation fields describing the still-live partition.
+    store.upsert_project(project, model_id="test/other")
+    assert store.project_state(project.id) == "rebuild_required"
+    assert store.incompatibility_reason(project.id, "test/other") is not None
+    assert store.incompatibility_reason(project.id, "test/model") is None
+    assert store.count_chunks([project.id]) == 1
+
+    # An incompatible upsert cannot clobber rebuild_required, whatever state
+    # it asks for: the partition still holds the old generation.
+    store.upsert_project(project, model_id="test/other", state="indexing")
+    assert store.project_state(project.id) == "rebuild_required"
+
+    # A compatible upsert (same stored model) proceeds normally.
+    store.upsert_project(project, model_id="test/model", state="indexing")
+    assert store.project_state(project.id) == "indexing"
+
+
+def test_incompatibility_reason_detects_model_dimension_and_schema_mismatches(
+    tmp_path: Path,
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+
+    assert store.incompatibility_reason(project.id, "test/model") is None
+    assert "embedding model" in (store.incompatibility_reason(project.id, "other") or "")
+
+    different_dimension = LanceStore(tmp_path / "lancedb-other", vector_dimension=8)
+    row = {
+        "id": project.id,
+        "name": project.name,
+        "root": str(project.root.resolve()),
+        "payload": project.model_dump_json(),
+        "model_id": "test/model",
+        "vector_dimension": 4,
+        "schema_version": storage_module.SCHEMA_VERSION,
+        "state": "ready",
+        "updated_at": 0,
+    }
+    different_dimension._merge(different_dimension._projects, "id", [row])
+    assert "vector dimension" in (
+        different_dimension.incompatibility_reason(project.id, "test/model") or ""
+    )
+
+    different_schema = LanceStore(tmp_path / "lancedb-other-schema", vector_dimension=4)
+    row = {
+        "id": project.id,
+        "name": project.name,
+        "root": str(project.root.resolve()),
+        "payload": project.model_dump_json(),
+        "model_id": "test/model",
+        "vector_dimension": 4,
+        "schema_version": storage_module.SCHEMA_VERSION - 1,
+        "state": "ready",
+        "updated_at": 0,
+    }
+    different_schema._merge(different_schema._projects, "id", [row])
+    assert "index schema version" in (
+        different_schema.incompatibility_reason(project.id, "test/model") or ""
+    )
+
+    # A pending registration has no live rows and is never incompatible.
+    store.upsert_project(project, model_id="test/model", state="pending")
+    assert store.incompatibility_reason(project.id, "other") is None
+
+
+def test_delete_partition_preserves_registration_and_re_stamps_the_generation(
+    tmp_path: Path,
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_file(stored_file(project.id), _stored_chunks(project.id, 1))
+    chunk_id = store.list_chunks([project.id])[0].chunk_id
+    assert store._existing_tables(project.id) is not None
+
+    removed = store.delete_partition(project.id, model_id="test/other")
+
+    assert removed is True
+    assert store.list_projects() == [project]
+    assert store.incompatibility_reason(project.id, "test/other") is None
+    assert store.project_state(project.id) == "indexing"
+    assert store.count_chunks([project.id]) == 0
+    assert store.get_chunk(chunk_id) is None
+    assert store._existing_tables(project.id) is None
+    assert (root / ".ci-mcp" / "project.toml").exists()
+    assert not (store.directory / "projects" / project.id).exists()
 
 
 def test_merge_semantics_probe_passes_on_the_installed_lancedb() -> None:

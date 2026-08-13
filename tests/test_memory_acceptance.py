@@ -244,9 +244,9 @@ def test_commit_batches_stay_bounded_far_below_the_memory_ceiling(tmp_path: Path
         reference_schema=LanceStore.reference_arrow_schema(),
     )
     job.begin()
-    # Each file carries ~512 KiB across content + embedding_text, so the
-    # default file-count bound (64) dominates the byte bound (64 MiB) and the
-    # batch shape below is deterministic.
+    # Each file carries ~512 KiB across content, so the default file-count
+    # bound (64) dominates the byte bound (64 MiB) and the batch shape below
+    # is deterministic.
     content = "x" * (256 * 1024)
     vector = struct.pack("<4f", 0.0, 0.0, 0.0, 1.0)
     for index in range(200):
@@ -254,9 +254,8 @@ def test_commit_batches_stay_bounded_far_below_the_memory_ceiling(tmp_path: Path
         job.stage_chunks(
             [
                 ChunkRow(
-                    chunk_id=f"chunk-{index}",
+                    chunk_id=f"project-1:chunk-{index}",
                     file_id=file_id,
-                    project_id="project-1",
                     path=f"file_{index}.py",
                     language="python",
                     kind="function",
@@ -268,9 +267,7 @@ def test_commit_batches_stay_bounded_far_below_the_memory_ceiling(tmp_path: Path
                     start_line=1,
                     end_line=1,
                     content=content,
-                    embedding_text=content,
-                    search_text="",
-                    content_hash="hash",
+                    identifier_terms="symbol file py",
                     part_index=0,
                     vector=vector,
                 )

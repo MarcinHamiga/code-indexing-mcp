@@ -1086,8 +1086,10 @@ class ReferenceService:
                 project=selector.project,
                 path=selector.path,
             )
+        # The project id is the selector's own; chunk rows no longer carry it.
+        assert selector.project is not None
         return SelectedDeclaration(
-            project_id=located_chunk.project_id,
+            project_id=selector.project,
             file_id=located_chunk.file_id,
             path=located_chunk.path,
             language=located_chunk.language,

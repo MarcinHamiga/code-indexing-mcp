@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS runs (
     schema_version INTEGER NOT NULL DEFAULT 0,
     scan_config_hash TEXT NOT NULL DEFAULT '',
     force INTEGER NOT NULL DEFAULT 0,
+    rebuild_reason TEXT,
     pid INTEGER NOT NULL DEFAULT 0,
     started_at TEXT NOT NULL,
     finished_at TEXT,
@@ -153,6 +154,8 @@ class HistoryStore:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
             if "pid" not in columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN pid INTEGER NOT NULL DEFAULT 0")
+            if "rebuild_reason" not in columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN rebuild_reason TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_SECONDS)
@@ -169,9 +172,9 @@ class HistoryStore:
                 """
                 INSERT OR REPLACE INTO runs (
                     run_id, project_id, trigger, server_version, git_revision,
-                    model_id, schema_version, scan_config_hash, force, pid,
-                    started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model_id, schema_version, scan_config_hash, force, rebuild_reason,
+                    pid, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     audit.run_id,
@@ -183,6 +186,7 @@ class HistoryStore:
                     audit.schema_version,
                     audit.scan_config_hash,
                     int(audit.force),
+                    audit.rebuild_reason,
                     int(audit.pid),
                     audit.started_at,
                 ),
@@ -338,6 +342,7 @@ def _row_to_audit(row: sqlite3.Row) -> RunAudit:
         schema_version=row["schema_version"],
         scan_config_hash=row["scan_config_hash"],
         force=bool(row["force"]),
+        rebuild_reason=row["rebuild_reason"],
         pid=row["pid"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],

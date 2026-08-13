@@ -27,7 +27,7 @@ from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
 from code_indexing_mcp.models import ExtractionResult
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner
-from code_indexing_mcp.storage import LanceStore
+from code_indexing_mcp.storage import LanceStore, _quoted
 
 
 class RecordingEmbedder:
@@ -261,9 +261,14 @@ def test_indexer_batches_chunks_across_changed_files(tmp_path: Path) -> None:
     assert len(embedder.passage_batches[0]) == 2
     tables = store._existing_tables(project.id)
     assert tables is not None
-    rows = tables.chunks.search().select(["path", "embedding_text", "vector"]).to_list()
+    rows = tables.chunks.search().select(["path", "identifier_terms", "vector"]).to_list()
     assert {row["path"] for row in rows} == {"a.py", "b.py"}
-    assert all(row["vector"][0] == float(len(row["embedding_text"]) % 7) for row in rows)
+    assert all(row["identifier_terms"] for row in rows)
+    # The embedding text is transient (never persisted); the committed vectors
+    # must still be the embedder's own output for the texts it was given.
+    embedded_first = {float(len(text) % 7) for batch in embedder.passage_batches for text in batch}
+    stored_first = {row["vector"][0] for row in rows}
+    assert stored_first == embedded_first
 
 
 def test_cross_file_batch_failure_only_rejects_its_own_file(tmp_path: Path) -> None:
@@ -356,6 +361,28 @@ def test_failed_changed_file_preserves_previous_generation(tmp_path: Path) -> No
     assert store.list_reference_records(project.id) == original_references
     # The no-op run must not clear the error it did not heal.
     assert store.list_files(project.id)[0].has_errors is True
+
+
+def test_reindexing_changed_content_retires_the_previous_chunk_id(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    previous = store.list_chunks([project.id])[0]
+
+    # Keep offsets stable so content identity is the only reason the stale id
+    # must be retired.
+    source.write_text("def answer():\n    return 43\n")
+    indexer.index(project)
+
+    current = store.list_chunks([project.id])[0]
+    assert current.chunk_id != previous.chunk_id
+    assert store.get_chunk(previous.chunk_id) is None
+    fetched = store.get_chunk(current.chunk_id)
+    assert fetched is not None and fetched.content.endswith("43")
 
 
 def test_failed_changed_file_retains_previous_references_on_extraction_failure(
@@ -589,21 +616,23 @@ def test_reference_backfill_retries_an_incomplete_parse(tmp_path: Path) -> None:
 
 
 def _assert_chunk_content_hashes_match_files(store: LanceStore, project_id: str) -> None:
-    """Divergence tripwire (S1): for every file that is *not* in a known-failed
-    state, its committed chunks' content_hash must equal the files row's
-    content_hash. A failed file legitimately keeps stale chunks under an
-    advanced hash (the non-destructive failure path), but a healthy file with
-    mismatched chunk/file hashes is exactly the silent corruption S1 caused --
-    catch it here instead of relying on coverage bookkeeping to self-report it.
+    """Divergence tripwire (S1), post-slim-schema form.
+
+    Chunk rows no longer carry a content hash (it lives on the files table),
+    but structural coverage rows do. A failed file legitimately keeps its
+    previous generation's coverage, and the files row keeps that same
+    generation's hash, so the comparison holds for failed files too -- a
+    mismatch is exactly the silent corruption S1 caused, caught without
+    relying on coverage bookkeeping to self-report it.
     """
     files_by_id = {record.file_id: record for record in store.list_files(project_id)}
-    for chunk in store.list_chunks([project_id]):
-        record = files_by_id.get(chunk.file_id)
-        if record is None or record.has_errors:
+    for coverage in store.reference_coverage(project_id):
+        record = files_by_id.get(coverage["file_id"])
+        if record is None:
             continue
-        assert chunk.content_hash == record.content_hash, (
-            f"chunk {chunk.chunk_id} for {record.path} was staged for content_hash "
-            f"{chunk.content_hash!r} but the files row now reports "
+        assert coverage["content_hash"] == record.content_hash, (
+            f"coverage for {record.path} was staged for content_hash "
+            f"{coverage['content_hash']!r} but the files row now reports "
             f"{record.content_hash!r}"
         )
 
@@ -1049,7 +1078,10 @@ def test_store_keeps_projects_isolated_and_removal_does_not_touch_markers(
     store.remove_project(projects[0].id)
 
     assert {project.id for project in store.list_projects()} == {projects[1].id}
-    assert {chunk.project_id for chunk in store.list_chunks()} == {projects[1].id}
+    # list_chunks no longer carries project_id on chunk rows; the surviving
+    # project's chunks are identifiable by their routing prefix.
+    assert len(store.list_chunks()) == 1
+    assert store.list_chunks()[0].chunk_id.startswith(f"{projects[1].id}:")
     assert (projects[0].root / ".ci-mcp" / "project.toml").exists()
 
 
@@ -1184,7 +1216,7 @@ def test_windowed_chunk_offsets_still_slice_the_original_source(tmp_path: Path) 
         assert chunk.end_line == chunk.start_line + chunk.content.count("\n")
 
 
-def test_every_window_keeps_the_context_header_and_identifier_tail(tmp_path: Path) -> None:
+def test_every_window_keeps_the_identifier_tail(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
     # Bytes, not text: write_text translates "\n" to "\r\n" on Windows, and
@@ -1198,12 +1230,14 @@ def test_every_window_keeps_the_context_header_and_identifier_tail(tmp_path: Pat
     indexer.index(project)
     chunks = store.list_chunks([project.id])
 
-    for chunk in chunks:
-        assert chunk.embedding_text.startswith("language: python\npath: main.py\n")
-        assert "symbol: answer" in chunk.embedding_text
-        assert chunk.embedding_text.endswith(chunk.content)
-        assert chunk.search_text.startswith(chunk.embedding_text)
-        assert chunk.search_text.endswith("main py answer answer")
+    # The identifier terms are not recomputed per window: every window of the
+    # chunk carries the same normalized path and symbol tail, so camelCase and
+    # snake_case symbol queries keep matching every part of a windowed chunk.
+    # The embedding context header is transient (it feeds the embedder, not
+    # storage), so only the persisted tail is observable here.
+    assert chunks
+    assert all(chunk.identifier_terms == "main py answer answer" for chunk in chunks)
+    assert all(chunk.content for chunk in chunks)
 
 
 def test_windows_cover_the_symbol_without_dropping_source(tmp_path: Path) -> None:
@@ -1245,7 +1279,13 @@ def test_a_chunk_within_the_budget_is_stored_unchanged(tmp_path: Path) -> None:
 
     def comparable(store: LanceStore) -> list[tuple[object, ...]]:
         return sorted(
-            (chunk.chunk_id, chunk.start_byte, chunk.end_byte, chunk.content, chunk.search_text)
+            (
+                chunk.chunk_id,
+                chunk.start_byte,
+                chunk.end_byte,
+                chunk.content,
+                chunk.identifier_terms,
+            )
             for chunk in store.list_chunks([project.id])
         )
 
@@ -1608,3 +1648,180 @@ def test_a_backfill_with_nothing_missing_leaves_no_audit_row(tmp_path: Path) -> 
     assert report.files_backfilled == 0
     page = history.list_runs(project.id)
     assert [run.trigger for run in page.runs] == ["manual"]
+
+
+class OtherModelEmbedder(RecordingEmbedder):
+    """The same vector shape under a different model id and different values.
+
+    The first component is offset so a rebuild is observable: an index that
+    failed to re-embed would keep the old generation's vectors.
+    """
+
+    model_id = "test/other"
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        return [[float(len(text) % 7) + 1.0, 1.0, 2.0, 3.0] for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return [float(len(text) % 7) + 1.0, 1.0, 2.0, 3.0]
+
+
+def make_indexer_on(
+    tmp_path: Path,
+    store: LanceStore,
+    embedder: RecordingEmbedder,
+    *,
+    history: HistoryStore | None = None,
+) -> Indexer:
+    return Indexer(
+        store=store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=embedder,
+        lock_directory=tmp_path / "locks",
+        history=history,
+    )
+
+
+def test_index_rebuilds_a_partition_written_by_an_incompatible_model(
+    tmp_path: Path,
+) -> None:
+    """A different embedding model rebuilds the partition instead of failing."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    first = make_indexer_on(tmp_path, store, RecordingEmbedder())
+    second = make_indexer_on(tmp_path, store, OtherModelEmbedder())
+
+    first.index(project)
+    assert store.project_state(project.id) == "ready"
+    old_chunk = store.list_chunks([project.id])[0]
+    tables = store._existing_tables(project.id)
+    assert tables is not None
+    old_vector = (
+        tables.chunks.search()
+        .where(f"chunk_id = {_quoted(old_chunk.chunk_id)}")
+        .select(["vector"])
+        .to_list()[0]["vector"]
+    )
+    assert store.incompatibility_reason(project.id, "test/other") is not None
+
+    report = second.index(project)
+
+    assert report.trigger == "schema-rebuild"
+    assert store.incompatibility_reason(project.id, "test/other") is None
+    assert store.project_state(project.id) == "ready"
+    rebuilt = store.list_chunks([project.id])
+    assert len(rebuilt) == 1
+    # Chunk ids are content-derived, so they survive a model rebuild; the
+    # vectors must not, or the rebuild never re-embedded anything.
+    assert rebuilt[0].chunk_id == old_chunk.chunk_id
+    tables = store._existing_tables(project.id)
+    assert tables is not None
+    new_vector = (
+        tables.chunks.search()
+        .where(f"chunk_id = {_quoted(old_chunk.chunk_id)}")
+        .select(["vector"])
+        .to_list()[0]["vector"]
+    )
+    assert new_vector[0] == old_vector[0] + 1.0
+
+
+def test_a_rebuild_records_its_reason_and_trigger_in_the_audit_history(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    history = HistoryStore(tmp_path / "history")
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    first = make_indexer_on(tmp_path, store, RecordingEmbedder())
+    second = make_indexer_on(tmp_path, store, OtherModelEmbedder(), history=history)
+    first.index(project)
+
+    second.index(project)
+
+    page = history.list_runs(project.id)
+    rebuild = next(run for run in page.runs if run.trigger == "schema-rebuild")
+    assert rebuild.rebuild_reason is not None
+    assert "embedding model" in rebuild.rebuild_reason
+    assert rebuild.state == "completed"
+
+
+def test_a_failed_rebuild_preserves_registration_and_recovers(tmp_path: Path) -> None:
+    """A rebuild failure must never drop the registration or the marker."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    first = make_indexer_on(tmp_path, store, RecordingEmbedder())
+    second = make_indexer_on(tmp_path, store, OtherModelEmbedder())
+    first.index(project)
+
+    with (
+        patch.object(
+            SourceScanner,
+            "iter_scan",
+            side_effect=RuntimeError("rebuild boom"),
+        ),
+        pytest.raises(RuntimeError, match="rebuild boom"),
+    ):
+        second.index(project)
+
+    assert store.list_projects() == [project]
+    assert (root / ".ci-mcp" / "project.toml").exists()
+    # The partition was deleted before the failed run; the project must be
+    # recoverable by a plain re-run, not stuck behind a permanent error.
+    assert store.project_state(project.id) == "error"
+    assert store.list_chunks([project.id]) == []
+
+    healed = second.index(project)
+    assert healed.errors == []
+    assert len(store.list_chunks([project.id])) == 1
+    assert store.project_state(project.id) == "ready"
+
+
+def test_backfill_delegates_a_rebuild_for_an_incompatible_partition(
+    tmp_path: Path,
+) -> None:
+    """A parse-only backfill cannot heal an incompatible partition; it must
+    rebuild it with a full embedding run first."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    history = HistoryStore(tmp_path / "history")
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    first = make_indexer_on(tmp_path, store, RecordingEmbedder())
+    second = make_indexer_on(tmp_path, store, OtherModelEmbedder(), history=history)
+    first.index(project)
+
+    report = second.backfill_references(project)
+
+    assert report.complete is True
+    assert report.files_current == 1
+    assert report.files_backfilled == 0
+    assert store.incompatibility_reason(project.id, "test/other") is None
+    page = history.list_runs(project.id)
+    assert any(run.trigger == "schema-rebuild" for run in page.runs)
+
+
+def test_rebuild_backfill_reports_unparseable_files_as_incomplete(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "valid.py").write_text("def answer():\n    return 42\n")
+    (root / "broken.py").write_text("def broken(:\n    pass\n")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    first = make_indexer_on(tmp_path, store, RecordingEmbedder())
+    second = make_indexer_on(tmp_path, store, OtherModelEmbedder())
+    first.index(project)
+
+    report = second.backfill_references(project)
+
+    assert report.files_current == 1
+    assert report.incomplete_paths == ["broken.py"]

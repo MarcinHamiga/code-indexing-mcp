@@ -1239,6 +1239,7 @@ class Application:
         roots: list[Path] | None = None,
     ) -> SearchResponse:
         project_ids = self.resolve_search_scope(projects, all_projects, roots)
+        self._ensure_query_generations(project_ids, roots)
         return self.search.search_code(
             query,
             project_ids,
@@ -1259,15 +1260,20 @@ class Application:
         roots: list[Path] | None = None,
     ) -> SymbolResponse:
         resolved = self.resolve_project(project, roots)
+        self._ensure_query_generations([resolved.id], roots)
         return self.search.find_symbol(name, resolved.id, match=match, kinds=kinds, limit=limit)
 
     def file_outline(
         self, path: str, project: str | None = None, *, roots: list[Path] | None = None
     ) -> OutlineResponse:
         resolved = self.resolve_project(project, roots)
+        self._ensure_query_generations([resolved.id], roots)
         return self.search.file_outline(path, resolved.id)
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
+        project_id = self.store._chunk_project_id(chunk_id)
+        if project_id is not None:
+            self._ensure_query_generations([project_id], None)
         return self.search.get_chunk(chunk_id)
 
     def _prepare_reference_query(
@@ -1280,8 +1286,26 @@ class Application:
             selector = selector.model_copy(update={"project": resolved.id})
             project_id = resolved.id
         else:
-            project_id = self.search.get_chunk(selector.chunk_id or "").project_id
+            chunk_project_id = self.store._chunk_project_id(selector.chunk_id or "")
+            if chunk_project_id is None:
+                # Preserve the established CHUNK_NOT_FOUND error contract for
+                # malformed and retired chunk ids.
+                self.search.get_chunk(selector.chunk_id or "")
+                raise AssertionError("get_chunk unexpectedly returned without a project id")
+            project_id = chunk_project_id
+        self._ensure_query_generations([project_id], roots)
         return selector, self.ensure_reference_index(project_id, roots=roots)
+
+    def _ensure_query_generations(self, project_ids: list[str], roots: list[Path] | None) -> None:
+        """Rebuild incompatible partitions before any query can observe them."""
+        for project_id in project_ids:
+            if self.store.incompatibility_reason(project_id, self.embedder.model_id) is not None:
+                self.index_project(
+                    project_id,
+                    roots=roots,
+                    wait_for_lock=True,
+                    trigger="lazy-query",
+                )
 
     def find_references(
         self,
@@ -1293,9 +1317,10 @@ class Application:
         roots: list[Path] | None = None,
     ) -> ReferenceResponse:
         selector, report = self._prepare_reference_query(selector, roots)
-        return self.references.find_references(
-            selector, kinds=kinds, limit=limit, cursor=cursor, backfill=report
-        )
+        with self.store.partition_access(report.project_id):
+            return self.references.find_references(
+                selector, kinds=kinds, limit=limit, cursor=cursor, backfill=report
+            )
 
     def analyze_refactor(
         self,
@@ -1307,9 +1332,10 @@ class Application:
         roots: list[Path] | None = None,
     ) -> RefactorAnalysis:
         selector, report = self._prepare_reference_query(selector, roots)
-        return self.references.analyze_refactor(
-            selector, operation, limit=limit, cursor=cursor, backfill=report
-        )
+        with self.store.partition_access(report.project_id):
+            return self.references.analyze_refactor(
+                selector, operation, limit=limit, cursor=cursor, backfill=report
+            )
 
     def prepare_model(self) -> None:
         if not isinstance(self.embedder, FastEmbedder):
@@ -1329,8 +1355,10 @@ class Application:
         A brand-new project starts in the "pending" state. An already-known
         project keeps its current state (e.g. "ready" is not reset back to
         "pending"), but the upsert still runs so LanceStore.upsert_project can
-        apply its compatibility checks (incompatible embedding model/schema,
-        or a project id already active at another root).
+        apply its compatibility checks. A project whose stored generation was
+        written by an incompatible embedding model or schema version is marked
+        "rebuild_required" rather than rejected: registration and discovery
+        keep working, and the next index run rebuilds the partition.
         """
         known = {existing.id for existing in self.store.list_projects()}
         state = self.store.project_state(project.id) if project.id in known else "pending"

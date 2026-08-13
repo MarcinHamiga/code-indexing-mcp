@@ -536,11 +536,14 @@ class IndexedChunk(FrozenModel):
 
     Read paths that only need chunk text and offsets use this so a whole project's
     768-float vectors are not decoded into Python lists for no consumer.
+
+    Mirrors the chunk row: project_id is not stored on it because the owning
+    partition knows it. content_hash stays on the row so a chunk response is
+    always one coherent generation, even while a files-table update commits.
     """
 
     chunk_id: str
     file_id: str
-    project_id: str
     path: str
     language: str
     kind: str
@@ -552,10 +555,9 @@ class IndexedChunk(FrozenModel):
     start_line: int
     end_line: int
     content: str
-    embedding_text: str
-    search_text: str
-    content_hash: str
+    identifier_terms: str
     part_index: int = 0
+    content_hash: str = ""
 
 
 class StoredChunk(IndexedChunk):
@@ -751,7 +753,9 @@ class CodeChunk(FrozenModel):
     768-dimension vector and both derived text columns to MCP clients: 72% of the
     response was the vector, and the code arrived three times over as content,
     embedding_text, and search_text. Adding a storage column must not silently
-    widen this payload, so the fields are listed rather than inherited.
+    widen this payload, so the fields are listed rather than inherited. Chunk
+    rows no longer persist project_id or content_hash either: both are injected
+    by the read path from the owning partition and the files table.
     """
 
     chunk_id: str
@@ -793,6 +797,9 @@ class RunAudit(FrozenModel):
     schema_version: int = 0
     scan_config_hash: str = ""
     force: bool = False
+    # Why a schema-rebuild run replaced its partition (model or schema
+    # mismatch, for example). None for ordinary runs.
+    rebuild_reason: str | None = None
     # Owning process, so startup can tell a crashed run from one another live
     # process is still executing.
     pid: int = Field(default_factory=os.getpid)
