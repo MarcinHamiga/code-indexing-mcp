@@ -35,6 +35,24 @@ def same_project_root(left: Path, right: Path) -> bool:
         return left.resolve() == right.resolve()
 
 
+def rooted_under(parent: Path, child: Path) -> bool:
+    """Return whether *child* names a directory strictly inside *parent*.
+
+    The boundary directory is compared with ``samefile`` rather than string
+    equality, so differently-cased spellings of one directory (common on macOS
+    and Windows) count as containment exactly like ``same_project_root``
+    counts them as equality. Both paths must be resolved; a missing boundary
+    directory means no containment.
+    """
+    if len(child.parts) <= len(parent.parts):
+        return False
+    boundary = Path(*child.parts[: len(parent.parts)])
+    try:
+        return boundary.samefile(parent)
+    except OSError:
+        return False
+
+
 def project_root_identity(root: Path) -> str:
     """Return a cross-process identity for an existing project directory."""
     resolved = root.expanduser().resolve()

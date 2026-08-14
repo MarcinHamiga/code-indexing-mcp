@@ -54,9 +54,7 @@ class SearchBenchmarkApplication(Protocol):
 
     def index_project(self, project: str, *, force: bool = False) -> IndexReport: ...
 
-    def search_code(
-        self, query: str, *, projects: list[str], limit: int = 8
-    ) -> SearchResponse: ...
+    def search_code(self, query: str, *, projects: list[str], limit: int = 8) -> SearchResponse: ...
 
 
 def write_benchmark_corpus(root: Path, *, files: int = 128, functions_per_file: int = 2) -> int:
@@ -333,7 +331,7 @@ def _run_in_workspace(
     result.update(
         {
             "model_id": app.embedder.model_id,
-            "embedding_backend": "cpu",
+            "embedding_backend": app.effective_backend_selection.descriptor.accelerator.value,
             "embedding_batch_size": batch_size,
             "corpus": {
                 "files": files,
@@ -425,7 +423,7 @@ def run_search_benchmark_command(
         result.update(
             {
                 "model_id": app.embedder.model_id,
-                "embedding_backend": "cpu",
+                "embedding_backend": app.effective_backend_selection.descriptor.accelerator.value,
                 "revision": update_check.checkout_head(Path(__file__).resolve().parents[2]),
             }
         )
@@ -434,15 +432,11 @@ def run_search_benchmark_command(
     if work_dir is not None:
         workspace = work_dir.expanduser().resolve()
         workspace.mkdir(parents=True, exist_ok=True)
-        if any(
-            (workspace / name).exists() for name in ("corpus", "data", "project_000")
-        ):
+        if any((workspace / name).exists() for name in ("corpus", "data", "project_000")):
             raise CodeIndexingError(
                 ErrorCode.INVALID_CONFIGURATION,
                 f"Benchmark work directory is not fresh: {workspace}",
             )
         return _run(workspace)
-    with tempfile.TemporaryDirectory(
-        prefix="code-indexing-mcp-search-benchmark-"
-    ) as temporary:
+    with tempfile.TemporaryDirectory(prefix="code-indexing-mcp-search-benchmark-") as temporary:
         return _run(Path(temporary))

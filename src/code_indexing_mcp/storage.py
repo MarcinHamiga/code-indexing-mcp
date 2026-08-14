@@ -41,7 +41,7 @@ from .models import (
     StoredFile,
     TableStorageStats,
 )
-from .projects import existing_marker_path, same_project_root
+from .projects import existing_marker_path, rooted_under, same_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +289,10 @@ def overlapping_registration(projects: Iterable[ProjectInfo], root: Path) -> Pro
     """Return an existing project whose root equals, contains, or nests in *root*.
 
     Every overlap kind indexes the same sources twice, so registration checks
-    all three. Detection only: rejecting a new overlap is the registration
+    all three. Containment goes through rooted_under, whose samefile boundary
+    check makes a differently-cased spelling of one directory count as overlap
+    on case-insensitive filesystems, matching how same_project_root treats
+    equality. Detection only: rejecting a new overlap is the registration
     layer's decision, and existing overlapping registrations stay valid.
     """
     root = root.expanduser().resolve()
@@ -297,14 +300,8 @@ def overlapping_registration(projects: Iterable[ProjectInfo], root: Path) -> Pro
         existing = project.root.expanduser().resolve()
         if same_project_root(existing, root):
             return project
-        try:
-            existing.relative_to(root)
-        except ValueError:
-            try:
-                root.relative_to(existing)
-            except ValueError:
-                continue
-        return project
+        if rooted_under(root, existing) or rooted_under(existing, root):
+            return project
     return None
 
 

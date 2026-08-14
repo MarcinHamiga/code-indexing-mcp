@@ -25,6 +25,7 @@ from code_indexing_mcp.models import (
     RenameOperation,
     SearchHit,
 )
+from code_indexing_mcp.projects import existing_marker_path
 from code_indexing_mcp.settings import IndexSettings
 from code_indexing_mcp.token_batching import DEFAULT_MAX_TOKEN_PRODUCT, REFERENCE_MEMORY_BYTES
 from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher
@@ -338,6 +339,29 @@ def test_init_project_rejects_a_root_nested_inside_a_registered_project(
 
     assert raised.value.code is ErrorCode.OVERLAPPING_PROJECT
     assert app.list_projects() == [parent]
+
+
+def test_init_project_rejecting_an_overlap_writes_no_marker(tmp_path: Path) -> None:
+    """A rejected registration must leave nothing for discovery to pick up.
+
+    If the overlap check ran after marker creation, the orphaned marker would
+    let a later discover_project call register exactly the registration the
+    user just rejected.
+    """
+    root = tmp_path / "repo"
+    nested = root / "src"
+    nested.mkdir(parents=True)
+    app = _overlap_application(tmp_path)
+    app.init_project(root)
+
+    with pytest.raises(CodeIndexingError):
+        app.init_project(nested)
+
+    assert existing_marker_path(nested) is None
+    # The rejected root still initializes cleanly once overlap is allowed.
+    child = app.init_project(nested, allow_overlap=True)
+    assert existing_marker_path(nested) is not None
+    assert child.root == nested.resolve()
 
 
 def test_init_project_rejects_a_root_containing_a_registered_project(

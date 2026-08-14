@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -1272,6 +1273,28 @@ def test_overlapping_registration_detects_exact_nested_and_parent_roots(tmp_path
     assert overlapping_registration([parent], nested) == parent
     assert overlapping_registration([child], root) == child
     assert overlapping_registration([parent, child], sibling) is None
+
+
+def test_overlapping_registration_matches_case_insensitive_aliases(
+    tmp_path: Path, case_insensitive_path_alias: Callable[[Path], Path]
+) -> None:
+    """Containment must agree with same_project_root on case-insensitive filesystems.
+
+    same_project_root already treats /Repo and /repo as one directory; without
+    a samefile-based containment check, a nested registration under a
+    differently-cased spelling would silently skip overlap detection.
+    """
+    root = tmp_path / "repo"
+    nested = root / "src"
+    nested.mkdir(parents=True)
+    alias = case_insensitive_path_alias(root)
+
+    def project(project_id: str, path: Path) -> ProjectInfo:
+        return ProjectInfo(id=project_id, name=project_id, root=path)
+
+    registered = project("parent", alias)
+    assert overlapping_registration([registered], nested) is registered
+    assert overlapping_registration([project("child", nested)], alias) is not None
 
 
 def test_worktree_warnings_share_a_git_common_directory(tmp_path: Path) -> None:

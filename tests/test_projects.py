@@ -17,6 +17,7 @@ from code_indexing_mcp.projects import (
     initialize_project,
     project_root_identity,
     read_project_marker,
+    rooted_under,
     same_project_root,
 )
 
@@ -177,3 +178,34 @@ def test_resolver_reuses_registered_project_for_case_insensitive_path_alias(
 
     assert resolved == project
     assert resolved.root == root.resolve()
+
+
+def test_rooted_under_reports_strict_nesting_only(tmp_path: Path) -> None:
+    parent = tmp_path / "repo"
+    child = parent / "src"
+    sibling = tmp_path / "other"
+    parent.mkdir()
+    child.mkdir()
+    sibling.mkdir()
+    resolved_parent = parent.resolve()
+    resolved_child = child.resolve()
+
+    assert rooted_under(resolved_parent, resolved_child) is True
+    assert rooted_under(resolved_child, resolved_parent) is False
+    assert rooted_under(resolved_parent, resolved_parent) is False
+    assert rooted_under(resolved_parent, sibling.resolve()) is False
+    # Containment verifies the boundary directory, not the child itself: a
+    # missing path whose boundary is a different directory stays unknown.
+    assert rooted_under(resolved_parent, sibling / "missing") is False
+    assert rooted_under(resolved_parent, parent / "missing" / "deep") is True
+
+
+def test_rooted_under_accepts_a_case_insensitive_parent_spelling(
+    tmp_path: Path, case_insensitive_path_alias: Callable[[Path], Path]
+) -> None:
+    parent = tmp_path / "repo"
+    child = parent / "src"
+    child.mkdir(parents=True)
+    alias = case_insensitive_path_alias(parent)
+
+    assert rooted_under(alias.resolve(), child.resolve()) is True
