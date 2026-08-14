@@ -463,6 +463,36 @@ async def test_search_across_projects_preserves_ambiguous_selector_error(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_init_project_rejects_overlap_unless_allow_overlap_is_set(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    nested = root / "src"
+    nested.mkdir(parents=True)
+    app = _tiny_application(tmp_path)
+    app.init_project(root)
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        rejected = await client.call_tool("init_project", {"path": str(nested)})
+        allowed = await client.call_tool(
+            "init_project", {"path": str(nested), "allow_overlap": True}
+        )
+
+    assert rejected.isError
+    message = "".join(
+        block.text for block in rejected.content if isinstance(block, types.TextContent)
+    )
+    assert ErrorCode.OVERLAPPING_PROJECT.value in message
+    assert not allowed.isError
+    assert allowed.structuredContent is not None
+    assert allowed.structuredContent["name"] == "src"
+
+
+@pytest.mark.asyncio
 async def test_lazy_search_across_projects_refreshes_projects_outside_active_roots(
     tmp_path: Path,
 ) -> None:
@@ -1718,7 +1748,14 @@ async def test_index_project_reports_file_counts_while_it_runs(
 
     assert not result.isError
     assert reports[0][2] == "Indexing project"
-    assert any("files" in (message or "") for _, _, message in reports[1:-1]), reports
+    # Mid-run visibility, not a specific phase: the scan phase can complete
+    # between two polls on a fast runner, so "Scanning for changed files" is
+    # not guaranteed to be sampled. Any live snapshot carrying candidate or
+    # file counts proves the bar showed what the run was doing.
+    assert any(
+        "files" in (message or "") or "candidates" in (message or "")
+        for _, _, message in reports[1:-1]
+    ), reports
     assert [value for value, _, _ in reports] == sorted(value for value, _, _ in reports)
     assert "chunks embedded" in (reports[-1][2] or "")
 

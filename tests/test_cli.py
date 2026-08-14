@@ -24,6 +24,65 @@ def test_cli_initializes_and_lists_projects(tmp_path: Path, monkeypatch, capsys)
     assert [project["id"] for project in projects] == [init_result["id"]]
 
 
+def test_cli_init_rejects_a_nested_root_without_allow_overlap(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = tmp_path / "repo"
+    nested = root / "src"
+    nested.mkdir(parents=True)
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        cli,
+        "Application",
+        lambda paths, cwd: Application(paths, embedder=_TinyEmbedder(), cwd=cwd),
+    )
+
+    assert main(["init", str(root)]) == 0
+    capsys.readouterr()
+    assert main(["init", str(nested)]) == 2
+    assert "OVERLAPPING_PROJECT" in capsys.readouterr().err
+    assert main(["init", str(nested), "--allow-overlap"]) == 0
+    nested_project = json.loads(capsys.readouterr().out)
+    assert nested_project["name"] == "src"
+
+
+def test_cli_runs_the_search_benchmark_with_machine_readable_output(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    received: dict[str, object] = {}
+
+    def fake_benchmark(**kwargs: object) -> dict[str, object]:
+        received.update(kwargs)
+        return {"schema_version": 1, "scopes": {"1": {}}}
+
+    monkeypatch.setattr(cli, "run_search_benchmark_command", fake_benchmark)
+    work_dir = tmp_path / "benchmark"
+
+    assert (
+        main(
+            [
+                "benchmark",
+                "search",
+                "--projects",
+                "50",
+                "--iterations",
+                "3",
+                "--work-dir",
+                str(work_dir),
+            ]
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out)["schema_version"] == 1
+    assert received["projects"] == 50
+    assert received["iterations"] == 3
+    assert received["work_dir"] == work_dir
+
+
 def test_cli_runs_the_index_benchmark_with_machine_readable_output(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:  # type: ignore[no-untyped-def]

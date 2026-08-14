@@ -4,8 +4,10 @@ import benchmark_index_memory
 
 from code_indexing_mcp.benchmark import (
     REPEATED_EDITS,
+    SEARCH_ITERATIONS,
     _duration_summary,
     run_index_benchmark,
+    run_search_benchmark,
     write_benchmark_corpus,
 )
 from code_indexing_mcp.models import (
@@ -13,6 +15,8 @@ from code_indexing_mcp.models import (
     MaintenanceReport,
     ProjectInfo,
     ProjectStorageStats,
+    SearchHit,
+    SearchResponse,
     StorageStatus,
     TableStorageStats,
 )
@@ -270,3 +274,87 @@ def test_the_benchmark_leaves_no_inherited_ceiling_behind(monkeypatch) -> None: 
 
     assert "CODE_INDEXING_EMBED_MEMORY_MB" not in environment
     assert "CODE_INDEXING_INDEX_MEMORY_MB" not in environment
+
+
+class SearchBenchmarkApplication:
+    def __init__(self) -> None:
+        self.init_calls: list[Path] = []
+        self.search_calls: list[int] = []
+
+    def init_project(self, path: Path) -> ProjectInfo:
+        self.init_calls.append(path)
+        return ProjectInfo(id=f"id-{path.name}", name=path.name, root=path)
+
+    def index_project(self, project: str, *, force: bool = False) -> IndexReport:
+        assert force is True
+        return IndexReport(project_id=project, duration_ms=1)
+
+    def search_code(self, query: str, *, projects: list[str], limit: int = 8) -> SearchResponse:
+        self.search_calls.append(len(projects))
+        return SearchResponse(
+            query=query,
+            hits=[
+                SearchHit(
+                    chunk_id=f"chunk-{index}",
+                    project_id=projects[index % len(projects)],
+                    project_name=projects[index % len(projects)],
+                    path="mod.py",
+                    language="python",
+                    kind="function",
+                    start_line=index,
+                    end_line=index,
+                    score=1.0 - index * 0.01,
+                    snippet="",
+                )
+                for index in range(min(limit, len(projects)))
+            ],
+        )
+
+
+class FlakySearchBenchmarkApplication(SearchBenchmarkApplication):
+    def search_code(self, query: str, *, projects: list[str], limit: int = 8) -> SearchResponse:
+        response = super().search_code(query, projects=projects, limit=limit)
+        if len(self.search_calls) % 2 == 0:
+            response = SearchResponse(query=response.query, hits=list(reversed(response.hits)))
+        return response
+
+
+def test_search_benchmark_measures_one_eight_and_fifty_project_scopes(
+    tmp_path: Path,
+) -> None:
+    roots = [tmp_path / f"p{index}" for index in range(50)]
+    app = SearchBenchmarkApplication()
+
+    payload = run_search_benchmark(app, roots)
+
+    assert payload["schema_version"] == 1
+    assert payload["projects"] == 50
+    assert list(payload["scopes"]) == ["1", "8", "50"]
+    for scope in ("1", "8", "50"):
+        scenario = payload["scopes"][scope]
+        assert scenario["projects"] == int(scope)
+        assert scenario["latency_ms"]["count"] == SEARCH_ITERATIONS
+        assert scenario["deterministic"] is True
+        assert len(scenario["top_hits"]) == min(int(scope), 8)
+    # Every scope times its iterations and then pins ordering twice more.
+    assert app.search_calls == [1] * 5 + [8] * 5 + [50] * 5
+
+
+def test_search_benchmark_caps_scopes_to_available_projects(tmp_path: Path) -> None:
+    app = SearchBenchmarkApplication()
+
+    payload = run_search_benchmark(app, [tmp_path / f"p{index}" for index in range(3)])
+
+    assert list(payload["scopes"]) == ["1", "3"]
+    assert payload["scopes"]["3"]["projects"] == 3
+
+
+def test_search_benchmark_reports_non_deterministic_ranking(tmp_path: Path) -> None:
+    app = FlakySearchBenchmarkApplication()
+
+    payload = run_search_benchmark(app, [tmp_path / "p0", tmp_path / "p1"], iterations=1)
+
+    # The two-project scope flips its hit order between the pinning runs, so the
+    # scenario must report the ranking as non-deterministic rather than silently
+    # publishing the last run's order.
+    assert payload["scopes"]["2"]["deterministic"] is False

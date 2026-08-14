@@ -70,6 +70,7 @@ from .probe_cache import ProbeCache, ProbeKey, ProbeRecord, model_artifact_finge
 from .progress import IndexProgress, read_progress
 from .projects import (
     ProjectResolver,
+    existing_marker_path,
     find_project_root,
     initialize_project,
     project_root_identity,
@@ -81,7 +82,7 @@ from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
 from .staging import has_pending_recovery, recover_staged_commits
-from .storage import LanceStore, overlap_warnings, worktree_warnings
+from .storage import LanceStore, overlap_warnings, overlapping_registration, worktree_warnings
 from .token_batching import max_token_product_for
 from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
@@ -627,6 +628,7 @@ class Application:
         path: Path | str | None = None,
         name: str | None = None,
         force_new_id: bool = False,
+        allow_overlap: bool = False,
         *,
         roots: list[Path] | None = None,
     ) -> ProjectInfo:
@@ -644,9 +646,33 @@ class Application:
         root = Path(path) if path is not None else self.cwd
         # The daemon serves every client on its own thread, so N clients calling
         # this for one root would otherwise all miss the marker and register N
-        # ids for the same project. Marker creation and registration are one
-        # critical section, keyed the same way as discovery.
-        with self._root_lock(root):
+        # ids for the same project. The root lock keys this the same way as
+        # discovery; the registration lock additionally serializes overlapping
+        # roots, which the per-root lock cannot: two concurrent init calls for a
+        # parent and its nested directory must not both pass the overlap check.
+        # The check runs before initialize_project so a rejected registration
+        # never writes a marker that discovery would later register anyway.
+        with self._root_lock(root), self._registration_lock():
+            resolved = root.expanduser().resolve()
+            if not allow_overlap and not force_new_id:
+                existing = overlapping_registration(self.store.list_projects(), resolved)
+                if existing is not None:
+                    marker = (
+                        read_project_marker(resolved)
+                        if existing_marker_path(resolved) is not None
+                        else None
+                    )
+                    # A marker whose id already matches the overlapping project
+                    # is a re-initialization of that project, not a new overlap.
+                    if marker is None or marker.id != existing.id:
+                        raise CodeIndexingError(
+                            ErrorCode.OVERLAPPING_PROJECT,
+                            f"Project root {resolved} overlaps the registered root "
+                            f"{existing.root} of project {existing.id!r}; pass "
+                            "allow_overlap=true to register it anyway",
+                            existing_project=existing.id,
+                            new_project=None if marker is None else marker.id,
+                        )
             project = initialize_project(root, name=name, force_new_id=force_new_id)
             self._register_project(project)
             self.invalidate_freshness(project.id)
@@ -1348,6 +1374,19 @@ class Application:
         directory.mkdir(parents=True, exist_ok=True)
         digest = sha256(project_root_identity(root).encode()).hexdigest()
         return FileLock(directory / f"discover-{digest}.lock")
+
+    def _registration_lock(self) -> FileLock:
+        """Return the lock serializing overlap checks and registration.
+
+        The root lock only guards one root at a time, but overlap is a
+        cross-root property: without this lock, concurrent init calls for a
+        parent directory and its nested child would both observe the
+        pre-registration state and both register. Always acquired after a root
+        lock, never before, so lock ordering stays deadlock-free.
+        """
+        directory = self.paths.data / "locks"
+        directory.mkdir(parents=True, exist_ok=True)
+        return FileLock(directory / "registration.lock")
 
     def _register_project(self, project: ProjectInfo) -> None:
         """Persist *project*, upserting as pending if new or revalidating if known.

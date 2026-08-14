@@ -777,7 +777,9 @@ def create_server(
             ".ci-mcp/project.toml marker, which holds a checkout-local id and the scan "
             "configuration. Returns the project id, name, root, and scan settings. Building the "
             "index is a separate operation (index_project). Re-running on an already-initialized "
-            "directory returns the existing project unless force_new_id is set."
+            "directory returns the existing project unless force_new_id is set. A new "
+            "registration whose root equals, contains, or is nested inside an existing "
+            "project's root is rejected unless allow_overlap is true."
         ),
         annotations=_INITIALIZES,
     )
@@ -806,6 +808,16 @@ def create_server(
                 )
             ),
         ] = False,
+        allow_overlap: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Register even when the directory equals, contains, or is nested inside "
+                    "the root of an already registered project, which would index the same "
+                    "sources twice. Set true only for an intentional duplicate registration."
+                )
+            ),
+        ] = False,
     ) -> ProjectInfo:
         roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(
@@ -813,6 +825,7 @@ def create_server(
             path,
             name,
             force_new_id,
+            allow_overlap,
             roots=roots,
         )
 
