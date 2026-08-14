@@ -13,13 +13,28 @@ from typing import Any, Protocol
 from . import update_check
 from .application import Application, RuntimePaths
 from .errors import CodeIndexingError, ErrorCode
-from .models import IndexReport, MaintenanceReport, ProjectInfo, StorageStatus
+from .models import (
+    IndexReport,
+    MaintenanceReport,
+    ProjectInfo,
+    SearchResponse,
+    StorageStatus,
+)
 from .settings import IndexSettings
 
 # The repeated_edits scenario applies this many consecutive edits to one file,
 # indexing after each one, so per-edit write amplification shows up as version
 # growth over a meaningful sample.
 REPEATED_EDITS = 100
+
+# Multi-project search scope sizes the search benchmark measures: one, eight,
+# and fifty partitions. With fewer projects available the benchmark measures
+# every achievable scope instead.
+SEARCH_SCOPES = (1, 8, 50)
+
+# How many times each search scope is timed. Search latency is noisy per run,
+# so every scope is a small sample, never a single point estimate.
+SEARCH_ITERATIONS = 3
 
 
 class IndexBenchmarkApplication(Protocol):
@@ -32,6 +47,16 @@ class IndexBenchmarkApplication(Protocol):
     def maintain_storage(
         self, project: str | None = None, *, wait_for_lock: bool = False
     ) -> MaintenanceReport: ...
+
+
+class SearchBenchmarkApplication(Protocol):
+    def init_project(self, path: Path) -> ProjectInfo: ...
+
+    def index_project(self, project: str, *, force: bool = False) -> IndexReport: ...
+
+    def search_code(
+        self, query: str, *, projects: list[str], limit: int = 8
+    ) -> SearchResponse: ...
 
 
 def write_benchmark_corpus(root: Path, *, files: int = 128, functions_per_file: int = 2) -> int:
@@ -228,6 +253,61 @@ def _unlink_if_present(path: Path) -> int:
     return 1
 
 
+def run_search_benchmark(
+    app: SearchBenchmarkApplication,
+    roots: list[Path],
+    *,
+    iterations: int = SEARCH_ITERATIONS,
+    query: str = "function returns value",
+) -> dict[str, Any]:
+    """Measure hybrid-search latency for one, eight, and fifty project scopes.
+
+    Every achievable scope runs the same query repeatedly and then twice more
+    to pin the global hit ordering, so ranking determinism is observable next
+    to the latency: multi-project latency should approach the slowest
+    partition plus merge overhead, not the sum of every partition, and the
+    ordered hit list must be identical across runs.
+    """
+    if len(roots) < 1:
+        raise ValueError("the search benchmark needs at least one project")
+    if iterations < 1:
+        raise ValueError("the search benchmark needs at least one iteration")
+    project_ids: list[str] = []
+    for root in roots:
+        write_benchmark_corpus(root, files=2, functions_per_file=2)
+        project = app.init_project(root)
+        app.index_project(project.id, force=True)
+        project_ids.append(project.id)
+    scopes = sorted(
+        {scope for scope in SEARCH_SCOPES if scope <= len(project_ids)} | {len(project_ids)}
+    )
+    scenarios: dict[str, dict[str, Any]] = {}
+    for scope in scopes:
+        selected = project_ids[:scope]
+        samples: list[float] = []
+        for _ in range(iterations):
+            started = time.monotonic_ns()
+            app.search_code(query, projects=selected, limit=8)
+            samples.append((time.monotonic_ns() - started) / 1_000_000)
+        first = app.search_code(query, projects=selected, limit=8)
+        second = app.search_code(query, projects=selected, limit=8)
+        scenarios[str(scope)] = {
+            "projects": len(selected),
+            "latency_ms": _duration_summary(samples),
+            "deterministic": [hit.chunk_id for hit in first.hits]
+            == [hit.chunk_id for hit in second.hits],
+            "top_hits": [
+                {
+                    "project_id": hit.project_id,
+                    "path": hit.path,
+                    "start_line": hit.start_line,
+                }
+                for hit in first.hits
+            ],
+        }
+    return {"schema_version": 1, "projects": len(project_ids), "query": query, "scopes": scenarios}
+
+
 def _run_in_workspace(
     paths: RuntimePaths,
     workspace: Path,
@@ -308,3 +388,61 @@ def run_index_benchmark_command(
             functions_per_file=functions_per_file,
             batch_size=batch_size,
         )
+
+
+def run_search_benchmark_command(
+    paths: RuntimePaths,
+    *,
+    projects: int,
+    iterations: int,
+    work_dir: Path | None,
+) -> dict[str, Any]:
+    """Create an isolated workspace of *projects* corpora and run the search benchmark."""
+    if not 1 <= projects <= 200:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "Benchmark project count must be from 1 to 200",
+        )
+    if not 1 <= iterations <= 20:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "Benchmark iterations must be from 1 to 20",
+        )
+
+    def _run(workspace: Path) -> dict[str, Any]:
+        settings = replace(
+            IndexSettings.from_environment(),
+            index_execution="in-process",
+            broker_mode="off",
+        )
+        app = Application(
+            RuntimePaths(data=workspace / "data", cache=paths.cache),
+            cwd=workspace,
+            settings=settings,
+        )
+        roots = [workspace / f"project_{index:03d}" for index in range(projects)]
+        result = run_search_benchmark(app, roots, iterations=iterations)
+        result.update(
+            {
+                "model_id": app.embedder.model_id,
+                "embedding_backend": "cpu",
+                "revision": update_check.checkout_head(Path(__file__).resolve().parents[2]),
+            }
+        )
+        return result
+
+    if work_dir is not None:
+        workspace = work_dir.expanduser().resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        if any(
+            (workspace / name).exists() for name in ("corpus", "data", "project_000")
+        ):
+            raise CodeIndexingError(
+                ErrorCode.INVALID_CONFIGURATION,
+                f"Benchmark work directory is not fresh: {workspace}",
+            )
+        return _run(workspace)
+    with tempfile.TemporaryDirectory(
+        prefix="code-indexing-mcp-search-benchmark-"
+    ) as temporary:
+        return _run(Path(temporary))

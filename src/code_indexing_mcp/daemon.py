@@ -493,6 +493,7 @@ class BrokerApplication:
         path: Path | str | None = None,
         name: str | None = None,
         force_new_id: bool = False,
+        allow_overlap: bool = False,
         *,
         roots: list[Path] | None = None,
     ) -> ProjectInfo:
@@ -502,6 +503,7 @@ class BrokerApplication:
                 path=path,
                 name=name,
                 force_new_id=force_new_id,
+                allow_overlap=allow_overlap,
                 roots=roots or [],
             )
         )

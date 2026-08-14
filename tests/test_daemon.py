@@ -92,6 +92,32 @@ def test_broker_application_calls_one_daemon_backend(tmp_path: Path) -> None:
 
 
 @requires_local_sockets
+def test_broker_forwards_allow_overlap_to_the_daemon(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    daemon = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=daemon.serve, daemon=True)
+    thread.start()
+    assert daemon.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+    root = tmp_path / "repo"
+    nested = root / "src"
+    nested.mkdir(parents=True)
+
+    try:
+        parent = broker.init_project(root)
+        with pytest.raises(CodeIndexingError) as raised:
+            broker.init_project(nested)
+        assert raised.value.code is ErrorCode.OVERLAPPING_PROJECT
+        child = broker.init_project(nested, allow_overlap=True)
+        assert {project.id for project in broker.list_projects()} == {parent.id, child.id}
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
+@requires_local_sockets
 def test_broker_forwards_refactor_pagination_parameters(tmp_path: Path) -> None:
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     root = tmp_path / "repo"

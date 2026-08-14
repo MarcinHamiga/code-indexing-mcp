@@ -81,7 +81,7 @@ from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
 from .staging import has_pending_recovery, recover_staged_commits
-from .storage import LanceStore, overlap_warnings, worktree_warnings
+from .storage import LanceStore, overlap_warnings, overlapping_registration, worktree_warnings
 from .token_batching import max_token_product_for
 from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
@@ -627,6 +627,7 @@ class Application:
         path: Path | str | None = None,
         name: str | None = None,
         force_new_id: bool = False,
+        allow_overlap: bool = False,
         *,
         roots: list[Path] | None = None,
     ) -> ProjectInfo:
@@ -644,10 +645,21 @@ class Application:
         root = Path(path) if path is not None else self.cwd
         # The daemon serves every client on its own thread, so N clients calling
         # this for one root would otherwise all miss the marker and register N
-        # ids for the same project. Marker creation and registration are one
-        # critical section, keyed the same way as discovery.
+        # ids for the same project. Marker creation, overlap rejection, and
+        # registration are one critical section, keyed the same way as discovery.
         with self._root_lock(root):
             project = initialize_project(root, name=name, force_new_id=force_new_id)
+            if not allow_overlap and not force_new_id:
+                existing = overlapping_registration(self.store.list_projects(), project.root)
+                if existing is not None and existing.id != project.id:
+                    raise CodeIndexingError(
+                        ErrorCode.OVERLAPPING_PROJECT,
+                        f"Project root {project.root} overlaps the registered root "
+                        f"{existing.root} of project {existing.id!r}; pass allow_overlap=true "
+                        "to register it anyway",
+                        existing_project=existing.id,
+                        new_project=project.id,
+                    )
             self._register_project(project)
             self.invalidate_freshness(project.id)
         return project

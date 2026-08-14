@@ -316,6 +316,116 @@ def test_init_project_defaults_to_the_single_client_root(tmp_path: Path) -> None
     assert project.root == root.resolve()
 
 
+def _overlap_application(tmp_path: Path) -> Application:
+    return Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+
+
+def test_init_project_rejects_a_root_nested_inside_a_registered_project(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    nested = root / "src"
+    nested.mkdir(parents=True)
+    app = _overlap_application(tmp_path)
+    parent = app.init_project(root)
+
+    with pytest.raises(CodeIndexingError) as raised:
+        app.init_project(nested)
+
+    assert raised.value.code is ErrorCode.OVERLAPPING_PROJECT
+    assert app.list_projects() == [parent]
+
+
+def test_init_project_rejects_a_root_containing_a_registered_project(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    nested = root / "src"
+    nested.mkdir(parents=True)
+    app = _overlap_application(tmp_path)
+    child = app.init_project(nested)
+
+    with pytest.raises(CodeIndexingError) as raised:
+        app.init_project(root)
+
+    assert raised.value.code is ErrorCode.OVERLAPPING_PROJECT
+    assert app.list_projects() == [child]
+
+
+def test_init_project_allows_a_nested_registration_when_allow_overlap_is_set(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    nested = root / "src"
+    nested.mkdir(parents=True)
+    app = _overlap_application(tmp_path)
+    parent = app.init_project(root)
+
+    child = app.init_project(nested, allow_overlap=True)
+
+    assert {project.id for project in app.list_projects()} == {parent.id, child.id}
+    warnings = app.storage_status().overlap_warnings
+    assert len(warnings) == 1
+    assert "contains the root" in warnings[0] or "nested inside" in warnings[0]
+
+
+def test_reinitializing_the_same_root_keeps_one_registration(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    app = _overlap_application(tmp_path)
+
+    project = app.init_project(root)
+    again = app.init_project(root)
+
+    assert again.id == project.id
+    assert app.list_projects() == [project]
+
+
+def test_force_new_id_replaces_a_registration_without_allow_overlap(tmp_path: Path) -> None:
+    """force_new_id is itself explicit intent to replace this directory's project."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    app = _overlap_application(tmp_path)
+
+    original = app.init_project(root)
+    replacement = app.init_project(root, force_new_id=True)
+
+    assert replacement.id != original.id
+    assert replacement.root == original.root
+
+
+def test_discovery_keeps_registering_roots_that_overlap(tmp_path: Path) -> None:
+    """Automatic MCP-root discovery has no allow_overlap flag, so it registers.
+
+    Existing overlapping registrations must remain usable; the resulting
+    overlap is advisory and surfaced through storage_status warnings.
+    """
+    root = tmp_path / "repo"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    for directory in (root, nested):
+        (directory / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+        (directory / "main.py").write_text("value = 1\n")
+    app = _overlap_application(tmp_path)
+
+    # Discovering the nested root first registers it while no marker exists
+    # above it; the parent root has no marker of its own, so it registers
+    # separately and the overlap stands.
+    first = app.discover_project(nested)
+    second = app.discover_project(root)
+
+    assert first is not None
+    assert second is not None
+    assert len(app.list_projects()) == 2
+    warnings = app.storage_status().overlap_warnings
+    assert len(warnings) == 1
+    assert "contains the root" in warnings[0] or "nested inside" in warnings[0]
+
+
 def test_case_insensitive_root_alias_is_one_registration_and_one_lock(
     tmp_path: Path, case_insensitive_path_alias: Callable[[Path], Path]
 ) -> None:

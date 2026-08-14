@@ -101,6 +101,39 @@ def test_hybrid_search_projects_result_columns(tmp_path: Path) -> None:
     assert "search_text" not in rows[0]
 
 
+def test_multi_project_search_is_deterministic_across_concurrent_runs(
+    tmp_path: Path,
+) -> None:
+    """Five partitions run through the bounded pool and merge identically every run."""
+    embedder = SemanticEmbedder()
+    store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
+    indexer = Indexer(
+        store=store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=embedder,
+        lock_directory=tmp_path / "locks",
+    )
+    project_ids: list[str] = []
+    for index in range(5):
+        root = tmp_path / f"p{index}"
+        root.mkdir()
+        (root / "mod.py").write_text(f"def feature_{index}(user):\n    return user.is_admin\n")
+        project = initialize_project(root)
+        project_ids.append(project.id)
+        indexer.index(project)
+    search = SearchService(store, embedder)
+
+    baseline = search.search_code("permissions", project_ids)
+    for _ in range(3):
+        repeated = search.search_code("permissions", project_ids)
+        assert [hit.chunk_id for hit in repeated.hits] == [hit.chunk_id for hit in baseline.hits]
+        assert [hit.score for hit in repeated.hits] == [hit.score for hit in baseline.hits]
+
+    assert len(baseline.hits) == 5
+    assert {hit.project_id for hit in baseline.hits} == set(project_ids)
+
+
 def test_symbol_lookup_and_outline_use_indexed_metadata(tmp_path: Path) -> None:
     _, search, projects = indexed_projects(tmp_path)
 

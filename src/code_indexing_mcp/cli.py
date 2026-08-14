@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import __version__, update_check
 from .application import Application, RuntimePaths
-from .benchmark import run_index_benchmark_command
+from .benchmark import run_index_benchmark_command, run_search_benchmark_command
 from .daemon import (
     BrokerApplication,
     DaemonServer,
@@ -66,6 +66,14 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("path", nargs="?")
     init.add_argument("--name")
     init.add_argument("--force-new-id", action="store_true")
+    init.add_argument(
+        "--allow-overlap",
+        action="store_true",
+        help=(
+            "register even when the directory equals, contains, or is nested inside the root "
+            "of an already registered project"
+        ),
+    )
     index = commands.add_parser("index", help="Incrementally index a project")
     index.add_argument("project", nargs="?")
     index.add_argument("--force", action="store_true")
@@ -126,6 +134,12 @@ def _parser() -> argparse.ArgumentParser:
     benchmark_index.add_argument("--functions-per-file", type=int, default=2)
     benchmark_index.add_argument("--batch-size", type=int, default=8)
     benchmark_index.add_argument("--work-dir", type=Path, default=None)
+    benchmark_search = benchmark_commands.add_parser(
+        "search", help="Measure hybrid search across one, eight, and fifty project scopes"
+    )
+    benchmark_search.add_argument("--projects", type=int, default=50)
+    benchmark_search.add_argument("--iterations", type=int, default=3)
+    benchmark_search.add_argument("--work-dir", type=Path, default=None)
     daemon = commands.add_parser("daemon", help="Manage the shared indexing daemon")
     daemon_commands = daemon.add_subparsers(dest="daemon_command", required=True)
     daemon_commands.add_parser("run", help=argparse.SUPPRESS)
@@ -334,6 +348,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(_json(benchmark_result))
             return 0
+        if args.command == "benchmark" and args.benchmark_command == "search":
+            benchmark_result = run_search_benchmark_command(
+                paths=paths,
+                projects=args.projects,
+                iterations=args.iterations,
+                work_dir=args.work_dir,
+            )
+            print(_json(benchmark_result))
+            return 0
         if args.command == "configure":
             # Lazy import: the installer package is never on the serve path, and
             # Textual is only imported when the wizard actually opens.
@@ -404,7 +427,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         app = Application(paths, cwd=Path.cwd())
         result: BaseModel | Sequence[BaseModel] | dict[str, Any]
         if args.command == "init":
-            result = app.init_project(args.path, args.name, args.force_new_id)
+            result = app.init_project(
+                args.path, args.name, args.force_new_id, allow_overlap=args.allow_overlap
+            )
         elif args.command == "index":
             printer = _ProgressPrinter(sys.stderr)
             try:

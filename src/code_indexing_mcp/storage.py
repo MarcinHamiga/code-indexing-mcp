@@ -13,6 +13,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -57,6 +58,11 @@ MINIMUM_OVERFETCH = 200
 # has ever indexed. Sixteen covers the projects one developer works across while
 # keeping the ceiling independent of how many they have registered.
 MAX_CACHED_PARTITIONS = 16
+
+# Upper bound on how many partitions one hybrid query reads at once. More
+# concurrency than this has not shown a latency win in benchmarks and raises
+# contention on the shared partition cache, so the pool stays small and bounded.
+_SEARCH_CONCURRENCY = 8
 
 # Columns get_chunk reads. The vector and the identifier-terms column are
 # excluded: nothing outside indexing and ranking can use them, and reading them
@@ -277,6 +283,29 @@ def overlap_warnings(projects: Iterable[ProjectInfo]) -> list[str]:
                 f"project {right.id!r} ({right_resolved})"
             )
     return warnings
+
+
+def overlapping_registration(projects: Iterable[ProjectInfo], root: Path) -> ProjectInfo | None:
+    """Return an existing project whose root equals, contains, or nests in *root*.
+
+    Every overlap kind indexes the same sources twice, so registration checks
+    all three. Detection only: rejecting a new overlap is the registration
+    layer's decision, and existing overlapping registrations stay valid.
+    """
+    root = root.expanduser().resolve()
+    for project in projects:
+        existing = project.root.expanduser().resolve()
+        if same_project_root(existing, root):
+            return project
+        try:
+            existing.relative_to(root)
+        except ValueError:
+            try:
+                root.relative_to(existing)
+            except ValueError:
+                continue
+        return project
+    return None
 
 
 def worktree_warnings(
@@ -952,56 +981,87 @@ class LanceStore:
         condition: str | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for project_id in project_ids:
-            tables = self._existing_tables(project_id)
-            if tables is None:
-                continue
-            # MultiMatchQuery spans the two single-column FTS indexes (content
-            # and identifier_terms); a plain string would silently search only
-            # one of them whenever both exist.
-            query = (
-                tables.chunks.search(query_type="hybrid", vector_column_name="vector")
-                .vector(vector)
-                .text(
-                    MultiMatchQuery(
-                        query_text,
-                        ["content", "identifier_terms"],
-                        boosts=None,
-                        operator=FullTextOperator.OR,
+        ids = list(project_ids)
+        if not ids:
+            return []
+        # Independent partitions are read concurrently through a small bounded
+        # pool, so a multi-project query costs the slowest partition plus the
+        # merge rather than the sum of every partition. Results are reassembled
+        # in request order so relevance-score ties break exactly as the
+        # sequential implementation did.
+        results: dict[int, list[dict[str, Any]]] = {}
+        if len(ids) == 1:
+            results[0] = self._hybrid_search_rows(ids[0], query_text, vector, condition, limit)
+        else:
+            workers = min(len(ids), _SEARCH_CONCURRENCY)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    index: pool.submit(
+                        self._hybrid_search_rows, project_id, query_text, vector, condition, limit
                     )
-                )
-            )
-            if condition:
-                query = query.where(condition, prefilter=True)
-            query = (
-                query.limit(limit)
-                .select(
-                    [
-                        "chunk_id",
-                        "path",
-                        "language",
-                        "kind",
-                        "symbol",
-                        "qualified_symbol",
-                        "parent_symbol",
-                        "start_line",
-                        "end_line",
-                        "content",
-                    ]
-                )
-                .rerank()
-            )
-            if self.vector_index == "exact":
-                query = query.bypass_vector_index()
-            # project_id is not stored on chunk rows; it belongs to the
-            # partition being searched, so it is injected per project.
-            query_rows = cast(list[dict[str, Any]], query.to_list())
-            for row in query_rows:
-                row["project_id"] = project_id
-            rows.extend(query_rows)
+                    for index, project_id in enumerate(ids)
+                }
+                for index, future in futures.items():
+                    results[index] = future.result()
+        rows = [row for index in range(len(ids)) for row in results.get(index, [])]
         rows.sort(key=lambda row: float(row.get("_relevance_score", 0.0)), reverse=True)
         return rows[:limit]
+
+    def _hybrid_search_rows(
+        self,
+        project_id: str,
+        query_text: str,
+        vector: list[float],
+        condition: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Run the hybrid query for one partition, injecting its project id."""
+        tables = self._existing_tables(project_id)
+        if tables is None:
+            return []
+        # MultiMatchQuery spans the two single-column FTS indexes (content
+        # and identifier_terms); a plain string would silently search only
+        # one of them whenever both exist.
+        query = (
+            tables.chunks.search(query_type="hybrid", vector_column_name="vector")
+            .vector(vector)
+            .text(
+                MultiMatchQuery(
+                    query_text,
+                    ["content", "identifier_terms"],
+                    boosts=None,
+                    operator=FullTextOperator.OR,
+                )
+            )
+        )
+        if condition:
+            query = query.where(condition, prefilter=True)
+        query = (
+            query.limit(limit)
+            .select(
+                [
+                    "chunk_id",
+                    "path",
+                    "language",
+                    "kind",
+                    "symbol",
+                    "qualified_symbol",
+                    "parent_symbol",
+                    "start_line",
+                    "end_line",
+                    "content",
+                ]
+            )
+            .rerank()
+        )
+        if self.vector_index == "exact":
+            query = query.bypass_vector_index()
+        # project_id is not stored on chunk rows; it belongs to the
+        # partition being searched, so it is injected per project.
+        query_rows = cast(list[dict[str, Any]], query.to_list())
+        for row in query_rows:
+            row["project_id"] = project_id
+        return query_rows
 
     def find_symbol_chunks(
         self,
