@@ -1748,7 +1748,14 @@ async def test_index_project_reports_file_counts_while_it_runs(
 
     assert not result.isError
     assert reports[0][2] == "Indexing project"
-    assert any("files" in (message or "") for _, _, message in reports[1:-1]), reports
+    # Mid-run visibility, not a specific phase: the scan phase can complete
+    # between two polls on a fast runner, so "Scanning for changed files" is
+    # not guaranteed to be sampled. Any live snapshot carrying candidate or
+    # file counts proves the bar showed what the run was doing.
+    assert any(
+        "files" in (message or "") or "candidates" in (message or "")
+        for _, _, message in reports[1:-1]
+    ), reports
     assert [value for value, _, _ in reports] == sorted(value for value, _, _ in reports)
     assert "chunks embedded" in (reports[-1][2] or "")
 
