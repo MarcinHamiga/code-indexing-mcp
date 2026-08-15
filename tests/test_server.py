@@ -1791,7 +1791,7 @@ async def test_index_storage_status_tool_reports_installation_statistics(tmp_pat
     # layer and leave the tool free to serialize an empty or malformed body.
     for result in (scoped, installation):
         payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
-        assert payload["schema_version"] == 1
+        assert payload["schema_version"] == 2
         assert payload["registry"]["name"] == "projects"
         assert payload["registry"]["row_count"] == 1
         assert payload["registry"]["logical_bytes"] > 0
@@ -1828,7 +1828,7 @@ async def test_index_storage_maintenance_tool_defaults_to_dry_run(tmp_path: Path
     assert not installation.isError
     for result in (scoped, installation):
         payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
-        assert payload["schema_version"] == 1
+        assert payload["schema_version"] == 2
         assert payload["dry_run"] is True
         assert payload["trigger"] == "manual"
         assert payload["retention_hours"] == 24

@@ -37,6 +37,7 @@ def test_catalog_covers_exactly_the_documented_settings() -> None:
         "CODE_INDEXING_EMBED_ACCELERATOR",
         "CODE_INDEXING_AUTO_MAINTENANCE",
         "CODE_INDEXING_VERSION_RETENTION_HOURS",
+        "CODE_INDEXING_BRANCH_CACHE_LIMIT",
     }
 
 
@@ -81,6 +82,12 @@ def test_index_mode_help_describes_continuous_eager_monitoring() -> None:
         ("CODE_INDEXING_DATA_DIR", "", False),
         ("CODE_INDEXING_EMBED_ACCELERATOR", "coreml", True),
         ("CODE_INDEXING_EMBED_ACCELERATOR", "tpu", False),
+        ("CODE_INDEXING_BRANCH_CACHE_LIMIT", "1", True),
+        ("CODE_INDEXING_BRANCH_CACHE_LIMIT", "4", True),
+        ("CODE_INDEXING_BRANCH_CACHE_LIMIT", "32", True),
+        ("CODE_INDEXING_BRANCH_CACHE_LIMIT", "0", False),
+        ("CODE_INDEXING_BRANCH_CACHE_LIMIT", "33", False),
+        ("CODE_INDEXING_BRANCH_CACHE_LIMIT", "four", False),
     ],
 )
 def test_validate(name: str, raw: str, ok: bool) -> None:

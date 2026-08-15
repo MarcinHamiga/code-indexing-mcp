@@ -244,6 +244,17 @@ SETTINGS: tuple[Setting, ...] = (
         minimum=1,
         maximum=24 * 30,
     ),
+    Setting(
+        "CODE_INDEXING_BRANCH_CACHE_LIMIT",
+        "Maintenance",
+        "Branch cache limit",
+        "How many per-branch index slots a project keeps, counting the active one, before the "
+        "least recently used is evicted; protected slots can exceed it temporarily.",
+        "int",
+        "4",
+        minimum=1,
+        maximum=32,
+    ),
 )
 
 BY_NAME: dict[str, Setting] = {setting.name: setting for setting in SETTINGS}

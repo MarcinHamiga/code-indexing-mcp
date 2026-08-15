@@ -476,7 +476,7 @@ def test_cli_reports_storage_status_as_json(  # type: ignore[no-untyped-def]
     assert main(["storage", "status", str(root)]) == 0
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["registry"]["row_count"] == 1
     assert len(payload["projects"]) == 1
     assert payload["projects"][0]["consistent"] is True
@@ -522,7 +522,7 @@ def test_cli_storage_vacuum_is_dry_run_by_default(  # type: ignore[no-untyped-de
     assert main(["storage", "vacuum", str(root)]) == 0
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["dry_run"] is True
     assert payload["trigger"] == "manual"
     entry = payload["projects"][0]

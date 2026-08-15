@@ -990,7 +990,7 @@ def test_storage_status_reports_registry_project_and_totals(tmp_path: Path) -> N
 
     status = app.storage_status()
 
-    assert status.schema_version == 1
+    assert status.schema_version == 2
     assert status.consistent is True
     assert status.overlap_warnings == []
     assert status.worktree_warnings == []

@@ -270,3 +270,32 @@ def test_version_retention_has_a_bounded_maximum(monkeypatch: pytest.MonkeyPatch
         IndexSettings.from_environment()
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+
+
+def test_branch_cache_limit_defaults_to_four_slots() -> None:
+    settings = IndexSettings.from_environment({})
+
+    assert settings.branch_cache_limit == 4
+
+
+def test_branch_cache_limit_is_configurable() -> None:
+    settings = IndexSettings.from_environment({"CODE_INDEXING_BRANCH_CACHE_LIMIT": "12"})
+
+    assert settings.branch_cache_limit == 12
+
+
+def test_branch_cache_limit_keeps_at_least_the_active_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A limit below one would evict the active slot itself."""
+    monkeypatch.setenv("CODE_INDEXING_BRANCH_CACHE_LIMIT", "0")
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment()
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+
+
+def test_branch_cache_limit_has_a_bounded_maximum(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODE_INDEXING_BRANCH_CACHE_LIMIT", "33")
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment()
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION

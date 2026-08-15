@@ -553,7 +553,7 @@ def test_broker_application_dispatches_storage_status(tmp_path: Path) -> None:
 
     status = broker.storage_status(project.id)
 
-    assert status.schema_version == 1
+    assert status.schema_version == 2
     assert status.registry.row_count == 1
     assert [entry.project.id for entry in status.projects] == [project.id]
     assert status.projects[0].consistent is True
