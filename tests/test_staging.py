@@ -455,7 +455,7 @@ def test_a_file_that_now_extracts_no_chunks_has_its_old_chunks_deleted(
     assert store.count_chunks([project.id]) == 1
 
     files = pa.RecordBatch.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema())
-    empty = pa.Table.from_batches([], schema=LanceStore.chunk_arrow_schema(4))
+    empty = pa.Table.from_batches([], schema=LanceStore.chunk_arrow_schema(4, store.vector_dtype))
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_batches([files]),
@@ -819,7 +819,9 @@ def test_upgrade_recovery_rolls_back_a_legacy_two_table_journal(tmp_path: Path) 
     store.upsert_project(project, model_id="test/model")
     database = lancedb.connect(store.directory / "projects" / project.id)
     files = database.create_table("files", schema=LanceStore.file_arrow_schema())
-    chunks = database.create_table("chunks", schema=LanceStore.chunk_arrow_schema(4))
+    chunks = database.create_table(
+        "chunks", schema=LanceStore.chunk_arrow_schema(4, store.vector_dtype)
+    )
     original_file = StoredFile(
         file_id="file-1",
         project_id=project.id,

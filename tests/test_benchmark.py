@@ -4,6 +4,7 @@ import benchmark_index_memory
 import numpy as np
 import pytest
 
+from code_indexing_mcp.application import RuntimePaths
 from code_indexing_mcp.benchmark import (
     REPEATED_EDITS,
     RETRIEVAL_TOPICS,
@@ -13,9 +14,11 @@ from code_indexing_mcp.benchmark import (
     build_retrieval_corpus,
     run_index_benchmark,
     run_precision_benchmark,
+    run_precision_benchmark_command,
     run_search_benchmark,
     write_benchmark_corpus,
 )
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.models import (
     IndexReport,
     MaintenanceReport,
@@ -418,6 +421,24 @@ def test_retrieval_corpus_is_deterministic_with_sound_judgments() -> None:
 def test_retrieval_corpus_rejects_too_few_passages() -> None:
     with pytest.raises(ValueError):
         build_retrieval_corpus(passages=len(RETRIEVAL_TOPICS) - 1)
+
+
+def test_precision_command_rejects_passages_below_the_corpus_minimum(tmp_path: Path) -> None:
+    # The command must reject what build_retrieval_corpus cannot build with
+    # the same INVALID_CONFIGURATION error every other bad CLI value raises,
+    # not a bare ValueError traceback.
+    with pytest.raises(CodeIndexingError) as caught:
+        run_precision_benchmark_command(
+            paths=RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+            passages=len(RETRIEVAL_TOPICS) - 1,
+            iterations=1,
+            recall_floor=0.99,
+            rank_floor=0.95,
+            work_dir=None,
+        )
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+    assert str(len(RETRIEVAL_TOPICS)) in str(caught.value)
 
 
 def test_precision_experiment_contract_and_self_consistency(tmp_path: Path) -> None:

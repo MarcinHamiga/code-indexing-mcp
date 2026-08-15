@@ -795,10 +795,10 @@ def run_precision_benchmark_command(
     work_dir: Path | None,
 ) -> dict[str, Any]:
     """Create an isolated workspace and run the vector-precision benchmark."""
-    if not 1 <= passages <= 100_000:
+    if not len(RETRIEVAL_TOPICS) <= passages <= 100_000:
         raise CodeIndexingError(
             ErrorCode.INVALID_CONFIGURATION,
-            "Benchmark passage count must be from 1 to 100000",
+            f"Benchmark passage count must be from {len(RETRIEVAL_TOPICS)} to 100000",
         )
     if not 1 <= iterations <= 20:
         raise CodeIndexingError(

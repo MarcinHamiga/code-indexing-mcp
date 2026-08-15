@@ -494,6 +494,10 @@ class LanceStore:
         mismatch is returned as a reason rather than raised as the hard
         ``INDEX_INCOMPATIBLE`` failure it used to be. A pending registration
         has no live rows to describe, so it is never incompatible.
+
+        The model, dimension, and schema-version comparisons are registry-only;
+        the dtype comparison is authoritative only on the partition's own
+        chunk-table schema, so it opens the partition on disk when one exists.
         """
         rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
         if not rows:
@@ -1281,8 +1285,7 @@ class LanceStore:
         )
 
     @staticmethod
-    def _chunk_schema(vector_dimension: int, vector_dtype: pa.DataType | None = None) -> pa.Schema:
-        dtype = pa.float16() if vector_dtype is None else vector_dtype
+    def _chunk_schema(vector_dimension: int, vector_dtype: pa.DataType) -> pa.Schema:
         return pa.schema(
             [
                 ("chunk_id", pa.string()),
@@ -1307,7 +1310,7 @@ class LanceStore:
                 ("part_index", pa.int32()),
                 (
                     "vector",
-                    pa.list_(dtype, vector_dimension),
+                    pa.list_(vector_dtype, vector_dimension),
                 ),
             ]
         )
@@ -1474,9 +1477,7 @@ class LanceStore:
         return LanceStore._file_schema()
 
     @staticmethod
-    def chunk_arrow_schema(
-        vector_dimension: int, vector_dtype: pa.DataType | None = None
-    ) -> pa.Schema:
+    def chunk_arrow_schema(vector_dimension: int, vector_dtype: pa.DataType) -> pa.Schema:
         return LanceStore._chunk_schema(vector_dimension, vector_dtype)
 
     @staticmethod

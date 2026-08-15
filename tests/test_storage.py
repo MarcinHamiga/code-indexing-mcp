@@ -168,7 +168,9 @@ def test_removing_a_file_deletes_its_reference_rows(tmp_path: Path) -> None:
                 [record.file_id],
                 pa.Table.from_pylist(
                     [_stored_chunks(project.id, 1)[0].model_dump()],
-                    schema=LanceStore.chunk_arrow_schema(store.vector_dimension),
+                    schema=LanceStore.chunk_arrow_schema(
+                        store.vector_dimension, store.vector_dtype
+                    ),
                 ),
             )
         ],
@@ -1433,7 +1435,7 @@ def _chunk_table(project_id: str, file_id: str, count: int) -> pa.Table:
             }
             for index in range(count)
         ],
-        schema=LanceStore.chunk_arrow_schema(4),
+        schema=LanceStore.chunk_arrow_schema(4, pa.float16()),
     )
 
 
@@ -1485,7 +1487,7 @@ def test_an_entirely_empty_batch_deletes_its_files_previous_chunks(tmp_path: Pat
     )
     assert store.count_chunks([project.id]) == 2
 
-    empty = pa.Table.from_batches([], schema=LanceStore.chunk_arrow_schema(4))
+    empty = pa.Table.from_batches([], schema=LanceStore.chunk_arrow_schema(4, store.vector_dtype))
     store.replace_files_from_arrow(
         project.id,
         files=pa.Table.from_pylist(
