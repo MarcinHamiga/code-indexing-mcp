@@ -216,6 +216,7 @@ class Application:
             paths.data / "lancedb",
             vector_dimension=embedder.dimension,
             vector_index=self.settings.vector_index,
+            vector_storage=self.settings.vector_storage,
         )
         # Durable audit history for indexing runs. A process that died
         # mid-run left its row in "running"; every new process start is the

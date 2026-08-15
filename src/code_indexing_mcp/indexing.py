@@ -676,7 +676,9 @@ class Indexer:
                     self.staging_directory,
                     project.id,
                     file_schema=LanceStore.file_arrow_schema(),
-                    chunk_schema=LanceStore.chunk_arrow_schema(self.store.vector_dimension),
+                    chunk_schema=LanceStore.chunk_arrow_schema(
+                        self.store.vector_dimension, self.store.vector_dtype
+                    ),
                     reference_schema=LanceStore.reference_arrow_schema(),
                 )
                 job.begin()
@@ -882,7 +884,9 @@ class Indexer:
                 self.staging_directory,
                 project.id,
                 file_schema=LanceStore.file_arrow_schema(),
-                chunk_schema=LanceStore.chunk_arrow_schema(self.store.vector_dimension),
+                chunk_schema=LanceStore.chunk_arrow_schema(
+                    self.store.vector_dimension, self.store.vector_dtype
+                ),
                 reference_schema=LanceStore.reference_arrow_schema(),
             )
             state.job.begin()

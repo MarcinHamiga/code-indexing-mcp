@@ -1,12 +1,18 @@
 from pathlib import Path
 
 import benchmark_index_memory
+import numpy as np
+import pytest
 
 from code_indexing_mcp.benchmark import (
     REPEATED_EDITS,
+    RETRIEVAL_TOPICS,
     SEARCH_ITERATIONS,
+    _directory_physical_bytes,
     _duration_summary,
+    build_retrieval_corpus,
     run_index_benchmark,
+    run_precision_benchmark,
     run_search_benchmark,
     write_benchmark_corpus,
 )
@@ -358,3 +364,148 @@ def test_search_benchmark_reports_non_deterministic_ranking(tmp_path: Path) -> N
     # scenario must report the ranking as non-deterministic rather than silently
     # publishing the last run's order.
     assert payload["scopes"]["2"]["deterministic"] is False
+
+
+class TopicPrecisionEmbedder:
+    """Topic axis plus a deterministic within-topic jitter axis; no model.
+
+    Passages embed positionally exactly as ``build_retrieval_corpus`` assigns
+    topics, and queries embed onto their topic's axis, so the float32-exact
+    reference ranking is the topic's passages ordered by ascending jitter --
+    a ranking whose margins dwarf float16 rounding.
+    """
+
+    model_id = "test/precision"
+    dimension = 16
+
+    def _vector(self, topic: int, jitter: float) -> list[float]:
+        vector = np.zeros(self.dimension, dtype=np.float32)
+        vector[topic] = 1.0
+        vector[8 + topic] = jitter
+        return vector.tolist()
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        return [
+            self._vector(index % len(RETRIEVAL_TOPICS), ((index % 9) + 1) * 0.1)
+            for index in range(len(texts))
+        ]
+
+    def embed_query(self, text: str) -> list[float]:
+        lowered = text.lower()
+        topic = next(
+            index
+            for index, terms in enumerate(RETRIEVAL_TOPICS)
+            if any(term in lowered for term in terms)
+        )
+        return self._vector(topic, 0.0)
+
+
+def test_retrieval_corpus_is_deterministic_with_sound_judgments() -> None:
+    first_corpus, first_queries = build_retrieval_corpus(passages=40)
+    second_corpus, second_queries = build_retrieval_corpus(passages=40)
+
+    assert first_corpus == second_corpus
+    assert first_queries == second_queries
+    ids = {passage.chunk_id for passage in first_corpus}
+    assert len(ids) == 40
+    assert len(first_queries) == len(RETRIEVAL_TOPICS)
+    for query in first_queries:
+        assert query.text
+        assert query.relevant
+        assert set(query.relevant) <= ids
+
+
+def test_retrieval_corpus_rejects_too_few_passages() -> None:
+    with pytest.raises(ValueError):
+        build_retrieval_corpus(passages=len(RETRIEVAL_TOPICS) - 1)
+
+
+def test_precision_experiment_contract_and_self_consistency(tmp_path: Path) -> None:
+    report = run_precision_benchmark(
+        TopicPrecisionEmbedder(),
+        tmp_path,
+        passages=40,
+        top_k=5,
+        iterations=2,
+    )
+
+    assert report["schema_version"] == 1
+    assert set(report["variants"]) == {
+        "float32_exact",
+        "float32_hnsw_sq8",
+        "float16_exact",
+        "float16_hnsw_sq8",
+    }
+    assert report["corpus"]["passages"] == 40
+    assert report["corpus"]["queries"] == len(RETRIEVAL_TOPICS)
+    assert report["corpus"]["digest"]
+    assert report["lancedb_version"]
+    assert report["thresholds"] == {"recall_at_k": 0.99, "rank_correlation": 0.95}
+    # Flat float32 Lance search must reproduce the numpy float32 reference
+    # exactly: it is the same computation on the same numbers.
+    baseline = report["variants"]["float32_exact"]
+    assert baseline.get("error") is None
+    assert baseline["recall_at_k"] == pytest.approx(1.0)
+    assert baseline["rank_correlation"] == pytest.approx(1.0)
+    assert report["baseline_self_recall"] == pytest.approx(1.0)
+    for name in ("float32_exact", "float16_exact"):
+        variant = report["variants"][name]
+        assert variant.get("error") is None, name
+        assert variant["recall_at_k"] == pytest.approx(1.0), name
+        assert variant["rank_correlation"] == pytest.approx(1.0), name
+    # Every combination that ran reports the full cost picture; approximate
+    # indexes are measured, not assumed identical to the exact reference.
+    for name, variant in report["variants"].items():
+        if variant.get("error") is not None:
+            continue
+        assert variant["physical_bytes"] > 0, name
+        assert variant["post_optimize_bytes"] > 0, name
+        assert variant["table_build_ms"] >= 0, name
+        assert variant["index_build_ms"] >= 0, name
+        assert variant["hybrid_latency_ms"]["count"] == len(RETRIEVAL_TOPICS) * 2, name
+    # Gates evaluate the recorded thresholds, so the exact variants pass and
+    # every variant's gate matches its own measured numbers.
+    for name, gate in report["gates"].items():
+        variant = report["variants"][name]
+        if variant.get("error") is not None:
+            assert gate["recall_ok"] is False, name
+            assert gate["rank_ok"] is False, name
+            continue
+        assert gate["recall_ok"] == (variant["recall_at_k"] >= 0.99), name
+        assert gate["rank_ok"] == (variant["rank_correlation"] >= 0.95), name
+
+
+def test_precision_report_recomputes_float16_recall_independently(tmp_path: Path) -> None:
+    """The published recall must be the arithmetic it claims (T3 convention)."""
+    embedder = TopicPrecisionEmbedder()
+    report = run_precision_benchmark(embedder, tmp_path, passages=40, top_k=5, iterations=1)
+
+    corpus, queries = build_retrieval_corpus(passages=40)
+    passages = np.asarray(embedder.embed_passages([p.content for p in corpus]), dtype=np.float32)
+    query_vectors = np.asarray(
+        [embedder.embed_query(query.text) for query in queries], dtype=np.float32
+    )
+    normalized = passages / np.linalg.norm(passages, axis=1, keepdims=True)
+    expected = 0.0
+    for query_vector in query_vectors:
+        reference_order = np.argsort(-(query_vector @ normalized.T), kind="stable")[:5]
+        reference = {corpus[index].chunk_id for index in reference_order}
+        halved = passages.astype(np.float16).astype(np.float32)
+        halved_normalized = halved / np.linalg.norm(halved, axis=1, keepdims=True)
+        candidate_order = np.argsort(-(query_vector @ halved_normalized.T), kind="stable")[:5]
+        candidate = {corpus[index].chunk_id for index in candidate_order}
+        expected += len(reference & candidate) / 5
+    expected /= len(query_vectors)
+
+    assert report["variants"]["float16_exact"]["recall_at_k"] == pytest.approx(expected)
+
+
+def test_directory_physical_bytes_ignores_symlinks(tmp_path: Path) -> None:
+    measured = tmp_path / "measured"
+    measured.mkdir()
+    (measured / "real.bin").write_bytes(b"x" * 100)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"y" * 4096)
+    (measured / "link.bin").symlink_to(outside)
+
+    assert _directory_physical_bytes(measured) == 100

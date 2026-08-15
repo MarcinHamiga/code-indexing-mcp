@@ -135,6 +135,7 @@ class IndexSettings:
     embedding_threads: int
     embedding_cpu_arena: bool
     vector_index: str
+    vector_storage: str
     index_memory_bytes: int
     index_execution: str
     broker_mode: str
@@ -186,6 +187,11 @@ class IndexSettings:
         vector_index = environment.get("CODE_INDEXING_VECTOR_INDEX", "exact").lower()
         if vector_index not in {"exact", "hnsw"}:
             raise _configuration_error("CODE_INDEXING_VECTOR_INDEX", vector_index, "exact or hnsw")
+        vector_storage = environment.get("CODE_INDEXING_VECTOR_STORAGE", "float16").lower()
+        if vector_storage not in {"float32", "float16"}:
+            raise _configuration_error(
+                "CODE_INDEXING_VECTOR_STORAGE", vector_storage, "float32 or float16"
+            )
         execution = environment.get("CODE_INDEXING_INDEX_EXECUTION", "worker").lower()
         if execution not in {"worker", "in-process"}:
             raise _configuration_error(
@@ -236,6 +242,7 @@ class IndexSettings:
             ),
             embedding_cpu_arena=_boolean(environment, "CODE_INDEXING_EMBED_CPU_ARENA", False),
             vector_index=vector_index,
+            vector_storage=vector_storage,
             index_memory_bytes=_memory_bytes(environment, default_memory_mb),
             index_execution=execution,
             broker_mode=broker_mode,

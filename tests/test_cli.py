@@ -122,6 +122,48 @@ def test_cli_runs_the_index_benchmark_with_machine_readable_output(
     assert received["work_dir"] == work_dir
 
 
+def test_cli_runs_the_precision_benchmark_with_machine_readable_output(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    received: dict[str, object] = {}
+
+    def fake_benchmark(**kwargs: object) -> dict[str, object]:
+        received.update(kwargs)
+        return {"schema_version": 1, "variants": {}}
+
+    monkeypatch.setattr(cli, "run_precision_benchmark_command", fake_benchmark)
+    work_dir = tmp_path / "benchmark"
+
+    assert (
+        main(
+            [
+                "benchmark",
+                "precision",
+                "--passages",
+                "40",
+                "--iterations",
+                "2",
+                "--recall-floor",
+                "0.99",
+                "--rank-floor",
+                "0.95",
+                "--work-dir",
+                str(work_dir),
+            ]
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out)["schema_version"] == 1
+    assert received["passages"] == 40
+    assert received["iterations"] == 2
+    assert received["recall_floor"] == 0.99
+    assert received["rank_floor"] == 0.95
+    assert received["work_dir"] == work_dir
+
+
 def test_serve_falls_back_to_direct_when_local_sockets_are_unavailable(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

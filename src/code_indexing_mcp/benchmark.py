@@ -2,16 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import statistics
 import tempfile
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
+
+import lancedb
+import numpy as np
+import pyarrow as pa
+from lancedb.index import FTS, HnswSq
+from lancedb.query import (
+    FullTextOperator,
+    LanceHybridQueryBuilder,
+    LanceVectorQueryBuilder,
+    MultiMatchQuery,
+)
+from numpy.typing import NDArray
 
 from . import update_check
+from .acceptance import top_k_rank_correlation
 from .application import Application, RuntimePaths
+from .embedding import PassageEmbedder, QueryEmbedder
 from .errors import CodeIndexingError, ErrorCode
 from .models import (
     IndexReport,
@@ -35,6 +51,30 @@ SEARCH_SCOPES = (1, 8, 50)
 # How many times each search scope is timed. Search latency is noisy per run,
 # so every scope is a small sample, never a single point estimate.
 SEARCH_ITERATIONS = 3
+
+# The vector-precision experiment judges every variant against one
+# float32-exact numpy reference, so K, the sample size, and the adoption-gate
+# floors live here and are recorded in the report rather than left to whoever
+# reads it to reconstruct.
+PRECISION_TOP_K = 8
+PRECISION_ITERATIONS = 5
+DEFAULT_RECALL_FLOOR = 0.99
+DEFAULT_RANK_FLOOR = 0.95
+
+# Fixed topic vocabulary for the retrieval corpus. Relevance judgments are by
+# construction -- a query is relevant to exactly its topic's passages -- so
+# the corpus needs no hand-maintained labels, and the corpus digest in the
+# report pins the exact text every number was measured on.
+RETRIEVAL_TOPICS: tuple[tuple[str, ...], ...] = (
+    ("authorize", "permission", "credential", "session"),
+    ("invoice", "billing", "tax", "subtotal"),
+    ("hybrid", "ranking", "lexical", "semantic"),
+    ("partition", "journal", "rollback", "fragment"),
+    ("grammar", "syntax", "node", "token"),
+    ("socket", "retry", "timeout", "listener"),
+    ("mutex", "atomic", "deadlock", "thread"),
+    ("metric", "trace", "span", "histogram"),
+)
 
 
 class IndexBenchmarkApplication(Protocol):
@@ -75,6 +115,71 @@ def write_benchmark_corpus(root: Path, *, files: int = 128, functions_per_file: 
         (root / f"module_{file_index:04d}.py").write_bytes(encoded)
         total += len(encoded)
     return total
+
+
+@dataclass(frozen=True)
+class RetrievalPassage:
+    """One corpus chunk: the persisted text columns the experiment searches."""
+
+    chunk_id: str
+    content: str
+    identifier_terms: str
+
+
+@dataclass(frozen=True)
+class RetrievalQuery:
+    """One corpus query with its by-construction relevance judgment."""
+
+    text: str
+    relevant: tuple[str, ...]
+
+
+class PrecisionEmbedder(PassageEmbedder, QueryEmbedder, Protocol):
+    """Both embedding roles the precision experiment needs."""
+
+
+def build_retrieval_corpus(
+    *, passages: int = 240
+) -> tuple[list[RetrievalPassage], list[RetrievalQuery]]:
+    """Build the deterministic judged corpus for the precision experiment.
+
+    Passages cycle through the topic vocabulary, so each topic owns
+    ``passages / len(RETRIEVAL_TOPICS)`` chunks whose text and identifier
+    terms repeat only that topic's words. One query per topic is relevant to
+    exactly that topic's passages.
+    """
+
+    if passages < len(RETRIEVAL_TOPICS):
+        raise ValueError(f"the retrieval corpus needs at least {len(RETRIEVAL_TOPICS)} passages")
+    corpus: list[RetrievalPassage] = []
+    relevant_by_topic: list[list[str]] = [[] for _ in RETRIEVAL_TOPICS]
+    for index in range(passages):
+        topic = index % len(RETRIEVAL_TOPICS)
+        terms = RETRIEVAL_TOPICS[topic]
+        within = index // len(RETRIEVAL_TOPICS)
+        name = f"{terms[0]}_{index:04d}"
+        chunk_id = f"precision-{index:06d}"
+        corpus.append(
+            RetrievalPassage(
+                chunk_id=chunk_id,
+                content=(
+                    f"def {name}(request, context):\n"
+                    f"    # {terms[1]} policy for {terms[2]} handling\n"
+                    f"    validate_{terms[3]}(request, context)\n"
+                    f"    return audit_{terms[2]}(context)\n"
+                ),
+                identifier_terms=f"{name} {' '.join(terms)} {within:04d}",
+            )
+        )
+        relevant_by_topic[topic].append(chunk_id)
+    queries = [
+        RetrievalQuery(
+            text=f"where is {terms[0]} {terms[3]} validated",
+            relevant=tuple(relevant_by_topic[topic]),
+        )
+        for topic, terms in enumerate(RETRIEVAL_TOPICS)
+    ]
+    return corpus, queries
 
 
 def _storage_snapshot(app: IndexBenchmarkApplication, project_id: str) -> dict[str, Any]:
@@ -306,6 +411,244 @@ def run_search_benchmark(
     return {"schema_version": 1, "projects": len(project_ids), "query": query, "scopes": scenarios}
 
 
+def _directory_physical_bytes(path: Path) -> int:
+    """Sum file sizes under *path* without following symlinks.
+
+    Mirrors the storage-stats convention: a symlink costs its own small
+    metadata, never the size of whatever it points at.
+    """
+
+    total = 0
+    for directory, subdirectories, filenames in os.walk(path, followlinks=False):
+        subdirectories[:] = [
+            name for name in subdirectories if not (Path(directory) / name).is_symlink()
+        ]
+        for name in filenames:
+            candidate = Path(directory) / name
+            if candidate.is_symlink():
+                continue
+            total += candidate.stat().st_size
+    return total
+
+
+def _precision_schema(dimension: int, dtype: pa.DataType) -> pa.Schema:
+    """The production chunk columns the precision experiment needs."""
+
+    return pa.schema(
+        [
+            ("chunk_id", pa.string()),
+            ("content", pa.string()),
+            ("identifier_terms", pa.string()),
+            ("vector", pa.list_(dtype, dimension)),
+        ]
+    )
+
+
+def _run_precision_variant(
+    directory: Path,
+    *,
+    corpus: list[RetrievalPassage],
+    query_texts: Sequence[str],
+    passage_vectors: NDArray[np.float32],
+    query_vectors: NDArray[np.float32],
+    storage: str,
+    exact: bool,
+    top_k: int,
+    iterations: int,
+    ground_truth: list[list[str]],
+) -> dict[str, Any]:
+    """Measure one storage x index combination on a standalone table.
+
+    The table mirrors the production chunk columns, FTS configuration, and
+    HNSW config, so the numbers describe what shipping that combination
+    would actually cost rather than a synthetic stand-in.
+    """
+
+    dtype = pa.float32() if storage == "float32" else pa.float16()
+    stored = passage_vectors if storage == "float32" else passage_vectors.astype(np.float16)
+    schema = _precision_schema(passage_vectors.shape[1], dtype)
+    vectors = pa.FixedSizeListArray.from_arrays(
+        pa.array(stored.reshape(-1)), passage_vectors.shape[1]
+    )
+    data = pa.table(
+        {
+            "chunk_id": pa.array([passage.chunk_id for passage in corpus], pa.string()),
+            "content": pa.array([passage.content for passage in corpus], pa.string()),
+            "identifier_terms": pa.array(
+                [passage.identifier_terms for passage in corpus], pa.string()
+            ),
+            "vector": vectors,
+        },
+        schema=schema,
+    )
+
+    started = time.monotonic_ns()
+    database = lancedb.connect(directory)
+    table = database.create_table("chunks", data=data)
+    table_build_ms = (time.monotonic_ns() - started) / 1_000_000
+
+    started = time.monotonic_ns()
+    for column in ("content", "identifier_terms"):
+        table.create_index(
+            column,
+            config=FTS(lower_case=True, stem=False, remove_stop_words=False),
+            replace=False,
+        )
+    if not exact:
+        table.create_index("vector", config=HnswSq(distance_type="cosine"), replace=False)
+    index_build_ms = (time.monotonic_ns() - started) / 1_000_000
+
+    result_orders: list[list[str]] = []
+    for query_vector in query_vectors:
+        search = cast(
+            "LanceVectorQueryBuilder",
+            table.search(query_vector.tolist(), vector_column_name="vector"),
+        ).select(["chunk_id"])
+        search = search.limit(top_k)
+        if exact:
+            search = search.bypass_vector_index()
+        result_orders.append([str(row["chunk_id"]) for row in search.to_list()])
+    recall_at_k = sum(
+        len(set(reference).intersection(candidate))
+        for reference, candidate in zip(ground_truth, result_orders, strict=True)
+    ) / (len(ground_truth) * top_k)
+    rank_correlation = top_k_rank_correlation(ground_truth, result_orders)
+
+    samples: list[float] = []
+    for _ in range(iterations):
+        for text, query_vector in zip(query_texts, query_vectors, strict=True):
+            started = time.monotonic_ns()
+            hybrid = cast(
+                "LanceHybridQueryBuilder",
+                table.search(query_type="hybrid", vector_column_name="vector"),
+            ).vector(query_vector.tolist())
+            hybrid = (
+                hybrid.text(
+                    MultiMatchQuery(
+                        text,
+                        ["content", "identifier_terms"],
+                        boosts=None,
+                        operator=FullTextOperator.OR,
+                    )
+                )
+                .limit(top_k)
+                .select(["chunk_id"])
+                .rerank()
+            )
+            if exact:
+                hybrid = hybrid.bypass_vector_index()
+            hybrid.to_list()
+            samples.append((time.monotonic_ns() - started) / 1_000_000)
+
+    physical_bytes = _directory_physical_bytes(directory)
+    table.optimize()
+    post_optimize_bytes = _directory_physical_bytes(directory)
+    return {
+        "storage": storage,
+        "index": "exact" if exact else "hnsw_sq8",
+        "table_build_ms": round(table_build_ms, 3),
+        "index_build_ms": round(index_build_ms, 3),
+        "recall_at_k": round(float(recall_at_k), 6),
+        "rank_correlation": round(float(rank_correlation), 6),
+        "hybrid_latency_ms": _duration_summary(samples),
+        "physical_bytes": physical_bytes,
+        "post_optimize_bytes": post_optimize_bytes,
+    }
+
+
+def run_precision_benchmark(
+    embedder: PrecisionEmbedder,
+    workspace: Path,
+    *,
+    passages: int = 240,
+    top_k: int = PRECISION_TOP_K,
+    iterations: int = PRECISION_ITERATIONS,
+    recall_floor: float = DEFAULT_RECALL_FLOOR,
+    rank_floor: float = DEFAULT_RANK_FLOOR,
+) -> dict[str, Any]:
+    """Compare vector-storage precisions against a float32-exact reference.
+
+    Every variant is judged against top-k rankings computed in numpy float32
+    cosine -- one reference for every variant -- and the float32 flat search
+    is itself checked against that reference as a baseline sanity anchor.
+    Retrieval quality is reported as overlap with the reference top-k and as
+    Kendall tau-b over the paired rankings; cost is reported as build time,
+    hybrid-search latency samples, and physical bytes before and after
+    ``optimize()``. A combination some LanceDB version cannot serve reports
+    an ``error`` instead of aborting the whole experiment.
+    """
+
+    corpus, queries = build_retrieval_corpus(passages=passages)
+    passage_vectors = np.asarray(
+        embedder.embed_passages([passage.content for passage in corpus]), dtype=np.float32
+    )
+    query_vectors = np.asarray(
+        [embedder.embed_query(query.text) for query in queries], dtype=np.float32
+    )
+
+    # The single reference every variant is judged against: float32 cosine.
+    normalized_passages = passage_vectors / np.linalg.norm(passage_vectors, axis=1, keepdims=True)
+    normalized_queries = query_vectors / np.linalg.norm(query_vectors, axis=1, keepdims=True)
+    ground_truth: list[list[str]] = []
+    for query_row in normalized_queries:
+        order = np.argsort(-(query_row @ normalized_passages.T), kind="stable")[:top_k]
+        ground_truth.append([corpus[index].chunk_id for index in order])
+
+    digest = hashlib.sha256()
+    for passage in corpus:
+        digest.update(passage.content.encode())
+        digest.update(passage.identifier_terms.encode())
+    for query in queries:
+        digest.update(query.text.encode())
+    query_texts = [query.text for query in queries]
+
+    variants: dict[str, dict[str, Any]] = {}
+    for storage in ("float32", "float16"):
+        for exact in (True, False):
+            key = f"{storage}_{'exact' if exact else 'hnsw_sq8'}"
+            try:
+                variants[key] = _run_precision_variant(
+                    workspace / key,
+                    corpus=corpus,
+                    query_texts=query_texts,
+                    passage_vectors=passage_vectors,
+                    query_vectors=query_vectors,
+                    storage=storage,
+                    exact=exact,
+                    top_k=top_k,
+                    iterations=iterations,
+                    ground_truth=ground_truth,
+                )
+            except Exception as exc:
+                variants[key] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    gates = {
+        name: {
+            "recall_ok": result.get("recall_at_k") is not None
+            and result["recall_at_k"] >= recall_floor,
+            "rank_ok": result.get("rank_correlation") is not None
+            and result["rank_correlation"] >= rank_floor,
+        }
+        for name, result in variants.items()
+    }
+    return {
+        "schema_version": 1,
+        "corpus": {
+            "passages": len(corpus),
+            "queries": len(queries),
+            "topics": len(RETRIEVAL_TOPICS),
+            "digest": digest.hexdigest(),
+        },
+        "top_k": top_k,
+        "iterations": iterations,
+        "lancedb_version": lancedb.__version__,
+        "thresholds": {"recall_at_k": recall_floor, "rank_correlation": rank_floor},
+        "baseline_self_recall": variants["float32_exact"].get("recall_at_k"),
+        "variants": variants,
+        "gates": gates,
+    }
+
+
 def _run_in_workspace(
     paths: RuntimePaths,
     workspace: Path,
@@ -439,4 +782,71 @@ def run_search_benchmark_command(
             )
         return _run(workspace)
     with tempfile.TemporaryDirectory(prefix="code-indexing-mcp-search-benchmark-") as temporary:
+        return _run(Path(temporary))
+
+
+def run_precision_benchmark_command(
+    paths: RuntimePaths,
+    *,
+    passages: int,
+    iterations: int,
+    recall_floor: float,
+    rank_floor: float,
+    work_dir: Path | None,
+) -> dict[str, Any]:
+    """Create an isolated workspace and run the vector-precision benchmark."""
+    if not 1 <= passages <= 100_000:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "Benchmark passage count must be from 1 to 100000",
+        )
+    if not 1 <= iterations <= 20:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "Benchmark iterations must be from 1 to 20",
+        )
+    if not 0 < recall_floor <= 1 or not 0 < rank_floor <= 1:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "Benchmark gate thresholds must be within (0, 1]",
+        )
+
+    def _run(workspace: Path) -> dict[str, Any]:
+        settings = replace(
+            IndexSettings.from_environment(),
+            index_execution="in-process",
+            broker_mode="off",
+        )
+        app = Application(
+            RuntimePaths(data=workspace / "data", cache=paths.cache),
+            cwd=workspace,
+            settings=settings,
+        )
+        result = run_precision_benchmark(
+            app.embedder,
+            workspace / "precision",
+            passages=passages,
+            iterations=iterations,
+            recall_floor=recall_floor,
+            rank_floor=rank_floor,
+        )
+        result.update(
+            {
+                "model_id": app.embedder.model_id,
+                "embedding_backend": app.effective_backend_selection.descriptor.accelerator.value,
+                "revision": update_check.checkout_head(Path(__file__).resolve().parents[2]),
+            }
+        )
+        return result
+
+    if work_dir is not None:
+        workspace = work_dir.expanduser().resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        if any((workspace / name).exists() for name in ("precision", "data")):
+            raise CodeIndexingError(
+                ErrorCode.INVALID_CONFIGURATION,
+                f"Benchmark work directory is not fresh: {workspace}",
+            )
+        return _run(workspace)
+    with tempfile.TemporaryDirectory(prefix="code-indexing-mcp-precision-benchmark-") as temporary:
         return _run(Path(temporary))

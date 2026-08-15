@@ -1884,3 +1884,65 @@ def test_a_failed_probe_refuses_the_batched_commit(tmp_path: Path) -> None:
 
     assert excinfo.value.code == storage_module.ErrorCode.UNSUPPORTED_RUNTIME
     assert store.list_chunks([project.id]) == []
+
+
+def test_chunk_vectors_store_as_float16_by_default(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+
+    store.replace_file(stored_file(project.id), _stored_chunks(project.id, 1))
+
+    tables = store._existing_tables(project.id)
+    assert tables is not None
+    assert tables.chunks.schema.field("vector").type == pa.list_(pa.float16(), 4)
+    # The one-hot vector survives the float16 round trip exactly, so hybrid
+    # search over the narrowed column still returns the stored chunk.
+    hits = store.hybrid_search("symbol", [0.0, 0.0, 0.0, 1.0], [project.id], None, 5)
+    assert [hit["chunk_id"] for hit in hits] == [f"{project.id}:chunk-0"]
+
+
+def test_vector_storage_opt_out_writes_float32(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4, vector_storage="float32")
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+
+    store.replace_file(stored_file(project.id), _stored_chunks(project.id, 1))
+
+    tables = store._existing_tables(project.id)
+    assert tables is not None
+    assert tables.chunks.schema.field("vector").type == pa.list_(pa.float32(), 4)
+    with pytest.raises(ValueError):
+        LanceStore(tmp_path / "other", vector_storage="int8")
+
+
+def test_vector_storage_flip_marks_rebuild_required(tmp_path: Path) -> None:
+    """Changing the configured dtype rebuilds rather than mixing generations."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_file(stored_file(project.id), _stored_chunks(project.id, 1))
+    assert store.project_state(project.id) == "ready"
+
+    flipped = LanceStore(tmp_path / "lancedb", vector_dimension=4, vector_storage="float32")
+    reason = flipped.incompatibility_reason(project.id, "test/model")
+    assert "vector storage" in (reason or "")
+    flipped.upsert_project(project, model_id="test/model")
+    assert flipped.project_state(project.id) == "rebuild_required"
+
+    # And symmetrically: a float16 store over a float32 partition.
+    float32_store = LanceStore(tmp_path / "f32", vector_dimension=4, vector_storage="float32")
+    other_root = tmp_path / "other-repo"
+    other_root.mkdir()
+    other = initialize_project(other_root)
+    float32_store.upsert_project(other, model_id="test/model")
+    float32_store.replace_file(stored_file(other.id), _stored_chunks(other.id, 1))
+
+    narrowed = LanceStore(tmp_path / "f32", vector_dimension=4)
+    assert "vector storage" in (narrowed.incompatibility_reason(other.id, "test/model") or "")

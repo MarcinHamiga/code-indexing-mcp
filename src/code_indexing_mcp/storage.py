@@ -45,7 +45,13 @@ from .projects import existing_marker_path, rooted_under, same_project_root
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+# Version 5 stores chunk vectors as float16. The precision benchmark measured
+# no recall or rank loss against a float32-exact reference while roughly
+# halving vector bytes, so float16 is the write default; float32 remains
+# available through CODE_INDEXING_VECTOR_STORAGE. The bump keeps a pre-float16
+# binary from serving a float16 partition: it sees version 5 against its own 4
+# and marks the partition for rebuild instead of mixing generations.
+SCHEMA_VERSION = 5
 
 # Symbol lookups over-fetch because the LIKE pushdown over-matches; these bound
 # how many rows are scanned before the exact filter and the caller's limit apply.
@@ -402,10 +408,15 @@ class LanceStore:
         *,
         vector_dimension: int = 768,
         vector_index: str = "exact",
+        vector_storage: str = "float16",
     ) -> None:
+        if vector_storage not in {"float32", "float16"}:
+            raise ValueError(f"vector_storage must be float32 or float16, got {vector_storage!r}")
         self.directory = directory
         self.vector_dimension = vector_dimension
         self.vector_index = vector_index
+        self.vector_storage = vector_storage
+        self.vector_dtype = pa.float16() if vector_storage == "float16" else pa.float32()
         legacy_rows = self._migrate_v1(directory)
         directory.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(directory / "registry", read_consistency_interval=timedelta(0))
@@ -476,13 +487,13 @@ class LanceStore:
     def incompatibility_reason(self, project_id: str, model_id: str) -> str | None:
         """Return why *project_id*'s stored generation must be rebuilt, or None.
 
-        A stored embedding model, vector dimension, or index schema version
-        that differs from this store's current values describes rows this
-        build cannot serve coherently. Rebuilding -- deleting the partition
-        and re-indexing -- recovers it, so the mismatch is returned as a
-        reason rather than raised as the hard ``INDEX_INCOMPATIBLE`` failure
-        it used to be. A pending registration has no live rows to describe,
-        so it is never incompatible.
+        A stored embedding model, vector dimension, index schema version, or
+        on-disk vector storage dtype that differs from this store's current
+        values describes rows this build cannot serve coherently. Rebuilding
+        -- deleting the partition and re-indexing -- recovers it, so the
+        mismatch is returned as a reason rather than raised as the hard
+        ``INDEX_INCOMPATIBLE`` failure it used to be. A pending registration
+        has no live rows to describe, so it is never incompatible.
         """
         rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
         if not rows:
@@ -499,6 +510,15 @@ class LanceStore:
             )
         if int(row["schema_version"]) != SCHEMA_VERSION:
             differences.append(f"index schema version {row['schema_version']} -> {SCHEMA_VERSION}")
+        # The registry row alone cannot describe a dtype flip between two
+        # builds of the same schema version, so the partition's own vector
+        # column is the authority: a stored float32 partition under a float16
+        # store (or the reverse) must rebuild rather than mix generations.
+        tables = self._existing_tables(project_id)
+        if tables is not None:
+            stored_dtype = tables.chunks.schema.field("vector").type.value_type
+            if stored_dtype != self.vector_dtype:
+                differences.append(f"vector storage {stored_dtype} -> {self.vector_dtype}")
         return "; ".join(differences) if differences else None
 
     def mark_rebuild_required(self, project_id: str) -> None:
@@ -706,7 +726,8 @@ class LanceStore:
         extracts to nothing, since every file in the predicate is either
         present in the source or intentionally empty. Replacement ids win over
         removal ids, and removed files are deleted in one predicate per table.
-        The vector columns stay fixed-size-list float32 arrays end to end.
+        The vector columns stay fixed-size-list arrays of the store's storage
+        dtype (float16 by default) end to end.
 
         Refuses to commit when the installed lancedb fails the batched
         merge-insert semantics probe, because a regression would delete rows
@@ -1260,7 +1281,8 @@ class LanceStore:
         )
 
     @staticmethod
-    def _chunk_schema(vector_dimension: int) -> pa.Schema:
+    def _chunk_schema(vector_dimension: int, vector_dtype: pa.DataType | None = None) -> pa.Schema:
+        dtype = pa.float16() if vector_dtype is None else vector_dtype
         return pa.schema(
             [
                 ("chunk_id", pa.string()),
@@ -1285,7 +1307,7 @@ class LanceStore:
                 ("part_index", pa.int32()),
                 (
                     "vector",
-                    pa.list_(pa.float32(), vector_dimension),
+                    pa.list_(dtype, vector_dimension),
                 ),
             ]
         )
@@ -1380,7 +1402,7 @@ class LanceStore:
             chunks=self._table(
                 database,
                 "chunks",
-                self._chunk_schema(self.vector_dimension),
+                self._chunk_schema(self.vector_dimension, self.vector_dtype),
             ),
             references=self._table(database, "references", self._reference_schema()),
             generation=self._partition_generation(project_id),
@@ -1452,8 +1474,10 @@ class LanceStore:
         return LanceStore._file_schema()
 
     @staticmethod
-    def chunk_arrow_schema(vector_dimension: int) -> pa.Schema:
-        return LanceStore._chunk_schema(vector_dimension)
+    def chunk_arrow_schema(
+        vector_dimension: int, vector_dtype: pa.DataType | None = None
+    ) -> pa.Schema:
+        return LanceStore._chunk_schema(vector_dimension, vector_dtype)
 
     @staticmethod
     def reference_arrow_schema() -> pa.Schema:

@@ -18,7 +18,19 @@ def test_indexing_defaults_to_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.embedding_threads >= 1
     assert settings.embedding_cpu_arena is False
     assert settings.vector_index == "exact"
+    assert settings.vector_storage == "float16"
     assert settings.index_wait_seconds == 300
+
+
+def test_vector_storage_is_parsed_and_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODE_INDEXING_VECTOR_STORAGE", "FLOAT32")
+    assert IndexSettings.from_environment().vector_storage == "float32"
+
+    monkeypatch.setenv("CODE_INDEXING_VECTOR_STORAGE", "int8")
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment()
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
 
 
 def test_index_wait_seconds_is_validated(monkeypatch: pytest.MonkeyPatch) -> None:

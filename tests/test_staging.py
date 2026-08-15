@@ -132,7 +132,7 @@ def make_job(
         tmp_path / "staging",
         project_id,
         file_schema=LanceStore.file_arrow_schema(),
-        chunk_schema=LanceStore.chunk_arrow_schema(store.vector_dimension),
+        chunk_schema=LanceStore.chunk_arrow_schema(store.vector_dimension, store.vector_dtype),
         reference_schema=LanceStore.reference_arrow_schema(),
         job_id=job_id,
     )
@@ -140,7 +140,7 @@ def make_job(
     return job
 
 
-def test_staged_vectors_stay_packed_float32_arrow_arrays(tmp_path: Path) -> None:
+def test_staged_vectors_carry_the_store_storage_dtype(tmp_path: Path) -> None:
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     job = make_job(tmp_path, store, "project-1")
     job.stage_chunks([chunk_row("project-1", "file-1", [1.5, 2.5, 3.5, 4.5])])
@@ -149,8 +149,10 @@ def test_staged_vectors_stay_packed_float32_arrow_arrays(tmp_path: Path) -> None
     table = pa.ipc.open_file(job.directory / CHUNKS_NAME).read_all()
 
     vector_field = table.schema.field("vector")
-    assert vector_field.type == pa.list_(pa.float32(), 4)
-    # 1.5/2.5/3.5/4.5 are exact in float32, so the round trip is lossless.
+    # float16 is the storage default: staged float32 worker bytes are cast
+    # while building the Arrow batch, never materialized as Python floats.
+    assert vector_field.type == pa.list_(pa.float16(), 4)
+    # 1.5/2.5/3.5/4.5 are exact in float16, so the round trip is lossless.
     assert table.column("vector")[0].as_py() == [1.5, 2.5, 3.5, 4.5]
 
     journal = json.loads((job.directory / JOURNAL_NAME).read_text())
@@ -158,6 +160,19 @@ def test_staged_vectors_stay_packed_float32_arrow_arrays(tmp_path: Path) -> None
     assert journal["files_version"] == 1
     assert journal["chunks_version"] == 1
     assert journal["references_version"] == 1
+    job.discard()
+
+
+def test_staged_vectors_stay_float32_with_the_explicit_opt_out(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4, vector_storage="float32")
+    job = make_job(tmp_path, store, "project-1")
+    job.stage_chunks([chunk_row("project-1", "file-1", [1.5, 2.5, 3.5, 4.5])])
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    table = pa.ipc.open_file(job.directory / CHUNKS_NAME).read_all()
+
+    assert table.schema.field("vector").type == pa.list_(pa.float32(), 4)
+    assert table.column("vector")[0].as_py() == [1.5, 2.5, 3.5, 4.5]
     job.discard()
 
 
