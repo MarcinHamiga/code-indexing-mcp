@@ -1100,29 +1100,6 @@ class Indexer:
             state.reference_extraction_ns += extraction.reference_extraction_ns
             state.staged_reference_rows += len(extraction.references)
             source_chars = sum(len(chunk.content) for chunk in extraction.chunks)
-            if state.pending and (
-                len(state.pending) >= CANDIDATE_GROUP_COUNT
-                or state.pending_chunks + len(extraction.chunks) > CANDIDATE_GROUP_COUNT
-                or state.pending_chars + source_chars > CANDIDATE_GROUP_CHARS
-            ):
-                self._flush_pending(
-                    project,
-                    existing,
-                    passage_embedder,
-                    progress,
-                    timer,
-                    process,
-                    state,
-                )
-            state.add_pending(
-                _PendingFile(
-                    record=record.model_copy(update={"has_errors": extraction.has_errors}),
-                    chunks=extraction.chunks,
-                    references=extraction.references,
-                    declarations=extraction.declarations,
-                    source_chars=source_chars,
-                )
-            )
         except Exception as exc:
             if isinstance(exc, CodeIndexingError) and exc.code in ENVIRONMENT_ERROR_CODES:
                 # Environment failures must abort the run rather than poison the
@@ -1146,6 +1123,36 @@ class Indexer:
             )
             with timer.measure("commit"):
                 self._stage_file_failure(project, existing, state, failed_record, exc)
+        else:
+            # This block sits outside the except above on purpose. The flush
+            # has already staged chunk rows for the pending files when it can
+            # fail, so swallowing its failure as this file's error would leave
+            # those files queued and re-stage them after other files --
+            # splitting one file across batches (or duplicating its rows).
+            # Flush failures must abort the run with their own error.
+            if state.pending and (
+                len(state.pending) >= CANDIDATE_GROUP_COUNT
+                or state.pending_chunks + len(extraction.chunks) > CANDIDATE_GROUP_COUNT
+                or state.pending_chars + source_chars > CANDIDATE_GROUP_CHARS
+            ):
+                self._flush_pending(
+                    project,
+                    existing,
+                    passage_embedder,
+                    progress,
+                    timer,
+                    process,
+                    state,
+                )
+            state.add_pending(
+                _PendingFile(
+                    record=record.model_copy(update={"has_errors": extraction.has_errors}),
+                    chunks=extraction.chunks,
+                    references=extraction.references,
+                    declarations=extraction.declarations,
+                    source_chars=source_chars,
+                )
+            )
 
     def _index_scan(
         self,

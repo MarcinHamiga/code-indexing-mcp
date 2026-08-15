@@ -12,6 +12,7 @@ from filelock import FileLock
 from lancedb.table import LanceTable
 from test_token_batching import fake_encode
 
+from code_indexing_mcp import indexing as indexing_module
 from code_indexing_mcp import staging as staging_module
 from code_indexing_mcp.embedding import (
     EmbeddedSegment,
@@ -24,7 +25,7 @@ from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.history import HistoryStore
 from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
-from code_indexing_mcp.models import ExtractionResult
+from code_indexing_mcp.models import ExtractionResult, StoredFile
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner
 from code_indexing_mcp.storage import LanceStore, _quoted
@@ -297,6 +298,54 @@ def test_cross_file_batch_failure_only_rejects_its_own_file(tmp_path: Path) -> N
     assert {chunk.path for chunk in chunks} == {"good.py", "bad.py"}
     assert any(chunk.symbol == "new_good" for chunk in chunks)
     assert {chunk.chunk_id for chunk in chunks if chunk.path == "bad.py"} == old_bad_ids
+
+
+def test_flush_failure_aborts_run_instead_of_poisoning_pending(tmp_path: Path) -> None:
+    """A failure inside the pending flush must abort the run, not queue poison.
+
+    The flush stages chunk rows for its whole pending batch before it writes
+    file records. When one of those final writes fails, the pending files have
+    chunks already in the staged stream: swallowing that failure as the
+    currently-scanned file's error leaves them queued, and the next flush
+    re-stages them after other files. That either splits one file across
+    batches and crashes the staging contiguity invariant, or silently
+    duplicates its rows.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    for name in ("a.py", "b.py", "c.py", "d.py"):
+        (root / name).write_text(f"def {name[0]}_value():\n    return 1\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+
+    calls = itertools.count()
+    real_stage_file = staging_module.StagingJob.stage_file
+
+    def flaky_stage_file(job: staging_module.StagingJob, record: StoredFile) -> None:
+        # a.py's record from the first flush succeeds; b.py's from the second
+        # flush's final loop explodes after its chunks were already staged.
+        if next(calls) == 1:
+            raise RuntimeError("staging exploded")
+        real_stage_file(job, record)
+
+    with (
+        patch.object(indexing_module, "CANDIDATE_GROUP_CHARS", 64),
+        patch.object(indexing_module, "CANDIDATE_GROUP_COUNT", 3),
+        patch.object(staging_module.StagingJob, "stage_file", flaky_stage_file),
+        pytest.raises(RuntimeError, match="staging exploded"),
+    ):
+        indexer.index(project)
+
+    # The aborted run committed nothing; a clean re-run heals the project.
+    assert store.list_files(project.id) == []
+    healed = indexer.index(project)
+    assert healed.errors == []
+    assert {record.path for record in store.list_files(project.id)} == {
+        "a.py",
+        "b.py",
+        "c.py",
+        "d.py",
+    }
 
 
 def test_indexer_replaces_changed_files_and_removes_deleted_files(tmp_path: Path) -> None:
