@@ -20,6 +20,7 @@ def test_catalog_covers_exactly_the_documented_settings() -> None:
         "CODE_INDEXING_INDEX_WAIT_SECONDS",
         "CODE_INDEXING_EMBED_MEMORY_MB",
         "CODE_INDEXING_VECTOR_INDEX",
+        "CODE_INDEXING_VECTOR_STORAGE",
         "CODE_INDEXING_INDEX_EXECUTION",
         "CODE_INDEXING_BROKER",
         "CODE_INDEXING_DATA_DIR",

@@ -87,6 +87,16 @@ SETTINGS: tuple[Setting, ...] = (
         choices=("exact", "hnsw"),
     ),
     Setting(
+        "CODE_INDEXING_VECTOR_STORAGE",
+        "Indexing",
+        "Vector storage",
+        "float16 halves vector bytes with no measured retrieval loss; float32 restores the "
+        "previous layout (a rebuild follows either change).",
+        "choice",
+        "float16",
+        choices=("float16", "float32"),
+    ),
+    Setting(
         "CODE_INDEXING_INDEX_EXECUTION",
         "Indexing",
         "Index execution",

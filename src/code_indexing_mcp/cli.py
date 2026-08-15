@@ -15,7 +15,11 @@ from pydantic import BaseModel
 
 from . import __version__, update_check
 from .application import Application, RuntimePaths
-from .benchmark import run_index_benchmark_command, run_search_benchmark_command
+from .benchmark import (
+    run_index_benchmark_command,
+    run_precision_benchmark_command,
+    run_search_benchmark_command,
+)
 from .daemon import (
     BrokerApplication,
     DaemonServer,
@@ -140,6 +144,30 @@ def _parser() -> argparse.ArgumentParser:
     benchmark_search.add_argument("--projects", type=int, default=50)
     benchmark_search.add_argument("--iterations", type=int, default=3)
     benchmark_search.add_argument("--work-dir", type=Path, default=None)
+    benchmark_precision = benchmark_commands.add_parser(
+        "precision",
+        help="Compare vector-precision storage retrieval quality and cost",
+    )
+    benchmark_precision.add_argument(
+        "--passages",
+        type=int,
+        default=240,
+        help="Retrieval-corpus size for the precision experiment",
+    )
+    benchmark_precision.add_argument("--iterations", type=int, default=5)
+    benchmark_precision.add_argument(
+        "--recall-floor",
+        type=float,
+        default=0.99,
+        help="Adoption-gate recall floor evaluated in the report",
+    )
+    benchmark_precision.add_argument(
+        "--rank-floor",
+        type=float,
+        default=0.95,
+        help="Adoption-gate rank-correlation floor evaluated in the report",
+    )
+    benchmark_precision.add_argument("--work-dir", type=Path, default=None)
     daemon = commands.add_parser("daemon", help="Manage the shared indexing daemon")
     daemon_commands = daemon.add_subparsers(dest="daemon_command", required=True)
     daemon_commands.add_parser("run", help=argparse.SUPPRESS)
@@ -353,6 +381,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 paths=paths,
                 projects=args.projects,
                 iterations=args.iterations,
+                work_dir=args.work_dir,
+            )
+            print(_json(benchmark_result))
+            return 0
+        if args.command == "benchmark" and args.benchmark_command == "precision":
+            benchmark_result = run_precision_benchmark_command(
+                paths=paths,
+                passages=args.passages,
+                iterations=args.iterations,
+                recall_floor=args.recall_floor,
+                rank_floor=args.rank_floor,
                 work_dir=args.work_dir,
             )
             print(_json(benchmark_result))

@@ -71,7 +71,8 @@ class ChunkRow:
 
     ``vector`` is contiguous little-endian float32 bytes exactly as the
     embedding worker returned them, so the write path never materializes a
-    list of Python floats per chunk. project_id is deliberately absent because
+    list of Python floats per chunk; staging casts to the storage dtype when
+    the Arrow batch is built. project_id is deliberately absent because
     it belongs to the owning partition. content_hash stays with the chunk so
     get_chunk never combines separately committed table generations.
     """
@@ -276,7 +277,11 @@ class StagingJob:
             if field.name == "vector":
                 packed = b"".join(row.vector for row in rows)
                 flat = np.frombuffer(packed, dtype="<f4")
-                values = pa.array(flat, type=pa.float32())
+                # The embedding worker always emits float32; the storage dtype
+                # (float16 by default) is whatever the schema's list carries,
+                # and pa.array performs the downcast. The cast is safe for the
+                # normalized vectors the probe contract guarantees.
+                values = pa.array(flat, type=vector_type.value_type)
                 columns.append(pa.FixedSizeListArray.from_arrays(values, dimension))
             else:
                 columns.append(

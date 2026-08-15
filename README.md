@@ -350,6 +350,27 @@ The command writes one JSON document to stdout with `cold_start`, `warm_index`,
 chunks per second. It reuses the configured model cache but isolates index data in a temporary
 workspace. Pass `--work-dir /fresh/path` to retain the corpus and index for inspection.
 
+Compare vector-storage precisions on a deterministic, judged retrieval corpus:
+
+```bash
+uv run --project /path/to/code-indexing-mcp code-indexing-mcp benchmark precision \
+  --passages 240 --iterations 5
+```
+
+The experiment builds standalone tables mirroring the production chunk schema, FTS
+configuration, and SQ8-quantized HNSW index, then reports recall and Kendall rank correlation
+against a float32-exact reference, hybrid-search latency samples, index-build time, and physical
+bytes before and after compaction for `float32` and `float16` storage under both exact and
+HNSW search. The JSON report records the corpus digest, model, LanceDB version, and the
+adoption-gate thresholds with their evaluated booleans.
+
+Those gates passed for `float16` storage with exact search at both 40 and 20,000 passages —
+no measurable recall or rank loss, roughly half the vector bytes — so chunk vectors are now
+stored as `float16` by default. Set `CODE_INDEXING_VECTOR_STORAGE=float32` to restore the
+previous layout; either change marks existing partitions for an automatic rebuild. The
+HNSW-SQ8 gates did not pass and approximate indexing remains opt-in via
+`CODE_INDEXING_VECTOR_INDEX=hnsw`.
+
 Initialization creates `.ci-mcp/project.toml` and a self-ignoring `.ci-mcp/.gitignore`. The
 marker contains a checkout-local UUID and scanning configuration. It is not intended to be
 committed. Markers created by earlier releases under `.code-indexing-mcp` remain readable, but all new

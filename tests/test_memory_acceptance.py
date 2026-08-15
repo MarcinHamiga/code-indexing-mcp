@@ -12,6 +12,7 @@ import struct
 import sys
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 from benchmark_index_memory import (
     MIB,
@@ -240,7 +241,7 @@ def test_commit_batches_stay_bounded_far_below_the_memory_ceiling(tmp_path: Path
         tmp_path / "staging",
         "project-1",
         file_schema=LanceStore.file_arrow_schema(),
-        chunk_schema=LanceStore.chunk_arrow_schema(4),
+        chunk_schema=LanceStore.chunk_arrow_schema(4, pa.float16()),
         reference_schema=LanceStore.reference_arrow_schema(),
     )
     job.begin()
