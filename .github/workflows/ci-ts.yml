@@ -103,15 +103,26 @@ jobs:
         working-directory: ts/packages/spikes
         shell: bash
         run: |
-          echo "dir=$(bun -e "console.log(require('@kreuzberg/tree-sitter-language-pack').cacheDir())")" >> "$GITHUB_OUTPUT"
+          # Single quotes outside, double inside: the reverse nesting resolved
+          # to an empty string on the Windows runner, and because `echo` still
+          # succeeded the step passed while emitting `dir=`, which then failed
+          # actions/cache with "Input required and not supplied: path".
+          dir=$(bun -e 'console.log(require("@kreuzberg/tree-sitter-language-pack").cacheDir())') || dir=""
+          echo "resolved to: ${dir:-<unresolved>}"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
       - name: Restore the language-pack cache
+        # Caching is an optimization -- `download` fetches whatever is absent --
+        # so a cache that cannot be located must not fail the job that the
+        # spikes are the real test of.
+        if: steps.pack.outputs.dir != ''
         uses: actions/cache@v4
         with:
           path: ${{ steps.pack.outputs.dir }}
           key: ts-language-pack-${{ runner.os }}-${{ hashFiles('ts/bun.lock') }}
       - name: Populate the language-pack cache
         working-directory: ts/packages/spikes
-        run: bun -e "require('@kreuzberg/tree-sitter-language-pack').download(['gdshader'])"
+        shell: bash
+        run: bun -e 'require("@kreuzberg/tree-sitter-language-pack").download(["gdshader"])'
 
       - name: Run the spikes
         working-directory: ts/packages/spikes
