@@ -135,12 +135,13 @@ const EXTENSIONS: Record<string, string> = {
 };
 
 /**
- * Grammars known to be unavailable on a platform, reported as skips.
+ * Grammars unavailable on a platform, reported as skips.
  *
  * A declared gap keeps the spike's verdict honest -- it reports SKIP rather
- * than PASS, so the run is visibly incomplete -- without leaving CI red on
- * something no commit here can fix. Removing an entry is how the gap gets
- * closed; nothing else in this file needs to change.
+ * than PASS, so the run is visibly incomplete -- without leaving CI red over a
+ * decided non-goal. Each entry is re-checked on every run and fails loudly if
+ * it stops reproducing, so an upstream fix hands the capability back rather
+ * than going unnoticed behind a stale exemption.
  */
 const KNOWN_GAPS: Array<{ language: string; platform: NodeJS.Platform; why: string }> = [
   {
@@ -149,9 +150,11 @@ const KNOWN_GAPS: Array<{ language: string; platform: NodeJS.Platform; why: stri
     why:
       "@kreuzberg/tree-sitter-language-pack cannot load its win32-x64 binding " +
       '("LoadLibrary failed: The specified module could not be found", which is ' +
-      "a missing transitive DLL rather than a missing addon). This is a " +
-      "regression against the Python build, whose PyPI language pack ships " +
-      "working Windows wheels, and must be resolved before Phase 2 ships",
+      "a missing transitive DLL rather than a missing addon). Accepted rather " +
+      "than fixed (2026-08-17): one shader format on one platform is not worth " +
+      "what the fixes cost. Phase 2 must skip .gdshader files on Windows the " +
+      "way it skips an unsupported extension -- failing an index over a Godot " +
+      "repository would be far worse than omitting its shaders",
   },
 ];
 

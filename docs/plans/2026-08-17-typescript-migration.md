@@ -107,7 +107,7 @@ in module docstrings and `docs/plans/` carries over.
 | `lancedb` | `@lancedb/lancedb` (native Node bindings over the same Rust core) | Medium — same storage format, but FTS/BTree index-config API parity must be **spiked first** (§6, S1) |
 | `pyarrow` | `apache-arrow` JS **pinned to 18.1.0** for IPC staging files (LanceDB peer-requires `>=15 <=18.1.0`, so the current 21.x is not available); LanceDB JS accepts Arrow tables natively | High — confirmed by S1 |
 | `tree-sitter-*` PyPI packages | `tree-sitter` native Node bindings + per-grammar npm packages; `.scm` queries port unchanged | High — S2 confirmed all 18 languages and every committed query |
-| `tree-sitter-language-pack` (PyPI) | `@kreuzberg/tree-sitter-language-pack` (306 grammars, native addons for all six platform triples, fetched on first use) | High — S2 verified `gdshader` against the Python pack's own output. Used only for `gdshader`; unlike the Python side, `gdscript` and `godot_resource` have dedicated npm packages |
+| `tree-sitter-language-pack` (PyPI) | `@kreuzberg/tree-sitter-language-pack` (306 grammars, native addons fetched on first use) | High on macOS and Linux — S2 verified `gdshader` against the Python pack's own output. Used only for `gdshader`; unlike the Python side, `gdscript` and `godot_resource` have dedicated npm packages. **Its Windows binding does not load, so `gdshader` is an accepted non-goal there** (§5.5) |
 | `fastembed` / `onnxruntime` | `onnxruntime-node` + `@huggingface/hub` (model download) + `@huggingface/tokenizers` — i.e. the TS port owns what `direct_onnx.py` does today, for CPU too | High — S3 measured exact vector parity |
 | `mlx` | No first-party Node binding. Options: onnxruntime-node CoreML EP, `@frost-beta/mlx` community bindings, or keep the Python MLX worker as a sidecar (the worker protocol is already cross-process) | Low — decision point D2 |
 | `watchfiles` | `@parcel/watcher` (native, recursive, battle-tested); confirm under Bun in S0, with `fs.watch` as fallback | Medium–High |
@@ -173,6 +173,24 @@ staging journal format all carry over unchanged, so a half-migrated
 machine (Python daemon still running, TS CLI installed) degrades loudly
 via the existing daemon `PROTOCOL_VERSION` guard rather than corrupting
 state.
+
+### 5.5 One accepted capability difference: `gdshader` on Windows
+
+`@kreuzberg/tree-sitter-language-pack` cannot load its `win32-x64` binding, and
+it is the only source for the GDShader grammar on npm. Rather than ship a VC++
+redistributable, run a second WASM parser stack for one language, or vendor and
+build the grammar's C sources, the capability is dropped on that platform: one
+shader format on one OS is worth less than any of those costs.
+
+The consequences are small but real, and Phase 2 owns them. A missing grammar
+must be a *supported state* rather than an error — `.gdshader`/`.gdshaderinc`
+files are skipped on Windows the way an unsupported extension is, because an
+index that fails on a Godot repository would be much worse than one that
+quietly omits its shaders. And because the Python build does index them there
+today, §12's cutover material has to say so.
+
+Everything else in the Godot family is unaffected: `.gd` and `.tscn`/`.tres`
+come from dedicated npm packages and work on all three platforms.
 
 ## 6. Phase 0 spikes — do these before committing to anything
 
@@ -319,3 +337,8 @@ after the TS build ships as default.
    retires stale daemons cleanly at switch time.
 4. Rollback is the same installer path in reverse; on-disk state is shared
    (§5.4) or rebuildable, so no migration-back tooling is needed.
+
+The release notes must call out the one deliberate capability difference:
+**Windows loses GDShader indexing** (§5.5). Scripts and scenes are unaffected,
+and every other platform is unaffected, but a Windows user with a Godot project
+would otherwise discover it by searching for a shader and finding nothing.

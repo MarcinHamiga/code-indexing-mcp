@@ -275,19 +275,35 @@ addon links against — rather than a missing addon, so the file is present and
 its dependencies are not.
 
 `gdshader` is therefore unavailable on Windows, and only `gdshader`: the other
-17 languages pass there. **This is a regression against the Python build**,
-whose PyPI `tree-sitter-language-pack` ships working Windows wheels, so it
-cannot simply be accepted — it must be resolved before Phase 2 ships. Likely
-routes, cheapest first: ship the VC++ redistributable dependency, take the
-grammar from the pack's WASM build through `web-tree-sitter` on Windows only,
-or vendor the grammar's C sources and build them as
-`@derekstride/tree-sitter-sql` already does successfully on all three
-platforms.
+17 languages pass there. It is a regression against the Python build, whose
+PyPI `tree-sitter-language-pack` ships working Windows wheels.
 
-S2 declares this in a `KNOWN_GAPS` table and reports it as a **skip**, so the
-spike's verdict is visibly incomplete on Windows rather than falsely green,
-while CI stays actionable. The entry re-checks the failure each run and fails
-loudly if the gap stops reproducing, so a fix upstream cannot go unnoticed.
+**Decision (2026-08-17): accepted, not fixed.** Shader files are a marginal
+part of the corpus, this is one format on one platform, and the two Godot
+formats that matter more — `.gd` and `.tscn`/`.tres` — work everywhere from
+dedicated packages. The routes to a fix (ship the VC++ redistributable, load
+the grammar from the pack's WASM build through `web-tree-sitter` on Windows
+only, or vendor the grammar's C sources as `@derekstride/tree-sitter-sql`
+already does) all cost more than the capability is worth.
+
+Two things follow from accepting it, and both are Phase 2's to carry:
+
+- **A missing grammar must be a supported state, not an error.** The extractor
+  builds its language table eagerly today; on Windows it will now have a hole
+  in it. Files matching `.gdshader`/`.gdshaderinc` must be skipped the way an
+  unsupported extension is, not raise — an index that fails on a Godot
+  repository would be a far worse outcome than one that quietly omits its
+  shaders.
+- **It belongs in the release notes.** A Windows user indexing a Godot project
+  gets their scripts and scenes but not their shaders, and that differs from
+  what the Python build does today, so §12's cutover material has to say so
+  rather than let them find out by searching for a shader and getting nothing.
+
+S2 keeps the gap in its `KNOWN_GAPS` table and reports it as a **skip**, so the
+spike's verdict stays visibly incomplete on Windows rather than falsely green.
+The entry re-checks the failure each run and fails loudly if it stops
+reproducing — if upstream ever fixes the binding, the capability comes back for
+free and the entry can be deleted.
 
 ### Two platform differences Phase 6 must encode
 
@@ -328,9 +344,9 @@ always seen.
    `@huggingface/tokenizers`, and the grammar row needs the language pack.
 3. **Correct §2.2/§7 of the plan**: the extractor registers **18** languages,
    not 19.
-4. **Close the Windows `gdshader` gap** (see above) before Phase 2 ships. It
-   is the only platform regression against the Python build that Phase 0
-   found.
+4. **Handle the accepted Windows `gdshader` gap in Phase 2** (see above):
+   skip the files rather than fail, and note the difference in the release
+   material. The gap itself is a decided non-goal, not an open question.
 5. **Pin the language pack's grammar revisions** before Phase 2 relies on it.
    The pack resolves grammars from a remote manifest at its own version, so a
    pack upgrade can move a grammar underneath the extractor — the same hazard
