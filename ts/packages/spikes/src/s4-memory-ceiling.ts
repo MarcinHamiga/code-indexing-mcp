@@ -87,13 +87,14 @@ async function pollRss(
   return samples;
 }
 
-await spike.check("pidusage tracks a child's growing resident set", async () => {
+await spike.check("pidusage reports a child's real resident set", async () => {
   // The hold matters more than it looks. Windows allocates fast enough that a
   // child with no hold finished and exited before the parent's first poll
   // landed, and the check reported "0 samples taken" while the checks below
   // sampled the same way successfully. A process that outlives the sampling
   // interval is a precondition for measuring it, not a detail.
-  const child = startChild(192, 16, 30, 4_000);
+  const allocatedMb = 192;
+  const child = startChild(allocatedMb, 16, 30, 4_000);
   const samples = await pollRss(child.pid, (rss) => rss > 120, 20_000);
   child.kill();
   await child.exited;
@@ -101,10 +102,18 @@ await spike.check("pidusage tracks a child's growing resident set", async () => 
   if (samples.length === 0) {
     throw new Error("never sampled the child at all -- it exited before the first poll landed");
   }
-  if (samples.length < 3) throw new Error(`only ${samples.length} samples taken`);
-  const first = samples[0] ?? 0;
+
+  // What the ceiling depends on is that the number is the child's real memory,
+  // not that it arrives in any particular number of increments. How many
+  // samples land during the climb is a function of how fast the platform
+  // allocates against a 25ms poll: macOS reports eight, Windows can allocate
+  // past the threshold before the first poll and report one. Requiring a
+  // sample count asserted the scheduler, and failed on Windows for it.
   const peak = Math.max(...samples);
-  if (peak <= first) throw new Error(`RSS never grew: started ${first}, peaked ${peak}`);
+  if (peak < 120) {
+    throw new Error(`peaked at ${peak.toFixed(0)} MB while the child allocated ${allocatedMb} MB`);
+  }
+  const first = samples[0] ?? 0;
   return `${samples.length} samples, ${first.toFixed(0)} MB -> ${peak.toFixed(0)} MB`;
 });
 
