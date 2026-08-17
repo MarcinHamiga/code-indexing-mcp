@@ -13,8 +13,10 @@
  * edits? Capture counts are recorded per language so Phase 2 has a baseline to
  * diff against when the chunker lands.
  *
- * The interesting part is the grammar *sourcing*: the Python build gets three
- * Godot grammars from `tree-sitter-language-pack`, which has no npm analogue.
+ * The interesting part is the grammar *sourcing*. The Python build takes three
+ * Godot grammars from `tree-sitter-language-pack`; on npm two of them have
+ * dedicated packages and only `gdshader` needs a pack, which is why the pack
+ * dependency is narrower here than on the Python side.
  */
 
 import { readFileSync } from "node:fs";
@@ -132,6 +134,32 @@ const EXTENSIONS: Record<string, string> = {
   ".lua": "lua",
 };
 
+/**
+ * Grammars known to be unavailable on a platform, reported as skips.
+ *
+ * A declared gap keeps the spike's verdict honest -- it reports SKIP rather
+ * than PASS, so the run is visibly incomplete -- without leaving CI red on
+ * something no commit here can fix. Removing an entry is how the gap gets
+ * closed; nothing else in this file needs to change.
+ */
+const KNOWN_GAPS: Array<{ language: string; platform: NodeJS.Platform; why: string }> = [
+  {
+    language: "gdshader",
+    platform: "win32",
+    why:
+      "@kreuzberg/tree-sitter-language-pack cannot load its win32-x64 binding " +
+      '("LoadLibrary failed: The specified module could not be found", which is ' +
+      "a missing transitive DLL rather than a missing addon). This is a " +
+      "regression against the Python build, whose PyPI language pack ships " +
+      "working Windows wheels, and must be resolved before Phase 2 ships",
+  },
+];
+
+function knownGap(language: string): string | undefined {
+  return KNOWN_GAPS.find((gap) => gap.language === language && gap.platform === process.platform)
+    ?.why;
+}
+
 const spike = new Spike("s2", "Grammar coverage");
 spike.header();
 
@@ -169,6 +197,20 @@ function fixtureFor(languageName: string): string | undefined {
 // against a full table rather than aborting the run.
 for (const name of Object.keys(GRAMMARS)) {
   await spike.check(`${name}: grammar loads, query compiles, corpus parses`, async () => {
+    const gap = knownGap(name);
+    if (gap !== undefined) {
+      // Confirm the gap is still real before skipping, so an entry that has
+      // quietly been fixed upstream shows up as a skip that should be deleted
+      // rather than silently masking a working grammar.
+      try {
+        await loadGrammar(name);
+      } catch {
+        return { skip: `known gap on ${process.platform}: ${gap}` };
+      }
+      throw new Error(
+        `the recorded ${process.platform} gap for ${name} no longer reproduces — remove it from KNOWN_GAPS`,
+      );
+    }
     const grammar = await loadGrammar(name);
 
     const querySource = readFileSync(join(QUERY_DIR, `${name}.scm`), "utf8");

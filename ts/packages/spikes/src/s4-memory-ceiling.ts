@@ -70,7 +70,15 @@ async function pollRss(
     try {
       rssMb = (await pidusage(pid)).memory / MEGABYTE;
     } catch {
-      break; // the process exited underneath the poll
+      // A lookup can fail either because the process has exited or because it
+      // has not been scheduled yet -- on Windows the first poll routinely
+      // lands before the child is visible. Only treat it as an exit once a
+      // sample has been seen; before that, keep waiting. Breaking on the first
+      // error instead reported "0 samples taken" on Windows while the very
+      // same polling worked in the checks below.
+      if (samples.length > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      continue;
     }
     samples.push(rssMb);
     if (predicate(rssMb)) return samples;
