@@ -228,6 +228,20 @@ The enforcement mechanism ports intact:
 - **`pidusage` and `psutil` agree to 0.00%** (288.2 MB vs 288.2 MB) when both
   measure the same quiesced child.
 
+**One caveat Phase 4 inherits: polling has a sampling race.** Windows allocates
+fast enough that a child could run to completion between two 25 ms polls. That
+showed up twice — as a check reporting zero samples, and more insidiously as a
+256 MB child appearing to *fit* under a 200 MB ceiling because its peak was
+never observed. An unobserved peak reads exactly like a peak that never
+happened.
+
+The spike now holds each child at its peak so the mechanism is measured rather
+than the scheduler, and refuses to trust a ceiling verdict it took no samples
+for. Phase 4 needs the same property in earnest: `embedding_worker.py`'s real
+batches allocate over a long enough window that this is unlikely to bite, but
+"unlikely" is not the same as "checked", and a ceiling that silently fails open
+is worse than no ceiling.
+
 **Consequence.** The §10 risk "child RSS accounting differs from `psutil`
 semantics" is retired: the ceilings in `settings.py` carry over numerically
 unchanged. Comparing *peak* RSS at `test_memory_acceptance.py`'s fixture scales

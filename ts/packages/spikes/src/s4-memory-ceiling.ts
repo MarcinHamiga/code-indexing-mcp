@@ -88,11 +88,19 @@ async function pollRss(
 }
 
 await spike.check("pidusage tracks a child's growing resident set", async () => {
-  const child = startChild(192, 16, 30);
+  // The hold matters more than it looks. Windows allocates fast enough that a
+  // child with no hold finished and exited before the parent's first poll
+  // landed, and the check reported "0 samples taken" while the checks below
+  // sampled the same way successfully. A process that outlives the sampling
+  // interval is a precondition for measuring it, not a detail.
+  const child = startChild(192, 16, 30, 4_000);
   const samples = await pollRss(child.pid, (rss) => rss > 120, 20_000);
   child.kill();
   await child.exited;
 
+  if (samples.length === 0) {
+    throw new Error("never sampled the child at all -- it exited before the first poll landed");
+  }
   if (samples.length < 3) throw new Error(`only ${samples.length} samples taken`);
   const first = samples[0] ?? 0;
   const peak = Math.max(...samples);
@@ -127,9 +135,18 @@ await spike.check("a halved retry completes under the same ceiling", async () =>
   // try again, until it fits or there is nothing left to halve.
   while (targetMb >= 16) {
     attempts += 1;
-    const child = startChild(targetMb, 16, 15);
+    // Hold at the peak for the same reason as the first check: without it a
+    // fast-allocating child can exit between polls, and an unobserved peak
+    // reads as "fits under the ceiling". That is how a 256 MB child passed a
+    // 200 MB ceiling on Windows -- a false pass, not a real one.
+    const child = startChild(targetMb, 16, 15, 1_500);
     const samples = await pollRss(child.pid, (rss) => rss >= ceilingMb, 60_000);
     const exceeded = Math.max(...samples, 0) >= ceilingMb;
+    if (samples.length === 0) {
+      child.kill();
+      await child.exited;
+      throw new Error(`never sampled the child at ${targetMb} MB -- the ceiling cannot be trusted`);
+    }
     if (exceeded) {
       child.kill();
       await child.exited;
