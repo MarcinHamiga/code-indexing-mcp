@@ -1,8 +1,10 @@
 # Python → TypeScript migration plan
 
 Date: 2026-08-17
-Status: proposed; Phase 0 executed — see
-[2026-08-17-phase-0-spike-results.md](2026-08-17-phase-0-spike-results.md)
+Status: in progress. Phase 0 executed — see
+[2026-08-17-phase-0-spike-results.md](2026-08-17-phase-0-spike-results.md).
+Phase 1 complete — see
+[2026-08-17-phase-1-notes.md](2026-08-17-phase-1-notes.md).
 Branch: `ts-migration`
 
 ## 1. Purpose and scope
@@ -103,7 +105,7 @@ in module docstrings and `docs/plans/` carries over.
 | Python | TypeScript replacement | Confidence |
 |---|---|---|
 | `mcp` (FastMCP) | `@modelcontextprotocol/sdk` (`McpServer` + stdio transport, zod tool schemas) | High — official SDK, same protocol |
-| `pydantic` v2 | `zod` v4 + inferred types; `zod-to-json-schema` where the SDK needs raw schemas | High |
+| `pydantic` v2 | `zod` v4 + inferred types | High — Phase 1 ported all ~50 models. `zod-to-json-schema` proved unnecessary: v4 ships `z.toJSONSchema()` |
 | `lancedb` | `@lancedb/lancedb` (native Node bindings over the same Rust core) | Medium — same storage format, but FTS/BTree index-config API parity must be **spiked first** (§6, S1) |
 | `pyarrow` | `apache-arrow` JS **pinned to 18.1.0** for IPC staging files (LanceDB peer-requires `>=15 <=18.1.0`, so the current 21.x is not available); LanceDB JS accepts Arrow tables natively | High — confirmed by S1 |
 | `tree-sitter-*` PyPI packages | `tree-sitter` native Node bindings + per-grammar npm packages; `.scm` queries port unchanged | High — S2 confirmed all 18 languages and every committed query |
@@ -113,7 +115,7 @@ in module docstrings and `docs/plans/` carries over.
 | `watchfiles` | `@parcel/watcher` (native, recursive, battle-tested); confirm under Bun in S0, with `fs.watch` as fallback | Medium–High |
 | `filelock` | `proper-lockfile` | High |
 | `platformdirs` | `env-paths` | High |
-| `psutil` | `pidusage` + `node:os`/`process.memoryUsage`; RSS ceilings via the same polling loop | Medium — verify per-platform RSS semantics match `embedding_worker.py`'s accounting |
+| `psutil` | `pidusage` + `node:os`/`process.memoryUsage`; RSS ceilings via the same polling loop | Medium — verify per-platform RSS semantics match `embedding_worker.py`'s accounting. `settings.py`'s only use is `virtual_memory().total`, which is `node:os`'s `totalmem()` and needed no dependency (Phase 1) |
 | `pathspec` | `ignore` npm package (gitignore semantics) | High |
 | SQLite (`history.py`) | `bun:sqlite` (built-in), behind the storage adapter per §3's compat discipline | High |
 | `multiprocessing` spawn + `Connection` auth | `Bun.spawn`/`node:child_process` + the same socket dial-back and HMAC challenge-response, now used for **all** workers (§5.3) | High |
@@ -243,8 +245,8 @@ spec, and the ~29k test lines are most of the migration's real cost.
 
 | Phase | Content | Source ln (approx) | Estimate |
 |---|---|---|---|
-| 0 | Spikes S0–S5; repo scaffolding (Bun workspace, tsconfig, Biome, `bun test`, CI skeleton) | — | 2–3 wk |
-| 1 | Foundations: `errors`, `models` (→ zod), `settings`, `path_filter`, `token_batching`, `acceptance`, `progress`, `projects`, `update_check` | ~2,600 | 2 wk |
+| 0 | ✅ Spikes S0–S5; repo scaffolding (Bun workspace, tsconfig, Biome, `bun test`, CI skeleton) | — | 2–3 wk |
+| 1 | ✅ Foundations: `errors`, `models` (→ zod), `settings`, `path_filter`, `token_batching`, `acceptance`, `progress`, `projects`, `update_check` | ~2,600 | 2 wk |
 | 2 | Scan & extract: `scanner`, `extractor`, query packs, `reference_service` | ~3,900 | 3–4 wk |
 | 3 | Storage: `storage`, `staging`, `history` | ~2,800 | 3 wk |
 | 4 | Embedding (CPU): `embedding` (direct-ONNX based, per §5.1), `embedding_worker`, `worker_launcher`, `passage_backend`, `backends`, `calibration`, `probe_cache` | ~2,900 | 3 wk |
@@ -266,7 +268,10 @@ golden snapshots directly) and is promoted to the package root at cutover.
 - **Golden fixtures**: the extractor fixture corpus and committed output
   snapshots under `tests/fixtures/` become language-neutral golden files
   consumed by both test suites. Any diff between Python and TS extraction
-  is a migration bug by definition.
+  is a migration bug by definition. Phase 1 established the shape with
+  `ts/packages/server/scripts/write_path_filter_parity.py`, which records what
+  the Python build emits for every search glob so the TS suite is held to it
+  instead of to a reimplemented oracle.
 - **MCP contract tests**: capture each tool's JSON schema and
   representative request/response pairs from the Python server into
   fixtures; the TS server must reproduce schemas (field names, optionality,

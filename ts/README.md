@@ -18,6 +18,17 @@ ts/
   packages/spikes/      the Phase 0 experiments -- see its README
 ```
 
+`packages/server/src` currently holds the Phase 1 foundations, each named after
+the Python module it ports:
+
+```
+errors.ts          models.ts        settings.ts      backends.ts
+path-filter.ts     token-batching.ts  acceptance.ts
+progress.ts        projects.ts      update-check.ts
+paths.ts           the pathlib semantics the rest of it leans on
+runtime/           the one directory allowed to import bun:* APIs
+```
+
 ## Checks
 
 Run these before pushing. They are the same four gates CI applies, in the same
@@ -42,7 +53,7 @@ bun test
 executes TypeScript by stripping types without checking them, so this is the
 only gate standing where `mypy --strict` stands today.
 
-## Two conventions worth knowing before writing code here
+## Four conventions worth knowing before writing code here
 
 **Bun-only APIs live in `src/runtime/`.** Core modules import `node:`-namespaced
 APIs and Web standards only, so any single process can be run under Node if a
@@ -53,3 +64,30 @@ are a lint error elsewhere.
 `namespace` are lint errors: Node can execute `.ts` directly but rejects
 TypeScript syntax that does not erase, and that ability is what makes the
 paragraph above true rather than aspirational.
+
+**Model fields stay snake_case; everything else is camelCase.** The models in
+`src/models.ts` *are* the wire contract — the MCP tool schemas are generated from
+them, the `.ci-mcp/project.toml` marker and the progress snapshot are written
+from them, and the daemon frames them. Renaming them would mean a hand-written
+mapping for each of the fifty models, which is exactly where a migration hides
+its bugs. Nothing outside that file follows the convention.
+
+**A schema and its type share a name.** `ProjectInfo.parse(raw)` is the
+constructor and `ProjectInfo` is the type, so the two halves read the way
+`ProjectInfo.model_validate(raw)` and `ProjectInfo` did in Python.
+
+## Parity fixtures
+
+Where a port has to agree with the Python build *exactly* rather than merely
+behave sensibly, the oracle is a committed fixture generated from the shipping
+implementation rather than a reimplementation of it in the test. Today that is
+the search path pushdown:
+
+```sh
+uv run python ts/packages/server/scripts/write_path_filter_parity.py
+```
+
+It records every regex `glob_to_regex` emits, character for character, and the
+ground-truth `PurePosixPath.match` result for 37 patterns against 932 corpus
+paths. Regenerate it whenever either implementation changes, and expect the diff
+to be empty.
