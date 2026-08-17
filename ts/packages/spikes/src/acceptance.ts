@@ -4,9 +4,15 @@
  *
  * S3 scores the TypeScript embedder against Python-produced vectors with the
  * *same* metrics the project already trusts, rather than inventing a parity
- * measure for the migration. Phase 1 ports this module properly; this copy
- * exists so the spike can run before Phase 1 starts, and its numbers are
- * directly comparable to what `test_accelerator_acceptance.py` asserts.
+ * measure for the migration. Its numbers are directly comparable to what
+ * `test_accelerator_acceptance.py` asserts.
+ *
+ * **The canonical port now lives in `packages/server/src/acceptance.ts`** --
+ * Phase 1 landed it, with `topKRankCorrelation` and a proper suite. This copy
+ * stays deliberately: a Phase 0 spike is a record of an experiment, and one that
+ * reached back into code written after it ran would no longer reproduce the
+ * verdict in `docs/plans/2026-08-17-phase-0-spike-results.md`. Fix bugs in the
+ * server module; change this one only to keep the spike runnable.
  *
  * Deliberately written over plain arrays: pulling in a linear-algebra
  * dependency to answer a Phase 0 question would prejudge a Phase 4 decision.

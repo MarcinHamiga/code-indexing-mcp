@@ -10,5 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
-  "dependencies": {}
+  "dependencies": {
+    "smol-toml": "1.8.0",
+    "zod": "4.4.3"
+  }
 }
