@@ -21,9 +21,15 @@ need a Python-produced fixture.
 | S4 — Memory ceiling | **Pass** | The polling/kill/retry mechanism ports, and `pidusage` agrees with `psutil` exactly. |
 | S5 — Watcher and scanner | **Pass** | `@parcel/watcher` holds the properties the auto-indexer relies on. |
 
-Measured on macOS 15 / arm64, Bun 1.3.14, Node 26.7.0. The Linux and Windows
-columns come from the CI matrix (`.github/workflows/ci-ts.yml`), which runs the
-spikes on all three platforms.
+Measured on macOS 15 / arm64, Bun 1.3.14, Node 26.7.0, and confirmed on
+ubuntu-latest / x64 through the CI matrix (`.github/workflows/ci-ts.yml`).
+S1, S3, and S4 skip on CI because their fixtures (a Python-written index, the
+model artifact, the project virtualenv) are not present there.
+
+Linux confirmed S0 and S2 in full — every native addon loads, all 18 grammars
+resolve, `@derekstride/tree-sitter-sql` compiles from source on the runner, and
+the language pack downloads `gdshader` — and surfaced two real behavioral
+differences in S5, recorded under that spike.
 
 ## S0 — Bun native-module matrix — PASS
 
@@ -235,12 +241,37 @@ Every property the auto-indexing monitor relies on holds under
 - `git ls-files -z` streams as NUL-delimited chunks through
   `child_process.spawn`, parsed incrementally rather than buffered (249 paths).
 
-**One behavioral difference worth encoding.** `ignore` entries are directory
-names and paths, **not globs**: `"node_modules"` suppresses correctly, while
-`"**/node_modules/**"` silently suppresses nothing. Since `pathspec` patterns in
-`scanner.py` *are* globs, Phase 6 must translate rather than pass them through —
-a mistranslated pattern fails silently, putting the churn it was meant to
-suppress back into the event stream with no error to notice.
+### Two platform differences Phase 6 must encode
+
+**1. `ignore` entries are names and paths, not globs — and the glob behavior
+differs by platform.** `"node_modules"` suppresses correctly everywhere. The
+glob form `"**/node_modules/**"` suppresses nothing on macOS and everything on
+Linux. Since `pathspec` patterns in `scanner.py` *are* globs, Phase 6 must
+translate them into the plain directory names this API wants rather than pass
+them through. A mistranslated pattern fails silently, putting the churn it was
+meant to suppress back into the event stream with no error to notice — and it
+would fail differently on each platform.
+
+**2. Linux misses files written into a just-created directory.** macOS watches
+a tree through FSEvents, so `mkdir -p a/b/c && write a/b/c/deep.py` is fully
+observed. Linux inotify has no recursive mode: `@parcel/watcher` adds a watch
+per directory as it learns of them, and a file created inside the window
+between the mkdir and the watch registration is missed outright. The Linux run
+saw the directory events and no event for the file.
+
+This is **not a regression against the Python build** — `watchfiles` carries the
+identical inotify constraint — and it is a latency issue rather than a
+correctness one: `application.py::_project_is_stale` rescans the tree and
+compares the whole path set on the next query, so a dropped event delays
+proactive auto-indexing but cannot leave a file permanently unindexed. Phase 6
+should not try to close the race in the watcher; it should preserve the lazy
+freshness check as the actual correctness mechanism, which is what it already
+is.
+
+The spike records this per-platform rather than asserting it, since the answer
+legitimately differs. The hard assertion it keeps is the property the monitor
+genuinely depends on: a write into an already-watched nested directory is
+always seen.
 
 ## Open items entering Phase 1
 
@@ -249,10 +280,10 @@ suppress back into the event stream with no error to notice.
    `@huggingface/tokenizers`, and the grammar row needs the language pack.
 3. **Correct §2.2/§7 of the plan**: the extractor registers **18** languages,
    not 19.
-4. **Re-run the spikes on Linux and Windows.** All measurements here are macOS
-   arm64; the CI matrix covers the other two but has not reported yet. The
-   language pack ships addons for all six platform triples, so nothing is
-   expected to differ, but it has not been observed.
+4. **Windows has not reported yet.** The first run's Windows jobs failed on
+   infrastructure (a 429 from codeload while fetching `setup-bun`) and on CRLF
+   checkout, not on anything the spikes measured. `.gitattributes` now forces
+   LF under `ts/`, matching what the extractor corpus already does.
 5. **Pin the language pack's grammar revisions** before Phase 2 relies on it.
    The pack resolves grammars from a remote manifest at its own version, so a
    pack upgrade can move a grammar underneath the extractor — the same hazard

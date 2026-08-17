@@ -64,18 +64,54 @@ async function observe(
   return events;
 }
 
-await spike.check("recursive coverage reaches a newly nested directory", async () => {
+await spike.check("recursive coverage reaches an existing nested directory", async () => {
+  // The property the monitor actually depends on: a write anywhere in the
+  // established tree is seen. The directory exists and is being watched before
+  // the write happens, which is the ordinary steady state.
   const root = join(scratch, "recursive");
+  const nested = join(root, "a", "b", "c");
+  mkdirSync(nested, { recursive: true });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+
+  const events = await observe(root, () => {
+    writeFileSync(join(nested, "deep.py"), "value = 1\n");
+  });
+  const deep = events.filter((event) => event.path.endsWith("deep.py"));
+  if (deep.length === 0) {
+    throw new Error(`no event for a file three levels down; saw ${events.length} events`);
+  }
+  return `${events.length} events, including ${deep[0]?.type} for the nested file`;
+});
+
+await spike.check("a directory created and populated in one burst", async () => {
+  // Recorded rather than asserted, because the answer is platform-dependent
+  // and the plan needs the fact, not a green tick.
+  //
+  // macOS watches a tree through FSEvents, so a file written into a
+  // just-created directory is seen. Linux inotify has no recursive mode:
+  // @parcel/watcher must add a watch per directory as it learns of them, and a
+  // file created inside the window between mkdir and watch-add is missed
+  // outright. watchfiles carries the identical constraint, so this is not a
+  // regression against the Python build.
+  //
+  // It is a latency issue rather than a correctness one:
+  // `application.py::_project_is_stale` rescans the tree and compares the whole
+  // path set on the next query, so a dropped event delays proactive
+  // auto-indexing but cannot leave a file permanently unindexed.
+  const root = join(scratch, "burst-create");
   mkdirSync(root, { recursive: true });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+
   const events = await observe(root, () => {
     mkdirSync(join(root, "a", "b", "c"), { recursive: true });
     writeFileSync(join(root, "a", "b", "c", "deep.py"), "value = 1\n");
   });
   const deep = events.filter((event) => event.path.endsWith("deep.py"));
-  if (deep.length === 0) {
-    throw new Error(`no event for a file created three levels down; saw ${events.length} events`);
-  }
-  return `${events.length} events, including ${deep[0]?.type} for the nested file`;
+  return deep.length > 0
+    ? `the nested file was seen (${deep[0]?.type}) -- no watch-registration race here`
+    : `the nested file was MISSED (${events.length} other events) -- ` +
+        `new directories race the watch registration on this platform; ` +
+        `proactive indexing waits for the next lazy freshness check`;
 });
 
 await spike.check("a burst of writes coalesces", async () => {

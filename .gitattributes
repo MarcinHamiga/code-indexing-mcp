@@ -3,3 +3,9 @@
 # out identically on every platform. Without this, Windows checkouts get CRLF and
 # every offset in the snapshot shifts by one byte per preceding line.
 tests/fixtures/extractor_corpus/** text eol=lf
+
+# The TypeScript tree is formatted by Biome, which writes LF. Without this a
+# Windows checkout gets CRLF and `biome format --check` fails on every line of
+# every file -- the same hazard the extractor corpus above guards against, for
+# the same reason.
+ts/** text eol=lf
