@@ -1,7 +1,8 @@
 # Python → TypeScript migration plan
 
 Date: 2026-08-17
-Status: proposed
+Status: proposed; Phase 0 executed — see
+[2026-08-17-phase-0-spike-results.md](2026-08-17-phase-0-spike-results.md)
 Branch: `ts-migration`
 
 ## 1. Purpose and scope
@@ -45,7 +46,7 @@ in module docstrings and `docs/plans/` carries over.
 | `storage.py` | 1,745 | Partitioned LanceDB persistence: `projects` table plus per-project `files`/`chunks`/`references` tables, PyArrow schemas, FTS + BTree index management |
 | `reference_service.py` | 1,685 | Conservative syntax-only reference classification over structural rows |
 | `indexing.py` | 1,610 | Incremental indexing orchestration (content hashing, delta computation) |
-| `extractor.py` | 1,583 | Tree-sitter symbol/module chunk extraction; 20 `.scm` chunk queries + 4 reference queries, 19 languages |
+| `extractor.py` | 1,583 | Tree-sitter symbol/module chunk extraction; 18 `.scm` chunk queries + 4 reference queries, 18 languages |
 | `application.py` | 1,455 | Application services shared by MCP and CLI adapters |
 | `models.py` | 1,084 | ~50 frozen pydantic v2 domain models (the MCP tool schemas derive from these) |
 | `staging.py` | 655 | Journalled Arrow IPC staging for crash-recoverable index commits |
@@ -104,9 +105,10 @@ in module docstrings and `docs/plans/` carries over.
 | `mcp` (FastMCP) | `@modelcontextprotocol/sdk` (`McpServer` + stdio transport, zod tool schemas) | High — official SDK, same protocol |
 | `pydantic` v2 | `zod` v4 + inferred types; `zod-to-json-schema` where the SDK needs raw schemas | High |
 | `lancedb` | `@lancedb/lancedb` (native Node bindings over the same Rust core) | Medium — same storage format, but FTS/BTree index-config API parity must be **spiked first** (§6, S1) |
-| `pyarrow` | `apache-arrow` JS for IPC staging files; LanceDB JS accepts Arrow tables natively | Medium |
-| `tree-sitter-*` PyPI packages | `tree-sitter` native Node bindings + per-grammar npm packages; `.scm` queries port unchanged; `web-tree-sitter` (WASM) is the fallback if the native bindings misbehave under Bun (S0) | High for mainstream grammars; **GDScript/gdshader/godot-resource and HCL/SQL need sourcing** (S2) |
-| `fastembed` / `onnxruntime` | `onnxruntime-node` + `@huggingface/hub` (model download) + HF `tokenizers` bindings — i.e. the TS port owns what `direct_onnx.py` does today, for CPU too | Medium — embedding-vector parity is the make-or-break gate (S3) |
+| `pyarrow` | `apache-arrow` JS **pinned to 18.1.0** for IPC staging files (LanceDB peer-requires `>=15 <=18.1.0`, so the current 21.x is not available); LanceDB JS accepts Arrow tables natively | High — confirmed by S1 |
+| `tree-sitter-*` PyPI packages | `tree-sitter` native Node bindings + per-grammar npm packages; `.scm` queries port unchanged | High — S2 confirmed all 18 languages and every committed query |
+| `tree-sitter-language-pack` (PyPI) | `@kreuzberg/tree-sitter-language-pack` (306 grammars, native addons for all six platform triples, fetched on first use) | High — S2 verified `gdshader` against the Python pack's own output. Used only for `gdshader`; unlike the Python side, `gdscript` and `godot_resource` have dedicated npm packages |
+| `fastembed` / `onnxruntime` | `onnxruntime-node` + `@huggingface/hub` (model download) + `@huggingface/tokenizers` — i.e. the TS port owns what `direct_onnx.py` does today, for CPU too | High — S3 measured exact vector parity |
 | `mlx` | No first-party Node binding. Options: onnxruntime-node CoreML EP, `@frost-beta/mlx` community bindings, or keep the Python MLX worker as a sidecar (the worker protocol is already cross-process) | Low — decision point D2 |
 | `watchfiles` | `@parcel/watcher` (native, recursive, battle-tested); confirm under Bun in S0, with `fs.watch` as fallback | Medium–High |
 | `filelock` | `proper-lockfile` | High |
@@ -177,6 +179,12 @@ state.
 Each spike is a small throwaway program with a pass/fail written into this
 document's follow-up. Order matters: S0–S3 are the bets the whole plan
 rests on.
+
+**Executed 2026-08-17.** The programs live in `ts/packages/spikes/` and the
+verdicts are in
+[2026-08-17-phase-0-spike-results.md](2026-08-17-phase-0-spike-results.md):
+all six pass. D1 resolves to *keep indexes*. D2 remains open — S3 measured the
+CPU provider only.
 
 - **S0 — Bun native-module matrix** (~2 days): under Bun on Linux, macOS,
   and Windows, load `@lancedb/lancedb`, `tree-sitter` plus one grammar,
@@ -282,7 +290,7 @@ golden snapshots directly) and is promoted to the package root at cutover.
 | A native addon (lancedb, tree-sitter, onnxruntime-node, parcel-watcher) hits a Bun N-API gap | Medium | High | S0 first; core code sticks to `node:` APIs behind adapters (§3), so a single process can run under Node without forking the codebase |
 | LanceDB JS lacks the FTS/BTree index-config API the write path needs | Medium | Blocking | S1 first; upstream contribution window is the schedule buffer |
 | Embedding vectors drift → all user indexes rebuild | Medium | Medium | S3 + acceptance gates; rebuild path already exists and is exercised |
-| Niche grammars (GDScript family, SQL, HCL) unavailable as npm packages | High | Low–Medium | Build from grammar C sources; worst case, gate those languages behind a follow-up |
+| ~~Niche grammars (GDScript family, SQL, HCL) unavailable as npm packages~~ | — | — | **Retired by S2**: all resolve to npm packages, `gdshader` through `@kreuzberg/tree-sitter-language-pack` |
 | Native-module install pain (tree-sitter, onnxruntime, parcel-watcher, lancedb across 3 OSes) | Medium | Medium | Prebuilt binaries exist for all; CI matrix mirrors today's OS coverage from Phase 0 |
 | Bun regression lands in a release (younger runtime, faster release cadence than Node LTS) | Medium | Low–Medium | Pin the Bun version in `engines` and CI; upgrade deliberately with the full suite as the gate |
 | `worker_threads`/child RSS accounting differs from `psutil` semantics | Medium | Medium | S4; keep polling-based ceiling design which is implementation-agnostic |

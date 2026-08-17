@@ -1,0 +1,51 @@
+{
+  // Shared compiler settings for every workspace package. Bun executes
+  // TypeScript directly and never type-checks, so `tsc --noEmit` against this
+  // config is the only thing standing where `mypy --strict` stands today --
+  // which is why the strictness here is deliberately above the TypeScript
+  // default rather than at it.
+  "compilerOptions": {
+    "target": "esnext",
+    "lib": ["esnext"],
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "types": ["bun", "node"],
+
+    // Bun resolves `./thing.ts` imports natively and so does Node's type
+    // stripping, so source keeps explicit extensions and nothing is emitted
+    // from this tree.
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noEmit": true,
+
+    // The `mypy --strict` parity target named in the migration plan (S3.
+    // "Language/config"). `noUncheckedIndexedAccess` is the one that matters
+    // most for the port: Python raises on a bad index, TypeScript without this
+    // flag hands back `undefined` and types it as present.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+
+    // `exactOptionalPropertyTypes` keeps `{ error?: string }` from silently
+    // accepting `{ error: undefined }`. The distinction is load-bearing here:
+    // the on-disk formats (project.toml markers, progress snapshots, probe
+    // records) treat an absent key and a null-valued key differently, and
+    // pydantic did too.
+    "exactOptionalPropertyTypes": true,
+
+    // Analogues of the ruff rules already selected in pyproject.toml: unused
+    // bindings (F401/F841), non-exhaustive fallthrough (B), and override
+    // typos that Python's own method resolution would have caught.
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+
+    // Native addon type definitions (lancedb, onnxruntime-node, tree-sitter)
+    // are not all clean under these settings, and their errors are not ours
+    // to fix.
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  }
+}

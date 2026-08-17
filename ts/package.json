@@ -1,0 +1,27 @@
+{
+  "name": "@code-indexing-mcp/workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "scripts": {
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun run test",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "lint": "biome lint .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "tsc --noEmit -p packages/server && tsc --noEmit -p packages/installer && tsc --noEmit -p packages/spikes",
+    "test": "bun test",
+    "spike": "bun --cwd packages/spikes run spike"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.8",
+    "@types/bun": "1.3.14",
+    "@types/node": "26.2.0",
+    "typescript": "7.0.2"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "@code-indexing-mcp/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "code-indexing-mcp": "./src/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {}
+}

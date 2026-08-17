@@ -1,0 +1,113 @@
+name: CI (TypeScript)
+
+# The second workflow §11 of the migration plan calls for: the same gates the
+# Python tree has, applied to the TypeScript tree, from Phase 0 onward. Both
+# suites run on every PR until cutover; this one is retired last.
+on:
+  push:
+    paths: &ts-paths
+      - "ts/**"
+      - ".github/workflows/ci-ts.yml"
+      # The spikes read the committed query packs and extractor corpus, so a
+      # change to either can break this workflow without touching ts/.
+      - "src/code_indexing_mcp/queries/**"
+      - "src/code_indexing_mcp/reference_queries/**"
+      - "tests/fixtures/extractor_corpus/**"
+  pull_request:
+    paths: *ts-paths
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: ts
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Pinned deliberately: Bun ships faster than Node LTS and the risk
+          # register treats an unplanned upgrade as a real hazard. Move this
+          # with the full suite as the gate, never incidentally.
+          bun-version: 1.3.14
+      - id: install
+        # `--frozen-lockfile` is the `uv sync --locked` equivalent: CI must
+        # install exactly what the committed bun.lock resolves to.
+        run: bun install --frozen-lockfile
+
+      # Cheap deterministic checks first, mirroring the Python workflow: a
+      # format slip fails in seconds rather than after the suite. Every step
+      # still runs on failure so one push reports every problem.
+      - name: Format
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bun run format:check
+      - name: Lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bun run lint
+      - name: Types
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        # Bun executes TypeScript without checking it, so this is the only
+        # thing standing where `mypy --strict` stands in the Python workflow.
+        run: bun run typecheck
+      - name: Test
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bun test
+
+  # The Phase 0 spikes, as a regression gate on the bets the plan rests on: a
+  # Bun release or a grammar republish that breaks native module loading should
+  # fail here rather than in the middle of Phase 2.
+  #
+  # Only the spikes that need no external fixture run here. S1's Python-index
+  # check and S3's vector-parity check skip without their fixtures, which the
+  # harness reports as a skip rather than a pass.
+  spikes:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+
+      # The language pack fetches a grammar's shared library on first use, the
+      # same way the PyPI pack fetches the Godot grammars in the Python
+      # workflow. Resolve it once, before the spikes run, so a transient outage
+      # is one failed step rather than a failed language. The cache is
+      # versioned by the pack itself, so a pack upgrade simply misses.
+      - name: Locate the language-pack cache
+        id: pack
+        working-directory: ts/packages/spikes
+        shell: bash
+        run: |
+          echo "dir=$(bun -e "console.log(require('@kreuzberg/tree-sitter-language-pack').cacheDir())")" >> "$GITHUB_OUTPUT"
+      - name: Restore the language-pack cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pack.outputs.dir }}
+          key: ts-language-pack-${{ runner.os }}-${{ hashFiles('ts/bun.lock') }}
+      - name: Populate the language-pack cache
+        working-directory: ts/packages/spikes
+        run: bun -e "require('@kreuzberg/tree-sitter-language-pack').download(['gdshader'])"
+
+      - name: Run the spikes
+        working-directory: ts/packages/spikes
+        run: bun run src/run.ts
+      - name: Upload the spike reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase0-spike-reports-${{ matrix.os }}
+          path: ts/packages/spikes/results/
+          if-no-files-found: warn

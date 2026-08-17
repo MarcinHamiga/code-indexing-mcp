@@ -17,3 +17,6 @@ dist/
 build/
 *.egg-info/
 
+
+# The TypeScript migration tree keeps its own ignore rules in ts/.gitignore,
+# which Biome also reads as its ignore source.

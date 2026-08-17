@@ -1,0 +1,9 @@
+# bun.lock is committed -- it is this tree's uv.lock -- but nothing it installs is.
+node_modules/
+# Spike verdicts are per-machine observations, reproduced by running the spike.
+# The findings that matter are written into docs/plans/, not carried here.
+packages/spikes/results/
+# node-gyp output from grammars that build from source (see the S2 findings).
+build/
+dist/
+*.tsbuildinfo
