@@ -22,7 +22,26 @@
         "code-indexing-mcp": "./src/cli.ts",
       },
       "dependencies": {
+        "@derekstride/tree-sitter-sql": "0.3.11",
+        "@kreuzberg/tree-sitter-language-pack": "1.10.9",
+        "@tree-sitter-grammars/tree-sitter-hcl": "1.2.0",
+        "@tree-sitter-grammars/tree-sitter-lua": "0.4.1",
+        "@tree-sitter-grammars/tree-sitter-yaml": "0.7.1",
+        "ignore": "7.0.5",
         "smol-toml": "1.8.0",
+        "tree-sitter": "0.25.1",
+        "tree-sitter-c": "0.24.1",
+        "tree-sitter-c-sharp": "0.23.5",
+        "tree-sitter-cpp": "0.23.4",
+        "tree-sitter-gdscript": "6.1.0",
+        "tree-sitter-go": "0.25.0",
+        "tree-sitter-godot-resource": "0.7.0",
+        "tree-sitter-java": "0.23.5",
+        "tree-sitter-javascript": "0.25.0",
+        "tree-sitter-json": "0.24.8",
+        "tree-sitter-python": "0.25.0",
+        "tree-sitter-rust": "0.24.0",
+        "tree-sitter-typescript": "0.23.2",
         "zod": "4.4.3",
       },
     },
@@ -62,8 +81,8 @@
     },
   },
   "trustedDependencies": [
-    "onnxruntime-node",
     "tree-sitter",
+    "onnxruntime-node",
     "@derekstride/tree-sitter-sql",
     "@parcel/watcher",
   ],
@@ -397,6 +416,8 @@
     "hasown": ["hasown@2.0.4", "", { "dependencies": { "function-bind": "^1.1.2" } }, "sha512-T2UbfbBEF32wiepXIsMlTW9+dDYC6wMh/t/vYA4tuOMKqWz/n3vr1NFSxQiyP+zk2mXsoMA/i/7qV6LKut1t1A=="],
 
     "humanize-ms": ["humanize-ms@1.2.1", "", { "dependencies": { "ms": "^2.0.0" } }, "sha512-Fl70vYtsAFb/C06PTS9dZBo7ihau+Tu/DNCk/OyHhea07S+aeMWpFFkUaXRa8fI+ScZbEI8dfSxwY7gxZ9SAVQ=="],
+
+    "ignore": ["ignore@7.0.5", "", {}, "sha512-Hs59xBNfUIunMFgWAbGX5cq6893IbWg4KnrjbYwX3tx0ztorVgTDA6B2sxf8ejHJ4wz8BqGUMYlnzNBer5NvGg=="],
 
     "is-arrayish": ["is-arrayish@0.3.4", "", {}, "sha512-m6UrgzFVUYawGBh1dUsWR5M2Clqic9RVXC/9f8ceNlv2IcO9j9J/z8UoCLPqtsPBFNzEpfR3xftohbfqDx8EQA=="],
 

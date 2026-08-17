@@ -5,6 +5,27 @@ import os from "node:os";
 import path from "node:path";
 
 /**
+ * The repository root, so tests can reach the shared fixture corpus.
+ *
+ * The migration plan (§7) has both suites read the same
+ * `tests/fixtures/` files rather than each keeping a copy: a golden snapshot
+ * that exists twice is a snapshot that can disagree with itself. This resolves
+ * from the test file's own location, so it survives the tree being promoted
+ * from `ts/` to the package root at cutover.
+ */
+export function repositoryRoot(): string {
+  let directory = path.dirname(new URL(import.meta.url).pathname);
+  for (;;) {
+    if (fs.existsSync(path.join(directory, "tests", "fixtures", "extractor_corpus"))) {
+      return directory;
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) throw new Error("could not locate the repository root");
+    directory = parent;
+  }
+}
+
+/**
  * A fresh temporary directory that removes itself when the suite ends.
  *
  * Returns a function rather than a value so each `beforeEach` gets its own, the

@@ -14,11 +14,15 @@ on:
     paths: &ts-paths
       - "ts/**"
       - ".github/workflows/ci-ts.yml"
-      # The spikes read the committed query packs and extractor corpus, so a
-      # change to either can break this workflow without touching ts/.
+      # The spikes and the Phase 2 suites read committed Python-tree files --
+      # the query packs, the extractor corpus and its golden snapshot, and the
+      # resolver corpus -- so a change to any of them can break this workflow
+      # without touching ts/.
       - "src/code_indexing_mcp/queries/**"
       - "src/code_indexing_mcp/reference_queries/**"
       - "tests/fixtures/extractor_corpus/**"
+      - "tests/fixtures/extractor_snapshot.json"
+      - "tests/fixtures/resolver_corpus/**"
   pull_request:
     paths: *ts-paths
   workflow_dispatch:
@@ -53,6 +57,37 @@ jobs:
         # `--frozen-lockfile` is the `uv sync --locked` equivalent: CI must
         # install exactly what the committed bun.lock resolves to.
         run: bun install --frozen-lockfile
+
+      # From Phase 2 the server package resolves `gdshader` through the language
+      # pack, which fetches a grammar's shared library on first use -- so the
+      # test job needs the same warm cache the spikes job does, for the same
+      # reason the Python workflow warms its grammar cache. Windows is skipped:
+      # the pack's binding cannot load there (§5.5), the scanner treats
+      # `.gdshader` as an unsupported extension, and downloading a grammar
+      # nothing will open would only add a way for the job to fail.
+      - name: Locate the language-pack cache
+        id: pack
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && runner.os != 'Windows' }}
+        working-directory: ts/packages/server
+        shell: bash
+        run: |
+          dir=$(bun -e 'console.log(require("@kreuzberg/tree-sitter-language-pack").cacheDir())') || dir=""
+          echo "resolved to: ${dir:-<unresolved>}"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+      - name: Restore the language-pack cache
+        # Caching is an optimization -- `download` fetches whatever is absent --
+        # so a cache that cannot be located must not fail the suite it exists to
+        # speed up.
+        if: ${{ !cancelled() && steps.pack.outputs.dir != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pack.outputs.dir }}
+          key: ts-language-pack-${{ runner.os }}-${{ hashFiles('ts/bun.lock') }}
+      - name: Populate the language-pack cache
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && runner.os != 'Windows' }}
+        working-directory: ts/packages/server
+        shell: bash
+        run: bun -e 'require("@kreuzberg/tree-sitter-language-pack").download(["gdshader"])'
 
       # Cheap deterministic checks first, mirroring the Python workflow: a
       # format slip fails in seconds rather than after the suite. Every step

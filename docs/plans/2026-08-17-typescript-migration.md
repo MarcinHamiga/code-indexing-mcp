@@ -5,6 +5,8 @@ Status: in progress. Phase 0 executed — see
 [2026-08-17-phase-0-spike-results.md](2026-08-17-phase-0-spike-results.md).
 Phase 1 complete — see
 [2026-08-17-phase-1-notes.md](2026-08-17-phase-1-notes.md).
+Phase 2 complete — see
+[2026-08-18-phase-2-notes.md](2026-08-18-phase-2-notes.md).
 Branch: `ts-migration`
 
 ## 1. Purpose and scope
@@ -108,7 +110,7 @@ in module docstrings and `docs/plans/` carries over.
 | `pydantic` v2 | `zod` v4 + inferred types | High — Phase 1 ported all ~50 models. `zod-to-json-schema` proved unnecessary: v4 ships `z.toJSONSchema()` |
 | `lancedb` | `@lancedb/lancedb` (native Node bindings over the same Rust core) | Medium — same storage format, but FTS/BTree index-config API parity must be **spiked first** (§6, S1) |
 | `pyarrow` | `apache-arrow` JS **pinned to 18.1.0** for IPC staging files (LanceDB peer-requires `>=15 <=18.1.0`, so the current 21.x is not available); LanceDB JS accepts Arrow tables natively | High — confirmed by S1 |
-| `tree-sitter-*` PyPI packages | `tree-sitter` native Node bindings + per-grammar npm packages; `.scm` queries port unchanged | High — S2 confirmed all 18 languages and every committed query |
+| `tree-sitter-*` PyPI packages | `tree-sitter` native Node bindings + per-grammar npm packages; `.scm` queries port unchanged | High — S2 confirmed all 18 languages and every committed query. **The Node binding reports UTF-16 code-unit indices where the Python one reports UTF-8 byte offsets**; Phase 2 converts every node offset, since those offsets are the stored contract (see the Phase 2 notes) |
 | `tree-sitter-language-pack` (PyPI) | `@kreuzberg/tree-sitter-language-pack` (306 grammars, native addons fetched on first use) | High on macOS and Linux — S2 verified `gdshader` against the Python pack's own output. Used only for `gdshader`; unlike the Python side, `gdscript` and `godot_resource` have dedicated npm packages. **Its Windows binding does not load, so `gdshader` is an accepted non-goal there** (§5.5) |
 | `fastembed` / `onnxruntime` | `onnxruntime-node` + `@huggingface/hub` (model download) + `@huggingface/tokenizers` — i.e. the TS port owns what `direct_onnx.py` does today, for CPU too | High — S3 measured exact vector parity |
 | `mlx` | No first-party Node binding. Options: onnxruntime-node CoreML EP, `@frost-beta/mlx` community bindings, or keep the Python MLX worker as a sidecar (the worker protocol is already cross-process) | Low — decision point D2 |
@@ -116,7 +118,7 @@ in module docstrings and `docs/plans/` carries over.
 | `filelock` | `proper-lockfile` | High |
 | `platformdirs` | `env-paths` | High |
 | `psutil` | `pidusage` + `node:os`/`process.memoryUsage`; RSS ceilings via the same polling loop | Medium — verify per-platform RSS semantics match `embedding_worker.py`'s accounting. `settings.py`'s only use is `virtual_memory().total`, which is `node:os`'s `totalmem()` and needed no dependency (Phase 1) |
-| `pathspec` | `ignore` npm package (gitignore semantics) | High |
+| `pathspec` | `ignore` npm package (gitignore semantics) | High — Phase 2 held it to a generated fixture of `GitIgnoreSpec`'s own verdicts; all 884 decisions agree |
 | SQLite (`history.py`) | `bun:sqlite` (built-in), behind the storage adapter per §3's compat discipline | High |
 | `multiprocessing` spawn + `Connection` auth | `Bun.spawn`/`node:child_process` + the same socket dial-back and HMAC challenge-response, now used for **all** workers (§5.3) | High |
 | `struct` framing | `Buffer`/`DataView` | High |
@@ -184,7 +186,8 @@ redistributable, run a second WASM parser stack for one language, or vendor and
 build the grammar's C sources, the capability is dropped on that platform: one
 shader format on one OS is worth less than any of those costs.
 
-The consequences are small but real, and Phase 2 owns them. A missing grammar
+The consequences are small but real, and Phase 2 owns them (done: the gap is a
+single table in `grammars.ts`, which `scanner.ts` reads). A missing grammar
 must be a *supported state* rather than an error — `.gdshader`/`.gdshaderinc`
 files are skipped on Windows the way an unsupported extension is, because an
 index that fails on a Godot repository would be much worse than one that
@@ -247,7 +250,7 @@ spec, and the ~29k test lines are most of the migration's real cost.
 |---|---|---|---|
 | 0 | ✅ Spikes S0–S5; repo scaffolding (Bun workspace, tsconfig, Biome, `bun test`, CI skeleton) | — | 2–3 wk |
 | 1 | ✅ Foundations: `errors`, `models` (→ zod), `settings`, `path_filter`, `token_batching`, `acceptance`, `progress`, `projects`, `update_check` | ~2,600 | 2 wk |
-| 2 | Scan & extract: `scanner`, `extractor`, query packs, `reference_service` | ~3,900 | 3–4 wk |
+| 2 | ✅ Scan & extract: `scanner`, `extractor`, query packs, `reference_service` | ~3,900 | 3–4 wk |
 | 3 | Storage: `storage`, `staging`, `history` | ~2,800 | 3 wk |
 | 4 | Embedding (CPU): `embedding` (direct-ONNX based, per §5.1), `embedding_worker`, `worker_launcher`, `passage_backend`, `backends`, `calibration`, `probe_cache` | ~2,900 | 3 wk |
 | 5 | Orchestration & search: `indexing`, `search`, `application` | ~3,200 | 3 wk |
@@ -271,7 +274,11 @@ golden snapshots directly) and is promoted to the package root at cutover.
   is a migration bug by definition. Phase 1 established the shape with
   `ts/packages/server/scripts/write_path_filter_parity.py`, which records what
   the Python build emits for every search glob so the TS suite is held to it
-  instead of to a reimplemented oracle.
+  instead of to a reimplemented oracle. Phase 2 applied it twice more: the TS
+  extractor is held to `tests/fixtures/extractor_snapshot.json` — the very file
+  the Python suite gates on, not a copy — across all 18 languages, and the
+  gitignore port to a generated record of `pathspec.GitIgnoreSpec`'s verdicts
+  (`scripts/write_ignore_parity.py`).
 - **MCP contract tests**: capture each tool's JSON schema and
   representative request/response pairs from the Python server into
   fixtures; the TS server must reproduce schemas (field names, optionality,
