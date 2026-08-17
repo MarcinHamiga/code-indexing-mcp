@@ -8,7 +8,7 @@ Branch: `ts-migration`
 
 This document plans a full migration of `code-indexing-mcp` from Python
 (~26,000 source lines across 56 modules, ~29,200 test lines across 74 files)
-to TypeScript running on Node.js. The migration must preserve, verbatim, the
+to TypeScript running on Bun. The migration must preserve, verbatim, the
 externally observable contract:
 
 - the 16-tool MCP surface and its JSON schemas,
@@ -69,19 +69,33 @@ in module docstrings and `docs/plans/` carries over.
 
 ## 3. Target stack
 
-- **Runtime**: Node.js ≥ 22 LTS (native `node:sqlite`, stable `fetch`,
-  `worker_threads`). Single `package.json` workspace with `server` and
-  `installer` packages mirroring today's package split.
+- **Runtime**: Bun ≥ 1.2, pinned in `package.json#engines` and CI. Bun
+  executes TypeScript directly (no build step for dev or serve), starts
+  fast enough to matter for a stdio MCP server and a CLI, and ships
+  `bun:sqlite`, `Bun.spawn`, and a package manager in the box. Single
+  workspace with `server` and `installer` packages mirroring today's
+  package split.
+- **Node-compat discipline**: core modules import only `node:`-namespaced
+  APIs and Web standards; Bun-only APIs (`bun:sqlite`, `Bun.spawn`,
+  `$` shell) live behind thin adapters. This costs little and keeps
+  per-process fallback to Node possible if a native module hits a Bun
+  N-API gap (risk register, and spike S0).
 - **Language/config**: TypeScript, `"strict": true` plus
   `noUncheckedIndexedAccess` — the parity target for `mypy --strict`.
-- **Package manager**: pnpm with a committed lockfile (the `uv.lock`
-  equivalent). Accelerator variants become optional dependencies /
-  install-time choices rather than conflicting extras — see §5.3.
-- **Test runner**: vitest (workers ≈ `pytest-xdist`), coverage via v8.
+  Bun does not type-check, so `tsc --noEmit` stays a CI gate.
+- **Package manager**: `bun install` with the committed `bun.lock` (the
+  `uv.lock` equivalent). Accelerator variants become optional
+  dependencies / install-time choices rather than conflicting extras —
+  see §5.3.
+- **Test runner**: `bun test` (jest-compatible, parallel ≈
+  `pytest-xdist`, built-in coverage).
 - **Lint/format**: Biome (single tool ≈ ruff's role).
 - **Distribution**: npm package with a `code-indexing-mcp` bin, plus the
-  same curl-pipeable bootstrap installer (now checking for/provisioning
-  Node instead of uv).
+  same curl-pipeable bootstrap installer (now provisioning Bun instead of
+  uv). `bun build --compile` additionally allows shipping per-platform
+  single-file executables, which would remove runtime provisioning from
+  the install entirely — evaluate in Phase 8 once S0 settles how the
+  native `.node` addons embed (decision D5).
 
 ## 4. Dependency map
 
@@ -91,21 +105,21 @@ in module docstrings and `docs/plans/` carries over.
 | `pydantic` v2 | `zod` v4 + inferred types; `zod-to-json-schema` where the SDK needs raw schemas | High |
 | `lancedb` | `@lancedb/lancedb` (native Node bindings over the same Rust core) | Medium — same storage format, but FTS/BTree index-config API parity must be **spiked first** (§6, S1) |
 | `pyarrow` | `apache-arrow` JS for IPC staging files; LanceDB JS accepts Arrow tables natively | Medium |
-| `tree-sitter-*` PyPI packages | `tree-sitter` native Node bindings + per-grammar npm packages; `.scm` queries port unchanged | High for mainstream grammars; **GDScript/gdshader/godot-resource and HCL/SQL need sourcing** (S2) |
+| `tree-sitter-*` PyPI packages | `tree-sitter` native Node bindings + per-grammar npm packages; `.scm` queries port unchanged; `web-tree-sitter` (WASM) is the fallback if the native bindings misbehave under Bun (S0) | High for mainstream grammars; **GDScript/gdshader/godot-resource and HCL/SQL need sourcing** (S2) |
 | `fastembed` / `onnxruntime` | `onnxruntime-node` + `@huggingface/hub` (model download) + HF `tokenizers` bindings — i.e. the TS port owns what `direct_onnx.py` does today, for CPU too | Medium — embedding-vector parity is the make-or-break gate (S3) |
 | `mlx` | No first-party Node binding. Options: onnxruntime-node CoreML EP, `@frost-beta/mlx` community bindings, or keep the Python MLX worker as a sidecar (the worker protocol is already cross-process) | Low — decision point D2 |
-| `watchfiles` | `@parcel/watcher` (native, recursive, battle-tested) | High |
+| `watchfiles` | `@parcel/watcher` (native, recursive, battle-tested); confirm under Bun in S0, with `fs.watch` as fallback | Medium–High |
 | `filelock` | `proper-lockfile` | High |
 | `platformdirs` | `env-paths` | High |
 | `psutil` | `pidusage` + `node:os`/`process.memoryUsage`; RSS ceilings via the same polling loop | Medium — verify per-platform RSS semantics match `embedding_worker.py`'s accounting |
 | `pathspec` | `ignore` npm package (gitignore semantics) | High |
-| SQLite (`history.py`) | `node:sqlite` (built-in) | High |
-| `multiprocessing` spawn + `Connection` auth | `child_process` + the same socket dial-back and HMAC challenge-response, now used for **all** workers (§5.3) | High |
+| SQLite (`history.py`) | `bun:sqlite` (built-in), behind the storage adapter per §3's compat discipline | High |
+| `multiprocessing` spawn + `Connection` auth | `Bun.spawn`/`node:child_process` + the same socket dial-back and HMAC challenge-response, now used for **all** workers (§5.3) | High |
 | `struct` framing | `Buffer`/`DataView` | High |
 | `tomllib`/`tomli-w` | `smol-toml` | High |
 | `argparse` | `commander` | High |
 | Textual TUI | Ink (React for terminals) or `@clack/prompts`; decision D3 | Medium |
-| `pytest` fixtures/parametrize | vitest `test.each`, fixtures as helpers | High |
+| `pytest` fixtures/parametrize | `bun test` with `test.each`, fixtures as helpers | High |
 
 ## 5. Architecture decisions forced by the migration
 
@@ -161,9 +175,18 @@ state.
 ## 6. Phase 0 spikes — do these before committing to anything
 
 Each spike is a small throwaway program with a pass/fail written into this
-document's follow-up. Order matters: S1–S3 are the bets the whole plan
+document's follow-up. Order matters: S0–S3 are the bets the whole plan
 rests on.
 
+- **S0 — Bun native-module matrix** (~2 days): under Bun on Linux, macOS,
+  and Windows, load `@lancedb/lancedb`, `tree-sitter` plus one grammar,
+  `onnxruntime-node`, and `@parcel/watcher`, and exercise one real call
+  through each (open a table, parse a file, run an inference, watch a
+  directory). These are N-API addons and Bun's N-API layer is the newest
+  part of this stack; any gap found here picks that module's fallback
+  (WASM tree-sitter, `fs.watch`) or — worst case, per §3's compat
+  discipline — runs that one process under Node while everything else
+  stays on Bun.
 - **S1 — LanceDB Node parity** (~3 days): open an index written by the
   Python build; create tables from Arrow schemas; build FTS + BTree indexes
   with the config the write path needs; run hybrid query + pushdown
@@ -182,7 +205,8 @@ rests on.
   model in Node (RSS polling of a child, kill-at-ceiling, batch retry);
   compare peak RSS at the fixture scales `test_memory_acceptance.py` uses.
 - **S5 — Watcher + scanner semantics** (~1 day): `@parcel/watcher` event
-  coalescing vs `watchfiles`; `git ls-files` streaming under Node.
+  coalescing vs `watchfiles`; `git ls-files` streaming through
+  `Bun.spawn`.
 
 ## 7. Migration order
 
@@ -193,7 +217,7 @@ spec, and the ~29k test lines are most of the migration's real cost.
 
 | Phase | Content | Source ln (approx) | Estimate |
 |---|---|---|---|
-| 0 | Spikes S1–S5; repo scaffolding (workspace, tsconfig, Biome, vitest, CI skeleton) | — | 2–3 wk |
+| 0 | Spikes S0–S5; repo scaffolding (Bun workspace, tsconfig, Biome, `bun test`, CI skeleton) | — | 2–3 wk |
 | 1 | Foundations: `errors`, `models` (→ zod), `settings`, `path_filter`, `token_batching`, `acceptance`, `progress`, `projects`, `update_check` | ~2,600 | 2 wk |
 | 2 | Scan & extract: `scanner`, `extractor`, query packs, `reference_service` | ~3,900 | 3–4 wk |
 | 3 | Storage: `storage`, `staging`, `history` | ~2,800 | 3 wk |
@@ -245,15 +269,22 @@ golden snapshots directly) and is promoted to the package root at cutover.
   move both platforms to named pipes (`net.createServer` supports
   `\\.\pipe\`). Default: keep today's design; revisit only if the port
   surfaces a problem.
+- **D5 — Compiled binaries.** If `bun build --compile` embeds the native
+  addons cleanly (S0 tells us), the installer can ship per-platform
+  single-file executables and stop provisioning a runtime at all — the
+  biggest install-story simplification available in this migration.
+  Decide at Phase 8; npm-package distribution works regardless.
 
 ## 10. Risk register
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
+| A native addon (lancedb, tree-sitter, onnxruntime-node, parcel-watcher) hits a Bun N-API gap | Medium | High | S0 first; core code sticks to `node:` APIs behind adapters (§3), so a single process can run under Node without forking the codebase |
 | LanceDB JS lacks the FTS/BTree index-config API the write path needs | Medium | Blocking | S1 first; upstream contribution window is the schedule buffer |
 | Embedding vectors drift → all user indexes rebuild | Medium | Medium | S3 + acceptance gates; rebuild path already exists and is exercised |
 | Niche grammars (GDScript family, SQL, HCL) unavailable as npm packages | High | Low–Medium | Build from grammar C sources; worst case, gate those languages behind a follow-up |
 | Native-module install pain (tree-sitter, onnxruntime, parcel-watcher, lancedb across 3 OSes) | Medium | Medium | Prebuilt binaries exist for all; CI matrix mirrors today's OS coverage from Phase 0 |
+| Bun regression lands in a release (younger runtime, faster release cadence than Node LTS) | Medium | Low–Medium | Pin the Bun version in `engines` and CI; upgrade deliberately with the full suite as the gate |
 | `worker_threads`/child RSS accounting differs from `psutil` semantics | Medium | Medium | S4; keep polling-based ceiling design which is implementation-agnostic |
 | Performance regression in extraction (Node bindings overhead per node visit) | Low–Medium | Medium | S2 measures on the perf fixtures from `2026-07-27-extractor-performance.md` |
 | Long dual-maintenance window | High | Medium | Feature freeze on Python except critical fixes once Phase 5 lands; parity harness makes backports mechanical |
@@ -261,7 +292,8 @@ golden snapshots directly) and is promoted to the package root at cutover.
 ## 11. CI for the migration
 
 From Phase 0, a second workflow mirrors today's gates for the TS tree:
-Biome check, `tsc --noEmit`, vitest on Ubuntu + Windows + macOS × Node 22.
+Biome check, `tsc --noEmit`, and `bun test` on Ubuntu + Windows + macOS
+with the pinned Bun version (`oven-sh/setup-bun`, `bun install --frozen-lockfile`).
 The existing model-download and grammar caches carry over. The memory gate
 and benchmark job join the workflow in Phase 4/9 respectively. Both suites
 run on every PR until cutover; the Python workflow is retired one release
