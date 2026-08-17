@@ -1051,12 +1051,11 @@ async def test_explicit_code_query_ignores_unrelated_startup_failure(tmp_path: P
         server, list_roots_callback=list_roots
     ) as client:
         await client.list_tools()
-        for _ in range(100):
-            if embedder.calls == 1:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            pytest.fail("expected the unrelated startup index to fail")
+        # The startup job embeds on a background task; a hard 1s window makes a
+        # loaded shared runner fail on timing rather than behavior. Poll to a
+        # generous deadline, and match >= 1 so a file split into several
+        # candidates (embed bisection retries) cannot skip the check.
+        await _wait_until(lambda: embedder.calls >= 1, timeout=30)
 
         result = await client.call_tool(
             "search_code",
