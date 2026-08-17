@@ -175,9 +175,10 @@ def test_linked_worktree_shares_repository_but_not_checkout_identity(tmp_path: P
     assert main_state.repository_identity == worktree_state.repository_identity
     assert main_state.checkout_identity != worktree_state.checkout_identity
     assert worktree_state.checkout_identity is not None
-    assert worktree_state.checkout_identity.startswith(
-        str((root / ".git").resolve()) + "/worktrees/"
-    )
+    # Build the expected prefix with Path, not string concatenation: Windows
+    # resolves checkout identities with backslashes while a hand-written
+    # "/worktrees/" fails to match its own representation of the same path.
+    assert worktree_state.checkout_identity.startswith(str((root / ".git" / "worktrees").resolve()))
     # `git worktree add <path>` checks out an auto-created branch; both
     # checkouts are attached, each on its own selector.
     assert main_state.selector_kind is SelectorKind.REF

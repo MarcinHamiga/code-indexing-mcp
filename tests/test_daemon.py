@@ -412,7 +412,9 @@ def test_concurrent_clients_share_one_model_and_one_indexing_job(
     reports = [outcome for outcome in outcomes if isinstance(outcome, IndexReport)]
     errors = [outcome for outcome in outcomes if isinstance(outcome, CodeIndexingError)]
     assert reports
-    assert all(error.code is ErrorCode.INDEX_BUSY for error in errors)
+    assert all(error.code is ErrorCode.INDEX_BUSY for error in errors), sorted(
+        str(error) for error in errors if error.code is not ErrorCode.INDEX_BUSY
+    )
     assert all(report.project_id == project_id for report in reports)
     assert all(report.errors == [] for report in reports)
     # Exactly one client did the work; any client that acquired the lock after it

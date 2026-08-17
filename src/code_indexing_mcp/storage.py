@@ -1679,6 +1679,12 @@ class LanceStore:
         own reference to the tables, so the underlying dataset stays open until that
         caller is done — the daemon serves each client on its own thread and must not
         have a table closed underneath it.
+
+        A caller that just built a complete partition (write path, references table
+        created) must win the cache slot even if a concurrent read of the same
+        partition cached a partial object while the tables were still being created;
+        returning the partial object would make the write path hand its own commit a
+        partition whose references table it can no longer see.
         """
         with self._partitions_lock:
             existing = self._partitions.get(partition_id)
@@ -1686,6 +1692,10 @@ class LanceStore:
                 # Another thread opened it first; keep one instance so both callers
                 # share a single set of handles.
                 self._partitions.move_to_end(partition_id)
+                if existing.references is None and tables.references is not None:
+                    self._partitions[partition_id] = tables
+                    self._partitions.move_to_end(partition_id)
+                    return tables
                 return existing
             self._partitions[partition_id] = tables
             while len(self._partitions) > MAX_CACHED_PARTITIONS:
