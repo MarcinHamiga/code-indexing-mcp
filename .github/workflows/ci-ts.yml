@@ -4,7 +4,13 @@ name: CI (TypeScript)
 # Python tree has, applied to the TypeScript tree, from Phase 0 onward. Both
 # suites run on every PR until cutover; this one is retired last.
 on:
+  # Restricted to main deliberately. A branch with an open PR would otherwise
+  # match both events and run this whole matrix twice per commit -- which is
+  # not only wasted minutes: twelve concurrent jobs fetching the same action
+  # archive got the runners rate-limited (HTTP 429) at "Set up job", so the
+  # duplication was failing Windows rather than merely doubling it.
   push:
+    branches: [main]
     paths: &ts-paths
       - "ts/**"
       - ".github/workflows/ci-ts.yml"
@@ -16,6 +22,12 @@ on:
   pull_request:
     paths: *ts-paths
   workflow_dispatch:
+
+# Superseded runs are cancelled: only the newest commit on a branch is worth
+# spending three OSes on, and it keeps concurrent action downloads down.
+concurrency:
+  group: ci-ts-${{ github.ref }}
+  cancel-in-progress: true
 
 defaults:
   run:
