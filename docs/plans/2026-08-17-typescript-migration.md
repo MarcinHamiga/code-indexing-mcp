@@ -7,6 +7,8 @@ Phase 1 complete — see
 [2026-08-17-phase-1-notes.md](2026-08-17-phase-1-notes.md).
 Phase 2 complete — see
 [2026-08-18-phase-2-notes.md](2026-08-18-phase-2-notes.md).
+Phase 3 complete — see
+[2026-08-18-phase-3-notes.md](2026-08-18-phase-3-notes.md).
 Branch: `ts-migration`
 
 ## 1. Purpose and scope
@@ -251,7 +253,7 @@ spec, and the ~29k test lines are most of the migration's real cost.
 | 0 | ✅ Spikes S0–S5; repo scaffolding (Bun workspace, tsconfig, Biome, `bun test`, CI skeleton) | — | 2–3 wk |
 | 1 | ✅ Foundations: `errors`, `models` (→ zod), `settings`, `path_filter`, `token_batching`, `acceptance`, `progress`, `projects`, `update_check` | ~2,600 | 2 wk |
 | 2 | ✅ Scan & extract: `scanner`, `extractor`, query packs, `reference_service` | ~3,900 | 3–4 wk |
-| 3 | Storage: `storage`, `staging`, `history` | ~2,800 | 3 wk |
+| 3 | ✅ Storage: `storage`, `staging`, `history` | ~2,800 | 3 wk |
 | 4 | Embedding (CPU): `embedding` (direct-ONNX based, per §5.1), `embedding_worker`, `worker_launcher`, `passage_backend`, `backends`, `calibration`, `probe_cache` | ~2,900 | 3 wk |
 | 5 | Orchestration & search: `indexing`, `search`, `application` | ~3,200 | 3 wk |
 | 6 | Surfaces: `server` (MCP), `daemon`, `cli`, `benchmark` | ~3,600 | 3–4 wk |

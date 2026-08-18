@@ -214,6 +214,49 @@ describe("Arrow IPC staging", () => {
       JSON.parse(await fs.readFile(path.join(staged.directory, JOURNAL_NAME), "utf8")).phase,
     ).toBe(PHASE_COMMITTING);
   });
+
+  test("rejects mixed-file chunk and reference batches", async () => {
+    const staged = job(path.join(temporary, "staging"), "project", "job");
+    await staged.begin();
+    await expect(staged.stageChunks([chunk("file-a"), chunk("file-b")])).rejects.toThrow(
+      "one file",
+    );
+    await expect(
+      staged.stageReferences([reference("file-a"), { ...reference("file-b"), reference_id: "rb" }]),
+    ).rejects.toThrow("one file");
+  });
+
+  test("commit batches respect the file, row, and byte limits", async () => {
+    const staged = job(path.join(temporary, "staging"), "project", "job");
+    await staged.begin();
+    for (let index = 0; index < 5; index += 1) {
+      await staged.stageChunks([chunk(`file-${index}`, `chunk-${index}`)]);
+      staged.markReplaced(`file-${index}`);
+    }
+    await staged.beginCommit(versions);
+    const byFiles = await staged.iterChunkBatches({ maxFiles: 2 });
+    expect(byFiles.map((batch) => batch.fileIds)).toEqual([
+      ["file-0", "file-1"],
+      ["file-2", "file-3"],
+      ["file-4"],
+    ]);
+  });
+
+  test("a single file may exceed the row and byte bounds", async () => {
+    const staged = job(path.join(temporary, "staging"), "project", "job");
+    await staged.begin();
+    await staged.stageChunks([
+      chunk("file-a", "a-1"),
+      chunk("file-a", "a-2"),
+      chunk("file-a", "a-3"),
+    ]);
+    staged.markReplaced("file-a");
+    await staged.beginCommit(versions);
+    const batches = await staged.iterChunkBatches({ maxFiles: 1, maxRows: 1, maxBytes: 1 });
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.fileIds).toEqual(["file-a"]);
+    expect(batches[0]?.rows).toHaveLength(3);
+  });
 });
 
 describe("staged commit recovery", () => {
@@ -258,5 +301,41 @@ describe("staged commit recovery", () => {
     expect(await recoverStagedCommits(root, store)).toBe(0);
     expect(store.states).toEqual([{ projectId: "project", state: "error" }]);
     await expect(fs.stat(staged.directory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("rolls back a legacy two-table journal without restoring references", async () => {
+    const root = path.join(temporary, "staging");
+    const directory = path.join(root, "project", "legacy");
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(
+      path.join(directory, JOURNAL_NAME),
+      JSON.stringify({
+        version: 1,
+        phase: PHASE_COMMITTING,
+        project_id: "project",
+        files_version: 1,
+        chunks_version: 2,
+      }),
+    );
+    const store = new RecoveryStore();
+    expect(await recoverStagedCommits(root, store)).toBe(1);
+    expect(store.restored).toEqual([
+      {
+        projectId: "project",
+        versions: { files: 1, chunks: 2, references: 0 },
+        restoreReferences: false,
+      },
+    ]);
+  });
+
+  test("repeated recovery is idempotent", async () => {
+    const root = path.join(temporary, "staging");
+    const staged = job(root, "project", "commit");
+    await staged.begin();
+    await staged.beginCommit(versions);
+    const store = new RecoveryStore();
+    expect(await recoverStagedCommits(root, store)).toBe(1);
+    expect(await recoverStagedCommits(root, store)).toBe(0);
+    expect(store.restored).toHaveLength(1);
   });
 });

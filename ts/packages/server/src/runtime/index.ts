@@ -8,7 +8,7 @@
  * outside `src/runtime/`.
  *
  * Adapters land here as the phases that need them arrive -- `bun:sqlite`
- * behind the history store's interface in Phase 3, `Bun.spawn` behind the
+ * behind the history store's interface (Phase 3), `Bun.spawn` behind the
  * worker launcher's in Phase 4.
  */
 

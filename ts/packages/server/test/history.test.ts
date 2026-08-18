@@ -152,4 +152,31 @@ describe("HistoryStore", () => {
     expect(database.query("PRAGMA journal_mode").get()?.journal_mode).toBe("wal");
     database.close();
   });
+
+  test("recent skips running and interrupted stubs", () => {
+    const history = store();
+    expect(history.recent("project-1")).toBeNull();
+    history.begin(audit("run-1", new Date(Date.now() - 2_000).toISOString()));
+    complete(history, "run-1", { eligible_files: 7 });
+    history.begin(audit("run-2", new Date(Date.now() + 1_000).toISOString()));
+    expect(history.recent("project-1")?.run_id).toBe("run-1");
+    history.begin(audit("run-3", new Date(Date.now() + 2_000).toISOString(), 999_999_999));
+    history.markInterrupted();
+    expect(history.recent("project-1")?.run_id).toBe("run-1");
+  });
+
+  test("concurrent writers do not corrupt history", async () => {
+    const history = store();
+    const writers = Array.from({ length: 4 }, async (_, number) => {
+      for (let index = 0; index < 40; index += 1) {
+        const runId = `w${number}-${index}`;
+        history.begin(audit(runId, new Date(Date.now() + number * 1_000 + index).toISOString()));
+        complete(history, runId);
+      }
+    });
+    await Promise.all(writers);
+    const page = history.listRuns("project-1", { limit: 1000 });
+    expect(page.runs).toHaveLength(MAX_RUNS_PER_PROJECT);
+    expect(new Set(page.runs.map((run) => run.run_id)).size).toBe(page.runs.length);
+  });
 });

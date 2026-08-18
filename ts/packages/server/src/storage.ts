@@ -1,6 +1,8 @@
 /** Partitioned LanceDB persistence compatible with the Python store's layout. */
 
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import type { Dirent } from "node:fs";
 import path from "node:path";
 import {
@@ -41,11 +43,14 @@ import {
   type ReferenceStore,
 } from "./reference-store.ts";
 import { CodeIndexingError } from "./errors.ts";
-import { resolvePath } from "./paths.ts";
-import { existingMarkerPath, sameProjectRoot } from "./projects.ts";
+import { isRelativeTo, resolvePath } from "./paths.ts";
+import { existingMarkerPath, rootedUnder, sameProjectRoot } from "./projects.ts";
 
 export const SCHEMA_VERSION = 5;
 export const MAX_CACHED_PARTITIONS = 16;
+const SEARCH_CONCURRENCY = 8;
+const GIT_TIMEOUT_MS = 5000;
+const MISSING_REFERENCE_TABLE = "Reference table is missing from an interrupted transaction";
 
 const CHUNK_COLUMNS = [
   "chunk_id",
@@ -85,10 +90,13 @@ export interface ReplacementBatch<T> {
   rows: readonly T[];
 }
 
+export type GitRunner = (command: readonly string[], cwd: string) => string | null;
+
 interface ProjectTables {
   files: Table;
   chunks: Table;
   references: Table | null;
+  generation: number;
 }
 
 type StoredProject = {
@@ -117,12 +125,17 @@ export class LanceStore implements ReferenceStore {
 
   #registry: Promise<{ connection: Connection; projects: Table }>;
   #partitions = new Map<string, ProjectTables>();
+  #locks = new Map<string, Promise<unknown>>();
 
   constructor(directory: string, options: StorageOptions = {}) {
+    const storage = options.vectorStorage ?? "float16";
+    if (storage !== "float16" && storage !== "float32") {
+      throw new Error(`vector_storage must be float32 or float16, got '${String(storage)}'`);
+    }
     this.directory = directory;
     this.vectorDimension = options.vectorDimension ?? 768;
     this.vectorIndex = options.vectorIndex ?? "exact";
-    this.vectorStorage = options.vectorStorage ?? "float16";
+    this.vectorStorage = storage;
     this.#registry = this.#openRegistry();
   }
 
@@ -269,15 +282,22 @@ export class LanceStore implements ReferenceStore {
     const current = (await rows<StoredProject>(projects, equals("id", projectId)))[0];
     if (current === undefined || current.state === "pending") return null;
     const reasons: string[] = [];
-    if (current.model_id !== modelId) reasons.push("embedding model differs");
-    if (current.vector_dimension !== this.vectorDimension) reasons.push("vector dimension differs");
-    if (current.schema_version !== SCHEMA_VERSION) reasons.push("index schema version differs");
+    if (current.model_id !== modelId)
+      reasons.push(
+        `embedding model ${JSON.stringify(current.model_id)} -> ${JSON.stringify(modelId)}`,
+      );
+    if (current.vector_dimension !== this.vectorDimension)
+      reasons.push(`vector dimension ${current.vector_dimension} -> ${this.vectorDimension}`);
+    if (current.schema_version !== SCHEMA_VERSION)
+      reasons.push(`index schema version ${current.schema_version} -> ${SCHEMA_VERSION}`);
     const tables = await this.#existingTables(projectId);
     if (tables !== null) {
       const vector = (await tables.chunks.schema()).fields.find((item) => item.name === "vector");
       const expected = this.vectorStorage === "float16" ? "Float16" : "Float32";
       if (vector?.type.children[0]?.type.constructor.name !== expected) {
-        reasons.push("vector storage differs");
+        reasons.push(
+          `vector storage ${vector?.type.children[0]?.type.constructor.name ?? "missing"} -> ${expected}`,
+        );
       }
     }
     return reasons.length === 0 ? null : reasons.join("; ");
@@ -288,22 +308,25 @@ export class LanceStore implements ReferenceStore {
   }
 
   async deletePartition(projectId: string, modelId: string): Promise<boolean> {
-    const projects = await this.#projects();
-    const record = (await rows<StoredProject>(projects, equals("id", projectId)))[0];
-    if (record === undefined) return false;
-    this.#closePartition(projectId);
-    await fs.rm(this.#partitionPath(projectId), { recursive: true, force: true });
-    await merge(projects, "id", [
-      {
-        ...record,
-        model_id: modelId,
-        vector_dimension: this.vectorDimension,
-        schema_version: SCHEMA_VERSION,
-        state: "indexing",
-        updated_at: BigInt(Date.now()) * 1_000_000n,
-      },
-    ]);
-    return true;
+    return this.withPartitionAccess(projectId, async () => {
+      await this.#advancePartitionGeneration(projectId);
+      const projects = await this.#projects();
+      const record = (await rows<StoredProject>(projects, equals("id", projectId)))[0];
+      if (record === undefined) return false;
+      this.#closePartition(projectId);
+      await fs.rm(this.#partitionPath(projectId), { recursive: true, force: true });
+      await merge(projects, "id", [
+        {
+          ...record,
+          model_id: modelId,
+          vector_dimension: this.vectorDimension,
+          schema_version: SCHEMA_VERSION,
+          state: "indexing",
+          updated_at: BigInt(Date.now()) * 1_000_000n,
+        },
+      ]);
+      return true;
+    });
   }
 
   async listProjects(): Promise<ProjectInfo[]> {
@@ -313,9 +336,13 @@ export class LanceStore implements ReferenceStore {
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 
-  async projectState(projectId: string): Promise<string | null> {
+  async projectState(projectId: string): Promise<string> {
     const projects = await this.#projects();
-    return (await rows<StoredProject>(projects, equals("id", projectId)))[0]?.state ?? null;
+    const state = (await rows<StoredProject>(projects, equals("id", projectId)))[0]?.state;
+    if (state === undefined) {
+      throw new CodeIndexingError("PROJECT_NOT_FOUND", `Unknown project: ${projectId}`);
+    }
+    return state;
   }
 
   async listFiles(projectId: string): Promise<StoredFile[]> {
@@ -357,6 +384,15 @@ export class LanceStore implements ReferenceStore {
       removedFileIds?: Iterable<string>;
     },
   ): Promise<void> {
+    if (!(await batchedMergeSemanticsOk())) {
+      throw new CodeIndexingError(
+        "UNSUPPORTED_RUNTIME",
+        "The installed lancedb version does not filter " +
+          "when_not_matched_by_source_delete rows the way batched commits " +
+          "require; refusing to commit because it could delete rows of " +
+          "untouched files. Upgrade lancedb and retry.",
+      );
+    }
     const tables = await this.#tables(projectId);
     const replaced = new Set<string>();
     for (const batch of input.chunkBatches) {
@@ -372,7 +408,7 @@ export class LanceStore implements ReferenceStore {
       batch.fileIds.forEach((id) => {
         replaced.add(id);
       });
-      if (tables.references === null) throw new Error("reference table is missing");
+      if (tables.references === null) throw new Error(MISSING_REFERENCE_TABLE);
       await replaceRows(tables.references, "reference_id", batch.fileIds, batch.rows);
     }
     if (input.files.length > 0) await merge(tables.files, "file_id", input.files);
@@ -386,14 +422,16 @@ export class LanceStore implements ReferenceStore {
 
   async removeFile(projectId: string, fileId: string): Promise<void> {
     const tables = await this.#tables(projectId);
+    if (tables.references === null) throw new Error(MISSING_REFERENCE_TABLE);
     const condition = equals("file_id", fileId);
-    await Promise.all([tables.chunks.delete(condition), tables.files.delete(condition)]);
-    if (tables.references !== null) await tables.references.delete(condition);
+    await tables.chunks.delete(condition);
+    await tables.references.delete(condition);
+    await tables.files.delete(condition);
   }
 
   async tableVersions(projectId: string): Promise<TableVersions> {
     const tables = await this.#tables(projectId);
-    if (tables.references === null) throw new Error("reference table is missing");
+    if (tables.references === null) throw new Error(MISSING_REFERENCE_TABLE);
     const [files, chunks, references] = await Promise.all([
       tables.files.version(),
       tables.chunks.version(),
@@ -412,7 +450,7 @@ export class LanceStore implements ReferenceStore {
     await restore(tables.files, versions.files);
     await restore(tables.chunks, versions.chunks);
     if (options.restoreReferences ?? true) {
-      if (tables.references === null) throw new Error("reference table is missing");
+      if (tables.references === null) throw new Error(MISSING_REFERENCE_TABLE);
       await restore(tables.references, versions.references);
     }
     return true;
@@ -481,6 +519,25 @@ export class LanceStore implements ReferenceStore {
     );
   }
 
+  async referenceCoverage(
+    projectId: string,
+    options: { version?: number } = {},
+  ): Promise<ReferenceRecord[]> {
+    return this.#referenceRows(projectId, "record_kind = 'coverage'", options.version);
+  }
+
+  async coverageForFile(
+    projectId: string,
+    fileId: string,
+    schemaVersion: number,
+  ): Promise<ReferenceRecord[]> {
+    validateSchemaVersion(schemaVersion);
+    return this.#referenceRows(
+      projectId,
+      and("record_kind = 'coverage'", equals("file_id", fileId), schemaCondition(schemaVersion)),
+    );
+  }
+
   async declarationShapes(
     projectId: string,
     qualifiedSymbol: string,
@@ -499,8 +556,8 @@ export class LanceStore implements ReferenceStore {
   }
 
   async getChunk(chunkId: string): Promise<CodeChunk | null> {
-    const projectId = chunkId.split(":", 1)[0];
-    if (projectId === undefined || projectId.length === 0 || !chunkId.includes(":")) return null;
+    const projectId = chunkIdPrefix(chunkId);
+    if (projectId === null || !(await exists(this.#partitionPath(projectId)))) return null;
     const tables = await this.#existingTables(projectId);
     if (tables === null) return null;
     const row = (
@@ -602,43 +659,41 @@ export class LanceStore implements ReferenceStore {
     projectIds: readonly string[],
     options: { condition?: string; limit: number },
   ): Promise<Record<string, unknown>[]> {
-    const results = await Promise.all(
-      projectIds.map(async (projectId) => {
-        const tables = await this.#existingTables(projectId);
-        if (tables === null) return [];
-        // S1 proved this is the JS equivalent of Python's MultiMatch hybrid
-        // query: text must be attached before vector because VectorQuery does
-        // not expose nearestToText.
-        const query = tables.chunks
-          .query()
-          .nearestToText(
-            new MultiMatchQuery(queryText, ["content", "identifier_terms"], {
-              operator: Operator.Or,
-            }),
-          )
-          .nearestTo([...vector]);
-        if (options.condition !== undefined) query.where(options.condition);
-        if (this.vectorIndex === "exact") query.bypassVectorIndex();
-        const reranker = await rerankers.RRFReranker.create();
-        const queryRows = await query
-          .rerank(reranker)
-          .select([
-            "chunk_id",
-            "path",
-            "language",
-            "kind",
-            "symbol",
-            "qualified_symbol",
-            "parent_symbol",
-            "start_line",
-            "end_line",
-            "content",
-          ])
-          .limit(options.limit)
-          .toArray();
-        return queryRows.map((row) => ({ ...numberFields(row), project_id: projectId }));
-      }),
-    );
+    const results = await mapPool(projectIds, SEARCH_CONCURRENCY, async (projectId) => {
+      const tables = await this.#existingTables(projectId);
+      if (tables === null) return [];
+      // S1 proved this is the JS equivalent of Python's MultiMatch hybrid
+      // query: text must be attached before vector because VectorQuery does
+      // not expose nearestToText.
+      const query = tables.chunks
+        .query()
+        .nearestToText(
+          new MultiMatchQuery(queryText, ["content", "identifier_terms"], {
+            operator: Operator.Or,
+          }),
+        )
+        .nearestTo([...vector]);
+      if (options.condition !== undefined) query.where(options.condition);
+      if (this.vectorIndex === "exact") query.bypassVectorIndex();
+      const reranker = await rerankers.RRFReranker.create();
+      const queryRows = await query
+        .rerank(reranker)
+        .select([
+          "chunk_id",
+          "path",
+          "language",
+          "kind",
+          "symbol",
+          "qualified_symbol",
+          "parent_symbol",
+          "start_line",
+          "end_line",
+          "content",
+        ])
+        .limit(options.limit)
+        .toArray();
+      return queryRows.map((row) => ({ ...numberFields(row), project_id: projectId }));
+    });
     return results.flat().sort(relevanceSort).slice(0, options.limit);
   }
 
@@ -658,17 +713,16 @@ export class LanceStore implements ReferenceStore {
       if (!indexed.has(column))
         await tables.chunks.createIndex(column, { config: Index.btree(), replace: false });
     }
-    if (
-      this.vectorIndex === "hnsw" &&
-      !indexed.has("vector") &&
-      (await tables.chunks.countRows()) >= 20_000
-    ) {
+    const vectorIndices = chunkIndexes.filter((index) => index.columns.includes("vector"));
+    if (this.vectorIndex === "exact") {
+      for (const index of vectorIndices) await tables.chunks.dropIndex(index.name);
+    } else if (vectorIndices.length === 0 && (await tables.chunks.countRows()) >= 20_000) {
       await tables.chunks.createIndex("vector", {
         config: Index.hnswSq({ distanceType: "cosine" }),
         replace: false,
       });
     }
-    if (tables.references === null) return;
+    if (tables.references === null) throw new Error(MISSING_REFERENCE_TABLE);
     const referenceIndexed = new Set(
       (await tables.references.listIndices()).flatMap((index) => index.columns),
     );
@@ -769,9 +823,36 @@ export class LanceStore implements ReferenceStore {
       projects: partitions,
       physical_bytes_total: await directoryBytes(this.directory),
       consistent: partitions.every((item) => item.consistent),
-      overlap_warnings: [],
-      worktree_warnings: [],
+      overlap_warnings: overlapWarnings(projects),
+      worktree_warnings: worktreeWarnings(projects),
     };
+  }
+
+  async withPartitionAccess<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.#locks.get(projectId) ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#locks.set(
+      projectId,
+      previous.then(() => held),
+    );
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.#locks.get(projectId) === held) this.#locks.delete(projectId);
+    }
+  }
+
+  cachedPartitionIds(): string[] {
+    return [...this.#partitions.keys()];
+  }
+
+  async openTables(projectId: string): Promise<void> {
+    await this.#tables(projectId);
   }
 
   async close(): Promise<void> {
@@ -780,9 +861,21 @@ export class LanceStore implements ReferenceStore {
   }
 
   async #openRegistry(): Promise<{ connection: Connection; projects: Table }> {
+    const legacy = await migrateV1(this.directory);
     await fs.mkdir(this.directory, { recursive: true });
     const connection = await connect(path.join(this.directory, "registry"));
     const projects = await table(connection, "projects", LanceStore.projectArrowSchema());
+    for (const row of legacy) {
+      await merge(projects, "id", [
+        {
+          ...row,
+          vector_dimension: this.vectorDimension,
+          schema_version: SCHEMA_VERSION,
+          state: "pending",
+          updated_at: BigInt(Date.now()) * 1_000_000n,
+        },
+      ]);
+    }
     return { connection, projects };
   }
 
@@ -804,8 +897,9 @@ export class LanceStore implements ReferenceStore {
   }
 
   async #tables(projectId: string): Promise<ProjectTables> {
+    const generation = await this.#partitionGeneration(projectId);
     const cached = this.#partitions.get(projectId);
-    if (cached !== undefined && cached.references !== null) {
+    if (cached !== undefined && cached.references !== null && cached.generation === generation) {
       this.#partitions.delete(projectId);
       this.#partitions.set(projectId, cached);
       return cached;
@@ -820,18 +914,25 @@ export class LanceStore implements ReferenceStore {
         LanceStore.chunkArrowSchema(this.vectorDimension, this.vectorStorage),
       ),
       references: await table(connection, "references", LanceStore.referenceArrowSchema()),
+      generation,
     };
     this.#remember(projectId, tables);
     return tables;
   }
 
   async #existingTables(projectId: string): Promise<ProjectTables | null> {
+    const generation = await this.#partitionGeneration(projectId);
     const cached = this.#partitions.get(projectId);
-    if (cached !== undefined && (await exists(this.#partitionPath(projectId)))) {
+    if (
+      cached !== undefined &&
+      cached.generation === generation &&
+      (await exists(this.#partitionPath(projectId)))
+    ) {
       this.#partitions.delete(projectId);
       this.#partitions.set(projectId, cached);
       return cached;
     }
+    if (cached !== undefined) this.#closePartition(projectId);
     if (!(await exists(this.#partitionPath(projectId)))) return null;
     const connection = await connect(this.#partitionPath(projectId));
     try {
@@ -844,6 +945,7 @@ export class LanceStore implements ReferenceStore {
         files: await connection.openTable("files"),
         chunks: await connection.openTable("chunks"),
         references: names.includes("references") ? await connection.openTable("references") : null,
+        generation,
       };
       this.#remember(projectId, tables);
       return tables;
@@ -851,6 +953,27 @@ export class LanceStore implements ReferenceStore {
       connection.close();
       return null;
     }
+  }
+
+  async #partitionGeneration(projectId: string): Promise<number> {
+    try {
+      return Number.parseInt(
+        await fs.readFile(path.join(this.directory, "partition-generations", projectId), "utf8"),
+        10,
+      );
+    } catch {
+      return 0;
+    }
+  }
+
+  async #advancePartitionGeneration(projectId: string): Promise<void> {
+    const directory = path.join(this.directory, "partition-generations");
+    await fs.mkdir(directory, { recursive: true });
+    const target = path.join(directory, projectId);
+    const next = `${(await this.#partitionGeneration(projectId)) + 1}`;
+    const temporary = `${target}.tmp`;
+    await fs.writeFile(temporary, next);
+    await fs.rename(temporary, target);
   }
 
   #remember(projectId: string, tables: ProjectTables): void {
@@ -1017,9 +1140,172 @@ function schemaCondition(version: number | undefined): string | null {
 }
 
 function validateSchemaVersion(version: number | undefined): void {
-  if (version !== undefined && (!Number.isInteger(version) || typeof version !== "number")) {
-    throw new TypeError("schemaVersion must be an integer");
+  if (version !== undefined && (typeof version !== "number" || !Number.isInteger(version))) {
+    throw new TypeError("schema_version must be a non-boolean integer");
   }
+}
+
+function chunkIdPrefix(chunkId: string): string | null {
+  const index = chunkId.indexOf(":");
+  if (index <= 0 || index === chunkId.length - 1) return null;
+  return chunkId.slice(0, index);
+}
+
+export function overlapWarnings(projects: readonly ProjectInfo[]): string[] {
+  const warnings: string[] = [];
+  for (const [left, right] of pairs(projects)) {
+    if (sameProjectRoot(left.root, right.root)) {
+      warnings.push(`Projects '${left.id}' and '${right.id}' register the same root: ${left.root}`);
+      continue;
+    }
+    const leftResolved = resolvePath(left.root);
+    const rightResolved = resolvePath(right.root);
+    if (isRelativeTo(leftResolved, rightResolved) && leftResolved !== rightResolved) {
+      warnings.push(
+        `Project '${left.id}' root ${leftResolved} is nested inside the root of project '${right.id}' (${rightResolved})`,
+      );
+    } else if (isRelativeTo(rightResolved, leftResolved) && leftResolved !== rightResolved) {
+      warnings.push(
+        `Project '${left.id}' root ${leftResolved} contains the root of project '${right.id}' (${rightResolved})`,
+      );
+    }
+  }
+  return warnings;
+}
+
+export function overlappingRegistration(
+  projects: readonly ProjectInfo[],
+  root: string,
+): ProjectInfo | null {
+  const resolved = resolvePath(root);
+  for (const project of projects) {
+    const existing = resolvePath(project.root);
+    if (sameProjectRoot(existing, resolved)) return project;
+    if (rootedUnder(existing, resolved) || rootedUnder(resolved, existing)) return project;
+  }
+  return null;
+}
+
+export function worktreeWarnings(
+  projects: readonly ProjectInfo[],
+  run: GitRunner = runGitQuietly,
+): string[] {
+  const repositories: Array<{ project: ProjectInfo; toplevel: string; common: string }> = [];
+  for (const project of projects) {
+    const toplevel = run(["git", "rev-parse", "--show-toplevel"], project.root);
+    const common = run(["git", "rev-parse", "--git-common-dir"], project.root);
+    if (toplevel === null || common === null) continue;
+    repositories.push({
+      project,
+      toplevel,
+      common: path.isAbsolute(common) ? common : resolvePath(path.join(project.root, common)),
+    });
+  }
+  const warnings: string[] = [];
+  for (const [left, right] of pairs(repositories)) {
+    if (
+      sameProjectRoot(left.common, right.common) &&
+      !sameProjectRoot(left.toplevel, right.toplevel)
+    ) {
+      warnings.push(
+        `Projects '${left.project.id}' and '${right.project.id}' share Git common directory ${left.common} from different checkouts (possible worktrees of one repository)`,
+      );
+    }
+  }
+  return warnings;
+}
+
+function runGitQuietly(command: readonly string[], cwd: string): string | null {
+  try {
+    return execFileSync(command[0] as string, command.slice(1), {
+      cwd,
+      encoding: "utf8",
+      timeout: GIT_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function* pairs<T>(items: readonly T[]): Generator<[T, T]> {
+  for (let left = 0; left < items.length; left += 1) {
+    for (let right = left + 1; right < items.length; right += 1) {
+      yield [items[left] as T, items[right] as T];
+    }
+  }
+}
+
+let mergeSemantics: boolean | undefined;
+
+export async function probeBatchedMergeSemantics(): Promise<boolean> {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ci-mcp-merge-probe-"));
+  try {
+    const connection = await connect(directory);
+    const tableHandle = await connection.createTable("probe", [
+      { file_id: "a", chunk_id: "a1", vector: [0, 0] },
+      { file_id: "b", chunk_id: "b1", vector: [0, 0] },
+      { file_id: "c", chunk_id: "c1", vector: [0, 0] },
+    ]);
+    await tableHandle
+      .mergeInsert("chunk_id")
+      .whenMatchedUpdateAll()
+      .whenNotMatchedInsertAll()
+      .whenNotMatchedBySourceDelete({ where: "file_id IN ('a', 'b')" })
+      .execute([{ file_id: "a", chunk_id: "a2", vector: [0, 0] }]);
+    const surviving = (await tableHandle.query().select(["chunk_id"]).toArray())
+      .map((row) => String(row.chunk_id))
+      .sort();
+    connection.close();
+    return surviving.join() === "a2,c1";
+  } catch {
+    return false;
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}
+
+export async function batchedMergeSemanticsOk(): Promise<boolean> {
+  mergeSemantics ??= await probeBatchedMergeSemantics();
+  return mergeSemantics;
+}
+
+export function setBatchedMergeSemanticsOk(value: boolean | undefined): void {
+  mergeSemantics = value;
+}
+
+async function migrateV1(directory: string): Promise<StoredProject[]> {
+  if (!(await exists(path.join(directory, "projects.lance")))) return [];
+  const connection = await connect(directory);
+  try {
+    const projects = await connection.openTable("projects");
+    const records = await rows<StoredProject>(projects);
+    connection.close();
+    const backup = `${directory}-v1-backup-${process.hrtime.bigint()}`;
+    await fs.rename(directory, backup);
+    return records;
+  } catch {
+    connection.close();
+    return [];
+  }
+}
+
+async function mapPool<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await fn(items[index] as T);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function referenceCondition(options: {

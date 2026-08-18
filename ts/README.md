@@ -18,14 +18,16 @@ ts/
   packages/spikes/      the Phase 0 experiments -- see its README
 ```
 
-`packages/server/src` currently holds the Phase 1 foundations, each named after
-the Python module it ports:
+`packages/server/src` currently holds Phases 1–3, each named after the Python
+module it ports:
 
 ```
 errors.ts          models.ts        settings.ts      backends.ts
 path-filter.ts     token-batching.ts  acceptance.ts
 progress.ts        projects.ts      update-check.ts
 paths.ts           the pathlib semantics the rest of it leans on
+scanner.ts         extractor.ts     reference-service.ts
+storage.ts         staging.ts       history.ts
 runtime/           the one directory allowed to import bun:* APIs
 ```
 
