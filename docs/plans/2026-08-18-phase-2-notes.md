@@ -10,7 +10,7 @@ Phase 2 ports the three modules that turn a directory into rows: `scanner`,
 source lines, against roughly 4,900 lines of Python tests.
 
 The gate is green on all four checks (`biome format`, `biome lint`,
-`tsc --noEmit`, `bun test`): 600 tests across 20 files, up from 282 across 12.
+`tsc --noEmit`, `bun test`): 633 tests across 22 files, up from 282 across 12.
 
 ## What is in the tree
 
@@ -26,8 +26,9 @@ The gate is green on all four checks (`biome format`, `biome lint`,
 | — (tree-sitter offset semantics) | `src/source-text.ts` | `test/extractor.test.ts` |
 
 New dependencies: `ignore` 7.0.5 plus `tree-sitter` 0.25.1 and the eighteen
-grammar packages S2 settled on, all pinned exactly and all already resolved in
-`bun.lock` from Phase 0.
+grammar packages S2 settled on, all pinned exactly. Rust and Lua use immutable
+upstream archive revisions matching the Python packages because their latest
+npm releases lag the grammar versions the shipping build uses.
 
 ## The one thing that would have broken everything
 
@@ -116,9 +117,11 @@ with threads, which this runtime does not have to reach for.
 
 It also made the `git ls-files` deadline simpler rather than harder.
 `_iter_git_batches` needs a daemon reader thread and a bounded staging queue
-because `select` cannot wait on a pipe on Windows; streaming stdout with an abort
-timer is the same guarantee in a tenth of the code. Batching, ordering, and the
-yielded items are unchanged.
+because `select` cannot wait on a pipe on Windows. The TypeScript port lets Git
+write its NUL stream to a temporary spool under an abort deadline, then parses
+that spool in bounded batches only after a successful exit. This keeps memory
+bounded and makes fallback transactional: a process that emits output and then
+fails cannot make the walk yield those files a second time.
 
 The extractor stays synchronous because tree-sitter is. The one place inside it
 that waits on a network round trip — the language pack's first-use grammar

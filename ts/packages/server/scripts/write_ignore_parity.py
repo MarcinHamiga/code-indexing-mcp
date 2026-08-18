@@ -63,6 +63,7 @@ PATTERN_SETS: list[list[str]] = [
 
 PATHS: list[str] = [
     "main.py",
+    "MAIN.PY",
     "ignored.py",
     "keep.py",
     "value.py",
@@ -78,6 +79,7 @@ PATHS: list[str] = [
     "app.ts",
     "notes.md",
     "package/keep.py",
+    "Package/Keep.py",
     "package/drop.py",
     "package/nested/keep.py",
     "src/app/main.py",

@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -161,13 +162,21 @@ def test_git_enumeration_order_is_deterministic(tmp_path: Path) -> None:
     root.mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     project = initialize_project(root)
-    for name in ("c.py", "a.py", "b.py"):
-        (root / name).write_text("value = 1\n")
+    for name in ("c.py", "a.py", "b.py", "a-.py", "a/file.py"):
+        source = root / name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("value = 1\n")
 
     first = SourceScanner().scan(project)
     second = SourceScanner().scan(project)
 
-    assert [item.path.as_posix() for item in first.files] == ["a.py", "b.py", "c.py"]
+    assert [item.path.as_posix() for item in first.files] == [
+        "a/file.py",
+        "a-.py",
+        "a.py",
+        "b.py",
+        "c.py",
+    ]
     assert [item.path.as_posix() for item in first.files] == [
         item.path.as_posix() for item in second.files
     ]
@@ -298,6 +307,32 @@ def test_failed_git_enumeration_falls_back_to_the_streaming_walk(
     result = scanner.scan(project)
 
     assert [item.path.as_posix() for item in result.files] == ["main.py"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX git stub")
+def test_failed_git_process_exposes_no_partial_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir()
+    git = bin_directory / "git"
+    git.write_text(
+        "#!/bin/sh\n"
+        "i=0\n"
+        "while [ $i -lt 300 ]; do printf 'file%03d.py\\0' $i; i=$((i + 1)); done\n"
+        "exit 1\n"
+    )
+    git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_directory))
+    batches: list[list[Path]] = []
+
+    with pytest.raises(_GitEnumerationError):
+        for batch in SourceScanner._iter_git_batches(root):
+            batches.append(batch)
+
+    assert batches == []
 
 
 def test_walk_mode_passes_only_supported_files_to_check_ignore(

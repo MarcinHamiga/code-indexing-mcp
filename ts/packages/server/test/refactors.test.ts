@@ -256,6 +256,26 @@ describe("rename", () => {
     ).toBe(true);
     expect(analysis.completeness.state).toBe("incomplete");
   });
+
+  test("a stale selected declaration has no edit span", async () => {
+    const { service, projectId, root } = indexed({
+      "auth.py": "def authorize(user):\n    return user\n",
+    });
+    fs.writeFileSync(
+      path.join(root, "auth.py"),
+      "# authorize moved\ndef authorize(user):\n    return user\n",
+    );
+
+    const analysis = await service.analyzeRefactor(
+      select(projectId, "auth.py", "authorize"),
+      rename("validate"),
+    );
+    const declaration = analysis.must_change.find((item) => item.reason_code === "declaration");
+
+    expect([declaration?.edit_start_byte, declaration?.edit_end_byte]).toEqual([null, null]);
+    expect(analysis.limitations.some((item) => item.code === "stale_file")).toBe(true);
+    expect(analysis.completeness.state).toBe("incomplete");
+  });
 });
 
 describe("signature change", () => {
@@ -326,6 +346,20 @@ describe("signature change", () => {
     expect(analysis.evidence.find((item) => item.kind === "call")?.reason_code).toBe(
       "known_owner_member",
     );
+  });
+
+  test("a keyword variadic parameter accepts otherwise unknown keywords", async () => {
+    const { service, projectId } = indexed({
+      "mail.py": "def send(**kwargs):\n    return kwargs\n\nsend(extra=1)\n",
+    });
+
+    const analysis = await service.analyzeRefactor(
+      select(projectId, "mail.py", "send"),
+      signature([parameter("kwargs", "keyword_variadic", true, 0)]),
+    );
+
+    expect(analysis.must_change.find((item) => item.kind === "call")).toBeUndefined();
+    expect(analysis.evidence.find((item) => item.kind === "call")).toBeDefined();
   });
 
   test.each([
@@ -403,6 +437,26 @@ describe("overrides", () => {
         (item) => item.path === "child.py" && item.reason_code === "override_of_renamed_method",
       ),
     ).toBe(false);
+  });
+
+  test("a base class imported through a barrel surfaces the override", async () => {
+    const { service, projectId } = indexed({
+      "pkg/impl.py": "class Base:\n    def handle(self):\n        return 1\n",
+      "pkg/__init__.py": "from .impl import Base\n",
+      "child.py":
+        "from pkg import Base\n\n\nclass Child(Base):\n    def handle(self):\n        return 2\n",
+    });
+
+    const analysis = await service.analyzeRefactor(
+      select(projectId, "pkg/impl.py", "Base.handle"),
+      rename("process"),
+    );
+
+    expect(
+      analysis.likely_change.find(
+        (item) => item.path === "child.py" && item.reason_code === "override_of_renamed_method",
+      )?.resolution,
+    ).toBe("likely");
   });
 
   test("an aliased base class still surfaces the override", async () => {
@@ -642,6 +696,22 @@ describe("pagination, counts and completeness", () => {
       .flatMap((analysis) => analysis.must_change)
       .filter((item) => item.kind === "call");
     expect(calls).toHaveLength(501);
+  });
+
+  test("a Unicode rename uses Python's operation digest", async () => {
+    const { service, projectId } = indexed({
+      "lib.py": `def answer():\n    return 42\n\n${callers}`,
+    });
+
+    const first = await service.analyzeRefactor(
+      select(projectId, "lib.py", "answer"),
+      rename("café"),
+    );
+    const payload = JSON.parse(
+      Buffer.from(first.cursor as string, "base64url").toString("utf8"),
+    ) as { operation_digest: string };
+
+    expect(payload.operation_digest).toBe("3c7376a9bf2c93e7");
   });
 
   test("an unanalyzable language makes the analysis incomplete", async () => {

@@ -536,6 +536,21 @@ describe("cursors", () => {
     ).toBe("STALE_CURSOR");
   });
 
+  test("an unrelated store failure is not mislabeled as a stale cursor", async () => {
+    const { service, store, projectId } = indexed({ "lib.py": "def answer():\n    return 42\n" });
+    const failure = new Error("storage unavailable");
+    store.listReferenceRecords = async () => {
+      throw failure;
+    };
+
+    try {
+      await service.findReferences(select(projectId, "lib.py", "answer"));
+      throw new Error("expected the store failure");
+    } catch (error) {
+      expect(error).toBe(failure);
+    }
+  });
+
   test("a well-formed cursor with foreign keys is rejected as invalid", async () => {
     // The defect this closes: a missing key used to surface as a bare property
     // error, leaking an internal message straight to the client.
@@ -587,6 +602,17 @@ describe("selection", () => {
       expect(error.code).toBe("AMBIGUOUS_SYMBOL");
       expect(error.message).toContain("No declaration missing");
     }
+  });
+
+  test("declaration shapes use Python's persisted JSON encoding", () => {
+    const { store } = indexed({ "lib.py": "def naïve(café):\n    return café\n" });
+    const declaration = store.records.find(
+      (row) => row.record_kind === "declaration" && row.source_qualified_symbol === "naïve",
+    );
+
+    expect(declaration?.shape_json).toBe(
+      '[{"destructured":false,"kind":"positional","name":"caf\\u00e9","position":0,"required":true}]',
+    );
   });
 
   test("a non-structural language is refused with its supported set", async () => {

@@ -13,6 +13,7 @@
 
 import { createHash } from "node:crypto";
 import type { ExtractedDeclarationShape, ExtractedReference, StoredFile } from "./models.ts";
+import { pythonJsonDumps } from "./python-compat.ts";
 import { REFERENCE_SCHEMA_VERSION, type ReferenceRecord } from "./reference-store.ts";
 
 /** The content and identity digest used throughout the index. */
@@ -88,7 +89,7 @@ export function referenceRows(
     end_byte: reference.end_byte,
     start_line: reference.start_line,
     end_line: reference.end_line,
-    shape_json: reference.call_shape === null ? null : JSON.stringify(reference.call_shape),
+    shape_json: reference.call_shape === null ? null : pythonJsonDumps(reference.call_shape),
   }));
 
   for (const declaration of declarations) {
@@ -113,15 +114,7 @@ export function referenceRows(
       end_byte: declaration.end_byte,
       start_line: declaration.start_line,
       end_line: declaration.end_line,
-      // Sorted keys and no whitespace, so a shape compares byte-for-byte across
-      // runs the way the Python writer's `json.dumps(..., sort_keys=True)` does.
-      shape_json: JSON.stringify(
-        declaration.parameters.map((parameter) =>
-          Object.fromEntries(
-            Object.entries(parameter).sort(([left], [right]) => (left < right ? -1 : 1)),
-          ),
-        ),
-      ),
+      shape_json: pythonJsonDumps(declaration.parameters),
     });
   }
 

@@ -38,10 +38,12 @@ import type {
 } from "./models.ts";
 import {
   REFERENCE_SCHEMA_VERSION,
+  ReferenceSnapshotExpiredError,
   type ReferenceRecord,
   type ReferenceStore,
 } from "./reference-store.ts";
 import { STRUCTURAL_LANGUAGES } from "./extractor.ts";
+import { comparePythonStrings, pythonJsonDumps } from "./python-compat.ts";
 
 /**
  * Reason codes that describe something the syntax-only index could not see.
@@ -97,6 +99,7 @@ interface ReferenceQuery {
   readonly hits: ReferenceHit[];
   readonly root: string | null;
   readonly sources: Map<string, FileBytes>;
+  readonly stalePaths: ReadonlySet<string>;
 }
 
 interface ClassifiedFindings {
@@ -270,6 +273,7 @@ export class ReferenceService {
         recordKinds: ["reference", "coverage"],
       });
     } catch (error) {
+      if (!(error instanceof ReferenceSnapshotExpiredError)) throw error;
       throw new CodeIndexingError(
         "STALE_CURSOR",
         "Reference cursor snapshot expired",
@@ -281,7 +285,7 @@ export class ReferenceService {
     }
     const root = await this.#projectRoot(selected.project_id);
     const sources = new Map<string, FileBytes>();
-    const { hits, limitations } = await this.#hitsAndLimitations(
+    const { hits, limitations, stalePaths } = await this.#hitsAndLimitations(
       selected,
       kinds,
       records,
@@ -321,7 +325,7 @@ export class ReferenceService {
       cursor: nextCursor,
       snapshot_version: version,
     };
-    return { response, records, hits, root, sources };
+    return { response, records, hits, root, sources, stalePaths };
   }
 
   /**
@@ -347,7 +351,11 @@ export class ReferenceService {
     sources: Map<string, FileBytes>,
     backfill: ReferenceBackfillReport | null,
     version: number,
-  ): Promise<{ hits: ReferenceHit[]; limitations: ReferenceLimitation[] }> {
+  ): Promise<{
+    hits: ReferenceHit[];
+    limitations: ReferenceLimitation[];
+    stalePaths: ReadonlySet<string>;
+  }> {
     // Lexical/class-scope resolution only ever compares a declaration against a
     // reference row in the *same* file, so a file with no `reference`-kind row
     // of its own can never be looked up below -- narrowing to this set, rather
@@ -478,7 +486,7 @@ export class ReferenceService {
         left.start_byte - right.start_byte ||
         compare(left.reference_id, right.reference_id),
     );
-    return { hits, limitations };
+    return { hits, limitations, stalePaths };
   }
 
   async analyzeRefactor(
@@ -492,7 +500,7 @@ export class ReferenceService {
       backfill: options.backfill ?? null,
       operationDigest: operationDigest(operation),
     });
-    const { response, records, root, sources } = query;
+    const { response, records, root, sources, stalePaths } = query;
     const isRename = operation.kind === "rename";
     if (isRename) validateRename(response.selected, operation as RenameOperation);
 
@@ -505,6 +513,7 @@ export class ReferenceService {
         root,
         sources,
         response.snapshot_version,
+        stalePaths,
       );
       declarationFinding = renamed.declaration;
       overrideFindings = renamed.overrides;
@@ -599,6 +608,7 @@ export class ReferenceService {
     root: string | null,
     sources: Map<string, FileBytes>,
     snapshotVersion: number,
+    stalePaths: ReadonlySet<string>,
   ): Promise<{ declaration: RefactorFinding; overrides: RefactorFinding[] }> {
     const declarations = await this.store.declarationShapes(
       selected.project_id,
@@ -610,7 +620,7 @@ export class ReferenceService {
     let endByte = 0;
     let editStart: number | null = null;
     let editEnd: number | null = null;
-    if (declaration !== null) {
+    if (declaration !== null && !stalePaths.has(selected.path)) {
       const [source, bom] = await readFileBytes(root, selected.path, sources);
       startByte = (declaration.start_byte ?? 0) + bom;
       endByte = (declaration.end_byte ?? 0) + bom;
@@ -760,6 +770,7 @@ export class ReferenceService {
       null;
     if (baseDeclaration === null) return [];
     const imports = importsByFile(records);
+    const reexports = reexportRowsByPath(records);
     const knownPaths = knownPathsOf(records);
     const coverageHashes = new Map<string, string>();
     for (const row of records) {
@@ -780,7 +791,11 @@ export class ReferenceService {
       const [baseFileId, baseQualified, basePath] = queue.shift() as [string, string, string];
       const baseTail = baseQualified.slice(baseQualified.lastIndexOf(".") + 1);
       for (const row of inheritanceRows) {
-        if (!inheritanceTargets(row, baseFileId, baseTail, basePath, imports, knownPaths)) continue;
+        if (
+          !inheritanceTargets(row, baseFileId, baseTail, basePath, imports, reexports, knownPaths)
+        ) {
+          continue;
+        }
         const subclassQualified = row.source_qualified_symbol;
         if (!subclassQualified) continue;
         const key = `${row.file_id}\0${subclassQualified}`;
@@ -1249,6 +1264,7 @@ function inheritanceTargets(
   baseTail: string,
   basePath: string,
   imports: ReadonlyMap<string, ReferenceRecord[]>,
+  reexports: ReadonlyMap<string, ReferenceRecord[]>,
   knownPaths: ReadonlySet<string>,
 ): boolean {
   const writtenTarget = row.target_name ?? "";
@@ -1270,10 +1286,7 @@ function inheritanceTargets(
     ) {
       continue;
     }
-    if (
-      item.module_path !== null &&
-      moduleMatches(item.path, item.language, item.module_path, basePath, knownPaths)
-    ) {
+    if (reexportTargetsSymbol(item, baseTail, basePath, reexports, knownPaths)) {
       return true;
     }
   }
@@ -1314,6 +1327,9 @@ function signatureIssue(
   const positionalCount = Number(shape.positional_count ?? 0);
   const keywords = new Set(shape.keywords ?? []);
   const newByName = new Map(operation.parameters.map((parameter) => [parameter.name, parameter]));
+  const acceptsKeywordVariadic = operation.parameters.some(
+    (parameter) => parameter.kind === "keyword_variadic",
+  );
   const boundReceiver =
     selected.language === "python" &&
     selected.kind === "method" &&
@@ -1329,8 +1345,14 @@ function signatureIssue(
   }
   for (const keyword of keywords) {
     const parameter = newByName.get(keyword);
-    if (parameter === undefined) return "invalid_keyword";
-    if (parameter.kind === "positional_only") return "parameter_mode_change";
+    if (parameter === undefined || parameter.kind === "variadic") {
+      if (acceptsKeywordVariadic) continue;
+      return "invalid_keyword";
+    }
+    if (parameter.kind === "positional_only") {
+      if (acceptsKeywordVariadic) continue;
+      return "parameter_mode_change";
+    }
   }
   if (
     newPositional.some(
@@ -1776,11 +1798,11 @@ function moduleMatches(
  * page 1.
  */
 function operationDigest(operation: RefactorOperation): string {
-  return digest(canonicalJson(operation)).slice(0, 16);
+  return digest(pythonJsonDumps(operation)).slice(0, 16);
 }
 
 function encodeCursor(payload: CursorPayload): string {
-  return Buffer.from(canonicalJson(payload), "utf8").toString("base64url").replace(/=+$/, "");
+  return Buffer.from(pythonJsonDumps(payload), "utf8").toString("base64url").replace(/=+$/, "");
 }
 
 /**
@@ -1837,23 +1859,6 @@ function decodeCursor(cursor: string): CursorPayload {
   };
 }
 
-/**
- * `json.dumps(..., separators=(",", ":"), sort_keys=True)`.
- *
- * Cursors and operation digests are compared against themselves across
- * requests, so the serialization has to be canonical rather than merely valid:
- * `JSON.stringify` preserves insertion order, which would make two equal
- * operations digest differently depending on how they were constructed.
- */
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, item]) => item !== undefined)
-    .sort(([left], [right]) => compare(left, right));
-  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
-}
-
 // --- small helpers --------------------------------------------------------
 
 function digest(value: string | Uint8Array): string {
@@ -1905,10 +1910,8 @@ function sameStringList(left: readonly string[], right: readonly string[]): bool
   return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
-/** Python's `<` on `str`: a code-unit comparison, which `localeCompare` is not. */
 function compare(left: string, right: string): number {
-  if (left === right) return 0;
-  return left < right ? -1 : 1;
+  return comparePythonStrings(left, right);
 }
 
 function startsWithBom(value: Uint8Array): boolean {

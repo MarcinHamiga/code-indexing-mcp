@@ -786,7 +786,7 @@ describe("packaging invariants", () => {
     // A copy that can drift is a copy that will, so byte-identity is asserted
     // rather than assumed; once the Python tree retires, this simply stops
     // having a source to compare against.
-    const pythonQueries = path.join(
+    const pythonSource = path.join(
       path.dirname(QUERY_DIRECTORIES.chunks),
       "..",
       "..",
@@ -794,13 +794,18 @@ describe("packaging invariants", () => {
       "..",
       "src",
       "code_indexing_mcp",
-      "queries",
     );
-    if (!fs.existsSync(pythonQueries)) return;
-    for (const name of fs.readdirSync(QUERY_DIRECTORIES.chunks)) {
-      expect(fs.readFileSync(path.join(QUERY_DIRECTORIES.chunks, name), "utf8")).toBe(
-        fs.readFileSync(path.join(pythonQueries, name), "utf8"),
-      );
+    const packs = [
+      [QUERY_DIRECTORIES.chunks, path.join(pythonSource, "queries")],
+      [QUERY_DIRECTORIES.references, path.join(pythonSource, "reference_queries")],
+    ] as const;
+    if (!fs.existsSync(pythonSource)) return;
+    for (const [packaged, python] of packs) {
+      for (const name of fs.readdirSync(packaged)) {
+        expect(fs.readFileSync(path.join(packaged, name), "utf8")).toBe(
+          fs.readFileSync(path.join(python, name), "utf8"),
+        );
+      }
     }
   });
 

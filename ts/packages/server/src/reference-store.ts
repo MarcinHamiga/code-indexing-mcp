@@ -32,6 +32,11 @@ import type { CodeChunk, IndexedChunk, ProjectInfo } from "./models.ts";
  */
 export const REFERENCE_SCHEMA_VERSION = 4;
 
+/** A pinned structural table version was pruned before a cursor finished reading it. */
+export class ReferenceSnapshotExpiredError extends Error {
+  override readonly name = "ReferenceSnapshotExpiredError";
+}
+
 /** One row of the structural index: a reference, a declaration, or a coverage marker. */
 export interface ReferenceRecord {
   reference_id: string;
@@ -73,7 +78,11 @@ export interface ReferenceStore {
   /** The current structural snapshot version, without creating a partition. */
   referenceVersion(projectId: string): Promise<number>;
 
-  /** Structural rows from one immutable table version, filtered in the query. */
+  /**
+   * Structural rows from one immutable table version, filtered in the query.
+   * Implementations throw {@link ReferenceSnapshotExpiredError} only when the
+   * requested version no longer exists; unrelated storage errors pass through.
+   */
   listReferenceRecords(
     projectId: string,
     options: {

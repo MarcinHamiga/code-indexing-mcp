@@ -91,6 +91,12 @@ CASES: dict[str, tuple[str, str]] = {
         # the fixture carries it.
         '﻿"""Módulo con BOM."""\n\n\ndef función(año):\n    return año\n',
     ),
+    "double_bom.py": (
+        "python",
+        # `utf-8-sig` strips one marker, not every leading U+FEFF. The second
+        # marker remains real module content and occupies three stored bytes.
+        "﻿﻿def función():\n    return 1\n",
+    ),
     "wide_lines.py": (
         "python",
         # An oversized line built from multi-byte characters, so the chunk

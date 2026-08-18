@@ -43,6 +43,29 @@ function digest(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 16);
 }
 
+function pythonRstrip(value: string): string {
+  let end = value.length;
+  while (end > 0) {
+    const code = value.charCodeAt(end - 1);
+    const whitespace =
+      code === 0x20 ||
+      (code >= 0x09 && code <= 0x0d) ||
+      (code >= 0x1c && code <= 0x1f) ||
+      code === 0x85 ||
+      code === 0xa0 ||
+      code === 0x1680 ||
+      (code >= 0x2000 && code <= 0x200a) ||
+      code === 0x2028 ||
+      code === 0x2029 ||
+      code === 0x202f ||
+      code === 0x205f ||
+      code === 0x3000;
+    if (!whitespace) break;
+    end -= 1;
+  }
+  return value.slice(0, end);
+}
+
 const extractor = new TreeSitterExtractor();
 
 describe("parity with Python on non-ASCII sources", () => {
@@ -118,11 +141,13 @@ describe("parity with Python on non-ASCII sources", () => {
       );
 
       for (const chunk of result.chunks) {
-        const sliced = new TextDecoder().decode(bytes.subarray(chunk.start_byte, chunk.end_byte));
-        expect(sliced.replace(/\s+$/u, "")).toBe(chunk.content);
+        const sliced = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+          bytes.subarray(chunk.start_byte, chunk.end_byte),
+        );
+        expect(pythonRstrip(sliced)).toBe(chunk.content);
       }
       for (const reference of result.references) {
-        const sliced = new TextDecoder().decode(
+        const sliced = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
           bytes.subarray(reference.start_byte, reference.end_byte),
         );
         // A reference's range covers the occurrence, which for an import or an

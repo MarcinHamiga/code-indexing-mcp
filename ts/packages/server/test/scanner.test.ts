@@ -24,6 +24,7 @@ import {
   SourceScanner,
   compileSpec,
   iterWalkBatches,
+  languageForExtension,
 } from "../src/scanner.ts";
 import { removeDirectory, temporaryDirectory } from "./helpers.ts";
 
@@ -172,12 +173,14 @@ describe("enumeration", () => {
     fs.mkdirSync(root);
     git(temporary, "init", "-q", root);
     const project = initializeProject(root);
-    for (const name of ["c.py", "a.py", "b.py"]) write(path.join(root, name), "value = 1\n");
+    for (const name of ["c.py", "a.py", "b.py", "a-.py", "a/file.py"]) {
+      write(path.join(root, name), "value = 1\n");
+    }
 
     const first = await new SourceScanner().scan(project);
     const second = await new SourceScanner().scan(project);
 
-    expect(paths(first.files)).toEqual(["a.py", "b.py", "c.py"]);
+    expect(paths(first.files)).toEqual(["a/file.py", "a-.py", "a.py", "b.py", "c.py"]);
     expect(paths(first.files)).toEqual(paths(second.files));
   });
 
@@ -298,6 +301,34 @@ describe("the streaming walk", () => {
     expect(paths(result.files)).toEqual(["main.py"]);
   });
 
+  test.skipIf(process.platform === "win32")(
+    "a failed git process exposes no partial batches",
+    async () => {
+      const root = path.join(temporary, "repo");
+      fs.mkdirSync(root);
+      const stub = path.join(temporary, "bin");
+      fs.mkdirSync(stub);
+      fs.writeFileSync(
+        path.join(stub, "git"),
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 300 ]; do printf 'file%03d.py\\0' $i; i=$((i + 1)); done\nexit 1\n",
+        { mode: 0o755 },
+      );
+      const originalPath = process.env.PATH;
+      process.env.PATH = stub;
+      const batches: string[][] = [];
+
+      try {
+        await expect(async () => {
+          for await (const batch of new SourceScanner().iterGitBatches(root)) batches.push(batch);
+        }).toThrow();
+      } finally {
+        process.env.PATH = originalPath;
+      }
+
+      expect(batches).toEqual([]);
+    },
+  );
+
   test("the walk fallback passes only supported files to check-ignore", async () => {
     // The rare walk-inside-a-worktree fallback must not hand unsupported files
     // to `git check-ignore`: the pre-filter happens before the batch.
@@ -361,6 +392,21 @@ describe("classification", () => {
     }
   });
 
+  test("include, exclude, and gitignore matching stay case-sensitive", async () => {
+    const root = path.join(temporary, "repo");
+    fs.mkdirSync(root);
+    const project = initializeProject(root);
+    write(path.join(root, "lower.py"), "value = 1\n");
+    write(path.join(root, "MAIN.PY"), "value = 2\n");
+    write(path.join(root, "Mixed.py"), "value = 3\n");
+    write(path.join(root, ".gitignore"), "mixed.py\n");
+
+    const result = await new SourceScanner().scan(project);
+
+    expect(paths(result.files)).toEqual(["Mixed.py", "lower.py"]);
+    expect(result.skipped.find((item) => item.path === "MAIN.PY")?.reason).toBe("unsupported");
+  });
+
   test("every default language is discovered", async () => {
     // Driven off `LANGUAGES` rather than a hand-written list so a newly mapped
     // extension cannot quietly go undiscovered: the file is written from the
@@ -376,9 +422,34 @@ describe("classification", () => {
 
     expect(result.files.map((item) => [item.path, item.language])).toEqual(
       Object.entries(LANGUAGES)
+        .filter(([extension]) => languageForExtension(extension) !== undefined)
         .map(([extension, language]) => [`sample${extension}`, language])
         .sort((left, right) => ((left[0] as string) < (right[0] as string) ? -1 : 1)),
     );
+  });
+
+  test("malformed UTF-8 invalidates the whole gitignore file", async () => {
+    const root = path.join(temporary, "repo");
+    fs.mkdirSync(root);
+    const project = initializeProject(root);
+    write(path.join(root, "main.py"), "value = 1\n");
+    fs.writeFileSync(
+      path.join(root, ".gitignore"),
+      Buffer.from([0xff, 0x0a, ...Buffer.from("main.py\n")]),
+    );
+
+    expect(paths((await new SourceScanner().scan(project)).files)).toEqual(["main.py"]);
+  });
+
+  test("gitignore parsing recognizes Python's non-LF line boundaries", async () => {
+    const root = path.join(temporary, "repo");
+    fs.mkdirSync(root);
+    const project = initializeProject(root);
+    write(path.join(root, "drop.py"), "value = 1\n");
+    write(path.join(root, "also_drop.py"), "value = 2\n");
+    write(path.join(root, ".gitignore"), "drop.py\ralso_drop.py");
+
+    expect(paths((await new SourceScanner().scan(project)).files)).toEqual([]);
   });
 
   test("the godot cache directory is excluded without excluding the project file", async () => {

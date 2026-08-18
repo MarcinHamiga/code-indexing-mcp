@@ -67,6 +67,7 @@ class _ReferenceQuery(NamedTuple):
     hits: list[ReferenceHit]
     root: Path | None
     sources: dict[str, tuple[bytes, int]]
+    stale_paths: frozenset[str]
 
 
 class _ClassifiedFindings(NamedTuple):
@@ -227,7 +228,7 @@ class ReferenceService:
             ) from error
         root = self._project_root(selected.project_id)
         sources: dict[str, tuple[bytes, int]] = {}
-        hits, limitations = self._hits_and_limitations(
+        hits, limitations, stale_paths = self._hits_and_limitations(
             selected, kinds, records, root, sources, backfill, version
         )
         page = hits[offset : offset + limit]
@@ -258,7 +259,7 @@ class ReferenceService:
             cursor=next_cursor,
             snapshot_version=version,
         )
-        return _ReferenceQuery(response, records, hits, root, sources)
+        return _ReferenceQuery(response, records, hits, root, sources, stale_paths)
 
     def _hits_and_limitations(
         self,
@@ -269,7 +270,7 @@ class ReferenceService:
         sources: dict[str, tuple[bytes, int]],
         backfill: ReferenceBackfillReport | None,
         version: int,
-    ) -> tuple[list[ReferenceHit], list[ReferenceLimitation]]:
+    ) -> tuple[list[ReferenceHit], list[ReferenceLimitation], frozenset[str]]:
         """Classify every reference row into a sorted, unsliced hit list.
 
         Shared by `find_references` (which then slices a page from the
@@ -426,7 +427,7 @@ class ReferenceService:
                 )
             )
         hits.sort(key=lambda hit: (hit.path, hit.start_line, hit.start_byte, hit.reference_id))
-        return hits, limitations
+        return hits, limitations, frozenset(stale_paths)
 
     def analyze_refactor(
         self,
@@ -444,11 +445,12 @@ class ReferenceService:
             backfill=backfill,
             operation_digest=self._operation_digest(operation),
         )
-        response, records, root, sources = (
+        response, records, root, sources, stale_paths = (
             query.response,
             query.records,
             query.root,
             query.sources,
+            query.stale_paths,
         )
         if isinstance(operation, RenameOperation):
             self._validate_rename(response.selected, operation)
@@ -462,6 +464,7 @@ class ReferenceService:
                 root,
                 sources,
                 response.snapshot_version,
+                stale_paths,
             )
 
         # Signature shapes are fetched once from the same pinned snapshot and reused
@@ -572,6 +575,7 @@ class ReferenceService:
         root: Path | None,
         sources: dict[str, tuple[bytes, int]],
         snapshot_version: int,
+        stale_paths: frozenset[str],
     ) -> tuple[RefactorFinding, list[RefactorFinding]]:
         declarations = self.store.declaration_shapes(
             selected.project_id,
@@ -585,7 +589,7 @@ class ReferenceService:
         )
         start_byte, end_byte = 0, 0
         edit_start, edit_end = None, None
-        if declaration is not None:
+        if declaration is not None and selected.path not in stale_paths:
             source, bom = self._file_bytes(root, selected.path, sources)
             start_byte = (declaration["start_byte"] or 0) + bom
             end_byte = (declaration["end_byte"] or 0) + bom
@@ -756,6 +760,9 @@ class ReferenceService:
         positional_count = int(shape.get("positional_count", 0))
         keywords = set(shape.get("keywords", []))
         new_by_name = {parameter.name: parameter for parameter in operation.parameters}
+        accepts_keyword_variadic = any(
+            parameter.kind == "keyword_variadic" for parameter in operation.parameters
+        )
         bound_receiver = (
             selected.language == "python"
             and selected.kind == "method"
@@ -772,9 +779,13 @@ class ReferenceService:
             return "missing_required_parameter"
         for keyword in keywords:
             parameter = new_by_name.get(keyword)
-            if parameter is None:
+            if parameter is None or parameter.kind == "variadic":
+                if accepts_keyword_variadic:
+                    continue
                 return "invalid_keyword"
             if parameter.kind == "positional_only":
+                if accepts_keyword_variadic:
+                    continue
                 return "parameter_mode_change"
         if any(
             parameter.required and position >= positional_count and parameter.name not in keywords
@@ -866,6 +877,7 @@ class ReferenceService:
         if base_decl is None:
             return []
         imports = self._imports_by_file(records)
+        reexports = self._reexport_rows_by_path(records)
         known_paths = self._known_paths(records)
         coverage_hashes = {
             row["path"]: row["content_hash"]
@@ -886,7 +898,13 @@ class ReferenceService:
             base_tail = base_qualified.rsplit(".", 1)[-1]
             for row in inheritance_rows:
                 if not self._inheritance_targets(
-                    row, base_file_id, base_tail, base_path, imports, known_paths
+                    row,
+                    base_file_id,
+                    base_tail,
+                    base_path,
+                    imports,
+                    reexports,
+                    known_paths,
                 ):
                     continue
                 subclass_qualified = row["source_qualified_symbol"]
@@ -955,6 +973,7 @@ class ReferenceService:
         base_tail: str,
         base_path: str,
         imports: dict[str, list[ReferenceRecord]],
+        reexports: dict[str, list[ReferenceRecord]],
         known_paths: frozenset[str],
     ) -> bool:
         """True if an `inheritance` row's base name binds to the class at hand.
@@ -987,10 +1006,7 @@ class ReferenceService:
                     continue
             elif binding != target or item["imported_name"] not in {base_tail, "default"}:
                 continue
-            module_path = item["module_path"]
-            if module_path is not None and self._module_matches(
-                item["path"], item["language"], module_path, base_path, known_paths
-            ):
+            if self._reexport_targets_symbol(item, base_tail, base_path, reexports, known_paths):
                 return True
         return False
 

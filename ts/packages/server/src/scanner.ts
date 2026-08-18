@@ -24,18 +24,20 @@
  * daemon share one event loop with the scan, and a synchronous walk of a large
  * repository would stall every in-flight request until it finished. It also
  * makes the `git ls-files` deadline enforceable without the reader thread and
- * staging queue `_iter_git_batches` needs -- streaming stdout with an abort
- * timer is the same guarantee in a tenth of the code. The yielded items,
- * batching, and ordering are unchanged, so callers see the identical sequence.
+ * staging queue `_iter_git_batches` needs. Git writes to a temporary spool so
+ * output is exposed only after a successful exit; parsing that spool remains
+ * batched and memory-bounded.
  */
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import ignore, { type Ignore } from "ignore";
 import type { ProjectInfo, ScanConfig, ScanResult, ScannedFile, SkippedFile } from "./models.ts";
 import { unavailableLanguages } from "./grammars.ts";
 import { resolvePath } from "./paths.ts";
+import { comparePythonPaths, comparePythonStrings } from "./python-compat.ts";
 
 export const LANGUAGES: Readonly<Record<string, string>> = {
   ".py": "python",
@@ -282,28 +284,44 @@ export class SourceScanner {
   }
 
   /**
-   * Stream `git ls-files` output in bounded, sorted batches.
+   * Return `git ls-files` output in bounded, sorted batches after it succeeds.
    *
    * A hung git process cannot wedge a scan: the child is aborted at the
    * deadline and the walk takes over. A non-zero exit (which cannot normally
    * happen for a worktree the probe just accepted) falls back the same way.
    */
   async *iterGitBatches(root: string): AsyncGenerator<string[]> {
-    const controller = new AbortController();
-    const deadline = setTimeout(() => controller.abort(), this.#lsFilesTimeoutMs);
-    const child = spawn(
-      "git",
-      ["-C", root, "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-      { stdio: ["ignore", "pipe", "ignore"], signal: controller.signal },
-    );
-    const exited = new Promise<number | null>((resolve, reject) => {
-      child.once("close", (code) => resolve(code));
-      child.once("error", (error) => reject(new GitEnumerationError(String(error))));
-    });
-    let batch: string[] = [];
-    let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    // Do not expose a partial enumeration: if Git later fails, the walk fallback
+    // must start from an empty stream rather than duplicating already-yielded
+    // files. A temporary spool keeps this transactional without retaining a
+    // repository-sized path list in memory.
+    const temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), "code-indexing-mcp-scan-"));
+    const outputPath = path.join(temporary, "ls-files");
+    let output: fs.promises.FileHandle | null = null;
+    let child: ReturnType<typeof spawn> | null = null;
+    let deadline: ReturnType<typeof setTimeout> | null = null;
     try {
-      for await (const chunk of child.stdout) {
+      output = await fs.promises.open(outputPath, "wx");
+      const controller = new AbortController();
+      deadline = setTimeout(() => controller.abort(), this.#lsFilesTimeoutMs);
+      child = spawn(
+        "git",
+        ["-C", root, "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        { stdio: ["ignore", output.fd, "ignore"], signal: controller.signal },
+      );
+      const code = await new Promise<number | null>((resolve, reject) => {
+        child?.once("close", resolve);
+        child?.once("error", reject);
+      });
+      if (code !== 0) throw new GitEnumerationError(`git ls-files exited with status ${code}`);
+      clearTimeout(deadline);
+      deadline = null;
+      await output.close();
+      output = null;
+
+      let batch: string[] = [];
+      let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+      for await (const chunk of fs.createReadStream(outputPath)) {
         pending =
           pending.length === 0 ? (chunk as Buffer) : Buffer.concat([pending, chunk as Buffer]);
         let start = 0;
@@ -314,28 +332,25 @@ export class SourceScanner {
           start = separator + 1;
           if (raw.length > 0) batch.push(path.join(root, raw.toString("utf8")));
           if (batch.length >= GIT_IGNORE_DISCOVERY_BATCH_SIZE) {
-            batch.sort(comparePaths);
+            batch.sort(comparePythonPaths);
             yield batch;
             batch = [];
           }
         }
-        // Compact the consumed prefix once per chunk rather than per path.
         pending = pending.subarray(start);
       }
-      const code = await exited;
-      if (code !== 0) throw new GitEnumerationError(`git ls-files exited with status ${code}`);
+      if (batch.length > 0) {
+        batch.sort(comparePythonPaths);
+        yield batch;
+      }
     } catch (error) {
       if (error instanceof GitEnumerationError) throw error;
       throw new GitEnumerationError(String(error));
     } finally {
-      clearTimeout(deadline);
-      // A consumer that stops early or an exception path must not leave the
-      // process running; an already-exited process makes kill a no-op.
-      child.kill();
-    }
-    if (batch.length > 0) {
-      batch.sort(comparePaths);
-      yield batch;
+      if (deadline !== null) clearTimeout(deadline);
+      child?.kill();
+      if (output !== null) await output.close().catch(() => undefined);
+      await fs.promises.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 
@@ -676,8 +691,9 @@ async function loadIgnoreSpecs(root: string, gitignores: readonly string[]): Pro
     const relative = relativePosix(root, file);
     if (inHardExcludedDirectory(relative)) continue;
     try {
-      const text = await fs.promises.readFile(file, "utf8");
-      specs.push({ base: posixDirname(relative), spec: compileSpec(text.split(/\r?\n/)) });
+      const bytes = await fs.promises.readFile(file);
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      specs.push({ base: posixDirname(relative), spec: compileSpec(splitPythonLines(text)) });
     } catch {
       // An unreadable or non-UTF-8 `.gitignore` contributes no rules rather
       // than failing the scan, as `_load_ignore_specs` does.
@@ -705,7 +721,7 @@ function isIgnored(relative: string, specs: readonly IgnoreSpec[]): boolean {
 
 /** Gitignore-syntax pattern matching, the `pathspec.GitIgnoreSpec` of this port. */
 export function compileSpec(lines: readonly string[]): Ignore {
-  return ignore({ allowRelativePaths: true }).add([...lines]);
+  return ignore({ allowRelativePaths: true, ignorecase: false }).add([...lines]);
 }
 
 function matches(spec: Ignore, relative: string): boolean {
@@ -721,14 +737,41 @@ function posixDirname(relative: string): string {
   return separator < 0 ? "" : relative.slice(0, separator);
 }
 
-/** Python's `PurePath.__lt__`: a plain comparison of the whole path string. */
-function comparePaths(left: string, right: string): number {
-  return compareStrings(left, right);
+function compareStrings(left: string, right: string): number {
+  return comparePythonStrings(left, right);
 }
 
-function compareStrings(left: string, right: string): number {
-  if (left === right) return 0;
-  return left < right ? -1 : 1;
+/** Python's `str.splitlines()` without retaining the line endings. */
+function splitPythonLines(value: string): string[] {
+  if (value.length === 0) return [];
+  const lines: string[] = [];
+  let start = 0;
+  let index = 0;
+  while (index < value.length) {
+    const code = value.charCodeAt(index);
+    if (!isPythonLineBoundary(code)) {
+      index += 1;
+      continue;
+    }
+    lines.push(value.slice(start, index));
+    index += code === 0x0d && value.charCodeAt(index + 1) === 0x0a ? 2 : 1;
+    start = index;
+  }
+  if (start < value.length) lines.push(value.slice(start));
+  return lines;
+}
+
+function isPythonLineBoundary(code: number): boolean {
+  return (
+    code === 0x0a ||
+    code === 0x0b ||
+    code === 0x0c ||
+    code === 0x0d ||
+    (code >= 0x1c && code <= 0x1e) ||
+    code === 0x85 ||
+    code === 0x2028 ||
+    code === 0x2029
+  );
 }
 
 /**

@@ -22,10 +22,11 @@ import type { CodeChunk, IndexedChunk, ProjectInfo } from "../src/models.ts";
 import { digest, fileId, referenceRows } from "../src/reference-records.ts";
 import {
   REFERENCE_SCHEMA_VERSION,
+  ReferenceSnapshotExpiredError,
   type ReferenceRecord,
   type ReferenceStore,
 } from "../src/reference-store.ts";
-import { LANGUAGES } from "../src/scanner.ts";
+import { languageForExtension } from "../src/scanner.ts";
 
 export class InMemoryReferenceStore implements ReferenceStore {
   readonly project: ProjectInfo;
@@ -63,7 +64,7 @@ export class InMemoryReferenceStore implements ReferenceStore {
     if (options.version !== undefined && options.version !== this.version) {
       // A pinned snapshot that no longer exists is what the real store reports
       // as a vanished table version, and the service maps to STALE_CURSOR.
-      throw new Error(`no such table version ${options.version}`);
+      throw new ReferenceSnapshotExpiredError(`no such table version ${options.version}`);
     }
     const kinds = options.recordKinds === undefined ? null : new Set(options.recordKinds);
     return this.records.filter(
@@ -159,7 +160,7 @@ export function indexedStore(
   });
   const extractor = new TreeSitterExtractor();
   for (const relative of Object.keys(files).sort()) {
-    const language = LANGUAGES[path.extname(relative).toLowerCase()];
+    const language = languageForExtension(path.extname(relative));
     if (language === undefined) continue;
     const bytes = new Uint8Array(fs.readFileSync(path.join(root, ...relative.split("/"))));
     const result = extractor.extract(relative, language, bytes);
@@ -178,7 +179,7 @@ export function indexedStore(
     store.records.push(...referenceRows(projectId, file, result.references, result.declarations));
     for (const chunk of result.chunks) {
       store.chunks.push({
-        chunk_id: `${projectId}:${digest([file.file_id, file.content_hash, chunk.kind, chunk.qualified_symbol ?? "", String(chunk.start_byte), String(chunk.part_index)].join("\0"))}`,
+        chunk_id: `${projectId}:${digest([file.file_id, file.content_hash, chunk.kind, chunk.qualified_symbol ?? "", String(chunk.start_byte), String(chunk.end_byte), String(chunk.part_index)].join("\0"))}`,
         file_id: file.file_id,
         path: relative,
         language,

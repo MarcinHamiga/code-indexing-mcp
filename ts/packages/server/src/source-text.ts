@@ -77,10 +77,9 @@ export class SourceText {
    * files before extraction ever sees them.
    */
   static decode(source: Uint8Array): SourceText {
-    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(source);
-    // TextDecoder already strips a leading BOM, but only for UTF-8 input that
-    // actually carries one; a stray U+FEFF that survived (Python's `utf-8-sig`
-    // strips exactly one leading marker too) is left alone beyond the first.
+    // Preserve BOM code points during decoding and remove exactly one below,
+    // matching `utf-8-sig` even when the source starts with two markers.
+    const decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(source);
     const text = decoded.codePointAt(0) === BOM_CODE_POINT ? decoded.slice(1) : decoded;
     return new SourceText(new TextEncoder().encode(text), text);
   }
@@ -106,7 +105,9 @@ export class SourceText {
 
   /** Decode a byte range back to text, as Python's `source[a:b].decode()` does. */
   slice(startByte: number, endByte: number): string {
-    return new TextDecoder("utf-8").decode(this.bytes.subarray(startByte, endByte));
+    return new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+      this.bytes.subarray(startByte, endByte),
+    );
   }
 }
 

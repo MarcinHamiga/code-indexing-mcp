@@ -1035,3 +1035,74 @@ def test_analyze_refactor_suppresses_edit_spans_from_a_stale_file(tmp_path: Path
         for item in analysis.limitations
     )
     assert analysis.completeness.state == "incomplete"
+
+
+def test_analyze_refactor_suppresses_the_stale_selected_declaration_span(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"auth.py": "def authorize(user):\n    return user\n"},
+    )
+    (tmp_path / "repo" / "auth.py").write_text(
+        "# authorize moved\ndef authorize(user):\n    return user\n"
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize"),
+        RenameOperation(new_name="validate"),
+    )
+    declaration = next(item for item in analysis.must_change if item.reason_code == "declaration")
+
+    assert (declaration.edit_start_byte, declaration.edit_end_byte) == (None, None)
+    assert any(item.code == "stale_file" for item in analysis.limitations)
+    assert analysis.completeness.state == "incomplete"
+
+
+def test_signature_change_keyword_variadic_accepts_unknown_keywords(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"mail.py": "def send(**kwargs):\n    return kwargs\n\nsend(extra=1)\n"},
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="mail.py", qualified_symbol="send"),
+        SignatureChangeOperation(
+            parameters=[
+                ParameterShape(name="kwargs", kind="keyword_variadic", required=True, position=0)
+            ]
+        ),
+    )
+
+    assert not any(item.kind == "call" for item in analysis.must_change)
+    assert any(item.kind == "call" for item in analysis.evidence)
+
+
+def test_barrel_imported_base_class_surfaces_the_subclass_override(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "pkg/impl.py": "class Base:\n    def handle(self):\n        return 1\n",
+            "pkg/__init__.py": "from .impl import Base\n",
+            "child.py": (
+                "from pkg import Base\n\n\n"
+                "class Child(Base):\n    def handle(self):\n        return 2\n"
+            ),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(
+            project=project_id,
+            path="pkg/impl.py",
+            qualified_symbol="Base.handle",
+        ),
+        RenameOperation(new_name="process"),
+    )
+
+    override = next(
+        item
+        for item in analysis.likely_change
+        if item.path == "child.py" and item.reason_code == "override_of_renamed_method"
+    )
+    assert override.resolution == "likely"

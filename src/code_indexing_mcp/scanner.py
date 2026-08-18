@@ -20,10 +20,8 @@ Two enumeration strategies share one classification pipeline:
 from __future__ import annotations
 
 import os
-import queue
 import subprocess
-import threading
-import time
+import tempfile
 from collections.abc import Iterable, Iterator
 from contextlib import suppress
 from pathlib import Path
@@ -98,10 +96,6 @@ GIT_IGNORE_DISCOVERY_BATCH_SIZE = 256
 GIT_CHECK_IGNORE_TIMEOUT_SECONDS = 10
 GIT_LS_FILES_TIMEOUT_SECONDS = 10
 SCAN_STREAM_READ_SIZE = 65536
-# Bound the reader thread's staging queue: at most this many chunk reads sit
-# ahead of the consumer, so candidate memory stays proportional to a few
-# chunks plus the current batch even while the consumer is busy.
-GIT_LS_FILES_QUEUE_CHUNKS = 8
 
 
 class _GitEnumerationError(Exception):
@@ -353,104 +347,70 @@ class SourceScanner:
     def _iter_git_batches(root: Path) -> Iterator[list[Path]]:
         """Stream ``git ls-files`` output in bounded, sorted batches.
 
-        A daemon reader thread drains stdout into a staging queue so the hard
-        deadline is enforceable on every platform: ``select`` cannot wait on a
-        pipe on Windows, so a blocking read with a select-driven timeout would
-        make every Windows scan fall back to the streaming walk. Reads are
-        chunked so candidate memory stays proportional to one batch, and a hung
-        git process cannot wedge a scan. A non-zero exit (which cannot normally
-        happen for a worktree the probe just accepted) falls back to the walk.
+        Git writes to a temporary spool before any candidate is exposed. That
+        keeps memory bounded while making enumeration transactional: a process
+        that emits output and then fails cannot make the walk fallback yield
+        those files a second time. A hung process is still killed at the same
+        hard deadline on every platform.
         """
-        try:
-            process = subprocess.Popen(
-                [
-                    "git",
-                    "-C",
-                    str(root),
-                    "ls-files",
-                    "--cached",
-                    "--others",
-                    "--exclude-standard",
-                    "-z",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as exc:
-            raise _GitEnumerationError(str(exc)) from exc
-        stdout = process.stdout
-        assert stdout is not None
-        chunks: queue.Queue[bytes | None | OSError] = queue.Queue(maxsize=GIT_LS_FILES_QUEUE_CHUNKS)
-
-        def _drain() -> None:
+        with tempfile.TemporaryFile() as stdout:
             try:
+                process = subprocess.Popen(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "ls-files",
+                        "--cached",
+                        "--others",
+                        "--exclude-standard",
+                        "-z",
+                    ],
+                    stdout=stdout,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                raise _GitEnumerationError(str(exc)) from exc
+            try:
+                try:
+                    returncode = process.wait(timeout=GIT_LS_FILES_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired as exc:
+                    raise _GitEnumerationError("git ls-files timed out") from exc
+                if returncode != 0:
+                    raise _GitEnumerationError(
+                        f"git ls-files exited with status {process.returncode}"
+                    )
+
+                stdout.seek(0)
+                batch: list[Path] = []
+                buffer = bytearray()
+                start = 0
                 while True:
                     chunk = stdout.read(SCAN_STREAM_READ_SIZE)
                     if not chunk:
-                        chunks.put(None)
-                        return
-                    chunks.put(chunk)
-            except OSError as exc:
-                chunks.put(exc)
-            finally:
-                stdout.close()
-
-        reader = threading.Thread(target=_drain, daemon=True)
-        reader.start()
-        batch: list[Path] = []
-        buffer = bytearray()
-        start = 0
-        deadline = time.monotonic() + GIT_LS_FILES_TIMEOUT_SECONDS
-        try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise _GitEnumerationError("git ls-files timed out")
-                try:
-                    chunk = chunks.get(timeout=remaining)
-                except queue.Empty:
-                    continue
-                if isinstance(chunk, OSError):
-                    raise _GitEnumerationError(str(chunk)) from chunk
-                if chunk is None:
-                    break
-                buffer.extend(chunk)
-                while True:
-                    separator = buffer.find(b"\0", start)
-                    if separator < 0:
-                        # Compact the consumed prefix once per chunk; without
-                        # this the bytearray shift would be O(n) per path.
-                        del buffer[:start]
-                        start = 0
                         break
-                    raw = bytes(buffer[start:separator])
-                    start = separator + 1
-                    if raw:
-                        batch.append(root / os.fsdecode(raw))
-                    if len(batch) >= GIT_IGNORE_DISCOVERY_BATCH_SIZE:
-                        batch.sort()
-                        yield batch
-                        batch = []
-            if process.wait() != 0:
-                raise _GitEnumerationError(f"git ls-files exited with status {process.returncode}")
-        except OSError as exc:
-            raise _GitEnumerationError(str(exc)) from exc
-        finally:
-            # A consumer that stops early or an exception path must not leave
-            # the process or its reader thread running; an already-exited
-            # process makes kill a no-op.
-            with suppress(ProcessLookupError):
-                process.kill()
-            # Drain the staging queue so a reader blocked on a full queue can
-            # reach EOF once the process is dead instead of waiting forever.
-            with suppress(queue.Empty):
-                while True:
-                    chunks.get_nowait()
-            reader.join(timeout=GIT_LS_FILES_TIMEOUT_SECONDS)
-            process.wait()
-        if batch:
-            batch.sort()
-            yield batch
+                    buffer.extend(chunk)
+                    while True:
+                        separator = buffer.find(b"\0", start)
+                        if separator < 0:
+                            del buffer[:start]
+                            start = 0
+                            break
+                        raw = bytes(buffer[start:separator])
+                        start = separator + 1
+                        if raw:
+                            batch.append(root / os.fsdecode(raw))
+                        if len(batch) >= GIT_IGNORE_DISCOVERY_BATCH_SIZE:
+                            batch.sort()
+                            yield batch
+                            batch = []
+                if batch:
+                    batch.sort()
+                    yield batch
+            finally:
+                with suppress(ProcessLookupError):
+                    process.kill()
+                process.wait()
 
     def _scan_candidates(
         self,
