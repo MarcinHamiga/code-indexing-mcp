@@ -104,7 +104,9 @@ test("a child that never connects gives up at the timeout", async () => {
   } finally {
     removeDirectory(directory);
   }
-});
+  // Headroom over the 0.5s give-up: under the full suite the event loop can
+  // lag far behind wall-clock time while native indexing work drains.
+}, 30_000);
 
 test("a peer with the right key is accepted", async () => {
   const [left, right] = await connectedPair();

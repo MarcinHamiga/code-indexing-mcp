@@ -84,9 +84,16 @@ export interface InstallContextOptions {
  *
  * `null` turns every other entry point here into a no-op.
  */
+/**
+ * Test seam standing in for the Python suite's `sys.prefix` patch: a managed
+ * install is only recognized when the running code lives inside it, and tests
+ * run from the repository instead.
+ */
+export const runtimeRootHolder: { current: string | null } = { current: null };
+
 export function installContext({
   environment = process.env,
-  runtimeRoot = import.meta.dirname,
+  runtimeRoot = runtimeRootHolder.current ?? import.meta.dirname,
 }: InstallContextOptions = {}): string | null {
   const configured = environment[INSTALL_DIRECTORY_VARIABLE] ?? "";
   try {
@@ -262,7 +269,7 @@ function wallClockSeconds(): number {
   return Date.now() / 1000;
 }
 
-function isDisabled(environment: Environment): boolean {
+export function isDisabled(environment: Environment = process.env): boolean {
   return DISABLED_VALUES.has((environment[DISABLE_VARIABLE] ?? "").trim().toLowerCase());
 }
 

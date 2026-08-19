@@ -148,7 +148,14 @@ export class LanceStore implements ReferenceStore {
     this.vectorDimension = options.vectorDimension ?? 768;
     this.vectorIndex = options.vectorIndex ?? "exact";
     this.vectorStorage = storage;
-    this.#registry = this.#openRegistry();
+    const registry = this.#openRegistry();
+    // The registry open is a native commit that can outlive a store that is
+    // dropped before anything awaits it (a CLI one-shot, a fast test). Python
+    // opens storage synchronously so nothing floats; keep that guarantee by
+    // marking the rejection handled for the floating case — awaiters of
+    // `#registry` still observe it.
+    registry.catch(() => undefined);
+    this.#registry = registry;
   }
 
   static projectArrowSchema(): Schema {
@@ -847,9 +854,12 @@ export class LanceStore implements ReferenceStore {
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
+    // `previous` may be a rejected chain (an earlier partition op failed); a
+    // bare `.then` would store a rejected promise that nobody awaits once the
+    // map entry is replaced, surfacing as an unhandled rejection later.
     this.#locks.set(
       projectId,
-      previous.then(() => held),
+      previous.catch(() => undefined).then(() => held),
     );
     await previous;
     try {

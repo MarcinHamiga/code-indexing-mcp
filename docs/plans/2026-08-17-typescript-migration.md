@@ -13,6 +13,8 @@ Phase 4 complete — see
 [2026-08-19-phase-4-notes.md](2026-08-19-phase-4-notes.md).
 Phase 5 complete — see
 [2026-08-19-phase-5-notes.md](2026-08-19-phase-5-notes.md).
+Phase 6 complete — see
+[2026-08-19-phase-6-notes.md](2026-08-19-phase-6-notes.md).
 Branch: `ts-migration`
 
 ## 1. Purpose and scope
@@ -260,7 +262,7 @@ spec, and the ~29k test lines are most of the migration's real cost.
 | 3 | ✅ Storage: `storage`, `staging`, `history` | ~2,800 | 3 wk |
 | 4 | ✅ Embedding (CPU): `embedding` (direct-ONNX based, per §5.1), `embedding_worker`, `worker_launcher`, `passage_backend`, `backends`, `calibration`, `probe_cache` | ~2,900 | 3 wk |
 | 5 | ✅ Orchestration & search: `indexing`, `search`, `application` | ~3,200 | 3 wk |
-| 6 | Surfaces: `server` (MCP), `daemon`, `cli`, `benchmark` | ~3,600 | 3–4 wk |
+| 6 | ✅ Surfaces: `server` (MCP), `daemon`, `cli`, `benchmark` | ~3,600 | 3–4 wk |
 | 7 | Accelerators: provider selection (CUDA/DML/WebGPU/CoreML per D2), `accelerator_env`/`accelerator_probe`, promotion gates on real hardware | ~1,200 | 2–3 wk |
 | 8 | Installer: bootstrap, harness config merging (JSON/JSONC/TOML comment-preserving), shell PATH launcher, self-update, uninstall, OpenTUI Core TUI (per D3) | ~4,600 | 3–4 wk |
 | 9 | Cutover: side-by-side parity soak, benchmark comparison, docs, release | — | 2 wk |

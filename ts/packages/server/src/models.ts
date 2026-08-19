@@ -257,6 +257,15 @@ export const SCAN_SKIP_REASONS: ReadonlySet<string> = new Set([
   "unreadable",
 ]);
 
+/**
+ * A nanosecond timestamp as it crosses the daemon wire: in-process values are
+ * bigints, but JSON frames carry unsafe integers (mtime_ns ≈ 1.7e18 exceeds
+ * 2^53) as strings to keep full precision, so parsing a frame accepts both.
+ */
+const wireNanoseconds = z
+  .union([z.bigint(), z.number(), z.string()])
+  .transform((value) => (typeof value === "bigint" ? value : BigInt(value)));
+
 /** One repository-relative scan outcome, without source contents. */
 export const ScanInspectionItem = z.object({
   path: z.string(),
@@ -265,7 +274,7 @@ export const ScanInspectionItem = z.object({
   reason: z.string().nullable().default(null),
   detail: z.string().nullable().default(null),
   size: z.int().nullable().default(null),
-  mtime_ns: z.bigint().nullable().default(null),
+  mtime_ns: wireNanoseconds.nullable().default(null),
 });
 export type ScanInspectionItem = z.infer<typeof ScanInspectionItem>;
 

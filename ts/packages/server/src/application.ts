@@ -249,7 +249,12 @@ export class Application {
     this.history.markInterrupted();
     const lockDirectory = path.join(paths.data, "locks");
     fs.mkdirSync(lockDirectory, { recursive: true });
-    this.#ready = this.#recover(lockDirectory);
+    const ready = this.#recover(lockDirectory);
+    // An application that is dropped before any method awaits recovery (a CLI
+    // one-shot, a fast test) must not leave a floating rejection behind; the
+    // first caller to await `#ready` still observes a failure.
+    ready.catch(() => undefined);
+    this.#ready = ready;
     this.servingProviders = availableExecutionProviders();
     this.acceleratorEnvironment = loadEnvironment(paths.data);
     this.backendSelection = this.#selectBackend();
