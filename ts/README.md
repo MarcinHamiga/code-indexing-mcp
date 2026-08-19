@@ -18,8 +18,9 @@ ts/
   packages/spikes/      the Phase 0 experiments -- see its README
 ```
 
-`packages/server/src` currently holds Phases 1–6, each named after the Python
-module it ports:
+`packages/installer` is Phase 8: bootstrap, comment-preserving harness merge,
+PATH launcher, update/uninstall, and an OpenTUI Core wizard. `packages/server/src`
+holds Phases 1–7, each named after the Python module it ports:
 
 ```
 errors.ts          models.ts        settings.ts      backends.ts

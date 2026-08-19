@@ -3,9 +3,16 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "code-indexing-mcp-install": "./src/bootstrap.ts"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@opentui/core": "0.1.76",
+    "commander": "15.0.0",
+    "smol-toml": "1.8.0"
+  }
 }
