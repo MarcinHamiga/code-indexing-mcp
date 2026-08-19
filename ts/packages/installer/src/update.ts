@@ -220,7 +220,7 @@ function phase1(
     writeServerLauncher(directory);
     const argv = [
       process.execPath,
-      path.join(directory, "ts", "packages", "installer", "src", "cli.ts"),
+      path.join(directory, "ts", "packages", "installer", "src", "command.ts"),
       "update",
       "--finalize",
       "--previous-sha",

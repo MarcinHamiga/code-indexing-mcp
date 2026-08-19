@@ -1,14 +1,85 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { Command } from "commander";
-import { ACCELERATOR_CHOICES, writeServerLauncher } from "./accelerator.ts";
-import { asBool } from "./settings-spec.ts";
-import { InstallerError } from "./config-files.ts";
-import { defaultInstallDirectory } from "./orchestrator.ts";
-import { expandUser, resolveExisting } from "./config-files.ts";
+import { parseArgs } from "node:util";
 
 export const DEFAULT_REPOSITORY_URL = "https://github.com/MarcinHamiga/code-indexing-mcp.git";
+const ACCELERATOR_CHOICES = ["auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml"];
+
+class InstallerError extends Error {}
+
+function expandUser(value: string): string {
+  if (value === "~") return os.homedir();
+  if (value.startsWith("~/") || value.startsWith("~\\")) {
+    return path.join(os.homedir(), value.slice(2));
+  }
+  if (value.startsWith("~"))
+    throw new InstallerError(`Cannot expand another user's home: ${value}`);
+  return value;
+}
+
+function resolveExisting(value: string): string {
+  return path.resolve(expandUser(value));
+}
+
+function defaultInstallDirectory(): string {
+  const configured = process.env.CODE_INDEXING_MCP_INSTALL_DIR;
+  if (configured !== undefined && configured !== "") return resolveExisting(configured);
+  return path.join(os.homedir(), ".local", "share", "code-indexing-mcp");
+}
+
+function asBool(raw: string): boolean {
+  return new Set(["1", "true", "yes", "on"]).has(raw.trim().toLowerCase());
+}
+
+type ParsedValues = ReturnType<typeof parseArgs>["values"];
+
+function stringOption(values: ParsedValues, name: string): string | undefined {
+  const value = values[name];
+  return typeof value === "string" ? value : undefined;
+}
+
+function stringOptions(values: ParsedValues, name: string): string[] {
+  const value = values[name];
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function boolOption(values: ParsedValues, name: string): boolean {
+  return values[name] === true;
+}
+
+function serverExecutable(
+  installDirectory: string,
+  platformName: string = process.platform,
+): string {
+  return path.join(
+    installDirectory,
+    "bin",
+    platformName.startsWith("win") ? "code-indexing-mcp.cmd" : "code-indexing-mcp",
+  );
+}
+
+function writeServerLauncher(
+  installDirectory: string,
+  platformName: string = process.platform,
+): string {
+  const executable = serverExecutable(installDirectory, platformName);
+  const entry = path.join(installDirectory, "ts", "packages", "server", "src", "cli.ts");
+  const bun = process.execPath;
+  fs.mkdirSync(path.dirname(executable), { recursive: true, mode: 0o700 });
+  if (platformName.startsWith("win")) {
+    fs.writeFileSync(executable, `@echo off\r\n"${bun}" "${entry}" %*\r\n`);
+  } else {
+    fs.writeFileSync(executable, `#!/bin/sh\nexec "${bun}" "${entry}" "$@"\n`, {
+      mode: 0o755,
+    });
+    fs.chmodSync(executable, 0o755);
+  }
+  return executable;
+}
 
 function runCommand(
   arguments_: string[],
@@ -113,60 +184,57 @@ function delegate(installDirectory: string, tail: string[]): number {
 }
 
 export function main(argv: string[] = process.argv.slice(2)): number {
-  const parser = new Command();
-  parser
-    .name("install")
-    .option("--install-dir <path>", "checkout location", defaultInstallDirectory())
-    .option(
-      "--repo-url <url>",
-      "Git repository to clone or update",
-      process.env.CODE_INDEXING_MCP_REPO_URL ?? DEFAULT_REPOSITORY_URL,
-    )
-    .addOption(
-      parser
-        .createOption("--accelerator <name>", "which accelerator to prepare")
-        .choices([...ACCELERATOR_CHOICES]),
-    )
-    .option("--harnesses <selection>")
-    .option(
-      "--set <NAME=VALUE>",
-      "set a managed setting",
-      (value, previous: string[]) => [...previous, value],
-      [],
-    )
-    .option(
-      "--unset <NAME>",
-      "remove a managed setting",
-      (value, previous: string[]) => [...previous, value],
-      [],
-    )
-    .option("--bin-dir <path>", undefined, process.env.CODE_INDEXING_MCP_BIN_DIR)
-    .option("--no-launcher")
-    .option("--no-modify-path")
-    .option("--tui")
-    .option("--no-tui")
-    .option("--no-prompt")
-    .option("--offline", undefined, asBool(process.env.CODE_INDEXING_OFFLINE ?? ""))
-    .exitOverride();
-  parser.parse(["install", ...argv], { from: "user" });
-  const args = parser.opts<{
-    installDir: string;
-    repoUrl: string;
-    accelerator?: string;
-    harnesses?: string;
-    set: string[];
-    unset: string[];
-    binDir?: string;
-    launcher?: boolean;
-    modifyPath?: boolean;
-    tui?: boolean;
-    noTui?: boolean;
-    prompt?: boolean;
-    offline?: boolean;
-  }>();
-  const installDirectory = resolveExisting(args.installDir);
+  let values: ReturnType<typeof parseArgs>["values"];
   try {
-    const action = cloneOrUpdateRepository(args.repoUrl, installDirectory);
+    ({ values } = parseArgs({
+      args: argv,
+      strict: true,
+      allowPositionals: false,
+      options: {
+        "install-dir": { type: "string" },
+        "repo-url": { type: "string" },
+        accelerator: { type: "string" },
+        harnesses: { type: "string" },
+        set: { type: "string", multiple: true },
+        unset: { type: "string", multiple: true },
+        "bin-dir": { type: "string" },
+        "no-launcher": { type: "boolean" },
+        "no-modify-path": { type: "boolean" },
+        tui: { type: "boolean" },
+        "no-tui": { type: "boolean" },
+        "no-prompt": { type: "boolean" },
+        offline: { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+      },
+    }));
+  } catch (error) {
+    process.stderr.write(`Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+  if (boolOption(values, "help")) {
+    process.stdout.write(
+      "Usage: install [--install-dir PATH] [--repo-url URL] [--accelerator NAME] " +
+        "[--harnesses LIST] [--set NAME=VALUE] [--unset NAME] [--no-tui]\n",
+    );
+    return 0;
+  }
+  const accelerator =
+    stringOption(values, "accelerator") ?? process.env.CODE_INDEXING_MCP_ACCELERATOR ?? "auto";
+  if (!ACCELERATOR_CHOICES.includes(accelerator)) {
+    process.stderr.write(
+      `Error: --accelerator must be one of: ${ACCELERATOR_CHOICES.join(", ")}\n`,
+    );
+    return 1;
+  }
+  const installDirectory = resolveExisting(
+    stringOption(values, "install-dir") ?? defaultInstallDirectory(),
+  );
+  const repositoryUrl =
+    stringOption(values, "repo-url") ??
+    process.env.CODE_INDEXING_MCP_REPO_URL ??
+    DEFAULT_REPOSITORY_URL;
+  try {
+    const action = cloneOrUpdateRepository(repositoryUrl, installDirectory);
     process.stdout.write(
       `${action[0]?.toUpperCase() ?? ""}${action.slice(1)} repository: ${installDirectory}\n`,
     );
@@ -179,27 +247,29 @@ export function main(argv: string[] = process.argv.slice(2)): number {
     return 1;
   }
 
-  const tail = [
-    "--install-dir",
-    installDirectory,
-    "--accelerator",
-    args.accelerator ?? process.env.CODE_INDEXING_MCP_ACCELERATOR ?? "auto",
-  ];
-  if (args.harnesses !== undefined) tail.push("--harnesses", args.harnesses);
-  for (const pair of args.set) tail.push("--set", pair);
-  for (const name of args.unset) tail.push("--unset", name);
-  if (args.binDir !== undefined && args.binDir !== "") tail.push("--bin-dir", args.binDir);
-  if (args.launcher === false) tail.push("--no-launcher");
-  if (args.modifyPath === false) tail.push("--no-modify-path");
-  if (args.offline === true) tail.push("--offline");
-  if (args.prompt === false) tail.push("--no-prompt");
+  const tail = ["--install-dir", installDirectory, "--accelerator", accelerator];
+  const harnesses = stringOption(values, "harnesses");
+  if (harnesses !== undefined) tail.push("--harnesses", harnesses);
+  const settings = stringOptions(values, "set");
+  const unsets = stringOptions(values, "unset");
+  for (const pair of settings) tail.push("--set", pair);
+  for (const name of unsets) tail.push("--unset", name);
+  const binDirectory = stringOption(values, "bin-dir") ?? process.env.CODE_INDEXING_MCP_BIN_DIR;
+  if (binDirectory !== undefined && binDirectory !== "") tail.push("--bin-dir", binDirectory);
+  if (boolOption(values, "no-launcher")) tail.push("--no-launcher");
+  if (boolOption(values, "no-modify-path")) tail.push("--no-modify-path");
+  if (boolOption(values, "offline") || asBool(process.env.CODE_INDEXING_OFFLINE ?? "")) {
+    tail.push("--offline");
+  }
+  if (boolOption(values, "no-prompt")) tail.push("--no-prompt");
   const scripted = Boolean(
-    args.harnesses !== undefined ||
-      args.set.length > 0 ||
-      args.unset.length > 0 ||
-      args.prompt === false,
+    harnesses !== undefined ||
+      settings.length > 0 ||
+      unsets.length > 0 ||
+      boolOption(values, "no-prompt"),
   );
-  const useTui = args.tui === true || (args.noTui !== true && !scripted && tuiAvailable());
+  const useTui =
+    boolOption(values, "tui") || (!boolOption(values, "no-tui") && !scripted && tuiAvailable());
   if (useTui) tail.push("--tui");
   const returncode = delegate(installDirectory, tail);
   if (useTui && returncode !== 0 && returncode !== 1 && returncode !== 130) {

@@ -23,11 +23,12 @@ The Python installer at the repository root remains the shipping product.
 | `src/verify.ts` | Post-install checks as warnings | orchestrator path |
 | `src/wizard.ts` | UI-agnostic wizard state | `test/wizard.test.ts` |
 | `src/cli.ts` | Non-interactive configure entry | `test/cli.test.ts` |
+| `src/command.ts` | Installed configure/update/uninstall command dispatch | `test/command.test.ts` |
 | `src/uninstall.ts` | Evidence-based teardown | `test/uninstall.test.ts` |
-| `src/update.ts` | Fast-forward + `bun install` + finalize | bootstrap tests |
+| `src/update.ts` | Fast-forward + `bun install` + finalize | `test/update.test.ts` |
 | `src/bootstrap.ts` | Clone/update checkout, `bun install --frozen-lockfile` | `test/bootstrap.test.ts` |
-| `src/tui/` | OpenTUI Core wizard; panel copy is UI-agnostic | `test/tui-content.test.ts` |
-| `ts/install.sh` | Curl-pipeable bootstrap that runs the TS installer under Bun | — |
+| `src/tui/` | OpenTUI Core wizard with UI-agnostic navigation and validation | `test/tui-content.test.ts`, `test/tui-controller.test.ts`, `test/tui-app.test.ts` |
+| `ts/install.sh` | Curl-pipeable bootstrap that provisions Bun when needed | `test/install-script.test.ts` |
 
 ## Deliberate differences from the Python installer
 

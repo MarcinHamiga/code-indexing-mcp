@@ -5,47 +5,42 @@ import {
   SelectRenderable,
   TextRenderable,
 } from "@opentui/core";
-import { ACCELERATOR_CHOICES } from "../accelerator.ts";
-import { parseHarnessSelection } from "../harnesses.ts";
 import { runInstall, type StepEvent } from "../orchestrator.ts";
-import { SETTINGS } from "../settings-spec.ts";
 import { toPlan, type WizardState } from "../wizard.ts";
-import {
-  doneText,
-  PANEL_ORDER,
-  PANEL_TITLES,
-  type PanelName,
-  summaryText,
-  welcomeText,
-} from "./content.ts";
+import { doneText } from "./content.ts";
+import { WizardController, type WizardControl } from "./controller.ts";
+
+type Renderer = Awaited<ReturnType<typeof createCliRenderer>>;
+type InstallRunner = typeof runInstall;
 
 export async function startInstallerApp(state: WizardState): Promise<number> {
   const renderer = await createCliRenderer({ exitOnCtrlC: false });
   const wizard = new InstallerWizard(renderer, state);
   renderer.root.add(wizard.root);
-  wizard.show(PANEL_ORDER[0]);
+  wizard.render();
   return await wizard.finished;
 }
 
-class InstallerWizard {
+export class InstallerWizard {
   readonly root: InstanceType<typeof BoxRenderable>;
   readonly finished: Promise<number>;
-  doneCode: number | null = null;
   private readonly resolveFinished: (code: number) => void;
   private readonly body: InstanceType<typeof TextRenderable>;
   private readonly title: InstanceType<typeof TextRenderable>;
   private readonly hint: InstanceType<typeof TextRenderable>;
   private readonly input: InstanceType<typeof InputRenderable>;
   private readonly select: InstanceType<typeof SelectRenderable>;
-  private panel: PanelName = "welcome";
+  private readonly renderer: Renderer;
+  private readonly controller: WizardController;
+  private readonly installRunner: InstallRunner;
   private cancelled = false;
+  private doneCode: number | null = null;
+  private closed = false;
 
-  private readonly renderer: Awaited<ReturnType<typeof createCliRenderer>>;
-  private readonly state: WizardState;
-
-  constructor(renderer: Awaited<ReturnType<typeof createCliRenderer>>, state: WizardState) {
+  constructor(renderer: Renderer, state: WizardState, installRunner: InstallRunner = runInstall) {
     this.renderer = renderer;
-    this.state = state;
+    this.controller = new WizardController(state);
+    this.installRunner = installRunner;
     this.root = new BoxRenderable(renderer, {
       id: "installer",
       flexGrow: 1,
@@ -79,149 +74,111 @@ class InstallerWizard {
     });
     this.resolveFinished = resolveFinished;
     renderer.keyInput.on("keypress", (event: { name?: string; ctrl?: boolean }) => {
-      if (this.panel === "progress" || this.panel === "done") return;
+      if (event.name === "escape") {
+        this.cancelOrClose();
+        return;
+      }
+      if (this.controller.panel === "progress" || this.controller.panel === "done") return;
       if (event.ctrl === true && event.name === "n") void this.advance();
-      if (event.ctrl === true && event.name === "b") this.back();
-      if (event.name === "escape") this.cancel();
+      if (event.ctrl === true && event.name === "b") {
+        this.controller.back();
+        this.render();
+      }
     });
   }
 
-  show(name: PanelName): void {
-    this.commit();
-    this.panel = name;
-    const walked = PANEL_ORDER.filter(
-      (panel): panel is Exclude<PanelName, "progress" | "done"> =>
-        panel !== "progress" && panel !== "done",
-    );
-    const index = walked.indexOf(name as Exclude<PanelName, "progress" | "done">);
-    const title =
-      index === -1
-        ? PANEL_TITLES[name]
-        : `Step ${index + 1} of ${walked.length} - ${PANEL_TITLES[name]}`;
-    this.title.content = `Code Indexing MCP Installer  ${title}`;
+  render(): void {
+    const view = this.controller.view();
+    this.title.content = `Code Indexing MCP Installer  ${view.title}`;
+    this.body.content = view.error === null ? view.body : `${view.body}\n\nError: ${view.error}`;
     this.input.visible = false;
     this.select.visible = false;
-    if (name === "welcome") this.body.content = welcomeText(this.state);
-    else if (name === "location") {
-      this.body.content = "The checkout this wizard configures.";
-      this.showInput(this.state.installDirectory);
-    } else if (name === "accelerator") {
-      this.body.content = "Which accelerator to prepare. auto detects one and falls back to CPU.";
-      this.showSelect(
-        ACCELERATOR_CHOICES.map((choice) => ({ name: choice, description: choice, value: choice })),
-        this.state.accelerator ?? "auto",
-      );
-    } else if (name === "harnesses") {
-      this.body.content = "Comma-separated harness numbers/slugs, or all.";
-      this.showInput(this.state.harnessSlugs.join(",") || "all");
-    } else if (name === "path") {
-      this.body.content = `Launcher directory: ${this.state.binDirectory}`;
-      this.showInput(this.state.binDirectory);
-    } else if (name === "indexing" || name === "embedding") {
-      const group = name === "indexing" ? "Indexing" : "Embedding";
-      const settings = SETTINGS.filter((setting) => setting.group === group);
-      this.body.content = settings
-        .map(
-          (setting) =>
-            `${setting.name}=${this.state.values[setting.name] ?? (setting.default || "(default)")}`,
-        )
-        .join("\n");
-    } else if (name === "summary") this.body.content = summaryText(this.state);
-    else if (name === "progress") {
-      this.body.content = "Running the installation…";
-      void this.run();
-    } else if (name === "done") {
-      this.hint.content = "Esc to exit";
+    this.showControl(view.control);
+  }
+
+  private showControl(control: WizardControl): void {
+    if (control.kind === "input") {
+      this.input.visible = true;
+      this.input.value = control.value;
+      this.input.placeholder = control.placeholder;
+      this.input.focus();
+      return;
+    }
+    if (control.kind === "select") {
+      this.select.visible = true;
+      this.select.options = [...control.choices];
+      const index = control.choices.findIndex((choice) => choice.value === control.selected);
+      this.select.selectedIndex = Math.max(0, index);
+      this.select.focus();
     }
   }
 
-  private showInput(value: string): void {
-    this.input.visible = true;
-    this.input.value = value;
-    this.input.focus();
-  }
-
-  private showSelect(
-    options: { name: string; description: string; value: string }[],
-    selected: string,
-  ): void {
-    this.select.visible = true;
-    this.select.options = options;
-    const index = options.findIndex((option) => option.value === selected);
-    if (index >= 0) this.select.selectedIndex = index;
-    this.select.focus();
-  }
-
-  private commit(): void {
-    if (this.panel === "location" && this.input.visible) {
-      this.state.installDirectory = this.input.value.trim() || this.state.installDirectory;
+  private controlValue(): string | null {
+    if (this.input.visible) return this.input.value.trim();
+    if (this.select.visible) {
+      const value = this.select.getSelectedOption()?.value;
+      return typeof value === "string" ? value : null;
     }
-    if (this.panel === "accelerator" && this.select.visible) {
-      const selected = this.select.options[this.select.selectedIndex]?.value;
-      this.state.accelerator = typeof selected === "string" ? selected : this.state.accelerator;
-    }
-    if (this.panel === "harnesses" && this.input.visible) {
-      try {
-        this.state.harnessSlugs = parseHarnessSelection(this.input.value);
-      } catch {
-        // Keep the previous selection; advance validates by staying put only on parse in CLI.
-      }
-    }
-    if (this.panel === "path" && this.input.visible) {
-      this.state.binDirectory = this.input.value.trim() || this.state.binDirectory;
-    }
+    return null;
   }
 
   private async advance(): Promise<void> {
-    this.commit();
-    const order = [...PANEL_ORDER];
-    const index = order.indexOf(this.panel);
-    const next = order[index + 1];
-    if (next === undefined) return;
-    this.show(next);
+    const result = this.controller.advance(this.controlValue());
+    this.render();
+    if (result.startInstall) await this.run();
   }
 
-  private back(): void {
-    const order = PANEL_ORDER.filter(
-      (panel): panel is Exclude<PanelName, "progress" | "done"> =>
-        panel !== "progress" && panel !== "done",
-    );
-    const index = order.indexOf(this.panel as Exclude<PanelName, "progress" | "done">);
-    const previous = order[index - 1];
-    if (previous === undefined) return;
-    this.show(previous);
-  }
-
-  private cancel(): void {
-    this.cancelled = true;
-    this.finish(130);
+  private cancelOrClose(): void {
+    if (this.controller.panel === "done") {
+      this.close(this.doneCode ?? 0);
+      return;
+    }
+    if (this.controller.panel === "progress") {
+      this.cancelled = true;
+      this.hint.content = "Cancelling after the current step...";
+      return;
+    }
+    this.close(130);
   }
 
   private async run(): Promise<void> {
+    this.input.visible = false;
+    this.select.visible = false;
+    this.title.content = "Code Indexing MCP Installer  Installing";
+    this.hint.content = "Esc cancels after the current step";
     const events: string[] = [];
     const onEvent = (event: StepEvent) => {
       events.push(`[${event.step}] ${event.status}: ${event.detail}`);
       this.body.content = events.join("\n");
     };
     try {
-      const result = await runInstall(toPlan(this.state), onEvent, () => !this.cancelled);
-      this.body.content = doneText(this.cancelled ? result : result, {
-        cancelled: this.cancelled,
-      });
-      this.panel = "done";
-      this.finish(this.cancelled ? 130 : result.failures.length > 0 ? 1 : 0);
+      const result = await this.installRunner(
+        toPlan(this.controller.state),
+        onEvent,
+        () => !this.cancelled,
+      );
+      this.doneCode = this.cancelled ? 130 : result.failures.length > 0 ? 1 : 0;
+      this.showDone(doneText(result, { cancelled: this.cancelled }));
     } catch (error) {
-      this.body.content = doneText(null, {
-        error: error instanceof Error ? error : new Error(String(error)),
-      });
-      this.panel = "done";
-      this.finish(1);
+      this.doneCode = 1;
+      this.showDone(
+        doneText(null, { error: error instanceof Error ? error : new Error(String(error)) }),
+      );
     }
   }
 
-  private finish(code: number): void {
-    if (this.doneCode !== null) return;
-    this.doneCode = code;
+  private showDone(content: string): void {
+    this.controller.showDone();
+    this.title.content = "Code Indexing MCP Installer  Done";
+    this.body.content = content;
+    this.hint.content = "Esc exit";
+    this.input.visible = false;
+    this.select.visible = false;
+  }
+
+  private close(code: number): void {
+    if (this.closed) return;
+    this.closed = true;
     this.renderer.destroy();
     this.resolveFinished(code);
   }

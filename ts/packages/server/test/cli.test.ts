@@ -5,6 +5,7 @@ import { Application, type RuntimePaths } from "../src/application.ts";
 import {
   applicationFactory,
   benchmarkCommands,
+  installerCommands,
   main,
   ProgressPrinter,
   serverFactory,
@@ -129,8 +130,19 @@ describe("CLI", () => {
     expect((JSON.parse(stdout()) as { name: string }).name).toBe("src");
   });
 
-  test("configure is deferred to phase 8", async () => {
-    expect(await main(["configure"])).toBe(2);
+  test("installer commands are delegated without loading installer code", async () => {
+    const calls: readonly string[][] = [];
+    const original = installerCommands.run;
+    installerCommands.run = (argv) => {
+      (calls as string[][]).push([...argv]);
+      return 7;
+    };
+    restored.push(() => {
+      installerCommands.run = original;
+    });
+
+    expect(await main(["configure", "--no-tui", "--set", "CODE_INDEXING_OFFLINE=1"])).toBe(7);
+    expect(calls).toEqual([["configure", "--no-tui", "--set", "CODE_INDEXING_OFFLINE=1"]]);
   });
 
   test("benchmark search passes options through and prints machine-readable output", async () => {

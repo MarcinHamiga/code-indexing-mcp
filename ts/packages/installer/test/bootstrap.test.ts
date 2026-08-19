@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { canonicalRepositoryUrl, cloneOrUpdateRepository } from "../src/bootstrap.ts";
+import { canonicalRepositoryUrl, cloneOrUpdateRepository, main } from "../src/bootstrap.ts";
 import { removeDirectory, temporaryDirectory } from "./helpers.ts";
 
 let workspace = "";
@@ -55,4 +55,36 @@ describe("bootstrap", () => {
     expect(cloneOrUpdateRepository(remote, checkout)).toBe("updated");
     expect(fs.readFileSync(path.join(checkout, "version.txt"), "utf8")).toBe("two\n");
   });
+
+  test("the downloaded bootstrap runs without sibling modules or dependencies", () => {
+    workspace = temporaryDirectory();
+    const standalone = path.join(workspace, "install.ts");
+    fs.copyFileSync(new URL("../src/bootstrap.ts", import.meta.url), standalone);
+    const result = spawnSync(process.execPath, [standalone, "--help"], {
+      cwd: workspace,
+      encoding: "utf8",
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Usage: install");
+    expect(result.stderr).toBe("");
+  });
+
+  test("help does not clone or require an existing installation", () => {
+    const stdout = captureStdout();
+    expect(main(["--help"])).toBe(0);
+    expect(stdout()).toContain("Usage: install");
+  });
 });
+
+function captureStdout(): () => string {
+  let output = "";
+  const original = process.stdout.write.bind(process.stdout);
+  process.stdout.write = ((chunk: string | Uint8Array) => {
+    output += String(chunk);
+    return true;
+  }) as typeof process.stdout.write;
+  return () => {
+    process.stdout.write = original;
+    return output;
+  };
+}

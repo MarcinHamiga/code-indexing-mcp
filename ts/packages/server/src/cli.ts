@@ -2,6 +2,7 @@
 
 /** Command-line interface for Code Indexing MCP administration and stdio serving. */
 
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
@@ -18,7 +19,7 @@ import {
   ensureDaemon,
   requireDaemonSupport,
 } from "./daemon.ts";
-import { CodeIndexingError, isCodeIndexingError } from "./errors.ts";
+import { isCodeIndexingError } from "./errors.ts";
 import { dumpJson } from "./jsonable.ts";
 import { describeProgress, type IndexProgress } from "./models.ts";
 import { createServer } from "./server.ts";
@@ -27,6 +28,7 @@ import { checkoutHead, isDisabled, notice, startBackgroundRefresh } from "./upda
 
 export const VERSION = "0.0.0";
 const NOTIFY_COMMANDS = new Set(["init", "index", "status", "projects", "model", "storage"]);
+const INSTALLER_COMMANDS = new Set(["configure", "update", "uninstall"]);
 
 export class ProgressPrinter {
   readonly stream: NodeJS.WriteStream;
@@ -79,12 +81,20 @@ function printJson(value: unknown): void {
   process.stdout.write(`${dumpJson(value, { indent: 2 })}\n`);
 }
 
-function installerStub(command: string): never {
-  throw new CodeIndexingError(
-    "UNSUPPORTED_RUNTIME",
-    `${command} is implemented in Phase 8 of the TypeScript port`,
-  );
-}
+export const installerCommands = {
+  run(argv: readonly string[]): number {
+    const entry = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../installer/src/command.ts",
+    );
+    const result = spawnSync(process.execPath, [entry, ...argv], { stdio: "inherit" });
+    if (result.error !== undefined) {
+      process.stderr.write(`Could not launch the installer: ${result.error.message}\n`);
+      return 1;
+    }
+    return result.status ?? 1;
+  },
+};
 
 /**
  * Test seam mirroring the Python suite's `monkeypatch.setattr(cli, "Application", ...)`:
@@ -111,6 +121,7 @@ export const benchmarkCommands = {
 };
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+  if (INSTALLER_COMMANDS.has(argv[0] ?? "")) return installerCommands.run(argv);
   const program = new Command();
   program.name("code-indexing-mcp").description("Local MCP code indexer").enablePositionalOptions();
   program.option("--version", "show the version and exit");
@@ -238,9 +249,6 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     }
     if (argv[0] === "benchmark") {
       return await runBenchmark(argv[1] ?? "", argv, paths);
-    }
-    if (argv[0] === "configure" || argv[0] === "update" || argv[0] === "uninstall") {
-      installerStub(argv[0]);
     }
     if (argv[0] === "serve") return 0;
     const app = applicationFactory.current(paths, { cwd: process.cwd() });
