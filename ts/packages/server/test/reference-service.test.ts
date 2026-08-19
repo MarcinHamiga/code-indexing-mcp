@@ -21,8 +21,8 @@ import { isCodeIndexingError } from "../src/errors.ts";
 import { DeclarationSelector } from "../src/models.ts";
 import { ReferenceService } from "../src/reference-service.ts";
 import { REFERENCE_SCHEMA_VERSION } from "../src/reference-store.ts";
-import { type InMemoryReferenceStore, indexedStore } from "./reference-fixtures.ts";
 import { removeDirectory, temporaryDirectory } from "./helpers.ts";
+import { type InMemoryReferenceStore, indexedStore } from "./reference-fixtures.ts";
 
 let temporary: string;
 

@@ -8,8 +8,9 @@
  * outside `src/runtime/`.
  *
  * Adapters land here as the phases that need them arrive -- `bun:sqlite`
- * behind the history store's interface (Phase 3), `Bun.spawn` behind the
- * worker launcher's in Phase 4.
+ * behind the history store's interface (Phase 3). Phase 4's worker launcher
+ * uses `node:child_process` rather than `Bun.spawn`, so it does not need an
+ * adapter here.
  */
 
 export type RuntimeName = "bun" | "node";

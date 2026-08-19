@@ -22,8 +22,8 @@ import type { CodeChunk, IndexedChunk, ProjectInfo } from "../src/models.ts";
 import { digest, fileId, referenceRows } from "../src/reference-records.ts";
 import {
   REFERENCE_SCHEMA_VERSION,
-  ReferenceSnapshotExpiredError,
   type ReferenceRecord,
+  ReferenceSnapshotExpiredError,
   type ReferenceStore,
 } from "../src/reference-store.ts";
 import { languageForExtension } from "../src/scanner.ts";

@@ -18,13 +18,12 @@
  * enforcement mechanism works, which is what Phase 0 needs to know.
  */
 
-import { spawn } from "node:child_process";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pidusage from "pidusage";
-import { Spike, repoRoot } from "./harness.ts";
+import { repoRoot, Spike } from "./harness.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CHILD = join(HERE, "s4-child.ts");

@@ -11,11 +11,11 @@ import { describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
 import Parser from "tree-sitter";
-import { QUERY_DIRECTORIES, TreeSitterExtractor, normalizeIdentifier } from "../src/extractor.ts";
+import { normalizeIdentifier, QUERY_DIRECTORIES, TreeSitterExtractor } from "../src/extractor.ts";
 import {
   PACK_DOWNLOAD_ATTEMPTS,
-  unavailableLanguages,
   supportedLanguages,
+  unavailableLanguages,
   withDownloadRetry,
 } from "../src/grammars.ts";
 import { CHUNK_KINDS } from "../src/models.ts";

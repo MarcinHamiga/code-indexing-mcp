@@ -34,7 +34,7 @@ import type {
   ParameterShape,
   ReferenceKind,
 } from "./models.ts";
-import { LineIndex, SourceText, codePointLength, sliceCodePoints } from "./source-text.ts";
+import { codePointLength, LineIndex, SourceText, sliceCodePoints } from "./source-text.ts";
 
 type SyntaxNode = Parser.SyntaxNode;
 

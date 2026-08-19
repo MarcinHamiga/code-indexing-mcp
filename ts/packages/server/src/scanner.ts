@@ -34,8 +34,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import ignore, { type Ignore } from "ignore";
-import type { ProjectInfo, ScanConfig, ScanResult, ScannedFile, SkippedFile } from "./models.ts";
 import { unavailableLanguages } from "./grammars.ts";
+import type { ProjectInfo, ScanConfig, ScannedFile, ScanResult, SkippedFile } from "./models.ts";
 import { resolvePath } from "./paths.ts";
 import { comparePythonPaths, comparePythonStrings } from "./python-compat.ts";
 

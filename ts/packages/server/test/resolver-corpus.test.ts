@@ -18,8 +18,8 @@ import path from "node:path";
 import { DeclarationSelector, type ParameterShape, type RefactorOperation } from "../src/models.ts";
 import { ReferenceService } from "../src/reference-service.ts";
 import type { ReferenceRecord } from "../src/reference-store.ts";
-import { type InMemoryReferenceStore, indexedStore } from "./reference-fixtures.ts";
 import { removeDirectory, repositoryRoot, temporaryDirectory } from "./helpers.ts";
+import { type InMemoryReferenceStore, indexedStore } from "./reference-fixtures.ts";
 
 const CORPUS_ROOT = path.join(repositoryRoot(), "tests", "fixtures", "resolver_corpus");
 

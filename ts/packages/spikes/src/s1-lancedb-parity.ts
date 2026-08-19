@@ -15,13 +15,12 @@
  * point this spike at its output with S1_PYTHON_INDEX.
  */
 
-import { existsSync } from "node:fs";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Field, FixedSizeList, Float16, Int32, Int64, Schema, Utf8 } from "apache-arrow";
 import * as lancedb from "@lancedb/lancedb";
 import { Index, MultiMatchQuery, Operator, rerankers } from "@lancedb/lancedb";
+import { Field, FixedSizeList, Float16, Int32, Int64, Schema, Utf8 } from "apache-arrow";
 import { Spike } from "./harness.ts";
 
 const VECTOR_DIMENSION = 768;

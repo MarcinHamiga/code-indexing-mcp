@@ -9,25 +9,25 @@
  */
 
 import { randomUUID } from "node:crypto";
-import fs from "node:fs/promises";
-import { createWriteStream } from "node:fs";
 import type { Dirent, WriteStream } from "node:fs";
+import { createWriteStream } from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { finished } from "node:stream/promises";
 import {
+  makeData,
+  Precision,
+  RecordBatch,
   RecordBatchFileWriter,
   RecordBatchReader,
-  RecordBatch,
-  Precision,
-  makeData,
-  Table,
+  type Schema,
   Struct,
+  Table,
   tableToIPC,
   vectorFromArray,
-  type Schema,
 } from "apache-arrow";
-import type { ReferenceRecord } from "./reference-store.ts";
 import type { StoredChunk, StoredFile } from "./models.ts";
+import type { ReferenceRecord } from "./reference-store.ts";
 import type { LanceStore, ReplacementBatch, TableVersions } from "./storage.ts";
 
 export const JOURNAL_NAME = "journal.json";

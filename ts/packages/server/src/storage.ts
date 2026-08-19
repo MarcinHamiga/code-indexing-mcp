@@ -1,17 +1,17 @@
 /** Partitioned LanceDB persistence compatible with the Python store's layout. */
 
 import { execFileSync } from "node:child_process";
+import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
-import type { Dirent } from "node:fs";
 import path from "node:path";
 import {
+  type Connection,
   connect,
   Index,
   MultiMatchQuery,
   Operator,
   rerankers,
-  type Connection,
   type Table,
 } from "@lancedb/lancedb";
 import {
@@ -26,25 +26,25 @@ import {
   Schema,
   Utf8,
 } from "apache-arrow";
+import { CodeIndexingError } from "./errors.ts";
 import {
   ChunkPreview,
   CodeChunk,
   IndexedChunk,
   ProjectInfo,
   type ProjectStorageStats,
-  StoredFile,
   type StorageStatus,
   type StoredChunk,
+  StoredFile,
   type TableStorageStats,
 } from "./models.ts";
-import {
-  ReferenceSnapshotExpiredError,
-  type ReferenceRecord,
-  type ReferenceStore,
-} from "./reference-store.ts";
-import { CodeIndexingError } from "./errors.ts";
 import { isRelativeTo, resolvePath } from "./paths.ts";
 import { existingMarkerPath, rootedUnder, sameProjectRoot } from "./projects.ts";
+import {
+  type ReferenceRecord,
+  ReferenceSnapshotExpiredError,
+  type ReferenceStore,
+} from "./reference-store.ts";
 
 export const SCHEMA_VERSION = 5;
 export const MAX_CACHED_PARTITIONS = 16;

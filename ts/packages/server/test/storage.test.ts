@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
 import { isCodeIndexingError } from "../src/errors.ts";
+import type { ProjectInfo, StoredChunk, StoredFile } from "../src/models.ts";
 import {
   REFERENCE_SCHEMA_VERSION,
   type ReferenceRecord,
@@ -10,13 +11,12 @@ import {
 import {
   LanceStore,
   MAX_CACHED_PARTITIONS,
-  overlapWarnings,
   overlappingRegistration,
+  overlapWarnings,
   probeBatchedMergeSemantics,
   setBatchedMergeSemanticsOk,
   worktreeWarnings,
 } from "../src/storage.ts";
-import type { ProjectInfo, StoredChunk, StoredFile } from "../src/models.ts";
 import { caseInsensitiveAlias, removeDirectory, temporaryDirectory } from "./helpers.ts";
 
 let temporary: string;

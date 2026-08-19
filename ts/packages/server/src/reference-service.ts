@@ -19,6 +19,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { CodeIndexingError } from "./errors.ts";
+import { STRUCTURAL_LANGUAGES } from "./extractor.ts";
 import type {
   CompletenessReport,
   DeclarationSelector,
@@ -36,14 +37,13 @@ import type {
   SelectedDeclaration,
   SignatureChangeOperation,
 } from "./models.ts";
+import { comparePythonStrings, pythonJsonDumps } from "./python-compat.ts";
 import {
   REFERENCE_SCHEMA_VERSION,
-  ReferenceSnapshotExpiredError,
   type ReferenceRecord,
+  ReferenceSnapshotExpiredError,
   type ReferenceStore,
 } from "./reference-store.ts";
-import { STRUCTURAL_LANGUAGES } from "./extractor.ts";
-import { comparePythonStrings, pythonJsonDumps } from "./python-compat.ts";
 
 /**
  * Reason codes that describe something the syntax-only index could not see.

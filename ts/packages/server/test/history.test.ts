@@ -4,10 +4,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  type FinishUpdates,
   HistoryStore,
   MAX_RUN_AGE_DAYS,
   MAX_RUNS_PER_PROJECT,
-  type FinishUpdates,
 } from "../src/history.ts";
 import { RunAudit, type RunAudit as RunAuditType } from "../src/models.ts";
 import { openSQLite } from "../src/runtime/sqlite.ts";

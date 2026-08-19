@@ -22,7 +22,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Spike, repoRoot } from "./harness.ts";
+import { repoRoot, Spike } from "./harness.ts";
 
 const spike = new Spike("s5", "Watcher and scanner semantics");
 spike.header();

@@ -12,13 +12,17 @@
   },
   "dependencies": {
     "@derekstride/tree-sitter-sql": "0.3.11",
+    "@huggingface/hub": "2.15.0",
+    "@huggingface/tokenizers": "0.1.3",
     "@kreuzberg/tree-sitter-language-pack": "1.10.9",
+    "@lancedb/lancedb": "0.37.1",
     "@tree-sitter-grammars/tree-sitter-hcl": "1.2.0",
     "@tree-sitter-grammars/tree-sitter-lua": "https://github.com/tree-sitter-grammars/tree-sitter-lua/archive/10fe0054734eec83049514ea2e718b2a56acd0c9.tar.gz",
     "@tree-sitter-grammars/tree-sitter-yaml": "0.7.1",
-    "@lancedb/lancedb": "0.37.1",
     "apache-arrow": "18.1.0",
     "ignore": "7.0.5",
+    "onnxruntime-node": "1.27.0",
+    "proper-lockfile": "4.1.2",
     "smol-toml": "1.8.0",
     "tree-sitter": "0.25.1",
     "tree-sitter-c": "0.24.1",
@@ -40,5 +44,8 @@
     "@tree-sitter-grammars/tree-sitter-lua",
     "tree-sitter-rust",
     "tree-sitter"
-  ]
+  ],
+  "devDependencies": {
+    "@types/proper-lockfile": "4.1.4"
+  }
 }

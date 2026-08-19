@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
+import { resolvePath } from "../src/paths.ts";
 import {
   CACHE_FILENAME,
   CHECK_INTERVAL_SECONDS,
@@ -15,11 +16,10 @@ import {
   readCache,
   refreshIfDue,
   startBackgroundRefresh,
-  updateAvailable,
   type UpdateStatus,
+  updateAvailable,
   writeCache,
 } from "../src/update-check.ts";
-import { resolvePath } from "../src/paths.ts";
 import { removeDirectory, temporaryDirectory } from "./helpers.ts";
 
 const LOCAL_SHA = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

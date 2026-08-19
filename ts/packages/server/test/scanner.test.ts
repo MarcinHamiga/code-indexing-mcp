@@ -18,13 +18,13 @@ import path from "node:path";
 import { DEFAULT_INCLUDES, LanguageName, ScanConfig } from "../src/models.ts";
 import { initializeProject } from "../src/projects.ts";
 import {
+  compileSpec,
   GitEnumerationError,
   HARD_EXCLUDED_DIRECTORIES,
-  LANGUAGES,
-  SourceScanner,
-  compileSpec,
   iterWalkBatches,
+  LANGUAGES,
   languageForExtension,
+  SourceScanner,
 } from "../src/scanner.ts";
 import { removeDirectory, temporaryDirectory } from "./helpers.ts";
 

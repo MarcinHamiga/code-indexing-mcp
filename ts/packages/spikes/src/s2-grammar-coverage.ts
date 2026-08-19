@@ -19,11 +19,10 @@
  * dependency is narrower here than on the Python side.
  */
 
-import { readFileSync } from "node:fs";
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import { type GrammarResolution, resolveGrammar } from "./grammar-loader.ts";
-import { Spike, describe, repoRoot } from "./harness.ts";
+import { describe, repoRoot, Spike } from "./harness.ts";
 
 const ROOT = repoRoot();
 const QUERY_DIR = join(ROOT, "src", "code_indexing_mcp", "queries");

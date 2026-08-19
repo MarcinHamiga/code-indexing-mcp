@@ -11,16 +11,16 @@ import {
   LEGACY_DEFAULT_INCLUDES_V2,
   LEGACY_DEFAULT_INCLUDES_V3,
 } from "../src/models.ts";
+import { resolvePath } from "../src/paths.ts";
 import {
   findProjectRoot,
   initializeProject,
-  projectRootIdentity,
   ProjectResolver,
+  projectRootIdentity,
   readProjectMarker,
   rootedUnder,
   sameProjectRoot,
 } from "../src/projects.ts";
-import { resolvePath } from "../src/paths.ts";
 import { caseInsensitiveAlias, removeDirectory, temporaryDirectory } from "./helpers.ts";
 
 let root: string;

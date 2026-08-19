@@ -3,21 +3,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { Float16, tableFromIPC, type Schema } from "apache-arrow";
+import { Float16, type Schema, tableFromIPC } from "apache-arrow";
 import type { StoredChunk, StoredFile } from "../src/models.ts";
 import type { ReferenceRecord } from "../src/reference-store.ts";
-import { LanceStore, type TableVersions } from "../src/storage.ts";
 import type { StagingStore } from "../src/staging.ts";
 import {
   CHUNKS_NAME,
   FILES_NAME,
+  hasPendingRecovery,
   JOURNAL_NAME,
   MAX_RECOVERY_ATTEMPTS,
   PHASE_COMMITTING,
-  StagingJob,
-  hasPendingRecovery,
   recoverStagedCommits,
+  StagingJob,
 } from "../src/staging.ts";
+import { LanceStore, type TableVersions } from "../src/storage.ts";
 import { removeDirectory, temporaryDirectory } from "./helpers.ts";
 
 let temporary: string;

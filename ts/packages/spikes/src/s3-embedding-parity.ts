@@ -28,7 +28,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { cosineRows, meanPoolAndNormalize, topKOverlap } from "./acceptance.ts";
-import { Spike, repoRoot } from "./harness.ts";
+import { repoRoot, Spike } from "./harness.ts";
 
 /** The promotion gate `test_accelerator_acceptance.py` already enforces. */
 const MIN_COSINE = 0.999;
