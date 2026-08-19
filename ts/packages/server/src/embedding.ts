@@ -204,12 +204,12 @@ export function planPassages(
   );
 }
 
-export function embedWindows<Vector>(
-  embed: (texts: string[]) => Vector[],
+export async function embedWindows<Vector>(
+  embed: (texts: string[]) => Vector[] | Promise<Vector[]>,
   candidates: readonly PassageCandidate[],
   windowsPerCandidate: readonly (readonly TokenWindow[])[],
   plan: SegmentPlan,
-): [TokenWindow, Vector][][] {
+): Promise<[TokenWindow, Vector][][]> {
   if (candidates.length === 0) return [];
   const owners: number[] = [];
   const windows: TokenWindow[] = [];
@@ -230,7 +230,7 @@ export function embedWindows<Vector>(
     windows.map((window) => window.tokenCount),
     { maxItems: plan.maxItems, maxTokenProduct: plan.maxTokenProduct },
   )) {
-    const vectors = embed(batch.map((position) => texts[position] ?? ""));
+    const vectors = await embed(batch.map((position) => texts[position] ?? ""));
     for (const [offset, position] of batch.entries()) {
       const owner = owners[position];
       const window = windows[position];
@@ -247,12 +247,12 @@ export function embedWindows<Vector>(
   return results;
 }
 
-export function embedPlannedSegments<Vector>(
+export async function embedPlannedSegments<Vector>(
   encode: EncodeFn | undefined,
-  embed: (texts: string[]) => Vector[],
+  embed: (texts: string[]) => Vector[] | Promise<Vector[]>,
   candidates: readonly PassageCandidate[],
   plan: SegmentPlan,
-): [TokenWindow, Vector][][] {
+): Promise<[TokenWindow, Vector][][]> {
   if (candidates.length === 0) return [];
   return embedWindows(embed, candidates, planPassages(encode, candidates, plan), plan);
 }
@@ -280,7 +280,12 @@ export interface SegmentingEmbedder {
 export type Embedder = QueryEmbedder & PassageEmbedder;
 
 export interface PassageModel {
-  passageEmbed(texts: string[]): Iterable<ArrayLike<number>> | ArrayLike<number>[];
+  passageEmbed(
+    texts: string[],
+  ):
+    | Iterable<ArrayLike<number>>
+    | ArrayLike<number>[]
+    | Promise<Iterable<ArrayLike<number>> | ArrayLike<number>[]>;
   readonly resolvedProviders?: readonly string[];
   readonly tokenizer?: { encode: (text: string) => unknown };
 }
@@ -330,7 +335,7 @@ export class OnnxEmbedder implements Embedder, SegmentingEmbedder {
   }
 
   async embedPassages(texts: string[]): Promise<number[][]> {
-    return vectorsFrom(this.embedRaw(await this.getModel(), texts));
+    return vectorsFrom(await this.embedRaw(await this.getModel(), texts));
   }
 
   async planAndEmbed(
@@ -341,9 +346,9 @@ export class OnnxEmbedder implements Embedder, SegmentingEmbedder {
     const tokenizer = resolveTokenizer(model);
     const encode =
       tokenizer === undefined ? undefined : asEncodeFn(tokenizer.encode.bind(tokenizer));
-    const planned = embedPlannedSegments(
+    const planned = await embedPlannedSegments(
       encode,
-      (texts) => this.embedRaw(model, texts).map((row) => packVector(row)),
+      async (texts) => (await this.embedRaw(model, texts)).map((row) => packVector(row)),
       candidates,
       plan,
     );
@@ -361,8 +366,8 @@ export class OnnxEmbedder implements Embedder, SegmentingEmbedder {
     return first;
   }
 
-  private embedRaw(model: PassageModel, texts: string[]): ArrayLike<number>[] {
-    return [...model.passageEmbed(texts)];
+  private async embedRaw(model: PassageModel, texts: string[]): Promise<ArrayLike<number>[]> {
+    return [...(await model.passageEmbed(texts))];
   }
 
   private async getModel(): Promise<PassageModel> {
@@ -400,7 +405,7 @@ export class OnnxEmbedder implements Embedder, SegmentingEmbedder {
 
 async function defaultModelFactory(options: ModelLoadOptions): Promise<PassageModel> {
   const { DirectOnnxEmbedding } = await import("./direct-onnx.ts");
-  return new DirectOnnxEmbedding(options.cacheDirectory, {
+  return DirectOnnxEmbedding.create(options.cacheDirectory, {
     offline: options.offline,
     threads: options.threads,
     enableCpuMemArena: options.enableCpuMemArena,

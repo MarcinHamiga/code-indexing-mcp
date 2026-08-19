@@ -96,7 +96,7 @@ test("model snapshot uses the shared cache and offline flag", async () => {
   }
 });
 
-test("direct model builds exact onnx inputs and reports resolved providers", () => {
+test("direct model builds exact onnx inputs and reports resolved providers", async () => {
   const directory = temporaryDirectory();
   try {
     const modelDirectory = path.join(directory, "snapshot");
@@ -153,13 +153,13 @@ test("direct model builds exact onnx inputs and reports resolved providers", () 
       },
     });
     try {
-      const model = new DirectOnnxEmbedding(path.join(directory, "models"), {
+      const model = await DirectOnnxEmbedding.create(path.join(directory, "models"), {
         offline: true,
         threads: 3,
         enableCpuMemArena: false,
         providers: ["MIGraphXExecutionProvider", "CPUExecutionProvider"],
       });
-      const vectors = model.passageEmbed(["short", "longer"]);
+      const vectors = await model.passageEmbed(["short", "longer"]);
       expect(documents).toEqual(["short", "longer"]);
       expect(vectors[0]?.[0]).toBeCloseTo(1.0);
       expect(vectors[1]?.[1]).toBeCloseTo(1.0);

@@ -146,3 +146,18 @@ export function pathCondition(
   }
   return `(${expressions.join(" OR ")})`;
 }
+
+/**
+ * `PurePosixPath(path).match(pattern)` for the post-filter.
+ *
+ * Pushdown uses `globToRegex`; this is the authority that still runs on the
+ * fetched rows. Absolute patterns never match a relative indexed path. An
+ * empty `[]` class is fnmatch's "leading `]` is a member", so `*[]*.py`
+ * matches `a[].py` rather than failing the search.
+ */
+export function pathMatches(filePath: string, pattern: string): boolean {
+  if (pattern.startsWith("/")) return false;
+  const translated = globToRegex(pattern) ?? globToRegex(pattern.replaceAll("[]", "[]]"));
+  if (translated === null) return false;
+  return new RegExp(translated).test(filePath);
+}

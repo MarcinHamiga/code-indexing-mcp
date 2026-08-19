@@ -11,6 +11,8 @@ Phase 3 complete — see
 [2026-08-18-phase-3-notes.md](2026-08-18-phase-3-notes.md).
 Phase 4 complete — see
 [2026-08-19-phase-4-notes.md](2026-08-19-phase-4-notes.md).
+Phase 5 complete — see
+[2026-08-19-phase-5-notes.md](2026-08-19-phase-5-notes.md).
 Branch: `ts-migration`
 
 ## 1. Purpose and scope
@@ -112,23 +114,23 @@ in module docstrings and `docs/plans/` carries over.
 |---|---|---|
 | `mcp` (FastMCP) | `@modelcontextprotocol/sdk` (`McpServer` + stdio transport, zod tool schemas) | High — official SDK, same protocol |
 | `pydantic` v2 | `zod` v4 + inferred types | High — Phase 1 ported all ~50 models. `zod-to-json-schema` proved unnecessary: v4 ships `z.toJSONSchema()` |
-| `lancedb` | `@lancedb/lancedb` (native Node bindings over the same Rust core) | Medium — same storage format, but FTS/BTree index-config API parity must be **spiked first** (§6, S1) |
+| `lancedb` | `@lancedb/lancedb` (native Node bindings over the same Rust core) | High — S1 confirmed storage and index APIs; Phase 5 retains reranker scores explicitly before TypeScript-side projection so cross-project ranking does not depend on deprecated score autoprojection |
 | `pyarrow` | `apache-arrow` JS **pinned to 18.1.0** for IPC staging files (LanceDB peer-requires `>=15 <=18.1.0`, so the current 21.x is not available); LanceDB JS accepts Arrow tables natively | High — confirmed by S1 |
 | `tree-sitter-*` PyPI packages | `tree-sitter` native Node bindings + per-grammar npm packages; `.scm` queries port unchanged | High — S2 confirmed all 18 languages and every committed query. **The Node binding reports UTF-16 code-unit indices where the Python one reports UTF-8 byte offsets**; Phase 2 converts every node offset, since those offsets are the stored contract (see the Phase 2 notes) |
-| `tree-sitter-language-pack` (PyPI) | `@kreuzberg/tree-sitter-language-pack` (306 grammars, native addons fetched on first use) | High on macOS and Linux — S2 verified `gdshader` against the Python pack's own output. Used only for `gdshader`; unlike the Python side, `gdscript` and `godot_resource` have dedicated npm packages. **Its Windows binding does not load, so `gdshader` is an accepted non-goal there** (§5.5) |
+| `tree-sitter-language-pack` (PyPI) | `@kreuzberg/tree-sitter-language-pack` (306 grammars, native addons fetched on first use) | High on macOS and Linux — S2 verified `gdshader` against the Python pack's own output. The reviewed artifact identity is pinned to `@kreuzberg/tree-sitter-language-pack@1.10.9:gdshader` and checked at runtime. Used only for `gdshader`; unlike the Python side, `gdscript` and `godot_resource` have dedicated npm packages. **Its Windows binding does not load, so `gdshader` is an accepted non-goal there** (§5.5) |
 | `fastembed` / `onnxruntime` | `onnxruntime-node` + `@huggingface/hub` (model download) + `@huggingface/tokenizers` — i.e. the TS port owns what `direct_onnx.py` does today, for CPU too | High — S3 measured exact vector parity |
 | `mlx` | No first-party Node binding. Options: onnxruntime-node CoreML EP, `@frost-beta/mlx` community bindings, or keep the Python MLX worker as a sidecar (the worker protocol is already cross-process) | Low — decision point D2 |
 | `watchfiles` | `@parcel/watcher` (native, recursive, battle-tested); confirm under Bun in S0, with `fs.watch` as fallback | Medium–High |
 | `filelock` | `proper-lockfile` | High |
 | `platformdirs` | `env-paths` | High |
-| `psutil` | `pidusage` + `node:os`/`process.memoryUsage`; RSS ceilings via the same polling loop | Medium — verify per-platform RSS semantics match `embedding_worker.py`'s accounting. `settings.py`'s only use is `virtual_memory().total`, which is `node:os`'s `totalmem()` and needed no dependency (Phase 1) |
+| `psutil` | `pidusage` + `node:os`/`process.memoryUsage`; RSS ceilings via the same polling loop | High — the production sampler reads the requested worker PID through `pidusage` on every OS, while parent growth is measured separately. `settings.py`'s only use is `virtual_memory().total`, which is `node:os`'s `totalmem()` and needed no dependency (Phase 1) |
 | `pathspec` | `ignore` npm package (gitignore semantics) | High — Phase 2 held it to a generated fixture of `GitIgnoreSpec`'s own verdicts; all 884 decisions agree |
 | SQLite (`history.py`) | `bun:sqlite` (built-in), behind the storage adapter per §3's compat discipline | High |
 | `multiprocessing` spawn + `Connection` auth | `Bun.spawn`/`node:child_process` + the same socket dial-back and HMAC challenge-response, now used for **all** workers (§5.3) | High |
 | `struct` framing | `Buffer`/`DataView` | High |
 | `tomllib`/`tomli-w` | `smol-toml` | High |
 | `argparse` | `commander` | High |
-| Textual TUI | Ink (React for terminals) or `@clack/prompts`; decision D3 | Medium |
+| Textual TUI | OpenTUI Core (`@opentui/core`) | High — required by resolved decision D3; Phase 8 must build directly on the core renderer rather than Ink or a prompt-only toolkit |
 | `pytest` fixtures/parametrize | `bun test` with `test.each`, fixtures as helpers | High |
 
 ## 5. Architecture decisions forced by the migration
@@ -257,10 +259,10 @@ spec, and the ~29k test lines are most of the migration's real cost.
 | 2 | ✅ Scan & extract: `scanner`, `extractor`, query packs, `reference_service` | ~3,900 | 3–4 wk |
 | 3 | ✅ Storage: `storage`, `staging`, `history` | ~2,800 | 3 wk |
 | 4 | ✅ Embedding (CPU): `embedding` (direct-ONNX based, per §5.1), `embedding_worker`, `worker_launcher`, `passage_backend`, `backends`, `calibration`, `probe_cache` | ~2,900 | 3 wk |
-| 5 | Orchestration & search: `indexing`, `search`, `application` | ~3,200 | 3 wk |
+| 5 | ✅ Orchestration & search: `indexing`, `search`, `application` | ~3,200 | 3 wk |
 | 6 | Surfaces: `server` (MCP), `daemon`, `cli`, `benchmark` | ~3,600 | 3–4 wk |
 | 7 | Accelerators: provider selection (CUDA/DML/WebGPU/CoreML per D2), `accelerator_env`/`accelerator_probe`, promotion gates on real hardware | ~1,200 | 2–3 wk |
-| 8 | Installer: bootstrap, harness config merging (JSON/JSONC/TOML comment-preserving), shell PATH launcher, self-update, uninstall, TUI (per D3) | ~4,600 | 3–4 wk |
+| 8 | Installer: bootstrap, harness config merging (JSON/JSONC/TOML comment-preserving), shell PATH launcher, self-update, uninstall, OpenTUI Core TUI (per D3) | ~4,600 | 3–4 wk |
 | 9 | Cutover: side-by-side parity soak, benchmark comparison, docs, release | — | 2 wk |
 
 Total: roughly 23–28 engineer-weeks for a single engineer; phases 2–4 can
@@ -292,8 +294,14 @@ golden snapshots directly) and is promoted to the package root at cutover.
   query set, and run the existing benchmark to bound the performance
   regression (target: within 15% on index time, no regression on search
   latency).
-- **Memory gate**: port `scripts/benchmark_index_memory.py` and keep the
-  CI memory job as a hard gate at the same thresholds.
+- **Memory gate**: the server package runs a deterministic near-cap corpus with
+  256-token windows through the real ONNX worker and enforces the memory budget
+  plus the existing 256 MiB allowance. A dedicated Ubuntu CI job caches the
+  model and uploads the JSON report; ordinary three-OS tests stay model-free.
+- **Persisted integration gates**: Phase 5 tests now drive real `Indexer` and
+  `LanceStore` instances for missing reference tables, stale-file healing, and
+  live progress counters. Storage tests retain `_relevance_score` and verify
+  global ordering across project partitions.
 
 ## 9. Decision points (need an owner's call, flagged as they arrive)
 
@@ -303,10 +311,10 @@ golden snapshots directly) and is promoted to the package root at cutover.
   measure it); fall back to community MLX bindings; keeping a Python MLX
   sidecar is the option of last resort since it drags a Python runtime
   back into the install.
-- **D3 — Installer TUI.** Ink gives Textual-equivalent panels; `@clack`
-  gives a simpler wizard at lower cost. Decide when Phase 8 starts —
-  everything below the TUI (wizard state machine, orchestrator events) is
-  UI-agnostic today and ports first either way.
+- **D3 — Installer TUI. Resolved: OpenTUI Core.** Phase 8 must use
+  `@opentui/core` directly for the installer UI. Keep the wizard state machine
+  and orchestrator events UI-agnostic, but do not substitute Ink, React-based
+  terminal components, or a prompt-only toolkit for the renderer.
 - **D4 — Windows daemon transport.** Keep loopback TCP + HMAC as today, or
   move both platforms to named pipes (`net.createServer` supports
   `\\.\pipe\`). Default: keep today's design; revisit only if the port
@@ -327,7 +335,7 @@ golden snapshots directly) and is promoted to the package root at cutover.
 | ~~Niche grammars (GDScript family, SQL, HCL) unavailable as npm packages~~ | — | — | **Retired by S2**: all resolve to npm packages, `gdshader` through `@kreuzberg/tree-sitter-language-pack` |
 | Native-module install pain (tree-sitter, onnxruntime, parcel-watcher, lancedb across 3 OSes) | Medium | Medium | Prebuilt binaries exist for all; CI matrix mirrors today's OS coverage from Phase 0 |
 | Bun regression lands in a release (younger runtime, faster release cadence than Node LTS) | Medium | Low–Medium | Pin the Bun version in `engines` and CI; upgrade deliberately with the full suite as the gate |
-| `worker_threads`/child RSS accounting differs from `psutil` semantics | Medium | Medium | S4; keep polling-based ceiling design which is implementation-agnostic |
+| ~~`worker_threads`/child RSS accounting differs from `psutil` semantics~~ | — | — | **Retired by Phase 5 closure**: `pidusage` samples the actual worker PID cross-platform, with a real-model CI memory gate |
 | Performance regression in extraction (Node bindings overhead per node visit) | Low–Medium | Medium | S2 measures on the perf fixtures from `2026-07-27-extractor-performance.md` |
 | Long dual-maintenance window | High | Medium | Feature freeze on Python except critical fixes once Phase 5 lands; parity harness makes backports mechanical |
 
@@ -336,10 +344,10 @@ golden snapshots directly) and is promoted to the package root at cutover.
 From Phase 0, a second workflow mirrors today's gates for the TS tree:
 Biome check, `tsc --noEmit`, and `bun test` on Ubuntu + Windows + macOS
 with the pinned Bun version (`oven-sh/setup-bun`, `bun install --frozen-lockfile`).
-The existing model-download and grammar caches carry over. The memory gate
-and benchmark job join the workflow in Phase 4/9 respectively. Both suites
-run on every PR until cutover; the Python workflow is retired one release
-after the TS build ships as default.
+The existing model-download and grammar caches carry over. The real-model
+memory gate is present as a dedicated cached Ubuntu job; the broader benchmark
+comparison joins in Phase 9. Both suites run on every PR until cutover; the
+Python workflow is retired one release after the TS build ships as default.
 
 ## 12. Cutover and rollback
 

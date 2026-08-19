@@ -65,14 +65,14 @@ test("planning without a tokenizer leaves candidates whole", () => {
   expect(windows[0]?.map((window) => [window.startChar, window.endChar])).toEqual([[0, 9]]);
 });
 
-test("embedding without a tokenizer sends the whole candidate", () => {
+test("embedding without a tokenizer sends the whole candidate", async () => {
   const seen: string[][] = [];
   const embed = (texts: string[]): string[] => {
     seen.push(texts);
     return texts.map(() => "vector");
   };
   const candidates: PassageCandidate[] = [passageCandidate("kind: module", "value = 1")];
-  const result = embedPlannedSegments(undefined, embed, candidates, segmentPlan());
+  const result = await embedPlannedSegments(undefined, embed, candidates, segmentPlan());
 
   expect(seen).toEqual([["kind: module\nvalue = 1"]]);
   expect(result[0]?.length).toBe(1);

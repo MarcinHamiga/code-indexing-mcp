@@ -13,6 +13,8 @@ import path from "node:path";
 import Parser from "tree-sitter";
 import { normalizeIdentifier, QUERY_DIRECTORIES, TreeSitterExtractor } from "../src/extractor.ts";
 import {
+  GDSHADER_GRAMMAR_ARTIFACT,
+  languagePackArtifactIdentity,
   PACK_DOWNLOAD_ATTEMPTS,
   supportedLanguages,
   unavailableLanguages,
@@ -765,6 +767,11 @@ class Old {
 });
 
 describe("packaging invariants", () => {
+  test("the GDShader grammar comes from the pinned language-pack release", () => {
+    expect(languagePackArtifactIdentity()).toBe(GDSHADER_GRAMMAR_ARTIFACT);
+    expect(GDSHADER_GRAMMAR_ARTIFACT).toBe("@kreuzberg/tree-sitter-language-pack@1.10.9:gdshader");
+  });
+
   test("every scanned language has a grammar and a query", () => {
     // The extension map, the grammar table, and the packaged .scm files are
     // three separate places; adding a language to only one of them is the easy

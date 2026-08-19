@@ -72,6 +72,18 @@ const CHUNK_COLUMNS = [
 ] as const;
 
 const CHUNK_PAYLOAD_COLUMNS = CHUNK_COLUMNS.filter((column) => column !== "identifier_terms");
+const SEARCH_RESULT_COLUMNS = [
+  "chunk_id",
+  "path",
+  "language",
+  "kind",
+  "symbol",
+  "qualified_symbol",
+  "parent_symbol",
+  "start_line",
+  "end_line",
+  "content",
+] as const;
 
 export interface TableVersions {
   files: number;
@@ -286,18 +298,16 @@ export class LanceStore implements ReferenceStore {
       reasons.push(
         `embedding model ${JSON.stringify(current.model_id)} -> ${JSON.stringify(modelId)}`,
       );
-    if (current.vector_dimension !== this.vectorDimension)
+    if (Number(current.vector_dimension) !== this.vectorDimension)
       reasons.push(`vector dimension ${current.vector_dimension} -> ${this.vectorDimension}`);
-    if (current.schema_version !== SCHEMA_VERSION)
+    if (Number(current.schema_version) !== SCHEMA_VERSION)
       reasons.push(`index schema version ${current.schema_version} -> ${SCHEMA_VERSION}`);
     const tables = await this.#existingTables(projectId);
     if (tables !== null) {
       const vector = (await tables.chunks.schema()).fields.find((item) => item.name === "vector");
-      const expected = this.vectorStorage === "float16" ? "Float16" : "Float32";
-      if (vector?.type.children[0]?.type.constructor.name !== expected) {
-        reasons.push(
-          `vector storage ${vector?.type.children[0]?.type.constructor.name ?? "missing"} -> ${expected}`,
-        );
+      const stored = vectorStorageOf(vector?.type.children[0]?.type);
+      if (stored !== this.vectorStorage) {
+        reasons.push(`vector storage ${stored} -> ${this.vectorStorage}`);
       }
     }
     return reasons.length === 0 ? null : reasons.join("; ");
@@ -676,23 +686,17 @@ export class LanceStore implements ReferenceStore {
       if (options.condition !== undefined) query.where(options.condition);
       if (this.vectorIndex === "exact") query.bypassVectorIndex();
       const reranker = await rerankers.RRFReranker.create();
-      const queryRows = await query
-        .rerank(reranker)
-        .select([
-          "chunk_id",
-          "path",
-          "language",
-          "kind",
-          "symbol",
-          "qualified_symbol",
-          "parent_symbol",
-          "start_line",
-          "end_line",
-          "content",
-        ])
-        .limit(options.limit)
-        .toArray();
-      return queryRows.map((row) => ({ ...numberFields(row), project_id: projectId }));
+      const queryRows = await query.rerank(reranker).limit(options.limit).toArray();
+      return queryRows.map((row) => {
+        const projected = Object.fromEntries(
+          SEARCH_RESULT_COLUMNS.map((column) => [column, row[column]]),
+        );
+        return {
+          ...numberFields(projected),
+          _relevance_score: Number(row._relevance_score ?? 0),
+          project_id: projectId,
+        };
+      });
     });
     return results.flat().sort(relevanceSort).slice(0, options.limit);
   }
@@ -826,6 +830,15 @@ export class LanceStore implements ReferenceStore {
       overlap_warnings: overlapWarnings(projects),
       worktree_warnings: worktreeWarnings(projects),
     };
+  }
+
+  async withPartitionsAccess<T>(projectIds: readonly string[], fn: () => Promise<T>): Promise<T> {
+    const run = async (index: number): Promise<T> => {
+      const projectId = projectIds[index];
+      if (projectId === undefined) return fn();
+      return this.withPartitionAccess(projectId, () => run(index + 1));
+    };
+    return run(0);
   }
 
   async withPartitionAccess<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
@@ -1119,7 +1132,16 @@ async function rows<T>(
   return (await query.toArray()) as T[];
 }
 
-function quote(value: string): string {
+function vectorStorageOf(
+  type: { toString?: () => string; constructor?: { name?: string } } | undefined,
+): string {
+  const text = `${type?.constructor?.name ?? ""} ${type?.toString?.() ?? ""}`.toLowerCase();
+  if (text.includes("16") || text.includes("half")) return "float16";
+  if (text.includes("32") || text.includes("float")) return "float32";
+  return type?.constructor?.name ?? "missing";
+}
+
+export function quote(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
@@ -1145,7 +1167,7 @@ function validateSchemaVersion(version: number | undefined): void {
   }
 }
 
-function chunkIdPrefix(chunkId: string): string | null {
+export function chunkIdPrefix(chunkId: string): string | null {
   const index = chunkId.indexOf(":");
   if (index <= 0 || index === chunkId.length - 1) return null;
   return chunkId.slice(0, index);

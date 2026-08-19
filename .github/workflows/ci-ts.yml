@@ -107,6 +107,34 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: bun test
 
+  memory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - name: Restore the embedding model cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/code-indexing-models
+          key: ts-embedding-model-${{ runner.os }}-${{ hashFiles('ts/bun.lock') }}
+      - name: Run the real-model memory gate
+        env:
+          CODE_INDEXING_EMBED_MEMORY_MB: "2048"
+          CODE_INDEXING_MEMORY_CACHE: ${{ runner.temp }}/code-indexing-models
+          CODE_INDEXING_MEMORY_REPORT: ${{ runner.temp }}/memory-report.json
+        run: bun --cwd packages/server run memory:gate
+      - name: Upload the memory report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typescript-memory-report
+          path: ${{ runner.temp }}/memory-report.json
+          if-no-files-found: warn
+
   # The Phase 0 spikes, as a regression gate on the bets the plan rests on: a
   # Bun release or a grammar republish that breaks native module loading should
   # fail here rather than in the middle of Phase 2.

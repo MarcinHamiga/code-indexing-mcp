@@ -1,21 +1,41 @@
 /**
  * Live indexing progress: in-process listeners and the cross-process snapshot.
  *
- * The Python suite drives most of this through a real `Indexer`, which arrives
- * in Phase 5. What is asserted here is everything the publisher and the reader
- * own by themselves; the end-to-end counters (`candidates_seen` rising
- * monotonically through a run, skip reasons aggregating, a run id on every
- * update) come back with the indexer that produces them.
+ * Publisher behavior is tested directly and the final section drives a real
+ * index to keep its counters and lifecycle wired to this contract.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
-import { describeProgress, progressFraction } from "../src/models.ts";
+import type { Embedder } from "../src/embedding.ts";
+import { TreeSitterExtractor } from "../src/extractor.ts";
+import { Indexer } from "../src/indexing.ts";
+import {
+  describeProgress,
+  type IndexProgress as ProgressSnapshot,
+  progressFraction,
+} from "../src/models.ts";
+import { initializeProject } from "../src/projects.ts";
 import { IndexProgress, ProgressPublisher, progressPath, readProgress } from "../src/progress.ts";
+import { SourceScanner } from "../src/scanner.ts";
+import { LanceStore } from "../src/storage.ts";
 import { removeDirectory, temporaryDirectory } from "./helpers.ts";
 
 let directory: string;
+
+class TinyEmbedder implements Embedder {
+  readonly modelId = "test/progress";
+  readonly dimension = 4;
+
+  embedPassages(texts: string[]): number[][] {
+    return texts.map((text) => [1, 0, 0, text.length]);
+  }
+
+  embedQuery(text: string): number[] {
+    return [1, 0, 0, text.length];
+  }
+}
 
 beforeEach(() => {
   directory = temporaryDirectory();
@@ -232,5 +252,48 @@ describe("the cross-process snapshot", () => {
 
     expect(() => publisher.update({ candidates_seen: 1 }, { force: true })).not.toThrow();
     expect(publisher.state.candidates_seen).toBe(1);
+  });
+});
+
+describe("real indexer progress", () => {
+  test("publishes monotonic counters, aggregate skips, phases, and one run id", async () => {
+    const root = path.join(directory, "repo");
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, "main.py"), "def answer():\n    return 42\n");
+    fs.writeFileSync(path.join(root, "binary.py"), Buffer.from("value = '\0'\n"));
+    const project = initializeProject(root);
+    const store = new LanceStore(path.join(directory, "data"), { vectorDimension: 4 });
+    const progressDirectory = path.join(directory, "progress");
+    const indexer = new Indexer({
+      store,
+      scanner: new SourceScanner(),
+      extractor: new TreeSitterExtractor(),
+      embedder: new TinyEmbedder(),
+      lockDirectory: path.join(directory, "locks"),
+      progressDirectory,
+    });
+    const seen: ProgressSnapshot[] = [];
+    try {
+      const report = await indexer.index(project, {
+        onProgress: (progress) => seen.push(progress),
+      });
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((progress) => progress.run_id === report.run_id)).toBe(true);
+      expect(
+        seen.every(
+          (progress, index) =>
+            index === 0 || progress.candidates_seen >= (seen[index - 1]?.candidates_seen ?? 0),
+        ),
+      ).toBe(true);
+      const final = seen.at(-1);
+      expect(final?.skipped_by_reason).toEqual(report.skip_reasons);
+      expect(final?.candidates_total).toBe(final?.candidates_seen);
+      expect(new Set(seen.map((progress) => progress.phase))).toEqual(
+        new Set(["scanning", "embedding", "committing"]),
+      );
+      expect(readProgress(progressDirectory, project.id)).toBeNull();
+    } finally {
+      await store.close();
+    }
   });
 });

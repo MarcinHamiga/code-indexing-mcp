@@ -30,6 +30,11 @@ import { dirname, join } from "node:path";
 import type Parser from "tree-sitter";
 
 const require = createRequire(import.meta.url);
+const LANGUAGE_PACK_PACKAGE = "@kreuzberg/tree-sitter-language-pack";
+const LANGUAGE_PACK_VERSION = "1.10.9";
+
+/** Versioned release bundle and member that supply the GDShader grammar. */
+export const GDSHADER_GRAMMAR_ARTIFACT = `${LANGUAGE_PACK_PACKAGE}@${LANGUAGE_PACK_VERSION}:gdshader`;
 
 /** Opaque to us: whatever the addon hands back for `Parser.setLanguage`. */
 export type Grammar = Parser.Language;
@@ -210,7 +215,8 @@ export function withDownloadRetry<T>(
  * download -- which is why CI warms the grammar cache before running offline.
  */
 function loadFromPack(language: string): Grammar {
-  const pack = require("@kreuzberg/tree-sitter-language-pack") as {
+  languagePackArtifactIdentity();
+  const pack = require(LANGUAGE_PACK_PACKAGE) as {
     manifestLanguages: () => string[];
     downloadedLanguages: () => string[];
     download: (names: string[]) => number;
@@ -223,6 +229,17 @@ function loadFromPack(language: string): Grammar {
     if (!pack.downloadedLanguages().includes(language)) pack.download([language]);
     return pack.getLanguage(language) as Grammar;
   });
+}
+
+/** Reject an install whose remote grammar bundle is not the reviewed release. */
+export function languagePackArtifactIdentity(): string {
+  const packageJson = require(`${LANGUAGE_PACK_PACKAGE}/package.json`) as { version?: unknown };
+  if (packageJson.version !== LANGUAGE_PACK_VERSION) {
+    throw new Error(
+      `GDShader requires ${GDSHADER_GRAMMAR_ARTIFACT}, installed ${String(packageJson.version)}`,
+    );
+  }
+  return GDSHADER_GRAMMAR_ARTIFACT;
 }
 
 /**

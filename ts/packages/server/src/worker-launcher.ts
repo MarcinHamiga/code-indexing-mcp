@@ -244,7 +244,11 @@ export class SpawnLauncher implements WorkerLauncher {
   }
 
   launch(config: WorkerConfig): Promise<LaunchedWorker> {
-    return new FunctionLauncher(this.target).launch(config);
+    return new ChildProcessLauncher({
+      executable: process.execPath,
+      environmentName: this.description,
+      target: targetReference(this.target),
+    }).launch(config);
   }
 }
 
@@ -440,6 +444,13 @@ export function registerWorkerTarget(name: string, target: WorkerTarget): void {
   targets.set(name, target);
 }
 
+function targetReference(target: WorkerTarget): string {
+  for (const [reference, registered] of targets) {
+    if (registered === target) return reference;
+  }
+  throw new Error("Worker target must be registered before it can be spawned");
+}
+
 export function resolveTarget(reference: string): WorkerTarget {
   const registered = targets.get(reference);
   if (registered !== undefined) return registered;
@@ -469,7 +480,11 @@ export async function childMain(stream: NodeJS.ReadableStream = process.stdin): 
     const message = (await connection.recv()) as [string, Record<string, unknown>];
     const [command, rawConfig] = message;
     if (command !== "configure") return 2;
-    const target = resolveTarget(String(payload.target ?? DEFAULT_WORKER_TARGET));
+    const reference = String(payload.target ?? DEFAULT_WORKER_TARGET);
+    if (reference === DEFAULT_WORKER_TARGET && !targets.has(reference)) {
+      await import("./embedding-worker.ts");
+    }
+    const target = resolveTarget(reference);
     await target(connection, parseWorkerConfig(rawConfig));
   } finally {
     connection.close();

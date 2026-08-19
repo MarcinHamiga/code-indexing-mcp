@@ -6,25 +6,40 @@
  * decoy stays out of `exact` -- a resolver that graded everything `likely`
  * would pass the positive tests and fail these.
  *
- * The store is in-memory (see `reference-fixtures.ts`) because LanceDB lands in
- * Phase 3 and the indexer in Phase 5; the extraction and row assembly are the
- * real ones. Two Python tests are deliberately absent until then and are named
- * in the Phase 2 notes: the one that renames a `.lance` directory on disk to
- * simulate a never-built table, and the one that heals a stale file by
- * re-running the indexer.
+ * Most resolution cases use the focused in-memory fixture. The integration
+ * cases at the end drive the real indexer and LanceDB partition.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
+import type { Embedder } from "../src/embedding.ts";
 import { isCodeIndexingError } from "../src/errors.ts";
+import { TreeSitterExtractor } from "../src/extractor.ts";
+import { Indexer } from "../src/indexing.ts";
 import { DeclarationSelector } from "../src/models.ts";
+import { initializeProject } from "../src/projects.ts";
 import { ReferenceService } from "../src/reference-service.ts";
 import { REFERENCE_SCHEMA_VERSION } from "../src/reference-store.ts";
+import { SourceScanner } from "../src/scanner.ts";
+import { LanceStore } from "../src/storage.ts";
 import { removeDirectory, temporaryDirectory } from "./helpers.ts";
 import { type InMemoryReferenceStore, indexedStore } from "./reference-fixtures.ts";
 
 let temporary: string;
+
+class TinyEmbedder implements Embedder {
+  readonly modelId = "test/reference-integration";
+  readonly dimension = 4;
+
+  embedPassages(texts: string[]): number[][] {
+    return texts.map((text) => [1, 0, 0, text.length]);
+  }
+
+  embedQuery(text: string): number[] {
+    return [1, 0, 0, text.length];
+  }
+}
 
 beforeEach(() => {
   temporary = temporaryDirectory();
@@ -59,6 +74,28 @@ async function errorCode(action: () => Promise<unknown>): Promise<string> {
     throw error;
   }
   throw new Error("expected a CodeIndexingError");
+}
+
+async function realIndexed(files: Readonly<Record<string, string>>) {
+  const root = path.join(temporary, "real-repo");
+  fs.mkdirSync(root, { recursive: true });
+  for (const [relative, source] of Object.entries(files)) {
+    const target = path.join(root, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, source);
+  }
+  const project = initializeProject(root);
+  const data = path.join(temporary, "real-data");
+  const store = new LanceStore(data, { vectorDimension: 4 });
+  const indexer = new Indexer({
+    store,
+    scanner: new SourceScanner(),
+    extractor: new TreeSitterExtractor(),
+    embedder: new TinyEmbedder(),
+    lockDirectory: path.join(temporary, "real-locks"),
+  });
+  await indexer.index(project);
+  return { data, indexer, project, root, store };
 }
 
 describe("import resolution", () => {
@@ -437,6 +474,52 @@ describe("coverage and staleness", () => {
     );
     expect(after).toHaveLength(1);
     expect(after.map((hit) => hit.reference_id)).toEqual(before.map((hit) => hit.reference_id));
+  });
+});
+
+describe("real-store integration", () => {
+  test("a physically missing reference table is reported distinctly", async () => {
+    const indexed = await realIndexed({ "lib.py": "def answer():\n    return 42\n" });
+    const selector = select(indexed.project.id, "lib.py", "answer");
+    expect((await new ReferenceService(indexed.store).findReferences(selector)).hits).toEqual([]);
+    await indexed.store.close();
+
+    fs.renameSync(
+      path.join(indexed.data, "projects", indexed.project.id, "references.lance"),
+      path.join(temporary, "references.lance.bak"),
+    );
+    const reopened = new LanceStore(indexed.data, { vectorDimension: 4 });
+    try {
+      expect(await errorCode(() => new ReferenceService(reopened).findReferences(selector))).toBe(
+        "REFERENCE_INDEX_UNAVAILABLE",
+      );
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  test("references return after a stale file is reindexed", async () => {
+    const indexed = await realIndexed({
+      "lib.py": "def answer():\n    return 42\n",
+      "main.py": "from lib import answer\n\ndef caller():\n    return answer()\n",
+    });
+    try {
+      const service = new ReferenceService(indexed.store);
+      const selector = select(indexed.project.id, "lib.py", "answer");
+      fs.writeFileSync(
+        path.join(indexed.root, "main.py"),
+        "from lib import answer\n\n\ndef caller():\n    return answer()\n",
+      );
+      expect((await service.findReferences(selector)).hits).toEqual([]);
+
+      await indexed.indexer.index(indexed.project);
+
+      const healed = await service.findReferences(selector);
+      expect(healed.hits.some((hit) => hit.path === "main.py" && hit.kind === "call")).toBe(true);
+      expect(healed.limitations.some((item) => item.code === "stale_file")).toBe(false);
+    } finally {
+      await indexed.store.close();
+    }
   });
 });
 

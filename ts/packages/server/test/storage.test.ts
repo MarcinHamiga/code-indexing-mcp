@@ -206,6 +206,35 @@ describe("LanceStore", () => {
     await instance.close();
   });
 
+  test("retains reranker scores while globally ordering project partitions", async () => {
+    const instance = await store();
+    await instance.upsertProject(project("project-b"), { modelId: "model", state: "ready" });
+    for (const projectId of ["project-a", "project-b"]) {
+      const best = { ...chunk(projectId, "file-a", "best"), path: `${projectId}/best.ts` };
+      const second = {
+        ...chunk(projectId, "file-a", "second"),
+        path: `${projectId}/second.ts`,
+        content: "export const unrelated = true;",
+        identifier_terms: "unrelated",
+        vector: [0, 1],
+      };
+      await instance.replaceFile(file(projectId), [best, second], [reference(projectId)]);
+      await instance.ensureIndexes(projectId);
+    }
+
+    const hits = await instance.hybridSearch("answer", [1, 0], ["project-a", "project-b"], {
+      limit: 4,
+    });
+    expect(hits.every((hit) => typeof hit._relevance_score === "number")).toBe(true);
+    expect(hits.map((hit) => Number(hit._relevance_score))).toEqual(
+      hits.map((hit) => Number(hit._relevance_score)).toSorted((left, right) => right - left),
+    );
+    expect(hits.findIndex((hit) => hit.chunk_id === "project-b:best")).toBeLessThan(
+      hits.findIndex((hit) => hit.chunk_id === "project-a:second"),
+    );
+    await instance.close();
+  });
+
   test("preserves an incompatible live generation and rejects active ID conflicts", async () => {
     const registeredRoot = path.join(temporary, "registered");
     const incomingRoot = path.join(temporary, "incoming");

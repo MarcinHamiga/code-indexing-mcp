@@ -1,6 +1,7 @@
 /** Memory ceiling, batch retry, and worker protocol. */
 
 import { expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import {
   PROBE_TEXTS,
   packVector as packFromEmbedding,
@@ -8,7 +9,9 @@ import {
   segmentPlan,
 } from "../src/embedding.ts";
 import {
+  defaultLauncher,
   EmbeddingWorkerSession,
+  childRss,
   effectiveMemoryCeiling,
   indexingMemoryBytes,
   MINIMUM_WORKER_BYTES,
@@ -115,6 +118,28 @@ test("embedding worker round trips vectors and stops", async () => {
   }
 });
 
+test("the default launcher starts a distinct operating-system process", async () => {
+  const directory = temporaryDirectory();
+  try {
+    const launched = await defaultLauncher().launch(
+      workerConfig({
+        cacheDirectory: directory,
+        offline: true,
+        threads: 1,
+        enableCpuMemArena: false,
+        dimension: 4,
+      }),
+    );
+    expect(launched.process.pid).toBeDefined();
+    expect(launched.process.pid).not.toBe(process.pid);
+    launched.process.terminate();
+    await launched.process.join(2);
+    launched.connection.close();
+  } finally {
+    removeDirectory(directory);
+  }
+});
+
 test("embedding worker refuses unsafe effective budget", () => {
   const directory = temporaryDirectory();
   try {
@@ -148,6 +173,18 @@ test("indexing memory never goes negative when the parent shrinks", () => {
   expect(
     indexingMemoryBytes({ parentBytes: 500, workerBytes: 100, parentBaselineBytes: 1_000 }),
   ).toBe(100);
+});
+
+test("worker RSS is sampled from the requested process", async () => {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10_000)"], {
+    stdio: "ignore",
+  });
+  try {
+    expect(child.pid).toBeDefined();
+    expect(await childRss(child.pid as number)).toBeGreaterThan(0);
+  } finally {
+    child.kill();
+  }
 });
 
 test("resident parent memory does not trip the ceiling", async () => {

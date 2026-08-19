@@ -2,8 +2,8 @@
  * Memory accounting primitives for disposable embedding workers.
  */
 
-import fs from "node:fs";
 import os from "node:os";
+import pidusage from "pidusage";
 import { CPU_PROVIDER } from "./backends.ts";
 import {
   DEFAULT_MODEL,
@@ -130,7 +130,12 @@ export type ModelLoader = (
 ) => Promise<PassageWorkerModel> | PassageWorkerModel;
 
 export interface PassageWorkerModel {
-  passageEmbed(texts: string[]): Iterable<ArrayLike<number>> | ArrayLike<number>[];
+  passageEmbed(
+    texts: string[],
+  ):
+    | Iterable<ArrayLike<number>>
+    | ArrayLike<number>[]
+    | Promise<Iterable<ArrayLike<number>> | ArrayLike<number>[]>;
   readonly resolvedProviders?: readonly string[];
   readonly tokenizer?: { encode: (text: string) => unknown };
 }
@@ -143,7 +148,7 @@ export function setLoadModel(loader: ModelLoader): void {
 
 async function defaultLoadModel(config: WorkerConfig): Promise<PassageWorkerModel> {
   const { DirectOnnxEmbedding } = await import("./direct-onnx.ts");
-  return new DirectOnnxEmbedding(config.cacheDirectory, {
+  return DirectOnnxEmbedding.create(config.cacheDirectory, {
     offline: config.offline,
     threads: config.threads,
     enableCpuMemArena: config.enableCpuMemArena,
@@ -160,8 +165,8 @@ export async function workerMain(
   try {
     const model = await loadModel(config);
     const tokenizer = resolveTokenizer(model);
-    const embedPacked = (texts: string[]): Uint8Array[] =>
-      [...model.passageEmbed(texts)].map((vector) => packLittleEndian(vector));
+    const embedPacked = async (texts: string[]): Promise<Uint8Array[]> =>
+      [...(await model.passageEmbed(texts))].map((vector) => packLittleEndian(vector));
 
     for (;;) {
       const message = (await connection.recv()) as [string, unknown];
@@ -176,11 +181,11 @@ export async function workerMain(
         continue;
       }
       if (command === "probe") {
-        connection.send(["probed", embedPacked([...PROBE_TEXTS])]);
+        connection.send(["probed", await embedPacked([...PROBE_TEXTS])]);
         continue;
       }
       if (command === "embed") {
-        connection.send(["packed", embedPacked(payload as string[])]);
+        connection.send(["packed", await embedPacked(payload as string[])]);
         continue;
       }
       if (command !== "plan_and_embed") {
@@ -212,7 +217,7 @@ export async function workerMain(
                 return { offsets: [] };
               };
         const windows = planPassages(encode, candidates, resolvedPlan);
-        const planned = embedWindows(embedPacked, candidates, windows, resolvedPlan);
+        const planned = await embedWindows(embedPacked, candidates, windows, resolvedPlan);
         connection.send([
           "planned",
           [
@@ -258,7 +263,7 @@ function packLittleEndian(vector: ArrayLike<number>): Uint8Array {
   return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
 }
 
-export type SampleRss = () => [number, number];
+export type SampleRss = () => [number, number] | Promise<[number, number]>;
 
 export class EmbeddingWorkerSession {
   readonly config: WorkerConfig;
@@ -485,7 +490,7 @@ export class EmbeddingWorkerSession {
           "Embedding worker exited without returning a result",
         );
       }
-      const [parentRss, workerRss] = this.sampleRss();
+      const [parentRss, workerRss] = await this.sampleRss();
       this.peakCombinedRss = Math.max(this.peakCombinedRss, parentRss + workerRss);
       const budgeted = indexingMemoryBytes({
         parentBytes: parentRss,
@@ -546,12 +551,12 @@ export class EmbeddingWorkerSession {
     this.connection = launched.connection;
   }
 
-  private readRss(): [number, number] {
+  private async readRss(): Promise<[number, number]> {
     const parentRss = process.memoryUsage().rss;
     const pid = this.processHandle?.pid;
     if (pid === undefined) return [parentRss, 0];
     try {
-      return [parentRss, childRss(pid)];
+      return [parentRss, await childRss(pid)];
     } catch {
       return [parentRss, 0];
     }
@@ -571,14 +576,8 @@ function isRetryable(error: unknown): error is CodeIndexingError {
   return error instanceof CodeIndexingError && RETRYABLE_CODES.has(error.code);
 }
 
-function childRss(pid: number): number {
-  if (process.platform === "linux") {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    const pages = Number(after[21] ?? 0);
-    return pages * 4096;
-  }
-  return process.memoryUsage().rss;
+export async function childRss(pid: number): Promise<number> {
+  return (await pidusage(pid)).memory;
 }
 
 export { FunctionLauncher };

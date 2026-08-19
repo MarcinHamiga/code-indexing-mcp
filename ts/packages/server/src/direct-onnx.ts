@@ -23,6 +23,8 @@ const MODEL_FILES = [
 export interface OnnxEncoding {
   ids: readonly number[];
   attentionMask: readonly number[];
+  offsets?: readonly (readonly [number, number])[];
+  specialTokensMask?: readonly number[];
 }
 
 export interface OnnxTokenizer {
@@ -37,8 +39,21 @@ export interface OnnxSessionInput {
 export interface OnnxSession {
   getInputs(): readonly OnnxSessionInput[];
   getProviders(): readonly string[];
-  run(outputNames: null, inputFeed: Record<string, ArrayLike<number | bigint>>): unknown;
+  run(
+    outputNames: null,
+    inputFeed: Record<string, ArrayLike<number | bigint>>,
+    dimensions?: readonly [batch: number, sequence: number],
+  ): unknown | Promise<unknown>;
 }
+
+export type SessionFactory = (
+  modelPath: string,
+  options: {
+    providers: readonly string[];
+    threads: number | undefined;
+    enableCpuMemArena: boolean;
+  },
+) => OnnxSession | Promise<OnnxSession>;
 
 export type SnapshotDownload = (options: {
   repoId: string;
@@ -61,6 +76,15 @@ export interface LoadedTokenizer {
   encode(text: string): OnnxEncoding;
 }
 
+export interface DirectOnnxOptions {
+  offline: boolean;
+  threads: number | undefined;
+  enableCpuMemArena: boolean;
+  providers: readonly string[];
+  modelId?: string;
+  accelerator?: string;
+}
+
 export let snapshotDownload: SnapshotDownload | undefined;
 export let tokenizerBindings: TokenizerBindings | undefined;
 export let resolveModelSnapshot: (
@@ -68,7 +92,7 @@ export let resolveModelSnapshot: (
   options: { modelId?: string; offline: boolean },
 ) => string | Promise<string> = defaultResolveModelSnapshot;
 export let loadTokenizer: typeof defaultLoadTokenizer = defaultLoadTokenizer;
-export let createSession: typeof defaultCreateSession = defaultCreateSession;
+export let createSession: SessionFactory = defaultCreateSession;
 export let createWebgpuSession: typeof defaultCreateWebgpuSession = defaultCreateWebgpuSession;
 
 export function configureDirectOnnx(overrides: {
@@ -78,7 +102,7 @@ export function configureDirectOnnx(overrides: {
     options: { modelId?: string; offline: boolean },
   ) => string | Promise<string>;
   loadTokenizer?: typeof defaultLoadTokenizer;
-  createSession?: typeof defaultCreateSession;
+  createSession?: SessionFactory;
   createWebgpuSession?: typeof defaultCreateWebgpuSession;
   onnxRuntimeBindings?: WebgpuOrtBindings | undefined;
   webgpuPluginBindings?: WebgpuPlugin | undefined;
@@ -144,43 +168,49 @@ async function huggingfaceSnapshotDownload(options: {
   cacheDir: string;
   localFilesOnly: boolean;
 }): Promise<string> {
-  const { downloadFile, listFiles } = await import("@huggingface/hub");
+  const { downloadFileToCacheDir } = await import("@huggingface/hub");
   const destRoot = path.join(
     options.cacheDir,
     `models--${options.repoId.replaceAll("/", "--")}`,
     "snapshots",
     "local",
   );
-  fs.mkdirSync(destRoot, { recursive: true });
-  const files = options.localFilesOnly
-    ? options.allowPatterns
-    : await collectHubFiles(listFiles, options.repoId, options.allowPatterns);
-  for (const relative of files) {
-    const dest = path.join(destRoot, relative);
-    if (options.localFilesOnly && fs.existsSync(dest)) continue;
-    if (options.localFilesOnly) {
-      throw new Error(`Offline snapshot is missing ${relative}`);
+  const repositoryRoot = path.dirname(path.dirname(destRoot));
+  const candidates = [destRoot];
+  try {
+    const revision = fs.readFileSync(path.join(repositoryRoot, "refs", "main"), "utf8").trim();
+    if (revision !== "") candidates.push(path.join(repositoryRoot, "snapshots", revision));
+  } catch {
+    // A first download has no main ref yet.
+  }
+  const cached = candidates.find((root) =>
+    options.allowPatterns.every((relative) => fs.existsSync(path.join(root, relative))),
+  );
+  if (cached !== undefined) {
+    return cached;
+  }
+  if (options.localFilesOnly) {
+    const missing = options.allowPatterns.find(
+      (relative) => !fs.existsSync(path.join(destRoot, relative)),
+    );
+    throw new Error(`Offline snapshot is missing ${missing}`);
+  }
+  let snapshotRoot: string | undefined;
+  for (const relative of options.allowPatterns) {
+    const downloaded = await downloadFileToCacheDir({
+      repo: options.repoId,
+      path: relative,
+      cacheDir: options.cacheDir,
+    });
+    let root = downloaded;
+    for (const _segment of relative.split("/")) root = path.dirname(root);
+    if (snapshotRoot !== undefined && snapshotRoot !== root) {
+      throw new Error("Model files resolved to different Hugging Face snapshots");
     }
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    const blob = await downloadFile({ repo: options.repoId, path: relative });
-    if (blob === null) continue;
-    const buffer = Buffer.from(await blob.arrayBuffer());
-    fs.writeFileSync(dest, buffer);
+    snapshotRoot = root;
   }
-  return destRoot;
-}
-
-async function collectHubFiles(
-  listFiles: (options: { repo: string }) => AsyncGenerator<{ path: string }>,
-  repoId: string,
-  allowPatterns: string[],
-): Promise<string[]> {
-  const allowed = new Set(allowPatterns);
-  const found: string[] = [];
-  for await (const file of listFiles({ repo: repoId })) {
-    if (allowed.has(file.path)) found.push(file.path);
-  }
-  return found.length > 0 ? found : allowPatterns;
+  if (snapshotRoot === undefined) throw new Error("Model snapshot contains no requested files");
+  return snapshotRoot;
 }
 
 function jsonObject(filePath: string): Record<string, unknown> {
@@ -197,7 +227,6 @@ function jsonObject(filePath: string): Record<string, unknown> {
 }
 
 export function defaultLoadTokenizer(modelDirectory: string): OnnxTokenizer {
-  const bindings = tokenizerBindings ?? nativeTokenizerBindings();
   const config = jsonObject(path.join(modelDirectory, "config.json"));
   const tokenizerConfig = jsonObject(path.join(modelDirectory, "tokenizer_config.json"));
   const specialTokens = jsonObject(path.join(modelDirectory, "special_tokens_map.json"));
@@ -210,7 +239,13 @@ export function defaultLoadTokenizer(modelDirectory: string): OnnxTokenizer {
   }
   const maxContext = Math.min(...lengths);
 
-  const tokenizer = bindings.Tokenizer.fromFile(path.join(modelDirectory, "tokenizer.json"));
+  if (tokenizerBindings === undefined) {
+    return loadHuggingFaceTokenizer(modelDirectory, tokenizerConfig, maxContext);
+  }
+
+  const tokenizer = tokenizerBindings.Tokenizer.fromFile(
+    path.join(modelDirectory, "tokenizer.json"),
+  );
   tokenizer.enableTruncation({ maxLength: maxContext });
   if (!tokenizer.padding) {
     const padToken = tokenizerConfig.pad_token;
@@ -225,18 +260,78 @@ export function defaultLoadTokenizer(modelDirectory: string): OnnxTokenizer {
     if (typeof rawToken === "string") {
       tokenizer.addSpecialTokens([rawToken]);
     } else if (rawToken !== null && typeof rawToken === "object" && !Array.isArray(rawToken)) {
-      tokenizer.addSpecialTokens([new bindings.AddedToken(rawToken as Record<string, unknown>)]);
+      tokenizer.addSpecialTokens([
+        new tokenizerBindings.AddedToken(rawToken as Record<string, unknown>),
+      ]);
     }
   }
   return tokenizer;
 }
 
-function nativeTokenizerBindings(): TokenizerBindings {
+function loadHuggingFaceTokenizer(
+  modelDirectory: string,
+  tokenizerConfig: Record<string, unknown>,
+  maxContext: number,
+): OnnxTokenizer {
+  interface Encoding {
+    ids: number[];
+    tokens: string[];
+    attention_mask: number[];
+  }
+  interface Tokenizer {
+    encode(text: string): Encoding;
+    token_to_id(token: string): number | undefined;
+    decoder: { convert_tokens_to_string(tokens: string[]): string } | null;
+  }
   const loaded = import.meta.require("@huggingface/tokenizers") as {
-    Tokenizer: { fromFile: (filePath: string) => LoadedTokenizer };
-    AddedToken: new (values: Record<string, unknown>) => unknown;
+    Tokenizer: new (tokenizer: object, config: object) => Tokenizer;
   };
-  return { Tokenizer: loaded.Tokenizer, AddedToken: loaded.AddedToken };
+  const tokenizer = new loaded.Tokenizer(
+    jsonObject(path.join(modelDirectory, "tokenizer.json")),
+    tokenizerConfig,
+  );
+  const padToken = tokenizerConfig.pad_token;
+  if (typeof padToken !== "string") throw new Error("Tokenizer config has no pad_token");
+  const padId = tokenizer.token_to_id(padToken) ?? 0;
+  const specialIds = new Set(tokenizer.encode("").ids);
+
+  const encode = (text: string): OnnxEncoding => {
+    const raw = tokenizer.encode(text);
+    const ids = raw.ids.slice(0, maxContext);
+    const attentionMask = raw.attention_mask.slice(0, maxContext);
+    const offsets: Array<readonly [number, number]> = [];
+    const specialTokensMask: number[] = [];
+    let cursor = 0;
+    for (const [index, id] of ids.entries()) {
+      const special = specialIds.has(id);
+      specialTokensMask.push(special ? 1 : 0);
+      if (special) {
+        offsets.push([0, 0]);
+        continue;
+      }
+      const fragment = tokenizer.decoder?.convert_tokens_to_string([raw.tokens[index] ?? ""]) ?? "";
+      const start = cursor;
+      cursor = Math.min(text.length, cursor + fragment.length);
+      offsets.push([start, cursor]);
+    }
+    return { ids, attentionMask, offsets, specialTokensMask };
+  };
+
+  return {
+    encode,
+    encodeBatch: (documents) => {
+      const rows = documents.map(encode);
+      const sequence = Math.max(0, ...rows.map((row) => row.ids.length));
+      return rows.map((row) => ({
+        ...row,
+        ids: [...row.ids, ...Array(sequence - row.ids.length).fill(padId)],
+        attentionMask: [
+          ...row.attentionMask,
+          ...Array(sequence - row.attentionMask.length).fill(0),
+        ],
+      }));
+    },
+  };
 }
 
 export function meanPoolAndNormalize(
@@ -273,14 +368,14 @@ export function meanPoolAndNormalize(
   return pooled;
 }
 
-export function defaultCreateSession(
+export async function defaultCreateSession(
   modelPath: string,
   {
     providers,
     threads,
     enableCpuMemArena,
   }: { providers: readonly string[]; threads: number | undefined; enableCpuMemArena: boolean },
-): OnnxSession {
+): Promise<OnnxSession> {
   const ort = import.meta.require("onnxruntime-node") as {
     InferenceSession: {
       create: (
@@ -296,15 +391,13 @@ export function defaultCreateSession(
     };
     Tensor: new (type: string, data: BigInt64Array | Int32Array, dims: number[]) => unknown;
   };
-  const created = waitFor(
-    ort.InferenceSession.create(modelPath, {
-      executionProviders: [...providers],
-      graphOptimizationLevel: "all",
-      enableCpuMemArena,
-      ...(threads === undefined ? {} : { intraOpNumThreads: threads, interOpNumThreads: threads }),
-    }),
-  );
-  return wrapOrtSession(created, ort.Tensor);
+  const created = await ort.InferenceSession.create(modelPath, {
+    executionProviders: providers.map(nodeExecutionProvider),
+    graphOptimizationLevel: "all",
+    enableCpuMemArena,
+    ...(threads === undefined ? {} : { intraOpNumThreads: threads, interOpNumThreads: threads }),
+  });
+  return wrapOrtSession(created, ort.Tensor, providers);
 }
 
 function wrapOrtSession(
@@ -316,19 +409,20 @@ function wrapOrtSession(
     ) => Promise<Record<string, { data: Float32Array; dims: number[] }>>;
   },
   Tensor: new (type: string, data: BigInt64Array | Int32Array, dims: number[]) => unknown,
+  requestedProviders: readonly string[],
 ): OnnxSession {
   return {
     getInputs: () => session.inputNames.map((name) => ({ name })),
-    getProviders: () => session.handler?.getProviders?.() ?? [],
-    run: (_outputNames, inputFeed) => {
+    getProviders: () => session.handler?.getProviders?.() ?? [...requestedProviders],
+    run: async (_outputNames, inputFeed, dimensions) => {
       const feeds: Record<string, unknown> = {};
       for (const [name, data] of Object.entries(inputFeed)) {
         const values = data instanceof BigInt64Array ? data : bigintFromInt32(toInt32(data));
-        const batch = inferBatch(toInt32(data));
-        const seq = data.length / batch;
+        const batch = dimensions?.[0] ?? 1;
+        const seq = dimensions?.[1] ?? data.length / batch;
         feeds[name] = new Tensor("int64", values, [batch, seq]);
       }
-      const outputs = waitFor(session.run(feeds));
+      const outputs = await session.run(feeds);
       const first = Object.values(outputs)[0];
       if (first === undefined) return [];
       return [reshape3(first.data, first.dims)];
@@ -336,8 +430,14 @@ function wrapOrtSession(
   };
 }
 
-function inferBatch(_data: Int32Array | BigInt64Array): number {
-  return 1;
+function nodeExecutionProvider(provider: string): string {
+  const names: Record<string, string> = {
+    CPUExecutionProvider: "cpu",
+    CUDAExecutionProvider: "cuda",
+    DmlExecutionProvider: "dml",
+    CoreMLExecutionProvider: "coreml",
+  };
+  return names[provider] ?? provider;
 }
 
 function toInt32(data: ArrayLike<number | bigint>): Int32Array {
@@ -368,13 +468,6 @@ function reshape3(data: Float32Array, dims: number[]): number[][][] {
     out.push(tokens);
   }
   return out;
-}
-
-function waitFor<T>(value: T | Promise<T>): T {
-  if (value !== null && typeof value === "object" && "then" in (value as object)) {
-    throw new Error("ONNX session construction must be injected in tests; live create is async");
-  }
-  return value as T;
 }
 
 export function defaultCreateWebgpuSession(
@@ -411,49 +504,48 @@ export class DirectOnnxEmbedding {
   readonly model: OnnxSession;
   readonly resolvedProviders: readonly string[];
 
-  constructor(
+  static async create(
     cacheDirectory: string,
-    {
-      offline,
-      threads,
-      enableCpuMemArena,
-      providers,
-      modelId = DEFAULT_MODEL,
-      accelerator = "",
-    }: {
-      offline: boolean;
-      threads: number | undefined;
-      enableCpuMemArena: boolean;
-      providers: readonly string[];
-      modelId?: string;
-      accelerator?: string;
-    },
-  ) {
-    const modelDirectory = mustString(
-      resolveModelSnapshot(cacheDirectory, { modelId, offline }),
-      "resolveModelSnapshot",
-    );
+    options: DirectOnnxOptions,
+  ): Promise<DirectOnnxEmbedding> {
+    const modelDirectory = await resolveModelSnapshot(cacheDirectory, {
+      offline: options.offline,
+      ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
+    });
     const modelPath = path.join(modelDirectory, DEFAULT_MODEL_ARTIFACT);
     if (!fs.existsSync(modelPath) || !fs.statSync(modelPath).isFile()) {
       throw new Error(`The model snapshot has no ONNX artifact at ${modelPath}`);
     }
-    this.tokenizer = loadTokenizer(modelDirectory);
-    if (accelerator === "webgpu") {
+    const tokenizer = loadTokenizer(modelDirectory);
+    let model: OnnxSession;
+    if (options.accelerator === "webgpu") {
       const [session, pluginProvider] = createWebgpuSession(modelPath, {
-        threads,
-        enableCpuMemArena,
+        threads: options.threads,
+        enableCpuMemArena: options.enableCpuMemArena,
       });
-      this.model = session;
-      if (providers.length > 0 && pluginProvider !== providers[0]) {
-        throw new Error(`The WebGPU plugin registered ${pluginProvider}, expected ${providers[0]}`);
+      model = session;
+      if (options.providers.length > 0 && pluginProvider !== options.providers[0]) {
+        throw new Error(
+          `The WebGPU plugin registered ${pluginProvider}, expected ${options.providers[0]}`,
+        );
       }
     } else {
-      this.model = createSession(modelPath, { providers, threads, enableCpuMemArena });
+      model = await createSession(modelPath, {
+        providers: options.providers,
+        threads: options.threads,
+        enableCpuMemArena: options.enableCpuMemArena,
+      });
     }
+    return new DirectOnnxEmbedding(tokenizer, model);
+  }
+
+  private constructor(tokenizer: OnnxTokenizer, model: OnnxSession) {
+    this.tokenizer = tokenizer;
+    this.model = model;
     this.resolvedProviders = [...new Set(this.model.getProviders().map((name) => String(name)))];
   }
 
-  passageEmbed(documents: string | Iterable<string>): number[][] {
+  async passageEmbed(documents: string | Iterable<string>): Promise<number[][]> {
     const texts = typeof documents === "string" ? [documents] : [...documents];
     if (texts.length === 0) return [];
     const encoded = this.tokenizer.encodeBatch(texts);
@@ -472,7 +564,7 @@ export class DirectOnnxEmbedding {
     if (inputNames.has("token_type_ids")) {
       inputs.token_type_ids = new BigInt64Array(inputIds.length);
     }
-    const outputs = this.model.run(null, inputs);
+    const outputs = await this.model.run(null, inputs, [texts.length, seq]);
     if (!Array.isArray(outputs) || outputs.length === 0) {
       throw new Error("The ONNX model returned no outputs");
     }
@@ -482,11 +574,6 @@ export class DirectOnnxEmbedding {
       encoded.map((row) => [...row.attentionMask]),
     );
   }
-}
-
-function mustString(value: string | Promise<string>, name: string): string {
-  if (typeof value === "string") return value;
-  throw new Error(`${name} returned a Promise; inject a sync implementation`);
 }
 
 function flattenInt64(rows: readonly (readonly number[])[], seq: number): BigInt64Array {
