@@ -179,6 +179,30 @@ test("a backend that fails verification is replaced by cpu", async () => {
   }
 });
 
+test("a backend that silently resolves to CPU is replaced by cpu", async () => {
+  const directory = temporaryDirectory();
+  try {
+    const session = backend(directory, {
+      acceleratorTarget: async (connection, config) => {
+        for (;;) {
+          const [command] = (await connection.recv()) as [string, unknown];
+          if (command === "stop") return;
+          if (command === "initialize") {
+            connection.send(["initialized", [[CPU_PROVIDER], config.dimension]]);
+          }
+        }
+      },
+    });
+    await session.enter();
+    await session.planAndEmbed([passageCandidate("", "x")], segmentPlan());
+    expect(session.backendUsed).toBe("cpu");
+    expect(session.fallbackReason).toContain("CUDAExecutionProvider was requested");
+    await session.exit();
+  } finally {
+    removeDirectory(directory);
+  }
+});
+
 test("strict mode refuses the fallback when verification fails", async () => {
   const directory = temporaryDirectory();
   try {

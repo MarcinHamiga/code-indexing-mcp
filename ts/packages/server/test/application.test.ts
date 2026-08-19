@@ -2,6 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
 import { Application } from "../src/application.ts";
+import {
+  RECORD_FILENAME,
+  runningRuntimeVersion,
+  writeEnvironment,
+} from "../src/accelerator-env.ts";
 import type { Embedder } from "../src/embedding.ts";
 import { isCodeIndexingError } from "../src/errors.ts";
 import { DeclarationSelector, isBackfillComplete } from "../src/models.ts";
@@ -72,6 +77,32 @@ describe("Application", () => {
     expect(removal.removed).toBe(true);
     expect(await application.listProjects()).toEqual([]);
     expect(fs.existsSync(path.join(root, ".ci-mcp", "project.toml"))).toBe(true);
+  });
+
+  test("uses a verified accelerator record for selection and model status", async () => {
+    const root = path.join(temporary, "repo");
+    const data = path.join(temporary, "data");
+    fs.mkdirSync(root);
+    writeEnvironment(path.join(data, RECORD_FILENAME), {
+      accelerator: "cuda",
+      interpreter: process.execPath,
+      providers: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+      runtimeVersion: "1.27.0",
+      driverVersion: "550.54.14",
+      device: "cuda:0",
+      pythonVersion: runningRuntimeVersion(),
+      recordedAtNs: "1",
+      detail: "probed 2 passages on CUDAExecutionProvider",
+    });
+    const application = app(root);
+
+    const status = await application.modelStatus();
+
+    expect(application.effectiveBackendSelection.accelerator).toBe("cuda");
+    expect(status.resolved_accelerator).toBe("cuda");
+    expect(status.execution_provider).toBe("CUDAExecutionProvider");
+    expect(status.device).toBe("cuda:0");
+    expect(status.accelerator_prepared).toBe("cuda");
   });
 
   test("can ensure the structural index without a semantic search", async () => {

@@ -265,10 +265,7 @@ export class PassageBackendSession {
   private async verify(session: EmbeddingWorkerSession): Promise<void> {
     const info = await session.initialize();
     const descriptor = this.selection.descriptor;
-    if (
-      info.resolvedProviders.length > 0 &&
-      !info.resolvedProviders.includes(descriptor.provider)
-    ) {
+    if (!info.resolvedProviders.includes(descriptor.provider)) {
       throw new CodeIndexingError(
         "BACKEND_UNAVAILABLE",
         `${descriptor.provider} was requested but the session runs on ${info.resolvedProviders.join(", ")}`,

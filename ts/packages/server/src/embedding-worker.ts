@@ -140,13 +140,13 @@ export interface PassageWorkerModel {
   readonly tokenizer?: { encode: (text: string) => unknown };
 }
 
-export let loadModel: ModelLoader = defaultLoadModel;
+export let loadModel: ModelLoader = loadPassageModel;
 
 export function setLoadModel(loader: ModelLoader): void {
   loadModel = loader;
 }
 
-async function defaultLoadModel(config: WorkerConfig): Promise<PassageWorkerModel> {
+export async function loadPassageModel(config: WorkerConfig): Promise<PassageWorkerModel> {
   const { DirectOnnxEmbedding } = await import("./direct-onnx.ts");
   return DirectOnnxEmbedding.create(config.cacheDirectory, {
     offline: config.offline,

@@ -14,7 +14,6 @@ import {
   availableExecutionProviders,
   backendFor,
   describeEnvironment,
-  parseAccelerator,
   platformFingerprint,
   runtimeVersion,
   selectBackend,
@@ -328,7 +327,7 @@ export class Application {
     const record = this.acceleratorEnvironment.environment;
     const providers = [...this.servingProviders];
     if (record !== null) {
-      const prepared = backendFor(parseAccelerator(record.accelerator));
+      const prepared = backendFor(record.accelerator);
       if (prepared !== undefined && record.providers.includes(prepared.provider)) {
         providers.push(prepared.provider);
       }
@@ -346,9 +345,10 @@ export class Application {
     return selection;
   }
 
-  #runsExternally(descriptor: BackendDescriptor): boolean {
-    const record = this.acceleratorEnvironment.environment;
-    return record !== null && !this.servingProviders.includes(descriptor.provider);
+  #runsExternally(_descriptor: BackendDescriptor): boolean {
+    // Node ONNX providers share the server's runtime; workers are isolated for
+    // memory accounting, not because they need a second dependency environment.
+    return false;
   }
 
   get effectiveBackendSelection(): BackendSelection {

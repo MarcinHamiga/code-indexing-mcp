@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "bin": {
-    "code-indexing-mcp": "./src/cli.ts"
+    "code-indexing-mcp": "./src/cli.ts",
+    "code-indexing-mcp-accelerator-probe": "./src/accelerator-probe-cli.ts"
   },
   "scripts": {
     "memory:gate": "bun run scripts/benchmark-index-memory.ts",
