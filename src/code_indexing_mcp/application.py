@@ -840,12 +840,19 @@ class Application:
                 for registered_project in registered
             ]
         registry_after = self.store.registry_stats()
+        partition_bytes: dict[str, int] = {}
+        for stats in projects:
+            if stats.slots:
+                partition_bytes.update(
+                    {slot.partition_id: slot.physical_bytes for slot in stats.slots}
+                )
+            else:
+                partition_bytes[stats.project.id] = stats.partition_physical_bytes
         return StorageStatus(
             snapshot_at=snapshot_at,
             registry=registry_after,
             projects=projects,
-            physical_bytes_total=registry_after.physical_bytes
-            + sum(stats.partition_physical_bytes for stats in projects),
+            physical_bytes_total=registry_after.physical_bytes + sum(partition_bytes.values()),
             consistent=registry_before.current_version == registry_after.current_version
             and all(stats.consistent for stats in projects),
             overlap_warnings=overlap_warnings(registered),

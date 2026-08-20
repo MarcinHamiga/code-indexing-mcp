@@ -311,6 +311,67 @@ def test_list_reference_records_schema_version_pushes_the_filter_into_sql(
     assert store.list_reference_records(project.id, schema_version=5) == []
 
 
+def test_historical_reference_reads_stay_on_one_physical_partition(
+    tmp_path: Path,
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
+    store.upsert_slot(_slot(project.id, "slot-b", partition_id="partition-b"))
+
+    store.activate_slot(project.id, "slot-a")
+    record_a = stored_file(project.id, file_id="file-a")
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record_a.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_batches=(),
+        reference_batches=[
+            ([record_a.file_id], reference_table(reference_record(project.id, record_a.file_id)))
+        ],
+    )
+    historical_version = store.reference_version(project.id)
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record_a.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_batches=(),
+        reference_batches=[
+            (
+                [record_a.file_id],
+                reference_table(
+                    reference_record(
+                        project.id,
+                        record_a.file_id,
+                        reference_id="reference-new",
+                    )
+                ),
+            )
+        ],
+    )
+
+    store.activate_slot(project.id, "slot-b")
+    record_b = stored_file(project.id, file_id="file-b")
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record_b.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_batches=(),
+        reference_batches=[
+            ([record_b.file_id], reference_table(reference_record(project.id, record_b.file_id)))
+        ],
+    )
+
+    with patch.object(
+        store,
+        "_partition_id_for",
+        side_effect=["partition-a", "partition-b"],
+    ):
+        rows = store.list_reference_records(project.id, version=historical_version)
+
+    assert [row["reference_id"] for row in rows] == ["reference-1"]
+
+
 @pytest.mark.parametrize("schema_version", [True, "1"])
 def test_list_reference_records_rejects_non_integer_schema_versions(
     tmp_path: Path, schema_version: object
@@ -793,6 +854,30 @@ def test_partition_deletion_waits_for_active_reader(tmp_path: Path) -> None:
     assert finished.is_set()
 
 
+def test_partition_lock_resolves_the_active_physical_slot(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
+    store.activate_slot(project.id, "slot-a")
+    store._tables("partition-a")
+    finished = threading.Event()
+
+    def delete() -> None:
+        store.delete_partition(project.id, model_id="test/other")
+        finished.set()
+
+    with store.partition_access(project.id):
+        thread = threading.Thread(target=delete)
+        thread.start()
+        assert not finished.wait(timeout=0.1)
+    thread.join(timeout=5)
+
+    assert finished.is_set()
+
+
 def test_get_chunk_rejects_malformed_unknown_and_pre_migration_ids(tmp_path: Path) -> None:
     store, project_id, _ = _store_with_one_chunk(tmp_path)
 
@@ -1078,6 +1163,29 @@ def test_storage_stats_reports_table_level_metrics(tmp_path: Path) -> None:
         assert table.logical_bytes >= 0
         assert table.physical_bytes >= 0
         assert table.retained_version_count >= 1
+
+
+def test_storage_stats_reports_every_slot_and_its_partition_bytes(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
+    store.upsert_slot(_slot(project.id, "slot-b", partition_id="partition-b"))
+    store.activate_slot(project.id, "slot-a")
+    store._tables("partition-a")
+    store._tables("partition-b")
+
+    report = store.storage_stats(project.id)
+
+    assert {slot.slot_id for slot in report.slots} == {"slot-a", "slot-b"}
+    by_id = {slot.slot_id: slot for slot in report.slots}
+    assert by_id["slot-a"].active is True
+    assert by_id["slot-b"].active is False
+    assert by_id["slot-a"].physical_bytes == report.partition_physical_bytes
+    assert by_id["slot-a"].physical_bytes > 0
+    assert by_id["slot-b"].physical_bytes > 0
 
 
 def test_storage_stats_reports_indexes_after_ensure_indexes(tmp_path: Path) -> None:

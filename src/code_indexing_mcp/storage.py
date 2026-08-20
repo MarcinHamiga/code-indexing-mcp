@@ -42,6 +42,7 @@ from .models import (
     ProjectInfo,
     ProjectSlot,
     ProjectStorageStats,
+    SlotStorageStats,
     StoredChunk,
     StoredFile,
     TableStorageStats,
@@ -813,7 +814,7 @@ class LanceStore:
         not registered.
         """
         partition_id = self._partition_id_for(project_id)
-        with self.partition_access(partition_id):
+        with self._partition_access_physical(partition_id):
             self._advance_partition_generation(partition_id)
             with self._partitions_lock:
                 self._partitions.pop(partition_id, None)
@@ -1657,19 +1658,26 @@ class LanceStore:
             return cached
 
     @contextmanager
-    def partition_access(self, partition_id: str) -> Iterator[None]:
+    def partition_access(self, project_id: str) -> Iterator[None]:
         """Prevent a destructive rebuild from invalidating an active query."""
+        with self._partition_access_physical(self._partition_id_for(project_id)):
+            yield
+
+    @contextmanager
+    def _partition_access_physical(self, partition_id: str) -> Iterator[None]:
+        """Lock one already-resolved physical partition."""
         directory = self.directory.parent / "locks"
         directory.mkdir(parents=True, exist_ok=True)
         with FileLock(directory / f"partition-{partition_id}.lock"):
             yield
 
     @contextmanager
-    def partitions_access(self, partition_ids: Iterable[str]) -> Iterator[None]:
-        """Hold partition locks in a stable order for a multi-project query."""
+    def partitions_access(self, project_ids: Iterable[str]) -> Iterator[None]:
+        """Hold the active partitions for logical projects in stable order."""
+        partition_ids = {self._partition_id_for(project_id) for project_id in project_ids}
         with ExitStack() as stack:
             for partition_id in sorted(set(partition_ids)):
-                stack.enter_context(self.partition_access(partition_id))
+                stack.enter_context(self._partition_access_physical(partition_id))
             yield
 
     def _remember(self, partition_id: str, tables: _ProjectTables) -> _ProjectTables:
@@ -1887,10 +1895,32 @@ class LanceStore:
         # not be conflated: report the failure explicitly and treat the
         # snapshot as unusable.
         open_failed = tables is None and partition.is_dir()
+        active = self.active_slot(project.id)
+        active_slot_id = active.slot_id if active is not None else None
+        slots = [
+            SlotStorageStats(
+                slot_id=slot.slot_id,
+                partition_id=slot.partition_id,
+                selector_kind=slot.selector_kind,
+                selector_value=slot.selector_value,
+                active=slot.slot_id == active_slot_id,
+                state=slot.state,
+                indexed_head=slot.indexed_head,
+                indexed_clean=slot.indexed_clean,
+                last_used_at=slot.last_used_at,
+                physical_bytes=(
+                    partition_physical_bytes
+                    if slot.partition_id == partition_id
+                    else _directory_bytes(self.directory / "projects" / slot.partition_id)
+                ),
+            )
+            for slot in self.list_slots(project.id)
+        ]
         return ProjectStorageStats(
             project=project,
             snapshot_at=datetime.now(UTC).isoformat(),
             tables=collected,
+            slots=slots,
             partition_physical_bytes=partition_physical_bytes,
             consistent=before == after and not open_failed,
             partition_open_failed=open_failed,
@@ -1988,13 +2018,16 @@ class LanceStore:
     def _reference_rows(
         self, project_id: str, condition: str | None, *, version: int | None = None
     ) -> list[ReferenceRecord]:
-        tables = self._project_existing_tables(project_id)
+        # Keep the physical partition fixed for the whole read. The active
+        # pointer may switch while a historical version is being reopened.
+        partition_id = self._partition_id_for(project_id)
+        tables = self._existing_tables(partition_id)
         if tables is None or tables.references is None:
             return []
         references = tables.references
         if version is not None and version != int(references.version):
             database = lancedb.connect(
-                self.directory / "projects" / self._partition_id_for(project_id),
+                self.directory / "projects" / partition_id,
                 read_consistency_interval=timedelta(0),
             )
             references = cast(LanceTable, database.open_table("references", version=version))

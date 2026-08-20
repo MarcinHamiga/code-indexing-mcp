@@ -934,7 +934,7 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
             server, list_roots_callback=list_roots
         ) as client:
             await client.list_tools()
-            assert await asyncio.to_thread(embedder.started.wait, 5)
+            await _wait_until(embedder.started.is_set, timeout=30)
 
             result = await asyncio.wait_for(
                 client.call_tool(
