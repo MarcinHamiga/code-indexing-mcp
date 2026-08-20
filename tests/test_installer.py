@@ -619,6 +619,42 @@ def test_main_delegates_to_the_module_cli_with_forwarded_flags(
     assert "Installed repository" in capsys.readouterr().out
 
 
+def test_main_delegates_to_the_typescript_bootstrap_when_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = load_installer()
+    checkout = tmp_path / "checkout"
+    monkeypatch.setattr(installer, "clone_or_update_repository", lambda url, directory: "installed")
+    monkeypatch.setattr(
+        installer, "sync_environment", lambda directory: pytest.fail("Python sync ran")
+    )
+    delegated: list[list[str]] = []
+    monkeypatch.setattr(
+        installer,
+        "_delegate_typescript",
+        lambda directory, tail: delegated.append(tail) or 0,
+    )
+
+    assert (
+        installer.main(
+            [
+                "--runtime",
+                "ts",
+                "--install-dir",
+                str(checkout),
+                "--harnesses",
+                "codex",
+                "--no-tui",
+            ]
+        )
+        == 0
+    )
+    (tail,) = delegated
+    assert tail[:4] == ["--install-dir", str(checkout), "--accelerator", "auto"]
+    assert tail[tail.index("--harnesses") + 1] == "codex"
+    assert "--tui" not in tail
+
+
 def test_main_adds_tui_flag_on_a_capable_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -193,6 +193,7 @@ export function main(argv: string[] = process.argv.slice(2)): number {
       options: {
         "install-dir": { type: "string" },
         "repo-url": { type: "string" },
+        runtime: { type: "string" },
         accelerator: { type: "string" },
         harnesses: { type: "string" },
         set: { type: "string", multiple: true },
@@ -217,6 +218,11 @@ export function main(argv: string[] = process.argv.slice(2)): number {
         "[--harnesses LIST] [--set NAME=VALUE] [--unset NAME] [--no-tui]\n",
     );
     return 0;
+  }
+  const runtime = stringOption(values, "runtime");
+  if (runtime !== undefined && runtime !== "ts") {
+    process.stderr.write("Error: the TypeScript installer only supports --runtime ts\n");
+    return 1;
   }
   const accelerator =
     stringOption(values, "accelerator") ?? process.env.CODE_INDEXING_MCP_ACCELERATOR ?? "auto";

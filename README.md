@@ -67,6 +67,17 @@ indexing; every other language and platform, including GDScript, is unaffected. 
 [ts/packages/server/README.md](ts/packages/server/README.md) and the migration plan under
 `docs/plans/` for details.
 
+Opt in through the same installer without changing the default:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MarcinHamiga/code-indexing-mcp/main/install.sh |
+  sh -s -- --runtime ts
+```
+
+This path provisions Bun when needed and rewrites selected harness entries to the TypeScript
+launcher's absolute path. On Windows, install Bun first, then add `--runtime ts` to the
+PowerShell command above.
+
 ### The `code-indexing-mcp` command
 
 Your MCP clients launch the server by absolute path and never need it on PATH, so the

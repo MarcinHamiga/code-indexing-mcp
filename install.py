@@ -3,8 +3,8 @@
 
 This file is stdlib-only and self-contained: install.sh downloads it into a
 temporary directory and runs it before any virtual environment exists. It
-clones or updates the repository, builds the locked environment, and delegates
-everything else to ``python -m code_indexing_mcp.installer`` inside that environment.
+clones or updates the repository, builds the selected locked runtime, and
+delegates everything else to that runtime's installer.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ DEFAULT_REPOSITORY_URL = "https://github.com/MarcinHamiga/code-indexing-mcp.git"
 # accelerator degrades to) plus the TUI extra for the interactive wizard.
 SERVING_EXTRAS = ("cpu", "tui")
 ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml")
+RUNTIME_CHOICES = ("python", "ts")
 
 
 class InstallerError(RuntimeError):
@@ -181,6 +182,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Git repository to clone or update (default: %(default)s)",
     )
     parser.add_argument(
+        "--runtime",
+        choices=RUNTIME_CHOICES,
+        default=os.environ.get("CODE_INDEXING_MCP_RUNTIME", "python"),
+        help="server runtime to install (default: %(default)s)",
+    )
+    parser.add_argument(
         "--accelerator",
         choices=ACCELERATOR_CHOICES,
         default=os.environ.get("CODE_INDEXING_MCP_ACCELERATOR", "auto"),
@@ -268,6 +275,29 @@ def _delegate(install_directory: Path, tail: list[str]) -> int:
     return completed.returncode
 
 
+def _delegate_typescript(install_directory: Path, tail: list[str]) -> int:
+    """Run the TypeScript bootstrap after this bootstrap prepared its checkout."""
+
+    bun = shutil.which("bun")
+    if bun is None:
+        candidate = Path(os.environ.get("BUN_INSTALL", Path.home() / ".bun")) / "bin" / "bun"
+        if candidate.is_file():
+            bun = str(candidate)
+    if bun is None:
+        raise InstallerError(
+            "Bun is required for --runtime ts. Install it from https://bun.sh or run "
+            "install.sh --runtime ts, which provisions it automatically."
+        )
+    bootstrap = install_directory / "ts" / "packages" / "installer" / "src" / "bootstrap.ts"
+    if not bootstrap.is_file():
+        raise InstallerError(f"No TypeScript installer bootstrap at {bootstrap}")
+    try:
+        completed = subprocess.run([bun, str(bootstrap), *tail], cwd=install_directory)
+    except OSError as exc:
+        raise InstallerError(f"could not launch the TypeScript installer: {exc}") from exc
+    return completed.returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = build_argument_parser().parse_args(argv)
     install_directory = Path(arguments.install_dir).expanduser().resolve()
@@ -277,8 +307,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{action.title()} repository: {install_directory}")
         if action == "updated":
             print("Next time you can run: code-indexing-mcp update")
-        command = sync_environment(install_directory)
-        print(f"Prepared MCP executable: {command}")
+        if arguments.runtime == "python":
+            command = sync_environment(install_directory)
+            print(f"Prepared MCP executable: {command}")
     except InstallerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -315,6 +346,13 @@ def main(argv: list[str] | None = None) -> int:
     use_tui = arguments.tui or (not arguments.no_tui and not scripted and tui_available())
     if use_tui:
         tail.append("--tui")
+
+    if arguments.runtime == "ts":
+        try:
+            return _delegate_typescript(install_directory, tail)
+        except InstallerError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     returncode = _delegate(install_directory, tail)
     if use_tui and returncode not in (0, 1, 130):

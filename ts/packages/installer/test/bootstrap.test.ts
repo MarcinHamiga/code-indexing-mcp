@@ -74,6 +74,16 @@ describe("bootstrap", () => {
     expect(main(["--help"])).toBe(0);
     expect(stdout()).toContain("Usage: install");
   });
+
+  test("accepts the root bootstrap's TypeScript runtime selector", () => {
+    const stdout = captureStdout();
+    expect(main(["--runtime", "ts", "--help"])).toBe(0);
+    expect(stdout()).toContain("Usage: install");
+  });
+
+  test("rejects another runtime selector", () => {
+    expect(main(["--runtime", "python"])).toBe(1);
+  });
 });
 
 function captureStdout(): () => string {

@@ -1,8 +1,9 @@
 # Phase 9 notes — cutover
 
 Date: 2026-08-20
-Status: tooling, CI, and packaging complete; the release flip itself is an
-operator action pending a full-scale soak on target repositories
+Status: tooling, CI, packaging, and the installer opt-in are complete; the
+release flip itself is an operator action pending a full-scale soak on target
+repositories
 Branch: `ts-migration`
 Plan: [2026-08-17-typescript-migration.md](2026-08-17-typescript-migration.md) §7–§12
 
@@ -138,10 +139,6 @@ Draft text for the `@next` release:
 
 1. Full-scale soak on the real target repositories (tooling above).
 2. `npm publish` of `code-indexing-mcp@next` and one release of feedback.
-3. The installer `--runtime ts` opt-in (§12 step 2): a Python-installer flag
-   that rewrites harness configs to the TS launcher. Harness configs are
-   absolute-path launchers, so the mechanism is the installer's existing
-   config-merge path.
-4. Real-hardware accelerator promotion, still pending from Phase 7 — this
+3. Real-hardware accelerator promotion, still pending from Phase 7 — this
    machine's CUDA device was deliberately bypassed (CPU forced) so the
    comparison described like-for-like backends.
