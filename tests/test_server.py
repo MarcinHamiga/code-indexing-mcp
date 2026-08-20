@@ -17,6 +17,7 @@ from code_indexing_mcp import server as server_module
 from code_indexing_mcp.application import Application, RuntimePaths
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.server import create_server
+from code_indexing_mcp.settings import IndexSettings
 
 
 class TinyEmbedder:
@@ -806,7 +807,7 @@ async def test_server_shutdown_waits_for_active_startup_index(tmp_path: Path) ->
             server, list_roots_callback=list_roots
         ) as client:
             await client.list_tools()
-            assert await asyncio.to_thread(embedder.started.wait, 5)
+            await _wait_until(embedder.started.is_set, timeout=30)
             entered.set()
             await leave.wait()
 
@@ -814,7 +815,7 @@ async def test_server_shutdown_waits_for_active_startup_index(tmp_path: Path) ->
     # Generous bounds: the startup index must reach the embedding phase and
     # then complete after release, and a cold CI runner (Windows especially)
     # can take far longer than a locally-observed 2s to get there.
-    await asyncio.wait_for(entered.wait(), timeout=30)
+    await asyncio.wait_for(entered.wait(), timeout=45)
     try:
         leave.set()
         await asyncio.sleep(0.05)
@@ -933,7 +934,7 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
             server, list_roots_callback=list_roots
         ) as client:
             await client.list_tools()
-            assert await asyncio.to_thread(embedder.started.wait, 5)
+            await _wait_until(embedder.started.is_set, timeout=30)
 
             result = await asyncio.wait_for(
                 client.call_tool(
@@ -979,7 +980,13 @@ async def test_startup_maintenance_defers_to_startup_indexing(tmp_path: Path) ->
             server, list_roots_callback=list_roots
         ) as client:
             await client.list_tools()
-            assert await asyncio.to_thread(embedder.started.wait, 5)
+            # Startup indexing loads the model before the test can release the
+            # embedder; a hard wait(t) bound makes a loaded shared runner fail
+            # on timing rather than behavior, so poll to a generous deadline.
+            started_deadline = time.monotonic() + 30
+            while time.monotonic() < started_deadline and not embedder.started.is_set():
+                await asyncio.sleep(0.05)
+            assert embedder.started.is_set(), "startup indexing never began embedding"
             await asyncio.sleep(0.3)
             assert not timestamp_path.exists()
             embedder.release.set()
@@ -1044,12 +1051,11 @@ async def test_explicit_code_query_ignores_unrelated_startup_failure(tmp_path: P
         server, list_roots_callback=list_roots
     ) as client:
         await client.list_tools()
-        for _ in range(100):
-            if embedder.calls == 1:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            pytest.fail("expected the unrelated startup index to fail")
+        # The startup job embeds on a background task; a hard 1s window makes a
+        # loaded shared runner fail on timing rather than behavior. Poll to a
+        # generous deadline, and match >= 1 so a file split into several
+        # candidates (embed bisection retries) cannot skip the check.
+        await _wait_until(lambda: embedder.calls >= 1, timeout=30)
 
         result = await client.call_tool(
             "search_code",
@@ -1729,6 +1735,11 @@ async def test_index_project_reports_file_counts_while_it_runs(
         RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
         embedder=SlowEmbedder(),
         cwd=tmp_path,
+        # The scheduled pass holds the registry's index-global lock while it
+        # optimises tables, and this test measures one manual run's progress
+        # bar - it must not race that background pass for the lock on a busy
+        # runner (observed as an INDEX_BUSY error on CI).
+        settings=IndexSettings.from_environment({"CODE_INDEXING_AUTO_MAINTENANCE": "0"}),
     )
     server = create_server(app)
     reports: list[tuple[float, float | None, str | None]] = []
@@ -1791,7 +1802,7 @@ async def test_index_storage_status_tool_reports_installation_statistics(tmp_pat
     # layer and leave the tool free to serialize an empty or malformed body.
     for result in (scoped, installation):
         payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
-        assert payload["schema_version"] == 1
+        assert payload["schema_version"] == 2
         assert payload["registry"]["name"] == "projects"
         assert payload["registry"]["row_count"] == 1
         assert payload["registry"]["logical_bytes"] > 0
@@ -1828,7 +1839,7 @@ async def test_index_storage_maintenance_tool_defaults_to_dry_run(tmp_path: Path
     assert not installation.isError
     for result in (scoped, installation):
         payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
-        assert payload["schema_version"] == 1
+        assert payload["schema_version"] == 2
         assert payload["dry_run"] is True
         assert payload["trigger"] == "manual"
         assert payload["retention_hours"] == 24

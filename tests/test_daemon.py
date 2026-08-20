@@ -412,7 +412,9 @@ def test_concurrent_clients_share_one_model_and_one_indexing_job(
     reports = [outcome for outcome in outcomes if isinstance(outcome, IndexReport)]
     errors = [outcome for outcome in outcomes if isinstance(outcome, CodeIndexingError)]
     assert reports
-    assert all(error.code is ErrorCode.INDEX_BUSY for error in errors)
+    assert all(error.code is ErrorCode.INDEX_BUSY for error in errors), sorted(
+        str(error) for error in errors if error.code is not ErrorCode.INDEX_BUSY
+    )
     assert all(report.project_id == project_id for report in reports)
     assert all(report.errors == [] for report in reports)
     # Exactly one client did the work; any client that acquired the lock after it
@@ -553,7 +555,7 @@ def test_broker_application_dispatches_storage_status(tmp_path: Path) -> None:
 
     status = broker.storage_status(project.id)
 
-    assert status.schema_version == 1
+    assert status.schema_version == 2
     assert status.registry.row_count == 1
     assert [entry.project.id for entry in status.projects] == [project.id]
     assert status.projects[0].consistent is True

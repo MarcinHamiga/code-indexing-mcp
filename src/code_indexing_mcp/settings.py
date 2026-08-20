@@ -161,6 +161,10 @@ class IndexSettings:
     # sets delete_unverified, regardless of configuration.
     auto_maintenance: bool = True
     version_retention_hours: int = DEFAULT_VERSION_RETENTION_HOURS
+    # How many branch index slots, counting the active one, a project retains
+    # before maintenance evicts the least recently used. Protection of the
+    # active, indexing, or recovery-pending slots can exceed it temporarily.
+    branch_cache_limit: int = 4
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> IndexSettings:
@@ -256,4 +260,5 @@ class IndexSettings:
                 1,
                 MAX_VERSION_RETENTION_HOURS,
             ),
+            branch_cache_limit=_integer(environment, "CODE_INDEXING_BRANCH_CACHE_LIMIT", 4, 1, 32),
         )

@@ -990,7 +990,7 @@ def test_storage_status_reports_registry_project_and_totals(tmp_path: Path) -> N
 
     status = app.storage_status()
 
-    assert status.schema_version == 1
+    assert status.schema_version == 2
     assert status.consistent is True
     assert status.overlap_warnings == []
     assert status.worktree_warnings == []
@@ -1010,6 +1010,25 @@ def test_storage_status_reports_registry_project_and_totals(tmp_path: Path) -> N
     scoped = app.storage_status(project.id)
 
     assert [entry.project.id for entry in scoped.projects] == [project.id]
+
+    active = app.store.active_slot(project.id)
+    assert active is not None
+    alternate = active.model_copy(
+        update={"slot_id": "slot-alternate", "partition_id": "partition-alternate"}
+    )
+    app.store.upsert_slot(alternate)
+    app.store._tables(alternate.partition_id)
+
+    with_alternate = app.storage_status()
+    with_alternate_stats = with_alternate.projects[0]
+    assert {slot.slot_id for slot in with_alternate_stats.slots} == {
+        active.slot_id,
+        "slot-alternate",
+    }
+    assert with_alternate.physical_bytes_total == (
+        with_alternate.registry.physical_bytes
+        + sum(slot.physical_bytes for slot in with_alternate_stats.slots)
+    )
 
 
 def test_storage_status_reports_registered_root_overlaps(tmp_path: Path) -> None:

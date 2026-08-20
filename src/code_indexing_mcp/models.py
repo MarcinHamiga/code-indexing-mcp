@@ -952,6 +952,16 @@ class ProjectStatus(FrozenModel):
     # full history: status stays inexpensive.
     progress: IndexProgress | None = None
     last_run: RunSummary | None = None
+    # Branch-aware fields, populated only for projects whose checkout resolves
+    # to a Git or workspace slot. Optional so a pre-slot registry continues to
+    # serialize without them.
+    active_slot_id: str | None = None
+    git_selector_kind: str | None = None
+    git_selector_value: str | None = None
+    git_head: str | None = None
+    git_probe: str | None = None
+    git_clean: bool | None = None
+    branch_build_pending: bool | None = None
 
 
 class RemovalReport(FrozenModel):
@@ -1004,12 +1014,54 @@ class TableStorageStats(FrozenModel):
     indexes: list[IndexStorageStats] = Field(default_factory=list)
 
 
+class ProjectSlot(FrozenModel):
+    """One retained index slot of a project: a branch, commit, workspace, or legacy partition."""
+
+    slot_id: str
+    project_id: str
+    partition_id: str
+    selector_kind: str
+    selector_value: str
+    repository_identity: str | None = None
+    checkout_identity: str | None = None
+    project_prefix: str = ""
+    # The HEAD the partition was last indexed at, and whether the checkout was
+    # clean then. A null HEAD or clean state forces full freshness validation.
+    indexed_head: str | None = None
+    indexed_clean: bool | None = None
+    scan_config_hash: str = ""
+    model_id: str = ""
+    vector_dimension: int = 0
+    schema_version: int = 0
+    state: str = "pending"
+    created_at: int = 0
+    last_used_at: int = 0
+
+
+class SlotStorageStats(FrozenModel):
+    """One branch slot's storage snapshot inside a project."""
+
+    slot_id: str
+    partition_id: str
+    selector_kind: str
+    selector_value: str
+    active: bool = False
+    state: str = "pending"
+    indexed_head: str | None = None
+    indexed_clean: bool | None = None
+    last_used_at: int | None = None
+    physical_bytes: int = 0
+
+
 class ProjectStorageStats(FrozenModel):
     """One project partition's storage snapshot."""
 
     project: ProjectInfo
     snapshot_at: str
     tables: list[TableStorageStats] = Field(default_factory=list)
+    # Every retained branch slot of this project; the active slot's partition
+    # is the one ``tables`` describes.
+    slots: list[SlotStorageStats] = Field(default_factory=list)
     # Sum of the partition's table directories on disk.
     partition_physical_bytes: int = 0
     # False when a table version changed while the snapshot was collected, or
@@ -1023,7 +1075,9 @@ class ProjectStorageStats(FrozenModel):
 class StorageStatus(FrozenModel):
     """Installation-wide read-only storage statistics."""
 
-    schema_version: int = 1
+    # 2: projects grew a per-slot ``slots`` list describing every retained
+    # branch partition.
+    schema_version: int = 2
     snapshot_at: str
     registry: TableStorageStats
     projects: list[ProjectStorageStats] = Field(default_factory=list)
@@ -1060,7 +1114,8 @@ class MaintenanceProjectResult(FrozenModel):
 class MaintenanceReport(FrozenModel):
     """Outcome of one storage maintenance pass, manual or scheduled."""
 
-    schema_version: int = 1
+    # 2: per-project before/after statistics grew the per-slot ``slots`` list.
+    schema_version: int = 2
     # "manual" or "scheduled".
     trigger: str
     dry_run: bool

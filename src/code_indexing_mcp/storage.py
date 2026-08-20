@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import itertools
+import json
 import logging
 import os
 import shutil
@@ -28,6 +30,8 @@ from lancedb.query import ColumnOrdering, FullTextOperator, MultiMatchQuery
 from lancedb.table import LanceTable
 
 from .errors import CodeIndexingError, ErrorCode
+from .git_state import GitProbeOutcome, probe_git_state
+from .git_state import slot_id as _git_slot_id
 from .models import (
     ChunkPreview,
     CodeChunk,
@@ -36,7 +40,9 @@ from .models import (
     IndexedChunk,
     IndexStorageStats,
     ProjectInfo,
+    ProjectSlot,
     ProjectStorageStats,
+    SlotStorageStats,
     StoredChunk,
     StoredFile,
     TableStorageStats,
@@ -117,6 +123,16 @@ INDEXED_CHUNK_COLUMNS = [
 
 def _quoted(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _optional_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _legacy_slot_id(project_id: str) -> str:
+    """Deterministic identifier of a project's pre-slot legacy partition."""
+    payload = json.dumps(["legacy-slot-v1", project_id], separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _file_ids_condition(file_ids: Iterable[str]) -> str:
@@ -421,8 +437,13 @@ class LanceStore:
         directory.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(directory / "registry", read_consistency_interval=timedelta(0))
         self._projects = self._table(self._db, "projects", self._project_schema())
+        self._project_slots = self._table(self._db, "project_slots", self._project_slot_schema())
+        self._active_slots = self._table(self._db, "active_slots", self._active_slot_schema())
         self._partitions: OrderedDict[str, _ProjectTables] = OrderedDict()
         self._partitions_lock = threading.Lock()
+        # Serializes legacy adoption inside this process; see _ensure_adopted
+        # for why it is not the cross-process project writer lock.
+        self._adoption_lock = threading.Lock()
         for row in legacy_rows:
             row = {
                 **row,
@@ -484,6 +505,245 @@ class LanceStore:
             return
         self._merge(self._projects, "id", [row])
 
+    def upsert_slot(self, slot: ProjectSlot) -> None:
+        """Create or update one slot row, idempotently.
+
+        Like ``upsert_project``, a no-op write must not churn registry table
+        versions, so timestamps (``created_at``, ``last_used_at``) are excluded
+        from the equality check.
+        """
+        row = self._slot_row(slot)
+        existing = self._rows(self._project_slots, f"slot_id = {_quoted(slot.slot_id)}")
+        if existing and all(
+            existing[0][column] == row[column]
+            for column in row
+            if column not in {"created_at", "last_used_at"}
+        ):
+            return
+        self._merge(self._project_slots, "slot_id", [row])
+
+    def get_slot(self, slot_id: str) -> ProjectSlot | None:
+        rows = self._rows(self._project_slots, f"slot_id = {_quoted(slot_id)}")
+        return self._slot_from_row(rows[0]) if rows else None
+
+    def list_slots(self, project_id: str) -> list[ProjectSlot]:
+        rows = self._rows(self._project_slots, f"project_id = {_quoted(project_id)}")
+        return [self._slot_from_row(row) for row in rows]
+
+    def touch_slot(self, slot_id: str) -> None:
+        """Stamp a slot's last-use time for least-recently-used retention."""
+        slot = self.get_slot(slot_id)
+        if slot is None:
+            return
+        row = self._slot_row(slot.model_copy(update={"last_used_at": time.time_ns()}))
+        self._merge(self._project_slots, "slot_id", [row])
+
+    def activate_slot(self, project_id: str, slot_id: str) -> int:
+        """Point *project_id*'s single active pointer at *slot_id*.
+
+        The pointer is one row keyed by the project, so switching slots is a
+        single atomic upsert rather than two coordinated flag updates. It is
+        published only after the slot row exists, and every actual change
+        increments ``activation_epoch`` so long-lived handles can detect that
+        the selection moved under them. Returns the resulting epoch.
+        """
+        slot = self.get_slot(slot_id)
+        if slot is None or slot.project_id != project_id:
+            raise ValueError(f"cannot activate unknown slot {slot_id!r} for {project_id!r}")
+        rows = self._rows(self._active_slots, f"project_id = {_quoted(project_id)}")
+        if rows and str(rows[0]["slot_id"]) == slot_id:
+            return int(rows[0]["activation_epoch"])
+        epoch = (int(rows[0]["activation_epoch"]) if rows else 0) + 1
+        self._merge(
+            self._active_slots,
+            "project_id",
+            [
+                {
+                    "project_id": project_id,
+                    "slot_id": slot_id,
+                    "activation_epoch": epoch,
+                    "updated_at": time.time_ns(),
+                }
+            ],
+        )
+        return epoch
+
+    def active_slot(self, project_id: str) -> ProjectSlot | None:
+        """Return the slot the project's active pointer selects, or None."""
+        rows = self._rows(self._active_slots, f"project_id = {_quoted(project_id)}")
+        if not rows:
+            return None
+        slot = self.get_slot(str(rows[0]["slot_id"]))
+        # A pointer left behind by a removed slot row selects nothing; the
+        # caller's fallback (adoption, then the legacy identity) takes over.
+        if slot is None or slot.project_id != project_id:
+            return None
+        return slot
+
+    def remove_slot(self, slot_id: str) -> bool:
+        """Remove a slot row and any pointer that still selects it.
+
+        Registry-level removal only. Durable physical eviction (deleting
+        states, generation advancement, partition deletion) is the retention
+        pass's job, so the partition directory is deliberately left alone.
+        """
+        slot = self.get_slot(slot_id)
+        if slot is None:
+            return False
+        self._active_slots.delete(f"slot_id = {_quoted(slot_id)}")
+        self._project_slots.delete(f"slot_id = {_quoted(slot_id)}")
+        with self._partitions_lock:
+            self._partitions.pop(slot.partition_id, None)
+        return True
+
+    def _partition_id_for(self, project_id: str) -> str:
+        """Resolve the physical partition a logical project currently reads and writes.
+
+        The active pointer selects it; a project without one is adopted on
+        first touch. Until the application boundary resolves explicit
+        ``ActiveIndexTarget`` values, this is the single place the
+        logical-to-physical mapping happens, and for adopted legacy and
+        workspace slots it deliberately still yields ``project_id``.
+        """
+        slot = self.active_slot(project_id)
+        if slot is not None:
+            return slot.partition_id
+        self._ensure_adopted(project_id)
+        slot = self.active_slot(project_id)
+        return slot.partition_id if slot is not None else project_id
+
+    def _ensure_adopted(self, project_id: str) -> None:
+        """Map a pre-slot registration onto the slot registry, once and idempotently.
+
+        Runs under an in-process mutex with a re-check inside it. It must not
+        take the logical project writer lock: the indexer and maintenance
+        already hold it while calling into storage, and re-acquiring it here
+        deadlocks. Adoption needs no cross-process mutual exclusion anyway --
+        slot identifiers are derived deterministically from stable inputs, so
+        two processes racing an adoption write the same row and the pointer
+        converges (the losing epoch bump is harmless because nothing has
+        captured an epoch yet).
+
+        Non-Git projects adopt their existing partition as the workspace slot.
+        Git (or temporarily unreadable) checkouts record the old partition as
+        an unscoped legacy slot that no branch selector claims. The slot row
+        mirrors the project row's lifecycle state, so a project that is still
+        pending adopts a pending slot and reads through it never materialise
+        a partition.
+        """
+        if self.active_slot(project_id) is not None:
+            return
+        rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
+        if not rows:
+            return
+        row = rows[0]
+        project = ProjectInfo.model_validate_json(str(row["payload"]))
+        with self._adoption_lock:
+            if self.active_slot(project.id) is not None:
+                return
+            state = probe_git_state(Path(project.root))
+            now = time.time_ns()
+            partition_state = str(row["state"])
+            scan_hash = self._scan_config_hash(project)
+            model_id = str(row["model_id"])
+            vector_dimension = int(row["vector_dimension"])
+            schema_version = int(row["schema_version"])
+            if state.probe is GitProbeOutcome.NOT_GIT:
+                slot = ProjectSlot(
+                    slot_id=_git_slot_id(project.id, state),
+                    project_id=project.id,
+                    partition_id=project.id,
+                    selector_kind=state.selector_kind.value,
+                    selector_value=state.selector_value,
+                    repository_identity=None,
+                    checkout_identity=None,
+                    project_prefix="",
+                    indexed_head=None,
+                    indexed_clean=None,
+                    scan_config_hash=scan_hash,
+                    model_id=model_id,
+                    vector_dimension=vector_dimension,
+                    schema_version=schema_version,
+                    state=partition_state,
+                    created_at=now,
+                    last_used_at=now,
+                )
+            else:
+                slot = ProjectSlot(
+                    slot_id=_legacy_slot_id(project.id),
+                    project_id=project.id,
+                    partition_id=project.id,
+                    selector_kind="legacy",
+                    selector_value=project.id,
+                    repository_identity=state.repository_identity,
+                    checkout_identity=state.checkout_identity,
+                    project_prefix=state.project_prefix,
+                    indexed_head=None,
+                    indexed_clean=None,
+                    scan_config_hash=scan_hash,
+                    model_id=model_id,
+                    vector_dimension=vector_dimension,
+                    schema_version=schema_version,
+                    state=partition_state,
+                    created_at=now,
+                    last_used_at=now,
+                )
+            self.upsert_slot(slot)
+            self.activate_slot(project.id, slot.slot_id)
+
+    @staticmethod
+    def _scan_config_hash(project: ProjectInfo) -> str:
+        payload = json.dumps(
+            project.scan.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _slot_row(slot: ProjectSlot) -> dict[str, Any]:
+        return {
+            "slot_id": slot.slot_id,
+            "project_id": slot.project_id,
+            "partition_id": slot.partition_id,
+            "selector_kind": slot.selector_kind,
+            "selector_value": slot.selector_value,
+            "repository_identity": slot.repository_identity,
+            "checkout_identity": slot.checkout_identity,
+            "project_prefix": slot.project_prefix,
+            "indexed_head": slot.indexed_head,
+            "indexed_clean": slot.indexed_clean,
+            "scan_config_hash": slot.scan_config_hash,
+            "model_id": slot.model_id,
+            "vector_dimension": slot.vector_dimension,
+            "schema_version": slot.schema_version,
+            "state": slot.state,
+            "created_at": slot.created_at,
+            "last_used_at": slot.last_used_at,
+        }
+
+    @staticmethod
+    def _slot_from_row(row: dict[str, Any]) -> ProjectSlot:
+        return ProjectSlot(
+            slot_id=str(row["slot_id"]),
+            project_id=str(row["project_id"]),
+            partition_id=str(row["partition_id"]),
+            selector_kind=str(row["selector_kind"]),
+            selector_value=str(row["selector_value"]),
+            repository_identity=_optional_str(row.get("repository_identity")),
+            checkout_identity=_optional_str(row.get("checkout_identity")),
+            project_prefix=str(row.get("project_prefix") or ""),
+            indexed_head=_optional_str(row.get("indexed_head")),
+            indexed_clean=(
+                None if row.get("indexed_clean") is None else bool(row["indexed_clean"])
+            ),
+            scan_config_hash=str(row.get("scan_config_hash") or ""),
+            model_id=str(row.get("model_id") or ""),
+            vector_dimension=int(row.get("vector_dimension") or 0),
+            schema_version=int(row.get("schema_version") or 0),
+            state=str(row.get("state") or "pending"),
+            created_at=int(row.get("created_at") or 0),
+            last_used_at=int(row.get("last_used_at") or 0),
+        )
+
     def incompatibility_reason(self, project_id: str, model_id: str) -> str | None:
         """Return why *project_id*'s stored generation must be rebuilt, or None.
 
@@ -518,7 +778,7 @@ class LanceStore:
         # builds of the same schema version, so the partition's own vector
         # column is the authority: a stored float32 partition under a float16
         # store (or the reverse) must rebuild rather than mix generations.
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         if tables is not None:
             stored_dtype = tables.chunks.schema.field("vector").type.value_type
             if stored_dtype != self.vector_dtype:
@@ -553,11 +813,12 @@ class LanceStore:
         to be written by the calling run. Returns False when the project is
         not registered.
         """
-        with self.partition_access(project_id):
-            self._advance_partition_generation(project_id)
+        partition_id = self._partition_id_for(project_id)
+        with self._partition_access_physical(partition_id):
+            self._advance_partition_generation(partition_id)
             with self._partitions_lock:
-                self._partitions.pop(project_id, None)
-            partition = self.directory / "projects" / project_id
+                self._partitions.pop(partition_id, None)
+            partition = self.directory / "projects" / partition_id
             if partition.exists():
                 shutil.rmtree(partition)
             rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
@@ -584,7 +845,7 @@ class LanceStore:
         return str(rows[0]["state"])
 
     def list_files(self, project_id: str) -> list[StoredFile]:
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         if tables is None:
             return []
         return [StoredFile.model_validate(row) for row in self._rows(tables.files)]
@@ -596,7 +857,7 @@ class LanceStore:
         not errors, so they do not count. Reads only the error rows instead of
         materializing every file in the project.
         """
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         if tables is None:
             return False
         return any(
@@ -606,13 +867,13 @@ class LanceStore:
 
     def upsert_file(self, record: StoredFile) -> None:
         self._merge(
-            self._tables(record.project_id).files,
+            self._project_tables(record.project_id).files,
             "file_id",
             [record.model_dump()],
         )
 
     def replace_file(self, record: StoredFile, chunks: list[StoredChunk]) -> None:
-        tables = self._tables(record.project_id)
+        tables = self._project_tables(record.project_id)
         condition = f"file_id = {_quoted(record.file_id)}"
         chunks = [
             chunk
@@ -639,7 +900,7 @@ class LanceStore:
         self.upsert_file(record)
 
     def remove_file(self, project_id: str, file_id: str) -> None:
-        tables = self._tables(project_id)
+        tables = self._project_tables(project_id)
         condition = f"file_id = {_quoted(file_id)}"
         tables.chunks.delete(condition)
         if tables.references is None:
@@ -649,7 +910,7 @@ class LanceStore:
 
     def table_versions(self, project_id: str) -> TableVersions:
         """Snapshot every partition table's version before a commit begins."""
-        tables = self._tables(project_id)
+        tables = self._project_tables(project_id)
         if tables.references is None:
             raise RuntimeError("Reference table is missing from an interrupted transaction")
         return TableVersions(
@@ -676,7 +937,7 @@ class LanceStore:
         must not go through the create-on-write path here: materialising an
         empty partition would leave a version the journal can never name.
         """
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         if tables is None:
             return False
         tables.files.restore(versions.files)
@@ -745,7 +1006,7 @@ class LanceStore:
                 "require; refusing to commit because it could delete rows of "
                 "untouched files. Upgrade lancedb and retry.",
             )
-        tables = self._tables(project_id)
+        tables = self._project_tables(project_id)
         replacement_ids: list[str] = []
         chunk_iter = iter(chunk_batches)
         try:
@@ -832,7 +1093,7 @@ class LanceStore:
 
     def reference_version(self, project_id: str) -> int:
         """Return the current structural snapshot without creating a partition."""
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         if tables is None or tables.references is None:
             return 0
         return int(tables.references.version)
@@ -849,7 +1110,7 @@ class LanceStore:
         that need the distinction must ask this directly rather than trust an
         empty result.
         """
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         return tables is not None and tables.references is not None
 
     def coverage_for_file(
@@ -928,7 +1189,7 @@ class LanceStore:
         ids = list(project_ids or [project.id for project in self.list_projects()])
         chunks: list[IndexedChunk] = []
         for project_id in ids:
-            tables = self._existing_tables(project_id)
+            tables = self._project_existing_tables(project_id)
             if tables is None:
                 continue
             chunks.extend(
@@ -950,7 +1211,7 @@ class LanceStore:
         project_id = self._chunk_project_id(chunk_id)
         if project_id is None:
             return None
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         if tables is None:
             return None
         rows = cast(
@@ -992,7 +1253,7 @@ class LanceStore:
 
     def count_chunks(self, project_ids: Iterable[str] | None = None) -> int:
         ids = list(project_ids or [project.id for project in self.list_projects()])
-        tables = (self._existing_tables(project_id) for project_id in ids)
+        tables = (self._project_existing_tables(project_id) for project_id in ids)
         return sum(table.chunks.count_rows() for table in tables if table is not None)
 
     def hybrid_search(
@@ -1038,7 +1299,7 @@ class LanceStore:
         limit: int,
     ) -> list[dict[str, Any]]:
         """Run the hybrid query for one partition, injecting its project id."""
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         if tables is None:
             return []
         # MultiMatchQuery spans the two single-column FTS indexes (content
@@ -1107,7 +1368,7 @@ class LanceStore:
         if kinds:
             values = ", ".join(_quoted(kind) for kind in kinds)
             conditions.append(f"kind IN ({values})")
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         if tables is None:
             return []
         # LIKE is only a pushdown pre-filter. The query engine ignores escape
@@ -1144,7 +1405,7 @@ class LanceStore:
         return matches[:limit]
 
     def outline_chunks(self, path: str, project_id: str) -> list[ChunkPreview]:
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         if tables is None:
             return []
         condition = (
@@ -1171,7 +1432,7 @@ class LanceStore:
         combine indexed rows with the unindexed tail until maintenance folds
         that tail into the indexes.
         """
-        tables = self._tables(project_id)
+        tables = self._project_tables(project_id)
         chunks = tables.chunks
         indices = list(chunks.list_indices())
         indexed_columns = {column for index in indices for column in index.columns}
@@ -1228,7 +1489,7 @@ class LanceStore:
         never be passed by an automatic path. A registered project with no
         partition is left untouched (``False``) rather than materialized.
         """
-        tables = self._existing_tables(project_id)
+        tables = self._project_existing_tables(project_id)
         if tables is None:
             return False
         tables.files.optimize(cleanup_older_than=cleanup_older_than)
@@ -1242,13 +1503,23 @@ class LanceStore:
         self._projects.optimize(cleanup_older_than=cleanup_older_than)
 
     def remove_project(self, project_id: str) -> bool:
+        """Remove a registration, every slot row, every owned partition, and its pointer."""
         existed = bool(self._rows(self._projects, f"id = {_quoted(project_id)}"))
         self._projects.delete(f"id = {_quoted(project_id)}")
-        with self._partitions_lock:
-            self._partitions.pop(project_id, None)
-        partition = self.directory / "projects" / project_id
-        if partition.exists():
-            shutil.rmtree(partition)
+        partition_ids = {slot.partition_id for slot in self.list_slots(project_id)}
+        # A never-adopted project still owns its legacy partition directory.
+        partition_ids.add(project_id)
+        self._project_slots.delete(f"project_id = {_quoted(project_id)}")
+        self._active_slots.delete(f"project_id = {_quoted(project_id)}")
+        for partition_id in sorted(partition_ids):
+            with self._partitions_lock:
+                self._partitions.pop(partition_id, None)
+            partition = self.directory / "projects" / partition_id
+            if partition.exists():
+                shutil.rmtree(partition)
+            generation = self.directory / "partition-generations" / partition_id
+            if generation.exists():
+                generation.unlink()
         return existed
 
     @staticmethod
@@ -1263,6 +1534,41 @@ class LanceStore:
                 ("vector_dimension", pa.int32()),
                 ("schema_version", pa.int32()),
                 ("state", pa.string()),
+                ("updated_at", pa.int64()),
+            ]
+        )
+
+    @staticmethod
+    def _project_slot_schema() -> pa.Schema:
+        return pa.schema(
+            [
+                ("slot_id", pa.string()),
+                ("project_id", pa.string()),
+                ("partition_id", pa.string()),
+                ("selector_kind", pa.string()),
+                ("selector_value", pa.string()),
+                ("repository_identity", pa.string()),
+                ("checkout_identity", pa.string()),
+                ("project_prefix", pa.string()),
+                ("indexed_head", pa.string()),
+                ("indexed_clean", pa.bool_()),
+                ("scan_config_hash", pa.string()),
+                ("model_id", pa.string()),
+                ("vector_dimension", pa.int32()),
+                ("schema_version", pa.int32()),
+                ("state", pa.string()),
+                ("created_at", pa.int64()),
+                ("last_used_at", pa.int64()),
+            ]
+        )
+
+    @staticmethod
+    def _active_slot_schema() -> pa.Schema:
+        return pa.schema(
+            [
+                ("project_id", pa.string()),
+                ("slot_id", pa.string()),
+                ("activation_epoch", pa.int64()),
                 ("updated_at", pa.int64()),
             ]
         )
@@ -1343,61 +1649,86 @@ class LanceStore:
             ]
         )
 
-    def _cached(self, project_id: str) -> _ProjectTables | None:
-        """Return the cached partition for *project_id*, marking it recently used."""
+    def _cached(self, partition_id: str) -> _ProjectTables | None:
+        """Return the cached partition, marking it recently used."""
         with self._partitions_lock:
-            cached = self._partitions.get(project_id)
+            cached = self._partitions.get(partition_id)
             if cached is not None:
-                self._partitions.move_to_end(project_id)
+                self._partitions.move_to_end(partition_id)
             return cached
 
     @contextmanager
     def partition_access(self, project_id: str) -> Iterator[None]:
         """Prevent a destructive rebuild from invalidating an active query."""
+        with self._partition_access_physical(self._partition_id_for(project_id)):
+            yield
+
+    @contextmanager
+    def _partition_access_physical(self, partition_id: str) -> Iterator[None]:
+        """Lock one already-resolved physical partition."""
         directory = self.directory.parent / "locks"
         directory.mkdir(parents=True, exist_ok=True)
-        with FileLock(directory / f"partition-{project_id}.lock"):
+        with FileLock(directory / f"partition-{partition_id}.lock"):
             yield
 
     @contextmanager
     def partitions_access(self, project_ids: Iterable[str]) -> Iterator[None]:
-        """Hold partition locks in a stable order for a multi-project query."""
+        """Hold the active partitions for logical projects in stable order."""
+        partition_ids = {self._partition_id_for(project_id) for project_id in project_ids}
         with ExitStack() as stack:
-            for project_id in sorted(set(project_ids)):
-                stack.enter_context(self.partition_access(project_id))
+            for partition_id in sorted(set(partition_ids)):
+                stack.enter_context(self._partition_access_physical(partition_id))
             yield
 
-    def _remember(self, project_id: str, tables: _ProjectTables) -> _ProjectTables:
+    def _remember(self, partition_id: str, tables: _ProjectTables) -> _ProjectTables:
         """Cache *tables*, evicting the least recently used partition past the bound.
 
         Eviction only drops this dictionary's reference. A caller mid-query holds its
         own reference to the tables, so the underlying dataset stays open until that
         caller is done — the daemon serves each client on its own thread and must not
         have a table closed underneath it.
+
+        A caller that just built a complete partition (write path, references table
+        created) must win the cache slot even if a concurrent read of the same
+        partition cached a partial object while the tables were still being created;
+        returning the partial object would make the write path hand its own commit a
+        partition whose references table it can no longer see.
         """
         with self._partitions_lock:
-            existing = self._partitions.get(project_id)
+            existing = self._partitions.get(partition_id)
             if existing is not None:
                 # Another thread opened it first; keep one instance so both callers
                 # share a single set of handles.
-                self._partitions.move_to_end(project_id)
+                self._partitions.move_to_end(partition_id)
+                if existing.references is None and tables.references is not None:
+                    self._partitions[partition_id] = tables
+                    self._partitions.move_to_end(partition_id)
+                    return tables
                 return existing
-            self._partitions[project_id] = tables
+            self._partitions[partition_id] = tables
             while len(self._partitions) > MAX_CACHED_PARTITIONS:
                 self._partitions.popitem(last=False)
             return tables
 
-    def _tables(self, project_id: str) -> _ProjectTables:
-        """Open *project_id*'s partition, creating it. For write paths only."""
-        cached = self._cached(project_id)
+    def _project_tables(self, project_id: str) -> _ProjectTables:
+        """Open *project_id*'s active partition, creating it. For write paths."""
+        return self._tables(self._partition_id_for(project_id))
+
+    def _project_existing_tables(self, project_id: str) -> _ProjectTables | None:
+        """Open *project_id*'s active partition without creating it, or None."""
+        return self._existing_tables(self._partition_id_for(project_id))
+
+    def _tables(self, partition_id: str) -> _ProjectTables:
+        """Open one physical partition, creating it. For write paths only."""
+        cached = self._cached(partition_id)
         if (
             cached is not None
             and cached.references is not None
-            and cached.generation == self._partition_generation(project_id)
+            and cached.generation == self._partition_generation(partition_id)
         ):
             return cached
         database = lancedb.connect(
-            self.directory / "projects" / project_id,
+            self.directory / "projects" / partition_id,
             read_consistency_interval=timedelta(0),
         )
         tables = _ProjectTables(
@@ -1408,35 +1739,36 @@ class LanceStore:
                 self._chunk_schema(self.vector_dimension, self.vector_dtype),
             ),
             references=self._table(database, "references", self._reference_schema()),
-            generation=self._partition_generation(project_id),
+            generation=self._partition_generation(partition_id),
         )
         if cached is not None:
-            return self._replace_cached(project_id, tables)
-        return self._remember(project_id, tables)
+            return self._replace_cached(partition_id, tables)
+        return self._remember(partition_id, tables)
 
-    def _replace_cached(self, project_id: str, tables: _ProjectTables) -> _ProjectTables:
+    def _replace_cached(self, partition_id: str, tables: _ProjectTables) -> _ProjectTables:
         """Replace a cached legacy partition after adding its references table."""
         with self._partitions_lock:
-            self._partitions[project_id] = tables
-            self._partitions.move_to_end(project_id)
+            self._partitions[partition_id] = tables
+            self._partitions.move_to_end(partition_id)
         return tables
 
-    def _existing_tables(self, project_id: str) -> _ProjectTables | None:
-        """Open *project_id*'s partition without creating it, or return None.
+    def _existing_tables(self, partition_id: str) -> _ProjectTables | None:
+        """Open one physical partition without creating it, or return None.
 
-        Reads must not materialise storage for a project they are only looking
-        at. get_chunk in particular scans every registered project, so going
-        through the create-on-write _tables() would leave an empty partition
-        directory behind for each project that has never been indexed.
+        Reads must not materialise storage for a partition they are only
+        looking at. get_chunk in particular scans every registered project, so
+        going through the create-on-write _tables() would leave an empty
+        partition directory behind for each project that has never been
+        indexed.
         """
-        cached = self._cached(project_id)
-        directory = self.directory / "projects" / project_id
-        generation = self._partition_generation(project_id)
+        cached = self._cached(partition_id)
+        directory = self.directory / "projects" / partition_id
+        generation = self._partition_generation(partition_id)
         if cached is not None:
             if directory.is_dir() and cached.generation == generation:
                 return cached
             with self._partitions_lock:
-                self._partitions.pop(project_id, None)
+                self._partitions.pop(partition_id, None)
         if not directory.is_dir():
             return None
         database = lancedb.connect(directory, read_consistency_interval=timedelta(0))
@@ -1449,20 +1781,20 @@ class LanceStore:
             )
         except (ValueError, FileNotFoundError):
             return None
-        return self._remember(project_id, tables)
+        return self._remember(partition_id, tables)
 
-    def _partition_generation(self, project_id: str) -> int:
-        path = self.directory / "partition-generations" / project_id
+    def _partition_generation(self, partition_id: str) -> int:
+        path = self.directory / "partition-generations" / partition_id
         try:
             return int(path.read_text())
         except (OSError, ValueError):
             return 0
 
-    def _advance_partition_generation(self, project_id: str) -> None:
-        path = self.directory / "partition-generations" / project_id
+    def _advance_partition_generation(self, partition_id: str) -> None:
+        path = self.directory / "partition-generations" / partition_id
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(str(self._partition_generation(project_id) + 1))
+        temporary.write_text(str(self._partition_generation(partition_id) + 1))
         os.replace(temporary, path)
 
     @staticmethod
@@ -1527,8 +1859,9 @@ class LanceStore:
         installation-wide report can resolve every project once and then
         collect each partition without N+1 registry reads.
         """
-        tables = self._existing_tables(project.id)
-        partition = self.directory / "projects" / project.id
+        partition_id = self._partition_id_for(project.id)
+        tables = self._existing_tables(partition_id)
+        partition = self.directory / "projects" / partition_id
         before = self._partition_versions(tables)
         collected: list[TableStorageStats] = []
         if tables is not None:
@@ -1562,10 +1895,32 @@ class LanceStore:
         # not be conflated: report the failure explicitly and treat the
         # snapshot as unusable.
         open_failed = tables is None and partition.is_dir()
+        active = self.active_slot(project.id)
+        active_slot_id = active.slot_id if active is not None else None
+        slots = [
+            SlotStorageStats(
+                slot_id=slot.slot_id,
+                partition_id=slot.partition_id,
+                selector_kind=slot.selector_kind,
+                selector_value=slot.selector_value,
+                active=slot.slot_id == active_slot_id,
+                state=slot.state,
+                indexed_head=slot.indexed_head,
+                indexed_clean=slot.indexed_clean,
+                last_used_at=slot.last_used_at,
+                physical_bytes=(
+                    partition_physical_bytes
+                    if slot.partition_id == partition_id
+                    else _directory_bytes(self.directory / "projects" / slot.partition_id)
+                ),
+            )
+            for slot in self.list_slots(project.id)
+        ]
         return ProjectStorageStats(
             project=project,
             snapshot_at=datetime.now(UTC).isoformat(),
             tables=collected,
+            slots=slots,
             partition_physical_bytes=partition_physical_bytes,
             consistent=before == after and not open_failed,
             partition_open_failed=open_failed,
@@ -1663,13 +2018,16 @@ class LanceStore:
     def _reference_rows(
         self, project_id: str, condition: str | None, *, version: int | None = None
     ) -> list[ReferenceRecord]:
-        tables = self._existing_tables(project_id)
+        # Keep the physical partition fixed for the whole read. The active
+        # pointer may switch while a historical version is being reopened.
+        partition_id = self._partition_id_for(project_id)
+        tables = self._existing_tables(partition_id)
         if tables is None or tables.references is None:
             return []
         references = tables.references
         if version is not None and version != int(references.version):
             database = lancedb.connect(
-                self.directory / "projects" / project_id,
+                self.directory / "projects" / partition_id,
                 read_consistency_interval=timedelta(0),
             )
             references = cast(LanceTable, database.open_table("references", version=version))

@@ -10,12 +10,13 @@ from unittest.mock import patch
 import lancedb
 import pyarrow as pa
 import pytest
+from conftest import run_git
 from lancedb.expr import Expr
 from lancedb.merge import LanceMergeInsertBuilder
 from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
-from code_indexing_mcp.models import ProjectInfo, StoredChunk, StoredFile
+from code_indexing_mcp.models import ProjectInfo, ProjectSlot, StoredChunk, StoredFile
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.storage import (
     LanceStore,
@@ -308,6 +309,67 @@ def test_list_reference_records_schema_version_pushes_the_filter_into_sql(
     assert store.list_reference_records(project.id, schema_version=4) == [current]
     assert store.list_reference_records(project.id, schema_version=3) == [stale]
     assert store.list_reference_records(project.id, schema_version=5) == []
+
+
+def test_historical_reference_reads_stay_on_one_physical_partition(
+    tmp_path: Path,
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
+    store.upsert_slot(_slot(project.id, "slot-b", partition_id="partition-b"))
+
+    store.activate_slot(project.id, "slot-a")
+    record_a = stored_file(project.id, file_id="file-a")
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record_a.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_batches=(),
+        reference_batches=[
+            ([record_a.file_id], reference_table(reference_record(project.id, record_a.file_id)))
+        ],
+    )
+    historical_version = store.reference_version(project.id)
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record_a.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_batches=(),
+        reference_batches=[
+            (
+                [record_a.file_id],
+                reference_table(
+                    reference_record(
+                        project.id,
+                        record_a.file_id,
+                        reference_id="reference-new",
+                    )
+                ),
+            )
+        ],
+    )
+
+    store.activate_slot(project.id, "slot-b")
+    record_b = stored_file(project.id, file_id="file-b")
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record_b.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_batches=(),
+        reference_batches=[
+            ([record_b.file_id], reference_table(reference_record(project.id, record_b.file_id)))
+        ],
+    )
+
+    with patch.object(
+        store,
+        "_partition_id_for",
+        side_effect=["partition-a", "partition-b"],
+    ):
+        rows = store.list_reference_records(project.id, version=historical_version)
+
+    assert [row["reference_id"] for row in rows] == ["reference-1"]
 
 
 @pytest.mark.parametrize("schema_version", [True, "1"])
@@ -792,6 +854,30 @@ def test_partition_deletion_waits_for_active_reader(tmp_path: Path) -> None:
     assert finished.is_set()
 
 
+def test_partition_lock_resolves_the_active_physical_slot(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
+    store.activate_slot(project.id, "slot-a")
+    store._tables("partition-a")
+    finished = threading.Event()
+
+    def delete() -> None:
+        store.delete_partition(project.id, model_id="test/other")
+        finished.set()
+
+    with store.partition_access(project.id):
+        thread = threading.Thread(target=delete)
+        thread.start()
+        assert not finished.wait(timeout=0.1)
+    thread.join(timeout=5)
+
+    assert finished.is_set()
+
+
 def test_get_chunk_rejects_malformed_unknown_and_pre_migration_ids(tmp_path: Path) -> None:
     store, project_id, _ = _store_with_one_chunk(tmp_path)
 
@@ -1077,6 +1163,29 @@ def test_storage_stats_reports_table_level_metrics(tmp_path: Path) -> None:
         assert table.logical_bytes >= 0
         assert table.physical_bytes >= 0
         assert table.retained_version_count >= 1
+
+
+def test_storage_stats_reports_every_slot_and_its_partition_bytes(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
+    store.upsert_slot(_slot(project.id, "slot-b", partition_id="partition-b"))
+    store.activate_slot(project.id, "slot-a")
+    store._tables("partition-a")
+    store._tables("partition-b")
+
+    report = store.storage_stats(project.id)
+
+    assert {slot.slot_id for slot in report.slots} == {"slot-a", "slot-b"}
+    by_id = {slot.slot_id: slot for slot in report.slots}
+    assert by_id["slot-a"].active is True
+    assert by_id["slot-b"].active is False
+    assert by_id["slot-a"].physical_bytes == report.partition_physical_bytes
+    assert by_id["slot-a"].physical_bytes > 0
+    assert by_id["slot-b"].physical_bytes > 0
 
 
 def test_storage_stats_reports_indexes_after_ensure_indexes(tmp_path: Path) -> None:
@@ -1948,3 +2057,239 @@ def test_vector_storage_flip_marks_rebuild_required(tmp_path: Path) -> None:
 
     narrowed = LanceStore(tmp_path / "f32", vector_dimension=4)
     assert "vector storage" in (narrowed.incompatibility_reason(other.id, "test/model") or "")
+
+
+def _slot(
+    project_id: str,
+    slot_id: str,
+    *,
+    partition_id: str | None = None,
+    selector_kind: str = "ref",
+    selector_value: str = "refs/heads/main",
+    state: str = "ready",
+) -> ProjectSlot:
+    return ProjectSlot(
+        slot_id=slot_id,
+        project_id=project_id,
+        partition_id=partition_id or slot_id,
+        selector_kind=selector_kind,
+        selector_value=selector_value,
+        scan_config_hash="hash",
+        model_id="test/model",
+        vector_dimension=4,
+        schema_version=storage_module.SCHEMA_VERSION,
+        state=state,
+        created_at=1,
+        last_used_at=1,
+    )
+
+
+def test_slot_registry_round_trip_is_idempotent(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    slot = _slot(project.id, "slot-a", partition_id="partition-a")
+
+    store.upsert_slot(slot)
+    store.upsert_slot(slot)
+
+    assert [row.slot_id for row in store.list_slots(project.id)] == ["slot-a"]
+    assert store.get_slot("slot-a") == slot
+    assert store.get_slot("missing") is None
+
+
+def test_activate_slot_publishes_the_pointer_only_after_the_row_exists(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+
+    with pytest.raises(ValueError):
+        store.activate_slot("project-a", "never-written")
+
+    assert store.active_slot("project-a") is None
+
+
+def test_activation_epoch_increments_on_every_pointer_change(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a"))
+    store.upsert_slot(_slot("project-a", "slot-b"))
+
+    assert store.activate_slot("project-a", "slot-a") == 1
+    assert store.activate_slot("project-a", "slot-b") == 2
+    assert store.activate_slot("project-a", "slot-a") == 3
+
+    # Re-selecting the current slot is a no-op, not another epoch.
+    version = store._active_slots.version
+    assert store.activate_slot("project-a", "slot-a") == 3
+    assert store._active_slots.version == version
+    assert store.active_slot("project-a") is not None
+    assert store.active_slot("project-a").slot_id == "slot-a"
+
+
+def test_partition_handles_and_generations_are_keyed_by_partition(tmp_path: Path) -> None:
+    """Two slots of one project must own independent handles and generation counters."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a", partition_id="partition-a"))
+    store.upsert_slot(_slot("project-a", "slot-b", partition_id="partition-b"))
+
+    tables_a = store._tables("partition-a")
+    tables_b = store._tables("partition-b")
+
+    assert "partition-a" in store._partitions
+    assert "partition-b" in store._partitions
+    assert store._partitions["partition-a"] is tables_a
+    assert store._partitions["partition-b"] is tables_b
+
+    store._advance_partition_generation("partition-a")
+    assert store._partition_generation("partition-a") == 1
+    assert store._partition_generation("partition-b") == 0
+    # The bumped handle is reopened at the new generation; the other is untouched.
+    assert store._existing_tables("partition-a").generation == 1
+    assert store._existing_tables("partition-b") is tables_b
+
+
+def test_legacy_adoption_maps_a_plain_directory_to_the_workspace_slot(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_file(stored_file(project.id), _stored_chunks(project.id, 1))
+
+    slots = store.list_slots(project.id)
+
+    assert len(slots) == 1
+    slot = slots[0]
+    assert slot.selector_kind == "workspace"
+    assert slot.selector_value == str(root.resolve())
+    assert slot.partition_id == project.id
+    assert slot.state == "ready"
+    assert store.active_slot(project.id).slot_id == slot.slot_id
+    assert store._partition_id_for(project.id) == project.id
+
+
+def test_legacy_adoption_records_a_git_checkout_as_an_unscoped_legacy_slot(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(root))
+    (root / "main.py").write_text("value = 1\n")
+    run_git("-c", "user.email=t@t", "-c", "user.name=t", "add", "main.py", cwd=root)
+    run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init", cwd=root)
+
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_file(stored_file(project.id), _stored_chunks(project.id, 1))
+
+    slots = store.list_slots(project.id)
+
+    assert len(slots) == 1
+    slot = slots[0]
+    assert slot.selector_kind == "legacy"
+    assert slot.selector_value == project.id
+    assert slot.partition_id == project.id
+    # The legacy identity keeps serving the existing partition unchanged.
+    assert store._partition_id_for(project.id) == project.id
+    assert store.count_chunks([project.id]) == 1
+
+
+def test_adoption_is_idempotent_across_restarts(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_file(stored_file(project.id), _stored_chunks(project.id, 1))
+    first = store.list_slots(project.id)[0]
+
+    reopened = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    reopened.list_files(project.id)
+    reopened.list_files(project.id)
+
+    slots = reopened.list_slots(project.id)
+    assert len(slots) == 1
+    assert slots[0] == first
+
+
+def test_interrupted_adoption_resumes_to_the_same_slot(tmp_path: Path) -> None:
+    """A crash between the slot row and the pointer converges on re-run."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+
+    # Simulate the interrupted write: exactly the row adoption would create,
+    # written without the pointer.
+    from code_indexing_mcp.git_state import probe_git_state
+    from code_indexing_mcp.git_state import slot_id as compute_slot_id
+
+    state = probe_git_state(root)
+    orphan = _slot(
+        project.id,
+        compute_slot_id(project.id, state),
+        partition_id=project.id,
+        selector_kind=state.selector_kind.value,
+        selector_value=state.selector_value,
+        state="pending",
+    )
+    store.upsert_slot(orphan)
+
+    store.list_files(project.id)
+
+    slots = store.list_slots(project.id)
+    assert len(slots) == 1
+    assert slots[0].slot_id == orphan.slot_id
+    assert store.active_slot(project.id).slot_id == orphan.slot_id
+
+
+def test_pending_slot_reads_never_materialize_a_partition(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    # The application registers brand-new projects as pending.
+    store.upsert_project(project, model_id="test/model", state="pending")
+
+    assert store.list_files(project.id) == []
+
+    assert not (store.directory / "projects" / project.id).exists()
+    slot = store.active_slot(project.id)
+    assert slot is not None
+    assert slot.state == "pending"
+    assert store._partition_id_for(project.id) == project.id
+
+
+def test_remove_slot_clears_rows_and_pointer_but_keeps_the_partition(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a", partition_id="partition-a"))
+    store.activate_slot("project-a", "slot-a")
+    store._tables("partition-a")
+
+    assert store.remove_slot("slot-a") is True
+    assert store.remove_slot("slot-a") is False
+
+    assert store.list_slots("project-a") == []
+    assert store.active_slot("project-a") is None
+    assert "partition-a" not in store._partitions
+    # Physical eviction is the retention pass's job, not row removal's.
+    assert (store.directory / "projects" / "partition-a").is_dir()
+
+
+def test_remove_project_deletes_slots_pointer_and_partitions(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_file(stored_file(project.id), _stored_chunks(project.id, 1))
+    slot = store.list_slots(project.id)[0]
+
+    assert store.remove_project(project.id) is True
+
+    assert store.list_slots(project.id) == []
+    assert store.active_slot(project.id) is None
+    assert not (store.directory / "projects" / project.id).exists()
+    assert not (store.directory / "partition-generations" / project.id).exists()
+    assert slot.partition_id == project.id
