@@ -1,15 +1,17 @@
 # Phase 9 notes — cutover
 
 Date: 2026-08-20
-Status: tooling, CI, packaging, and the installer opt-in are complete; the
-release flip itself is an operator action pending a full-scale soak on target
-repositories
+Status: retired; tooling, CI, packaging, and the installer opt-in were
+completed, but the release flip was cancelled after the real-repository
+benchmark failed the migration's performance objective. See the
+[retrospective](2026-08-20-typescript-migration-retrospective.md).
 Branch: `ts-migration`
 Plan: [2026-08-17-typescript-migration.md](2026-08-17-typescript-migration.md) §7–§12
 
-Phase 9 delivers the cutover evidence machinery §8 calls for (the dual-run
+Phase 9 delivered the cutover evidence machinery §8 calls for (the dual-run
 soak and the benchmark comparison), the §11 CI job, and the §12 npm `@next`
-packaging. The Python tree remains the shipping default until the flip.
+packaging. The Python tree remains the shipping implementation; there will be
+no TypeScript release flip from this branch.
 
 ## What is in the tree
 

@@ -1,10 +1,15 @@
 # TypeScript tree
 
-The in-progress port described in
+> [!WARNING]
+> This port was retired and deprecated on 2026-08-20 after a matched WebGPU
+> benchmark on a moderate real repository was substantially slower than the
+> Python implementation. It is retained for research and parity reference;
+> do not release or merge it. See the
+> [retrospective](../docs/plans/2026-08-20-typescript-migration-retrospective.md).
+
+The historical port described in
 [docs/plans/2026-08-17-typescript-migration.md](../docs/plans/2026-08-17-typescript-migration.md).
-Until cutover, the Python tree at the repository root remains the shipping
-product; this tree grows beside it and is promoted to the package root at
-Phase 9.
+The Python tree at the repository root remains the shipping product.
 
 Phase 0 verdicts are in
 [docs/plans/2026-08-17-phase-0-spike-results.md](../docs/plans/2026-08-17-phase-0-spike-results.md).

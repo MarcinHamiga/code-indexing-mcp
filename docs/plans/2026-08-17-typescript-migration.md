@@ -1,7 +1,14 @@
 # Python → TypeScript migration plan
 
 Date: 2026-08-17
-Status: in progress. Phase 0 executed — see
+Status: **retired and deprecated as an implementation path on 2026-08-20**.
+The completed port did not meet its objective of reducing end-to-end indexing
+time on a moderate-to-large real repository. PR #38 is closed and the
+`ts-migration` branch is retained only as a research and parity reference. See
+the
+[retrospective and benchmark record](2026-08-20-typescript-migration-retrospective.md).
+
+Historical progress: Phase 0 executed — see
 [2026-08-17-phase-0-spike-results.md](2026-08-17-phase-0-spike-results.md).
 Phase 1 complete — see
 [2026-08-17-phase-1-notes.md](2026-08-17-phase-1-notes.md).
@@ -19,10 +26,10 @@ Phase 7 implementation complete — hardware promotion remains pending; see
 [2026-08-19-phase-7-notes.md](2026-08-19-phase-7-notes.md).
 Phase 8 complete — see
 [2026-08-19-phase-8-notes.md](2026-08-19-phase-8-notes.md).
-Phase 9 tooling, CI, and packaging complete — the release flip (npm publish,
-full-scale soak, installer default change) remains an operator action; see
+Phase 9 tooling, CI, and packaging complete; the release flip (npm publish,
+full-scale soak, installer default change) was cancelled; see
 [2026-08-20-phase-9-notes.md](2026-08-20-phase-9-notes.md).
-Branch: `ts-migration`
+Branch: `ts-migration` (archived in place; do not release or merge)
 
 ## 1. Purpose and scope
 
