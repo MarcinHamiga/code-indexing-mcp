@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { connect, Index, MultiMatchQuery, Operator, rerankers, type Table } from "@lancedb/lancedb";
 import { Field, FixedSizeList, Float16, Float32, Schema, Utf8 } from "apache-arrow";
 import { topKRankCorrelation } from "./acceptance.ts";
+import { RECORD_FILENAME, loadEnvironment, writeEnvironment } from "./accelerator-env.ts";
 import { Application, type RuntimePaths } from "./application.ts";
 import type { Embedder } from "./embedding.ts";
 import { CodeIndexingError } from "./errors.ts";
@@ -30,6 +31,13 @@ export const PRECISION_TOP_K = 8;
 export const PRECISION_ITERATIONS = 5;
 export const DEFAULT_RECALL_FLOOR = 0.99;
 export const DEFAULT_RANK_FLOOR = 0.95;
+
+function benchmarkRuntimePaths(paths: RuntimePaths, workspace: string): RuntimePaths {
+  const data = path.join(workspace, "data");
+  const environment = loadEnvironment(paths.data).environment;
+  if (environment !== null) writeEnvironment(path.join(data, RECORD_FILENAME), environment);
+  return { data, cache: paths.cache };
+}
 
 export const RETRIEVAL_TOPICS: readonly (readonly string[])[] = [
   ["authorize", "permission", "credential", "session"],
@@ -584,16 +592,17 @@ async function runInWorkspace(
   const settings = {
     ...indexSettingsFromEnvironment(),
     embeddingBatchSize: batchSize,
-    indexExecution: "in-process" as const,
+    embeddingBatchAuto: false,
+    // Benchmark the selected backend rather than production's small-run
+    // deferral policy, which would otherwise turn an accelerator run into CPU.
+    embeddingCrossoverCharacters: 0,
+    embeddingCrossoverAuto: false,
     brokerMode: "off" as const,
   };
-  const app = new Application(
-    { data: path.join(workspace, "data"), cache: paths.cache },
-    {
-      cwd: root,
-      settings,
-    },
-  );
+  const app = new Application(benchmarkRuntimePaths(paths, workspace), {
+    cwd: root,
+    settings,
+  });
   const result = await runIndexBenchmark(app, root);
   result.model_id = app.embedder.modelId;
   result.embedding_backend = app.effectiveBackendSelection.descriptor.accelerator;

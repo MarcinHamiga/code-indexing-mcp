@@ -1,14 +1,22 @@
+import sys
 from pathlib import Path
 
 import benchmark_index_memory
 import numpy as np
 import pytest
 
+from code_indexing_mcp.accelerator_env import (
+    RECORD_FILENAME,
+    AcceleratorEnvironment,
+    write_environment,
+)
 from code_indexing_mcp.application import RuntimePaths
+from code_indexing_mcp.backends import Accelerator
 from code_indexing_mcp.benchmark import (
     REPEATED_EDITS,
     RETRIEVAL_TOPICS,
     SEARCH_ITERATIONS,
+    _benchmark_runtime_paths,
     _directory_physical_bytes,
     _duration_summary,
     build_retrieval_corpus,
@@ -90,6 +98,22 @@ class BenchmarkApplication:
             duration_ms=1_000,
             registry_status="ok",
         )
+
+
+def test_index_benchmark_reuses_the_prepared_accelerator_environment(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "runtime-data", cache=tmp_path / "cache")
+    record = AcceleratorEnvironment(
+        accelerator=Accelerator.WEBGPU,
+        interpreter=Path(sys.executable),
+        providers=("WebGpuExecutionProvider", "CPUExecutionProvider"),
+        python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+    )
+    write_environment(paths.data / RECORD_FILENAME, record)
+
+    benchmark_paths = _benchmark_runtime_paths(paths, tmp_path / "benchmark")
+
+    assert benchmark_paths.data == tmp_path / "benchmark" / "data"
+    assert (benchmark_paths.data / RECORD_FILENAME).exists()
 
 
 def test_benchmark_runs_the_storage_growth_scenarios(tmp_path: Path) -> None:

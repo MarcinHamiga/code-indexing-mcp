@@ -25,6 +25,7 @@ from lancedb.query import (
 from numpy.typing import NDArray
 
 from . import update_check
+from .accelerator_env import RECORD_FILENAME, load_environment, write_environment
 from .acceptance import top_k_rank_correlation
 from .application import Application, RuntimePaths
 from .embedding import PassageEmbedder, QueryEmbedder
@@ -649,6 +650,15 @@ def run_precision_benchmark(
     }
 
 
+def _benchmark_runtime_paths(paths: RuntimePaths, workspace: Path) -> RuntimePaths:
+    """Keep a verified machine accelerator available to an isolated benchmark."""
+    data = workspace / "data"
+    environment = load_environment(paths.data).environment
+    if environment is not None:
+        write_environment(data / RECORD_FILENAME, environment)
+    return RuntimePaths(data=data, cache=paths.cache)
+
+
 def _run_in_workspace(
     paths: RuntimePaths,
     workspace: Path,
@@ -662,11 +672,16 @@ def _run_in_workspace(
     settings = replace(
         IndexSettings.from_environment(),
         embedding_batch_size=batch_size,
-        index_execution="in-process",
+        embedding_batch_auto=False,
+        # A benchmark measures the selected backend's complete worker path,
+        # including model load. Deferral is a production latency policy, not a
+        # performance result, and would turn small accelerator runs into CPU.
+        embedding_crossover_characters=0,
+        embedding_crossover_auto=False,
         broker_mode="off",
     )
     app = Application(
-        RuntimePaths(data=workspace / "data", cache=paths.cache),
+        _benchmark_runtime_paths(paths, workspace),
         cwd=root,
         settings=settings,
     )
