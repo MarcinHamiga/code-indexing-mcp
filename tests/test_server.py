@@ -807,7 +807,7 @@ async def test_server_shutdown_waits_for_active_startup_index(tmp_path: Path) ->
             server, list_roots_callback=list_roots
         ) as client:
             await client.list_tools()
-            assert await asyncio.to_thread(embedder.started.wait, 5)
+            await _wait_until(embedder.started.is_set, timeout=30)
             entered.set()
             await leave.wait()
 
@@ -815,7 +815,7 @@ async def test_server_shutdown_waits_for_active_startup_index(tmp_path: Path) ->
     # Generous bounds: the startup index must reach the embedding phase and
     # then complete after release, and a cold CI runner (Windows especially)
     # can take far longer than a locally-observed 2s to get there.
-    await asyncio.wait_for(entered.wait(), timeout=30)
+    await asyncio.wait_for(entered.wait(), timeout=45)
     try:
         leave.set()
         await asyncio.sleep(0.05)
