@@ -939,6 +939,7 @@ class Indexer:
         # Embedding is the longest gap between progress updates, so announce it
         # before starting each pending batch.
         progress.update(phase="embedding", current_path=None, force=True)
+        slot_id = self.store.active_partition(project.id).slot_id
         for group in _candidate_groups(candidates):
             active = [
                 candidate for candidate in group if state.pending[candidate.owner].error is None
@@ -959,7 +960,7 @@ class Indexer:
                     continue
                 windowed = self._windowed_chunks([candidate.chunk], [segments])
                 rows = [
-                    self._chunk_row(project.id, target.record, chunk, vector)
+                    self._chunk_row(project.id, target.record, chunk, vector, slot_id=slot_id)
                     for chunk, vector in windowed
                 ]
                 staged_rows.setdefault(candidate.owner, []).extend(rows)
@@ -1570,10 +1571,16 @@ class Indexer:
 
     @staticmethod
     def _chunk_row(
-        project_id: str, file: StoredFile, chunk: ExtractedChunk, vector: bytes
+        project_id: str,
+        file: StoredFile,
+        chunk: ExtractedChunk,
+        vector: bytes,
+        *,
+        slot_id: str = "",
     ) -> ChunkRow:
         identity = "\0".join(
             [
+                slot_id,
                 file.file_id,
                 file.content_hash,
                 chunk.kind,
@@ -1583,9 +1590,9 @@ class Indexer:
                 str(chunk.part_index),
             ]
         )
-        # The project-id prefix routes get_chunk to the owning partition; the
-        # digest keeps the id content-derived, so it still changes whenever
-        # the file is re-indexed.
+        # The logical project prefix routes get_chunk to the owning registry
+        # entry; the slot participates in the digest so equal content in two
+        # physical branch partitions cannot share a selector.
         return ChunkRow(
             chunk_id=f"{project_id}:{_digest(identity)}",
             file_id=file.file_id,

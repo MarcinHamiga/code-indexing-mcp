@@ -2293,3 +2293,36 @@ def test_remove_project_deletes_slots_pointer_and_partitions(tmp_path: Path) -> 
     assert not (store.directory / "projects" / project.id).exists()
     assert not (store.directory / "partition-generations" / project.id).exists()
     assert slot.partition_id == project.id
+
+
+def test_chunk_fetch_is_limited_to_the_active_physical_slot(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+
+    first = _slot(project.id, "slot-a", partition_id="partition-a")
+    second = _slot(project.id, "slot-b", partition_id="partition-b")
+    store.upsert_slot(first)
+    store.upsert_slot(second)
+    store.activate_slot(project.id, first.slot_id)
+
+    first_chunk = _stored_chunks(project.id, 1)[0].model_copy(
+        update={"chunk_id": f"{project.id}:slot-a"}
+    )
+    second_chunk = first_chunk.model_copy(update={"chunk_id": f"{project.id}:slot-b"})
+    store._tables(first.partition_id).chunks.add([first_chunk.model_dump()])
+    store._tables(second.partition_id).chunks.add([second_chunk.model_dump()])
+
+    assert store.table_versions(project.id, partition_id=first.partition_id).chunks == (
+        store.table_versions(project.id, partition_id=second.partition_id).chunks
+    )
+    assert store._chunk_project_id(first_chunk.chunk_id) == project.id
+    assert store.get_chunk(first_chunk.chunk_id) is not None
+    assert store.get_chunk(second_chunk.chunk_id) is None
+
+    store.activate_slot(project.id, second.slot_id)
+
+    assert store.get_chunk(first_chunk.chunk_id) is None
+    assert store.get_chunk(second_chunk.chunk_id) is not None

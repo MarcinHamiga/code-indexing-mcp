@@ -439,10 +439,15 @@ def test_analyze_refactor_fetches_the_reference_table_only_once(
         version: int | None = None,
         schema_version: int | None = None,
         record_kinds: object = None,
+        partition_id: str | None = None,
     ) -> list[object]:
         calls.append(version)
         return real_list_reference_records(
-            project, version=version, schema_version=schema_version, record_kinds=record_kinds
+            project,
+            version=version,
+            schema_version=schema_version,
+            record_kinds=record_kinds,
+            partition_id=partition_id,
         )
 
     monkeypatch.setattr(service.store, "list_reference_records", counting_list_reference_records)
