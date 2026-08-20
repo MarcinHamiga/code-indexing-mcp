@@ -54,6 +54,19 @@ does the same thing. To change settings or harnesses without updating, run
 current configuration. Naming what to change applies it directly instead:
 `code-indexing-mcp configure --set CODE_INDEXING_BROKER=off --unset CODE_INDEXING_INDEX_MODE`.
 
+### Trying the TypeScript build
+
+The TypeScript port of this server is published as
+[`code-indexing-mcp@next`](https://www.npmjs.com/package/code-indexing-mcp) on npm while this
+Python build remains the default. It requires [Bun](https://bun.sh) 1.2 or newer (its
+binaries execute TypeScript sources directly), shares all on-disk state with this build —
+existing indexes, project markers, history, and probe caches open unchanged — and its
+cross-build parity is gated in CI by a benchmark comparison and a dual-run soak harness
+(`ts/packages/server/scripts/`). One deliberate platform difference: Windows omits GDShader
+indexing; every other language and platform, including GDScript, is unaffected. See
+[ts/packages/server/README.md](ts/packages/server/README.md) and the migration plan under
+`docs/plans/` for details.
+
 ### The `code-indexing-mcp` command
 
 Your MCP clients launch the server by absolute path and never need it on PATH, so the

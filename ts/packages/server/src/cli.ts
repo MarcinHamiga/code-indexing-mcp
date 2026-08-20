@@ -3,6 +3,7 @@
 /** Command-line interface for Code Indexing MCP administration and stdio serving. */
 
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
@@ -26,7 +27,10 @@ import { createServer } from "./server.ts";
 import { indexSettingsFromEnvironment } from "./settings.ts";
 import { checkoutHead, isDisabled, notice, startBackgroundRefresh } from "./update-check.ts";
 
-export const VERSION = "0.0.0";
+// The published package is the version source, mirroring how the Python CLI
+// reads importlib.metadata rather than keeping a second copy of the number.
+export const VERSION = (createRequire(import.meta.url)("../package.json") as { version: string })
+  .version;
 const NOTIFY_COMMANDS = new Set(["init", "index", "status", "projects", "model", "storage"]);
 const INSTALLER_COMMANDS = new Set(["configure", "update", "uninstall"]);
 

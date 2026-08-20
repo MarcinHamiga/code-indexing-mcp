@@ -97,5 +97,13 @@ uv run python ts/packages/server/scripts/write_path_filter_parity.py
 
 It records every regex `glob_to_regex` emits, character for character, and the
 ground-truth `PurePosixPath.match` result for 37 patterns against 932 corpus
-paths. Regenerate it whenever either implementation changes, and expect the diff
-to be empty.
+paths. Regenerate it whenever either implementation changes, and expect the
+diff to be empty.
+
+Phase 9 added the operator-run cutover harnesses beside those fixtures: the
+dual-run soak (`scripts/write_soak_snapshot.py`, `write_soak_snapshot.ts`,
+`soak_compare.ts`) and the cross-build benchmark comparison
+(`scripts/benchmark_compare.ts`, gated in CI by
+`.github/workflows/ci-ts-parity.yml`). See
+[docs/plans/2026-08-20-phase-9-notes.md](../docs/plans/2026-08-20-phase-9-notes.md)
+for what they measure and how to run them.

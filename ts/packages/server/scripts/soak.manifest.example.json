@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "repositories": [{ "path": "/absolute/path/to/a/real/repository" }],
+  "queries": [
+    "token batching window planning",
+    "hybrid search reranker scoring",
+    "storage partition commit staging",
+    "daemon challenge response authentication"
+  ],
+  "limit": 8
+}

@@ -1,11 +1,27 @@
 {
-  "name": "@code-indexing-mcp/server",
-  "version": "0.0.0",
-  "private": true,
+  "name": "code-indexing-mcp",
+  "version": "0.4.0",
+  "description": "Local Tree-sitter code indexing with hybrid semantic and full-text search, served over MCP",
+  "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MarcinHamiga/code-indexing-mcp.git",
+    "directory": "ts/packages/server"
+  },
+  "engines": {
+    "bun": ">=1.2.0"
+  },
   "bin": {
     "code-indexing-mcp": "./src/cli.ts",
     "code-indexing-mcp-accelerator-probe": "./src/accelerator-probe-cli.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
   },
   "scripts": {
     "memory:gate": "bun run scripts/benchmark-index-memory.ts",

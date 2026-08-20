@@ -19,6 +19,9 @@ Phase 7 implementation complete — hardware promotion remains pending; see
 [2026-08-19-phase-7-notes.md](2026-08-19-phase-7-notes.md).
 Phase 8 complete — see
 [2026-08-19-phase-8-notes.md](2026-08-19-phase-8-notes.md).
+Phase 9 tooling, CI, and packaging complete — the release flip (npm publish,
+full-scale soak, installer default change) remains an operator action; see
+[2026-08-20-phase-9-notes.md](2026-08-20-phase-9-notes.md).
 Branch: `ts-migration`
 
 ## 1. Purpose and scope
@@ -269,7 +272,7 @@ spec, and the ~29k test lines are most of the migration's real cost.
 | 6 | ✅ Surfaces: `server` (MCP), `daemon`, `cli`, `benchmark` | ~3,600 | 3–4 wk |
 | 7 | ✅ Accelerators: provider selection (CUDA/DML/WebGPU/CoreML per D2), `accelerator_env`/`accelerator_probe`; hardware promotion pending | ~1,200 | 2–3 wk |
 | 8 | ✅ Installer: bootstrap, harness config merging (JSON/JSONC/TOML comment-preserving), shell PATH launcher, self-update, uninstall, OpenTUI Core TUI (per D3). D5 deferred | ~4,600 | 3–4 wk |
-| 9 | Cutover: side-by-side parity soak, benchmark comparison, docs, release | — | 2 wk |
+| 9 | 🔶 Cutover: soak + benchmark comparison tooling, parity CI job, `@next` packaging, docs; release flip pending | — | 2 wk |
 
 Total: roughly 23–28 engineer-weeks for a single engineer; phases 2–4 can
 overlap across two engineers once Phase 1 lands.

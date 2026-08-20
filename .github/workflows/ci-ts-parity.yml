@@ -1,0 +1,78 @@
+name: CI (TypeScript parity)
+
+# The Phase 9 §11 job: the broader benchmark comparison the migration plan
+# bounds the port with -- within 15% on index time, no regression on search
+# latency -- measured against the Python build on the same runner, with the
+# same model cache serving both. It triggers on either tree because either
+# side's benchmark can regress the comparison.
+on:
+  push:
+    branches: [main]
+    paths: &parity-paths
+      - "ts/**"
+      - "src/code_indexing_mcp/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/ci-ts-parity.yml"
+  pull_request:
+    paths: *parity-paths
+  workflow_dispatch:
+
+concurrency:
+  group: ci-ts-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark-compare:
+    runs-on: ubuntu-latest
+    # Two full benchmark suites (index + search, both builds) with a real
+    # model: the memory gate's 30 minutes plus the Python side's share.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Pinned for the same reason as the main TS workflow: an unplanned
+          # Bun upgrade is a registered risk, not an incident to discover mid-
+          # comparison.
+          bun-version: 1.3.14
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # 3.13 deliberately: the 3.12 marker pulls the ROCm MIGraphX wheel
+          # this comparison has no use for.
+          python-version: "3.13"
+          enable-cache: true
+      - name: Sync the Python environment
+        run: uv sync --all-groups --extra cpu --locked
+      - name: Install the TypeScript workspace
+        working-directory: ts
+        run: bun install --frozen-lockfile
+
+      # One cache serves both builds: each manages its own subtree under
+      # CODE_INDEXING_CACHE_DIR, and warming both before the comparison keeps
+      # a transient HF outage from failing a benchmark run instead of a
+      # download step.
+      - name: Restore the shared embedding model cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/code-indexing-models
+          key: ts-parity-models-${{ runner.os }}-${{ hashFiles('ts/bun.lock', 'uv.lock') }}
+      - name: Warm both model caches
+        env:
+          CODE_INDEXING_CACHE_DIR: ${{ runner.temp }}/code-indexing-models
+        run: |
+          uv run code-indexing-mcp model pull
+          bun ts/packages/server/src/cli.ts model pull
+      - name: Run the cross-build benchmark comparison
+        env:
+          CODE_INDEXING_CACHE_DIR: ${{ runner.temp }}/code-indexing-models
+        run: >-
+          bun ts/packages/server/scripts/benchmark_compare.ts
+          --output ${{ runner.temp }}/benchmark-comparison.json
+      - name: Upload the comparison report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typescript-benchmark-comparison
+          path: ${{ runner.temp }}/benchmark-comparison.json
+          if-no-files-found: warn
