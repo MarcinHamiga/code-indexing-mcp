@@ -436,6 +436,8 @@ function nodeExecutionProvider(provider: string): string {
     CUDAExecutionProvider: "cuda",
     DmlExecutionProvider: "dml",
     CoreMLExecutionProvider: "coreml",
+    MIGraphXExecutionProvider: "migraphx",
+    WebGpuExecutionProvider: "webgpu",
   };
   return names[provider] ?? provider;
 }
@@ -470,14 +472,19 @@ function reshape3(data: Float32Array, dims: number[]): number[][][] {
   return out;
 }
 
-export function defaultCreateWebgpuSession(
+export async function defaultCreateWebgpuSession(
   modelPath: string,
   { threads, enableCpuMemArena }: { threads: number | undefined; enableCpuMemArena: boolean },
-): [OnnxSession, string] {
+): Promise<[OnnxSession, string]> {
   const ort = onnxRuntimeBindings;
   const plugin = webgpuPluginBindings;
   if (ort === undefined || plugin === undefined) {
-    throw new Error("The WebGPU plugin is not available in this Phase 4 CPU build");
+    const session = await defaultCreateSession(modelPath, {
+      providers: ["WebGpuExecutionProvider", "CPUExecutionProvider"],
+      threads,
+      enableCpuMemArena,
+    });
+    return [session, "WebGpuExecutionProvider"];
   }
   const provider = String(plugin.getEpName());
   ort.registerExecutionProviderLibrary("code-indexing-mcp_webgpu_ep", plugin.getLibraryPath());
@@ -519,7 +526,7 @@ export class DirectOnnxEmbedding {
     const tokenizer = loadTokenizer(modelDirectory);
     let model: OnnxSession;
     if (options.accelerator === "webgpu") {
-      const [session, pluginProvider] = createWebgpuSession(modelPath, {
+      const [session, pluginProvider] = await createWebgpuSession(modelPath, {
         threads: options.threads,
         enableCpuMemArena: options.enableCpuMemArena,
       });

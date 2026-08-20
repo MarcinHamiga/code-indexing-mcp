@@ -147,6 +147,13 @@ export function setLoadModel(loader: ModelLoader): void {
 }
 
 export async function loadPassageModel(config: WorkerConfig): Promise<PassageWorkerModel> {
+  if (config.accelerator === "mlx") {
+    const { MlxEmbedding } = await import("./mlx-backend.ts");
+    return MlxEmbedding.create(config.cacheDirectory, {
+      offline: config.offline,
+      modelId: config.modelId,
+    });
+  }
   const { DirectOnnxEmbedding } = await import("./direct-onnx.ts");
   return DirectOnnxEmbedding.create(config.cacheDirectory, {
     offline: config.offline,

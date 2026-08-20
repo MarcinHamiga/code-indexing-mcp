@@ -180,7 +180,7 @@ test("direct model builds exact onnx inputs and reports resolved providers", asy
   }
 });
 
-test("webgpu session refuses a registered plugin with no device", () => {
+test("webgpu session refuses a registered plugin with no device", async () => {
   configureDirectOnnx({
     onnxRuntimeBindings: {
       GraphOptimizationLevel: { ORT_ENABLE_ALL: "all" },
@@ -211,9 +211,9 @@ test("webgpu session refuses a registered plugin with no device", () => {
     },
   });
   try {
-    expect(() =>
+    await expect(
       createWebgpuSession("/tmp/model.onnx", { threads: 2, enableCpuMemArena: false }),
-    ).toThrow("no WebGPU device");
+    ).rejects.toThrow("no WebGPU device");
   } finally {
     configureDirectOnnx({ onnxRuntimeBindings: undefined, webgpuPluginBindings: undefined });
   }
