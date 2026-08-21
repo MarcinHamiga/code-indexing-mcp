@@ -300,6 +300,34 @@ def test_failed_git_enumeration_falls_back_to_the_streaming_walk(
     assert [item.path.as_posix() for item in result.files] == ["main.py"]
 
 
+def test_walk_fallback_after_partial_git_enumeration_never_repeats_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A git enumeration that fails after streaming some batches must not let
+    the walk fallback yield those files again: the indexer queues pending work
+    per yielded file, and a repeat would stage one file's chunk rows under two
+    owners, crashing the staging contiguity invariant."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    (root / "a.py").write_text("value = 1\n")
+    (root / "b.py").write_text("value = 2\n")
+    (root / "notes.md").write_text("not source\n")
+    scanner = SourceScanner()
+
+    def partially_failing_enumeration(_: Path):
+        yield [root / "a.py", root / "notes.md"]
+        raise _GitEnumerationError("simulated mid-stream git failure")
+
+    monkeypatch.setattr(scanner, "_iter_git_batches", partially_failing_enumeration)
+
+    result = scanner.scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["a.py", "b.py"]
+    assert [skip.path.as_posix() for skip in result.skipped] == ["notes.md"]
+
+
 def test_walk_mode_passes_only_supported_files_to_check_ignore(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

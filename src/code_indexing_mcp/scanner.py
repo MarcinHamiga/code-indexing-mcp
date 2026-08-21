@@ -199,14 +199,17 @@ class SourceScanner:
         config_excludes = GitIgnoreSpec.from_lines(project.scan.exclude)
         include_spec = GitIgnoreSpec.from_lines(project.scan.include)
         in_worktree = self._in_git_worktree(root)
+        git_yielded: set[str] = set()
+        fallback = False
         if in_worktree:
             try:
                 for batch in self._iter_git_batches(root):
                     for item in self._prefilter_git_batch(batch, root, include_spec):
                         if isinstance(item, SkippedFile):
+                            git_yielded.add(item.path.as_posix())
                             yield item
                             continue
-                        yield from self._scan_candidates(
+                        for scanned in self._scan_candidates(
                             item,
                             root=root,
                             include_spec=include_spec,
@@ -215,17 +218,25 @@ class SourceScanner:
                             known_files=known_files,
                             read_contents=read_contents,
                             run_check_ignore=False,
-                        )
+                        ):
+                            git_yielded.add(scanned.path.as_posix())
+                            yield scanned
                 return
             except _GitEnumerationError:
                 # A failed or timed-out git process must not silently produce
                 # an empty index: the streaming walk covers the same tree.
-                pass
+                # Batches streamed before the failure already reached the
+                # consumer, so the walk must skip those paths: an indexer that
+                # sees one file twice queues it under two pending owners and
+                # stages its chunk rows non-contiguously, which crashes the
+                # staging invariant (or silently duplicates the rows).
+                fallback = True
         for walk_batch in self._iter_walk_batches(root, include_spec):
             if isinstance(walk_batch, SkippedFile):
-                yield walk_batch
+                if not fallback or walk_batch.path.as_posix() not in git_yielded:
+                    yield walk_batch
                 continue
-            yield from self._scan_candidates(
+            for scanned in self._scan_candidates(
                 walk_batch,
                 root=root,
                 include_spec=include_spec,
@@ -234,7 +245,10 @@ class SourceScanner:
                 known_files=known_files,
                 read_contents=read_contents,
                 run_check_ignore=in_worktree,
-            )
+            ):
+                if fallback and scanned.path.as_posix() in git_yielded:
+                    continue
+                yield scanned
 
     def _prefilter_git_batch(
         self,

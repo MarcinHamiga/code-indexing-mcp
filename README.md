@@ -115,6 +115,11 @@ python3 install.py --accelerator webgpu   # experimental Metal, Vulkan, or D3D12
 python3 install.py --accelerator migraphx # experimental pinned AMD/ROCm path
 ```
 
+An explicit installer choice also selects the backend at runtime in every configured harness;
+if planning falls back, the resolved backend is what gets selected. `--accelerator auto` removes
+an older runtime override. An explicit `--set CODE_INDEXING_EMBED_ACCELERATOR=...` takes precedence
+when preparing one backend but selecting another is intentional.
+
 Detection that finds nothing, an environment that cannot be built, and a probe that does not
 pass all leave the installation on CPU and report why. Nothing here changes system drivers,
 and no package is ever installed while the server is running. See

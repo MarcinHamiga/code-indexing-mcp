@@ -7,6 +7,7 @@ import pytest
 from code_indexing_mcp.installer import accelerator, harnesses, shell_path
 from code_indexing_mcp.installer.config_files import InstallerError
 from code_indexing_mcp.installer.orchestrator import (
+    EMBED_ACCELERATOR_SETTING,
     InstallPlan,
     StepEvent,
     default_install_directory,
@@ -69,7 +70,11 @@ def test_run_install_emits_step_events_in_order(
 
     assert calls == [
         ("accel", "cpu"),
-        ("harnesses", ("kimi-code",), {"CODE_INDEXING_OFFLINE": "1"}),
+        (
+            "harnesses",
+            ("kimi-code",),
+            {"CODE_INDEXING_OFFLINE": "1", EMBED_ACCELERATOR_SETTING: "cpu"},
+        ),
         ("skills", ("kimi-code",)),
     ]
     steps = [event.step for event in events]
@@ -90,6 +95,69 @@ def test_run_install_emits_step_events_in_order(
     assert result.failures == ()
     assert result.accelerator_plan is not None
     assert result.accelerator_plan.accelerator == "cpu"
+
+
+@pytest.mark.parametrize(
+    ("requested", "resolved", "expected"),
+    [
+        ("webgpu", "webgpu", "webgpu"),
+        ("migraphx", "webgpu", "webgpu"),
+        ("auto", "cuda", None),
+    ],
+)
+def test_run_install_configures_the_runtime_backend_selected_by_the_installer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested: str,
+    resolved: str,
+    expected: str | None,
+) -> None:
+    configured_env: dict[str, str | None] = {}
+    monkeypatch.setattr(
+        accelerator,
+        "configure_accelerator",
+        lambda directory, choice, *, offline=False: accelerator.AcceleratorPlan(resolved, "ok"),
+    )
+    monkeypatch.setattr(accelerator, "server_executable", lambda directory: _server(tmp_path))
+
+    def fake_configure(slugs, command, *, env=None, **kwargs):
+        configured_env.update(env or {})
+        return [], []
+
+    monkeypatch.setattr(harnesses, "configure_selected_harnesses", fake_configure)
+    monkeypatch.setattr(harnesses, "install_skills", lambda *args: [])
+
+    run_install(_plan(accelerator=requested))
+
+    assert configured_env[EMBED_ACCELERATOR_SETTING] == expected
+
+
+def test_run_install_preserves_an_explicit_runtime_backend_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configured_env: dict[str, str | None] = {}
+    monkeypatch.setattr(
+        accelerator,
+        "configure_accelerator",
+        lambda directory, requested, *, offline=False: accelerator.AcceleratorPlan("webgpu", "ok"),
+    )
+    monkeypatch.setattr(accelerator, "server_executable", lambda directory: _server(tmp_path))
+
+    def fake_configure(slugs, command, *, env=None, **kwargs):
+        configured_env.update(env or {})
+        return [], []
+
+    monkeypatch.setattr(harnesses, "configure_selected_harnesses", fake_configure)
+    monkeypatch.setattr(harnesses, "install_skills", lambda *args: [])
+
+    run_install(
+        _plan(
+            accelerator="webgpu",
+            env_updates={EMBED_ACCELERATOR_SETTING: "auto"},
+        )
+    )
+
+    assert configured_env[EMBED_ACCELERATOR_SETTING] == "auto"
 
 
 def test_run_install_reports_unhonored_accelerator_as_warning(
@@ -117,19 +185,26 @@ def test_run_install_reports_unhonored_accelerator_as_warning(
 def test_run_install_skips_accelerator_when_plan_keeps_backend(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    configured_env: dict[str, str | None] = {}
     monkeypatch.setattr(
         accelerator,
         "configure_accelerator",
         lambda *args, **kwargs: pytest.fail("accelerator step must not run"),
     )
     monkeypatch.setattr(accelerator, "server_executable", lambda directory: _server(tmp_path))
-    monkeypatch.setattr(harnesses, "configure_selected_harnesses", lambda *args, **kwargs: ([], []))
+
+    def fake_configure(slugs, command, *, env=None, **kwargs):
+        configured_env.update(env or {})
+        return [], []
+
+    monkeypatch.setattr(harnesses, "configure_selected_harnesses", fake_configure)
     monkeypatch.setattr(harnesses, "install_skills", lambda *args: [])
     events: list[StepEvent] = []
 
     result = run_install(_plan(accelerator=None), on_event=events.append)
 
     assert result.accelerator_plan is None
+    assert EMBED_ACCELERATOR_SETTING not in configured_env
     assert events[0] == StepEvent("accelerator", "skipped", "keeping the prepared backend")
 
 

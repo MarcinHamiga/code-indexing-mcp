@@ -1,6 +1,7 @@
 import itertools
 import os
 import sqlite3
+import subprocess
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -27,7 +28,7 @@ from code_indexing_mcp.history import HistoryStore
 from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
 from code_indexing_mcp.models import ExtractedChunk, ExtractionResult, StoredFile
 from code_indexing_mcp.projects import initialize_project
-from code_indexing_mcp.scanner import SourceScanner
+from code_indexing_mcp.scanner import SourceScanner, _GitEnumerationError
 from code_indexing_mcp.storage import LanceStore, _quoted
 
 
@@ -113,6 +114,35 @@ def test_indexer_skips_unchanged_and_metadata_only_files(tmp_path: Path) -> None
     assert metadata_only.parsed_files == 0
     assert len(embedder.passage_batches) == 1
     assert len(store.list_files(project.id)) == 1
+
+
+def test_walk_fallback_after_partial_git_enumeration_indexes_each_file_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a git enumeration that failed after streaming some batches
+    let the walk fallback yield those files again. The repeat queued the same
+    file_id under a second pending owner, so the flush staged its chunk rows
+    non-contiguously and crashed with "Staged chunk batches for a file must be
+    contiguous" (or duplicated the rows when the copies landed adjacently)."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / "a.py").write_text("def a():\n    return 1\n")
+    (root / "b.py").write_text("def b():\n    return 2\n")
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+
+    def partially_failing_enumeration(_: Path):
+        yield [root / "a.py"]
+        raise _GitEnumerationError("simulated mid-stream git failure")
+
+    monkeypatch.setattr(indexer.scanner, "_iter_git_batches", partially_failing_enumeration)
+
+    report = indexer.index(project)
+
+    assert report.indexed_files == 2
+    assert len(store.list_files(project.id)) == 2
+    assert sorted(chunk.path for chunk in store.list_chunks([project.id])) == ["a.py", "b.py"]
 
 
 def test_successful_index_stages_references_declarations_and_coverage(tmp_path: Path) -> None:
