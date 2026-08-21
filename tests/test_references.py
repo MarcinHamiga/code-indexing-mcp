@@ -400,6 +400,16 @@ def test_cursor_is_filter_bound_and_reads_its_original_snapshot(tmp_path: Path) 
         service.find_references(selector, limit=1, cursor="not-a-real-cursor")
     assert excinfo.value.code == ErrorCode.INVALID_CURSOR
 
+    cursor_payload = service._decode_cursor(first.cursor)
+    cursor_payload["slot_id"] = "inactive-slot"
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.find_references(
+            selector,
+            limit=1,
+            cursor=service._encode_cursor(cursor_payload),
+        )
+    assert excinfo.value.code == ErrorCode.STALE_CURSOR
+
     file_id = service.store.list_files(project_id)[0].file_id
     service.store.replace_files_from_arrow(
         project_id,

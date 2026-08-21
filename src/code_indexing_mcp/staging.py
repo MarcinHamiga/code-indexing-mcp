@@ -30,7 +30,7 @@ import numpy as np
 import pyarrow as pa
 
 from .models import StoredFile
-from .storage import LanceStore, TableVersions
+from .storage import LanceStore, PartitionRef, TableVersions
 
 logger = logging.getLogger(__name__)
 
@@ -202,9 +202,11 @@ class StagingJob:
         chunk_schema: pa.Schema,
         reference_schema: pa.Schema,
         job_id: str | None = None,
+        partition: PartitionRef | None = None,
     ) -> None:
         self.staging_root = staging_root
         self.project_id = project_id
+        self.partition = partition
         self.job_id = job_id or f"{time.time_ns():x}-{os.getpid()}"
         self._file_schema = file_schema
         self._chunk_schema = chunk_schema
@@ -237,6 +239,14 @@ class StagingJob:
             "phase": PHASE_STAGING,
             "created_at_ns": time.time_ns(),
         }
+        if self.partition is not None:
+            self._journal.update(
+                {
+                    "slot_id": self.partition.slot_id,
+                    "partition_id": self.partition.partition_id,
+                    "activation_epoch": self.partition.activation_epoch,
+                }
+            )
         self._write_journal()
         self._files_sink, self._files_writer = self._open_writer(FILES_NAME, self._file_schema)
         self._chunks_sink, self._chunks_writer = self._open_writer(CHUNKS_NAME, self._chunk_schema)
@@ -610,6 +620,11 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
                 project_id,
                 versions,
                 restore_references=journal_version != LEGACY_JOURNAL_FORMAT_VERSION,
+                partition_id=(
+                    None
+                    if journal_version == LEGACY_JOURNAL_FORMAT_VERSION
+                    else journal.get("partition_id")
+                ),
             )
         except Exception:
             attempts = int(journal.get("recovery_attempts", 0)) + 1

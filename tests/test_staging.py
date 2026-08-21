@@ -36,7 +36,7 @@ from code_indexing_mcp.staging import (
     StagingJob,
     recover_staged_commits,
 )
-from code_indexing_mcp.storage import LanceStore, TableVersions
+from code_indexing_mcp.storage import LanceStore, PartitionRef, TableVersions
 
 
 class RecordingEmbedder:
@@ -126,7 +126,11 @@ def reference_row(
 
 
 def make_job(
-    tmp_path: Path, store: LanceStore, project_id: str, job_id: str = "job-1"
+    tmp_path: Path,
+    store: LanceStore,
+    project_id: str,
+    job_id: str = "job-1",
+    partition: PartitionRef | None = None,
 ) -> StagingJob:
     job = StagingJob(
         tmp_path / "staging",
@@ -135,9 +139,27 @@ def make_job(
         chunk_schema=LanceStore.chunk_arrow_schema(store.vector_dimension, store.vector_dtype),
         reference_schema=LanceStore.reference_arrow_schema(),
         job_id=job_id,
+        partition=partition,
     )
     job.begin()
     return job
+
+
+def test_staging_journal_records_the_pinned_partition(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    project = make_project(root)
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model")
+    partition = store.active_partition(project.id)
+    job = make_job(tmp_path, store, project.id, partition=partition)
+    job.begin_commit(TableVersions(files=1, chunks=2, references=3))
+
+    journal = json.loads((job.directory / JOURNAL_NAME).read_text())
+
+    assert journal["slot_id"] == partition.slot_id
+    assert journal["partition_id"] == partition.partition_id
+    assert journal["activation_epoch"] == partition.activation_epoch
+    job.discard()
 
 
 def test_staged_vectors_carry_the_store_storage_dtype(tmp_path: Path) -> None:

@@ -68,13 +68,18 @@ class SearchService:
                 _FALLBACK_FETCH_ROWS,
             )
         fetch = _FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5)
-        with self.store.partitions_access(project_ids):
+        partitions = {
+            project_id: self.store.active_partition(project_id) for project_id in project_ids
+        }
+        partition_ids = {project_id: ref.partition_id for project_id, ref in partitions.items()}
+        with self.store.partitions_access(partitions):
             rows = self.store.hybrid_search(
                 query,
                 self.embedder.embed_query(query),
                 project_ids,
                 " AND ".join(conditions) if conditions else None,
                 fetch,
+                partition_ids=partition_ids,
             )
         names = {project.id: project.name for project in self.store.list_projects()}
         hits: list[SearchHit] = []
@@ -105,9 +110,15 @@ class SearchService:
         if match not in {"exact", "prefix", "contains"}:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, f"Invalid symbol match mode: {match}")
         limit = max(1, min(limit, 50))
-        with self.store.partition_access(project_id):
+        partition = self.store.active_partition(project_id)
+        with self.store.partition_access(project_id, partition_id=partition.partition_id):
             candidates = self.store.find_symbol_chunks(
-                name, project_id, match=match, kinds=kinds, limit=limit
+                name,
+                project_id,
+                match=match,
+                kinds=kinds,
+                limit=limit,
+                partition_id=partition.partition_id,
             )
         names = {project.id: project.name for project in self.store.list_projects()}
 
@@ -120,8 +131,11 @@ class SearchService:
     def file_outline(self, path: str, project_id: str) -> OutlineResponse:
         items: list[OutlineItem] = []
         seen: set[tuple[str, str]] = set()
-        with self.store.partition_access(project_id):
-            chunks = self.store.outline_chunks(path, project_id)
+        partition = self.store.active_partition(project_id)
+        with self.store.partition_access(project_id, partition_id=partition.partition_id):
+            chunks = self.store.outline_chunks(
+                path, project_id, partition_id=partition.partition_id
+            )
         for chunk in sorted(chunks, key=lambda item: (item.path, item.start_line)):
             if chunk.path != path or not chunk.symbol or not chunk.qualified_symbol:
                 continue
@@ -146,8 +160,9 @@ class SearchService:
         if project_id is None:
             chunk = None
         else:
-            with self.store.partition_access(project_id):
-                chunk = self.store.get_chunk(chunk_id)
+            partition = self.store.active_partition(project_id)
+            with self.store.partition_access(project_id, partition_id=partition.partition_id):
+                chunk = self.store.get_chunk(chunk_id, partition_id=partition.partition_id)
         if chunk is None:
             raise CodeIndexingError(
                 ErrorCode.CHUNK_NOT_FOUND,

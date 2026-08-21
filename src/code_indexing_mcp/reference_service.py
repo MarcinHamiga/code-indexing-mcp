@@ -28,7 +28,7 @@ from .models import (
     SelectedDeclaration,
     SignatureChangeOperation,
 )
-from .storage import LanceStore, ReferenceRecord
+from .storage import LanceStore, PartitionRef, ReferenceRecord
 
 # Reason codes that describe something the syntax-only index could not see.
 # They are surfaced as limitations whatever resolution level they carry, so a
@@ -67,6 +67,9 @@ class _ReferenceQuery(NamedTuple):
     hits: list[ReferenceHit]
     root: Path | None
     sources: dict[str, tuple[bytes, int]]
+    partition_id: str
+    slot_id: str
+    activation_epoch: int
 
 
 class _ClassifiedFindings(NamedTuple):
@@ -109,6 +112,7 @@ class ReferenceService:
         cursor: str | None = None,
         backfill: ReferenceBackfillReport | None = None,
         operation_digest: str | None = None,
+        partition: PartitionRef | None = None,
     ) -> ReferenceResponse:
         """Resolve references for `selector`, one page at a time.
 
@@ -122,6 +126,7 @@ class ReferenceService:
             cursor=cursor,
             backfill=backfill,
             operation_digest=operation_digest,
+            partition=partition,
         ).response
 
     def _find_references_with_records(
@@ -133,6 +138,7 @@ class ReferenceService:
         cursor: str | None = None,
         backfill: ReferenceBackfillReport | None = None,
         operation_digest: str | None = None,
+        partition: PartitionRef | None = None,
     ) -> _ReferenceQuery:
         """`find_references`'s body, also returning everything it computed along the way.
 
@@ -148,7 +154,11 @@ class ReferenceService:
         """
         if limit < 1 or limit > 500:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, "limit must be between 1 and 500")
-        selected = self._select(selector)
+        selected = self._select(
+            selector,
+            partition_id=None if partition is None else partition.partition_id,
+        )
+        partition = partition or self.store.active_partition(selected.project_id)
         if selected.language not in STRUCTURAL_LANGUAGES:
             raise CodeIndexingError(
                 ErrorCode.UNSUPPORTED_LANGUAGE,
@@ -158,7 +168,9 @@ class ReferenceService:
                 path=selected.path,
                 language=selected.language,
             )
-        if not self.store.has_reference_table(selected.project_id):
+        if not self.store.has_reference_table(
+            selected.project_id, partition_id=partition.partition_id
+        ):
             # A missing table and a legitimately empty one both read as `[]`
             # from `list_reference_records`/`reference_version` (S5). Trusting
             # that silence would report "no references" for a project whose
@@ -171,7 +183,9 @@ class ReferenceService:
                 "Run ensure_reference_index (or reindex) before querying references.",
                 project=selected.project_id,
             )
-        version = self.store.reference_version(selected.project_id)
+        version = self.store.reference_version(
+            selected.project_id, partition_id=partition.partition_id
+        )
         offset = 0
         if cursor is not None:
             payload = self._decode_cursor(cursor)
@@ -194,6 +208,14 @@ class ReferenceService:
             if payload["operation_digest"] != operation_digest:
                 raise CodeIndexingError(
                     ErrorCode.INVALID_CURSOR, "cursor does not match the refactor operation"
+                )
+            if payload["slot_id"] != partition.slot_id:
+                raise CodeIndexingError(
+                    ErrorCode.STALE_CURSOR, "Reference cursor belongs to an inactive index slot"
+                )
+            if payload["activation_epoch"] != partition.activation_epoch:
+                raise CodeIndexingError(
+                    ErrorCode.STALE_CURSOR, "Reference cursor belongs to an earlier slot activation"
                 )
             offset = cast(int, payload["offset"])
             version = cast(int, payload["version"])
@@ -220,6 +242,7 @@ class ReferenceService:
                 version=version,
                 schema_version=REFERENCE_SCHEMA_VERSION,
                 record_kinds=("reference", "coverage"),
+                partition_id=partition.partition_id,
             )
         except (FileNotFoundError, ValueError) as error:
             raise CodeIndexingError(
@@ -228,7 +251,14 @@ class ReferenceService:
         root = self._project_root(selected.project_id)
         sources: dict[str, tuple[bytes, int]] = {}
         hits, limitations = self._hits_and_limitations(
-            selected, kinds, records, root, sources, backfill, version
+            selected,
+            kinds,
+            records,
+            root,
+            sources,
+            backfill,
+            version,
+            partition_id=partition.partition_id,
         )
         page = hits[offset : offset + limit]
         next_cursor = None
@@ -243,6 +273,8 @@ class ReferenceService:
                     "offset": offset + len(page),
                     "limit": limit,
                     "operation_digest": operation_digest,
+                    "slot_id": partition.slot_id,
+                    "activation_epoch": partition.activation_epoch,
                 }
             )
         unique_limitations = {
@@ -258,7 +290,16 @@ class ReferenceService:
             cursor=next_cursor,
             snapshot_version=version,
         )
-        return _ReferenceQuery(response, records, hits, root, sources)
+        return _ReferenceQuery(
+            response,
+            records,
+            hits,
+            root,
+            sources,
+            partition.partition_id,
+            partition.slot_id,
+            partition.activation_epoch,
+        )
 
     def _hits_and_limitations(
         self,
@@ -269,6 +310,8 @@ class ReferenceService:
         sources: dict[str, tuple[bytes, int]],
         backfill: ReferenceBackfillReport | None,
         version: int,
+        *,
+        partition_id: str,
     ) -> tuple[list[ReferenceHit], list[ReferenceLimitation]]:
         """Classify every reference row into a sorted, unsliced hit list.
 
@@ -301,6 +344,7 @@ class ReferenceService:
             reference_file_ids,
             version=version,
             schema_version=REFERENCE_SCHEMA_VERSION,
+            partition_id=partition_id,
         )
         # Precomputed once per query instead of scanned per row (E2):
         # `_lexical_declaration` only ever wants declarations sharing a
@@ -321,6 +365,7 @@ class ReferenceService:
             record_kind="declaration",
             version=version,
             schema_version=REFERENCE_SCHEMA_VERSION,
+            partition_id=partition_id,
         )
         imports = self._imports_by_file(records)
         reexport_rows = self._reexport_rows_by_path(records)
@@ -436,6 +481,7 @@ class ReferenceService:
         limit: int = 500,
         cursor: str | None = None,
         backfill: ReferenceBackfillReport | None = None,
+        partition: PartitionRef | None = None,
     ) -> RefactorAnalysis:
         query = self._find_references_with_records(
             selector,
@@ -443,13 +489,13 @@ class ReferenceService:
             cursor=cursor,
             backfill=backfill,
             operation_digest=self._operation_digest(operation),
+            partition=partition,
         )
-        response, records, root, sources = (
-            query.response,
-            query.records,
-            query.root,
-            query.sources,
-        )
+        response = query.response
+        records = query.records
+        root = query.root
+        sources = query.sources
+        partition_id = query.partition_id
         if isinstance(operation, RenameOperation):
             self._validate_rename(response.selected, operation)
 
@@ -462,6 +508,7 @@ class ReferenceService:
                 root,
                 sources,
                 response.snapshot_version,
+                partition_id,
             )
 
         # Signature shapes are fetched once from the same pinned snapshot and reused
@@ -474,6 +521,7 @@ class ReferenceService:
                 response.selected.qualified_symbol,
                 version=response.snapshot_version,
                 schema_version=REFERENCE_SCHEMA_VERSION,
+                partition_id=partition_id,
             )
         )
         shapes_by_id = {row["reference_id"]: row for row in records}
@@ -572,12 +620,14 @@ class ReferenceService:
         root: Path | None,
         sources: dict[str, tuple[bytes, int]],
         snapshot_version: int,
+        partition_id: str,
     ) -> tuple[RefactorFinding, list[RefactorFinding]]:
         declarations = self.store.declaration_shapes(
             selected.project_id,
             selected.qualified_symbol,
             version=snapshot_version,
             schema_version=REFERENCE_SCHEMA_VERSION,
+            partition_id=partition_id,
         )
         declaration = next(
             (row for row in declarations if row["file_id"] == selected.file_id),
@@ -615,7 +665,9 @@ class ReferenceService:
             edit_start_byte=edit_start,
             edit_end_byte=edit_end,
         )
-        overrides = self._override_findings(selected, records, root, sources, snapshot_version)
+        overrides = self._override_findings(
+            selected, records, root, sources, snapshot_version, partition_id
+        )
         return finding, overrides
 
     def _classify_refactor_hits(
@@ -830,6 +882,7 @@ class ReferenceService:
         root: Path | None,
         sources: dict[str, tuple[bytes, int]],
         version: int,
+        partition_id: str,
     ) -> list[RefactorFinding]:
         """Walk transitive subclasses of a renamed method's owner class.
 
@@ -854,6 +907,7 @@ class ReferenceService:
             owner_symbol,
             version=version,
             schema_version=REFERENCE_SCHEMA_VERSION,
+            partition_id=partition_id,
         )
         base_decl = next(
             (
@@ -903,6 +957,7 @@ class ReferenceService:
                     override_symbol,
                     version=version,
                     schema_version=REFERENCE_SCHEMA_VERSION,
+                    partition_id=partition_id,
                 )
                 override_decl = next(
                     (decl for decl in override_candidates if decl["file_id"] == row["file_id"]),
@@ -1009,9 +1064,11 @@ class ReferenceService:
         }
         return explanations[issue]
 
-    def _select(self, selector: DeclarationSelector) -> SelectedDeclaration:
+    def _select(
+        self, selector: DeclarationSelector, *, partition_id: str | None = None
+    ) -> SelectedDeclaration:
         if selector.chunk_id is not None:
-            selected_chunk = self.store.get_chunk(selector.chunk_id)
+            selected_chunk = self.store.get_chunk(selector.chunk_id, partition_id=partition_id)
             if (
                 selected_chunk is None
                 or selected_chunk.symbol is None
@@ -1036,7 +1093,10 @@ class ReferenceService:
             )
         assert selector.project is not None and selector.path is not None
         assert selector.qualified_symbol is not None
-        indexed = self.store.list_chunks([selector.project])
+        indexed = self.store.list_chunks(
+            [selector.project],
+            partition_ids=None if partition_id is None else {selector.project: partition_id},
+        )
         chunks = [
             chunk
             for chunk in indexed
@@ -1653,6 +1713,8 @@ class ReferenceService:
             "offset",
             "limit",
             "operation_digest",
+            "slot_id",
+            "activation_epoch",
         }
     )
 
@@ -1669,11 +1731,11 @@ class ReferenceService:
 
         if not isinstance(payload, dict) or set(payload) != ReferenceService._CURSOR_FIELDS:
             raise invalid()
-        for int_field in ("version", "offset", "limit"):
+        for int_field in ("version", "offset", "limit", "activation_epoch"):
             value = payload[int_field]
             if isinstance(value, bool) or not isinstance(value, int):
                 raise invalid()
-        for str_field in ("project_id", "path", "qualified_symbol"):
+        for str_field in ("project_id", "path", "qualified_symbol", "slot_id"):
             if not isinstance(payload[str_field], str):
                 raise invalid()
         kinds = payload["kinds"]

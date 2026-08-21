@@ -26,7 +26,7 @@ from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.history import HistoryStore
 from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
-from code_indexing_mcp.models import ExtractionResult, StoredFile
+from code_indexing_mcp.models import ExtractedChunk, ExtractionResult, StoredFile
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner, _GitEnumerationError
 from code_indexing_mcp.storage import LanceStore, _quoted
@@ -1806,6 +1806,38 @@ def test_index_rebuilds_a_partition_written_by_an_incompatible_model(
         .to_list()[0]["vector"]
     )
     assert new_vector[0] == old_vector[0] + 1.0
+
+
+def test_chunk_identity_includes_the_physical_slot() -> None:
+    file = StoredFile(
+        file_id="file-1",
+        project_id="project-1",
+        path="module.py",
+        language="python",
+        size=1,
+        mtime_ns=1,
+        content_hash="content-hash",
+        indexed_at=1,
+    )
+    chunk = ExtractedChunk(
+        kind="function",
+        symbol="answer",
+        qualified_symbol="answer",
+        start_byte=0,
+        end_byte=1,
+        start_line=1,
+        end_line=1,
+        content="pass",
+        embedding_text="pass",
+        search_text="answer",
+    )
+
+    first = Indexer._chunk_row("project-1", file, chunk, b"vector", slot_id="slot-a")
+    second = Indexer._chunk_row("project-1", file, chunk, b"vector", slot_id="slot-b")
+    repeat = Indexer._chunk_row("project-1", file, chunk, b"vector", slot_id="slot-a")
+
+    assert first.chunk_id != second.chunk_id
+    assert first.chunk_id == repeat.chunk_id
 
 
 def test_a_rebuild_records_its_reason_and_trigger_in_the_audit_history(

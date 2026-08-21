@@ -267,9 +267,10 @@ def _resolve_query_directory(value: str, root: Path) -> Path:
 
 def _project_prefix(root: Path, toplevel: Path) -> str:
     relative = os.path.relpath(root, toplevel)
+    parts = Path(relative).parts
     if relative == ".":
         return ""
-    if relative.startswith(".."):
+    if parts and parts[0] == "..":
         raise ValueError(f"{root} is outside the worktree {toplevel}")
     return Path(relative).as_posix()
 
