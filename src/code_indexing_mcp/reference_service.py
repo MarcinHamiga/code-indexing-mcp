@@ -28,7 +28,7 @@ from .models import (
     SelectedDeclaration,
     SignatureChangeOperation,
 )
-from .storage import LanceStore, ReferenceRecord
+from .storage import LanceStore, PartitionRef, ReferenceRecord
 
 # Reason codes that describe something the syntax-only index could not see.
 # They are surfaced as limitations whatever resolution level they carry, so a
@@ -112,6 +112,7 @@ class ReferenceService:
         cursor: str | None = None,
         backfill: ReferenceBackfillReport | None = None,
         operation_digest: str | None = None,
+        partition: PartitionRef | None = None,
     ) -> ReferenceResponse:
         """Resolve references for `selector`, one page at a time.
 
@@ -125,6 +126,7 @@ class ReferenceService:
             cursor=cursor,
             backfill=backfill,
             operation_digest=operation_digest,
+            partition=partition,
         ).response
 
     def _find_references_with_records(
@@ -136,6 +138,7 @@ class ReferenceService:
         cursor: str | None = None,
         backfill: ReferenceBackfillReport | None = None,
         operation_digest: str | None = None,
+        partition: PartitionRef | None = None,
     ) -> _ReferenceQuery:
         """`find_references`'s body, also returning everything it computed along the way.
 
@@ -151,8 +154,11 @@ class ReferenceService:
         """
         if limit < 1 or limit > 500:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, "limit must be between 1 and 500")
-        selected = self._select(selector)
-        partition = self.store.active_partition(selected.project_id)
+        selected = self._select(
+            selector,
+            partition_id=None if partition is None else partition.partition_id,
+        )
+        partition = partition or self.store.active_partition(selected.project_id)
         if selected.language not in STRUCTURAL_LANGUAGES:
             raise CodeIndexingError(
                 ErrorCode.UNSUPPORTED_LANGUAGE,
@@ -475,6 +481,7 @@ class ReferenceService:
         limit: int = 500,
         cursor: str | None = None,
         backfill: ReferenceBackfillReport | None = None,
+        partition: PartitionRef | None = None,
     ) -> RefactorAnalysis:
         query = self._find_references_with_records(
             selector,
@@ -482,6 +489,7 @@ class ReferenceService:
             cursor=cursor,
             backfill=backfill,
             operation_digest=self._operation_digest(operation),
+            partition=partition,
         )
         response = query.response
         records = query.records
@@ -1056,9 +1064,11 @@ class ReferenceService:
         }
         return explanations[issue]
 
-    def _select(self, selector: DeclarationSelector) -> SelectedDeclaration:
+    def _select(
+        self, selector: DeclarationSelector, *, partition_id: str | None = None
+    ) -> SelectedDeclaration:
         if selector.chunk_id is not None:
-            selected_chunk = self.store.get_chunk(selector.chunk_id)
+            selected_chunk = self.store.get_chunk(selector.chunk_id, partition_id=partition_id)
             if (
                 selected_chunk is None
                 or selected_chunk.symbol is None
@@ -1083,7 +1093,10 @@ class ReferenceService:
             )
         assert selector.project is not None and selector.path is not None
         assert selector.qualified_symbol is not None
-        indexed = self.store.list_chunks([selector.project])
+        indexed = self.store.list_chunks(
+            [selector.project],
+            partition_ids=None if partition_id is None else {selector.project: partition_id},
+        )
         chunks = [
             chunk
             for chunk in indexed

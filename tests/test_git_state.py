@@ -150,6 +150,32 @@ def test_subdirectory_root_reports_prefix_and_resolves_relative_directories(
     assert state.untracked_paths == ("inner.py",)
 
 
+def test_subdirectory_status_does_not_match_a_similarly_prefixed_path(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path, "repo")
+    (root / "sub").mkdir()
+    (root / "submarine.py").write_text("value = 2\n")
+    state = probe_git_state(root / "sub", include_status=True)
+
+    # Git reports paths relative to the repository root. `submarine.py` is not
+    # inside the registered `sub` prefix and must remain invisible to it.
+    assert state.project_prefix == "sub"
+    assert "submarine.py" not in state.untracked_paths
+
+
+def test_git_probe_rejects_a_toplevel_outside_the_registered_root(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    identities = "\n".join([str(root / ".git"), str(root / ".git"), str(outside)])
+    runner = _scripted({_IDENTITIES: GitCommandResult(returncode=0, stdout=identities)})
+
+    state = probe_git_state(root, runner=runner)
+
+    assert state.probe is GitProbeOutcome.INVALID
+
+
 def test_non_git_directory_falls_back_to_the_workspace_selector(tmp_path: Path) -> None:
     root = tmp_path / "plain"
     root.mkdir()

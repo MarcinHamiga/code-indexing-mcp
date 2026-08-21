@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 from collections.abc import Callable
@@ -33,6 +34,7 @@ from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
+from .git_state import GitProbeOutcome, WorktreeStatus, probe_git_state
 from .history import HistoryStore
 from .indexing import Indexer
 from .models import (
@@ -82,7 +84,13 @@ from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
 from .staging import has_pending_recovery, recover_staged_commits
-from .storage import LanceStore, overlap_warnings, overlapping_registration, worktree_warnings
+from .storage import (
+    LanceStore,
+    PartitionRef,
+    overlap_warnings,
+    overlapping_registration,
+    worktree_warnings,
+)
 from .token_batching import max_token_product_for
 from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
@@ -217,6 +225,7 @@ class Application:
             vector_dimension=embedder.dimension,
             vector_index=self.settings.vector_index,
             vector_storage=self.settings.vector_storage,
+            branch_cache_limit=self.settings.branch_cache_limit,
         )
         # Durable audit history for indexing runs. A process that died
         # mid-run left its row in "running"; every new process start is the
@@ -742,7 +751,8 @@ class Application:
         """
 
         resolved = self._resolve(project, roots)
-        if self._project_is_stale(resolved):
+        partition = self.store.active_partition(resolved.id)
+        if self._project_is_stale(resolved, partition_id=partition.partition_id):
             self.indexer.index(resolved, wait_for_lock=True, trigger="lazy-query")
         report = self.indexer.backfill_references(
             resolved, wait_for_lock=True, trigger="reference-backfill"
@@ -759,16 +769,23 @@ class Application:
         self, project: str | None = None, *, roots: list[Path] | None = None
     ) -> ProjectStatus:
         resolved = self._resolve(project, roots)
-        files = self.store.list_files(resolved.id)
-        state = self.store.project_state(resolved.id)
+        partition = self.store.active_partition(resolved.id)
+        slot = self.store.get_slot(partition.slot_id)
+        files = self.store.list_files(resolved.id, partition_id=partition.partition_id)
+        state = slot.state if slot is not None else self.store.project_state(resolved.id)
+        git = probe_git_state(resolved.root, include_status=True)
         if state in {"ready", "partial"}:
-            fingerprint = resolved.scan.model_dump_json()
+            fingerprint = f"{partition.slot_id}:{resolved.scan.model_dump_json()}"
             cached = self._clean_freshness_until.get(resolved.id)
             if cached is not None and cached[1] == fingerprint and cached[0] > time.monotonic():
                 # A recent check found this exact scan configuration clean;
                 # do not walk the repository again for this call.
                 pass
-            elif self._project_is_stale(resolved, {record.path: record for record in files}):
+            elif self._project_is_stale(
+                resolved,
+                {record.path: record for record in files},
+                partition_id=partition.partition_id,
+            ):
                 self._clean_freshness_until.pop(resolved.id, None)
                 state = "stale"
             else:
@@ -780,9 +797,30 @@ class Application:
             project=resolved,
             state=state,
             file_count=len(files),
-            chunk_count=self.store.count_chunks([resolved.id]),
+            chunk_count=self.store.count_chunks(
+                [resolved.id], partition_ids={resolved.id: partition.partition_id}
+            ),
             progress=self.index_progress(resolved.id),
             last_run=self.history.recent(resolved.id),
+            active_slot_id=partition.slot_id,
+            git_selector_kind=git.selector_kind.value,
+            git_selector_value=git.selector_value,
+            git_head=git.head_oid,
+            git_probe=git.probe.value,
+            git_clean=(
+                None
+                if git.worktree is WorktreeStatus.UNKNOWN
+                else git.worktree is WorktreeStatus.CLEAN
+            ),
+            branch_build_pending=(
+                slot is None
+                or slot.state != "ready"
+                or (
+                    git.probe is GitProbeOutcome.GIT
+                    and slot.indexed_head is not None
+                    and slot.indexed_head != git.head_oid
+                )
+            ),
         )
 
     def invalidate_freshness(self, project_id: str) -> None:
@@ -995,7 +1033,11 @@ class Application:
                         )
                     )
                     continue
-                self.store.maintain_project(registered_project.id, cleanup_older_than=retention)
+                self.store.maintain_project(
+                    registered_project.id,
+                    cleanup_older_than=retention,
+                    branch_cache_limit=self.settings.branch_cache_limit,
+                )
                 after = self.store.storage_stats_for(registered_project)
                 if after.partition_open_failed or not after.tables:
                     raise RuntimeError("Partition became unreadable during maintenance")
@@ -1144,13 +1186,22 @@ class Application:
         self, project: str | None = None, *, roots: list[Path] | None = None
     ) -> bool:
         """Return whether eligible source metadata differs from the live index."""
-        return self._project_is_stale(self._resolve(project, roots))
+        resolved = self._resolve(project, roots)
+        partition = self.store.active_partition(resolved.id)
+        return self._project_is_stale(resolved, partition_id=partition.partition_id)
 
     def _project_is_stale(
-        self, project: ProjectInfo, existing: dict[str, StoredFile] | None = None
+        self,
+        project: ProjectInfo,
+        existing: dict[str, StoredFile] | None = None,
+        *,
+        partition_id: str | None = None,
     ) -> bool:
         if existing is None:
-            existing = {record.path: record for record in self.store.list_files(project.id)}
+            existing = {
+                record.path: record
+                for record in self.store.list_files(project.id, partition_id=partition_id)
+            }
         current = {
             item.path.as_posix(): item
             for item in self.indexer.scanner.iter_scan(project, existing, read_contents=False)
@@ -1255,10 +1306,19 @@ class Application:
     def remove_project(self, project: str) -> RemovalReport:
         resolved = self._resolve(project, [])
         self._clean_freshness_until.pop(resolved.id, None)
-        return RemovalReport(
-            project_id=resolved.id,
-            removed=self.store.remove_project(resolved.id),
-        )
+        lock_directory = self.paths.data / "locks"
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        with (
+            FileLock(lock_directory / "index-global.lock"),
+            FileLock(lock_directory / f"{resolved.id}.lock"),
+            FileLock(lock_directory / f"active-{resolved.id}.lock"),
+        ):
+            removed = self.store.remove_project(resolved.id, locks_held=True)
+            if removed:
+                shutil.rmtree(self.paths.data / "staging" / resolved.id, ignore_errors=True)
+                progress = self.paths.data / "progress" / f"{resolved.id}.json"
+                progress.unlink(missing_ok=True)
+        return RemovalReport(project_id=resolved.id, removed=removed)
 
     def search_code(
         self,
@@ -1314,7 +1374,7 @@ class Application:
         self,
         selector: DeclarationSelector,
         roots: list[Path] | None,
-    ) -> tuple[DeclarationSelector, ReferenceBackfillReport]:
+    ) -> tuple[DeclarationSelector, ReferenceBackfillReport, PartitionRef]:
         if selector.project is not None:
             resolved = self._resolve(selector.project, roots)
             selector = selector.model_copy(update={"project": resolved.id})
@@ -1328,12 +1388,21 @@ class Application:
                 raise AssertionError("get_chunk unexpectedly returned without a project id")
             project_id = chunk_project_id
         self._ensure_query_generations([project_id], roots)
-        return selector, self.ensure_reference_index(project_id, roots=roots)
+        report = self.ensure_reference_index(project_id, roots=roots)
+        return selector, report, self.store.active_partition(project_id)
 
     def _ensure_query_generations(self, project_ids: list[str], roots: list[Path] | None) -> None:
         """Rebuild incompatible partitions before any query can observe them."""
         for project_id in project_ids:
-            if self.store.incompatibility_reason(project_id, self.embedder.model_id) is not None:
+            partition = self.store.active_partition(project_id)
+            if (
+                self.store.incompatibility_reason(
+                    project_id,
+                    self.embedder.model_id,
+                    partition_id=partition.partition_id,
+                )
+                is not None
+            ):
                 self.index_project(
                     project_id,
                     roots=roots,
@@ -1350,10 +1419,15 @@ class Application:
         cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> ReferenceResponse:
-        selector, report = self._prepare_reference_query(selector, roots)
-        with self.store.partition_access(report.project_id):
+        selector, report, partition = self._prepare_reference_query(selector, roots)
+        with self.store.partition_access(report.project_id, partition_id=partition.partition_id):
             return self.references.find_references(
-                selector, kinds=kinds, limit=limit, cursor=cursor, backfill=report
+                selector,
+                kinds=kinds,
+                limit=limit,
+                cursor=cursor,
+                backfill=report,
+                partition=partition,
             )
 
     def analyze_refactor(
@@ -1365,10 +1439,15 @@ class Application:
         cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> RefactorAnalysis:
-        selector, report = self._prepare_reference_query(selector, roots)
-        with self.store.partition_access(report.project_id):
+        selector, report, partition = self._prepare_reference_query(selector, roots)
+        with self.store.partition_access(report.project_id, partition_id=partition.partition_id):
             return self.references.analyze_refactor(
-                selector, operation, limit=limit, cursor=cursor, backfill=report
+                selector,
+                operation,
+                limit=limit,
+                cursor=cursor,
+                backfill=report,
+                partition=partition,
             )
 
     def prepare_model(self) -> None:

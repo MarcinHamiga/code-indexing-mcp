@@ -2326,3 +2326,44 @@ def test_chunk_fetch_is_limited_to_the_active_physical_slot(tmp_path: Path) -> N
 
     assert store.get_chunk(first_chunk.chunk_id) is None
     assert store.get_chunk(second_chunk.chunk_id) is not None
+
+
+def test_storage_stats_does_not_adopt_or_materialize_a_project(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model", state="pending")
+    registry_version = store._projects.version
+    slots_version = store._project_slots.version
+    active_version = store._active_slots.version
+
+    stats = store.storage_stats_for(project)
+
+    assert stats.tables == []
+    assert stats.slots == []
+    assert store._projects.version == registry_version
+    assert store._project_slots.version == slots_version
+    assert store._active_slots.version == active_version
+    assert not (store.directory / "projects").exists()
+
+
+def test_branch_cache_limit_evicts_the_oldest_inactive_slot(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4, branch_cache_limit=1)
+    store.upsert_slot(_slot("project-a", "slot-a", partition_id="partition-a"))
+    store.upsert_slot(
+        _slot("project-a", "slot-b", partition_id="partition-b").model_copy(
+            update={"last_used_at": 1}
+        )
+    )
+    store.activate_slot("project-a", "slot-a")
+    store._tables("partition-a")
+    store._tables("partition-b")
+
+    assert store.maintain_project(
+        "project-a", cleanup_older_than=timedelta(hours=1), branch_cache_limit=1
+    )
+
+    assert [slot.slot_id for slot in store.list_slots("project-a")] == ["slot-a"]
+    assert not (store.directory / "projects" / "partition-b").exists()
+    assert store.active_slot("project-a").slot_id == "slot-a"

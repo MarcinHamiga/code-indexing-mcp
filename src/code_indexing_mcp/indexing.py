@@ -52,7 +52,7 @@ from .models import (
 from .progress import IndexProgress, ProgressPublisher
 from .scanner import SourceScanner
 from .staging import ChunkRow, ReferenceRow, StagingJob
-from .storage import SCHEMA_VERSION, LanceStore
+from .storage import SCHEMA_VERSION, LanceStore, PartitionRef
 from .update_check import checkout_head
 
 logger = logging.getLogger(__name__)
@@ -188,6 +188,7 @@ class _IndexScanState:
     reference_extraction_ns: int = 0
     staged_reference_rows: int = 0
     peak_memory_bytes: int = 0
+    partition: PartitionRef | None = None
 
     def record_skip(self, path: str, reason: str) -> None:
         self.skipped += 1
@@ -368,8 +369,17 @@ class Indexer:
                 global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
                 project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
             ):
+                try:
+                    partition = self.store.active_partition(project.id)
+                except CodeIndexingError as exc:
+                    if exc.code is not ErrorCode.PROJECT_NOT_FOUND:
+                        raise
+                    self.store.upsert_project(
+                        project, model_id=self.embedder.model_id, state="pending"
+                    )
+                    partition = self.store.active_partition(project.id)
                 rebuild_reason = self.store.incompatibility_reason(
-                    project.id, self.embedder.model_id
+                    project.id, self.embedder.model_id, partition_id=partition.partition_id
                 )
                 effective_trigger = trigger if rebuild_reason is None else "schema-rebuild"
                 with self._recorded_run(
@@ -378,11 +388,14 @@ class Indexer:
                     effective_trigger,
                     force=force,
                     rebuild_reason=rebuild_reason,
+                    partition_id=partition.partition_id,
                 ) as record:
                     if rebuild_reason is not None:
-                        self._prepare_rebuild(project, rebuild_reason)
+                        self._prepare_rebuild(project, rebuild_reason, partition)
                     try:
-                        report = self._index_locked(project, force=force, progress=progress)
+                        report = self._index_locked(
+                            project, partition=partition, force=force, progress=progress
+                        )
                     finally:
                         # Only the run that holds the lock owns the snapshot, so
                         # clearing here can never delete another process's progress.
@@ -434,7 +447,18 @@ class Indexer:
     ) -> ReferenceBackfillReport:
         """Parse missing structural generations without embedding source chunks."""
 
-        if self.store.incompatibility_reason(project.id, self.embedder.model_id) is not None:
+        try:
+            partition = self.store.active_partition(project.id)
+        except CodeIndexingError as exc:
+            if exc.code is ErrorCode.PROJECT_NOT_FOUND:
+                return ReferenceBackfillReport(project_id=project.id)
+            raise
+        if (
+            self.store.incompatibility_reason(
+                project.id, self.embedder.model_id, partition_id=partition.partition_id
+            )
+            is not None
+        ):
             # An incompatible partition cannot be healed by a parse-only
             # backfill: its rows were written by an older model or schema.
             # Rebuild it with a full embedding run (recorded as its own
@@ -450,6 +474,7 @@ class Indexer:
             # uncovered. Continue through normal backfill accounting so the
             # caller sees those coverage limitations instead of a false clean
             # report.
+            partition = self.store.active_partition(project.id)
 
         self.lock_directory.mkdir(parents=True, exist_ok=True)
         run_id = uuid.uuid4().hex
@@ -469,11 +494,18 @@ class Indexer:
                 # Deferred: reference tools run a backfill on every query, and
                 # the overwhelmingly common outcome is "nothing missing". Only
                 # a backfill that actually starts work earns an audit row.
-                self._recorded_run(project, run_id, trigger, deferred=True) as record,
+                self._recorded_run(
+                    project,
+                    run_id,
+                    trigger,
+                    deferred=True,
+                    partition_id=partition.partition_id,
+                ) as record,
             ):
+                partition = self.store.active_partition(project.id)
                 try:
                     report = self._backfill_references_locked(
-                        project, progress=progress, run_record=record
+                        project, partition=partition, progress=progress, run_record=record
                     )
                 finally:
                     progress.clear()
@@ -509,6 +541,7 @@ class Indexer:
         force: bool = False,
         deferred: bool = False,
         rebuild_reason: str | None = None,
+        partition_id: str | None = None,
     ) -> Iterator[_RunRecord]:
         """Record one run's audit trail around the body of a locked run.
 
@@ -527,7 +560,7 @@ class Indexer:
             audit=lambda: self._run_audit(
                 project, run_id, trigger, force, rebuild_reason=rebuild_reason
             ),
-            snapshot=lambda: self._storage_snapshot(project.id),
+            snapshot=lambda: self._storage_snapshot(project.id, partition_id=partition_id),
         )
         if not deferred:
             record.start()
@@ -565,7 +598,7 @@ class Indexer:
             rebuild_reason=rebuild_reason,
         )
 
-    def _prepare_rebuild(self, project: ProjectInfo, reason: str) -> None:
+    def _prepare_rebuild(self, project: ProjectInfo, reason: str, partition: PartitionRef) -> None:
         """Delete *project*'s partition when its generation is incompatible.
 
         Called under the writer locks after the run's audit row is written.
@@ -575,7 +608,9 @@ class Indexer:
         registry row is re-stamped to the current generation because no rows
         remain for the old generation's claim to describe.
         """
-        self.store.delete_partition(project.id, model_id=self.embedder.model_id)
+        self.store.delete_partition(
+            project.id, model_id=self.embedder.model_id, partition_id=partition.partition_id
+        )
         logger.warning("Rebuilding incompatible index for %s: %s", project.id, reason)
 
     @staticmethod
@@ -587,12 +622,15 @@ class Indexer:
                 durations[phase] = value
         return durations
 
-    def _storage_snapshot(self, project_id: str) -> dict[str, int]:
+    def _storage_snapshot(
+        self, project_id: str, *, partition_id: str | None = None
+    ) -> dict[str, int]:
         """Best-effort pre/post table versions; empty when there is no partition yet."""
 
         with contextlib.suppress(Exception):
-            if (self.store.directory / "projects" / project_id).exists():
-                versions = self.store.table_versions(project_id)
+            physical = partition_id or project_id
+            if (self.store.directory / "projects" / physical).exists():
+                versions = self.store.table_versions(project_id, partition_id=partition_id)
                 return {
                     "files": versions.files,
                     "chunks": versions.chunks,
@@ -601,7 +639,12 @@ class Indexer:
         return {}
 
     def _backfill_references_locked(
-        self, project: ProjectInfo, *, progress: ProgressPublisher, run_record: _RunRecord
+        self,
+        project: ProjectInfo,
+        *,
+        partition: PartitionRef,
+        progress: ProgressPublisher,
+        run_record: _RunRecord,
     ) -> ReferenceBackfillReport:
         # Backfill never embeds or re-parses chunks; it must not use its own
         # (always error-free) run to promote a project past whatever state a
@@ -622,8 +665,13 @@ class Indexer:
             # value would ever be read; it exists only so a future change to
             # that invariant fails safe instead of crashing.
             prior_state = "ready"
-        existing = {record.path: record for record in self.store.list_files(project.id)}
-        coverage_rows = self.store.reference_coverage(project.id)
+        existing = {
+            record.path: record
+            for record in self.store.list_files(project.id, partition_id=partition.partition_id)
+        }
+        coverage_rows = self.store.reference_coverage(
+            project.id, partition_id=partition.partition_id
+        )
         coverage = {
             row["file_id"]: ReferenceCoverage(
                 file_id=row["file_id"],
@@ -680,6 +728,7 @@ class Indexer:
                         self.store.vector_dimension, self.store.vector_dtype
                     ),
                     reference_schema=LanceStore.reference_arrow_schema(),
+                    partition=partition,
                 )
                 job.begin()
             return job
@@ -810,7 +859,7 @@ class Indexer:
                 # the exact backfill that just ran and cannot help (S8). An
                 # otherwise-empty commit still creates the table.
                 job = staging_job()
-            self._commit_staged(project, job, errors=[], state=prior_state)
+            self._commit_staged(project, job, partition=partition, errors=[], state=prior_state)
             return ReferenceBackfillReport(
                 project_id=project.id,
                 files_checked=files_checked,
@@ -835,10 +884,16 @@ class Indexer:
             raise
 
     def _index_locked(
-        self, project: ProjectInfo, *, force: bool, progress: ProgressPublisher
+        self,
+        project: ProjectInfo,
+        *,
+        partition: PartitionRef,
+        force: bool,
+        progress: ProgressPublisher,
     ) -> IndexReport:
-        self.store.upsert_project(project, model_id=self.embedder.model_id, state="indexing")
         try:
+            self.store.upsert_project(project, model_id=self.embedder.model_id, state="indexing")
+            self.store.set_slot_state(partition, "indexing")
             context = (
                 self.passage_session_factory()
                 if self.passage_session_factory is not None
@@ -846,7 +901,11 @@ class Indexer:
             )
             with context as passage_embedder:
                 report = self._index_scan(
-                    project, force=force, passage_embedder=passage_embedder, progress=progress
+                    project,
+                    partition=partition,
+                    force=force,
+                    passage_embedder=passage_embedder,
+                    progress=progress,
                 )
             if isinstance(context, TelemetrySource):
                 # Read after the context exits, so a session that fell back from
@@ -876,6 +935,7 @@ class Indexer:
             # Never leave the project stuck in "indexing" after a crash.
             with contextlib.suppress(Exception):
                 self.store.upsert_project(project, model_id=self.embedder.model_id, state="error")
+                self.store.set_slot_state(partition, "error")
             raise
 
     def _staging_job(self, project: ProjectInfo, state: _IndexScanState) -> StagingJob:
@@ -888,6 +948,7 @@ class Indexer:
                     self.store.vector_dimension, self.store.vector_dtype
                 ),
                 reference_schema=LanceStore.reference_arrow_schema(),
+                partition=state.partition,
             )
             state.job.begin()
         return state.job
@@ -939,7 +1000,9 @@ class Indexer:
         # Embedding is the longest gap between progress updates, so announce it
         # before starting each pending batch.
         progress.update(phase="embedding", current_path=None, force=True)
-        slot_id = self.store.active_partition(project.id).slot_id
+        if state.partition is None:
+            raise RuntimeError("index scan has no pinned partition")
+        slot_id = state.partition.slot_id
         for group in _candidate_groups(candidates):
             active = [
                 candidate for candidate in group if state.pending[candidate.owner].error is None
@@ -1159,16 +1222,20 @@ class Indexer:
         self,
         project: ProjectInfo,
         *,
+        partition: PartitionRef,
         force: bool,
         passage_embedder: PassageEmbedder,
         progress: ProgressPublisher,
     ) -> IndexReport:
         timer = _PhaseTimer()
         with timer.measure("scan"):
-            existing = {record.path: record for record in self.store.list_files(project.id)}
+            existing = {
+                record.path: record
+                for record in self.store.list_files(project.id, partition_id=partition.partition_id)
+            }
         # Streaming scans do not know their total until the walk finishes.
         progress.update(phase="scanning", force=True)
-        state = _IndexScanState()
+        state = _IndexScanState(partition=partition)
         process = psutil.Process()
         state.sample_memory(process)
         stream = self.scanner.iter_scan(project, existing)
@@ -1240,13 +1307,19 @@ class Indexer:
                         self._staging_job(project, state).mark_removed(record.file_id)
                         state.removed += 1
                 if state.job is not None:
-                    self._commit_staged(project, state.job, errors=state.errors)
+                    self._commit_staged(
+                        project, state.job, partition=partition, errors=state.errors
+                    )
                 else:
+                    final_state = self._derive_index_state(
+                        project.id, state.errors, partition_id=partition.partition_id
+                    )
                     self.store.upsert_project(
                         project,
                         model_id=self.embedder.model_id,
-                        state=self._derive_index_state(project.id, state.errors),
+                        state=final_state,
                     )
+                    self.store.set_slot_state(partition, final_state, project=project)
         except BaseException:
             # Discard staged bytes unless a failed rollback left a committing
             # journal that startup recovery still needs.
@@ -1255,7 +1328,9 @@ class Indexer:
             raise
         return state.to_report(project.id, timer, self.batch_size)
 
-    def _derive_index_state(self, project_id: str, errors: list[IndexIssue]) -> str:
+    def _derive_index_state(
+        self, project_id: str, errors: list[IndexIssue], *, partition_id: str | None = None
+    ) -> str:
         """A project is partial while *this* run errored or any stored file row
         still records a genuine error.
 
@@ -1269,7 +1344,7 @@ class Indexer:
         """
         if errors:
             return "partial"
-        if self.store.has_file_errors(project_id):
+        if self.store.has_file_errors(project_id, partition_id=partition_id):
             return "partial"
         return "ready"
 
@@ -1278,6 +1353,7 @@ class Indexer:
         project: ProjectInfo,
         job: StagingJob,
         *,
+        partition: PartitionRef | None = None,
         errors: list[IndexIssue],
         state: str | None = None,
     ) -> None:
@@ -1292,26 +1368,41 @@ class Indexer:
         backfill commits no chunks or embeddings and therefore cannot promote a
         project whose earlier indexing failure left it partial.
         """
-        versions = self.store.table_versions(project.id)
+        if partition is None:
+            partition = self.store.active_partition(project.id)
+        versions = self.store.table_versions(project.id, partition_id=partition.partition_id)
         job.begin_commit(versions)
         try:
-            self.store.replace_files_from_arrow(
-                project.id,
-                files=job.files_table(),
-                chunk_batches=job.iter_chunk_batches(),
-                reference_batches=job.iter_reference_batches(),
-                removed_file_ids=job.removed_file_ids,
-            )
-            if job.replace_file_ids or job.replace_reference_file_ids or job.removed_file_ids:
-                self.store.ensure_indexes(project.id)
-            self.store.upsert_project(
-                project,
-                model_id=self.embedder.model_id,
-                state=state if state is not None else self._derive_index_state(project.id, errors),
-            )
+            with self.store.partition_access(project.id, partition_id=partition.partition_id):
+                self.store.replace_files_from_arrow(
+                    project.id,
+                    files=job.files_table(),
+                    chunk_batches=job.iter_chunk_batches(),
+                    reference_batches=job.iter_reference_batches(),
+                    removed_file_ids=job.removed_file_ids,
+                    partition_id=partition.partition_id,
+                )
+                if job.replace_file_ids or job.replace_reference_file_ids or job.removed_file_ids:
+                    self.store.ensure_indexes(project.id, partition_id=partition.partition_id)
+                final_state = (
+                    state
+                    if state is not None
+                    else self._derive_index_state(
+                        project.id, errors, partition_id=partition.partition_id
+                    )
+                )
+                self.store.upsert_project(
+                    project,
+                    model_id=self.embedder.model_id,
+                    state=final_state,
+                )
+                self.store.set_slot_state(partition, final_state, project=project)
         except BaseException:
             try:
-                self.store.restore_versions(project.id, versions)
+                with self.store.partition_access(project.id, partition_id=partition.partition_id):
+                    self.store.restore_versions(
+                        project.id, versions, partition_id=partition.partition_id
+                    )
             except Exception:
                 # The journal stays in "committing" and StagingJob.discard
                 # deliberately keeps the directory, so the next startup's

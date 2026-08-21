@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from conftest import run_git
 from test_indexing import _remove_reference_generation
 
 from code_indexing_mcp.accelerator_env import (
@@ -114,6 +115,61 @@ def test_application_orchestrates_default_project_lifecycle(tmp_path: Path) -> N
     assert removal.removed is True
     assert app.list_projects() == []
     assert (root / ".ci-mcp" / "project.toml").exists()
+
+
+def test_git_checkout_switches_active_slots_without_leaking_branch_rows(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(root))
+    (root / "main.py").write_text("def main_branch():\n    return 1\n")
+    run_git("add", "main.py", cwd=root)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "main",
+        cwd=root,
+    )
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    main_slot = app.project_status(project.id).active_slot_id
+
+    run_git("checkout", "-qb", "feature", cwd=root)
+    (root / "feature.py").write_text("def feature_branch():\n    return 2\n")
+    run_git("add", "feature.py", cwd=root)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "feature",
+        cwd=root,
+    )
+
+    pending = app.project_status(project.id)
+    assert pending.active_slot_id != main_slot
+    assert pending.branch_build_pending is True
+    assert pending.file_count == 0
+    app.index_project(project.id)
+    feature = app.search_code("feature branch", projects=[project.id], paths=["feature.py"])
+    assert [hit.symbol for hit in feature.hits] == ["feature_branch"]
+
+    run_git("checkout", "-q", "main", cwd=root)
+    restored = app.project_status(project.id)
+    assert restored.active_slot_id == main_slot
+    assert restored.file_count == 1
+    assert restored.branch_build_pending is False
+    assert app.search_code("feature branch", projects=[project.id], paths=["feature.py"]).hits == []
 
 
 def test_application_can_ensure_the_structural_index_without_a_semantic_search(
