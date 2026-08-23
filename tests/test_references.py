@@ -781,3 +781,45 @@ def test_references_return_once_a_stale_file_is_reindexed(tmp_path: Path) -> Non
     healed = service.find_references(selector)
     assert any(hit.path == "main.py" and hit.kind == "call" for hit in healed.hits)
     assert all(item.code != "stale_file" for item in healed.limitations)
+
+
+def test_reference_cursor_is_bound_to_the_active_slot(tmp_path: Path) -> None:
+    from code_indexing_mcp import storage as storage_module
+    from code_indexing_mcp.models import ProjectSlot
+
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "main.py": (
+                "from lib import answer\n\ndef a(): return answer()\ndef b(): return answer()\n"
+            ),
+        },
+    )
+    selector = DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    first = service.find_references(selector, limit=1)
+    assert first.cursor is not None
+    original = service.store.active_pointer(project_id)
+    assert original is not None
+
+    other = ProjectSlot(
+        slot_id="other-slot",
+        project_id=project_id,
+        partition_id="partition-b",
+        selector_kind="ref",
+        selector_value="refs/heads/other",
+        scan_config_hash="hash",
+        model_id="test/reference",
+        vector_dimension=4,
+        schema_version=storage_module.SCHEMA_VERSION,
+        state="ready",
+        created_at=1,
+        last_used_at=1,
+    )
+    service.store.upsert_slot(other)
+    service.store.activate_slot(project_id, other.slot_id)
+    service.store._tables(other.partition_id)
+
+    with pytest.raises(CodeIndexingError) as caught:
+        service.find_references(selector, limit=1, cursor=first.cursor)
+    assert caught.value.code is ErrorCode.STALE_CURSOR

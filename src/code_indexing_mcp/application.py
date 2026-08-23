@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from typing import TypeVar
 
 from filelock import FileLock, Timeout
 from platformdirs import user_cache_path, user_data_path
@@ -33,6 +34,15 @@ from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
+from .git_state import (
+    ActiveIndexTarget,
+    GitProbeOutcome,
+    GitState,
+    WorktreeStatus,
+    partition_id,
+    probe_git_state,
+    slot_id,
+)
 from .history import HistoryStore
 from .indexing import Indexer
 from .models import (
@@ -47,6 +57,7 @@ from .models import (
     ModelStatus,
     OutlineResponse,
     ProjectInfo,
+    ProjectSlot,
     ProjectStatus,
     ProjectStorageStats,
     RefactorAnalysis,
@@ -82,11 +93,19 @@ from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
 from .staging import has_pending_recovery, recover_staged_commits
-from .storage import LanceStore, overlap_warnings, overlapping_registration, worktree_warnings
+from .storage import (
+    SCHEMA_VERSION,
+    LanceStore,
+    overlap_warnings,
+    overlapping_registration,
+    worktree_warnings,
+)
 from .token_batching import max_token_product_for
 from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # Startup recovery needs the global index lock, but that lock is held for the
 # whole of an index run. Wait only long enough to lose a race against a commit
@@ -696,6 +715,89 @@ class Application:
             self.invalidate_freshness(project.id)
             return project
 
+    def resolve_active_target(
+        self, project: ProjectInfo, *, include_status: bool = False
+    ) -> ActiveIndexTarget:
+        """Probe Git, ensure the matching slot exists, and publish the pointer."""
+        state = probe_git_state(Path(project.root), include_status=include_status)
+        sid = slot_id(project.id, state)
+        existing = self.store.get_slot(sid)
+        if existing is None:
+            now = time.time_ns()
+            physical = project.id if state.probe is GitProbeOutcome.NOT_GIT else partition_id(sid)
+            existing = ProjectSlot(
+                slot_id=sid,
+                project_id=project.id,
+                partition_id=physical,
+                selector_kind=state.selector_kind.value,
+                selector_value=state.selector_value,
+                repository_identity=state.repository_identity,
+                checkout_identity=state.checkout_identity,
+                project_prefix=state.project_prefix,
+                indexed_head=None,
+                indexed_clean=None,
+                scan_config_hash=self.store._scan_config_hash(project),
+                model_id=self.embedder.model_id,
+                vector_dimension=self.store.vector_dimension,
+                schema_version=SCHEMA_VERSION,
+                state="pending",
+                created_at=now,
+                last_used_at=now,
+            )
+            self.store.upsert_slot(existing)
+        epoch = self.store.activate_slot(project.id, existing.slot_id)
+        self.store.touch_slot(existing.slot_id)
+        slot = self.store.get_slot(existing.slot_id) or existing
+        return ActiveIndexTarget(
+            project=project,
+            slot=slot,
+            partition_id=slot.partition_id,
+            activation_epoch=epoch,
+            git_state=state,
+        )
+
+    def _resolve_targets(
+        self, project_ids: list[str], roots: list[Path] | None
+    ) -> list[ActiveIndexTarget]:
+        projects = [self._resolve(project_id, roots) for project_id in sorted(project_ids)]
+        return [self.resolve_active_target(project) for project in projects]
+
+    @staticmethod
+    def _git_identity(state: GitState) -> tuple[str, str, str | None]:
+        return (state.selector_kind.value, state.selector_value, state.head_oid)
+
+    def _targets_current(self, targets: list[ActiveIndexTarget]) -> bool:
+        return all(
+            self._git_identity(probe_git_state(Path(target.project.root)))
+            == self._git_identity(target.git_state)
+            for target in targets
+        )
+
+    def _run_with_stable_targets(
+        self,
+        project_ids: list[str],
+        roots: list[Path] | None,
+        operation: Callable[[list[ActiveIndexTarget]], _T],
+    ) -> _T:
+        targets = self._resolve_targets(project_ids, roots)
+        result = operation(targets)
+        if self._targets_current(targets):
+            return result
+        targets = self._resolve_targets(project_ids, roots)
+        result = operation(targets)
+        if self._targets_current(targets):
+            return result
+        raise CodeIndexingError(
+            ErrorCode.REPOSITORY_CHANGED,
+            "The repository changed while the query was running; retry the request",
+        )
+
+    def _project_by_id(self, project_id: str) -> ProjectInfo:
+        for project in self.store.list_projects():
+            if project.id == project_id:
+                return project
+        raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {project_id}")
+
     def index_project(
         self,
         project: str | None = None,
@@ -707,6 +809,7 @@ class Application:
         trigger: IndexTrigger = "manual",
     ) -> IndexReport:
         resolved = self._resolve(project, roots)
+        self.resolve_active_target(resolved)
         try:
             return self.indexer.index(
                 resolved,
@@ -742,6 +845,7 @@ class Application:
         """
 
         resolved = self._resolve(project, roots)
+        self.resolve_active_target(resolved)
         if self._project_is_stale(resolved):
             self.indexer.index(resolved, wait_for_lock=True, trigger="lazy-query")
         report = self.indexer.backfill_references(
@@ -759,8 +863,15 @@ class Application:
         self, project: str | None = None, *, roots: list[Path] | None = None
     ) -> ProjectStatus:
         resolved = self._resolve(project, roots)
+        target = self.resolve_active_target(resolved, include_status=True)
         files = self.store.list_files(resolved.id)
-        state = self.store.project_state(resolved.id)
+        # A pending first-visit branch slot must not inherit the previous
+        # branch's ready/partial summary. Otherwise prefer the project row,
+        # which still carries generation-wide states such as rebuild_required.
+        if target.slot.state == "pending":
+            state = "pending"
+        else:
+            state = self.store.project_state(resolved.id)
         if state in {"ready", "partial"}:
             fingerprint = resolved.scan.model_dump_json()
             cached = self._clean_freshness_until.get(resolved.id)
@@ -776,13 +887,32 @@ class Application:
                     time.monotonic() + FRESHNESS_CACHE_SECONDS,
                     fingerprint,
                 )
+        worktree = target.git_state.worktree
+        git_clean = None
+        if worktree is WorktreeStatus.CLEAN:
+            git_clean = True
+        elif worktree in {
+            WorktreeStatus.TRACKED_DIRTY,
+            WorktreeStatus.UNTRACKED,
+            WorktreeStatus.MIXED,
+        }:
+            git_clean = False
         return ProjectStatus(
             project=resolved,
             state=state,
             file_count=len(files),
-            chunk_count=self.store.count_chunks([resolved.id]),
+            chunk_count=self.store.count_chunks(
+                [resolved.id], partitions={resolved.id: target.partition_id}
+            ),
             progress=self.index_progress(resolved.id),
             last_run=self.history.recent(resolved.id),
+            active_slot_id=target.slot.slot_id,
+            git_selector_kind=target.git_state.selector_kind.value,
+            git_selector_value=target.git_state.selector_value,
+            git_head=target.git_state.head_oid,
+            git_probe=target.git_state.probe.value,
+            git_clean=git_clean,
+            branch_build_pending=target.slot.state == "pending",
         )
 
     def invalidate_freshness(self, project_id: str) -> None:
@@ -833,12 +963,13 @@ class Application:
         registered = self.list_projects()
         if project is not None:
             resolved = self._resolve(project, roots)
+            self.resolve_active_target(resolved)
             projects = [self.store.storage_stats_for(resolved)]
         else:
-            projects = [
-                self.store.storage_stats_for(registered_project)
-                for registered_project in registered
-            ]
+            projects = []
+            for registered_project in registered:
+                self.resolve_active_target(registered_project)
+                projects.append(self.store.storage_stats_for(registered_project))
         registry_after = self.store.registry_stats()
         partition_bytes: dict[str, int] = {}
         for stats in projects:
@@ -891,6 +1022,8 @@ class Application:
             scope: list[ProjectInfo] = [resolved]
         else:
             scope = registered
+        for scoped in scope:
+            self.resolve_active_target(scoped)
         lock_directory = self.paths.data / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
 
@@ -1184,6 +1317,7 @@ class Application:
         the project again for every page.
         """
         resolved = self._resolve(project, roots)
+        self.resolve_active_target(resolved)
         if limit < 1 or limit > SCAN_INSPECTION_MAX_LIMIT:
             raise CodeIndexingError(
                 ErrorCode.INVALID_FILTER,
@@ -1274,14 +1408,20 @@ class Application:
     ) -> SearchResponse:
         project_ids = self.resolve_search_scope(projects, all_projects, roots)
         self._ensure_query_generations(project_ids, roots)
-        return self.search.search_code(
-            query,
-            project_ids,
-            languages=languages,
-            paths=paths,
-            kinds=kinds,
-            limit=limit,
-        )
+
+        def run(targets: list[ActiveIndexTarget]) -> SearchResponse:
+            partitions = {target.project.id: target.partition_id for target in targets}
+            return self.search.search_code(
+                query,
+                [target.project.id for target in targets],
+                languages=languages,
+                paths=paths,
+                kinds=kinds,
+                limit=limit,
+                partitions=partitions,
+            )
+
+        return self._run_with_stable_targets(project_ids, roots, run)
 
     def find_symbol(
         self,
@@ -1295,6 +1435,7 @@ class Application:
     ) -> SymbolResponse:
         resolved = self.resolve_project(project, roots)
         self._ensure_query_generations([resolved.id], roots)
+        self.resolve_active_target(resolved)
         return self.search.find_symbol(name, resolved.id, match=match, kinds=kinds, limit=limit)
 
     def file_outline(
@@ -1302,13 +1443,16 @@ class Application:
     ) -> OutlineResponse:
         resolved = self.resolve_project(project, roots)
         self._ensure_query_generations([resolved.id], roots)
+        self.resolve_active_target(resolved)
         return self.search.file_outline(path, resolved.id)
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         project_id = self.store._chunk_project_id(chunk_id)
-        if project_id is not None:
-            self._ensure_query_generations([project_id], None)
-        return self.search.get_chunk(chunk_id)
+        if project_id is None:
+            return self.search.get_chunk(chunk_id)
+        self._ensure_query_generations([project_id], None)
+        target = self.resolve_active_target(self._project_by_id(project_id))
+        return self.search.get_chunk(chunk_id, partition_id=target.partition_id)
 
     def _prepare_reference_query(
         self,
@@ -1328,6 +1472,7 @@ class Application:
                 raise AssertionError("get_chunk unexpectedly returned without a project id")
             project_id = chunk_project_id
         self._ensure_query_generations([project_id], roots)
+        self.resolve_active_target(self._project_by_id(project_id))
         return selector, self.ensure_reference_index(project_id, roots=roots)
 
     def _ensure_query_generations(self, project_ids: list[str], roots: list[Path] | None) -> None:

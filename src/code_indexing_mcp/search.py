@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from pathlib import PurePosixPath
 
 from .embedding import Embedder
@@ -41,6 +42,7 @@ class SearchService:
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
         limit: int = 8,
+        partitions: Mapping[str, str] | None = None,
     ) -> SearchResponse:
         query = query.strip()
         if not query or not project_ids:
@@ -68,13 +70,14 @@ class SearchService:
                 _FALLBACK_FETCH_ROWS,
             )
         fetch = _FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5)
-        with self.store.partitions_access(project_ids):
+        with self.store.partitions_access(project_ids, partitions=partitions):
             rows = self.store.hybrid_search(
                 query,
                 self.embedder.embed_query(query),
                 project_ids,
                 " AND ".join(conditions) if conditions else None,
                 fetch,
+                partitions=partitions,
             )
         names = {project.id: project.name for project in self.store.list_projects()}
         hits: list[SearchHit] = []
@@ -141,13 +144,13 @@ class SearchService:
             )
         return OutlineResponse(project_id=project_id, path=path, items=items)
 
-    def get_chunk(self, chunk_id: str) -> CodeChunk:
+    def get_chunk(self, chunk_id: str, *, partition_id: str | None = None) -> CodeChunk:
         project_id = self.store._chunk_project_id(chunk_id)
         if project_id is None:
             chunk = None
         else:
-            with self.store.partition_access(project_id):
-                chunk = self.store.get_chunk(chunk_id)
+            with self.store.partition_access(project_id, partition_id=partition_id):
+                chunk = self.store.get_chunk(chunk_id, partition_id=partition_id)
         if chunk is None:
             raise CodeIndexingError(
                 ErrorCode.CHUNK_NOT_FOUND,

@@ -672,6 +672,7 @@ class Indexer:
         def staging_job() -> StagingJob:
             nonlocal job
             if job is None:
+                slot = self.store.active_slot(project.id)
                 job = StagingJob(
                     self.staging_directory,
                     project.id,
@@ -680,6 +681,8 @@ class Indexer:
                         self.store.vector_dimension, self.store.vector_dtype
                     ),
                     reference_schema=LanceStore.reference_arrow_schema(),
+                    slot_id=None if slot is None else slot.slot_id,
+                    partition_id=None if slot is None else slot.partition_id,
                 )
                 job.begin()
             return job
@@ -880,6 +883,7 @@ class Indexer:
 
     def _staging_job(self, project: ProjectInfo, state: _IndexScanState) -> StagingJob:
         if state.job is None:
+            slot = self.store.active_slot(project.id)
             state.job = StagingJob(
                 self.staging_directory,
                 project.id,
@@ -888,6 +892,8 @@ class Indexer:
                     self.store.vector_dimension, self.store.vector_dtype
                 ),
                 reference_schema=LanceStore.reference_arrow_schema(),
+                slot_id=None if slot is None else slot.slot_id,
+                partition_id=None if slot is None else slot.partition_id,
             )
             state.job.begin()
         return state.job
@@ -931,6 +937,8 @@ class Indexer:
     ) -> None:
         if not state.pending:
             return
+        slot = self.store.active_slot(project.id)
+        slot_id = "" if slot is None else slot.slot_id
         candidates = [
             _PendingCandidate(owner, chunk)
             for owner, pending_file in enumerate(state.pending)
@@ -959,7 +967,7 @@ class Indexer:
                     continue
                 windowed = self._windowed_chunks([candidate.chunk], [segments])
                 rows = [
-                    self._chunk_row(project.id, target.record, chunk, vector)
+                    self._chunk_row(project.id, target.record, chunk, vector, slot_id)
                     for chunk, vector in windowed
                 ]
                 staged_rows.setdefault(candidate.owner, []).extend(rows)
@@ -1303,14 +1311,18 @@ class Indexer:
             )
             if job.replace_file_ids or job.replace_reference_file_ids or job.removed_file_ids:
                 self.store.ensure_indexes(project.id)
+            derived = state if state is not None else self._derive_index_state(project.id, errors)
             self.store.upsert_project(
                 project,
                 model_id=self.embedder.model_id,
-                state=state if state is not None else self._derive_index_state(project.id, errors),
+                state=derived,
             )
+            slot = self.store.active_slot(project.id)
+            if slot is not None:
+                self.store.upsert_slot(slot.model_copy(update={"state": derived}))
         except BaseException:
             try:
-                self.store.restore_versions(project.id, versions)
+                self.store.restore_versions(project.id, versions, partition_id=job.partition_id)
             except Exception:
                 # The journal stays in "committing" and StagingJob.discard
                 # deliberately keeps the directory, so the next startup's
@@ -1570,10 +1582,15 @@ class Indexer:
 
     @staticmethod
     def _chunk_row(
-        project_id: str, file: StoredFile, chunk: ExtractedChunk, vector: bytes
+        project_id: str,
+        file: StoredFile,
+        chunk: ExtractedChunk,
+        vector: bytes,
+        slot_id: str = "",
     ) -> ChunkRow:
         identity = "\0".join(
             [
+                slot_id,
                 file.file_id,
                 file.content_hash,
                 chunk.kind,
@@ -1583,9 +1600,10 @@ class Indexer:
                 str(chunk.part_index),
             ]
         )
-        # The project-id prefix routes get_chunk to the owning partition; the
-        # digest keeps the id content-derived, so it still changes whenever
-        # the file is re-indexed.
+        # The project-id prefix routes get_chunk to the logical project; the
+        # slot id in the digest keeps identical content in two branch slots
+        # from sharing a selector. The digest still changes whenever the
+        # file is re-indexed.
         return ChunkRow(
             chunk_id=f"{project_id}:{_digest(identity)}",
             file_id=file.file_id,

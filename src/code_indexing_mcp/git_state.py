@@ -16,7 +16,7 @@ from collections.abc import Callable, Sequence
 from enum import StrEnum
 from pathlib import Path
 
-from .models import FrozenModel
+from .models import FrozenModel, ProjectInfo, ProjectSlot
 
 GIT_TIMEOUT_SECONDS = 5.0
 SLOT_KEY_VERSION = "git-slot-v1"
@@ -115,6 +115,20 @@ class GitState(FrozenModel):
     dirty_paths: tuple[str, ...] = ()
     untracked_paths: tuple[str, ...] = ()
     status_fingerprint: str | None = None
+
+
+class ActiveIndexTarget(FrozenModel):
+    """Immutable physical index a single operation may read or write.
+
+    Resolved once at the application boundary. Lower layers must not
+    re-consult the active pointer while using this target.
+    """
+
+    project: ProjectInfo
+    slot: ProjectSlot
+    partition_id: str
+    activation_epoch: int
+    git_state: GitState
 
 
 def probe_git_state(

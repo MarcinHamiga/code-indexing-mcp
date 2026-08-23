@@ -2,7 +2,7 @@
 
 An index run never touches the live Lance tables while it scans, parses, and
 embeds. It streams file, chunk, and structural-reference rows into Arrow IPC files under
-``<data>/staging/<project-id>/<job-id>/`` and records its progress in
+``<data>/staging/<project-id>/<slot-id>/<job-id>/`` and records its progress in
 ``journal.json``. Only once staging finishes does the run record the live
 tables' versions, switch the journal to ``committing``, and apply the staged
 batches. A crash before that switch leaves the live tables untouched; a crash
@@ -45,7 +45,8 @@ PHASE_COMPLETE = "complete"
 PHASE_ROLLED_BACK = "rolled_back"
 
 LEGACY_JOURNAL_FORMAT_VERSION = 1
-JOURNAL_FORMAT_VERSION = 2
+REFERENCES_JOURNAL_FORMAT_VERSION = 2
+JOURNAL_FORMAT_VERSION = 3
 
 # A rollback that keeps failing must not be retried forever: every startup
 # would pay for it, under the global index lock, with no prospect of success.
@@ -150,6 +151,37 @@ def _sync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _remove_empty_parents(path: Path, stop_at: Path) -> None:
+    current = path
+    while current != stop_at:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def _all_journals(staging_root: Path) -> list[Path]:
+    return sorted(
+        {*staging_root.glob(f"*/*/{JOURNAL_NAME}"), *staging_root.glob(f"*/*/*/{JOURNAL_NAME}")}
+    )
+
+
+def _project_journals(project_root: Path) -> list[Path]:
+    """Two-level ``<job>/journal`` and three-level ``<slot>/<job>/journal``."""
+    return sorted(
+        [*project_root.glob(f"*/{JOURNAL_NAME}"), *project_root.glob(f"*/*/{JOURNAL_NAME}")]
+    )
+
+
+def _journal_protects_recovery(payload: object) -> bool:
+    known_phases = {PHASE_STAGING, PHASE_COMMITTING, PHASE_COMPLETE, PHASE_ROLLED_BACK}
+    if not isinstance(payload, dict):
+        return True
+    phase = payload.get("phase")
+    return phase == PHASE_COMMITTING or phase not in known_phases
+
+
 def has_pending_recovery(staging_root: Path, project_id: str) -> bool:
     """Return whether maintenance must preserve *project_id*'s old versions.
 
@@ -162,25 +194,46 @@ def has_pending_recovery(staging_root: Path, project_id: str) -> bool:
     if not project_root.is_dir():
         return False
     try:
-        jobs = list(project_root.iterdir())
+        journals = _project_journals(project_root)
     except OSError:
         return True
-    known_phases = {PHASE_STAGING, PHASE_COMMITTING, PHASE_COMPLETE, PHASE_ROLLED_BACK}
-    for job in jobs:
+    for journal_path in journals:
         try:
-            if not job.is_dir():
-                continue
-            payload = json.loads((job / JOURNAL_NAME).read_text(encoding="utf-8"))
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             continue
         except (OSError, json.JSONDecodeError):
             return True
-        if not isinstance(payload, dict):
-            return True
-        phase = payload.get("phase")
-        if phase == PHASE_COMMITTING or phase not in known_phases:
+        if _journal_protects_recovery(payload):
             return True
     return False
+
+
+def pending_recovery_slot_ids(staging_root: Path, project_id: str) -> set[str]:
+    """Slot ids whose journals must not be evicted while recovery is pending."""
+    project_root = staging_root / project_id
+    if not project_root.is_dir():
+        return set()
+    protected: set[str] = set()
+    try:
+        journals = _project_journals(project_root)
+    except OSError:
+        return {project_id}
+    for journal_path in journals:
+        try:
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, json.JSONDecodeError):
+            protected.add(project_id)
+            continue
+        if not _journal_protects_recovery(payload):
+            continue
+        if isinstance(payload, dict) and payload.get("slot_id"):
+            protected.add(str(payload["slot_id"]))
+        else:
+            protected.add(project_id)
+    return protected
 
 
 class StagingJob:
@@ -202,9 +255,13 @@ class StagingJob:
         chunk_schema: pa.Schema,
         reference_schema: pa.Schema,
         job_id: str | None = None,
+        slot_id: str | None = None,
+        partition_id: str | None = None,
     ) -> None:
         self.staging_root = staging_root
         self.project_id = project_id
+        self.slot_id = slot_id or project_id
+        self.partition_id = partition_id or project_id
         self.job_id = job_id or f"{time.time_ns():x}-{os.getpid()}"
         self._file_schema = file_schema
         self._chunk_schema = chunk_schema
@@ -226,7 +283,7 @@ class StagingJob:
 
     @property
     def directory(self) -> Path:
-        return self.staging_root / self.project_id / self.job_id
+        return self.staging_root / self.project_id / self.slot_id / self.job_id
 
     def begin(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -234,6 +291,8 @@ class StagingJob:
             "version": JOURNAL_FORMAT_VERSION,
             "job_id": self.job_id,
             "project_id": self.project_id,
+            "slot_id": self.slot_id,
+            "partition_id": self.partition_id,
             "phase": PHASE_STAGING,
             "created_at_ns": time.time_ns(),
         }
@@ -499,13 +558,13 @@ class StagingJob:
         """Mark the commit successful and remove the staged directory."""
         self._journal["phase"] = PHASE_COMPLETE
         self._write_journal()
-        shutil.rmtree(self.directory)
+        self._remove_directory()
 
     def rolled_back(self) -> None:
         """Mark the commit rolled back and remove the staged directory."""
         self._journal["phase"] = PHASE_ROLLED_BACK
         self._write_journal()
-        shutil.rmtree(self.directory)
+        self._remove_directory()
 
     def discard(self) -> None:
         """Abandon a job that never started committing; live tables untouched.
@@ -527,7 +586,11 @@ class StagingJob:
             self._close_writers(finalize=False)
         except Exception:
             logger.debug("Discarding staging writers failed", exc_info=True)
+        self._remove_directory()
+
+    def _remove_directory(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)
+        _remove_empty_parents(self.directory.parent, self.staging_root)
 
     def _open_writer(self, name: str, schema: pa.Schema) -> tuple[Any, pa.RecordBatchWriter]:
         temporary = self.directory / f"{name}.tmp"
@@ -579,7 +642,7 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
     if not staging_root.is_dir():
         return 0
     recovered = 0
-    for journal_path in sorted(staging_root.glob(f"*/*/{JOURNAL_NAME}")):
+    for journal_path in _all_journals(staging_root):
         directory = journal_path.parent
         try:
             journal = json.loads(journal_path.read_text(encoding="utf-8"))
@@ -588,6 +651,7 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
             continue
         if journal.get("phase") != PHASE_COMMITTING:
             shutil.rmtree(directory, ignore_errors=True)
+            _remove_empty_parents(directory.parent, staging_root)
             continue
         project_id = str(journal["project_id"])
         try:
@@ -598,18 +662,28 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
                     chunks=int(journal["chunks_version"]),
                     references=0,
                 )
+                partition_id = project_id
+            elif journal_version == REFERENCES_JOURNAL_FORMAT_VERSION:
+                versions = TableVersions(
+                    files=int(journal["files_version"]),
+                    chunks=int(journal["chunks_version"]),
+                    references=int(journal["references_version"]),
+                )
+                partition_id = project_id
             elif journal_version == JOURNAL_FORMAT_VERSION:
                 versions = TableVersions(
                     files=int(journal["files_version"]),
                     chunks=int(journal["chunks_version"]),
                     references=int(journal["references_version"]),
                 )
+                partition_id = str(journal.get("partition_id") or project_id)
             else:
                 raise ValueError(f"Unsupported staging journal version: {journal_version}")
             restored = store.restore_versions(
                 project_id,
                 versions,
                 restore_references=journal_version != LEGACY_JOURNAL_FORMAT_VERSION,
+                partition_id=partition_id,
             )
         except Exception:
             attempts = int(journal.get("recovery_attempts", 0)) + 1
@@ -639,6 +713,7 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
             with contextlib.suppress(Exception):
                 store.mark_project_state(project_id, "error")
             shutil.rmtree(directory, ignore_errors=True)
+            _remove_empty_parents(directory.parent, staging_root)
             continue
         if not restored:
             # The project was removed after the journal was written, so there
@@ -647,9 +722,11 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
                 "Discarding staged commit for removed project %s in %s", project_id, directory
             )
             shutil.rmtree(directory, ignore_errors=True)
+            _remove_empty_parents(directory.parent, staging_root)
             continue
         journal["phase"] = PHASE_ROLLED_BACK
         _write_atomically(journal_path, json.dumps(journal, indent=2, sort_keys=True).encode())
         shutil.rmtree(directory, ignore_errors=True)
+        _remove_empty_parents(directory.parent, staging_root)
         recovered += 1
     return recovered

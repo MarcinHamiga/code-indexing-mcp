@@ -2293,3 +2293,82 @@ def test_remove_project_deletes_slots_pointer_and_partitions(tmp_path: Path) -> 
     assert not (store.directory / "projects" / project.id).exists()
     assert not (store.directory / "partition-generations" / project.id).exists()
     assert slot.partition_id == project.id
+
+
+def test_get_chunk_reads_only_the_active_slot(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
+    store.upsert_slot(_slot(project.id, "slot-b", partition_id="partition-b"))
+
+    shared_id = f"{project.id}:shared"
+    store.activate_slot(project.id, "slot-a")
+    store.replace_file(
+        stored_file(project.id),
+        [
+            _stored_chunks(project.id, 1)[0].model_copy(
+                update={"chunk_id": shared_id, "content": "A"}
+            )
+        ],
+    )
+    store.activate_slot(project.id, "slot-b")
+    store.replace_file(
+        stored_file(project.id),
+        [
+            _stored_chunks(project.id, 1)[0].model_copy(
+                update={"chunk_id": shared_id, "content": "B"}
+            )
+        ],
+    )
+
+    active = store.get_chunk(shared_id)
+    assert active is not None and active.content == "B"
+
+    store.activate_slot(project.id, "slot-a")
+    previous = store.get_chunk(shared_id)
+    assert previous is not None and previous.content == "A"
+    assert store.get_chunk(shared_id, partition_id="partition-b") is not None
+    assert store.get_chunk(shared_id, partition_id="partition-b").content == "B"
+
+
+def test_chunk_project_id_uses_the_registry_not_the_partition_directory(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
+    store.activate_slot(project.id, "slot-a")
+    chunks = _stored_chunks(project.id, 1)
+    store.replace_file(stored_file(project.id), chunks)
+
+    assert store._chunk_project_id(chunks[0].chunk_id) == project.id
+    assert not (store.directory / "projects" / project.id).exists()
+    assert store.get_chunk(chunks[0].chunk_id) is not None
+
+
+def test_chunk_digest_includes_the_slot_id() -> None:
+    from code_indexing_mcp.indexing import Indexer
+    from code_indexing_mcp.models import ExtractedChunk
+
+    file = stored_file("project-a")
+    chunk = ExtractedChunk(
+        kind="function",
+        symbol="answer",
+        qualified_symbol="answer",
+        start_byte=0,
+        end_byte=4,
+        start_line=1,
+        end_line=1,
+        content="pass",
+        embedding_text="pass",
+        search_text="pass",
+    )
+    first = Indexer._chunk_row("project-a", file, chunk, b"\x00" * 8, "slot-a")
+    second = Indexer._chunk_row("project-a", file, chunk, b"\x00" * 8, "slot-b")
+
+    assert first.chunk_id.startswith("project-a:")
+    assert first.chunk_id != second.chunk_id

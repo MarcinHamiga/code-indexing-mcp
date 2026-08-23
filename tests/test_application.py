@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from conftest import run_git
 from test_indexing import _remove_reference_generation
 
 from code_indexing_mcp.accelerator_env import (
@@ -1829,3 +1830,57 @@ def test_inspect_scan_rejects_unknown_filters_and_cursors(tmp_path: Path) -> Non
     with pytest.raises(CodeIndexingError) as limit_error:
         app.inspect_scan(project.id, limit=0)
     assert limit_error.value.code is ErrorCode.INVALID_FILTER
+
+
+def _git_indexed_app(tmp_path: Path) -> tuple[Application, ProjectInfo, Path]:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    run_git("init", "-q", "--initial-branch", "main", str(root))
+    run_git("add", "-A", cwd=root)
+    run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init", cwd=root)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    return app, project, root
+
+
+def test_unseen_branch_does_not_serve_the_previous_slot(tmp_path: Path) -> None:
+    app, project, root = _git_indexed_app(tmp_path)
+    on_main = app.search_code("answer", projects=[project.id])
+    assert on_main.hits
+    main_chunk = on_main.hits[0].chunk_id
+
+    run_git("switch", "-c", "feature", cwd=root)
+    status = app.project_status(project.id)
+    assert status.branch_build_pending is True
+    assert status.git_selector_value == "refs/heads/feature"
+    assert app.search_code("answer", projects=[project.id]).hits == []
+
+    with pytest.raises(CodeIndexingError) as caught:
+        app.get_chunk(main_chunk)
+    assert caught.value.code is ErrorCode.CHUNK_NOT_FOUND
+
+
+def test_degraded_git_probe_uses_a_workspace_slot(tmp_path: Path) -> None:
+    from code_indexing_mcp.git_state import GitProbeOutcome, GitState, SelectorKind
+
+    app, project, root = _git_indexed_app(tmp_path)
+    branch = app.resolve_active_target(project)
+    degraded = GitState(
+        probe=GitProbeOutcome.TIMEOUT,
+        selector_kind=SelectorKind.WORKSPACE,
+        selector_value=str(root.resolve()),
+    )
+    with patch("code_indexing_mcp.application.probe_git_state", return_value=degraded):
+        fallback = app.resolve_active_target(project)
+
+    assert fallback.slot.slot_id != branch.slot.slot_id
+    assert fallback.git_state.probe is GitProbeOutcome.TIMEOUT
+    retained = app.store.get_slot(branch.slot.slot_id)
+    assert retained is not None
+    assert retained.selector_kind == "ref"

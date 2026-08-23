@@ -401,3 +401,32 @@ def test_get_chunk_payload_is_dominated_by_content(tmp_path: Path) -> None:
     # Metadata is ~290 chars of ids and offsets; anything beyond a small multiple of
     # the content means a payload field crept back in.
     assert len(encoded) < len(chunk.content) * 2
+
+
+def test_get_chunk_does_not_return_an_inactive_slot(tmp_path: Path) -> None:
+    from code_indexing_mcp import storage as storage_module
+    from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+    from code_indexing_mcp.models import ProjectSlot
+
+    search, project = _indexed_source(tmp_path, "def authenticate(user):\n    return user.token\n")
+    hit = search.search_code("authenticate", [project]).hits[0]
+    other = ProjectSlot(
+        slot_id="other-slot",
+        project_id=project,
+        partition_id="partition-b",
+        selector_kind="ref",
+        selector_value="refs/heads/other",
+        scan_config_hash="hash",
+        model_id="test/semantic-code",
+        vector_dimension=4,
+        schema_version=storage_module.SCHEMA_VERSION,
+        state="ready",
+        created_at=1,
+        last_used_at=1,
+    )
+    search.store.upsert_slot(other)
+    search.store.activate_slot(project, other.slot_id)
+
+    with pytest.raises(CodeIndexingError) as caught:
+        search.get_chunk(hit.chunk_id)
+    assert caught.value.code is ErrorCode.CHUNK_NOT_FOUND

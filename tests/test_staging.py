@@ -607,7 +607,12 @@ def test_a_commit_whose_rollback_fails_keeps_its_journal_for_recovery(
     ):
         indexer.index(project)
 
-    journals = sorted((tmp_path / "staging").glob(f"*/*/{JOURNAL_NAME}"))
+    journals = sorted(
+        {
+            *(tmp_path / "staging").glob(f"*/*/{JOURNAL_NAME}"),
+            *(tmp_path / "staging").glob(f"*/*/*/{JOURNAL_NAME}"),
+        }
+    )
     assert len(journals) == 1
     assert json.loads(journals[0].read_text())["phase"] == PHASE_COMMITTING
 
@@ -971,3 +976,92 @@ def test_staging_phase_leftovers_are_removed_without_touching_live_tables(
     assert recovered == 0
     assert store.list_chunks([project.id]) == chunks_before
     assert list((tmp_path / "staging").glob("*/*/")) == []
+
+
+def test_recovery_restores_the_journal_partition_not_the_active_slot(tmp_path: Path) -> None:
+    from code_indexing_mcp import storage as storage_module
+    from code_indexing_mcp.models import ProjectSlot
+    from code_indexing_mcp.staging import pending_recovery_slot_ids
+
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.upsert_slot(
+        ProjectSlot(
+            slot_id="slot-a",
+            project_id=project.id,
+            partition_id="partition-a",
+            selector_kind="ref",
+            selector_value="refs/heads/a",
+            scan_config_hash="hash",
+            model_id="test/model",
+            vector_dimension=4,
+            schema_version=storage_module.SCHEMA_VERSION,
+            state="ready",
+            created_at=1,
+            last_used_at=1,
+        )
+    )
+    store.upsert_slot(
+        ProjectSlot(
+            slot_id="slot-b",
+            project_id=project.id,
+            partition_id="partition-b",
+            selector_kind="ref",
+            selector_value="refs/heads/b",
+            scan_config_hash="hash",
+            model_id="test/model",
+            vector_dimension=4,
+            schema_version=storage_module.SCHEMA_VERSION,
+            state="ready",
+            created_at=1,
+            last_used_at=1,
+        )
+    )
+    store.activate_slot(project.id, "slot-a")
+    record = StoredFile(
+        file_id="file-1",
+        project_id=project.id,
+        path="main.py",
+        language="python",
+        size=4,
+        mtime_ns=1,
+        content_hash="hash",
+        indexed_at=1,
+    )
+    store.replace_file(record, _staged_chunks_for_recovery(project.id, "file-1"))
+    versions = store.table_versions(project.id)
+    store.replace_file(
+        record.model_copy(update={"mtime_ns": 2}),
+        _staged_chunks_for_recovery(project.id, "file-1"),
+    )
+    store.activate_slot(project.id, "slot-b")
+    store._tables("partition-b")
+
+    directory = tmp_path / "staging" / project.id / "slot-a" / "job-1"
+    directory.mkdir(parents=True)
+    (directory / JOURNAL_NAME).write_text(
+        json.dumps(
+            {
+                "version": JOURNAL_FORMAT_VERSION,
+                "job_id": "job-1",
+                "project_id": project.id,
+                "slot_id": "slot-a",
+                "partition_id": "partition-a",
+                "phase": PHASE_COMMITTING,
+                "files_version": versions.files,
+                "chunks_version": versions.chunks,
+                "references_version": versions.references,
+                "replace_file_ids": [],
+                "removed_file_ids": [],
+            }
+        )
+    )
+
+    assert pending_recovery_slot_ids(tmp_path / "staging", project.id) == {"slot-a"}
+    assert recover_staged_commits(tmp_path / "staging", store) == 1
+    assert store.list_files(project.id) == []
+    store.activate_slot(project.id, "slot-a")
+    assert store.list_files(project.id) == [record]

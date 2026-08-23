@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -568,8 +568,8 @@ class LanceStore:
         )
         return epoch
 
-    def active_slot(self, project_id: str) -> ProjectSlot | None:
-        """Return the slot the project's active pointer selects, or None."""
+    def active_pointer(self, project_id: str) -> tuple[ProjectSlot, int] | None:
+        """Return the active slot and its activation epoch, or None."""
         rows = self._rows(self._active_slots, f"project_id = {_quoted(project_id)}")
         if not rows:
             return None
@@ -578,7 +578,12 @@ class LanceStore:
         # caller's fallback (adoption, then the legacy identity) takes over.
         if slot is None or slot.project_id != project_id:
             return None
-        return slot
+        return slot, int(rows[0]["activation_epoch"])
+
+    def active_slot(self, project_id: str) -> ProjectSlot | None:
+        """Return the slot the project's active pointer selects, or None."""
+        pointer = self.active_pointer(project_id)
+        return None if pointer is None else pointer[0]
 
     def remove_slot(self, slot_id: str) -> bool:
         """Remove a slot row and any pointer that still selects it.
@@ -925,6 +930,7 @@ class LanceStore:
         versions: TableVersions,
         *,
         restore_references: bool = True,
+        partition_id: str | None = None,
     ) -> bool:
         """Return every partition table to *versions*' data.
 
@@ -936,8 +942,12 @@ class LanceStore:
         since the journal was written has nothing left to roll back. Recovery
         must not go through the create-on-write path here: materialising an
         empty partition would leave a version the journal can never name.
+
+        *partition_id* is the physical partition named by the journal. When
+        omitted the active pointer is used, which is only correct for
+        in-process rollback of the job that still holds that pointer.
         """
-        tables = self._project_existing_tables(project_id)
+        tables = self._existing_tables(partition_id or self._partition_id_for(project_id))
         if tables is None:
             return False
         tables.files.restore(versions.files)
@@ -1185,11 +1195,20 @@ class LanceStore:
             condition = f"{condition} AND schema_version = {schema_version}"
         return self._reference_rows(project_id, condition, version=version)
 
-    def list_chunks(self, project_ids: Iterable[str] | None = None) -> list[IndexedChunk]:
+    def list_chunks(
+        self,
+        project_ids: Iterable[str] | None = None,
+        *,
+        partitions: Mapping[str, str] | None = None,
+    ) -> list[IndexedChunk]:
         ids = list(project_ids or [project.id for project in self.list_projects()])
         chunks: list[IndexedChunk] = []
         for project_id in ids:
-            tables = self._project_existing_tables(project_id)
+            tables = self._existing_tables(
+                partitions[project_id]
+                if partitions is not None
+                else self._partition_id_for(project_id)
+            )
             if tables is None:
                 continue
             chunks.extend(
@@ -1201,17 +1220,18 @@ class LanceStore:
             )
         return chunks
 
-    def get_chunk(self, chunk_id: str) -> CodeChunk | None:
+    def get_chunk(self, chunk_id: str, *, partition_id: str | None = None) -> CodeChunk | None:
         # New-format ids carry a project-routing prefix
-        # ("<project-id>:<digest>"), so the owning partition is opened directly
-        # instead of scanning every registered project. A malformed id, one
-        # whose prefix names no partition, or one from a pre-migration
-        # generation is treated as unknown -- consistent with the existing
-        # contract that chunk ids change when a file is re-indexed.
+        # ("<project-id>:<digest>"), so the owning logical project is resolved
+        # from the registry. The chunk is then read from the active slot (or
+        # an explicit partition). A malformed id, one whose prefix names no
+        # registered project, or one from an inactive slot is treated as
+        # unknown -- consistent with the existing contract that chunk ids
+        # change when a file is re-indexed.
         project_id = self._chunk_project_id(chunk_id)
         if project_id is None:
             return None
-        tables = self._project_existing_tables(project_id)
+        tables = self._existing_tables(partition_id or self._partition_id_for(project_id))
         if tables is None:
             return None
         rows = cast(
@@ -1238,22 +1258,33 @@ class LanceStore:
         return prefix
 
     def _chunk_project_id(self, chunk_id: str) -> str | None:
-        """Resolve a chunk id's routing prefix to its partition's project id.
+        """Resolve a chunk id's routing prefix to a registered logical project.
 
-        The prefix is the project id itself, and the partition directory is
-        named by it, so resolution is a single directory probe -- no registry
-        scan, and no partition is materialized for an unknown id.
+        The prefix is the project id itself. Resolution checks the registry
+        rather than probing ``projects/<project-id>``, because a branch slot's
+        physical directory is named by an opaque partition id.
         """
         prefix = self._chunk_id_prefix(chunk_id)
         if prefix is None:
             return None
-        if (self.directory / "projects" / prefix).is_dir():
-            return prefix
-        return None
+        rows = self._rows(self._projects, f"id = {_quoted(prefix)}")
+        return prefix if rows else None
 
-    def count_chunks(self, project_ids: Iterable[str] | None = None) -> int:
+    def count_chunks(
+        self,
+        project_ids: Iterable[str] | None = None,
+        *,
+        partitions: Mapping[str, str] | None = None,
+    ) -> int:
         ids = list(project_ids or [project.id for project in self.list_projects()])
-        tables = (self._project_existing_tables(project_id) for project_id in ids)
+        tables = (
+            self._existing_tables(
+                partitions[project_id]
+                if partitions is not None
+                else self._partition_id_for(project_id)
+            )
+            for project_id in ids
+        )
         return sum(table.chunks.count_rows() for table in tables if table is not None)
 
     def hybrid_search(
@@ -1263,6 +1294,8 @@ class LanceStore:
         project_ids: Iterable[str],
         condition: str | None,
         limit: int,
+        *,
+        partitions: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         ids = list(project_ids)
         if not ids:
@@ -1274,13 +1307,26 @@ class LanceStore:
         # sequential implementation did.
         results: dict[int, list[dict[str, Any]]] = {}
         if len(ids) == 1:
-            results[0] = self._hybrid_search_rows(ids[0], query_text, vector, condition, limit)
+            results[0] = self._hybrid_search_rows(
+                ids[0],
+                query_text,
+                vector,
+                condition,
+                limit,
+                partition_id=None if partitions is None else partitions[ids[0]],
+            )
         else:
             workers = min(len(ids), _SEARCH_CONCURRENCY)
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
                     index: pool.submit(
-                        self._hybrid_search_rows, project_id, query_text, vector, condition, limit
+                        self._hybrid_search_rows,
+                        project_id,
+                        query_text,
+                        vector,
+                        condition,
+                        limit,
+                        partition_id=None if partitions is None else partitions[project_id],
                     )
                     for index, project_id in enumerate(ids)
                 }
@@ -1297,9 +1343,11 @@ class LanceStore:
         vector: list[float],
         condition: str | None,
         limit: int,
+        *,
+        partition_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Run the hybrid query for one partition, injecting its project id."""
-        tables = self._project_existing_tables(project_id)
+        tables = self._existing_tables(partition_id or self._partition_id_for(project_id))
         if tables is None:
             return []
         # MultiMatchQuery spans the two single-column FTS indexes (content
@@ -1658,9 +1706,11 @@ class LanceStore:
             return cached
 
     @contextmanager
-    def partition_access(self, project_id: str) -> Iterator[None]:
+    def partition_access(
+        self, project_id: str, *, partition_id: str | None = None
+    ) -> Iterator[None]:
         """Prevent a destructive rebuild from invalidating an active query."""
-        with self._partition_access_physical(self._partition_id_for(project_id)):
+        with self._partition_access_physical(partition_id or self._partition_id_for(project_id)):
             yield
 
     @contextmanager
@@ -1672,9 +1722,17 @@ class LanceStore:
             yield
 
     @contextmanager
-    def partitions_access(self, project_ids: Iterable[str]) -> Iterator[None]:
+    def partitions_access(
+        self,
+        project_ids: Iterable[str],
+        *,
+        partitions: Mapping[str, str] | None = None,
+    ) -> Iterator[None]:
         """Hold the active partitions for logical projects in stable order."""
-        partition_ids = {self._partition_id_for(project_id) for project_id in project_ids}
+        if partitions is None:
+            partition_ids = {self._partition_id_for(project_id) for project_id in project_ids}
+        else:
+            partition_ids = {partitions[project_id] for project_id in project_ids}
         with ExitStack() as stack:
             for partition_id in sorted(set(partition_ids)):
                 stack.enter_context(self._partition_access_physical(partition_id))

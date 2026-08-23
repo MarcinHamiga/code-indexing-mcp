@@ -148,6 +148,10 @@ class ReferenceService:
         """
         if limit < 1 or limit > 500:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, "limit must be between 1 and 500")
+        cursor_payload: dict[str, object] | None = None
+        if cursor is not None:
+            cursor_payload = self._decode_cursor(cursor)
+            self._require_active_cursor_slot(str(cursor_payload["project_id"]), cursor_payload)
         selected = self._select(selector)
         if selected.language not in STRUCTURAL_LANGUAGES:
             raise CodeIndexingError(
@@ -173,8 +177,8 @@ class ReferenceService:
             )
         version = self.store.reference_version(selected.project_id)
         offset = 0
-        if cursor is not None:
-            payload = self._decode_cursor(cursor)
+        if cursor_payload is not None:
+            payload = cursor_payload
             if payload["project_id"] != selected.project_id or payload["path"] != selected.path:
                 raise CodeIndexingError(
                     ErrorCode.INVALID_CURSOR, "cursor does not match the selected declaration"
@@ -233,6 +237,7 @@ class ReferenceService:
         page = hits[offset : offset + limit]
         next_cursor = None
         if offset + len(page) < len(hits):
+            pointer = self.store.active_pointer(selected.project_id)
             next_cursor = self._encode_cursor(
                 {
                     "version": version,
@@ -243,6 +248,8 @@ class ReferenceService:
                     "offset": offset + len(page),
                     "limit": limit,
                     "operation_digest": operation_digest,
+                    "slot_id": "" if pointer is None else pointer[0].slot_id,
+                    "activation_epoch": 0 if pointer is None else pointer[1],
                 }
             )
         unique_limitations = {
@@ -1633,6 +1640,17 @@ class ReferenceService:
         ).encode()
         return hashlib.sha256(raw).hexdigest()[:16]
 
+    def _require_active_cursor_slot(self, project_id: str, payload: dict[str, object]) -> None:
+        pointer = self.store.active_pointer(project_id)
+        if (
+            pointer is None
+            or pointer[0].slot_id != payload["slot_id"]
+            or pointer[1] != payload["activation_epoch"]
+        ):
+            raise CodeIndexingError(
+                ErrorCode.STALE_CURSOR, "Reference cursor slot is no longer active"
+            )
+
     @staticmethod
     def _encode_cursor(payload: dict[str, object]) -> str:
         raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
@@ -1653,6 +1671,8 @@ class ReferenceService:
             "offset",
             "limit",
             "operation_digest",
+            "slot_id",
+            "activation_epoch",
         }
     )
 
@@ -1669,11 +1689,11 @@ class ReferenceService:
 
         if not isinstance(payload, dict) or set(payload) != ReferenceService._CURSOR_FIELDS:
             raise invalid()
-        for int_field in ("version", "offset", "limit"):
+        for int_field in ("version", "offset", "limit", "activation_epoch"):
             value = payload[int_field]
             if isinstance(value, bool) or not isinstance(value, int):
                 raise invalid()
-        for str_field in ("project_id", "path", "qualified_symbol"):
+        for str_field in ("project_id", "path", "qualified_symbol", "slot_id"):
             if not isinstance(payload[str_field], str):
                 raise invalid()
         kinds = payload["kinds"]
