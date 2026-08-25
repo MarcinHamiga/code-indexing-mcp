@@ -1351,11 +1351,14 @@ async def test_a_second_root_gives_up_instead_of_queueing_behind_the_first(
             else:
                 pytest.fail("expected both roots to be registered")
 
-            # Exactly one root won the limiter and is stuck on the embedder;
-            # target the other, which is the one that had to wait.
-            blocked = root_a if app.project_status(roots=[root_a]).state == "indexing" else root_b
-            waiting = root_b if blocked is root_a else root_a
-            waiting_id = app.project_status(roots=[waiting]).project.id
+            # A new branch slot remains publicly pending while its first build
+            # runs, so inspect the indexer's physical state to find the root
+            # that won the limiter and target the other one.
+            projects = app.list_projects()
+            active = next(
+                project for project in projects if app.store.project_state(project.id) == "indexing"
+            )
+            waiting_id = next(project.id for project in projects if project.id != active.id)
 
             result = await asyncio.wait_for(
                 client.call_tool("search_code", {"query": "value", "projects": [waiting_id]}),
