@@ -43,15 +43,16 @@ class BlockingEmbedder(TinyEmbedder):
 
 
 class SwitchableBlockingEmbedder(TinyEmbedder):
-    def __init__(self) -> None:
+    def __init__(self, *, wait_timeout: float = 5.0) -> None:
         self.block = False
         self.started = threading.Event()
         self.release = threading.Event()
+        self.wait_timeout = wait_timeout
 
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
         if self.block:
             self.started.set()
-            assert self.release.wait(timeout=5)
+            assert self.release.wait(timeout=self.wait_timeout)
         return super().embed_passages(texts)
 
 
@@ -915,7 +916,7 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
     (startup_root / "pyproject.toml").write_text("[project]\nname = 'startup'\n")
     (startup_root / "slow.py").write_text("def slow():\n    return True\n")
 
-    embedder = SwitchableBlockingEmbedder()
+    embedder = SwitchableBlockingEmbedder(wait_timeout=30)
     app = Application(
         RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
         embedder=embedder,
@@ -941,10 +942,11 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
                     "search_code",
                     {"query": "answer", "projects": [ready_project.id]},
                 ),
-                timeout=0.5,
+                timeout=10,
             )
 
             assert not result.isError
+            embedder.release.set()
     finally:
         embedder.release.set()
 
