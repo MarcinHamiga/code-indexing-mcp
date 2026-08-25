@@ -206,13 +206,26 @@ class StartupCoordinator:
 
     async def has_pending_indexing(self, roots: list[Path], project_ids: set[str]) -> bool:
         """Return whether a caller would actually block waiting on these roots."""
+
+        # A job that has not finished discovery has no project_id yet, but it
+        # was scheduled for exactly these roots: until discovery resolves, it
+        # must be treated as pending or a caller would race past it.
         return any(
-            job.project_id in project_ids and job.indexes and not job.ready.is_set()
+            (job.project_id is None or job.project_id in project_ids)
+            and job.indexes
+            and not job.ready.is_set()
             for job in await self._jobs_for(roots)
         )
 
     async def wait_for_ready(self, roots: list[Path], project_ids: set[str]) -> None:
         for job in await self._jobs_for(roots):
+            if job.project_id is None and not job.discovered.is_set():
+                # Discovery assigns project_id just before setting this event;
+                # filtering before it fires would skip a job that was just
+                # scheduled for these roots, letting a refresh iteration
+                # "complete" without ever waiting on -- or reconciling -- the
+                # run it started.
+                await job.discovered.wait()
             if job.project_id not in project_ids:
                 continue
             await job.ready.wait()
@@ -319,6 +332,7 @@ class StartupCoordinator:
     async def _refresh_dirty_root(
         self, root: Path, project_id: str, dirty: asyncio.Queue[None]
     ) -> None:
+        retry_seconds = WATCH_RETRY_INITIAL_SECONDS
         while True:
             with anyio.move_on_after(EAGER_RECONCILE_SECONDS) as reconcile:
                 await dirty.get()
@@ -328,6 +342,8 @@ class StartupCoordinator:
             if isinstance(self.application, Application):
                 self.application.invalidate_freshness(project_id)
             generation = self._dirty_generation.get(root, 0)
+            reconciled = False
+            failed = False
             try:
                 # The first pass either starts a refresh or waits for one that
                 # was already active. Event-driven refreshes make a second pass
@@ -342,13 +358,32 @@ class StartupCoordinator:
                 # that window still sees the project as changed. Only this
                 # iteration may clear it: if an event landed while the refresh
                 # was in flight its generation bumped, the mark stays, and the
-                # next iteration -- which has that event's sentinel queued --
-                # reconciles it while scheduling still skips the freshness walk.
+                # next iteration reconciles it while scheduling still skips
+                # the freshness walk.
                 if self._dirty_generation.get(root, 0) == generation:
                     self._dirty_roots.discard(root)
                     self._dirty_generation.pop(root, None)
+                    reconciled = True
             except Exception:
+                failed = True
                 logger.exception("Automatic refresh after a file change failed for %s", root)
+            if not failed:
+                retry_seconds = WATCH_RETRY_INITIAL_SECONDS
+            if reconciled:
+                continue
+            # The sentinel that started this iteration is consumed, so a root
+            # that is still dirty -- an event bumped its generation mid-run,
+            # its sentinel was dropped by the bounded queue, or the iteration
+            # failed outright -- has nothing left to wake this loop and would
+            # wait for the periodic reconcile otherwise. Requeue one nudge
+            # while the mark persists; a failed iteration backs off first so a
+            # persistent failure cannot spin.
+            if failed:
+                await anyio.sleep(retry_seconds)
+                retry_seconds = min(retry_seconds * 2, WATCH_RETRY_MAXIMUM_SECONDS)
+            if root in self._dirty_roots:
+                with suppress(asyncio.QueueFull):
+                    dirty.put_nowait(None)
 
     async def _index_when_free(
         self, project_id: str, *, trigger: IndexTrigger = "startup"

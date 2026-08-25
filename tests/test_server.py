@@ -600,11 +600,16 @@ async def test_eager_monitor_refreshes_created_and_deleted_sources(
         removed.unlink()
         (root / "added.py").write_text("def added_symbol():\n    return True\n")
 
+        # Two full incremental runs on a contended CI runner (git probes,
+        # staging, Lance commits) can outlast the default 5-second budget;
+        # the periodic reconcile backstop is 30 seconds, so anything past
+        # this window is a real stranding bug, not runner jitter.
         await _wait_until(
             lambda: (
                 bool(app.find_symbol("added_symbol", project.id).hits)
                 and not app.find_symbol("removed_symbol", project.id).hits
-            )
+            ),
+            timeout=20,
         )
 
         assert app.find_symbol("added_symbol", project.id).hits
@@ -647,9 +652,66 @@ async def test_eager_monitor_repeats_when_source_changes_during_refresh(
 
         _write_with_later_mtime(source, "def final_change():\n    return 2\n")
         embedder.release.set()
-        await _wait_until(lambda: bool(app.find_symbol("final_change", project.id).hits))
+        # See the budget note in the created-and-deleted monitor test: the
+        # release unwinds one blocked run and then a second full incremental
+        # run must reconcile this write, all on a possibly contended runner.
+        await _wait_until(
+            lambda: bool(app.find_symbol("final_change", project.id).hits), timeout=20
+        )
 
         assert not app.find_symbol("first_change", project.id).hits
+        assert not app.find_symbol("initial_symbol", project.id).hits
+
+
+@pytest.mark.asyncio
+async def test_eager_monitor_retries_after_a_refresh_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A refresh iteration consumes its sentinel before running, so a failing
+    # one used to strand the dirty root until the periodic reconcile. The
+    # monitor must requeue its own retry and reconcile the change promptly.
+    monkeypatch.setenv("WATCHFILES_FORCE_POLLING", "true")
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    source = root / "main.py"
+    source.write_text("def initial_symbol():\n    return 0\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    server = create_server(app, auto_index=True)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        await client.call_tool("find_symbol", {"name": "initial_symbol"})
+        project = app.list_projects()[0]
+        await _wait_until(lambda: bool(app.find_symbol("initial_symbol", project.id).hits))
+
+        armed = threading.Event()
+        failures = {"count": 0}
+        original_index = app.index_project
+
+        def failing_index(project_id=None, **kwargs):
+            if kwargs.get("trigger") == "watcher" and armed.is_set():
+                failures["count"] += 1
+                armed.clear()
+                raise CodeIndexingError(ErrorCode.MODEL_UNAVAILABLE, "injected refresh failure")
+            return original_index(project_id, **kwargs)
+
+        monkeypatch.setattr(app, "index_project", failing_index)
+        armed.set()
+        _write_with_later_mtime(source, "def after_failure():\n    return 1\n")
+
+        await _wait_until(lambda: bool(app.find_symbol("after_failure", project.id).hits))
+
+        assert failures["count"] == 1
         assert not app.find_symbol("initial_symbol", project.id).hits
 
 
