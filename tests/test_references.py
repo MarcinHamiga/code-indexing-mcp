@@ -10,7 +10,7 @@ from code_indexing_mcp.models import DeclarationSelector
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.reference_service import ReferenceService
 from code_indexing_mcp.scanner import SourceScanner
-from code_indexing_mcp.storage import LanceStore
+from code_indexing_mcp.storage import LanceStore, PartitionRef
 
 
 class TinyEmbedder:
@@ -422,6 +422,41 @@ def test_cursor_is_filter_bound_and_reads_its_original_snapshot(tmp_path: Path) 
     original_snapshot = service.find_references(selector, limit=1, cursor=first.cursor)
     assert original_snapshot.hits
     assert original_snapshot.snapshot_version == first.snapshot_version
+
+
+def test_cursor_switch_is_stale_before_declaration_lookup(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "main.py": (
+                "from lib import answer\n\ndef a(): return answer()\ndef b(): return answer()\n"
+            ),
+        },
+    )
+    selector = DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    first = service.find_references(selector, limit=1)
+    assert first.cursor is not None
+    active = service.store.active_partition(project_id)
+    active_slot = service.store.get_slot(active.slot_id)
+    assert active_slot is not None
+    pending = active_slot.model_copy(
+        update={
+            "slot_id": "other-slot",
+            "partition_id": "slot-other-slot",
+            "selector_kind": "ref",
+            "selector_value": "refs/heads/other",
+            "state": "pending",
+        }
+    )
+    service.store.upsert_slot(pending)
+    epoch = service.store.activate_slot(project_id, pending.slot_id)
+    partition = PartitionRef(project_id, pending.slot_id, pending.partition_id, epoch)
+
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.find_references(selector, limit=1, cursor=first.cursor, partition=partition)
+
+    assert excinfo.value.code is ErrorCode.STALE_CURSOR
 
 
 def test_stale_schema_version_rows_are_not_served(tmp_path: Path) -> None:

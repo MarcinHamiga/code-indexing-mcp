@@ -154,6 +154,30 @@ class ReferenceService:
         """
         if limit < 1 or limit > 500:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, "limit must be between 1 and 500")
+        selector_project_id = selector.project
+        if selector_project_id is None and selector.chunk_id is not None:
+            selector_project_id = self.store._chunk_project_id(selector.chunk_id)
+        if partition is None and selector_project_id is not None:
+            partition = self.store.active_partition(selector_project_id)
+        if (
+            partition is not None
+            and selector_project_id is not None
+            and partition.project_id != selector_project_id
+        ):
+            raise ValueError("reference partition does not belong to selector project")
+        payload = self._decode_cursor(cursor) if cursor is not None else None
+        if payload is not None and partition is not None:
+            # Slot identity must be checked before declaration lookup. After a
+            # branch switch the old declaration or chunk may not exist at all,
+            # but a valid old cursor is still stale rather than ambiguous.
+            if payload["slot_id"] != partition.slot_id:
+                raise CodeIndexingError(
+                    ErrorCode.STALE_CURSOR, "Reference cursor belongs to an inactive index slot"
+                )
+            if payload["activation_epoch"] != partition.activation_epoch:
+                raise CodeIndexingError(
+                    ErrorCode.STALE_CURSOR, "Reference cursor belongs to an earlier slot activation"
+                )
         selected = self._select(
             selector,
             partition_id=None if partition is None else partition.partition_id,
@@ -187,8 +211,7 @@ class ReferenceService:
             selected.project_id, partition_id=partition.partition_id
         )
         offset = 0
-        if cursor is not None:
-            payload = self._decode_cursor(cursor)
+        if payload is not None:
             if payload["project_id"] != selected.project_id or payload["path"] != selected.path:
                 raise CodeIndexingError(
                     ErrorCode.INVALID_CURSOR, "cursor does not match the selected declaration"
@@ -208,14 +231,6 @@ class ReferenceService:
             if payload["operation_digest"] != operation_digest:
                 raise CodeIndexingError(
                     ErrorCode.INVALID_CURSOR, "cursor does not match the refactor operation"
-                )
-            if payload["slot_id"] != partition.slot_id:
-                raise CodeIndexingError(
-                    ErrorCode.STALE_CURSOR, "Reference cursor belongs to an inactive index slot"
-                )
-            if payload["activation_epoch"] != partition.activation_epoch:
-                raise CodeIndexingError(
-                    ErrorCode.STALE_CURSOR, "Reference cursor belongs to an earlier slot activation"
                 )
             offset = cast(int, payload["offset"])
             version = cast(int, payload["version"])

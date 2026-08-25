@@ -29,7 +29,7 @@ from code_indexing_mcp.staging import (
     ChunkRow,
     StagingJob,
 )
-from code_indexing_mcp.storage import LanceStore, TableVersions
+from code_indexing_mcp.storage import LanceStore, PartitionRef, TableVersions
 
 CEILING = 2048 * MIB
 
@@ -243,6 +243,7 @@ def test_commit_batches_stay_bounded_far_below_the_memory_ceiling(tmp_path: Path
         file_schema=LanceStore.file_arrow_schema(),
         chunk_schema=LanceStore.chunk_arrow_schema(4, pa.float16()),
         reference_schema=LanceStore.reference_arrow_schema(),
+        partition=PartitionRef("project-1", "slot-project-1", "project-1", 1),
     )
     job.begin()
     # Each file carries ~512 KiB across content, so the default file-count

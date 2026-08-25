@@ -8,11 +8,12 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from typing import TypeVar, cast
 
 from filelock import FileLock, Timeout
 from platformdirs import user_cache_path, user_data_path
@@ -35,6 +36,7 @@ from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_laun
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
 from .git_state import GitProbeOutcome, WorktreeStatus, probe_git_state
+from .git_state import slot_id as git_slot_id
 from .history import HistoryStore
 from .indexing import Indexer
 from .models import (
@@ -83,8 +85,9 @@ from .reference_service import ReferenceService
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
-from .staging import has_pending_recovery, recover_staged_commits
+from .staging import pending_recovery, recover_staged_commits
 from .storage import (
+    ActiveIndexTarget,
     LanceStore,
     PartitionRef,
     overlap_warnings,
@@ -95,6 +98,8 @@ from .token_batching import max_token_product_for
 from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
 logger = logging.getLogger(__name__)
+
+_Result = TypeVar("_Result")
 
 # Startup recovery needs the global index lock, but that lock is held for the
 # whole of an index run. Wait only long enough to lose a race against a commit
@@ -685,6 +690,7 @@ class Application:
                         )
             project = initialize_project(root, name=name, force_new_id=force_new_id)
             self._register_project(project)
+            self._resolve_active_target(project)
             self.invalidate_freshness(project.id)
         return project
 
@@ -702,8 +708,118 @@ class Application:
                     return None
                 project = initialize_project(root)
             self._register_project(project)
+            self._resolve_active_target(project)
             self.invalidate_freshness(project.id)
             return project
+
+    def _resolve_active_target(
+        self,
+        project: ProjectInfo,
+        *,
+        include_status: bool = False,
+        lock_held: bool = False,
+    ) -> ActiveIndexTarget:
+        """Resolve one immutable Git and physical-partition operation target."""
+        git = probe_git_state(project.root, include_status=include_status)
+        lock_directory = self.paths.data / "locks"
+        lock_directory.mkdir(parents=True, exist_ok=True)
+
+        def current_target() -> ActiveIndexTarget | None:
+            partition = self.store._active_partition_ref(project.id)
+            if partition is None or partition.slot_id != git_slot_id(project.id, git):
+                return None
+            slot = self.store.get_slot(partition.slot_id)
+            if slot is None or slot.partition_id != partition.partition_id:
+                return None
+            self.store.touch_slot(slot.slot_id)
+            return ActiveIndexTarget(
+                project=project,
+                slot=slot,
+                partition_id=partition.partition_id,
+                activation_epoch=partition.activation_epoch,
+                git_state=git,
+            )
+
+        def activate() -> ActiveIndexTarget:
+            current = current_target()
+            if current is not None:
+                return current
+            try:
+                partition = self.store.resolve_partition(project, git)
+            except CodeIndexingError as exc:
+                if exc.code is not ErrorCode.PROJECT_NOT_FOUND:
+                    raise
+                self.store.upsert_project(project, model_id=self.embedder.model_id, state="pending")
+                partition = self.store.resolve_partition(project, git)
+            slot = self.store.get_slot(partition.slot_id)
+            if slot is None or slot.partition_id != partition.partition_id:
+                raise CodeIndexingError(
+                    ErrorCode.PROJECT_NOT_FOUND,
+                    f"Project {project.id} has no active index slot",
+                )
+            return ActiveIndexTarget(
+                project=project,
+                slot=slot,
+                partition_id=partition.partition_id,
+                activation_epoch=partition.activation_epoch,
+                git_state=git,
+            )
+
+        if lock_held:
+            return activate()
+        current = current_target()
+        if current is not None:
+            return current
+        with FileLock(lock_directory / f"{project.id}.lock"):
+            return activate()
+
+    def _resolve_active_targets(
+        self, projects: list[ProjectInfo], *, include_status: bool = False
+    ) -> dict[str, ActiveIndexTarget]:
+        """Resolve targets in stable logical-project order to keep lock order fixed."""
+        return {
+            project.id: self._resolve_active_target(project, include_status=include_status)
+            for project in sorted(projects, key=lambda item: item.id)
+        }
+
+    @staticmethod
+    def _target_changed(target: ActiveIndexTarget) -> bool:
+        current = probe_git_state(target.project.root)
+        return (
+            git_slot_id(target.project.id, current) != target.slot.slot_id
+            or current.head_oid != target.git_state.head_oid
+        )
+
+    def _run_repository_stable_query(
+        self,
+        projects: list[ProjectInfo],
+        operation: Callable[[Mapping[str, ActiveIndexTarget]], _Result],
+        *,
+        include_status: bool = False,
+    ) -> _Result:
+        """Retry one read when its checkout identity changes during execution."""
+        for attempt in range(2):
+            targets = self._resolve_active_targets(projects, include_status=include_status)
+            error: Exception | None = None
+            result: _Result | None = None
+            try:
+                result = operation(targets)
+            except Exception as exc:
+                error = exc
+            changed = [
+                project_id for project_id, target in targets.items() if self._target_changed(target)
+            ]
+            if not changed:
+                if error is not None:
+                    raise error
+                return cast(_Result, result)
+            if attempt == 1:
+                raise CodeIndexingError(
+                    ErrorCode.REPOSITORY_CHANGED,
+                    "Repository selector or HEAD changed repeatedly while serving the request",
+                    projects=changed,
+                ) from error
+        raise AssertionError("repository query retry loop did not return")
 
     def index_project(
         self,
@@ -716,9 +832,11 @@ class Application:
         trigger: IndexTrigger = "manual",
     ) -> IndexReport:
         resolved = self._resolve(project, roots)
+        target = self._resolve_active_target(resolved)
         try:
             return self.indexer.index(
                 resolved,
+                partition=target.partition,
                 force=force,
                 wait_for_lock=wait_for_lock,
                 on_progress=on_progress,
@@ -735,7 +853,11 @@ class Application:
         return read_progress(self.paths.data / "progress", project_id)
 
     def ensure_reference_index(
-        self, project: str | None = None, *, roots: list[Path] | None = None
+        self,
+        project: str | None = None,
+        *,
+        roots: list[Path] | None = None,
+        _target: ActiveIndexTarget | None = None,
     ) -> ReferenceBackfillReport:
         """Bring structural rows current without running during semantic searches.
 
@@ -751,16 +873,39 @@ class Application:
         """
 
         resolved = self._resolve(project, roots)
-        partition = self.store.active_partition(resolved.id)
-        if self._project_is_stale(resolved, partition_id=partition.partition_id):
-            self.indexer.index(resolved, wait_for_lock=True, trigger="lazy-query")
+        target = _target or self._resolve_active_target(resolved)
+        if target.project.id != resolved.id:
+            raise ValueError("reference target does not belong to project")
+        return self._ensure_reference_target(target)
+
+    def _ensure_reference_target(self, target: ActiveIndexTarget) -> ReferenceBackfillReport:
+        resolved = target.project
+        partition = target.partition
+        if self._project_is_stale(resolved, partition_id=target.partition_id):
+            self.indexer.index(
+                resolved,
+                partition=partition,
+                wait_for_lock=True,
+                trigger="lazy-query",
+            )
         report = self.indexer.backfill_references(
-            resolved, wait_for_lock=True, trigger="reference-backfill"
+            resolved,
+            partition=partition,
+            wait_for_lock=True,
+            trigger="reference-backfill",
         )
         if report.stale_paths:
-            self.indexer.index(resolved, wait_for_lock=True, trigger="lazy-query")
+            self.indexer.index(
+                resolved,
+                partition=partition,
+                wait_for_lock=True,
+                trigger="lazy-query",
+            )
             report = self.indexer.backfill_references(
-                resolved, wait_for_lock=True, trigger="reference-backfill"
+                resolved,
+                partition=partition,
+                wait_for_lock=True,
+                trigger="reference-backfill",
             )
         self.invalidate_freshness(resolved.id)
         return report
@@ -769,11 +914,19 @@ class Application:
         self, project: str | None = None, *, roots: list[Path] | None = None
     ) -> ProjectStatus:
         resolved = self._resolve(project, roots)
-        partition = self.store.active_partition(resolved.id)
-        slot = self.store.get_slot(partition.slot_id)
-        files = self.store.list_files(resolved.id, partition_id=partition.partition_id)
-        state = slot.state if slot is not None else self.store.project_state(resolved.id)
-        git = probe_git_state(resolved.root, include_status=True)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._project_status_for_target(targets[resolved.id]),
+            include_status=True,
+        )
+
+    def _project_status_for_target(self, target: ActiveIndexTarget) -> ProjectStatus:
+        resolved = target.project
+        partition = target.partition
+        slot = target.slot
+        files = self.store.list_files(resolved.id, partition_id=target.partition_id)
+        state = slot.state
+        git = target.git_state
         if state in {"ready", "partial"}:
             fingerprint = f"{partition.slot_id}:{resolved.scan.model_dump_json()}"
             cached = self._clean_freshness_until.get(resolved.id)
@@ -802,7 +955,7 @@ class Application:
             ),
             progress=self.index_progress(resolved.id),
             last_run=self.history.recent(resolved.id),
-            active_slot_id=partition.slot_id,
+            active_slot_id=slot.slot_id,
             git_selector_kind=git.selector_kind.value,
             git_selector_value=git.selector_value,
             git_head=git.head_oid,
@@ -813,8 +966,7 @@ class Application:
                 else git.worktree is WorktreeStatus.CLEAN
             ),
             branch_build_pending=(
-                slot is None
-                or slot.state != "ready"
+                slot.state != "ready"
                 or (
                     git.probe is GitProbeOutcome.GIT
                     and slot.indexed_head is not None
@@ -862,39 +1014,50 @@ class Application:
     ) -> StorageStatus:
         """Read-only storage statistics for one project or the whole installation.
 
-        Never mutates the index: a registered project with no partition reports
-        zeroed tables instead of materializing one. Root-overlap and shared-Git
-        worktree warnings are advisory and best-effort.
+        Resolving the current checkout may create or activate an empty pending
+        slot, but reads never materialize its physical partition. Root-overlap
+        and shared-Git worktree warnings are advisory and best-effort.
         """
-        snapshot_at = datetime.now(UTC).isoformat()
-        registry_before = self.store.registry_stats()
         registered = self.list_projects()
         if project is not None:
             resolved = self._resolve(project, roots)
-            projects = [self.store.storage_stats_for(resolved)]
+            scope = [resolved]
         else:
-            projects = [
-                self.store.storage_stats_for(registered_project)
-                for registered_project in registered
-            ]
-        registry_after = self.store.registry_stats()
-        partition_bytes: dict[str, int] = {}
-        for stats in projects:
-            if stats.slots:
-                partition_bytes.update(
-                    {slot.partition_id: slot.physical_bytes for slot in stats.slots}
+            scope = registered
+
+        def collect(targets: Mapping[str, ActiveIndexTarget]) -> StorageStatus:
+            snapshot_at = datetime.now(UTC).isoformat()
+            registry_before = self.store.registry_stats()
+            project_stats = [
+                self.store.storage_stats_for(
+                    registered_project,
+                    partition_ref=targets[registered_project.id].partition,
                 )
-            else:
-                partition_bytes[stats.project.id] = stats.partition_physical_bytes
-        return StorageStatus(
-            snapshot_at=snapshot_at,
-            registry=registry_after,
-            projects=projects,
-            physical_bytes_total=registry_after.physical_bytes + sum(partition_bytes.values()),
-            consistent=registry_before.current_version == registry_after.current_version
-            and all(stats.consistent for stats in projects),
-            overlap_warnings=overlap_warnings(registered),
-            worktree_warnings=worktree_warnings(registered),
+                for registered_project in scope
+            ]
+            registry_after = self.store.registry_stats()
+            partition_bytes: dict[str, int] = {}
+            for stats in project_stats:
+                if stats.slots:
+                    partition_bytes.update(
+                        {slot.partition_id: slot.physical_bytes for slot in stats.slots}
+                    )
+                else:
+                    partition_bytes[stats.project.id] = stats.partition_physical_bytes
+            return StorageStatus(
+                snapshot_at=snapshot_at,
+                registry=registry_after,
+                projects=project_stats,
+                physical_bytes_total=registry_after.physical_bytes + sum(partition_bytes.values()),
+                consistent=registry_before.current_version == registry_after.current_version
+                and all(stats.consistent for stats in project_stats),
+                overlap_warnings=overlap_warnings(registered),
+                worktree_warnings=worktree_warnings(registered),
+            )
+
+        return self._run_repository_stable_query(
+            scope,
+            collect,
         )
 
     def maintain_storage(
@@ -929,6 +1092,7 @@ class Application:
             scope: list[ProjectInfo] = [resolved]
         else:
             scope = registered
+        targets = self._resolve_active_targets(scope) if dry_run else {}
         lock_directory = self.paths.data / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
 
@@ -948,7 +1112,10 @@ class Application:
             estimate = 0
             if dry_run:
                 try:
-                    before = self.store.storage_stats_for(registered_project)
+                    before = self.store.storage_stats_for(
+                        registered_project,
+                        partition_ref=targets[registered_project.id].partition,
+                    )
                     estimate = _estimate_reclaimable(before)
                     if before.partition_open_failed:
                         results.append(
@@ -1002,7 +1169,9 @@ class Application:
                         )
                     )
                     continue
-                if has_pending_recovery(self.paths.data / "staging", registered_project.id):
+                target = self._resolve_active_target(registered_project, lock_held=True)
+                recovery = pending_recovery(self.paths.data / "staging", registered_project.id)
+                if recovery.project_wide:
                     results.append(
                         MaintenanceProjectResult(
                             project=registered_project,
@@ -1010,7 +1179,10 @@ class Application:
                         )
                     )
                     continue
-                before = self.store.storage_stats_for(registered_project)
+                before = self.store.storage_stats_for(
+                    registered_project,
+                    partition_ref=target.partition,
+                )
                 estimate = _estimate_reclaimable(before)
                 if before.partition_open_failed:
                     results.append(
@@ -1023,7 +1195,7 @@ class Application:
                         )
                     )
                     continue
-                if not before.tables:
+                if not before.tables and not any(slot.physical_bytes > 0 for slot in before.slots):
                     results.append(
                         MaintenanceProjectResult(
                             project=registered_project,
@@ -1037,9 +1209,13 @@ class Application:
                     registered_project.id,
                     cleanup_older_than=retention,
                     branch_cache_limit=self.settings.branch_cache_limit,
+                    protected_slot_ids=recovery.slot_ids,
                 )
-                after = self.store.storage_stats_for(registered_project)
-                if after.partition_open_failed or not after.tables:
+                after = self.store.storage_stats_for(
+                    registered_project,
+                    partition_ref=target.partition,
+                )
+                if after.partition_open_failed:
                     raise RuntimeError("Partition became unreadable during maintenance")
                 results.append(
                     MaintenanceProjectResult(
@@ -1187,8 +1363,12 @@ class Application:
     ) -> bool:
         """Return whether eligible source metadata differs from the live index."""
         resolved = self._resolve(project, roots)
-        partition = self.store.active_partition(resolved.id)
-        return self._project_is_stale(resolved, partition_id=partition.partition_id)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._project_is_stale(
+                resolved, partition_id=targets[resolved.id].partition_id
+            ),
+        )
 
     def _project_is_stale(
         self,
@@ -1333,14 +1513,25 @@ class Application:
         roots: list[Path] | None = None,
     ) -> SearchResponse:
         project_ids = self.resolve_search_scope(projects, all_projects, roots)
-        self._ensure_query_generations(project_ids, roots)
-        return self.search.search_code(
-            query,
-            project_ids,
-            languages=languages,
-            paths=paths,
-            kinds=kinds,
-            limit=limit,
+        resolved = [self._resolve(project_id, roots) for project_id in project_ids]
+
+        def search(targets: Mapping[str, ActiveIndexTarget]) -> SearchResponse:
+            self._ensure_query_generations(targets)
+            return self.search.search_code(
+                query,
+                project_ids,
+                languages=languages,
+                paths=paths,
+                kinds=kinds,
+                limit=limit,
+                partitions={
+                    project_id: targets[project_id].partition for project_id in project_ids
+                },
+            )
+
+        return self._run_repository_stable_query(
+            resolved,
+            search,
         )
 
     def find_symbol(
@@ -1354,58 +1545,98 @@ class Application:
         roots: list[Path] | None = None,
     ) -> SymbolResponse:
         resolved = self.resolve_project(project, roots)
-        self._ensure_query_generations([resolved.id], roots)
-        return self.search.find_symbol(name, resolved.id, match=match, kinds=kinds, limit=limit)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._find_symbol_for_target(
+                name,
+                targets[resolved.id],
+                match=match,
+                kinds=kinds,
+                limit=limit,
+            ),
+        )
+
+    def _find_symbol_for_target(
+        self,
+        name: str,
+        target: ActiveIndexTarget,
+        *,
+        match: str,
+        kinds: list[str] | None,
+        limit: int,
+    ) -> SymbolResponse:
+        self._ensure_query_generations({target.project.id: target})
+        return self.search.find_symbol(
+            name,
+            target.project.id,
+            match=match,
+            kinds=kinds,
+            limit=limit,
+            partition=target.partition,
+        )
 
     def file_outline(
         self, path: str, project: str | None = None, *, roots: list[Path] | None = None
     ) -> OutlineResponse:
         resolved = self.resolve_project(project, roots)
-        self._ensure_query_generations([resolved.id], roots)
-        return self.search.file_outline(path, resolved.id)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._file_outline_for_target(path, targets[resolved.id]),
+        )
+
+    def _file_outline_for_target(self, path: str, target: ActiveIndexTarget) -> OutlineResponse:
+        self._ensure_query_generations({target.project.id: target})
+        return self.search.file_outline(path, target.project.id, partition=target.partition)
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         project_id = self.store._chunk_project_id(chunk_id)
-        if project_id is not None:
-            self._ensure_query_generations([project_id], None)
-        return self.search.get_chunk(chunk_id)
+        if project_id is None:
+            return self.search.get_chunk(chunk_id)
+        resolved = self._resolve(project_id, None)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._get_chunk_for_target(chunk_id, targets[project_id]),
+        )
+
+    def _get_chunk_for_target(self, chunk_id: str, target: ActiveIndexTarget) -> CodeChunk:
+        self._ensure_query_generations({target.project.id: target})
+        return self.search.get_chunk(chunk_id, partition=target.partition)
 
     def _prepare_reference_query(
         self,
         selector: DeclarationSelector,
-        roots: list[Path] | None,
+        target: ActiveIndexTarget,
     ) -> tuple[DeclarationSelector, ReferenceBackfillReport, PartitionRef]:
         if selector.project is not None:
-            resolved = self._resolve(selector.project, roots)
-            selector = selector.model_copy(update={"project": resolved.id})
-            project_id = resolved.id
+            selector = selector.model_copy(update={"project": target.project.id})
         else:
             chunk_project_id = self.store._chunk_project_id(selector.chunk_id or "")
             if chunk_project_id is None:
                 # Preserve the established CHUNK_NOT_FOUND error contract for
                 # malformed and retired chunk ids.
-                self.search.get_chunk(selector.chunk_id or "")
+                self.search.get_chunk(selector.chunk_id or "", partition=target.partition)
                 raise AssertionError("get_chunk unexpectedly returned without a project id")
-            project_id = chunk_project_id
-        self._ensure_query_generations([project_id], roots)
-        report = self.ensure_reference_index(project_id, roots=roots)
-        return selector, report, self.store.active_partition(project_id)
+            if chunk_project_id != target.project.id:
+                raise ValueError("reference target does not own selector chunk")
+        self._ensure_query_generations({target.project.id: target})
+        report = self.ensure_reference_index(target.project.id, _target=target)
+        return selector, report, target.partition
 
-    def _ensure_query_generations(self, project_ids: list[str], roots: list[Path] | None) -> None:
+    def _ensure_query_generations(self, targets: Mapping[str, ActiveIndexTarget]) -> None:
         """Rebuild incompatible partitions before any query can observe them."""
-        for project_id in project_ids:
-            partition = self.store.active_partition(project_id)
+        for project_id in sorted(targets):
+            target = targets[project_id]
             if (
                 self.store.incompatibility_reason(
                     project_id,
                     self.embedder.model_id,
-                    partition_id=partition.partition_id,
+                    partition_id=target.partition_id,
                 )
                 is not None
             ):
-                self.index_project(
-                    project_id,
-                    roots=roots,
+                self.indexer.index(
+                    target.project,
+                    partition=target.partition,
                     wait_for_lock=True,
                     trigger="lazy-query",
                 )
@@ -1419,7 +1650,28 @@ class Application:
         cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> ReferenceResponse:
-        selector, report, partition = self._prepare_reference_query(selector, roots)
+        resolved = self._resolve_reference_project(selector, roots)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._find_references_for_target(
+                selector,
+                targets[resolved.id],
+                kinds=kinds,
+                limit=limit,
+                cursor=cursor,
+            ),
+        )
+
+    def _find_references_for_target(
+        self,
+        selector: DeclarationSelector,
+        target: ActiveIndexTarget,
+        *,
+        kinds: set[str] | None,
+        limit: int,
+        cursor: str | None,
+    ) -> ReferenceResponse:
+        selector, report, partition = self._prepare_reference_query(selector, target)
         with self.store.partition_access(report.project_id, partition_id=partition.partition_id):
             return self.references.find_references(
                 selector,
@@ -1439,7 +1691,28 @@ class Application:
         cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> RefactorAnalysis:
-        selector, report, partition = self._prepare_reference_query(selector, roots)
+        resolved = self._resolve_reference_project(selector, roots)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._analyze_refactor_for_target(
+                selector,
+                operation,
+                targets[resolved.id],
+                limit=limit,
+                cursor=cursor,
+            ),
+        )
+
+    def _analyze_refactor_for_target(
+        self,
+        selector: DeclarationSelector,
+        operation: RefactorOperation,
+        target: ActiveIndexTarget,
+        *,
+        limit: int,
+        cursor: str | None,
+    ) -> RefactorAnalysis:
+        selector, report, partition = self._prepare_reference_query(selector, target)
         with self.store.partition_access(report.project_id, partition_id=partition.partition_id):
             return self.references.analyze_refactor(
                 selector,
@@ -1449,6 +1722,17 @@ class Application:
                 backfill=report,
                 partition=partition,
             )
+
+    def _resolve_reference_project(
+        self, selector: DeclarationSelector, roots: list[Path] | None
+    ) -> ProjectInfo:
+        if selector.project is not None:
+            return self._resolve(selector.project, roots)
+        project_id = self.store._chunk_project_id(selector.chunk_id or "")
+        if project_id is None:
+            self.search.get_chunk(selector.chunk_id or "")
+            raise AssertionError("get_chunk unexpectedly returned without a project id")
+        return self._resolve(project_id, roots)
 
     def prepare_model(self) -> None:
         if not isinstance(self.embedder, FastEmbedder):

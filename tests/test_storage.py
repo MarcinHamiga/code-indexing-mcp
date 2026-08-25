@@ -989,6 +989,13 @@ def test_stored_chunk_still_carries_its_vector(tmp_path: Path) -> None:
     assert list(StoredChunk.model_fields)[-1] == "vector"
 
 
+def test_explicit_partition_mapping_must_cover_every_requested_project(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+
+    with pytest.raises(ValueError, match="Missing physical partitions"):
+        store.count_chunks(["project-a", "project-b"], partition_ids={"project-a": "slot-a"})
+
+
 def _break_references_table(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make every future `_tables()` call build a partition with no references table.
 
@@ -1051,7 +1058,7 @@ def test_restore_versions_checkout_raises_instead_of_asserting(
     )
 
     with pytest.raises(RuntimeError, match="Reference table is missing"):
-        store.restore_versions(project.id, versions)
+        store.restore_versions(project.id, versions, partition_id=project.id)
 
 
 def test_ensure_indexes_raises_instead_of_asserting_on_a_missing_reference_table(

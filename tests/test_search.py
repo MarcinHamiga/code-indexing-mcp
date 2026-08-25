@@ -2,12 +2,13 @@ from pathlib import Path
 
 import pytest
 
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import Indexer
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner
 from code_indexing_mcp.search import SearchService
-from code_indexing_mcp.storage import LanceStore
+from code_indexing_mcp.storage import LanceStore, PartitionRef
 
 
 class SemanticEmbedder:
@@ -203,6 +204,34 @@ def test_search_truncates_snippet_and_get_chunk_returns_full_content(tmp_path: P
     assert len(result.hits[0].snippet) == 4_000
     assert result.hits[0].truncated is True
     assert len(full.content) > len(result.hits[0].snippet)
+
+
+def test_explicit_active_slot_never_reads_an_inactive_chunk_partition(tmp_path: Path) -> None:
+    store, search, projects = indexed_projects(tmp_path)
+    project_id = projects[0]
+    active = store.active_partition(project_id)
+    old_chunk_id = search.find_symbol("enforce_permissions", project_id).hits[0].chunk_id
+    active_slot = store.get_slot(active.slot_id)
+    assert active_slot is not None
+    pending = active_slot.model_copy(
+        update={
+            "slot_id": "pending-slot",
+            "partition_id": "slot-pending-slot",
+            "selector_kind": "ref",
+            "selector_value": "refs/heads/pending",
+            "state": "pending",
+        }
+    )
+    store.upsert_slot(pending)
+    epoch = store.activate_slot(project_id, pending.slot_id)
+    partition = PartitionRef(project_id, pending.slot_id, pending.partition_id, epoch)
+
+    response = search.search_code("permissions", [project_id], partitions={project_id: partition})
+
+    assert response.hits == []
+    with pytest.raises(CodeIndexingError) as excinfo:
+        search.get_chunk(old_chunk_id, partition=partition)
+    assert excinfo.value.code is ErrorCode.CHUNK_NOT_FOUND
 
 
 def _indexed_source(tmp_path: Path, source: str) -> tuple[SearchService, str]:

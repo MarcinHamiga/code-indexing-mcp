@@ -1,4 +1,4 @@
-"""Staging, commit-rollback, and startup-recovery coverage for Task 4."""
+"""Slot-aware staging, commit rollback, and startup recovery coverage."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from code_indexing_mcp.staging import (
     PHASE_COMMITTING,
     PHASE_STAGING,
     REFERENCES_NAME,
+    THREE_TABLE_JOURNAL_FORMAT_VERSION,
     ChunkRow,
     ReferenceRow,
     StagingJob,
@@ -132,6 +133,12 @@ def make_job(
     job_id: str = "job-1",
     partition: PartitionRef | None = None,
 ) -> StagingJob:
+    partition = partition or PartitionRef(
+        project_id=project_id,
+        slot_id=f"slot-{project_id}",
+        partition_id=project_id,
+        activation_epoch=1,
+    )
     job = StagingJob(
         tmp_path / "staging",
         project_id,
@@ -159,6 +166,8 @@ def test_staging_journal_records_the_pinned_partition(tmp_path: Path) -> None:
     assert journal["slot_id"] == partition.slot_id
     assert journal["partition_id"] == partition.partition_id
     assert journal["activation_epoch"] == partition.activation_epoch
+    assert journal["version"] == JOURNAL_FORMAT_VERSION
+    assert job.directory == tmp_path / "staging" / project.id / partition.slot_id / "job-1"
     job.discard()
 
 
@@ -573,7 +582,7 @@ def test_a_failed_commit_restores_reference_rows_with_files_and_chunks(tmp_path:
     files_before = store.list_files(project.id)
     chunks_before = store.list_chunks([project.id])
     references_before = store.list_reference_records(project.id)
-    job = make_job(tmp_path, store, project.id)
+    job = make_job(tmp_path, store, project.id, partition=store.active_partition(project.id))
     job.stage_references(
         [reference_row(project.id, file_id, reference_id="replacement", target_name="renamed")]
     )
@@ -588,7 +597,7 @@ def test_a_failed_commit_restores_reference_rows_with_files_and_chunks(tmp_path:
         patch.object(LanceStore, "replace_files_from_arrow", apply_then_crash),
         pytest.raises(RuntimeError, match="simulated crash"),
     ):
-        indexer._commit_staged(project, job, errors=[])
+        indexer._commit_staged(project, job, partition=job.partition, errors=[])
 
     assert store.list_files(project.id) == files_before
     assert store.list_chunks([project.id]) == chunks_before
@@ -629,7 +638,7 @@ def test_a_commit_whose_rollback_fails_keeps_its_journal_for_recovery(
     ):
         indexer.index(project)
 
-    journals = sorted((tmp_path / "staging").glob(f"*/*/{JOURNAL_NAME}"))
+    journals = sorted((tmp_path / "staging").glob(f"*/*/*/{JOURNAL_NAME}"))
     assert len(journals) == 1
     assert json.loads(journals[0].read_text())["phase"] == PHASE_COMMITTING
 
@@ -666,7 +675,7 @@ def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -
 
     # Stage a replacement, record the versions, and then "crash" after all
     # three live tables mutate but before rollback code runs.
-    job = make_job(tmp_path, store, project.id)
+    job = make_job(tmp_path, store, project.id, partition=store.active_partition(project.id))
     record = files_before[0].model_copy(update={"mtime_ns": 2})
     job.stage_file(record)
     job.stage_chunks([chunk_row(project.id, file_id, [9.0, 9.0, 9.0, 9.0])])
@@ -695,6 +704,71 @@ def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -
     assert store.list_chunks([project.id]) == chunks_before
     assert store.list_reference_records(project.id) == references_before
     assert list((tmp_path / "staging").glob("*/*/")) == []
+
+
+def test_recovery_of_an_inactive_slot_never_changes_the_active_pointer(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    project = make_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    active = store.active_partition(project.id)
+    files_before = store.list_files(project.id, partition_id=active.partition_id)
+    file_id = files_before[0].file_id
+    job = make_job(tmp_path, store, project.id, partition=active)
+    job.stage_file(files_before[0].model_copy(update={"mtime_ns": 99}))
+    job.mark_replaced(file_id)
+    job.begin_commit(store.table_versions(project.id, partition_id=active.partition_id))
+
+    active_slot = store.get_slot(active.slot_id)
+    assert active_slot is not None
+    other = active_slot.model_copy(
+        update={
+            "slot_id": "other-slot",
+            "partition_id": "slot-other-slot",
+            "selector_kind": "ref",
+            "selector_value": "refs/heads/other",
+            "state": "pending",
+        }
+    )
+    store.upsert_slot(other)
+    epoch = store.activate_slot(project.id, other.slot_id)
+    store.replace_files_from_arrow(
+        project.id,
+        files=job.files_table(),
+        chunk_batches=job.iter_chunk_batches(),
+        reference_batches=job.iter_reference_batches(),
+        partition_id=active.partition_id,
+    )
+
+    assert recover_staged_commits(tmp_path / "staging", store) == 1
+    current = store._active_partition_ref(project.id)
+    assert current is not None
+    assert (current.slot_id, current.activation_epoch) == (other.slot_id, epoch)
+    assert store.list_files(project.id, partition_id=active.partition_id) == files_before
+    assert not (store.directory / "projects" / other.partition_id).exists()
+
+
+def test_recovery_discards_a_journal_for_an_evicted_slot(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    project = make_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    partition = store.active_partition(project.id)
+    job = make_job(tmp_path, store, project.id, partition=partition)
+    job.begin_commit(store.table_versions(project.id, partition_id=partition.partition_id))
+    assert (store.directory / "projects" / partition.partition_id).is_dir()
+    assert store.remove_slot(partition.slot_id) is True
+
+    with patch.object(
+        store,
+        "restore_versions",
+        side_effect=AssertionError("an evicted slot must never be restored"),
+    ) as restore_versions:
+        assert recover_staged_commits(tmp_path / "staging", store) == 0
+
+    restore_versions.assert_not_called()
+    assert not job.directory.exists()
+    assert (store.directory / "projects" / partition.partition_id).is_dir()
 
 
 def test_recovery_of_a_rebuild_journal_discards_a_deleted_partition(
@@ -732,7 +806,7 @@ def test_recovery_of_a_rebuild_journal_discards_a_deleted_partition(
     (directory / JOURNAL_NAME).write_text(
         json.dumps(
             {
-                "version": JOURNAL_FORMAT_VERSION,
+                "version": THREE_TABLE_JOURNAL_FORMAT_VERSION,
                 "job_id": "rebuild-job",
                 "project_id": project.id,
                 "phase": PHASE_COMMITTING,
@@ -789,7 +863,7 @@ def test_repeated_recovery_is_idempotent(tmp_path: Path) -> None:
     journal_dir = tmp_path / "staging" / project.id / "job-1"
     journal_dir.mkdir(parents=True)
     journal = {
-        "version": JOURNAL_FORMAT_VERSION,
+        "version": THREE_TABLE_JOURNAL_FORMAT_VERSION,
         "job_id": "job-1",
         "project_id": project.id,
         "phase": PHASE_COMMITTING,
@@ -818,7 +892,7 @@ def _committing_journal(directory: Path, project_id: str, versions: TableVersion
     path.write_text(
         json.dumps(
             {
-                "version": JOURNAL_FORMAT_VERSION,
+                "version": THREE_TABLE_JOURNAL_FORMAT_VERSION,
                 "job_id": directory.name,
                 "project_id": project_id,
                 "phase": PHASE_COMMITTING,

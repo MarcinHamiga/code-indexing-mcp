@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from pathlib import PurePosixPath
 
 from .embedding import Embedder
@@ -17,7 +18,7 @@ from .models import (
     SymbolResponse,
 )
 from .path_filter import path_condition
-from .storage import LanceStore, _quoted
+from .storage import LanceStore, PartitionRef, _quoted
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class SearchService:
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
         limit: int = 8,
+        partitions: Mapping[str, PartitionRef] | None = None,
     ) -> SearchResponse:
         query = query.strip()
         if not query or not project_ids:
@@ -68,11 +70,17 @@ class SearchService:
                 _FALLBACK_FETCH_ROWS,
             )
         fetch = _FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5)
-        partitions = {
-            project_id: self.store.active_partition(project_id) for project_id in project_ids
-        }
-        partition_ids = {project_id: ref.partition_id for project_id, ref in partitions.items()}
-        with self.store.partitions_access(partitions):
+        selected = (
+            {project_id: self.store.active_partition(project_id) for project_id in project_ids}
+            if partitions is None
+            else dict(partitions)
+        )
+        if set(selected) != set(project_ids) or any(
+            ref.project_id != project_id for project_id, ref in selected.items()
+        ):
+            raise ValueError("search partitions do not match the requested projects")
+        partition_ids = {project_id: ref.partition_id for project_id, ref in selected.items()}
+        with self.store.partitions_access(selected):
             rows = self.store.hybrid_search(
                 query,
                 self.embedder.embed_query(query),
@@ -106,11 +114,14 @@ class SearchService:
         match: str = "exact",
         kinds: list[str] | None = None,
         limit: int = 20,
+        partition: PartitionRef | None = None,
     ) -> SymbolResponse:
         if match not in {"exact", "prefix", "contains"}:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, f"Invalid symbol match mode: {match}")
         limit = max(1, min(limit, 50))
-        partition = self.store.active_partition(project_id)
+        partition = partition or self.store.active_partition(project_id)
+        if partition.project_id != project_id:
+            raise ValueError("symbol partition does not belong to project")
         with self.store.partition_access(project_id, partition_id=partition.partition_id):
             candidates = self.store.find_symbol_chunks(
                 name,
@@ -128,10 +139,14 @@ class SearchService:
         )[:limit]
         return SymbolResponse(name=name, hits=[self._hit(chunk, names, 1.0) for chunk in selected])
 
-    def file_outline(self, path: str, project_id: str) -> OutlineResponse:
+    def file_outline(
+        self, path: str, project_id: str, *, partition: PartitionRef | None = None
+    ) -> OutlineResponse:
         items: list[OutlineItem] = []
         seen: set[tuple[str, str]] = set()
-        partition = self.store.active_partition(project_id)
+        partition = partition or self.store.active_partition(project_id)
+        if partition.project_id != project_id:
+            raise ValueError("outline partition does not belong to project")
         with self.store.partition_access(project_id, partition_id=partition.partition_id):
             chunks = self.store.outline_chunks(
                 path, project_id, partition_id=partition.partition_id
@@ -155,12 +170,14 @@ class SearchService:
             )
         return OutlineResponse(project_id=project_id, path=path, items=items)
 
-    def get_chunk(self, chunk_id: str) -> CodeChunk:
+    def get_chunk(self, chunk_id: str, *, partition: PartitionRef | None = None) -> CodeChunk:
         project_id = self.store._chunk_project_id(chunk_id)
         if project_id is None:
             chunk = None
         else:
-            partition = self.store.active_partition(project_id)
+            partition = partition or self.store.active_partition(project_id)
+            if partition.project_id != project_id:
+                raise ValueError("chunk partition does not belong to project")
             with self.store.partition_access(project_id, partition_id=partition.partition_id):
                 chunk = self.store.get_chunk(chunk_id, partition_id=partition.partition_id)
         if chunk is None:

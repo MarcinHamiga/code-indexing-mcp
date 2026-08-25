@@ -19,12 +19,14 @@ from code_indexing_mcp.application import Application, RuntimePaths
 from code_indexing_mcp.backends import CPU_BACKEND, Accelerator
 from code_indexing_mcp.embedding_worker import default_launcher
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
+from code_indexing_mcp.git_state import GitProbeOutcome, GitState, SelectorKind
 from code_indexing_mcp.models import (
     DeclarationSelector,
     ProjectInfo,
     ReferenceBackfillReport,
     RenameOperation,
     SearchHit,
+    SearchResponse,
 )
 from code_indexing_mcp.projects import existing_marker_path
 from code_indexing_mcp.settings import IndexSettings
@@ -141,6 +143,7 @@ def test_git_checkout_switches_active_slots_without_leaking_branch_rows(tmp_path
     project = app.init_project(root)
     app.index_project(project.id)
     main_slot = app.project_status(project.id).active_slot_id
+    main_chunk_id = app.find_symbol("main_branch", project.id).hits[0].chunk_id
 
     run_git("checkout", "-qb", "feature", cwd=root)
     (root / "feature.py").write_text("def feature_branch():\n    return 2\n")
@@ -160,9 +163,15 @@ def test_git_checkout_switches_active_slots_without_leaking_branch_rows(tmp_path
     assert pending.active_slot_id != main_slot
     assert pending.branch_build_pending is True
     assert pending.file_count == 0
+    assert app.find_symbol("main_branch", project.id).hits == []
+    assert app.file_outline("main.py", project.id).items == []
+    with pytest.raises(CodeIndexingError) as excinfo:
+        app.get_chunk(main_chunk_id)
+    assert excinfo.value.code is ErrorCode.CHUNK_NOT_FOUND
     app.index_project(project.id)
     feature = app.search_code("feature branch", projects=[project.id], paths=["feature.py"])
     assert [hit.symbol for hit in feature.hits] == ["feature_branch"]
+    feature_chunk_id = feature.hits[0].chunk_id
 
     run_git("checkout", "-q", "main", cwd=root)
     restored = app.project_status(project.id)
@@ -170,6 +179,94 @@ def test_git_checkout_switches_active_slots_without_leaking_branch_rows(tmp_path
     assert restored.file_count == 1
     assert restored.branch_build_pending is False
     assert app.search_code("feature branch", projects=[project.id], paths=["feature.py"]).hits == []
+    with pytest.raises(CodeIndexingError) as excinfo:
+        app.get_chunk(feature_chunk_id)
+    assert excinfo.value.code is ErrorCode.CHUNK_NOT_FOUND
+
+
+def test_degraded_git_probe_activates_an_empty_workspace_slot(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(root))
+    (root / "main.py").write_text("def main_branch():\n    return 1\n")
+    run_git("add", "main.py", cwd=root)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "main",
+        cwd=root,
+    )
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    branch_slot = app.project_status(project.id).active_slot_id
+    degraded = GitState(
+        probe=GitProbeOutcome.TIMEOUT,
+        selector_kind=SelectorKind.WORKSPACE,
+        selector_value=str(root.resolve()),
+    )
+
+    with patch("code_indexing_mcp.application.probe_git_state", return_value=degraded):
+        status = app.project_status(project.id)
+
+    assert status.active_slot_id != branch_slot
+    assert status.git_probe == GitProbeOutcome.TIMEOUT.value
+    assert status.file_count == 0
+    assert status.branch_build_pending is True
+    assert branch_slot in {slot.slot_id for slot in app.store.list_slots(project.id)}
+
+
+def test_search_retries_once_when_the_repository_changes(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    first = SearchResponse(query="answer", hits=[])
+    second = SearchResponse(query="answer after switch", hits=[])
+
+    with (
+        patch.object(app.search, "search_code", side_effect=[first, second]) as search_code,
+        patch.object(app, "_target_changed", side_effect=[True, False]),
+    ):
+        response = app.search_code("answer", projects=[project.id])
+
+    assert response is second
+    assert search_code.call_count == 2
+
+
+def test_search_rejects_a_second_repository_transition(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    response = SearchResponse(query="answer", hits=[])
+
+    with (
+        patch.object(app.search, "search_code", return_value=response),
+        patch.object(app, "_target_changed", side_effect=[True, True]),
+        pytest.raises(CodeIndexingError) as excinfo,
+    ):
+        app.search_code("answer", projects=[project.id])
+
+    assert excinfo.value.code is ErrorCode.REPOSITORY_CHANGED
 
 
 def test_application_can_ensure_the_structural_index_without_a_semantic_search(
@@ -1203,8 +1300,9 @@ def test_maintenance_preserves_versions_named_by_a_recovery_journal(tmp_path: Pa
     )
 
     app, project = _indexed_app(tmp_path)
+    partition = app.store.active_partition(project.id)
     versions = app.store.table_versions(project.id)
-    directory = app.paths.data / "staging" / project.id / "job-1"
+    directory = app.paths.data / "staging" / project.id / partition.slot_id / "job-1"
     directory.mkdir(parents=True)
     (directory / JOURNAL_NAME).write_text(
         json.dumps(
@@ -1212,6 +1310,9 @@ def test_maintenance_preserves_versions_named_by_a_recovery_journal(tmp_path: Pa
                 "version": JOURNAL_FORMAT_VERSION,
                 "job_id": directory.name,
                 "project_id": project.id,
+                "slot_id": partition.slot_id,
+                "partition_id": partition.partition_id,
+                "activation_epoch": partition.activation_epoch,
                 "phase": PHASE_COMMITTING,
                 "files_version": versions.files,
                 "chunks_version": versions.chunks,
@@ -1226,13 +1327,13 @@ def test_maintenance_preserves_versions_named_by_a_recovery_journal(tmp_path: Pa
     with patch.object(
         app.store,
         "maintain_project",
-        side_effect=AssertionError("recovery-dependent versions must not be cleaned"),
-    ):
+        wraps=app.store.maintain_project,
+    ) as maintain_project:
         report = app.maintain_storage(wait_for_lock=True)
 
     entry = next(result for result in report.projects if result.project.id == project.id)
-    assert entry.status == "skipped"
-    assert entry.skip_reason == "recovery-pending"
+    assert entry.status == "ok"
+    assert maintain_project.call_args.kwargs["protected_slot_ids"] == frozenset({partition.slot_id})
     assert recover_staged_commits(app.paths.data / "staging", app.store) == 1
 
 

@@ -347,6 +347,7 @@ class Indexer:
         self,
         project: ProjectInfo,
         *,
+        partition: PartitionRef | None = None,
         force: bool = False,
         wait_for_lock: bool = False,
         on_progress: Callable[[IndexProgress], None] | None = None,
@@ -369,15 +370,18 @@ class Indexer:
                 global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
                 project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
             ):
-                try:
-                    partition = self.store.active_partition(project.id)
-                except CodeIndexingError as exc:
-                    if exc.code is not ErrorCode.PROJECT_NOT_FOUND:
-                        raise
-                    self.store.upsert_project(
-                        project, model_id=self.embedder.model_id, state="pending"
-                    )
-                    partition = self.store.active_partition(project.id)
+                if partition is None:
+                    try:
+                        partition = self.store.active_partition(project.id)
+                    except CodeIndexingError as exc:
+                        if exc.code is not ErrorCode.PROJECT_NOT_FOUND:
+                            raise
+                        self.store.upsert_project(
+                            project, model_id=self.embedder.model_id, state="pending"
+                        )
+                        partition = self.store.active_partition(project.id)
+                if partition.project_id != project.id:
+                    raise ValueError("index partition does not belong to project")
                 rebuild_reason = self.store.incompatibility_reason(
                     project.id, self.embedder.model_id, partition_id=partition.partition_id
                 )
@@ -441,18 +445,22 @@ class Indexer:
         self,
         project: ProjectInfo,
         *,
+        partition: PartitionRef | None = None,
         wait_for_lock: bool = False,
         on_progress: Callable[[IndexProgress], None] | None = None,
         trigger: IndexTrigger = "reference-backfill",
     ) -> ReferenceBackfillReport:
         """Parse missing structural generations without embedding source chunks."""
 
-        try:
-            partition = self.store.active_partition(project.id)
-        except CodeIndexingError as exc:
-            if exc.code is ErrorCode.PROJECT_NOT_FOUND:
-                return ReferenceBackfillReport(project_id=project.id)
-            raise
+        if partition is None:
+            try:
+                partition = self.store.active_partition(project.id)
+            except CodeIndexingError as exc:
+                if exc.code is ErrorCode.PROJECT_NOT_FOUND:
+                    return ReferenceBackfillReport(project_id=project.id)
+                raise
+        if partition.project_id != project.id:
+            raise ValueError("reference partition does not belong to project")
         if (
             self.store.incompatibility_reason(
                 project.id, self.embedder.model_id, partition_id=partition.partition_id
@@ -466,6 +474,7 @@ class Indexer:
             # the caller proceeds to serve queries against the fresh index.
             self.index(
                 project,
+                partition=partition,
                 wait_for_lock=wait_for_lock,
                 on_progress=on_progress,
                 trigger="schema-rebuild",
@@ -474,7 +483,6 @@ class Indexer:
             # uncovered. Continue through normal backfill accounting so the
             # caller sees those coverage limitations instead of a false clean
             # report.
-            partition = self.store.active_partition(project.id)
 
         self.lock_directory.mkdir(parents=True, exist_ok=True)
         run_id = uuid.uuid4().hex
@@ -502,7 +510,6 @@ class Indexer:
                     partition_id=partition.partition_id,
                 ) as record,
             ):
-                partition = self.store.active_partition(project.id)
                 try:
                     report = self._backfill_references_locked(
                         project, partition=partition, progress=progress, run_record=record
@@ -940,6 +947,8 @@ class Indexer:
 
     def _staging_job(self, project: ProjectInfo, state: _IndexScanState) -> StagingJob:
         if state.job is None:
+            if state.partition is None:
+                raise RuntimeError("index scan has no pinned partition")
             state.job = StagingJob(
                 self.staging_directory,
                 project.id,
@@ -1353,7 +1362,7 @@ class Indexer:
         project: ProjectInfo,
         job: StagingJob,
         *,
-        partition: PartitionRef | None = None,
+        partition: PartitionRef,
         errors: list[IndexIssue],
         state: str | None = None,
     ) -> None:
@@ -1368,8 +1377,8 @@ class Indexer:
         backfill commits no chunks or embeddings and therefore cannot promote a
         project whose earlier indexing failure left it partial.
         """
-        if partition is None:
-            partition = self.store.active_partition(project.id)
+        if job.partition != partition:
+            raise ValueError("staged job and commit partition do not match")
         versions = self.store.table_versions(project.id, partition_id=partition.partition_id)
         job.begin_commit(versions)
         try:
@@ -1667,7 +1676,7 @@ class Indexer:
         chunk: ExtractedChunk,
         vector: bytes,
         *,
-        slot_id: str = "",
+        slot_id: str,
     ) -> ChunkRow:
         identity = "\0".join(
             [
