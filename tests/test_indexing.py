@@ -1957,9 +1957,14 @@ def _git_head(root: Path) -> str:
     return completed.stdout.strip()
 
 
-def _restore_mtime(path: Path) -> None:
-    """Pin a file's mtime across an edit, hiding the change from metadata."""
+def _write_with_pinned_mtime(path: Path, content: str) -> None:
+    """Overwrite *path* while restoring its previous timestamps.
+
+    Captures size and mtime *before* the write so a same-length edit is
+    invisible to a metadata walk and only the validation plan can catch it.
+    """
     stat = path.stat()
+    path.write_text(content)
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 
 
@@ -1982,8 +1987,7 @@ def test_a_commit_revalidates_only_the_paths_the_diff_names(tmp_path: Path) -> N
 
     # Same-length content change plus a pinned mtime: neither size nor mtime
     # can reveal it, so only the commit-to-commit diff names main.py.
-    (root / "main.py").write_text("def one():\n    return 2\n")
-    _restore_mtime(root / "main.py")
+    _write_with_pinned_mtime(root / "main.py", "def one():\n    return 2\n")
     _git_commit(root, "second")
 
     report = indexer.index(project)
@@ -2005,8 +2009,7 @@ def test_a_dirty_tracked_file_with_a_pinned_mtime_is_revalidated(tmp_path: Path)
     indexer.index(project)
     first_head = _git_head(root)
 
-    (root / "main.py").write_text("def one():\n    return 3\n")
-    _restore_mtime(root / "main.py")
+    _write_with_pinned_mtime(root / "main.py", "def one():\n    return 3\n")
 
     report = indexer.index(project)
 
@@ -2025,8 +2028,7 @@ def test_an_untracked_file_with_a_pinned_mtime_is_revalidated(tmp_path: Path) ->
     (root / "extra.py").write_text("def three():\n    return 3\n")
     indexer.index(project)
 
-    (root / "extra.py").write_text("def three():\n    return 4\n")
-    _restore_mtime(root / "extra.py")
+    _write_with_pinned_mtime(root / "extra.py", "def three():\n    return 4\n")
 
     report = indexer.index(project)
 

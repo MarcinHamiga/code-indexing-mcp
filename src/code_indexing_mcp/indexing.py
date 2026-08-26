@@ -537,18 +537,6 @@ class Indexer:
         run_id = uuid.uuid4().hex
         global_lock = FileLock(self.lock_directory / "index-global.lock")
         project_lock = FileLock(self.lock_directory / f"{project.id}.lock")
-        guard = self._capture_git_guard(project, partition)
-        progress = ProgressPublisher(
-            project.id,
-            run_id=run_id,
-            trigger=trigger,
-            directory=self.progress_directory,
-            listener=on_progress,
-            slot_id=partition.slot_id,
-            activation_epoch=partition.activation_epoch,
-            selector=guard.selector if guard is not None else None,
-            expected_head=guard.state.head_oid if guard is not None else None,
-        )
         try:
             with (
                 global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
@@ -564,6 +552,21 @@ class Indexer:
                     partition_id=partition.partition_id,
                 ) as record,
             ):
+                # Same contract as index(): capture the checkout identity
+                # under the lock so a branch switch while waiting cannot
+                # publish progress or staged rows for the wrong selector.
+                guard = self._capture_git_guard(project, partition)
+                progress = ProgressPublisher(
+                    project.id,
+                    run_id=run_id,
+                    trigger=trigger,
+                    directory=self.progress_directory,
+                    listener=on_progress,
+                    slot_id=partition.slot_id,
+                    activation_epoch=partition.activation_epoch,
+                    selector=guard.selector if guard is not None else None,
+                    expected_head=guard.state.head_oid if guard is not None else None,
+                )
                 try:
                     report = self._backfill_references_locked(
                         project,
