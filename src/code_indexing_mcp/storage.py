@@ -593,6 +593,16 @@ class LanceStore:
             else:
                 updates["indexed_head"] = None
                 updates["indexed_clean"] = None
+            # The generation identity the next freshness check compares against:
+            # scan configuration, model, dimension, and schema as of this
+            # commit. The caller's upsert_project has already refreshed the
+            # logical row these are mirrored from.
+            rows = self._rows(self._projects, f"id = {_quoted(project.id)}")
+            if rows:
+                updates["scan_config_hash"] = self._scan_config_hash(project)
+                updates["model_id"] = str(rows[0]["model_id"])
+                updates["vector_dimension"] = int(rows[0]["vector_dimension"])
+                updates["schema_version"] = int(rows[0]["schema_version"])
         self.upsert_slot(slot.model_copy(update=updates))
 
     def activate_slot(self, project_id: str, slot_id: str) -> int:

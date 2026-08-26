@@ -227,3 +227,22 @@ def test_the_snapshot_is_replaced_atomically(tmp_path: Path) -> None:
     payload = json.loads(progress_path(tmp_path, "abc").read_text())
     assert payload["candidates_seen"] == 2
     assert list(tmp_path.iterdir()) == [progress_path(tmp_path, "abc")]
+
+
+def test_slot_identity_is_carried_on_every_published_snapshot() -> None:
+    seen: list[object] = []
+    publisher = ProgressPublisher(
+        "project",
+        listener=seen.append,
+        interval_seconds=0.0,
+        slot_id="slot-a",
+        selector="ref:refs/heads/main",
+        expected_head="0" * 40,
+        activation_epoch=3,
+    )
+
+    publisher.update(phase="scanning", candidates_seen=1)
+
+    assert [(p.slot_id, p.selector, p.expected_head, p.activation_epoch) for p in seen] == [
+        ("slot-a", "ref:refs/heads/main", "0" * 40, 3)
+    ]
