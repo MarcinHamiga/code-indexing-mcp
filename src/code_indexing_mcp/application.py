@@ -836,7 +836,7 @@ class Application:
         try:
             return self.indexer.index(
                 resolved,
-                target=target,
+                partition=target.partition,
                 force=force,
                 wait_for_lock=wait_for_lock,
                 on_progress=on_progress,
@@ -880,29 +880,30 @@ class Application:
 
     def _ensure_reference_target(self, target: ActiveIndexTarget) -> ReferenceBackfillReport:
         resolved = target.project
+        partition = target.partition
         if self._project_is_stale(resolved, partition_id=target.partition_id):
             self.indexer.index(
                 resolved,
-                target=target,
+                partition=partition,
                 wait_for_lock=True,
                 trigger="lazy-query",
             )
         report = self.indexer.backfill_references(
             resolved,
-            target=target,
+            partition=partition,
             wait_for_lock=True,
             trigger="reference-backfill",
         )
         if report.stale_paths:
             self.indexer.index(
                 resolved,
-                target=target,
+                partition=partition,
                 wait_for_lock=True,
                 trigger="lazy-query",
             )
             report = self.indexer.backfill_references(
                 resolved,
-                target=target,
+                partition=partition,
                 wait_for_lock=True,
                 trigger="reference-backfill",
             )
@@ -919,29 +920,6 @@ class Application:
             include_status=True,
         )
 
-    def _slot_is_current(self, target: ActiveIndexTarget) -> bool:
-        """Whether a clean slot indexed at the current HEAD needs no source scan.
-
-        The one comparison that makes a branch switch-back free: selector slot,
-        indexed HEAD, clean state, scan configuration, model, dimension, and
-        schema all matching means the scanner walk itself has nothing to add.
-        """
-        slot, git = target.slot, target.git_state
-        if git.probe is not GitProbeOutcome.GIT or git.worktree is not WorktreeStatus.CLEAN:
-            return False
-        if slot.indexed_head is None or slot.indexed_head != git.head_oid:
-            return False
-        if slot.indexed_clean is not True:
-            return False
-        if slot.scan_config_hash != LanceStore._scan_config_hash(target.project):
-            return False
-        return (
-            self.store.incompatibility_reason(
-                target.project.id, self.embedder.model_id, partition_id=target.partition_id
-            )
-            is None
-        )
-
     def _project_status_for_target(self, target: ActiveIndexTarget) -> ProjectStatus:
         resolved = target.project
         partition = target.partition
@@ -950,36 +928,12 @@ class Application:
         state = slot.state
         git = target.git_state
         if state in {"ready", "partial"}:
-            fingerprint = (
-                f"{partition.slot_id}:{partition.activation_epoch}:{git.head_oid}:"
-                f"{resolved.scan.model_dump_json()}"
-            )
+            fingerprint = f"{partition.slot_id}:{resolved.scan.model_dump_json()}"
             cached = self._clean_freshness_until.get(resolved.id)
             if cached is not None and cached[1] == fingerprint and cached[0] > time.monotonic():
-                # A recent check found this exact slot, activation, HEAD, and
-                # scan configuration clean; do not walk the repository again
-                # for this call.
+                # A recent check found this exact scan configuration clean;
+                # do not walk the repository again for this call.
                 pass
-            elif self._slot_is_current(target):
-                # A clean slot indexed at exactly this HEAD cannot be stale:
-                # the switch-back fast path, with no scanner, parser, or
-                # embedder work at all.
-                self._clean_freshness_until[resolved.id] = (
-                    time.monotonic() + FRESHNESS_CACHE_SECONDS,
-                    fingerprint,
-                )
-            elif (
-                git.probe is GitProbeOutcome.GIT
-                and slot.indexed_head is not None
-                and slot.indexed_head != git.head_oid
-            ):
-                # The slot was indexed at a different HEAD of the same branch:
-                # a commit or reset can hide a same-size, same-mtime content
-                # change from any metadata walk, so only an index run that
-                # validates the diff can prove the slot current. Lazy and
-                # eager modes schedule exactly that run.
-                self._clean_freshness_until.pop(resolved.id, None)
-                state = "stale"
             elif self._project_is_stale(
                 resolved,
                 {record.path: record for record in files},

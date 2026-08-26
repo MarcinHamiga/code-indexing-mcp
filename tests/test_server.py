@@ -84,7 +84,7 @@ class FailingEmbedder(TinyEmbedder):
         raise CodeIndexingError(ErrorCode.MODEL_UNAVAILABLE, "embedding backend unavailable")
 
 
-async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 15.0) -> None:
+async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
         if asyncio.get_running_loop().time() >= deadline:
@@ -709,12 +709,7 @@ async def test_eager_monitor_retries_after_a_refresh_failure(
         armed.set()
         _write_with_later_mtime(source, "def after_failure():\n    return 1\n")
 
-        # A failed iteration backs off for WATCH_RETRY_INITIAL_SECONDS before
-        # requeuing, and the retry runs two full index passes; on a slow
-        # Windows runner that exceeds the short default deadline.
-        await _wait_until(
-            lambda: bool(app.find_symbol("after_failure", project.id).hits), timeout=30
-        )
+        await _wait_until(lambda: bool(app.find_symbol("after_failure", project.id).hits))
 
         assert failures["count"] == 1
         assert not app.find_symbol("initial_symbol", project.id).hits
@@ -808,11 +803,7 @@ async def test_eager_monitor_restarts_after_a_watcher_failure(
 
         source.write_text("def after_recovery():\n    return 2\n")
         change.set()
-        # The event-driven refresh runs two full index passes; a slow Windows
-        # runner needs more than the short default deadline for both.
-        await _wait_until(
-            lambda: bool(app.find_symbol("after_recovery", project.id).hits), timeout=30
-        )
+        await _wait_until(lambda: bool(app.find_symbol("after_recovery", project.id).hits))
 
         assert not app.find_symbol("before_failure", project.id).hits
 

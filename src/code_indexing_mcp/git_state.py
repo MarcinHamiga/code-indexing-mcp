@@ -240,39 +240,6 @@ def partition_id(slot: str) -> str:
     return f"{_SLOT_PARTITION_PREFIX}{slot[:_SLOT_PARTITION_HEX_CHARS]}"
 
 
-def changed_paths_between(
-    root: Path, old_oid: str, new_oid: str, *, project_prefix: str = ""
-) -> frozenset[str] | None:
-    """Project-relative tracked paths whose content differs between two commits.
-
-    Runs ``git diff --name-only -z <old> <new> -- .`` from the registered root,
-    so a project registered inside a subdirectory only sees its own subtree.
-    Git prints repository-root-relative paths; those are re-rooted onto the
-    project exactly like status output. Returns ``None`` whenever the diff
-    cannot be computed -- a missing repository, an unreachable object after a
-    history rewrite, any nonzero exit -- so the caller can fall back to
-    validating every path instead of trusting a partial answer.
-    """
-    if not old_oid or not new_oid or old_oid == new_oid:
-        return frozenset()
-    try:
-        result = run_git(
-            ("git", "diff", "--name-only", "-z", old_oid, new_oid, "--", "."), cwd=root
-        )
-    except GitRunnerError:
-        return None
-    if result.returncode != 0:
-        return None
-    changed: set[str] = set()
-    for path in result.stdout.split("\0"):
-        if not path:
-            continue
-        relative = _project_relative_path(path, project_prefix)
-        if relative is not None:
-            changed.add(relative)
-    return frozenset(changed)
-
-
 def _fallback_state(root: Path, outcome: GitProbeOutcome) -> GitState:
     """Route a non-Git or degraded probe to the checkout-local workspace slot.
 

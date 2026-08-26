@@ -899,13 +899,6 @@ class IndexProgress(BaseModel):
     # it must strictly advance across phase changes on every platform.
     phase_started_at: float = 0.0
     pid: int = Field(default_factory=os.getpid)
-    # Branch-slot identity of the run: which slot is being written, which
-    # selector chose it, and the HEAD captured before scanning began. A
-    # watcher uses these to ignore a finishing prior-branch job.
-    slot_id: str | None = None
-    selector: str | None = None
-    expected_head: str | None = None
-    activation_epoch: int | None = None
 
     @property
     def fraction(self) -> float | None:

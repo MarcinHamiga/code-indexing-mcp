@@ -52,10 +52,6 @@ class ProgressPublisher:
         listener: Callable[[IndexProgress], None] | None = None,
         interval_seconds: float = PUBLISH_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
-        slot_id: str | None = None,
-        selector: str | None = None,
-        expected_head: str | None = None,
-        activation_epoch: int | None = None,
     ) -> None:
         self.directory = directory
         self.listener = listener
@@ -68,10 +64,6 @@ class ProgressPublisher:
             trigger=trigger,
             started_at=time.time(),
             phase_started_at=self._clock(),
-            slot_id=slot_id,
-            selector=selector,
-            expected_head=expected_head,
-            activation_epoch=activation_epoch,
         )
 
     @property

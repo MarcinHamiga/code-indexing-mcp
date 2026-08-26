@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 from conftest import run_git
-from test_indexing import _remove_reference_generation, _write_with_pinned_mtime
+from test_indexing import _remove_reference_generation
 
 from code_indexing_mcp.accelerator_env import (
     RECORD_FILENAME,
@@ -1986,86 +1986,3 @@ def test_inspect_scan_rejects_unknown_filters_and_cursors(tmp_path: Path) -> Non
     with pytest.raises(CodeIndexingError) as limit_error:
         app.inspect_scan(project.id, limit=0)
     assert limit_error.value.code is ErrorCode.INVALID_FILTER
-
-
-def test_returning_to_a_clean_indexed_branch_skips_the_source_scan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Switching back to an unchanged clean cached branch must cost no scan.
-
-    The acceptance gate for branch caching is stronger than "no parsing or
-    embedding": an exact clean cache hit performs no scanner, parser, or
-    embedder work at all, because the slot already proves every generation
-    identity matches.
-    """
-    root = tmp_path / "repo"
-    root.mkdir()
-    run_git("init", "-q", "--initial-branch", "main", str(root))
-    (root / "main.py").write_text("def main_branch():\n    return 1\n")
-    run_git("add", "main.py", cwd=root)
-    run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "main", cwd=root)
-    app = Application(
-        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
-        embedder=TinyEmbedder(),
-        cwd=root,
-    )
-    project = app.init_project(root)
-    app.index_project(project.id)
-
-    run_git("checkout", "-qb", "feature", cwd=root)
-    (root / "feature.py").write_text("def feature_branch():\n    return 2\n")
-    run_git("add", "feature.py", cwd=root)
-    run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "feature", cwd=root)
-    app.index_project(project.id)
-    assert app.project_status(project.id).active_slot_id is not None
-
-    run_git("checkout", "-q", "main", cwd=root)
-    scans = _counted_scanner_scans(app, monkeypatch)
-    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 0.0)
-
-    status = app.project_status(project.id)
-
-    assert status.state == "ready"
-    assert status.branch_build_pending is False
-    assert scans[0] == 0
-
-
-def test_a_commit_with_a_hidden_content_change_marks_the_slot_stale(
-    tmp_path: Path,
-) -> None:
-    """A same-size, same-mtime commit must not keep a slot looking current.
-
-    Metadata cannot distinguish the reset or fast-forward case, so a slot
-    indexed at a different HEAD of the same branch reports stale until an
-    index run validates the commit-to-commit diff.
-    """
-    root = tmp_path / "repo"
-    root.mkdir()
-    run_git("init", "-q", "--initial-branch", "main", str(root))
-    (root / "main.py").write_text("def one():\n    return 1\n")
-    run_git("add", "main.py", cwd=root)
-    run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "first", cwd=root)
-    app = Application(
-        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
-        embedder=TinyEmbedder(),
-        cwd=root,
-    )
-    project = app.init_project(root)
-    app.index_project(project.id)
-    assert app.project_status(project.id).state == "ready"
-
-    _write_with_pinned_mtime(root / "main.py", "def one():\n    return 2\n")
-    run_git("add", "main.py", cwd=root)
-    run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "second", cwd=root)
-
-    stale = app.project_status(project.id)
-
-    assert stale.state == "stale"
-    assert stale.branch_build_pending is True
-
-    report = app.index_project(project.id)
-
-    assert report.indexed_files == 1
-    assert app.project_status(project.id).state == "ready"
-    hits = app.search_code("return 2", projects=[project.id]).hits
-    assert hits and "return 2" in hits[0].snippet
