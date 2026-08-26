@@ -402,7 +402,9 @@ supported. Clients that do not provide filesystem roots can still auto-refresh e
 already registered projects; discovering a new project requires a root or `init_project`.
 
 `project_status` performs the same metadata comparison without rebuilding and reports `stale` when
-a stored `ready` or `partial` index has drifted from the source tree.
+a stored `ready` or `partial` index has drifted from the source tree. Every project-scoped
+operation resolves the checkout's active branch slot before touching the index — see
+[Branch-aware indexing](#branch-aware-indexing).
 
 Two things can make an automatic refresh wait: another root queued ahead of it in the same session,
 and another process holding the global index lock. One budget covers both. The refresh retries with
@@ -486,6 +488,136 @@ current one at runtime, so a project created before a language was supported pic
 being re-initialized. A customized `scan.include` list is never rewritten — add the patterns you
 want (`**/*.cs`, `**/*.gd`, `**/*.gdshader`, `**/*.tscn`, `**/*.tres`, `**/*.sql`, `**/*.yaml`,
 `**/*.yml`, `**/*.json`) explicitly.
+
+## Branch-aware indexing
+
+Only the checked-out working tree is ever indexed. Nothing reads branches or commits out of Git's
+object database, so a ref that is not checked out cannot be indexed; a branch becomes visible the
+moment Git switches the working tree to it.
+
+Each registered Git checkout owns one *index slot* per branch, and every project-scoped operation
+resolves the active slot before it reads or writes storage:
+
+- An attached or unborn branch selects its slot by the full symbolic ref, such as
+  `refs/heads/main`. An unborn branch keeps the same slot through its first commit.
+- A detached HEAD selects its slot by the full commit OID, so checking out the same commit again
+  reuses its cache. These slots are cached exactly like branch slots.
+- A non-Git directory — and a checkout whose Git probe failed or timed out — selects one
+  checkout-local workspace slot, so a transient Git failure serves the workspace slot instead of
+  mutating a known branch slot's data.
+- Linked worktrees get fully separate slot sets per checkout, because each can have different
+  dirty files, untracked files, sparse-checkout rules, and worktree-local configuration. A project
+  registered inside a subdirectory of the worktree keys its slots by that prefix as well.
+
+The slot is a separate physical Lance partition, and activation is cheap. Switching back to a
+branch whose slot is cached and was indexed at exactly the current HEAD of a clean checkout is
+immediate: no source scan, no parsing, no embedding. Commits, dirty files, untracked files, and
+resets reuse the same slot and validate it incrementally:
+
+- A commit on the current branch runs `git diff --name-only` between the slot's indexed HEAD and
+  the new HEAD and re-hashes exactly those paths — a same-size, same-mtime content change can no
+  longer hide behind the metadata fast path. Unchanged content is still neither parsed nor
+  embedded.
+- Dirty and untracked paths are always content-hash validated, whatever their size and mtime.
+- A reset, or a branch name reused at a different commit, reuses the slot but forces validation;
+  a diff that cannot be computed (a rewritten history, for example) falls back to validating every
+  path.
+
+Each index mode handles a switch within its existing rules:
+
+- Lazy mode activates an unseen branch as a pending, empty slot, and the first project-scoped
+  query builds it and waits — reporting progress while it does. A pending slot never falls back to
+  or serves results from the previously active branch.
+- Eager mode treats a branch transition as a change even when filesystem watcher events were
+  coalesced or missed, because status compares the slot's indexed HEAD with the checkout's HEAD.
+- Manual mode exposes the pending or stale same-branch slot through `project_status` without
+  automatically indexing it. Direct searches can read a stale same-branch slot, never a different
+  branch's slot.
+
+A switch while work is in flight is detected, not guessed through: an index run captures the Git
+selector and HEAD before scanning and verifies both before committing, discarding staged rows and
+returning a retryable `REPOSITORY_CHANGED` error when they moved, so no mixed-generation index is
+ever published. A query that observes the checkout change mid-flight re-resolves and retries once,
+then returns `REPOSITORY_CHANGED` after a second transition. A chunk ID from an inactive slot
+returns `CHUNK_NOT_FOUND`, and a reference cursor carried across a switch returns `STALE_CURSOR`.
+
+Retained slots are bounded by least-recently-used eviction:
+
+```bash
+export CODE_INDEXING_BRANCH_CACHE_LIMIT=4   # per project, 1–32; counts the active slot
+```
+
+Eviction runs during storage maintenance (the scheduled daily pass or an explicit
+`index_storage_maintenance`), ordered by last use. It never removes the active slot, a slot being
+indexed, or a slot with pending crash recovery, so the durable slot count can temporarily exceed
+the limit — a failed first build does not destroy a usable cached branch. `remove_project` deletes
+every slot, partition, and pointer of the project while leaving the local marker.
+
+An installation from before branch awareness migrates conservatively: a non-Git registration
+adopts its existing partition as the workspace slot and keeps working without a rebuild, while a
+Git registration keeps the old partition as an unscoped legacy slot that no branch selector
+serves, so the first query on any branch performs one fresh build into that branch's own slot.
+
+`project_status` reports the active branch and slot (abridged):
+
+```console
+$ code-indexing-mcp status
+{
+  "active_slot_id": "8cca8ea14be11b16ca366add8d72edb7d2fdf2a78739f2877481d60204d9b7f8",
+  "branch_build_pending": false,
+  "chunk_count": 1,
+  "file_count": 1,
+  "git_clean": true,
+  "git_head": "eb2114a9ca75549316e8ecc2fa21b4b04cdfc86d",
+  "git_probe": "git",
+  "git_selector_kind": "ref",
+  "git_selector_value": "refs/heads/main",
+  "state": "ready",
+  ...
+}
+```
+
+`git_probe` is one of `git`, `not_git`, `unavailable`, `timeout`, or `invalid`; `git_clean` is
+`null` when cleanliness could not be determined; `branch_build_pending` is true while the active
+slot still needs its first build or a HEAD-advancing validation. `index_storage_status` lists every
+retained slot with its selector, active flag, state, indexed HEAD, last-use timestamp, and physical
+bytes, and sums them into the project and installation totals (abridged):
+
+```console
+$ code-indexing-mcp storage status
+{
+  "schema_version": 2,
+  "projects": [
+    {
+      "project": { "name": "repo", ... },
+      "slots": [
+        {
+          "slot_id": "a65f028ec4908fdac1c064772429f58f136b96eaaf1bd2aa8969b3b3f631dcc4",
+          "selector_kind": "ref",
+          "selector_value": "refs/heads/feature/refunds",
+          "active": false,
+          "state": "ready",
+          "indexed_head": "7e9023276f5677d26a5ec7f67f7e84f10c7efc9f",
+          "indexed_clean": true,
+          "physical_bytes": 85469,
+          ...
+        },
+        {
+          "slot_id": "8cca8ea14be11b16ca366add8d72edb7d2fdf2a78739f2877481d60204d9b7f8",
+          "selector_kind": "ref",
+          "selector_value": "refs/heads/main",
+          "active": true,
+          "state": "ready",
+          ...
+        }
+      ],
+      ...
+    }
+  ],
+  "physical_bytes_total": 280116,
+  ...
+}
+```
 
 ## Multi-project search
 
@@ -875,9 +1007,12 @@ The daemon needs Unix domain sockets. Where they are unavailable — currently W
 `CODE_INDEXING_BROKER=auto` serves directly and logs a warning; an explicit `CODE_INDEXING_BROKER=on` fails with
 `INVALID_CONFIGURATION` instead of being silently downgraded.
 
-Storage schema v2 keeps a registry plus one LanceDB partition per project. On first upgrade from
-v1, the old global store is moved to a timestamped `lancedb-v1-backup-*` directory and projects are
-rebuilt lazily from source. Old chunk rows are never copied, which repairs duplicate chunk IDs.
+Storage schema v2 keeps a registry plus one flat `projects/` directory of LanceDB partitions, one
+per index slot — the active branch, commit, workspace, or legacy partition — with `project_slots`
+and `active_slots` registry tables mapping each logical project to its slots and current active
+slot. On first upgrade from v1, the old global store is moved to a timestamped
+`lancedb-v1-backup-*` directory and projects are rebuilt lazily from source. Old chunk rows are
+never copied, which repairs duplicate chunk IDs.
 
 With `CODE_INDEXING_OFFLINE=1`, Code Indexing MCP will not download a missing model and returns
 `MODEL_UNAVAILABLE` instead. Source code, embeddings, and search queries remain local; there is
