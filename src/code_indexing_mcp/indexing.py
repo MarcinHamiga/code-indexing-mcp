@@ -33,6 +33,15 @@ from .embedding import (
 from .embedding_worker import TelemetrySource
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
+from .git_state import (
+    GitProbeOutcome,
+    GitState,
+    changed_paths_between,
+    probe_git_state,
+)
+from .git_state import (
+    slot_id as git_slot_id,
+)
 from .history import HistoryStore
 from .models import (
     ExtractedChunk,
@@ -52,7 +61,7 @@ from .models import (
 from .progress import IndexProgress, ProgressPublisher
 from .scanner import SourceScanner
 from .staging import ChunkRow, ReferenceRow, StagingJob
-from .storage import SCHEMA_VERSION, LanceStore, PartitionRef
+from .storage import SCHEMA_VERSION, ActiveIndexTarget, LanceStore, PartitionRef
 from .update_check import checkout_head
 
 logger = logging.getLogger(__name__)
@@ -158,6 +167,23 @@ class _PhaseTimer:
 
     def milliseconds(self, phase: str) -> int:
         return self.totals.get(phase, 0) // 1_000_000
+
+
+@dataclass(frozen=True)
+class _GitGuard:
+    """Git identity captured under the index lock and re-verified at commit.
+
+    A guard of ``None`` means Git could not be probed at all; there is then no
+    selector to verify, and the commit deliberately records no indexed HEAD so
+    the next successful probe forces full freshness validation.
+    """
+
+    state: GitState
+    slot_id: str
+
+    @property
+    def selector(self) -> str:
+        return f"{self.state.selector_kind.value}:{self.state.selector_value}"
 
 
 @dataclass
@@ -348,23 +374,21 @@ class Indexer:
         project: ProjectInfo,
         *,
         partition: PartitionRef | None = None,
+        target: ActiveIndexTarget | None = None,
         force: bool = False,
         wait_for_lock: bool = False,
         on_progress: Callable[[IndexProgress], None] | None = None,
         trigger: IndexTrigger = "manual",
     ) -> IndexReport:
+        if partition is None and target is not None:
+            partition = target.partition
+        elif partition is not None and target is not None and partition != target.partition:
+            raise ValueError("index partition and target disagree")
         started = time.monotonic_ns()
         run_id = uuid.uuid4().hex
         self.lock_directory.mkdir(parents=True, exist_ok=True)
         global_lock = FileLock(self.lock_directory / "index-global.lock")
         project_lock = FileLock(self.lock_directory / f"{project.id}.lock")
-        progress = ProgressPublisher(
-            project.id,
-            run_id=run_id,
-            trigger=trigger,
-            directory=self.progress_directory,
-            listener=on_progress,
-        )
         try:
             with (
                 global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
@@ -382,6 +406,22 @@ class Indexer:
                         partition = self.store.active_partition(project.id)
                 if partition.project_id != project.id:
                     raise ValueError("index partition does not belong to project")
+                # Capture the checkout identity before scanning. The guard is
+                # verified again immediately before the staged commit, so a
+                # branch that moved mid-scan can never publish rows into the
+                # slot of a branch that no longer exists in the worktree.
+                guard = self._capture_git_guard(project, partition)
+                progress = ProgressPublisher(
+                    project.id,
+                    run_id=run_id,
+                    trigger=trigger,
+                    directory=self.progress_directory,
+                    listener=on_progress,
+                    slot_id=partition.slot_id,
+                    activation_epoch=partition.activation_epoch,
+                    selector=guard.selector if guard is not None else None,
+                    expected_head=guard.state.head_oid if guard is not None else None,
+                )
                 rebuild_reason = self.store.incompatibility_reason(
                     project.id, self.embedder.model_id, partition_id=partition.partition_id
                 )
@@ -398,7 +438,11 @@ class Indexer:
                         self._prepare_rebuild(project, rebuild_reason, partition)
                     try:
                         report = self._index_locked(
-                            project, partition=partition, force=force, progress=progress
+                            project,
+                            partition=partition,
+                            force=force,
+                            progress=progress,
+                            guard=guard,
                         )
                     finally:
                         # Only the run that holds the lock owns the snapshot, so
@@ -446,12 +490,17 @@ class Indexer:
         project: ProjectInfo,
         *,
         partition: PartitionRef | None = None,
+        target: ActiveIndexTarget | None = None,
         wait_for_lock: bool = False,
         on_progress: Callable[[IndexProgress], None] | None = None,
         trigger: IndexTrigger = "reference-backfill",
     ) -> ReferenceBackfillReport:
         """Parse missing structural generations without embedding source chunks."""
 
+        if partition is None and target is not None:
+            partition = target.partition
+        elif partition is not None and target is not None and partition != target.partition:
+            raise ValueError("reference partition and target disagree")
         if partition is None:
             try:
                 partition = self.store.active_partition(project.id)
@@ -488,13 +537,6 @@ class Indexer:
         run_id = uuid.uuid4().hex
         global_lock = FileLock(self.lock_directory / "index-global.lock")
         project_lock = FileLock(self.lock_directory / f"{project.id}.lock")
-        progress = ProgressPublisher(
-            project.id,
-            run_id=run_id,
-            trigger=trigger,
-            directory=self.progress_directory,
-            listener=on_progress,
-        )
         try:
             with (
                 global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
@@ -510,9 +552,28 @@ class Indexer:
                     partition_id=partition.partition_id,
                 ) as record,
             ):
+                # Same contract as index(): capture the checkout identity
+                # under the lock so a branch switch while waiting cannot
+                # publish progress or staged rows for the wrong selector.
+                guard = self._capture_git_guard(project, partition)
+                progress = ProgressPublisher(
+                    project.id,
+                    run_id=run_id,
+                    trigger=trigger,
+                    directory=self.progress_directory,
+                    listener=on_progress,
+                    slot_id=partition.slot_id,
+                    activation_epoch=partition.activation_epoch,
+                    selector=guard.selector if guard is not None else None,
+                    expected_head=guard.state.head_oid if guard is not None else None,
+                )
                 try:
                     report = self._backfill_references_locked(
-                        project, partition=partition, progress=progress, run_record=record
+                        project,
+                        partition=partition,
+                        progress=progress,
+                        run_record=record,
+                        guard=guard,
                     )
                 finally:
                     progress.clear()
@@ -652,6 +713,7 @@ class Indexer:
         partition: PartitionRef,
         progress: ProgressPublisher,
         run_record: _RunRecord,
+        guard: _GitGuard | None = None,
     ) -> ReferenceBackfillReport:
         # Backfill never embeds or re-parses chunks; it must not use its own
         # (always error-free) run to promote a project past whatever state a
@@ -866,6 +928,10 @@ class Indexer:
                 # the exact backfill that just ran and cannot help (S8). An
                 # otherwise-empty commit still creates the table.
                 job = staging_job()
+            # Structural rows describe the checkout the guard captured; a
+            # reference backfill that outlived a branch switch must not pin
+            # its generations into the moved-from slot.
+            self._verify_git_guard(project, partition, guard)
             self._commit_staged(project, job, partition=partition, errors=[], state=prior_state)
             return ReferenceBackfillReport(
                 project_id=project.id,
@@ -890,6 +956,80 @@ class Indexer:
                 job.discard()
             raise
 
+    def _capture_git_guard(self, project: ProjectInfo, partition: PartitionRef) -> _GitGuard | None:
+        """Snapshot the checkout identity this run will be verified against.
+
+        Raises :class:`CodeIndexingError` with ``REPOSITORY_CHANGED`` when the
+        checkout has already moved off *partition*'s slot: indexing it now
+        would stage the wrong branch's rows, and the caller's retry re-resolves
+        the target against the new selector.
+        """
+        state = probe_git_state(project.root, include_status=True)
+        if state.probe is not GitProbeOutcome.GIT:
+            return None
+        if git_slot_id(project.id, state) != partition.slot_id:
+            raise CodeIndexingError(
+                ErrorCode.REPOSITORY_CHANGED,
+                f"The Git checkout of {project.name} moved before indexing started",
+                project=project.id,
+            )
+        return _GitGuard(state=state, slot_id=partition.slot_id)
+
+    def _verify_git_guard(
+        self, project: ProjectInfo, partition: PartitionRef, guard: _GitGuard | None
+    ) -> None:
+        """Refuse to publish rows the captured checkout no longer describes."""
+        if guard is None:
+            return
+        state = probe_git_state(project.root)
+        if state.probe is not GitProbeOutcome.GIT:
+            # A transient Git failure cannot prove the checkout moved. The
+            # staged rows still describe the working tree that was scanned,
+            # and the commit records no indexed HEAD, so the next successful
+            # probe forces full freshness validation.
+            return
+        if (
+            git_slot_id(project.id, state) != guard.slot_id
+            or state.head_oid != guard.state.head_oid
+        ):
+            raise CodeIndexingError(
+                ErrorCode.REPOSITORY_CHANGED,
+                f"The Git checkout of {project.name} changed while it was being indexed",
+                project=project.id,
+            )
+
+    def _validation_plan(
+        self, project: ProjectInfo, partition: PartitionRef, guard: _GitGuard | None
+    ) -> tuple[frozenset[str], bool]:
+        """Paths whose stored size/mtime must not be trusted this run.
+
+        A same-slot HEAD advance validates only the paths the commits touched,
+        plus whatever Git currently reports dirty or untracked. A diff that
+        cannot be computed, or a slot with no recorded HEAD or clean state,
+        validates every path; content hashes are still reused, so unchanged
+        files pay a read and a digest, never a re-parse or re-embed.
+        """
+        if guard is None:
+            return frozenset(), False
+        state = guard.state
+        verify_paths: set[str] = {*state.dirty_paths, *state.untracked_paths}
+        slot = self.store.get_slot(partition.slot_id)
+        if slot is None:
+            return frozenset(verify_paths), False
+        if slot.indexed_head is None or slot.indexed_clean is None:
+            return frozenset(verify_paths), True
+        if state.head_oid is not None and slot.indexed_head != state.head_oid:
+            changed = changed_paths_between(
+                project.root,
+                slot.indexed_head,
+                state.head_oid,
+                project_prefix=state.project_prefix,
+            )
+            if changed is None:
+                return frozenset(verify_paths), True
+            verify_paths |= changed
+        return frozenset(verify_paths), False
+
     def _index_locked(
         self,
         project: ProjectInfo,
@@ -897,7 +1037,11 @@ class Indexer:
         partition: PartitionRef,
         force: bool,
         progress: ProgressPublisher,
+        guard: _GitGuard | None = None,
     ) -> IndexReport:
+        slot_row = self.store.get_slot(partition.slot_id)
+        previous_state = slot_row.state if slot_row is not None else "pending"
+        verify_paths, verify_all = self._validation_plan(project, partition, guard)
         try:
             self.store.upsert_project(project, model_id=self.embedder.model_id, state="indexing")
             self.store.set_slot_state(partition, "indexing")
@@ -913,6 +1057,9 @@ class Indexer:
                     force=force,
                     passage_embedder=passage_embedder,
                     progress=progress,
+                    verify_paths=verify_paths,
+                    verify_all=verify_all,
+                    guard=guard,
                 )
             if isinstance(context, TelemetrySource):
                 # Read after the context exits, so a session that fell back from
@@ -938,11 +1085,19 @@ class Indexer:
                     }
                 )
             return report
-        except Exception:
-            # Never leave the project stuck in "indexing" after a crash.
+        except Exception as exc:
+            # Never leave the project stuck in "indexing" after a crash. A
+            # repository that moved under the run is retryable rather than
+            # failed, so its slot returns to the pre-run state instead of
+            # "error" and keeps its last-good indexed HEAD.
+            fallback = (
+                previous_state
+                if isinstance(exc, CodeIndexingError) and exc.code is ErrorCode.REPOSITORY_CHANGED
+                else "error"
+            )
             with contextlib.suppress(Exception):
-                self.store.upsert_project(project, model_id=self.embedder.model_id, state="error")
-                self.store.set_slot_state(partition, "error")
+                self.store.upsert_project(project, model_id=self.embedder.model_id, state=fallback)
+                self.store.set_slot_state(partition, fallback)
             raise
 
     def _staging_job(self, project: ProjectInfo, state: _IndexScanState) -> StagingJob:
@@ -1104,15 +1259,25 @@ class Indexer:
         timer: _PhaseTimer,
         process: psutil.Process,
         state: _IndexScanState,
+        verify_paths: frozenset[str] = frozenset(),
+        verify_all: bool = False,
     ) -> None:
         path = item.path.as_posix()
         previous = existing.get(path)
         if (
             not force
+            and not verify_all
+            and path not in verify_paths
             and previous is not None
             and previous.size == item.size
             and previous.mtime_ns == item.mtime_ns
         ):
+            # Size and mtime alone trusted the filesystem's version of a
+            # branch switch or reset: identical metadata can hide different
+            # content. Paths the validation plan named -- every path after a
+            # HEAD advance it could not diff, and Git's current dirty and
+            # untracked paths -- fall through to the content-hash comparison
+            # below instead, which reuses stored generations byte-for-byte.
             state.unchanged += 1
             return
 
@@ -1235,6 +1400,9 @@ class Indexer:
         force: bool,
         passage_embedder: PassageEmbedder,
         progress: ProgressPublisher,
+        verify_paths: frozenset[str] = frozenset(),
+        verify_all: bool = False,
+        guard: _GitGuard | None = None,
     ) -> IndexReport:
         timer = _PhaseTimer()
         with timer.measure("scan"):
@@ -1284,6 +1452,8 @@ class Indexer:
                     timer=timer,
                     process=process,
                     state=state,
+                    verify_paths=verify_paths,
+                    verify_all=verify_all,
                 )
 
             self._flush_pending(
@@ -1311,6 +1481,9 @@ class Indexer:
                 force=True,
             )
             with timer.measure("commit"):
+                # The staged rows describe the checkout the guard captured
+                # before scanning; publish them only if it still does.
+                self._verify_git_guard(project, partition, guard)
                 for path, record in existing.items():
                     if path not in state.current_paths:
                         self._staging_job(project, state).mark_removed(record.file_id)

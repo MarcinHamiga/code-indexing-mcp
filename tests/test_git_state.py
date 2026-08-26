@@ -15,6 +15,7 @@ from code_indexing_mcp.git_state import (
     GitUnavailable,
     SelectorKind,
     WorktreeStatus,
+    changed_paths_between,
     partition_id,
     probe_git_state,
     slot_id,
@@ -364,3 +365,48 @@ def test_partition_ids_are_opaque_and_path_safe(tmp_path: Path) -> None:
     assert "/" not in partition
     assert partition_id(slot) == partition
     assert partition_id(slot_id("project-b", probe_git_state(root))) != partition
+
+
+def test_changed_paths_between_lists_tracked_changes(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    first = _head_oid(root)
+    (root / "main.py").write_text("value = 2\n")
+    (root / "added.py").write_text("value = 3\n")
+    _commit_all(root, "second")
+    second = _head_oid(root)
+
+    assert changed_paths_between(root, first, second) == frozenset({"main.py", "added.py"})
+    # Identical OIDs describe no change at all, not an unknown answer.
+    assert changed_paths_between(root, second, second) == frozenset()
+
+
+def test_changed_paths_between_re_roots_onto_a_registered_subdirectory(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    (root / "sub").mkdir()
+    (root / "sub" / "util.py").write_text("value = 1\n")
+    (root / "other.py").write_text("value = 1\n")
+    _commit_all(root, "first")
+    first = _head_oid(root)
+    (root / "sub" / "util.py").write_text("value = 2\n")
+    (root / "other.py").write_text("value = 2\n")
+    _commit_all(root, "second")
+    second = _head_oid(root)
+
+    changed = changed_paths_between(root / "sub", first, second, project_prefix="sub")
+
+    # Git prints repository-root-relative paths; a project registered inside
+    # sub/ must see its own subtree re-rooted, and only its own subtree.
+    assert changed == frozenset({"util.py"})
+
+
+def test_changed_paths_between_returns_none_when_the_diff_cannot_run(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+
+    assert changed_paths_between(plain, "0" * 40, "1" * 40) is None
+
+
+def test_changed_paths_between_returns_none_for_unreachable_commits(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+
+    assert changed_paths_between(root, "0" * 40, "1" * 40) is None

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pyarrow as pa
 import pytest
+from conftest import run_git
 from filelock import FileLock
 from lancedb.table import LanceTable
 from test_token_batching import fake_encode
@@ -26,7 +27,13 @@ from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.history import HistoryStore
 from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
-from code_indexing_mcp.models import ExtractedChunk, ExtractionResult, StoredFile
+from code_indexing_mcp.models import (
+    ExtractedChunk,
+    ExtractionResult,
+    IndexProgress,
+    ProjectInfo,
+    StoredFile,
+)
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner, _GitEnumerationError
 from code_indexing_mcp.storage import LanceStore, _quoted
@@ -1936,3 +1943,178 @@ def test_rebuild_backfill_reports_unparseable_files_as_incomplete(tmp_path: Path
 
     assert report.files_current == 1
     assert report.incomplete_paths == ["broken.py"]
+
+
+def _git_commit(root: Path, message: str) -> None:
+    run_git("add", "-A", cwd=root)
+    run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", message, cwd=root)
+
+
+def _git_head(root: Path) -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    )
+    return completed.stdout.strip()
+
+
+def _write_with_pinned_mtime(path: Path, content: str) -> None:
+    """Overwrite *path* while restoring its previous timestamps.
+
+    Captures size and mtime *before* the write so a same-length edit is
+    invisible to a metadata walk and only the validation plan can catch it.
+    The content lands through a sibling temp file: an in-place rewrite keeps
+    the NTFS creation time -- git's ctime stand-in on Windows -- unchanged,
+    so git's stat cache would trust the pinned size and mtime and report the
+    working tree clean. The replacement's fresh identity forces a re-hash on
+    every platform while the restored timestamps stay invisible to the scan.
+    """
+    stat = path.stat()
+    replacement = path.with_name(f"{path.name}.pinned")
+    replacement.write_text(content)
+    os.replace(replacement, path)
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+
+def _git_project(tmp_path: Path) -> tuple[Path, ProjectInfo]:
+    root = tmp_path / "repo"
+    root.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(root))
+    (root / "main.py").write_text("def one():\n    return 1\n")
+    (root / "other.py").write_text("def two():\n    return 2\n")
+    _git_commit(root, "init")
+    return root, initialize_project(root)
+
+
+def test_a_commit_revalidates_only_the_paths_the_diff_names(tmp_path: Path) -> None:
+    root, project = _git_project(tmp_path)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    indexer.index(project)
+    batches_after_first = len(embedder.passage_batches)
+
+    # Same-length content change plus a pinned mtime: neither size nor mtime
+    # can reveal it, so only the commit-to-commit diff names main.py.
+    _write_with_pinned_mtime(root / "main.py", "def one():\n    return 2\n")
+    _git_commit(root, "second")
+
+    report = indexer.index(project)
+
+    assert report.indexed_files == 1
+    assert report.unchanged_files == 1
+    assert len(embedder.passage_batches) == batches_after_first + 1
+    assert "return 2" in embedder.passage_batches[-1][-1]
+    partition = store.active_partition(project.id)
+    slot = store.get_slot(partition.slot_id)
+    assert slot is not None
+    assert slot.indexed_head == _git_head(root)
+
+
+def test_a_dirty_tracked_file_with_a_pinned_mtime_is_revalidated(tmp_path: Path) -> None:
+    root, project = _git_project(tmp_path)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    indexer.index(project)
+    first_head = _git_head(root)
+
+    _write_with_pinned_mtime(root / "main.py", "def one():\n    return 3\n")
+
+    report = indexer.index(project)
+
+    assert report.indexed_files == 1
+    assert report.unchanged_files == 1
+    slot = store.get_slot(store.active_partition(project.id).slot_id)
+    assert slot is not None
+    assert slot.indexed_head == first_head
+    assert slot.indexed_clean is False
+
+
+def test_an_untracked_file_with_a_pinned_mtime_is_revalidated(tmp_path: Path) -> None:
+    root, project = _git_project(tmp_path)
+    embedder = RecordingEmbedder()
+    indexer, _store = make_indexer(tmp_path, embedder)
+    (root / "extra.py").write_text("def three():\n    return 3\n")
+    indexer.index(project)
+
+    _write_with_pinned_mtime(root / "extra.py", "def three():\n    return 4\n")
+
+    report = indexer.index(project)
+
+    assert report.indexed_files == 1
+    assert report.unchanged_files == 2
+    assert "return 4" in embedder.passage_batches[-1][-1]
+
+
+def test_a_branch_moved_before_indexing_raises_without_scanning(tmp_path: Path) -> None:
+    root, project = _git_project(tmp_path)
+    run_git("checkout", "-qb", "feature", cwd=root)
+    run_git("checkout", "-q", "main", cwd=root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    store.upsert_project(project, model_id="test/code", state="pending")
+    partition = store.active_partition(project.id)
+
+    run_git("checkout", "-q", "feature", cwd=root)
+    with (
+        patch.object(
+            indexer.scanner, "iter_scan", side_effect=AssertionError("the scan must not start")
+        ) as scan,
+        pytest.raises(CodeIndexingError) as excinfo,
+    ):
+        indexer.index(project, partition=partition)
+
+    scan.assert_not_called()
+    assert excinfo.value.code is ErrorCode.REPOSITORY_CHANGED
+    assert excinfo.value.details["project"] == project.id
+
+
+def test_a_branch_switch_during_the_scan_discards_the_staged_run(tmp_path: Path) -> None:
+    root, project = _git_project(tmp_path)
+    run_git("checkout", "-qb", "feature", cwd=root)
+    run_git("checkout", "-q", "main", cwd=root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    store.upsert_project(project, model_id="test/code", state="pending")
+    partition = store.active_partition(project.id)
+    original_scan = indexer.scanner.iter_scan
+
+    def switching_scan(
+        scan_project: ProjectInfo,
+        known_files: dict[str, StoredFile] | None = None,
+        **kwargs: bool,
+    ):
+        stream = original_scan(scan_project, known_files, **kwargs)
+        for index, item in enumerate(stream):
+            if index == 0:
+                run_git("checkout", "-q", "feature", cwd=root)
+            yield item
+
+    with (
+        patch.object(indexer.scanner, "iter_scan", switching_scan),
+        pytest.raises(CodeIndexingError) as excinfo,
+    ):
+        indexer.index(project, partition=partition)
+
+    assert excinfo.value.code is ErrorCode.REPOSITORY_CHANGED
+    # No staged row survived into the moved-from slot, the slot is not stuck
+    # in "indexing", and no journal remains for recovery to trip over.
+    assert store.list_files(project.id, partition_id=partition.partition_id) == []
+    slot = store.get_slot(partition.slot_id)
+    assert slot is not None
+    assert slot.state == "pending"
+    assert list((tmp_path / "staging").rglob("job-*")) == []
+    # The moved-to branch keeps its own untouched pending slot.
+    active = store.active_partition(project.id)
+    assert slot.partition_id != active.partition_id
+
+
+def test_progress_publishes_the_slot_identity(tmp_path: Path) -> None:
+    root, project = _git_project(tmp_path)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    snapshots: list[IndexProgress] = []
+
+    indexer.index(project, on_progress=snapshots.append)
+
+    partition = store.active_partition(project.id)
+    assert snapshots
+    assert {item.slot_id for item in snapshots} == {partition.slot_id}
+    assert {item.activation_epoch for item in snapshots} == {partition.activation_epoch}
+    assert snapshots[0].selector == "ref:refs/heads/main"
+    assert snapshots[0].expected_head == _git_head(root)
