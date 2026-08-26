@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 from conftest import run_git
-from test_indexing import _remove_reference_generation
+from test_indexing import _remove_reference_generation, _write_with_pinned_mtime
 
 from code_indexing_mcp.accelerator_env import (
     RECORD_FILENAME,
@@ -2039,8 +2039,6 @@ def test_a_commit_with_a_hidden_content_change_marks_the_slot_stale(
     indexed at a different HEAD of the same branch reports stale until an
     index run validates the commit-to-commit diff.
     """
-    import os
-
     root = tmp_path / "repo"
     root.mkdir()
     run_git("init", "-q", "--initial-branch", "main", str(root))
@@ -2056,9 +2054,7 @@ def test_a_commit_with_a_hidden_content_change_marks_the_slot_stale(
     app.index_project(project.id)
     assert app.project_status(project.id).state == "ready"
 
-    stat = (root / "main.py").stat()
-    (root / "main.py").write_text("def one():\n    return 2\n")
-    os.utime(root / "main.py", ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    _write_with_pinned_mtime(root / "main.py", "def one():\n    return 2\n")
     run_git("add", "main.py", cwd=root)
     run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "second", cwd=root)
 

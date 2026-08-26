@@ -1962,9 +1962,16 @@ def _write_with_pinned_mtime(path: Path, content: str) -> None:
 
     Captures size and mtime *before* the write so a same-length edit is
     invisible to a metadata walk and only the validation plan can catch it.
+    The content lands through a sibling temp file: an in-place rewrite keeps
+    the NTFS creation time -- git's ctime stand-in on Windows -- unchanged,
+    so git's stat cache would trust the pinned size and mtime and report the
+    working tree clean. The replacement's fresh identity forces a re-hash on
+    every platform while the restored timestamps stay invisible to the scan.
     """
     stat = path.stat()
-    path.write_text(content)
+    replacement = path.with_name(f"{path.name}.pinned")
+    replacement.write_text(content)
+    os.replace(replacement, path)
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 
 

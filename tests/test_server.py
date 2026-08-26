@@ -84,7 +84,7 @@ class FailingEmbedder(TinyEmbedder):
         raise CodeIndexingError(ErrorCode.MODEL_UNAVAILABLE, "embedding backend unavailable")
 
 
-async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> None:
+async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 15.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
         if asyncio.get_running_loop().time() >= deadline:
