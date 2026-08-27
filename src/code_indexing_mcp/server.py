@@ -869,8 +869,10 @@ def create_server(
         description=(
             "Incrementally index a project: scan for supported source files, parse changed files "
             "with Tree-sitter, embed their chunks, and commit them. Files whose size, mtime, and "
-            "content hash are unchanged are skipped without being re-read. Returns per-phase "
-            "counts and durations plus any per-file errors. Indexes supported source files, "
+            "content hash are unchanged are skipped without being re-read; a selector switch "
+            "indexes the newly active slot, and returning to a clean cached slot at "
+            "the same HEAD costs no scan at all. Returns per-phase counts and durations plus any "
+            "per-file errors. Indexes supported source files in the checked-out working tree, "
             "skipping symlinks, binaries, and files over 1 MiB."
         ),
         annotations=_WRITES,
@@ -920,10 +922,13 @@ def create_server(
         title="Project status",
         description=(
             "Report one project's index state — pending, indexing, ready, partial, stale, "
-            "rebuild_required, or error — with its indexed file count and chunk count. Compares "
-            "eligible source metadata with the index but does not rebuild it; index_project does "
-            "that, including rebuilding a rebuild_required partition. A root that is not "
-            "registered yet is registered first, which writes its .ci-mcp/project.toml marker."
+            "rebuild_required, or error — with its indexed file count and chunk count, plus the "
+            "active index slot's Git selector, HEAD, probe outcome, clean state, slot id, and "
+            "whether the active slot still needs a build. Compares eligible source metadata "
+            "with the index but does not rebuild it; index_project does that, "
+            "including rebuilding a rebuild_required partition. A root that is not registered "
+            "yet is registered first, "
+            "which writes its .ci-mcp/project.toml marker."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -1045,9 +1050,11 @@ def create_server(
             "Read-only storage statistics for one project or the whole installation — current "
             "table versions, row counts, Lance-reported logical bytes, filesystem-reported "
             "physical bytes, fragment and retained-version counts, index coverage, and an "
-            "installation total — plus advisory warnings for overlapping registered roots and "
-            "Git worktrees that share one repository. Never mutates the index: a registered "
-            "project with no partition reports zeroed tables instead of materializing one."
+            "installation total — plus every retained index slot with its selector, active "
+            "flag, state, indexed HEAD, last-use timestamp, and physical bytes, and advisory "
+            "warnings for overlapping registered roots and Git worktrees that share one "
+            "repository. Never mutates the index: a registered project with no partition "
+            "reports zeroed tables instead of materializing one."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -1149,7 +1156,8 @@ def create_server(
     @mcp.tool(
         title="Search code",
         description=(
-            "Hybrid semantic and keyword search over indexed code chunks. Returns hits ranked by "
+            "Hybrid semantic and keyword search over indexed code chunks, resolved against the "
+            "active index slot before anything is read. Returns hits ranked by "
             "relevance, each with a code snippet, file path, line range, and a chunk_id that "
             "get_chunk expands to the full text. Searches indexed source only — not commit "
             "history, not comments in unindexed files, and not files excluded by .gitignore or "
@@ -1491,9 +1499,10 @@ def create_server(
         title="Get chunk",
         description=(
             "Fetch one indexed chunk's full stored text by the chunk_id returned from search_code "
-            "or find_symbol, with its path, symbol, and line range. Chunk ids are content-derived "
-            "and change when the file is re-indexed, so a stale id returns CHUNK_NOT_FOUND rather "
-            "than the wrong code."
+            "or find_symbol, with its path, symbol, and line range. Resolved against the active "
+            "index slot: chunk ids are content-derived and change when the file is re-indexed, "
+            "and a selector switch makes the previous slot's chunks unavailable through this "
+            "lookup, so a stale id returns CHUNK_NOT_FOUND rather than the wrong code."
         ),
         annotations=_READ_ONLY,
     )
