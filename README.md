@@ -403,7 +403,7 @@ already registered projects; discovering a new project requires a root or `init_
 
 `project_status` performs the same metadata comparison without rebuilding and reports `stale` when
 a stored `ready` or `partial` index has drifted from the source tree. Every project-scoped
-operation resolves the checkout's active branch slot before touching the index — see
+operation resolves the checkout's active index slot before touching the index — see
 [Branch-aware indexing](#branch-aware-indexing).
 
 Two things can make an automatic refresh wait: another root queued ahead of it in the same session,
@@ -491,11 +491,12 @@ want (`**/*.cs`, `**/*.gd`, `**/*.gdshader`, `**/*.tscn`, `**/*.tres`, `**/*.sql
 
 ## Branch-aware indexing
 
-Only the checked-out working tree is ever indexed. Nothing reads branches or commits out of Git's
-object database, so a ref that is not checked out cannot be indexed; a branch becomes visible the
-moment Git switches the working tree to it.
+Only the checked-out working tree is ever indexed. Git metadata and commit objects may be consulted
+to identify the active selector and changed paths, but content from a ref that is not checked out
+is never indexed; a branch or detached commit becomes visible when Git switches the working tree
+to it.
 
-Each registered Git checkout owns one *index slot* per branch, and every project-scoped operation
+Each registered checkout retains index slots keyed by the resolved selector, and every project-scoped operation
 resolves the active slot before it reads or writes storage:
 
 - An attached or unborn branch selects its slot by the full symbolic ref, such as
@@ -510,7 +511,7 @@ resolves the active slot before it reads or writes storage:
   registered inside a subdirectory of the worktree keys its slots by that prefix as well.
 
 The slot is a separate physical Lance partition, and activation is cheap. Switching back to a
-branch whose slot is cached and was indexed at exactly the current HEAD of a clean checkout is
+selector whose slot is cached and was indexed at exactly the current HEAD of a clean checkout is
 immediate: no source scan, no parsing, no embedding. Commits, dirty files, untracked files, and
 resets reuse the same slot and validate it incrementally:
 
@@ -525,14 +526,14 @@ resets reuse the same slot and validate it incrementally:
 
 Each index mode handles a switch within its existing rules:
 
-- Lazy mode activates an unseen branch as a pending, empty slot, and the first project-scoped
+- Lazy mode activates an unseen selector as a pending, empty slot, and the first project-scoped
   query builds it and waits — reporting progress while it does. A pending slot never falls back to
-  or serves results from the previously active branch.
-- Eager mode treats a branch transition as a change even when filesystem watcher events were
+  or serves results from the previously active selector.
+- Eager mode treats a selector transition as a change even when filesystem watcher events were
   coalesced or missed, because status compares the slot's indexed HEAD with the checkout's HEAD.
-- Manual mode exposes the pending or stale same-branch slot through `project_status` without
-  automatically indexing it. Direct searches can read a stale same-branch slot, never a different
-  branch's slot.
+- Manual mode exposes the pending or stale same-selector slot through `project_status` without
+  automatically indexing it. Direct searches can read a stale active-selector slot, never a
+  different selector's slot.
 
 A switch while work is in flight is detected, not guessed through: an index run captures the Git
 selector and HEAD before scanning and verifies both before committing, discarding staged rows and
@@ -550,15 +551,15 @@ export CODE_INDEXING_BRANCH_CACHE_LIMIT=4   # per project, 1–32; counts the ac
 Eviction runs during storage maintenance (the scheduled daily pass or an explicit
 `index_storage_maintenance`), ordered by last use. It never removes the active slot, a slot being
 indexed, or a slot with pending crash recovery, so the durable slot count can temporarily exceed
-the limit — a failed first build does not destroy a usable cached branch. `remove_project` deletes
+the limit — a failed first build does not destroy a usable cached slot. `remove_project` deletes
 every slot, partition, and pointer of the project while leaving the local marker.
 
 An installation from before branch awareness migrates conservatively: a non-Git registration
 adopts its existing partition as the workspace slot and keeps working without a rebuild, while a
-Git registration keeps the old partition as an unscoped legacy slot that no branch selector
-serves, so the first query on any branch performs one fresh build into that branch's own slot.
+Git registration keeps the old partition as an unscoped legacy slot that no selector serves, so
+the first query on any selector performs one fresh build into that selector's own slot.
 
-`project_status` reports the active branch and slot (abridged):
+`project_status` reports the active selector and slot (abridged):
 
 ```console
 $ code-indexing-mcp status
