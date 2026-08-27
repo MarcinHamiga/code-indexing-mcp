@@ -450,7 +450,7 @@ def test_cursor_switch_is_stale_before_declaration_lookup(tmp_path: Path) -> Non
         }
     )
     service.store.upsert_slot(pending)
-    epoch = service.store.activate_slot(project_id, pending.slot_id)
+    epoch = service.store.activate_slot(project_id, pending.slot_id, checkout_key="checkout")
     partition = PartitionRef(project_id, pending.slot_id, pending.partition_id, epoch)
 
     with pytest.raises(CodeIndexingError) as excinfo:

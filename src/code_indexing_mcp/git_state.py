@@ -19,7 +19,7 @@ from pathlib import Path
 from .models import FrozenModel
 
 GIT_TIMEOUT_SECONDS = 5.0
-SLOT_KEY_VERSION = "git-slot-v1"
+SLOT_KEY_VERSION = "git-slot-v2"
 _SLOT_PARTITION_PREFIX = "slot-"
 _SLOT_PARTITION_HEX_CHARS = 32
 
@@ -205,24 +205,39 @@ def probe_git_state(
     )
 
 
-def slot_key(project_id: str, state: GitState) -> tuple[str, str, str, str, str, str, str]:
+def slot_key(project_id: str, state: GitState) -> tuple[str, str, str, str, str, str]:
     """Return the identity tuple of the physical index slot for *state*.
 
     Deliberately excludes the mutable properties of one checkout: the HEAD
     OID, dirty state, dirty paths, scan configuration, model, and schema
-    version. A branch therefore keeps one slot across commits and local
-    edits, while a rename, a detached OID, or a different checkout selects a
+    version. It also excludes ``checkout_identity``: a slot names one branch
+    of one repository subtree, so every worktree of that repository that has
+    the branch checked out maps to -- and keeps working on -- the same slot.
+    A rename, a detached OID, or a different repository still selects a
     different slot.
     """
     return (
         SLOT_KEY_VERSION,
         project_id,
         state.repository_identity or "",
-        state.checkout_identity or "",
         state.project_prefix,
         state.selector_kind.value,
         state.selector_value,
     )
+
+
+def checkout_key(state: GitState) -> str:
+    """Return the stable per-checkout identity behind *state*.
+
+    Active-slot pointers are keyed by checkout, not by project: two worktrees
+    of one project must be able to keep two different slots active at the
+    same time. A Git probe names its checkout by the private git directory;
+    degraded and non-Git probes carry their resolved root path as the
+    workspace selector value, which is the checkout then.
+    """
+    if state.checkout_identity:
+        return state.checkout_identity
+    return state.selector_value
 
 
 def slot_id(project_id: str, state: GitState) -> str:

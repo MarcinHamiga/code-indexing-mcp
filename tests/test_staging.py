@@ -731,7 +731,7 @@ def test_recovery_of_an_inactive_slot_never_changes_the_active_pointer(tmp_path:
         }
     )
     store.upsert_slot(other)
-    epoch = store.activate_slot(project.id, other.slot_id)
+    epoch = store.activate_slot(project.id, other.slot_id, checkout_key="other-checkout")
     store.replace_files_from_arrow(
         project.id,
         files=job.files_table(),

@@ -234,7 +234,19 @@ class ExternalInterpreterLauncher:
         try:
             _write_handshake(popen, channel.handshake_payload(self._target))
         except OSError as exc:
+            # A broken pipe while handing over the details usually means the
+            # child died before it could even dial back -- the same fault the
+            # wait below names, and it must be named the same way: a broken
+            # environment is reported, not retried.
+            exit_code = popen.poll()
             _reap(popen)
+            if exit_code is not None:
+                raise CodeIndexingError(
+                    ErrorCode.BACKEND_UNAVAILABLE,
+                    f"The accelerator worker exited with status {exit_code} before it "
+                    "could be reached; its environment is most likely incomplete",
+                    exit_code=exit_code,
+                ) from exc
             raise CodeIndexingError(
                 ErrorCode.EMBEDDING_WORKER_FAILED,
                 f"Could not hand the accelerator worker its connection details: {exc}",

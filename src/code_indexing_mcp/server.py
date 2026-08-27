@@ -566,32 +566,33 @@ async def _reporting_index_progress(
 
 
 async def _wait_for_startup_projects(
-    ctx: ServerContext, roots: list[Path], project_ids: list[str]
+    ctx: ServerContext, roots: list[Path], projects: list[ProjectInfo]
 ) -> None:
     coordinator = _coordinator(ctx)
     if coordinator is None:
         return
     if coordinator.mode is IndexMode.MANUAL:
         return
-    projects = await asyncio.gather(
-        *(
-            asyncio.to_thread(coordinator.application.resolve_project, project_id)
-            for project_id in project_ids
-        )
-    )
     # An explicit project or all_projects query can select registrations that
     # are not among the client's advertised roots. Freshen those too; otherwise
     # lazy mode would silently serve an old index for exactly those scopes.
+    # One entry per requested checkout: a merged multi-checkout search reads
+    # every requested slot, so every one of them is freshness-checked here,
+    # each against its own checkout root rather than the registration's
+    # canonical one.
     selected_roots = _unique_project_roots([*roots, *(project.root for project in projects)])
     statuses = await asyncio.gather(
         *(
-            asyncio.to_thread(coordinator.application.project_status, project.id)
+            asyncio.to_thread(
+                coordinator.application.project_status, project.id, roots=[project.root]
+            )
             for project in projects
         )
     )
     # A root the eager watcher has marked dirty is known-changed even if a
     # cached status check says otherwise, so it must be refreshed before the
-    # query is answered.
+    # query is answered. Dirtiness compares against every bound checkout root,
+    # not just the registration's canonical one.
     dirty_roots = set(coordinator._dirty_roots)
     refresh_roots = [
         project.root
@@ -601,7 +602,7 @@ async def _wait_for_startup_projects(
     ]
     await coordinator.schedule(refresh_roots, indexes=True, trigger="lazy-query")
     await coordinator.wait_for_discovery(selected_roots)
-    wanted = set(project_ids)
+    wanted = {project.id for project in projects}
     # A lazy query blocks on any refresh its selected scope needs. Report
     # progress so the client can distinguish a slow index from a hung tool call,
     # and so the wait shows how far along it is rather than just that it exists.
@@ -616,7 +617,7 @@ async def _wait_for_startup_projects(
     )
     logger.info("%s before serving the code query", message)
     async with _reporting_index_progress(
-        ctx, coordinator.application, project_ids, message=message
+        ctx, coordinator.application, sorted(wanted), message=message
     ) as stream:
         await coordinator.wait_for_ready(selected_roots, wanted)
     await stream.finish("Index ready")
@@ -781,14 +782,14 @@ def create_server(
     async def search_resolved_projects(
         ctx: ServerContext,
         query: str,
-        project_ids: list[str],
+        projects: list[ProjectInfo],
         roots: list[Path],
         languages: list[LanguageName] | None,
         paths: list[str] | None,
         kinds: list[ChunkKind] | None,
         limit: int,
     ) -> SearchResponse:
-        await _wait_for_startup_projects(ctx, roots, project_ids)
+        await _wait_for_startup_projects(ctx, roots, projects)
         # The service layer takes open list[str]; the closed Literal lists exist to
         # constrain the tool schema, and list invariance blocks passing them through.
         selected_languages: list[str] | None = list(languages) if languages else None
@@ -796,7 +797,7 @@ def create_server(
         return await asyncio.to_thread(
             app.search_code,
             query,
-            projects=project_ids,
+            projects=list(dict.fromkeys(project.id for project in projects)),
             all_projects=False,
             languages=selected_languages,
             paths=paths,
@@ -809,8 +810,11 @@ def create_server(
         title="Initialize project",
         description=(
             "Register a directory as an indexable project and write its local "
-            ".ci-mcp/project.toml marker, which holds a checkout-local id and the scan "
-            "configuration. Returns the project id, name, root, and scan settings. Building the "
+            ".ci-mcp/project.toml marker, which holds the shared project id and the scan "
+            "configuration. A Git worktree of an already-registered repository joins that "
+            "repository's registration -- its branches occupy slots inside the existing "
+            "project rather than forming a new one; pass force_new_id to deliberately split "
+            "it away. Returns the project id, name, root, and scan settings. Building the "
             "index is a separate operation (index_project). Re-running on an already-initialized "
             "directory returns the existing project unless force_new_id is set. A new "
             "registration whose root equals, contains, or is nested inside an existing "
@@ -923,12 +927,13 @@ def create_server(
         description=(
             "Report one project's index state — pending, indexing, ready, partial, stale, "
             "rebuild_required, or error — with its indexed file count and chunk count, plus the "
-            "active index slot's Git selector, HEAD, probe outcome, clean state, slot id, and "
-            "whether the active slot still needs a build. Compares eligible source metadata "
-            "with the index but does not rebuild it; index_project does that, "
+            "requesting checkout's active index slot's Git selector, HEAD, probe outcome, clean "
+            "state, slot id, and whether that slot still needs a build. Compares eligible source "
+            "metadata with the index but does not rebuild it; index_project does that, "
             "including rebuilding a rebuild_required partition. A root that is not registered "
-            "yet is registered first, "
-            "which writes its .ci-mcp/project.toml marker."
+            "yet is registered first, which writes its .ci-mcp/project.toml marker. For a "
+            "shared registration observed through a worktree, the status describes that "
+            "worktree's checkout and reports it as checkout_root."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -1052,9 +1057,11 @@ def create_server(
             "physical bytes, fragment and retained-version counts, index coverage, and an "
             "installation total — plus every retained index slot with its selector, active "
             "flag, state, indexed HEAD, last-use timestamp, and physical bytes, and advisory "
-            "warnings for overlapping registered roots and Git worktrees that share one "
-            "repository. Never mutates the index: a registered project with no partition "
-            "reports zeroed tables instead of materializing one."
+            "warnings for overlapping registered roots and for pre-worktree-support "
+            "registrations that still index one repository's worktrees as separate projects "
+            "(re-run init_project on the secondary root to unify them). Never mutates the "
+            "index: a registered project with no partition reports zeroed tables instead of "
+            "materializing one."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -1221,13 +1228,13 @@ def create_server(
         ] = 8,
     ) -> SearchResponse:
         roots = await _startup_roots(ctx, discover=True)
-        project_ids = await asyncio.to_thread(
-            app.resolve_search_scope, projects, all_projects, roots
+        checkouts = await asyncio.to_thread(
+            app.resolve_scope_checkouts, projects, all_projects, roots
         )
         return await search_resolved_projects(
             ctx,
             query,
-            project_ids,
+            checkouts,
             roots,
             languages,
             paths,
@@ -1295,8 +1302,8 @@ def create_server(
         ] = 8,
     ) -> SearchResponse:
         roots = await _startup_roots(ctx, discover=True)
-        resolved_ids = await asyncio.to_thread(app.resolve_search_scope, projects, False, roots)
-        project_ids = list(dict.fromkeys(resolved_ids))
+        checkouts = await asyncio.to_thread(app.resolve_scope_checkouts, projects, False, roots)
+        project_ids = list(dict.fromkeys(project.id for project in checkouts))
         if len(project_ids) < 2:
             raise CodeIndexingError(
                 ErrorCode.INVALID_FILTER,
@@ -1305,7 +1312,7 @@ def create_server(
         return await search_resolved_projects(
             ctx,
             query,
-            project_ids,
+            checkouts,
             roots,
             languages,
             paths,
@@ -1365,7 +1372,7 @@ def create_server(
     ) -> SymbolResponse:
         roots = await _startup_roots(ctx, discover=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
-        await _wait_for_startup_projects(ctx, roots, [resolved.id])
+        await _wait_for_startup_projects(ctx, roots, [resolved])
         selected_kinds: list[str] | None = list(kinds) if kinds else None
         return await asyncio.to_thread(
             app.find_symbol,
@@ -1492,7 +1499,7 @@ def create_server(
     ) -> OutlineResponse:
         roots = await _startup_roots(ctx, discover=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
-        await _wait_for_startup_projects(ctx, roots, [resolved.id])
+        await _wait_for_startup_projects(ctx, roots, [resolved])
         return await asyncio.to_thread(app.file_outline, path, resolved.id, roots=roots)
 
     @mcp.tool(

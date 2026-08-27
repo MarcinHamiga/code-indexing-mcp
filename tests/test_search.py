@@ -223,7 +223,7 @@ def test_explicit_active_slot_never_reads_an_inactive_chunk_partition(tmp_path: 
         }
     )
     store.upsert_slot(pending)
-    epoch = store.activate_slot(project_id, pending.slot_id)
+    epoch = store.activate_slot(project_id, pending.slot_id, checkout_key="checkout")
     partition = PartitionRef(project_id, pending.slot_id, pending.partition_id, epoch)
 
     response = search.search_code("permissions", [project_id], partitions={project_id: partition})

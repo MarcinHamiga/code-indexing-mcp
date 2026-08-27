@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -30,9 +30,21 @@ from lancedb.query import ColumnOrdering, FullTextOperator, MultiMatchQuery
 from lancedb.table import LanceTable
 
 from .errors import CodeIndexingError, ErrorCode
-from .git_state import GitProbeOutcome, GitState, probe_git_state
-from .git_state import partition_id as _git_partition_id
-from .git_state import slot_id as _git_slot_id
+from .git_state import (
+    GitProbeOutcome,
+    GitState,
+    SelectorKind,
+    probe_git_state,
+)
+from .git_state import (
+    checkout_key as _checkout_key,
+)
+from .git_state import (
+    partition_id as _git_partition_id,
+)
+from .git_state import (
+    slot_id as _git_slot_id,
+)
 from .models import (
     ChunkPreview,
     CodeChunk,
@@ -335,8 +347,9 @@ def worktree_warnings(
 
     Two roots whose ``--show-toplevel`` differs but whose Git common directory
     is the same are worktrees (or a main checkout and a worktree) of one
-    repository, which is a likely duplicate registration. All failures are
-    swallowed: this is advisory information only.
+    repository. Since registrations are now shared across a repository's
+    checkouts, such a pair means two pre-worktree-support registrations that
+    were never unified. All failures are swallowed: this is advisory only.
     """
     runner = _run or _run_git_quietly
     repositories: list[tuple[ProjectInfo, Path, Path]] = []
@@ -361,7 +374,10 @@ def worktree_warnings(
         ):
             warnings.append(
                 f"Projects {left.id!r} and {right.id!r} share Git common directory "
-                f"{left_common} from different checkouts (possible worktrees of one repository)"
+                f"{left_common} from different checkouts. Linked worktrees of one "
+                "repository now share one project registration; remove one of these "
+                f"registrations and re-run init_project on its root ({left_top} or "
+                f"{right_top}) to unify them."
             )
     return warnings
 
@@ -430,7 +446,13 @@ class PartitionRef:
 
 @dataclass(frozen=True)
 class ActiveIndexTarget:
-    """Immutable application-boundary selection for one index operation."""
+    """Immutable application-boundary selection for one index operation.
+
+    ``project.root`` names the checkout the request was resolved from -- the
+    worktree root, not the registered canonical root, whenever the request
+    arrived through a worktree's marker -- so every scan, probe, and guard
+    derived from the target observes that same checkout.
+    """
 
     project: ProjectInfo
     slot: ProjectSlot
@@ -469,6 +491,7 @@ class LanceStore:
         legacy_rows = self._migrate_v1(directory)
         directory.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(directory / "registry", read_consistency_interval=timedelta(0))
+        self._migrate_active_checkouts(directory / "registry")
         self._projects = self._table(self._db, "projects", self._project_schema())
         self._project_slots = self._table(self._db, "project_slots", self._project_slot_schema())
         self._active_slots = self._table(self._db, "active_slots", self._active_slot_schema())
@@ -493,15 +516,21 @@ class LanceStore:
             registered_root = Path(str(existing[0]["root"])).resolve()
             incoming_root = project.root.resolve()
             same_root = same_project_root(registered_root, incoming_root)
-            if not same_root and existing_marker_path(registered_root) is not None:
-                raise CodeIndexingError(
-                    ErrorCode.PROJECT_ID_CONFLICT,
-                    "The project ID is already active at another path",
-                    project=project.id,
-                    registered_root=str(registered_root),
-                    incoming_root=str(incoming_root),
-                )
             if same_root:
+                project = project.model_copy(update={"root": registered_root})
+            elif existing_marker_path(registered_root) is not None:
+                if not self._shares_repository(registered_root, incoming_root):
+                    raise CodeIndexingError(
+                        ErrorCode.PROJECT_ID_CONFLICT,
+                        "The project ID is already active at another path",
+                        project=project.id,
+                        registered_root=str(registered_root),
+                        incoming_root=str(incoming_root),
+                    )
+                # A checkout of the same repository -- a linked worktree --
+                # legally carries this registration id in its local marker.
+                # The canonical root stays whichever checkout registered
+                # first; only the marker's mutable payload flows through.
                 project = project.model_copy(update={"root": registered_root})
         if (
             existing
@@ -537,6 +566,25 @@ class LanceStore:
         ):
             return
         self._merge(self._projects, "id", [row])
+
+    def _shares_repository(self, left: Path, right: Path) -> bool:
+        """Return whether both paths are checkouts of one Git repository.
+
+        This is what makes a linked worktree's marker with the same project
+        id legal, while a plain directory copy (a different repository
+        identity) still conflicts. A degraded probe cannot verify anything
+        and deliberately counts as "not shared": fail closed.
+        """
+        if same_project_root(left, right):
+            return True
+        left_state = probe_git_state(left)
+        right_state = probe_git_state(right)
+        return (
+            left_state.probe is GitProbeOutcome.GIT
+            and right_state.probe is GitProbeOutcome.GIT
+            and bool(left_state.repository_identity)
+            and left_state.repository_identity == right_state.repository_identity
+        )
 
     def upsert_slot(self, slot: ProjectSlot) -> None:
         """Create or update one slot row, idempotently.
@@ -578,7 +626,12 @@ class LanceStore:
         *,
         project: ProjectInfo | None = None,
     ) -> None:
-        """Update one pinned slot without changing the active pointer."""
+        """Update one pinned slot without changing any active pointer.
+
+        ``project`` carries the checkout whose state is being stamped: a
+        shared slot can be indexed from any worktree of the repository, and
+        its HEAD/cleanliness stamp must describe the checkout that ran.
+        """
         slot = self.get_slot(partition.slot_id)
         if slot is None or slot.partition_id != partition.partition_id:
             return
@@ -605,14 +658,16 @@ class LanceStore:
                 updates["schema_version"] = int(rows[0]["schema_version"])
         self.upsert_slot(slot.model_copy(update=updates))
 
-    def activate_slot(self, project_id: str, slot_id: str) -> int:
-        """Point *project_id*'s single active pointer at *slot_id*.
+    def activate_slot(self, project_id: str, slot_id: str, *, checkout_key: str) -> int:
+        """Point *checkout_key*'s active pointer at *slot_id*.
 
-        The pointer is one row keyed by the project, so switching slots is a
-        single atomic upsert rather than two coordinated flag updates. It is
-        published only after the slot row exists, and every actual change
-        increments ``activation_epoch`` so long-lived handles can detect that
-        the selection moved under them. Returns the resulting epoch.
+        Pointers are keyed per checkout, not per project: two worktrees of
+        one project must be able to keep two different slots active at the
+        same time. A switch is a single atomic upsert rather than two
+        coordinated flag updates. It is published only after the slot row
+        exists, and every actual change increments ``activation_epoch`` so
+        long-lived handles can detect that the selection moved under them.
+        Returns the resulting epoch.
         """
         lock_directory = self.directory.parent / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
@@ -620,17 +675,21 @@ class LanceStore:
             slot = self.get_slot(slot_id)
             if slot is None or slot.project_id != project_id:
                 raise ValueError(f"cannot activate unknown slot {slot_id!r} for {project_id!r}")
-            rows = self._rows(self._active_slots, f"project_id = {_quoted(project_id)}")
+            rows = self._rows(
+                self._active_slots,
+                f"project_id = {_quoted(project_id)} AND checkout_key = {_quoted(checkout_key)}",
+            )
             if rows and str(rows[0]["slot_id"]) == slot_id:
                 return int(rows[0]["activation_epoch"])
             epoch = (int(rows[0]["activation_epoch"]) if rows else 0) + 1
             self._merge(
                 self._active_slots,
-                "project_id",
+                ["project_id", "checkout_key"],
                 [
                     {
                         "project_id": project_id,
                         "slot_id": slot_id,
+                        "checkout_key": checkout_key,
                         "activation_epoch": epoch,
                         "updated_at": time.time_ns(),
                     }
@@ -638,40 +697,85 @@ class LanceStore:
             )
             return epoch
 
-    def active_slot(self, project_id: str) -> ProjectSlot | None:
-        """Return the slot the project's active pointer selects, or None."""
+    def active_slots_for(self, project_id: str) -> list[ProjectSlot]:
+        """Return every checkout pointer's slot, one entry per live checkout."""
         rows = self._rows(self._active_slots, f"project_id = {_quoted(project_id)}")
-        if not rows:
+        slots: list[ProjectSlot] = []
+        seen: set[str] = set()
+        for row in rows:
+            slot_id = str(row["slot_id"])
+            if slot_id in seen:
+                continue
+            seen.add(slot_id)
+            slot = self.get_slot(slot_id)
+            # A pointer left behind by a removed slot row selects nothing.
+            if slot is not None and slot.project_id == project_id:
+                slots.append(slot)
+        return slots
+
+    def active_slot(
+        self, project_id: str, *, checkout_key: str | None = None
+    ) -> ProjectSlot | None:
+        """Return the slot *checkout_key*'s active pointer selects, or None.
+
+        Without an explicit key the project's freshest checkout-scoped pointer
+        wins, falling back to a pre-worktree empty-key pointer only when no
+        real one exists; callers that care about one checkout always pass its
+        key.
+        """
+        slot_row = self._selected_pointer_row(project_id, checkout_key)
+        if slot_row is None:
             return None
-        slot = self.get_slot(str(rows[0]["slot_id"]))
+        slot = self.get_slot(str(slot_row["slot_id"]))
         # A pointer left behind by a removed slot row selects nothing; the
         # caller's fallback (adoption, then the legacy identity) takes over.
         if slot is None or slot.project_id != project_id:
             return None
         return slot
 
-    def active_partition(self, project_id: str) -> PartitionRef:
-        """Resolve and pin the project's active physical partition."""
+    def _selected_pointer_row(
+        self, project_id: str, checkout_key: str | None
+    ) -> dict[str, Any] | None:
+        condition = f"project_id = {_quoted(project_id)}"
+        if checkout_key is not None:
+            condition += f" AND checkout_key = {_quoted(checkout_key)}"
+        rows = self._rows(self._active_slots, condition)
+        if not rows:
+            return None
+        if checkout_key is not None:
+            return rows[0]
+        keyed = [row for row in rows if str(row["checkout_key"])]
+        return max(keyed or rows, key=lambda row: int(row["updated_at"]))
+
+    def active_partition(self, project_id: str, *, checkout_key: str | None = None) -> PartitionRef:
+        """Resolve and pin an active physical partition for the project."""
         rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
         if not rows:
             raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {project_id}")
         project = ProjectInfo.model_validate_json(str(rows[0]["payload"]))
-        return self.resolve_partition(project, probe_git_state(project.root))
+        state = probe_git_state(project.root)
+        resolved_key = checkout_key if checkout_key is not None else _checkout_key(state)
+        return self.resolve_partition(project, state, resolved_key)
 
-    def resolve_partition(self, project: ProjectInfo, state: GitState) -> PartitionRef:
+    def resolve_partition(
+        self, project: ProjectInfo, state: GitState, checkout_key: str | None = None
+    ) -> PartitionRef:
         """Activate the slot selected by an already-probed Git state.
 
         The application owns probing so every lower layer uses the same
         immutable selector and HEAD snapshot. Workspace selectors are resolved
         for degraded probes too; a transient Git failure must never leave a
-        known branch partition active.
+        known branch partition active. The pointer that is moved belongs to
+        this checkout alone (*checkout_key*, derived from *state* when
+        omitted), so sibling worktrees keep their own selections.
         """
         self._ensure_adopted(project.id)
+        selected_key = checkout_key if checkout_key is not None else _checkout_key(state)
         rows = self._rows(self._projects, f"id = {_quoted(project.id)}")
         if not rows:
             raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {project.id}")
         desired = self._slot_for_git_state(rows[0], state)
-        active = self._active_partition_ref(project.id)
+        active = self._active_partition_ref(project.id, checkout_key=selected_key)
         existing = self.get_slot(desired.slot_id)
         if existing is None:
             desired = desired.model_copy(update={"state": "pending"})
@@ -688,8 +792,8 @@ class LanceStore:
             )
         self.upsert_slot(selected)
         if active is None or active.slot_id != selected.slot_id:
-            self.activate_slot(project.id, selected.slot_id)
-        active = self._active_partition_ref(project.id)
+            self.activate_slot(project.id, selected.slot_id, checkout_key=selected_key)
+        active = self._active_partition_ref(project.id, checkout_key=selected_key)
         if active is None:
             raise CodeIndexingError(
                 ErrorCode.PROJECT_NOT_FOUND,
@@ -698,18 +802,20 @@ class LanceStore:
         self.touch_slot(active.slot_id)
         return active
 
-    def _active_partition_ref(self, project_id: str) -> PartitionRef | None:
-        rows = self._rows(self._active_slots, f"project_id = {_quoted(project_id)}")
-        if not rows:
+    def _active_partition_ref(
+        self, project_id: str, *, checkout_key: str | None = None
+    ) -> PartitionRef | None:
+        slot_row = self._selected_pointer_row(project_id, checkout_key)
+        if slot_row is None:
             return None
-        slot = self.get_slot(str(rows[0]["slot_id"]))
+        slot = self.get_slot(str(slot_row["slot_id"]))
         if slot is None or slot.project_id != project_id:
             return None
         return PartitionRef(
             project_id=project_id,
             slot_id=slot.slot_id,
             partition_id=slot.partition_id,
-            activation_epoch=int(rows[0]["activation_epoch"]),
+            activation_epoch=int(slot_row["activation_epoch"]),
         )
 
     def _slot_for_git_state(self, row: dict[str, Any], state: GitState) -> ProjectSlot:
@@ -784,7 +890,9 @@ class LanceStore:
         pending adopts a pending slot and reads through it never materialise
         a partition.
         """
-        if self.active_slot(project_id) is not None:
+        if self._active_pointer_rows(project_id):
+            # Adopted already, or at least owned by a checkout pointer; either
+            # way there is nothing pre-slot left to adopt.
             return
         rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
         if not rows:
@@ -792,7 +900,7 @@ class LanceStore:
         row = rows[0]
         project = ProjectInfo.model_validate_json(str(row["payload"]))
         with self._adoption_lock:
-            if self.active_slot(project.id) is not None:
+            if self._active_pointer_rows(project.id):
                 return
             state = probe_git_state(Path(project.root))
             now = time.time_ns()
@@ -842,7 +950,7 @@ class LanceStore:
                     last_used_at=now,
                 )
             self.upsert_slot(slot)
-            self.activate_slot(project.id, slot.slot_id)
+            self.activate_slot(project.id, slot.slot_id, checkout_key=_checkout_key(state))
 
     @staticmethod
     def _scan_config_hash(project: ProjectInfo) -> str:
@@ -1486,8 +1594,14 @@ class LanceStore:
         condition: str | None,
         limit: int,
         *,
-        partition_ids: Mapping[str, str] | None = None,
+        partition_ids: Mapping[str, str | Sequence[str]] | None = None,
     ) -> list[dict[str, Any]]:
+        """Run the hybrid query across every pinned physical partition.
+
+        A project may pin several partitions -- one per live checkout of a
+        shared registration -- so each project's entry may be one partition id
+        or a sequence of them.
+        """
         ids = list(project_ids)
         if not ids:
             return []
@@ -1497,18 +1611,26 @@ class LanceStore:
         # merge rather than the sum of every partition. Results are reassembled
         # in request order so relevance-score ties break exactly as the
         # sequential implementation did.
+        tasks: list[tuple[str, str | None]] = []
+        for project_id in ids:
+            pinned = None if partition_ids is None else partition_ids[project_id]
+            if pinned is None or isinstance(pinned, str):
+                tasks.append((project_id, pinned))
+            else:
+                tasks.extend((project_id, partition_id) for partition_id in pinned)
         results: dict[int, list[dict[str, Any]]] = {}
-        if len(ids) == 1:
+        if len(tasks) == 1:
+            project_id, partition_id = tasks[0]
             results[0] = self._hybrid_search_rows(
-                ids[0],
+                project_id,
                 query_text,
                 vector,
                 condition,
                 limit,
-                partition_id=None if partition_ids is None else partition_ids[ids[0]],
+                partition_id=partition_id,
             )
         else:
-            workers = min(len(ids), _SEARCH_CONCURRENCY)
+            workers = min(len(tasks), _SEARCH_CONCURRENCY)
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
                     index: pool.submit(
@@ -1518,19 +1640,19 @@ class LanceStore:
                         vector,
                         condition,
                         limit,
-                        partition_id=(None if partition_ids is None else partition_ids[project_id]),
+                        partition_id=partition_id,
                     )
-                    for index, project_id in enumerate(ids)
+                    for index, (project_id, partition_id) in enumerate(tasks)
                 }
                 for index, future in futures.items():
                     results[index] = future.result()
-        rows = [row for index in range(len(ids)) for row in results.get(index, [])]
+        rows = [row for index in range(len(tasks)) for row in results.get(index, [])]
         rows.sort(key=lambda row: float(row.get("_relevance_score", 0.0)), reverse=True)
         return rows[:limit]
 
     @staticmethod
     def _validate_partition_mapping(
-        project_ids: Iterable[str], partition_ids: Mapping[str, str] | None
+        project_ids: Iterable[str], partition_ids: Mapping[str, Any] | None
     ) -> None:
         if partition_ids is None:
             return
@@ -1750,18 +1872,14 @@ class LanceStore:
         partition is left untouched (``False``) rather than materialized.
         """
         slots = self.list_slots(project_id)
-        active = self._active_partition_ref(project_id)
         limit = self.branch_cache_limit if branch_cache_limit is None else branch_cache_limit
         recovery_protected = set(protected_slot_ids)
-        protected = set(recovery_protected)
-        if active is not None:
-            protected.add(active.slot_id)
-        candidates = sorted(
-            (slot for slot in slots if slot.slot_id not in protected and slot.state != "indexing"),
-            key=lambda slot: (slot.last_used_at, slot.slot_id),
-        )
-        remove_count = max(0, len(slots) - limit)
-        for slot in candidates[:remove_count]:
+        # Every checkout pointer protects its slot: a worktree of this project
+        # may be holding another branch live while maintenance runs.
+        pointed = {str(row["slot_id"]) for row in self._active_pointer_rows(project_id)}
+        protected = recovery_protected | pointed
+
+        def evict(slot: ProjectSlot) -> None:
             with self._partition_access_physical(slot.partition_id):
                 self.remove_slot(slot.slot_id)
                 self._advance_partition_generation(slot.partition_id)
@@ -1774,7 +1892,28 @@ class LanceStore:
                 if generation.exists():
                     generation.unlink()
 
-        ran = False
+        # Branch slots keyed by an obsolete slot-key formula can never be
+        # claimed by any checkout again (they only survive from before an
+        # upgrade), so they are reclaimed first rather than competing with
+        # live slots for the retention budget.
+        stale_ids = self._stale_slot_ids(project_id, slots) - protected
+        stale = sorted(
+            (slot for slot in slots if slot.slot_id in stale_ids and slot.state != "indexing"),
+            key=lambda slot: (slot.last_used_at, slot.slot_id),
+        )
+        for slot in stale:
+            evict(slot)
+
+        remaining = [slot for slot in self.list_slots(project_id) if slot.slot_id not in protected]
+        candidates = sorted(
+            (slot for slot in remaining if slot.state != "indexing"),
+            key=lambda slot: (slot.last_used_at, slot.slot_id),
+        )
+        remove_count = max(0, len(remaining) - limit)
+        for slot in candidates[:remove_count]:
+            evict(slot)
+
+        ran = bool(stale) or bool(candidates[:remove_count])
         for slot in self.list_slots(project_id):
             if slot.slot_id in recovery_protected:
                 continue
@@ -1788,6 +1927,34 @@ class LanceStore:
                     tables.references.optimize(cleanup_older_than=cleanup_older_than)
             ran = True
         return ran or bool(slots)
+
+    def _active_pointer_rows(self, project_id: str) -> list[dict[str, Any]]:
+        return self._rows(self._active_slots, f"project_id = {_quoted(project_id)}")
+
+    def _stale_slot_ids(self, project_id: str, slots: list[ProjectSlot]) -> set[str]:
+        """Return branch/commit slots no current slot key can ever claim.
+
+        The slot-key formula is versioned; rows written before a formula
+        change keep their old identifiers. Selector kind, value, repository
+        identity, and prefix are all stored on the row, so the identity each
+        row *would* claim today is recomputable -- and a mismatch means the
+        row is unreachable by design, never merely out of date.
+        """
+        stale: set[str] = set()
+        branch_kinds = {SelectorKind.REF.value, SelectorKind.COMMIT.value}
+        for slot in slots:
+            if slot.selector_kind not in branch_kinds:
+                continue
+            synthetic = GitState(
+                probe=GitProbeOutcome.GIT,
+                selector_kind=SelectorKind(slot.selector_kind),
+                selector_value=slot.selector_value,
+                repository_identity=slot.repository_identity,
+                project_prefix=slot.project_prefix,
+            )
+            if _git_slot_id(project_id, synthetic) != slot.slot_id:
+                stale.add(slot.slot_id)
+        return stale
 
     def maintain_registry(self, *, cleanup_older_than: timedelta) -> None:
         """Compact and clean the project registry table."""
@@ -1874,6 +2041,12 @@ class LanceStore:
             [
                 ("project_id", pa.string()),
                 ("slot_id", pa.string()),
+                # One pointer per live checkout, not per project: two
+                # worktrees of one project keep their different slots active
+                # at the same time. Empty on rows written before worktree
+                # support; such rows stay addressable but no lookup reuses
+                # the empty key, so every checkout converges onto its own.
+                ("checkout_key", pa.string()),
                 ("activation_epoch", pa.int64()),
                 ("updated_at", pa.int64()),
             ]
@@ -1983,23 +2156,38 @@ class LanceStore:
     @contextmanager
     def partitions_access(
         self,
-        project_ids: Iterable[str] | Mapping[str, str | PartitionRef] | Iterable[PartitionRef],
+        project_ids: Iterable[str]
+        | Mapping[str, str | PartitionRef | Sequence[PartitionRef]]
+        | Iterable[PartitionRef],
     ) -> Iterator[None]:
-        """Hold the active partitions for logical projects in stable order."""
+        """Hold the pinned partitions of logical projects in stable order.
+
+        A project's mapping entry may be one partition or a sequence of them
+        (one per requested checkout of a shared registration); every distinct
+        physical partition is locked exactly once.
+        """
+        partition_ids: set[str] = set()
+
+        def collect(value: str | PartitionRef | Sequence[PartitionRef]) -> None:
+            if isinstance(value, PartitionRef):
+                partition_ids.add(value.partition_id)
+            elif isinstance(value, str):
+                partition_ids.add(value)
+            else:
+                for ref in value:
+                    partition_ids.add(ref.partition_id)
+
         if isinstance(project_ids, Mapping):
-            partition_ids = {
-                value.partition_id if isinstance(value, PartitionRef) else value
-                for value in project_ids.values()
-            }
+            for value in project_ids.values():
+                collect(value)
         else:
-            partition_ids = {
-                value.partition_id
-                if isinstance(value, PartitionRef)
-                else self._partition_id_for(value)
-                for value in project_ids
-            }
+            for value in project_ids:
+                if isinstance(value, PartitionRef):
+                    partition_ids.add(value.partition_id)
+                else:
+                    partition_ids.add(self._partition_id_for(value))
         with ExitStack() as stack:
-            for partition_id in sorted(set(partition_ids)):
+            for partition_id in sorted(partition_ids):
                 stack.enter_context(self._partition_access_physical(partition_id))
             yield
 
@@ -2146,7 +2334,11 @@ class LanceStore:
         return LanceStore._reference_schema()
 
     @staticmethod
-    def _merge(table: LanceTable, key: str, rows: list[dict[str, Any]] | pa.Table) -> None:
+    def _merge(
+        table: LanceTable,
+        key: str | Sequence[str],
+        rows: list[dict[str, Any]] | pa.Table,
+    ) -> None:
         (
             table.merge_insert(key)
             .when_matched_update_all()
@@ -2229,14 +2421,16 @@ class LanceStore:
         # not be conflated: report the failure explicitly and treat the
         # snapshot as unusable.
         open_failed = tables is None and partition_path.is_dir()
-        active_slot_id = active.slot_id if active is not None else None
+        # With per-checkout pointers a project can have several live slots at
+        # once (one worktree per branch), so "active" flags every pointed slot.
+        pointed = {str(row["slot_id"]) for row in self._active_pointer_rows(project.id)}
         slots = [
             SlotStorageStats(
                 slot_id=slot.slot_id,
                 partition_id=slot.partition_id,
                 selector_kind=slot.selector_kind,
                 selector_value=slot.selector_value,
-                active=slot.slot_id == active_slot_id,
+                active=slot.slot_id in pointed,
                 state=slot.state,
                 indexed_head=slot.indexed_head,
                 indexed_clean=slot.indexed_clean,
@@ -2439,3 +2633,38 @@ class LanceStore:
             backup = directory.with_name(f"{directory.name}-v1-backup-{time.time_ns()}")
             shutil.move(str(directory), str(backup))
             return rows
+
+    def _migrate_active_checkouts(self, registry_directory: Path) -> None:
+        """Add the per-checkout pointer key to a pre-worktree active_slots table.
+
+        The pre-worktree layout kept exactly one active pointer per project
+        and no ``checkout_key`` column. Existing rows are preserved verbatim
+        under the empty key: they keep such legacy installations readable,
+        while every real lookup filters on a concrete checkout identity (an
+        absolute git-directory or root path) and therefore re-activates its
+        own pointer on first touch.
+        """
+        lock_directory = registry_directory.parent.parent / "locks"
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        with FileLock(lock_directory / ".active-slots-migrate.lock"):
+            try:
+                existing = self._db.open_table("active_slots")
+            except (ValueError, FileNotFoundError):
+                return
+            if "checkout_key" in {field.name for field in existing.schema}:
+                return
+            rows = self._rows(cast(LanceTable, existing))
+            self._db.drop_table("active_slots")
+            fresh = self._table(self._db, "active_slots", self._active_slot_schema())
+            migrated = [
+                {
+                    "project_id": str(row["project_id"]),
+                    "slot_id": str(row["slot_id"]),
+                    "checkout_key": "",
+                    "activation_epoch": int(row["activation_epoch"]),
+                    "updated_at": int(row["updated_at"]),
+                }
+                for row in rows
+            ]
+            if migrated:
+                self._merge(fresh, ["project_id", "checkout_key"], migrated)
