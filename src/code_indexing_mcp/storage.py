@@ -1896,13 +1896,9 @@ class LanceStore:
         # claimed by any checkout again (they only survive from before an
         # upgrade), so they are reclaimed first rather than competing with
         # live slots for the retention budget.
+        stale_ids = self._stale_slot_ids(project_id, slots) - protected
         stale = sorted(
-            (
-                slot
-                for slot in slots
-                if slot.slot_id in self._stale_slot_ids(project_id, slots) - protected
-                and slot.state != "indexing"
-            ),
+            (slot for slot in slots if slot.slot_id in stale_ids and slot.state != "indexing"),
             key=lambda slot: (slot.last_used_at, slot.slot_id),
         )
         for slot in stale:

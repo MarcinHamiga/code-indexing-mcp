@@ -49,7 +49,7 @@ class SearchService:
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
         limit: int = 8,
-        partitions: Mapping[str, Sequence[PartitionRef]] | None = None,
+        partitions: Mapping[str, PartitionRef | Sequence[PartitionRef]] | None = None,
     ) -> SearchResponse:
         """Search every given project's pinned partitions and rank globally.
 
