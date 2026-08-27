@@ -388,6 +388,10 @@ class DaemonServer:
             return app.resolve_project(params["explicit"], roots)
         if method == "resolve_search_scope":
             return app.resolve_search_scope(params.get("projects"), params["all_projects"], roots)
+        if method == "resolve_scope_checkouts":
+            return app.resolve_scope_checkouts(
+                params.get("projects"), params["all_projects"], roots
+            )
         if method == "search_code":
             return app.search_code(roots=roots, **params)
         if method == "find_symbol":
@@ -644,6 +648,22 @@ class BrokerApplication:
                 roots=roots or [],
             )
         )
+
+    def resolve_scope_checkouts(
+        self,
+        projects: list[str] | None,
+        all_projects: bool,
+        roots: list[Path] | None = None,
+    ) -> list[ProjectInfo]:
+        return [
+            ProjectInfo.model_validate(item)
+            for item in self._call(
+                "resolve_scope_checkouts",
+                projects=projects,
+                all_projects=all_projects,
+                roots=roots or [],
+            )
+        ]
 
     def search_code(self, query: str, **params: Any) -> SearchResponse:
         return SearchResponse.model_validate(self._call("search_code", query=query, **params))

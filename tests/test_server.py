@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from conftest import run_git
 from filelock import FileLock
 from mcp import types
 from mcp.server.fastmcp.exceptions import ToolError
@@ -305,6 +306,93 @@ async def test_manual_mode_does_not_refresh_a_changed_source(tmp_path: Path) -> 
     assert not result.isError
     assert not app.find_symbol("after_change", project.id).hits
     assert app.find_symbol("before_change", project.id).hits
+
+
+@pytest.mark.asyncio
+async def test_lazy_merged_search_refreshes_every_requested_checkout(tmp_path: Path) -> None:
+    """A merged multi-checkout search freshness-checks each checkout's slot.
+
+    Both advertised roots carry markers of one shared registration. A change
+    in the canonical checkout must still be refreshed before the next merged
+    answer, even though the worktree's marker would otherwise win a
+    single-checkout binding.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(repo))
+    (repo / "main.py").write_text("def main_branch():\n    return 1\n")
+    run_git("add", "main.py", cwd=repo)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "main",
+        cwd=repo,
+    )
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(repo)
+    app.index_project(project.id)
+
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=repo)
+    (worktree / "wt.py").write_text("def worktree_branch():\n    return 2\n")
+    run_git("add", "wt.py", cwd=worktree)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "worktree commit",
+        cwd=worktree,
+    )
+    assert app.init_project(worktree).id == project.id
+    app.index_project(project.id, roots=[worktree])
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(
+            roots=[types.Root(uri=repo.as_uri()), types.Root(uri=worktree.as_uri())]
+        )
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        first = await client.call_tool("search_code", {"query": "return"})
+        assert not first.isError
+
+        # A commit changes the canonical checkout's HEAD, which no clean-answer
+        # cache may paper over: the fingerprint includes the HEAD OID.
+        (repo / "main.py").write_text("def after_change():\n    return 3\n")
+        run_git("add", "main.py", cwd=repo)
+        run_git(
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "user.name=Tests",
+            "commit",
+            "-qm",
+            "change main",
+            cwd=repo,
+        )
+        second = await client.call_tool("search_code", {"query": "after_change"})
+        assert not second.isError
+
+    symbols = {hit.symbol for hit in app.search_code("return", roots=[repo, worktree]).hits}
+    # The canonical checkout's slot was refreshed before the merged answer.
+    assert "after_change" in symbols
+    # The untouched worktree slot keeps serving its own checkout, still at the
+    # pre-commit HEAD. (main_branch is deduplicated against the refreshed
+    # main.py chunk: same project, path, and line range across two slots.)
+    assert "worktree_branch" in symbols
 
 
 @pytest.mark.asyncio

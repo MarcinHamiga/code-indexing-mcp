@@ -1953,6 +1953,20 @@ class Application:
             )
         )
 
+    def resolve_scope_checkouts(
+        self,
+        projects: list[str] | None,
+        all_projects: bool,
+        roots: list[Path] | None = None,
+    ) -> list[ProjectInfo]:
+        """Resolve every checkout behind a search scope, primary checkout first.
+
+        One entry per requested checkout, so freshness can be verified for
+        each slot a merged search will actually read instead of only the
+        primary checkout's.
+        """
+        return self._scope_checkouts(projects, all_projects, roots)
+
     def _scope_checkouts(
         self,
         projects: list[str] | None,
