@@ -248,8 +248,9 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_BRANCH_CACHE_LIMIT",
         "Maintenance",
         "Branch cache limit",
-        "How many per-branch index slots a project keeps, counting the active one, before the "
-        "least recently used is evicted; protected slots can exceed it temporarily.",
+        "How many branch index slots a project keeps, counting the active ones (one per "
+        "live checkout -- the main repository plus any worktrees), before the least recently "
+        "used is evicted; protected slots can exceed it temporarily.",
         "int",
         "4",
         minimum=1,

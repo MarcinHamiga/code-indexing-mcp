@@ -8,7 +8,7 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -76,6 +76,7 @@ from .projects import (
     ProjectResolver,
     existing_marker_path,
     find_project_root,
+    initialize_checkout,
     initialize_project,
     project_root_identity,
     read_project_marker,
@@ -279,7 +280,7 @@ class Application:
         self._runtime_fallback: BackendSelection | None = None
         # Negative freshness results, keyed by project id: the monotonic
         # deadline and the scan-config fingerprint the answer was computed for.
-        self._clean_freshness_until: dict[str, tuple[float, str]] = {}
+        self._clean_freshness_until: dict[tuple[str, str], tuple[float, str]] = {}
         self.embedding_batch_size = self.settings.embedding_batch_size
         self.batch_calibration = "explicit"
         if self.settings.embedding_batch_auto:
@@ -688,11 +689,72 @@ class Application:
                             existing_project=existing.id,
                             new_project=None if marker is None else marker.id,
                         )
-            project = initialize_project(root, name=name, force_new_id=force_new_id)
+            project = self._initialize_registration(resolved, name=name, force_new_id=force_new_id)
             self._register_project(project)
             self._resolve_active_target(project)
             self.invalidate_freshness(project.id)
         return project
+
+    def _initialize_registration(
+        self, root: Path, *, name: str | None, force_new_id: bool
+    ) -> ProjectInfo:
+        """Create or re-read the marker at *root*, joining shared registrations.
+
+        A checkout of an already-registered repository -- a linked worktree --
+        joins that repository's project instead of minting its own id: its
+        branches occupy slots inside the existing registration. A leftover
+        pre-worktree duplicate registration (its own id on a worktree marker)
+        folds into the surviving registration when explicitly initialized.
+        ``force_new_id`` deliberately splits away and skips both paths.
+        """
+        if force_new_id:
+            return initialize_project(root, name=name, force_new_id=True)
+        marker = read_project_marker(root) if existing_marker_path(root) is not None else None
+        shared = self._shared_registration(root)
+        if marker is not None:
+            if shared is not None and shared.id != marker.id:
+                # The marker still names a separate pre-worktree registration;
+                # unifying drops that registration together with its slots,
+                # which the slot-key upgrade has already invalidated.
+                self.store.remove_project(marker.id)
+                self.invalidate_freshness(marker.id)
+                logger.info(
+                    "Unified legacy worktree registration %s into %s (%s)",
+                    marker.id,
+                    shared.name,
+                    shared.id,
+                )
+                return initialize_checkout(root, shared, name=name)
+            return marker
+        if shared is not None:
+            return initialize_checkout(root, shared, name=name)
+        return initialize_project(root, name=name)
+
+    def _shared_registration(self, root: Path) -> ProjectInfo | None:
+        """Return the registered project *root*'s checkout already belongs to.
+
+        Sharing requires the same Git repository identity and the same
+        project prefix: two toplevel checkouts of one repository are one
+        project's checkouts, while a subdirectory registration scopes only
+        its own subtree even inside the same repository. Without a usable
+        Git identity nothing is ever shared.
+        """
+        state = probe_git_state(root)
+        if state.probe is not GitProbeOutcome.GIT:
+            return None
+        for project in self.store.list_projects():
+            registered = Path(project.root)
+            if same_project_root(registered, root):
+                continue
+            candidate = probe_git_state(registered)
+            if (
+                candidate.probe is GitProbeOutcome.GIT
+                and bool(candidate.repository_identity)
+                and candidate.repository_identity == state.repository_identity
+                and candidate.project_prefix == state.project_prefix
+            ):
+                return project
+        return None
 
     def discover_project(self, root: Path) -> ProjectInfo | None:
         """Find an initialized project or initialize a qualifying client root."""
@@ -706,7 +768,11 @@ class Application:
             else:
                 if not self._is_project_shaped(root):
                     return None
-                project = initialize_project(root)
+                shared = self._shared_registration(root)
+                if shared is not None:
+                    project = initialize_checkout(root, shared)
+                else:
+                    project = initialize_project(root)
             self._register_project(project)
             self._resolve_active_target(project)
             self.invalidate_freshness(project.id)
@@ -774,13 +840,40 @@ class Application:
             return activate()
 
     def _resolve_active_targets(
-        self, projects: list[ProjectInfo], *, include_status: bool = False
-    ) -> dict[str, ActiveIndexTarget]:
-        """Resolve targets in stable logical-project order to keep lock order fixed."""
-        return {
-            project.id: self._resolve_active_target(project, include_status=include_status)
-            for project in sorted(projects, key=lambda item: item.id)
-        }
+        self, projects: Sequence[ProjectInfo], *, include_status: bool = False
+    ) -> dict[str, list[ActiveIndexTarget]]:
+        """Resolve per-checkout targets keyed by project id, primary checkout first.
+
+        One shared registration may arrive through several live checkouts
+        (its main worktree and linked worktrees); each gets its own target so
+        a query can read every requested branch slot together. Sorting keeps
+        the logical-project lock order fixed while remaining stable within a
+        project, preserving the request's checkout order.
+        """
+        grouped: dict[str, list[ActiveIndexTarget]] = {}
+        seen: set[tuple[str, str]] = set()
+        for project in sorted(projects, key=lambda item: item.id):
+            key = (project.id, project_root_identity(project.root))
+            if key in seen:
+                continue
+            seen.add(key)
+            grouped.setdefault(project.id, []).append(
+                self._resolve_active_target(project, include_status=include_status)
+            )
+        return grouped
+
+    @staticmethod
+    def _primary_target(
+        targets: Mapping[str, Sequence[ActiveIndexTarget]], project_id: str
+    ) -> ActiveIndexTarget:
+        """Return the primary -- first requested -- checkout's target."""
+        checkouts = targets.get(project_id) or ()
+        if not checkouts:
+            raise CodeIndexingError(
+                ErrorCode.PROJECT_NOT_FOUND,
+                f"No active index slot was resolved for project {project_id}",
+            )
+        return checkouts[0]
 
     @staticmethod
     def _target_changed(target: ActiveIndexTarget) -> bool:
@@ -792,12 +885,12 @@ class Application:
 
     def _run_repository_stable_query(
         self,
-        projects: list[ProjectInfo],
-        operation: Callable[[Mapping[str, ActiveIndexTarget]], _Result],
+        projects: Sequence[ProjectInfo],
+        operation: Callable[[Mapping[str, Sequence[ActiveIndexTarget]]], _Result],
         *,
         include_status: bool = False,
     ) -> _Result:
-        """Retry one read when its checkout identity changes during execution."""
+        """Retry one read when any checkout's identity changes during execution."""
         for attempt in range(2):
             targets = self._resolve_active_targets(projects, include_status=include_status)
             error: Exception | None = None
@@ -807,7 +900,9 @@ class Application:
             except Exception as exc:
                 error = exc
             changed = [
-                project_id for project_id, target in targets.items() if self._target_changed(target)
+                project_id
+                for project_id, checkouts in sorted(targets.items())
+                if any(self._target_changed(target) for target in checkouts)
             ]
             if not changed:
                 if error is not None:
@@ -915,7 +1010,9 @@ class Application:
         resolved = self._resolve(project, roots)
         return self._run_repository_stable_query(
             [resolved],
-            lambda targets: self._project_status_for_target(targets[resolved.id]),
+            lambda targets: self._project_status_for_target(
+                self._primary_target(targets, resolved.id)
+            ),
             include_status=True,
         )
 
@@ -954,7 +1051,10 @@ class Application:
                 f"{partition.slot_id}:{partition.activation_epoch}:{git.head_oid}:"
                 f"{resolved.scan.model_dump_json()}"
             )
-            cached = self._clean_freshness_until.get(resolved.id)
+            # Keyed per slot, not per project: several worktrees share one
+            # registration id and must not thrash each other's cached answer.
+            cache_key = (resolved.id, partition.slot_id)
+            cached = self._clean_freshness_until.get(cache_key)
             if cached is not None and cached[1] == fingerprint and cached[0] > time.monotonic():
                 # A recent check found this exact slot, activation, HEAD, and
                 # scan configuration clean; do not walk the repository again
@@ -964,7 +1064,7 @@ class Application:
                 # A clean slot indexed at exactly this HEAD cannot be stale:
                 # the switch-back fast path, with no scanner, parser, or
                 # embedder work at all.
-                self._clean_freshness_until[resolved.id] = (
+                self._clean_freshness_until[cache_key] = (
                     time.monotonic() + FRESHNESS_CACHE_SECONDS,
                     fingerprint,
                 )
@@ -978,17 +1078,17 @@ class Application:
                 # change from any metadata walk, so only an index run that
                 # validates the diff can prove the slot current. Lazy and
                 # eager modes schedule exactly that run.
-                self._clean_freshness_until.pop(resolved.id, None)
+                self._clean_freshness_until.pop(cache_key, None)
                 state = "stale"
             elif self._project_is_stale(
                 resolved,
                 {record.path: record for record in files},
                 partition_id=partition.partition_id,
             ):
-                self._clean_freshness_until.pop(resolved.id, None)
+                self._clean_freshness_until.pop(cache_key, None)
                 state = "stale"
             else:
-                self._clean_freshness_until[resolved.id] = (
+                self._clean_freshness_until[cache_key] = (
                     time.monotonic() + FRESHNESS_CACHE_SECONDS,
                     fingerprint,
                 )
@@ -1019,6 +1119,7 @@ class Application:
                     and slot.indexed_head != git.head_oid
                 )
             ),
+            checkout_root=str(resolved.root),
         )
 
     def invalidate_freshness(self, project_id: str) -> None:
@@ -1028,7 +1129,8 @@ class Application:
         a completed index or reference backfill, removal -- and by eager-mode
         watchers the moment a file system event lands.
         """
-        self._clean_freshness_until.pop(project_id, None)
+        for key in [k for k in self._clean_freshness_until if k[0] == project_id]:
+            self._clean_freshness_until.pop(key, None)
 
     def index_history(
         self,
@@ -1071,13 +1173,13 @@ class Application:
         else:
             scope = registered
 
-        def collect(targets: Mapping[str, ActiveIndexTarget]) -> StorageStatus:
+        def collect(targets: Mapping[str, Sequence[ActiveIndexTarget]]) -> StorageStatus:
             snapshot_at = datetime.now(UTC).isoformat()
             registry_before = self.store.registry_stats()
             project_stats = [
                 self.store.storage_stats_for(
                     registered_project,
-                    partition_ref=targets[registered_project.id].partition,
+                    partition_ref=self._primary_target(targets, registered_project.id).partition,
                 )
                 for registered_project in scope
             ]
@@ -1160,7 +1262,9 @@ class Application:
                 try:
                     before = self.store.storage_stats_for(
                         registered_project,
-                        partition_ref=targets[registered_project.id].partition,
+                        partition_ref=self._primary_target(
+                            targets, registered_project.id
+                        ).partition,
                     )
                     estimate = _estimate_reclaimable(before)
                     if before.partition_open_failed:
@@ -1412,7 +1516,8 @@ class Application:
         return self._run_repository_stable_query(
             [resolved],
             lambda targets: self._project_is_stale(
-                resolved, partition_id=targets[resolved.id].partition_id
+                resolved,
+                partition_id=self._primary_target(targets, resolved.id).partition_id,
             ),
         )
 
@@ -1531,7 +1636,8 @@ class Application:
 
     def remove_project(self, project: str) -> RemovalReport:
         resolved = self._resolve(project, [])
-        self._clean_freshness_until.pop(resolved.id, None)
+        for key in [k for k in self._clean_freshness_until if k[0] == resolved.id]:
+            self._clean_freshness_until.pop(key, None)
         lock_directory = self.paths.data / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
         with (
@@ -1558,10 +1664,10 @@ class Application:
         limit: int = 8,
         roots: list[Path] | None = None,
     ) -> SearchResponse:
-        project_ids = self.resolve_search_scope(projects, all_projects, roots)
-        resolved = [self._resolve(project_id, roots) for project_id in project_ids]
+        resolved = self._scope_checkouts(projects, all_projects, roots)
+        project_ids = list(dict.fromkeys(project.id for project in resolved))
 
-        def search(targets: Mapping[str, ActiveIndexTarget]) -> SearchResponse:
+        def search(targets: Mapping[str, Sequence[ActiveIndexTarget]]) -> SearchResponse:
             self._ensure_query_generations(targets)
             return self.search.search_code(
                 query,
@@ -1571,7 +1677,8 @@ class Application:
                 kinds=kinds,
                 limit=limit,
                 partitions={
-                    project_id: targets[project_id].partition for project_id in project_ids
+                    project_id: [target.partition for target in targets.get(project_id, ())]
+                    for project_id in project_ids
                 },
             )
 
@@ -1595,7 +1702,7 @@ class Application:
             [resolved],
             lambda targets: self._find_symbol_for_target(
                 name,
-                targets[resolved.id],
+                self._primary_target(targets, resolved.id),
                 match=match,
                 kinds=kinds,
                 limit=limit,
@@ -1611,7 +1718,7 @@ class Application:
         kinds: list[str] | None,
         limit: int,
     ) -> SymbolResponse:
-        self._ensure_query_generations({target.project.id: target})
+        self._ensure_query_generations({target.project.id: [target]})
         return self.search.find_symbol(
             name,
             target.project.id,
@@ -1627,11 +1734,13 @@ class Application:
         resolved = self.resolve_project(project, roots)
         return self._run_repository_stable_query(
             [resolved],
-            lambda targets: self._file_outline_for_target(path, targets[resolved.id]),
+            lambda targets: self._file_outline_for_target(
+                path, self._primary_target(targets, resolved.id)
+            ),
         )
 
     def _file_outline_for_target(self, path: str, target: ActiveIndexTarget) -> OutlineResponse:
-        self._ensure_query_generations({target.project.id: target})
+        self._ensure_query_generations({target.project.id: [target]})
         return self.search.file_outline(path, target.project.id, partition=target.partition)
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
@@ -1641,11 +1750,13 @@ class Application:
         resolved = self._resolve(project_id, None)
         return self._run_repository_stable_query(
             [resolved],
-            lambda targets: self._get_chunk_for_target(chunk_id, targets[project_id]),
+            lambda targets: self._get_chunk_for_target(
+                chunk_id, self._primary_target(targets, project_id)
+            ),
         )
 
     def _get_chunk_for_target(self, chunk_id: str, target: ActiveIndexTarget) -> CodeChunk:
-        self._ensure_query_generations({target.project.id: target})
+        self._ensure_query_generations({target.project.id: [target]})
         return self.search.get_chunk(chunk_id, partition=target.partition)
 
     def _prepare_reference_query(
@@ -1664,28 +1775,28 @@ class Application:
                 raise AssertionError("get_chunk unexpectedly returned without a project id")
             if chunk_project_id != target.project.id:
                 raise ValueError("reference target does not own selector chunk")
-        self._ensure_query_generations({target.project.id: target})
+        self._ensure_query_generations({target.project.id: [target]})
         report = self.ensure_reference_index(target.project.id, _target=target)
         return selector, report, target.partition
 
-    def _ensure_query_generations(self, targets: Mapping[str, ActiveIndexTarget]) -> None:
+    def _ensure_query_generations(self, targets: Mapping[str, Sequence[ActiveIndexTarget]]) -> None:
         """Rebuild incompatible partitions before any query can observe them."""
         for project_id in sorted(targets):
-            target = targets[project_id]
-            if (
-                self.store.incompatibility_reason(
-                    project_id,
-                    self.embedder.model_id,
-                    partition_id=target.partition_id,
-                )
-                is not None
-            ):
-                self.indexer.index(
-                    target.project,
-                    partition=target.partition,
-                    wait_for_lock=True,
-                    trigger="lazy-query",
-                )
+            for target in targets[project_id]:
+                if (
+                    self.store.incompatibility_reason(
+                        project_id,
+                        self.embedder.model_id,
+                        partition_id=target.partition_id,
+                    )
+                    is not None
+                ):
+                    self.indexer.index(
+                        target.project,
+                        partition=target.partition,
+                        wait_for_lock=True,
+                        trigger="lazy-query",
+                    )
 
     def find_references(
         self,
@@ -1701,7 +1812,7 @@ class Application:
             [resolved],
             lambda targets: self._find_references_for_target(
                 selector,
-                targets[resolved.id],
+                self._primary_target(targets, resolved.id),
                 kinds=kinds,
                 limit=limit,
                 cursor=cursor,
@@ -1743,7 +1854,7 @@ class Application:
             lambda targets: self._analyze_refactor_for_target(
                 selector,
                 operation,
-                targets[resolved.id],
+                self._primary_target(targets, resolved.id),
                 limit=limit,
                 cursor=cursor,
             ),
@@ -1836,7 +1947,67 @@ class Application:
         roots: list[Path] | None = None,
     ) -> list[str]:
         """Resolve the project ids a search will use without executing it."""
-        return self._search_scope(projects, all_projects, roots)
+        return list(
+            dict.fromkeys(
+                project.id for project in self._scope_checkouts(projects, all_projects, roots)
+            )
+        )
+
+    def _scope_checkouts(
+        self,
+        projects: list[str] | None,
+        all_projects: bool,
+        roots: list[Path] | None = None,
+    ) -> list[ProjectInfo]:
+        """Resolve every checkout behind a search scope.
+
+        An explicit selector binds its project to the request's own checkout
+        when possible; an unscoped request returns all requested checkouts of
+        the single in-scope registration so their branch slots are searched
+        together. ``all_projects`` keeps each registration's canonical root.
+        """
+        resolver = ProjectResolver(self.store.list_projects())
+        if projects and all_projects:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                "projects and all_projects cannot be used together",
+            )
+        if all_projects:
+            scope = [
+                resolver.resolve_scope(explicit=project.id)[0] for project in self.list_projects()
+            ]
+        elif projects:
+            selected: dict[str, ProjectInfo] = {}
+            for selector in projects:
+                project = resolver.resolve_scope(
+                    explicit=selector, roots=roots or [], cwd=self.cwd
+                )[0]
+                selected.setdefault(project.id, project)
+            # Explicit selection answers with each requested checkout of the
+            # selected registrations, not just one: when the request's roots
+            # carry several markers of a shared registration -- a main
+            # checkout and linked worktrees -- every one of those checkouts
+            # joins the scope behind its primary.
+            scope = []
+            seen: set[tuple[str, str]] = set()
+            candidates = [*selected.values(), *resolver._marked_checkouts(roots or [])]
+            for project in candidates:
+                if project.id not in selected:
+                    continue
+                key = (project.id, project_root_identity(project.root))
+                if key in seen:
+                    continue
+                seen.add(key)
+                scope.append(project)
+        else:
+            scope = resolver.resolve_scope(roots=roots or [], cwd=self.cwd)
+        if not scope:
+            raise CodeIndexingError(
+                ErrorCode.PROJECT_NOT_FOUND,
+                "No indexed projects are available; init_project registers one and "
+                "index_project builds its index",
+            )
+        return scope
 
     def _resolve(self, explicit: str | None, roots: list[Path] | None) -> ProjectInfo:
         return ProjectResolver(self.store.list_projects()).resolve(
@@ -1844,28 +2015,3 @@ class Application:
             roots=roots or [],
             cwd=self.cwd,
         )
-
-    def _search_scope(
-        self,
-        projects: list[str] | None,
-        all_projects: bool,
-        roots: list[Path] | None,
-    ) -> list[str]:
-        if projects and all_projects:
-            raise CodeIndexingError(
-                ErrorCode.INVALID_FILTER,
-                "projects and all_projects cannot be used together",
-            )
-        if all_projects:
-            project_ids = [project.id for project in self.list_projects()]
-        elif projects:
-            project_ids = [self._resolve(project, roots).id for project in projects]
-        else:
-            project_ids = [self._resolve(None, roots).id]
-        if not project_ids:
-            raise CodeIndexingError(
-                ErrorCode.PROJECT_NOT_FOUND,
-                "No indexed projects are available; init_project registers one and "
-                "index_project builds its index",
-            )
-        return project_ids

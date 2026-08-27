@@ -575,13 +575,16 @@ async def _wait_for_startup_projects(
         return
     projects = await asyncio.gather(
         *(
-            asyncio.to_thread(coordinator.application.resolve_project, project_id)
+            asyncio.to_thread(coordinator.application.resolve_project, project_id, roots)
             for project_id in project_ids
         )
     )
     # An explicit project or all_projects query can select registrations that
     # are not among the client's advertised roots. Freshen those too; otherwise
     # lazy mode would silently serve an old index for exactly those scopes.
+    # Projects bind to the checkout the request arrived through -- a linked
+    # worktree when the client advertised its root -- so its branch slot is
+    # the one freshness waits on.
     selected_roots = _unique_project_roots([*roots, *(project.root for project in projects)])
     statuses = await asyncio.gather(
         *(
@@ -591,7 +594,8 @@ async def _wait_for_startup_projects(
     )
     # A root the eager watcher has marked dirty is known-changed even if a
     # cached status check says otherwise, so it must be refreshed before the
-    # query is answered.
+    # query is answered. Dirtiness compares against every bound checkout root,
+    # not just the registration's canonical one.
     dirty_roots = set(coordinator._dirty_roots)
     refresh_roots = [
         project.root
@@ -809,8 +813,11 @@ def create_server(
         title="Initialize project",
         description=(
             "Register a directory as an indexable project and write its local "
-            ".ci-mcp/project.toml marker, which holds a checkout-local id and the scan "
-            "configuration. Returns the project id, name, root, and scan settings. Building the "
+            ".ci-mcp/project.toml marker, which holds the shared project id and the scan "
+            "configuration. A Git worktree of an already-registered repository joins that "
+            "repository's registration -- its branches occupy slots inside the existing "
+            "project rather than forming a new one; pass force_new_id to deliberately split "
+            "it away. Returns the project id, name, root, and scan settings. Building the "
             "index is a separate operation (index_project). Re-running on an already-initialized "
             "directory returns the existing project unless force_new_id is set. A new "
             "registration whose root equals, contains, or is nested inside an existing "
@@ -923,12 +930,13 @@ def create_server(
         description=(
             "Report one project's index state — pending, indexing, ready, partial, stale, "
             "rebuild_required, or error — with its indexed file count and chunk count, plus the "
-            "active index slot's Git selector, HEAD, probe outcome, clean state, slot id, and "
-            "whether the active slot still needs a build. Compares eligible source metadata "
-            "with the index but does not rebuild it; index_project does that, "
+            "requesting checkout's active index slot's Git selector, HEAD, probe outcome, clean "
+            "state, slot id, and whether that slot still needs a build. Compares eligible source "
+            "metadata with the index but does not rebuild it; index_project does that, "
             "including rebuilding a rebuild_required partition. A root that is not registered "
-            "yet is registered first, "
-            "which writes its .ci-mcp/project.toml marker."
+            "yet is registered first, which writes its .ci-mcp/project.toml marker. For a "
+            "shared registration observed through a worktree, the status describes that "
+            "worktree's checkout and reports it as checkout_root."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -1052,9 +1060,11 @@ def create_server(
             "physical bytes, fragment and retained-version counts, index coverage, and an "
             "installation total — plus every retained index slot with its selector, active "
             "flag, state, indexed HEAD, last-use timestamp, and physical bytes, and advisory "
-            "warnings for overlapping registered roots and Git worktrees that share one "
-            "repository. Never mutates the index: a registered project with no partition "
-            "reports zeroed tables instead of materializing one."
+            "warnings for overlapping registered roots and for pre-worktree-support "
+            "registrations that still index one repository's worktrees as separate projects "
+            "(re-run init_project on the secondary root to unify them). Never mutates the "
+            "index: a registered project with no partition reports zeroed tables instead of "
+            "materializing one."
         ),
         annotations=_READS_AND_REGISTERS,
     )

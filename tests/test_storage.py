@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -16,6 +19,14 @@ from lancedb.merge import LanceMergeInsertBuilder
 from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
+from code_indexing_mcp.errors import ErrorCode
+from code_indexing_mcp.git_state import (
+    partition_id as _git_partition_id,
+)
+from code_indexing_mcp.git_state import (
+    probe_git_state,
+)
+from code_indexing_mcp.git_state import slot_id as _git_slot_id
 from code_indexing_mcp.models import ProjectInfo, ProjectSlot, StoredChunk, StoredFile
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.storage import (
@@ -322,7 +333,7 @@ def test_historical_reference_reads_stay_on_one_physical_partition(
     store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
     store.upsert_slot(_slot(project.id, "slot-b", partition_id="partition-b"))
 
-    store.activate_slot(project.id, "slot-a")
+    store.activate_slot(project.id, "slot-a", checkout_key="checkout-a")
     record_a = stored_file(project.id, file_id="file-a")
     store.replace_files_from_arrow(
         project.id,
@@ -351,7 +362,7 @@ def test_historical_reference_reads_stay_on_one_physical_partition(
         ],
     )
 
-    store.activate_slot(project.id, "slot-b")
+    store.activate_slot(project.id, "slot-b", checkout_key="checkout-b")
     record_b = stored_file(project.id, file_id="file-b")
     store.replace_files_from_arrow(
         project.id,
@@ -861,7 +872,7 @@ def test_partition_lock_resolves_the_active_physical_slot(tmp_path: Path) -> Non
     project = initialize_project(root)
     store.upsert_project(project, model_id="test/model")
     store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
-    store.activate_slot(project.id, "slot-a")
+    store.activate_slot(project.id, "slot-a", checkout_key="checkout-a")
     store._tables("partition-a")
     finished = threading.Event()
 
@@ -1180,7 +1191,7 @@ def test_storage_stats_reports_every_slot_and_its_partition_bytes(tmp_path: Path
     store.upsert_project(project, model_id="test/model")
     store.upsert_slot(_slot(project.id, "slot-a", partition_id="partition-a"))
     store.upsert_slot(_slot(project.id, "slot-b", partition_id="partition-b"))
-    store.activate_slot(project.id, "slot-a")
+    store.activate_slot(project.id, "slot-a", checkout_key="checkout-a")
     store._tables("partition-a")
     store._tables("partition-b")
 
@@ -2110,7 +2121,7 @@ def test_activate_slot_publishes_the_pointer_only_after_the_row_exists(tmp_path:
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
 
     with pytest.raises(ValueError):
-        store.activate_slot("project-a", "never-written")
+        store.activate_slot("project-a", "never-written", checkout_key="checkout")
 
     assert store.active_slot("project-a") is None
 
@@ -2120,13 +2131,13 @@ def test_activation_epoch_increments_on_every_pointer_change(tmp_path: Path) -> 
     store.upsert_slot(_slot("project-a", "slot-a"))
     store.upsert_slot(_slot("project-a", "slot-b"))
 
-    assert store.activate_slot("project-a", "slot-a") == 1
-    assert store.activate_slot("project-a", "slot-b") == 2
-    assert store.activate_slot("project-a", "slot-a") == 3
+    assert store.activate_slot("project-a", "slot-a", checkout_key="checkout") == 1
+    assert store.activate_slot("project-a", "slot-b", checkout_key="checkout") == 2
+    assert store.activate_slot("project-a", "slot-a", checkout_key="checkout") == 3
 
     # Re-selecting the current slot is a no-op, not another epoch.
     version = store._active_slots.version
-    assert store.activate_slot("project-a", "slot-a") == 3
+    assert store.activate_slot("project-a", "slot-a", checkout_key="checkout") == 3
     assert store._active_slots.version == version
     assert store.active_slot("project-a") is not None
     assert store.active_slot("project-a").slot_id == "slot-a"
@@ -2271,7 +2282,7 @@ def test_pending_slot_reads_never_materialize_a_partition(tmp_path: Path) -> Non
 def test_remove_slot_clears_rows_and_pointer_but_keeps_the_partition(tmp_path: Path) -> None:
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
     store.upsert_slot(_slot("project-a", "slot-a", partition_id="partition-a"))
-    store.activate_slot("project-a", "slot-a")
+    store.activate_slot("project-a", "slot-a", checkout_key="checkout")
     store._tables("partition-a")
 
     assert store.remove_slot("slot-a") is True
@@ -2313,7 +2324,7 @@ def test_chunk_fetch_is_limited_to_the_active_physical_slot(tmp_path: Path) -> N
     second = _slot(project.id, "slot-b", partition_id="partition-b")
     store.upsert_slot(first)
     store.upsert_slot(second)
-    store.activate_slot(project.id, first.slot_id)
+    store.activate_slot(project.id, first.slot_id, checkout_key="checkout")
 
     first_chunk = _stored_chunks(project.id, 1)[0].model_copy(
         update={"chunk_id": f"{project.id}:slot-a"}
@@ -2329,7 +2340,7 @@ def test_chunk_fetch_is_limited_to_the_active_physical_slot(tmp_path: Path) -> N
     assert store.get_chunk(first_chunk.chunk_id) is not None
     assert store.get_chunk(second_chunk.chunk_id) is None
 
-    store.activate_slot(project.id, second.slot_id)
+    store.activate_slot(project.id, second.slot_id, checkout_key="checkout")
 
     assert store.get_chunk(first_chunk.chunk_id) is None
     assert store.get_chunk(second_chunk.chunk_id) is not None
@@ -2363,7 +2374,7 @@ def test_branch_cache_limit_evicts_the_oldest_inactive_slot(tmp_path: Path) -> N
             update={"last_used_at": 1}
         )
     )
-    store.activate_slot("project-a", "slot-a")
+    store.activate_slot("project-a", "slot-a", checkout_key="checkout")
     store._tables("partition-a")
     store._tables("partition-b")
 
@@ -2374,3 +2385,174 @@ def test_branch_cache_limit_evicts_the_oldest_inactive_slot(tmp_path: Path) -> N
     assert [slot.slot_id for slot in store.list_slots("project-a")] == ["slot-a"]
     assert not (store.directory / "projects" / "partition-b").exists()
     assert store.active_slot("project-a").slot_id == "slot-a"
+
+
+def _git_repo(tmp_path: Path, name: str) -> Path:
+    root = tmp_path / name
+    root.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(root))
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    run_git("add", "main.py", cwd=root)
+    run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "initial", cwd=root)
+    return root
+
+
+def test_active_pointers_are_per_checkout_of_one_project(tmp_path: Path) -> None:
+    """Two checkouts of one shared registration keep two active slots at once."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a", partition_id="partition-a"))
+    store.upsert_slot(_slot("project-a", "slot-b", partition_id="partition-b"))
+
+    first = store.activate_slot("project-a", "slot-a", checkout_key="/repo/.git")
+    second = store.activate_slot("project-a", "slot-b", checkout_key="/wt/.git")
+
+    assert store.active_slot("project-a", checkout_key="/repo/.git").slot_id == "slot-a"
+    assert store.active_slot("project-a", checkout_key="/wt/.git").slot_id == "slot-b"
+    # Both pointers survive each other's activation with independent epochs.
+    assert (
+        store._active_partition_ref("project-a", checkout_key="/repo/.git").activation_epoch
+        == first
+    )
+    assert (
+        store._active_partition_ref("project-a", checkout_key="/wt/.git").activation_epoch == second
+    )
+    # Unkeyed legacy reads prefer the freshest real checkout pointer.
+    assert {slot.slot_id for slot in store.active_slots_for("project-a")} == {
+        "slot-a",
+        "slot-b",
+    }
+    assert store.active_slot("project-a").slot_id == "slot-b"
+    assert store._active_partition_ref("project-a").slot_id == "slot-b"
+
+
+def test_maintain_project_protects_every_checkout_pointer(tmp_path: Path) -> None:
+    """A live worktree's slot survives retention even when another is fresher."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4, branch_cache_limit=1)
+    root = _git_repo(tmp_path, "repo")
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    state = probe_git_state(root)
+    branch_slot = ProjectSlot(
+        slot_id=_git_slot_id(project.id, state),
+        project_id=project.id,
+        partition_id=_git_partition_id(_git_slot_id(project.id, state)),
+        selector_kind="ref",
+        selector_value=state.selector_value,
+        repository_identity=state.repository_identity,
+        scan_config_hash="hash",
+        model_id="test/model",
+    )
+    store.upsert_slot(branch_slot)
+    # The victim is older than either pointer and unprotected.
+    victim = _slot(project.id, "unpointed", partition_id="partition-old").model_copy(
+        update={"last_used_at": 1}
+    )
+    store.upsert_slot(victim)
+    store.upsert_slot(_slot(project.id, "worktree-slot", partition_id="partition-wt"))
+    store.activate_slot(project.id, branch_slot.slot_id, checkout_key="/repo/.git")
+    store.activate_slot(
+        project.id,
+        "worktree-slot",
+        checkout_key="/wt/.git",
+    )
+    store._tables(branch_slot.partition_id)
+    store._tables("partition-wt")
+    store._tables("partition-old")
+
+    store.maintain_project(project.id, cleanup_older_than=timedelta(hours=1))
+
+    survivor_ids = {slot.slot_id for slot in store.list_slots(project.id)}
+    assert survivor_ids == {branch_slot.slot_id, "worktree-slot"}
+    assert not (store.directory / "projects" / "partition-old").exists()
+
+
+def test_maintain_project_sweeps_slots_from_an_obsolete_key_formula(tmp_path: Path) -> None:
+    """Pre-worktree slot ids can never be claimed again and are reclaimed first."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4, branch_cache_limit=8)
+    payload = json.dumps(
+        ["git-slot-v1", "project-a", "/repo/.git", "/repo/.git", "", "ref", "refs/heads/main"],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    stale_id = hashlib.sha256(payload.encode()).hexdigest()
+    store.upsert_slot(_slot("project-a", stale_id, partition_id=f"slot-{stale_id[:32]}"))
+    current = _slot("project-a", "current-slot", partition_id="partition-current")
+    store.upsert_slot(current)
+    store.activate_slot("project-a", "current-slot", checkout_key="/repo/.git")
+    store._tables(f"slot-{stale_id[:32]}")
+    store._tables("partition-current")
+
+    store.maintain_project("project-a", cleanup_older_than=timedelta(hours=1))
+
+    assert [slot.slot_id for slot in store.list_slots("project-a")] == ["current-slot"]
+    assert not (store.directory / "projects" / f"slot-{stale_id[:32]}").exists()
+
+
+def test_upsert_project_accepts_a_worktree_marker_of_one_repository(
+    tmp_path: Path,
+) -> None:
+    root = _git_repo(tmp_path, "repo")
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=root)
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model", state="ready")
+
+    checkout = ProjectInfo(id=project.id, name=project.name, root=worktree)
+    store.upsert_project(checkout, model_id="test/model", state="ready")
+
+    stored = ProjectInfo.model_validate_json(
+        str(store._rows(store._projects, f"id = '{project.id}'")[0]["payload"])
+    )
+    assert stored.root == project.root.resolve()
+    assert store.project_state(project.id) == "ready"
+    # Registration stays singular: the checkout never becomes its own row.
+    assert len(store.list_projects()) == 1
+
+
+def test_upsert_project_still_conflicts_for_a_copied_tree(tmp_path: Path) -> None:
+    root = _git_repo(tmp_path, "repo")
+    copy = tmp_path / "copy"
+    shutil.copytree(root, copy, symlinks=True)
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model")
+
+    duplicate = ProjectInfo(id=project.id, name=project.name, root=copy)
+    with pytest.raises(storage_module.CodeIndexingError) as excinfo:
+        store.upsert_project(duplicate, model_id="test/model")
+
+    assert excinfo.value.code == ErrorCode.PROJECT_ID_CONFLICT
+
+
+def test_active_slots_registry_gains_the_checkout_key_in_place(tmp_path: Path) -> None:
+    """A pre-worktree active_slots table is migrated without losing its pointer."""
+    import lancedb
+
+    data = tmp_path / "data"
+    database = lancedb.connect(data / "registry")
+    legacy_schema = pa.schema(
+        [
+            ("project_id", pa.string()),
+            ("slot_id", pa.string()),
+            ("activation_epoch", pa.int64()),
+            ("updated_at", pa.int64()),
+        ]
+    )
+    legacy = database.create_table("active_slots", schema=legacy_schema)
+    legacy.add(
+        [{"project_id": "p", "slot_id": "slot-old", "activation_epoch": 3, "updated_at": 42}]
+    )
+
+    store = LanceStore(data, vector_dimension=4)
+
+    rows = store._rows(store._active_slots)
+    assert [(row["slot_id"], row["checkout_key"]) for row in rows] == [("slot-old", "")]
+    # A dangling legacy pointer still resolves to nothing until its slot row
+    # exists; once it does, the unkeyed read serves it like before.
+    assert store.active_slot("p") is None
+    store.upsert_slot(_slot("p", "slot-old"))
+    assert store.active_slot("p") is not None
+    assert store.active_slot("p").slot_id == "slot-old"
+    reopened = LanceStore(data, vector_dimension=4)
+    assert reopened.active_slot("p").slot_id == "slot-old"

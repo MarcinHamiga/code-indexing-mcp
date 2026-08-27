@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
 from .embedding import Embedder
@@ -28,6 +28,13 @@ logger = logging.getLogger(__name__)
 _FALLBACK_FETCH_ROWS = 500
 
 
+def _as_partition_refs(value: PartitionRef | Sequence[PartitionRef]) -> list[PartitionRef]:
+    """Normalize one pinned partition or a sequence of them into a list."""
+    if isinstance(value, PartitionRef):
+        return [value]
+    return list(value)
+
+
 class SearchService:
     def __init__(self, store: LanceStore, embedder: Embedder) -> None:
         self.store = store
@@ -42,8 +49,14 @@ class SearchService:
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
         limit: int = 8,
-        partitions: Mapping[str, PartitionRef] | None = None,
+        partitions: Mapping[str, Sequence[PartitionRef]] | None = None,
     ) -> SearchResponse:
+        """Search every given project's pinned partitions and rank globally.
+
+        A project may pin several partitions at once -- one per requested
+        checkout of a shared registration -- and their rows compete in one
+        ranked result list.
+        """
         query = query.strip()
         if not query or not project_ids:
             raise CodeIndexingError(
@@ -70,16 +83,27 @@ class SearchService:
                 _FALLBACK_FETCH_ROWS,
             )
         fetch = _FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5)
-        selected = (
-            {project_id: self.store.active_partition(project_id) for project_id in project_ids}
-            if partitions is None
-            else dict(partitions)
-        )
-        if set(selected) != set(project_ids) or any(
-            ref.project_id != project_id for project_id, ref in selected.items()
+        if partitions is None:
+            selected = {
+                project_id: [self.store.active_partition(project_id)] for project_id in project_ids
+            }
+        else:
+            selected = {
+                project_id: _as_partition_refs(refs) for project_id, refs in partitions.items()
+            }
+        if (
+            set(selected) != set(project_ids)
+            or any(
+                ref.project_id != project_id
+                for project_id, refs in selected.items()
+                for ref in refs
+            )
+            or any(not refs for refs in selected.values())
         ):
             raise ValueError("search partitions do not match the requested projects")
-        partition_ids = {project_id: ref.partition_id for project_id, ref in selected.items()}
+        partition_ids = {
+            project_id: [ref.partition_id for ref in refs] for project_id, refs in selected.items()
+        }
         with self.store.partitions_access(selected):
             rows = self.store.hybrid_search(
                 query,

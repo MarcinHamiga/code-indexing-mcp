@@ -16,6 +16,7 @@ from code_indexing_mcp.git_state import (
     SelectorKind,
     WorktreeStatus,
     changed_paths_between,
+    checkout_key,
     partition_id,
     probe_git_state,
     slot_id,
@@ -326,18 +327,60 @@ def test_selector_repository_checkout_and_prefix_changes_move_the_slot(tmp_path:
     assert slot_id(project, attached) != slot_id(project, detached)
 
     worktree = tmp_path / "wt"
-    run_git("worktree", "add", "-q", str(worktree), cwd=root)
+    run_git("worktree", "add", "-q", "-b", "elsewhere", str(worktree), cwd=root)
     worktree_state = probe_git_state(worktree)
+    assert worktree_state.selector_value == "refs/heads/elsewhere"
     assert slot_id(project, detached) != slot_id(project, worktree_state)
 
     (root / "sub").mkdir()
     subdirectory = probe_git_state(root / "sub")
-    assert slot_id(project, attached) != slot_id(project, subdirectory)
+    assert slot_id(project, detached) != slot_id(project, subdirectory)
 
     other = _repo(tmp_path, "other")
     other_state = probe_git_state(other)
-    assert other_state.selector_value == attached.selector_value
-    assert slot_id(project, attached) != slot_id(project, other_state)
+    assert slot_id(project, detached) != slot_id(project, other_state)
+
+
+def test_a_selector_in_any_worktree_of_one_repository_shares_the_slot(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    project = "project-a"
+
+    run_git("checkout", "-q", "--detach", cwd=root)
+    head = _head_oid(root)
+    main_state = probe_git_state(root)
+
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=root)
+    worktree_state = probe_git_state(worktree)
+
+    assert main_state.repository_identity == worktree_state.repository_identity
+    assert main_state.checkout_identity != worktree_state.checkout_identity
+    assert main_state.selector_value == worktree_state.selector_value == head
+    assert slot_id(project, main_state) == slot_id(project, worktree_state)
+
+
+def test_checkout_key_is_per_checkout_and_slot_stays_per_branch(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    state = probe_git_state(root)
+
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=root)
+    worktree_state = probe_git_state(worktree)
+
+    assert checkout_key(state) == state.checkout_identity
+    assert checkout_key(worktree_state) == worktree_state.checkout_identity
+    assert checkout_key(state) != checkout_key(worktree_state)
+
+    non_git = tmp_path / "plain"
+    non_git.mkdir()
+    degraded = probe_git_state(non_git)
+    assert checkout_key(degraded) == degraded.selector_value
+
+    def timeout_runner(command: Sequence[str], cwd: Path) -> GitCommandResult:
+        raise GitTimeout("too slow")
+
+    timed_out = probe_git_state(root, runner=timeout_runner)
+    assert checkout_key(timed_out) == str(root.resolve())
 
 
 def test_degraded_probes_never_share_a_branch_slot(tmp_path: Path) -> None:

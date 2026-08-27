@@ -969,6 +969,10 @@ class ProjectStatus(FrozenModel):
     git_probe: str | None = None
     git_clean: bool | None = None
     branch_build_pending: bool | None = None
+    # The checkout this status describes. Equal to project.root for the
+    # canonical checkout; a linked worktree's root when the request arrived
+    # through that worktree's marker.
+    checkout_root: str | None = None
 
 
 class RemovalReport(FrozenModel):
@@ -1030,6 +1034,9 @@ class ProjectSlot(FrozenModel):
     selector_kind: str
     selector_value: str
     repository_identity: str | None = None
+    # Informational only: the checkout whose git directory last indexed this
+    # slot. It takes no part in the slot identity, so a branch checked out in
+    # any worktree of the repository maps to the same slot.
     checkout_identity: str | None = None
     project_prefix: str = ""
     # The HEAD the partition was last indexed at, and whether the checkout was

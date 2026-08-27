@@ -161,9 +161,10 @@ class IndexSettings:
     # sets delete_unverified, regardless of configuration.
     auto_maintenance: bool = True
     version_retention_hours: int = DEFAULT_VERSION_RETENTION_HOURS
-    # How many branch index slots, counting the active one, a project retains
-    # before maintenance evicts the least recently used. Protection of the
-    # active, indexing, or recovery-pending slots can exceed it temporarily.
+    # How many branch index slots, counting the active ones (one per live
+    # checkout of a shared registration), a project retains before maintenance
+    # evicts the least recently used. Protection of the active, indexing, or
+    # recovery-pending slots can exceed it temporarily.
     branch_cache_limit: int = 4
 
     @classmethod

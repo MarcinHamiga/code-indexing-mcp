@@ -377,9 +377,20 @@ HNSW-SQ8 gates did not pass and approximate indexing remains opt-in via
 `CODE_INDEXING_VECTOR_INDEX=hnsw`.
 
 Initialization creates `.ci-mcp/project.toml` and a self-ignoring `.ci-mcp/.gitignore`. The
-marker contains a checkout-local UUID and scanning configuration. It is not intended to be
+marker carries the project's shared UUID and scanning configuration. It is not intended to be
 committed. Markers created by earlier releases under `.code-indexing-mcp` remain readable, but all new
 markers use `.ci-mcp`.
+
+Git worktrees are first-class. A worktree of an already-registered repository joins that
+repository's registration instead of forming a new project: its marker reuses the shared id,
+each branch maps to exactly one slot no matter which checkout has it, and every live checkout
+keeps its own active-slot pointer. A request answered through a worktree scans, probes, and
+freshens that worktree; when a scope contains several checkouts of one project at once, their
+slots are searched together and merged into one ranking. Register a worktree with `init_project`
+or let root discovery do it; pass `force_new_id` to deliberately keep it separate.
+Registrations that predate this behavior (a repository indexed as several projects) keep working
+and surface an advisory warning in `index_storage_status`; re-running `init_project` on the
+secondary root unifies them under the surviving registration.
 
 CLI index refreshes are explicit and incremental. MCP indexing is lazy by default: listing tools
 does not discover projects, load the model, or start indexing. Every project-scoped code query

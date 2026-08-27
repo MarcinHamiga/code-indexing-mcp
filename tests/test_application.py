@@ -28,7 +28,7 @@ from code_indexing_mcp.models import (
     SearchHit,
     SearchResponse,
 )
-from code_indexing_mcp.projects import existing_marker_path
+from code_indexing_mcp.projects import existing_marker_path, initialize_project
 from code_indexing_mcp.settings import IndexSettings
 from code_indexing_mcp.token_batching import DEFAULT_MAX_TOKEN_PRODUCT, REFERENCE_MEMORY_BYTES
 from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher
@@ -2069,3 +2069,194 @@ def test_a_commit_with_a_hidden_content_change_marks_the_slot_stale(
     assert app.project_status(project.id).state == "ready"
     hits = app.search_code("return 2", projects=[project.id]).hits
     assert hits and "return 2" in hits[0].snippet
+
+
+def _git_repo_with_main(tmp_path: Path, name: str = "repo") -> tuple[Path, ProjectInfo]:
+    root = tmp_path / name
+    root.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(root))
+    (root / "main.py").write_text("def main_branch():\n    return 1\n")
+    run_git("add", "main.py", cwd=root)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "main",
+        cwd=root,
+    )
+    return root, ProjectInfo(id="pending", name=name, root=root)
+
+
+def test_a_worktree_joins_the_registration_and_keeps_its_own_slot(
+    tmp_path: Path,
+) -> None:
+    """Registering a linked worktree must not mint a second project."""
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    main_status = app.project_status(project.id)
+
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=root)
+    joined = app.init_project(worktree)
+
+    assert joined.id == project.id
+    assert existing_marker_path(worktree) is not None
+    assert len(app.list_projects()) == 1
+
+    app.index_project(project.id, roots=[worktree])
+    wt_status = app.project_status(project.id, roots=[worktree])
+    assert wt_status.checkout_root == str(worktree.resolve())
+    assert wt_status.active_slot_id != main_status.active_slot_id
+    # The canonical checkout keeps its own pointer and its own rows.
+    assert app.project_status(project.id).active_slot_id == main_status.active_slot_id
+    hits = app.search_code("main branch", projects=[project.id], roots=[root])
+    assert [hit.symbol for hit in hits.hits] == ["main_branch"]
+    merged = app.search_code("branch", roots=[root, worktree])
+    assert {hit.project_id for hit in merged.hits} == {project.id}
+
+
+def test_search_merges_slots_of_all_requested_checkouts(tmp_path: Path) -> None:
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    # Branch off main, then diverge both histories so each checkout holds a
+    # symbol the other has never seen.
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=root)
+    (worktree / "wt.py").write_text("def worktree_branch():\n    return 2\n")
+    run_git("add", "wt.py", cwd=worktree)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "worktree commit",
+        cwd=worktree,
+    )
+    (root / "extra.py").write_text("def main_only():\n    return 3\n")
+    run_git("add", "extra.py", cwd=root)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "diverge main",
+        cwd=root,
+    )
+    app.init_project(worktree)
+    app.index_project(project.id, roots=[worktree])
+    app.index_project(project.id, roots=[root])
+
+    def symbols(response: SearchResponse) -> list[str]:
+        return sorted(hit.symbol for hit in response.hits)
+
+    # Each checkout's slot answers only from its own branch.
+    scoped_main = app.search_code("return", projects=[project.id], roots=[root])
+    assert symbols(scoped_main) == ["main_branch", "main_only"]
+    scoped_wt = app.search_code("return", projects=[project.id], roots=[worktree])
+    assert symbols(scoped_wt) == ["main_branch", "worktree_branch"]
+
+    # One request across both checkouts merges every slot into one ranking.
+    merged = app.search_code("return", projects=[project.id], roots=[root, worktree])
+    assert symbols(merged) == ["main_branch", "main_only", "worktree_branch"]
+
+
+def test_a_branch_slot_survives_relocation_between_worktrees(tmp_path: Path) -> None:
+    """Checking a branch out elsewhere reuses the slot; no second index run."""
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "-b", "feature", str(worktree), cwd=root)
+    (worktree / "feature.py").write_text("def feature_branch():\n    return 3\n")
+    run_git("add", "feature.py", cwd=worktree)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "feature",
+        cwd=worktree,
+    )
+    app.init_project(worktree)
+    app.index_project(project.id, roots=[worktree])
+    feature_slot = app.project_status(project.id, roots=[worktree]).active_slot_id
+    feature_chunk_id = (
+        app.find_symbol("feature_branch", project.id, roots=[worktree]).hits[0].chunk_id
+    )
+
+    # Tear the worktree down out of band; pruning unregisters it so the
+    # branch becomes available to the main checkout again.
+    shutil.rmtree(worktree)
+    run_git("worktree", "prune", cwd=root)
+    run_git("checkout", "-q", "feature", cwd=root)
+
+    relocated = app.project_status(project.id, roots=[root])
+    assert relocated.checkout_root == str(root.resolve())
+    assert relocated.active_slot_id == feature_slot
+    assert relocated.branch_build_pending is False
+    # The worktree's branch tree (main.py + feature.py) is now served from
+    # the main checkout through the very same slot.
+    assert relocated.file_count == 2
+    # And the cached chunk resolves through the shared registration.
+    assert app.get_chunk(feature_chunk_id).content is not None
+
+
+def test_init_project_unifies_a_legacy_duplicate_worktree_registration(
+    tmp_path: Path,
+) -> None:
+    """Pre-worktree registrations surface as warnings until init unifies them."""
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=root)
+    # Simulate the old behavior: the worktree was initialized as its own
+    # project before registrations were shared across checkouts.
+    legacy_marker = initialize_project(worktree)
+    app.store.upsert_project(legacy_marker, model_id=app.embedder.model_id, state="pending")
+
+    status = app.storage_status()
+    assert len(status.worktree_warnings) == 1
+
+    unified = app.init_project(worktree)
+
+    assert unified.id == project.id
+    assert len(app.list_projects()) == 1
+    assert app.storage_status().worktree_warnings == []
+    assert app.index_project(project.id, roots=[worktree]).indexed_files >= 1
+    wt_status = app.project_status(project.id, roots=[worktree])
+    assert wt_status.state == "ready"
+    assert wt_status.file_count == 1
