@@ -429,3 +429,96 @@ def test_r4_last_page_completeness_accounts_for_earlier_pages(tmp_path: Path) ->
     second = service.analyze_refactor(selector, operation, limit=2, cursor=first.cursor)
     assert second.cursor is None
     assert second.completeness.state != "complete"
+
+
+# ---------------------------------------------------------------------------
+# Go language step: package imports, intra-package calls, receivers, dot
+# imports, and embedded interfaces resolve with the shared
+# exact/likely/unresolved contract.
+# ---------------------------------------------------------------------------
+
+
+def test_go_package_import_resolves_exactly(tmp_path: Path) -> None:
+    """`store.Save()` through a plain import binds the suffixed directory."""
+
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "go" / "package_import_exact")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="app/store/save.go", qualified_symbol="Save")
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "main.go" and hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "known_namespace_member"
+
+
+def test_go_same_package_call_resolves_exactly(tmp_path: Path) -> None:
+    """A bare intra-package call needs no import: one directory IS one package."""
+
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "go" / "same_package_exact")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="auth.go", qualified_symbol="Authorize")
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "main.go" and hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "same_package_symbol"
+
+
+def test_go_aliased_package_receiver_resolves_exactly(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "go" / "aliased_import")
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id, path="app/users/user.go", qualified_symbol="GetByName"
+        )
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "main.go" and hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "known_namespace_member"
+
+
+def test_go_a_foreign_receiver_stays_likely(tmp_path: Path) -> None:
+    """`s.Handle()` inside `(*Worker).Run`: the local's spelling matches no
+    receiver parameter of the enclosing method, so the name alone cannot bind
+    even though it is unique -- the plan's honest receiver cap."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "go" / "unknown_receiver_likely")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="store.go", qualified_symbol="Handle")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "likely"
+    assert call.reason_code == "unknown_receiver"
+    assert any(item.code == "unknown_receiver" for item in response.limitations)
+
+
+def test_go_dot_import_is_unresolved_with_a_wildcard_reason(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "go" / "dot_import_unresolved")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="app/util/util.go", qualified_symbol="Stamp")
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "main.go" and hit.kind == "call")
+    assert call.resolution == "unresolved"
+    assert call.reason_code == "wildcard_import"
+
+
+def test_go_embedded_interface_is_an_inheritance_edge(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "go" / "embedded_interface")
+
+    rows = service.store.list_reference_records(project_id)
+    embedded = [
+        row
+        for row in rows
+        if row["record_kind"] == "reference"
+        and row["kind"] == "inheritance"
+        and row["target_name"] == "Reader"
+    ]
+
+    assert len(embedded) == 1
+    assert embedded[0]["source_qualified_symbol"] == "LogStore"

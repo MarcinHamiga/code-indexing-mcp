@@ -608,7 +608,7 @@ def test_files_without_reference_extraction_are_reported_as_a_coverage_gap(
         tmp_path,
         {
             "lib.py": "def answer():\n    return 42\n",
-            "svc.go": "package main\n\nfunc Run() int {\n\treturn 1\n}\n",
+            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
         },
     )
 
@@ -617,8 +617,98 @@ def test_files_without_reference_extraction_are_reported_as_a_coverage_gap(
     )
 
     limitation = next(item for item in response.limitations if item.code == "unsupported_language")
-    assert "svc.go" in limitation.explanation
-    assert "go" in limitation.explanation
+    assert "svc.c" in limitation.explanation
+    assert "1 c file(s)" in limitation.explanation
+
+
+def test_go_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> None:
+    """Coverage flips only for the newly supported language.
+
+    Indexing a mixed Python + Go + C project must stop reporting
+    `unsupported_language` for the Go files while the C files stay reported,
+    proving the flip is scoped to the language that gained extraction.
+    """
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "main.go": 'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("hi")\n}\n',
+            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    )
+
+    go_gaps = [
+        item
+        for item in response.limitations
+        if item.code == "unsupported_language" and "main.go" in item.explanation
+    ]
+    assert not go_gaps
+    c_gaps = [
+        item
+        for item in response.limitations
+        if item.code == "unsupported_language" and "svc.c" in item.explanation
+    ]
+    assert c_gaps
+
+
+def test_go_method_receiver_name_binds_a_unique_member_exactly(tmp_path: Path) -> None:
+    """`c.Handle()` inside a method whose receiver is also named `c` is exact.
+
+    A method's first parameter is its receiver, so a shared receiver name plus
+    a project-wide unique member name upgrades the unknown receiver -- the
+    one Go case where the name alone really does prove the binding."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "conn.go": (
+                "package main\n\n"
+                "type Conn struct{}\n\n"
+                "func (c *Conn) Handle() {}\n\n"
+                "func (c *Conn) Serve() {\n"
+                "\tc.Handle()\n"
+                "}\n"
+            )
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="conn.go", qualified_symbol="Handle")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "same_receiver_member"
+
+
+def test_go_plain_function_parameters_are_not_receivers(tmp_path: Path) -> None:
+    """A plain function's first parameter shares the receiver's name shape but
+    not its meaning: `w.Write` on an external writer must stay `likely`, not
+    bind to the project's unique `Write` declaration."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "store.go": (
+                "package main\n\n"
+                "type FileStore struct{}\n\n"
+                "func (f *FileStore) Write(p []byte) (int, error) {\n"
+                "\treturn len(p), nil\n"
+                "}\n"
+            ),
+            "handle.go": "package main\n\nfunc handle(w Writer) {\n\tw.Write(nil)\n}\n",
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="store.go", qualified_symbol="Write")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call" and hit.path == "handle.go")
+    assert call.resolution == "likely"
+    assert call.reason_code == "unknown_receiver"
 
 
 def test_find_references_narrows_the_declaration_fetch_to_files_with_a_reference(

@@ -54,6 +54,28 @@ _BOM: Final = b"\xef\xbb\xbf"
 _MAX_LIMITATION_PATHS: Final = 10
 
 
+class _ModuleIndex(NamedTuple):
+    """Path arithmetic over one query's snapshot, precomputed instead of rescanned.
+
+    Three lookups the language resolvers need repeatedly:
+    `directories_by_suffix` maps an import path's segment tuple to every known
+    directory whose trailing segments equal it (module-prefix agnostic -- the
+    shape Go package imports resolve against without reading go.mod),
+    `files_by_directory` lists the files indexed directly inside each such
+    directory (Go packages span files, so one directory is many candidates),
+    and `receiver_names` maps `(file_id, enclosing qualified symbol)` to its
+    first parameter name for method declarations only (Go methods put their
+    receiver there; a plain function's first parameter is not a receiver),
+    which powers the Go receiver-name rule. Python and JavaScript resolution
+    ignore the index entirely; only callers whose language has a
+    directory-suffix or receiver rule consult it.
+    """
+
+    directories_by_suffix: dict[tuple[str, ...], tuple[str, ...]]
+    files_by_directory: dict[str, tuple[str, ...]]
+    receiver_names: dict[tuple[str, str], str]
+
+
 class _ReferenceQuery(NamedTuple):
     """Pinned-snapshot data shared by reference and refactor responses.
 
@@ -385,6 +407,7 @@ class ReferenceService:
         imports = self._imports_by_file(records)
         reexport_rows = self._reexport_rows_by_path(records)
         known_paths = self._known_paths(records)
+        module_index = self._build_module_index(records, declarations)
         # A declaration nested directly in a class body is reachable only
         # through a receiver, so it must not shadow a bare name the way a
         # nested function does.
@@ -410,7 +433,7 @@ class ReferenceService:
         stale_paths: set[str] = set()
         for row in records:
             if row["record_kind"] != "reference" or not self._may_refer(
-                row, selected, imports, reexport_rows, known_paths
+                row, selected, imports, reexport_rows, known_paths, module_index
             ):
                 continue
             if kinds is not None and row["kind"] not in kinds:
@@ -423,7 +446,13 @@ class ReferenceService:
             ):
                 continue
             resolution, reason, explanation = self._classify(
-                row, selected, target_candidates, imports, reexport_rows, known_paths
+                row,
+                selected,
+                target_candidates,
+                imports,
+                reexport_rows,
+                known_paths,
+                module_index,
             )
             if reason in _LIMITATION_REASONS:
                 limitations.append(
@@ -936,6 +965,7 @@ class ReferenceService:
             return []
         imports = self._imports_by_file(records)
         known_paths = self._known_paths(records)
+        module_index = self._build_module_index(records, None)
         coverage_hashes = {
             row["path"]: row["content_hash"]
             for row in records
@@ -955,7 +985,7 @@ class ReferenceService:
             base_tail = base_qualified.rsplit(".", 1)[-1]
             for row in inheritance_rows:
                 if not self._inheritance_targets(
-                    row, base_file_id, base_tail, base_path, imports, known_paths
+                    row, base_file_id, base_tail, base_path, imports, known_paths, module_index
                 ):
                     continue
                 subclass_qualified = row["source_qualified_symbol"]
@@ -1026,6 +1056,7 @@ class ReferenceService:
         base_path: str,
         imports: dict[str, list[ReferenceRecord]],
         known_paths: frozenset[str],
+        module_index: _ModuleIndex | None = None,
     ) -> bool:
         """True if an `inheritance` row's base name binds to the class at hand.
 
@@ -1059,7 +1090,7 @@ class ReferenceService:
                 continue
             module_path = item["module_path"]
             if module_path is not None and self._module_matches(
-                item["path"], item["language"], module_path, base_path, known_paths
+                item["path"], item["language"], module_path, base_path, known_paths, module_index
             ):
                 return True
         return False
@@ -1242,6 +1273,7 @@ class ReferenceService:
         imports: dict[str, list[ReferenceRecord]],
         reexport_rows: dict[str, list[ReferenceRecord]],
         known_paths: frozenset[str],
+        module_index: _ModuleIndex | None = None,
     ) -> bool:
         target_tail = (row["target_name"] or "").rsplit(".", 1)[-1]
         written_tail = (row["written_name"] or "").rsplit(".", 1)[-1]
@@ -1253,9 +1285,9 @@ class ReferenceService:
         return any(
             (item["alias"] or item["written_name"] or item["imported_name"]) == spelling
             and (
-                self._import_targets(item, selected, known_paths)
+                self._import_targets(item, selected, known_paths, module_index)
                 or self._reexport_targets_symbol(
-                    item, selected.symbol, selected.path, reexport_rows, known_paths
+                    item, selected.symbol, selected.path, reexport_rows, known_paths, module_index
                 )
             )
             for item in imports.get(row["file_id"], [])
@@ -1294,6 +1326,7 @@ class ReferenceService:
         imports: dict[str, list[ReferenceRecord]],
         reexport_rows: dict[str, list[ReferenceRecord]],
         known_paths: frozenset[str],
+        module_index: _ModuleIndex | None = None,
     ) -> tuple[str, str, str]:
         source_imports = imports.get(row["file_id"], [])
         if any(
@@ -1315,12 +1348,38 @@ class ReferenceService:
                 )
             for item in source_imports:
                 binding = item["alias"] or item["written_name"] or item["imported_name"]
-                if binding == receiver and self._import_targets(item, selected, known_paths):
+                if binding == receiver and self._import_targets(
+                    item, selected, known_paths, module_index
+                ):
                     return (
                         "exact",
                         "known_namespace_member",
                         "The receiver is a known imported namespace.",
                     )
+            # Go receiver-name rule: `s.Handle()` inside a method whose own
+            # receiver parameter is also named `s` (only method declarations
+            # are recorded in `receiver_names`, so a same-named first parameter
+            # of a plain function never matches). The variable provably holds
+            # that method's receiver type only when the name resolves
+            # project-wide uniquely (two same-named methods on different types
+            # keep this at `likely` -- flat Go method names cannot prove which
+            # receiver type the local holds, the plan's honest cap).
+            enclosing = row["source_qualified_symbol"]
+            owner_receiver = (
+                module_index.receiver_names.get((row["file_id"], enclosing))
+                if module_index is not None and enclosing
+                else None
+            )
+            if (
+                row["language"] == "go"
+                and owner_receiver == receiver
+                and len(target_candidates) == 1
+            ):
+                return (
+                    "exact",
+                    "same_receiver_member",
+                    "The receiver variable names the enclosing method's receiver parameter.",
+                )
             return (
                 "likely",
                 "unknown_receiver",
@@ -1331,14 +1390,14 @@ class ReferenceService:
             alias = item["alias"] or item["written_name"] or item["imported_name"]
             if alias != row["written_name"]:
                 continue
-            if self._import_targets(item, selected, known_paths):
+            if self._import_targets(item, selected, known_paths, module_index):
                 return (
                     "exact",
                     "direct_import_alias",
                     "The local alias directly imports this declaration.",
                 )
             if self._reexport_targets_symbol(
-                item, selected.symbol, selected.path, reexport_rows, known_paths
+                item, selected.symbol, selected.path, reexport_rows, known_paths, module_index
             ):
                 return (
                     "exact",
@@ -1356,6 +1415,26 @@ class ReferenceService:
             )
         if row["file_id"] == selected.file_id:
             return "exact", "same_file_symbol", "The call is in the declaration's source file."
+        # Go's intra-package default: a bare name used inside another file of
+        # the same directory needs no import, because one directory IS one Go
+        # package. A same-named symbol in another package cannot leak into
+        # this spelling -- reaching it requires an import (an explicit alias
+        # the branches above would have matched) or a dot-import (held at
+        # `unresolved` by the wildcard gate). Local shadowing is NOT modeled:
+        # a same-named local binding in the using function keeps the `exact`
+        # verdict, the same known cap `same_file_symbol` has always carried.
+        # Uniqueness is still required: Go allows a function and a
+        # method to share a name, and only then does this stay `likely`.
+        if (
+            row["language"] == "go"
+            and len(target_candidates) == 1
+            and PurePosixPath(row["path"]).parent == PurePosixPath(selected.path).parent
+        ):
+            return (
+                "exact",
+                "same_package_symbol",
+                "The use sits in the declaration's own Go package directory.",
+            )
         # `target_candidates` is already the project-wide set of
         # declarations sharing `selected.symbol` (fetched once, above, via
         # `target_name_candidates`), so no further filtering by name is
@@ -1373,12 +1452,23 @@ class ReferenceService:
         )
 
     def _import_targets(
-        self, item: ReferenceRecord, selected: SelectedDeclaration, known_paths: frozenset[str]
+        self,
+        item: ReferenceRecord,
+        selected: SelectedDeclaration,
+        known_paths: frozenset[str],
+        module_index: _ModuleIndex | None = None,
     ) -> bool:
-        return self._import_targets_symbol(item, selected.symbol, selected.path, known_paths)
+        return self._import_targets_symbol(
+            item, selected.symbol, selected.path, known_paths, module_index
+        )
 
     def _import_targets_symbol(
-        self, item: ReferenceRecord, symbol: str, path: str, known_paths: frozenset[str]
+        self,
+        item: ReferenceRecord,
+        symbol: str,
+        path: str,
+        known_paths: frozenset[str],
+        module_index: _ModuleIndex | None = None,
     ) -> bool:
         imported = item["imported_name"]
         if not self._is_namespace_import(item) and imported not in {symbol, "default", None}:
@@ -1386,7 +1476,9 @@ class ReferenceService:
         module_path = item["module_path"]
         if module_path is None:
             return False
-        return self._module_matches(item["path"], item["language"], module_path, path, known_paths)
+        return self._module_matches(
+            item["path"], item["language"], module_path, path, known_paths, module_index
+        )
 
     def _reexport_targets_symbol(
         self,
@@ -1395,6 +1487,7 @@ class ReferenceService:
         path: str,
         rows_by_path: dict[str, list[ReferenceRecord]],
         known_paths: frozenset[str],
+        module_index: _ModuleIndex | None = None,
         visited: frozenset[tuple[str, str]] = frozenset(),
         depth: int = 0,
     ) -> bool:
@@ -1412,7 +1505,7 @@ class ReferenceService:
         path + the name being chased there) and `depth` prevent chasing a
         cycle or a pathological fan-out forever.
         """
-        if self._import_targets_symbol(item, symbol, path, known_paths):
+        if self._import_targets_symbol(item, symbol, path, known_paths, module_index):
             return True
         if depth >= _MAX_REEXPORT_DEPTH or self._is_namespace_import(item):
             return False
@@ -1422,7 +1515,7 @@ class ReferenceService:
         imported = item["imported_name"]
         lookup_name = symbol if imported is None or imported == "default" else imported
         for candidate in self._module_candidates(
-            item["path"], item["language"], module_path, known_paths
+            item["path"], item["language"], module_path, known_paths, module_index
         ):
             key = (str(candidate), lookup_name)
             if key in visited:
@@ -1433,7 +1526,14 @@ class ReferenceService:
                 if binding != lookup_name:
                     continue
                 if self._reexport_targets_symbol(
-                    hop, symbol, path, rows_by_path, known_paths, next_visited, depth + 1
+                    hop,
+                    symbol,
+                    path,
+                    rows_by_path,
+                    known_paths,
+                    module_index,
+                    next_visited,
+                    depth + 1,
                 ):
                     return True
         return False
@@ -1493,8 +1593,76 @@ class ReferenceService:
         return PurePosixPath(*parts[:boundary])
 
     @staticmethod
+    def _build_module_index(
+        records: list[ReferenceRecord],
+        declarations: list[ReferenceRecord] | None = None,
+    ) -> _ModuleIndex:
+        """Precompute directory arithmetic once per query instead of per row.
+
+        `_module_candidates`'s Go arm needs "which known directories end with
+        these import-path segments" and "which files sit directly in that
+        directory". Deriving both from `known_paths` for every import row made
+        classification O(rows x paths); these two maps turn each lookup into a
+        dict access. Only suffix equality of *directory* parts is recorded --
+        no go.mod is read (a stated non-goal), so module prefix identity stays
+        unproven by design.
+
+        `declarations` (when the caller already has them) feeds the Go
+        receiver-name map, which records method declarations only; callers
+        that lack them simply leave it empty.
+        """
+        directories_by_suffix: dict[tuple[str, ...], set[str]] = {}
+        files_by_directory: dict[str, set[str]] = {}
+        receiver_names: dict[tuple[str, str], str] = {}
+        if declarations is not None:
+            for declaration in declarations:
+                if declaration["kind"] != "method":
+                    # Only a method's first parameter is a receiver. A plain
+                    # function's first parameter (`func handle(w http.Writer)`)
+                    # just happens to share the name shape; treating it as a
+                    # receiver upgraded unrelated stdlib calls to `exact`.
+                    continue
+                parameters = declaration["shape_json"]
+                qualified = declaration["source_qualified_symbol"]
+                if not parameters or not qualified:
+                    continue
+                try:
+                    shapes = json.loads(parameters)
+                except ValueError:
+                    continue
+                first = shapes[0] if shapes else None
+                if isinstance(first, dict) and first.get("name"):
+                    receiver_names[(declaration["file_id"], qualified)] = str(first["name"])
+        for row in records:
+            path = PurePosixPath(row["path"])
+            directory = path.parent
+            if str(directory) == ".":
+                continue
+            if path.suffix == ".go":
+                files_by_directory.setdefault(str(directory), set()).add(row["path"])
+            parts = directory.parts
+            # Every trailing-segment view of this directory is one potential
+            # import-path match: `app/store` also matches the suffix ("store",)
+            # because two different modules can contribute identical tails.
+            for depth in range(1, len(parts) + 1):
+                directories_by_suffix.setdefault(parts[-depth:], set()).add(str(directory))
+        return _ModuleIndex(
+            directories_by_suffix={
+                suffix: tuple(sorted(dirs)) for suffix, dirs in directories_by_suffix.items()
+            },
+            files_by_directory={
+                directory: tuple(sorted(files)) for directory, files in files_by_directory.items()
+            },
+            receiver_names=receiver_names,
+        )
+
+    @staticmethod
     def _module_candidates(
-        source_path: str, language: str, module_path: str, known_paths: frozenset[str]
+        source_path: str,
+        language: str,
+        module_path: str,
+        known_paths: frozenset[str],
+        module_index: _ModuleIndex | None = None,
     ) -> set[PurePosixPath]:
         """Every file path a relative `module_path` from `source_path` could mean.
 
@@ -1503,6 +1671,18 @@ class ReferenceService:
         path(s) to keep walking a re-export chain).
         """
         source = PurePosixPath(source_path)
+        if language == "go":
+            if module_index is None:
+                return set()
+            segments = tuple(part for part in PurePosixPath(module_path).parts if part != ".")
+            directories = module_index.directories_by_suffix.get(segments, ())
+            candidates: set[PurePosixPath] = set()
+            for directory in directories:
+                for file_path in module_index.files_by_directory.get(directory, ()):
+                    # A Go package spans files: every known sibling `.go` file
+                    # could carry the declaration the import binds.
+                    candidates.add(PurePosixPath(file_path))
+            return candidates
         if language == "python":
             dots = len(module_path) - len(module_path.lstrip("."))
             suffix = module_path[dots:]
@@ -1556,10 +1736,11 @@ class ReferenceService:
         module_path: str,
         target_path: str,
         known_paths: frozenset[str],
+        module_index: _ModuleIndex | None = None,
     ) -> bool:
         target = PurePosixPath(target_path)
         return target in ReferenceService._module_candidates(
-            source_path, language, module_path, known_paths
+            source_path, language, module_path, known_paths, module_index
         )
 
     @staticmethod
