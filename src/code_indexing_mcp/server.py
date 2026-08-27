@@ -26,6 +26,7 @@ from watchfiles import awatch
 from .application import Application
 from .daemon import BrokerApplication
 from .errors import CodeIndexingError, ErrorCode
+from .extractor import STRUCTURAL_LANGUAGES
 from .models import (
     ChunkKind,
     CodeChunk,
@@ -664,6 +665,36 @@ _WRITES = ToolAnnotations(
 _DESTRUCTIVE = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
 )
+
+# Display names for the languages named in tool descriptions. A language
+# missing here renders as its identifier, which is still readable -- but every
+# STRUCTURAL_LANGUAGES member should look right in the docs clients show.
+_STRUCTURAL_LANGUAGE_NAMES: dict[str, str] = {
+    "python": "Python",
+    "javascript": "JavaScript",
+    "typescript": "TypeScript",
+    "tsx": "TSX",
+    "go": "Go",
+    "rust": "Rust",
+    "java": "Java",
+    "csharp": "C#",
+    "c": "C",
+}
+
+
+def _structural_language_phrase() -> str:
+    """The 'Python, JavaScript, TypeScript, or TSX'-style phrase for descriptions.
+
+    Derived from `sorted(STRUCTURAL_LANGUAGES)` so the two tool descriptions can
+    never drift from the set that actually gates structural references.
+    """
+    names = [
+        _STRUCTURAL_LANGUAGE_NAMES.get(language, language)
+        for language in sorted(STRUCTURAL_LANGUAGES)
+    ]
+    if len(names) <= 1:
+        return ", ".join(names)
+    return f"{', '.join(names[:-1])}, or {names[-1]}"
 
 
 class AutoIndexingMCP(FastMCP):
@@ -1372,7 +1403,7 @@ def create_server(
     @mcp.tool(
         title="Find references",
         description=(
-            "Find structural uses of one Python, JavaScript, TypeScript, or TSX declaration; "
+            f"Find structural uses of one {_structural_language_phrase()} declaration; "
             "other languages return UNSUPPORTED_LANGUAGE. Select it with a chunk_id or project, "
             "path, and qualified_symbol. Results distinguish exact, likely, and unresolved "
             "bindings and may trigger parse-only structural backfill; they never edit source "
@@ -1415,7 +1446,7 @@ def create_server(
         title="Analyze refactor impact",
         description=(
             "Analyze a proposed rename or signature change without editing source files, for a "
-            "Python, JavaScript, TypeScript, or TSX declaration. Returns required edits, likely "
+            f"{_structural_language_phrase()} declaration. Returns required edits, likely "
             "changes, dynamic-review findings, and evidence: for a rename, resolved aliases that "
             "need no spelling change; for a signature change, compatible call sites that need no "
             "argument edit. Always read `completeness` and `limitations`: only the state "

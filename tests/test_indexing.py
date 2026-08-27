@@ -591,6 +591,41 @@ def test_reference_backfill_parses_unchanged_files_without_embedding(tmp_path: P
     )
 
 
+def test_go_backfill_gains_occurrences_without_an_embedding_pass(tmp_path: Path) -> None:
+    """The language-step version bump is the Go backfill trigger.
+
+    Go files indexed before the bump carry coverage rows but zero occurrences
+    (no structural extraction existed for them). After the version moves, the
+    parse-only backfill must re-extract them -- occurrences appear and
+    `reference_extraction_ns` is real -- while never running an embedding
+    pass.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.go").write_text(
+        'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("hi")\n}\n'
+    )
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    indexer.index(project)
+    file_id = store.list_files(project.id)[0].file_id
+    _remove_reference_generation(store, project.id)
+    batches_before = len(embedder.passage_batches)
+
+    report = indexer.backfill_references(project)
+
+    assert report.files_backfilled == 1
+    assert report.complete is True
+    assert len(embedder.passage_batches) == batches_before
+    rows = [row for row in store.list_reference_records(project.id) if row["file_id"] == file_id]
+    kinds = sorted(row["kind"] for row in rows if row["record_kind"] == "reference")
+    assert "call" in kinds
+    assert "import" in kinds
+    coverage = [row for row in rows if row["record_kind"] == "coverage"]
+    assert coverage and coverage[0]["schema_version"] == REFERENCE_SCHEMA_VERSION
+
+
 def test_files_current_agrees_between_the_backfilling_call_and_the_converged_one(
     tmp_path: Path,
 ) -> None:

@@ -608,7 +608,7 @@ def test_files_without_reference_extraction_are_reported_as_a_coverage_gap(
         tmp_path,
         {
             "lib.py": "def answer():\n    return 42\n",
-            "svc.go": "package main\n\nfunc Run() int {\n\treturn 1\n}\n",
+            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
         },
     )
 
@@ -617,8 +617,42 @@ def test_files_without_reference_extraction_are_reported_as_a_coverage_gap(
     )
 
     limitation = next(item for item in response.limitations if item.code == "unsupported_language")
-    assert "svc.go" in limitation.explanation
-    assert "go" in limitation.explanation
+    assert "svc.c" in limitation.explanation
+    assert "1 c file(s)" in limitation.explanation
+
+
+def test_go_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> None:
+    """Coverage flips only for the newly supported language.
+
+    Indexing a mixed Python + Go + C project must stop reporting
+    `unsupported_language` for the Go files while the C files stay reported,
+    proving the flip is scoped to the language that gained extraction.
+    """
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "main.go": 'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("hi")\n}\n',
+            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    )
+
+    go_gaps = [
+        item
+        for item in response.limitations
+        if item.code == "unsupported_language" and "main.go" in item.explanation
+    ]
+    assert not go_gaps
+    c_gaps = [
+        item
+        for item in response.limitations
+        if item.code == "unsupported_language" and "svc.c" in item.explanation
+    ]
+    assert c_gaps
 
 
 def test_find_references_narrows_the_declaration_fetch_to_files_with_a_reference(

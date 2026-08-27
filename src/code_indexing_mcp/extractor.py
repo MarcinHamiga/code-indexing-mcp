@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -59,7 +59,18 @@ _CONTAINER_KINDS: Final = frozenset(
 )
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 _QUOTE_CHARACTERS: Final = ("'", '"')
-STRUCTURAL_LANGUAGES: Final = frozenset({"python", "javascript", "typescript", "tsx"})
+STRUCTURAL_LANGUAGES: Final = frozenset({"python", "javascript", "typescript", "tsx", "go"})
+# Per-language handler for the non-`reference.identifier` captures of that
+# language's structural query. Both handlers share one signature
+# `(node, source, add_reference)` and re-dispatch on `node.type`, so a new
+# structured language slots in as one map entry beside its `.scm` file.
+_STRUCTURAL_RECORD_HANDLERS: Final[dict[str, str]] = {
+    "python": "_python_records",
+    "javascript": "_javascript_records",
+    "typescript": "_javascript_records",
+    "tsx": "_javascript_records",
+    "go": "_go_records",
+}
 _PACK_DOWNLOAD_ATTEMPTS: Final = 6
 _PACK_DOWNLOAD_BACKOFF_SECONDS: Final = 1.0
 _ReferenceAdder = Callable[..., None]
@@ -321,14 +332,20 @@ class TreeSitterExtractor:
     ) -> tuple[list[ExtractedReference], list[ExtractedDeclarationShape]]:
         """Extract syntax facts using the already parsed tree and definition index."""
         matches = QueryCursor(self._structural_query(language)).matches(root)
-        parameter_nodes: dict[int, Node] = {}
+        # A definition can own several captured parameter lists -- Go's
+        # `method_declaration` captures its receiver list AND its parameter
+        # list. Slot order follows source order (receiver first), which is
+        # exactly slot 0 = Python's `self` convention.
+        parameter_nodes: dict[int, list[Node]] = {}
         for _, captures in matches:
             for parameter_node in captures.get("declaration.parameters", []):
                 owner = parameter_node.parent
                 while owner is not None and owner.id not in index.by_node_id:
                     owner = owner.parent
                 if owner is not None:
-                    parameter_nodes[owner.id] = parameter_node
+                    bucket = parameter_nodes.setdefault(owner.id, [])
+                    if all(existing != parameter_node for existing in bucket):
+                        bucket.append(parameter_node)
         declarations = self._declaration_shapes(language, index, line_index, parameter_nodes)
         declaration_by_node = {
             definition.node.id: declaration
@@ -372,6 +389,8 @@ class TreeSitterExtractor:
                 )
             )
 
+        handler = _STRUCTURAL_RECORD_HANDLERS[language]
+        method = getattr(self, handler)
         for _, captures in matches:
             for capture, nodes in captures.items():
                 if not capture.startswith("reference."):
@@ -379,10 +398,11 @@ class TreeSitterExtractor:
                 for node in nodes:
                     if capture == "reference.identifier":
                         self._identifier_record(language, node, source, add)
-                    elif language == "python":
-                        self._python_records(node, source, add)
                     else:
-                        self._javascript_records(node, source, add)
+                        # Reference-query captures are decorative: every language
+                        # handler re-dispatches on `node.type`, so adding a
+                        # language is one `.scm` file plus one map entry.
+                        method(node, source, add)
         references.sort(key=lambda item: (item.start_byte, item.end_byte, item.kind))
         return references, declarations
 
@@ -414,7 +434,12 @@ class TreeSitterExtractor:
                 "extends_type_clause",
             }:
                 return
-            if parent.type in {"parameters", "formal_parameters", "lambda_parameters"}:
+            if parent.type in {
+                "parameters",
+                "formal_parameters",
+                "lambda_parameters",
+                "parameter_list",
+            }:
                 parameter = node
                 while parameter.parent is not None and parameter.parent != parent:
                     parameter = parameter.parent
@@ -454,8 +479,20 @@ class TreeSitterExtractor:
                 "jsx_opening_element",
                 "jsx_self_closing_element",
                 "jsx_closing_element",
+                # Go declaration-name fields surface as identifier or
+                # field_identifier and are bindings, not references. The
+                # receiver/parameter names are already cut by the
+                # parameter_list walk above; these cut the named owners.
+                "method_declaration",
+                "type_spec",
+                "type_alias",
+                "field_declaration",
+                "method_elem",
+                # A var spec's annotated type is emitted as `type_use` by the
+                # handler; the spec's own name is a binding.
+                "var_spec",
             }:
-                excluded_fields = ("name",)
+                excluded_fields = ("name", "type")
             elif parent.type in {
                 "assignment",
                 "assignment_expression",
@@ -466,6 +503,13 @@ class TreeSitterExtractor:
                 # JS `for (const item of items)` -- the loop binding is not a
                 # reference to an existing `item` (E11).
                 "for_in_statement",
+                # Go write targets and new bindings: `x = v` writes, `x := v`
+                # declares, `range`'s left side declares. The `write` row for
+                # an LHS member access comes from the selector handler; a bare
+                # LHS identifier is a pure binding here.
+                "assignment_statement",
+                "short_var_declaration",
+                "range_clause",
             }:
                 excluded_fields = ("left", "name")
             elif parent.type in {"arrow_function", "lambda"}:
@@ -491,8 +535,30 @@ class TreeSitterExtractor:
                 excluded_fields = ("alias", "parameter")
             elif parent.type == "export_statement":
                 excluded_fields = ("value",)
-            elif language != "python" and parent.type in {"pair", "pair_pattern"}:
+            elif language != "python" and parent.type in {
+                "pair",
+                "pair_pattern",
+                # Go composite-literal keys (`Widget{Name: "x"}`) are field
+                # bindings, not reads.
+                "keyed_element",
+            }:
                 excluded_fields = ("key",)
+            elif language != "python" and parent.type in {
+                # Go type wrappers: every identifier directly inside one is a
+                # type position, already emitted as `type_use` by the handler
+                # -- a parallel plain read would only duplicate it. (An array
+                # length expression nested deeper is untouched by this
+                # direct-parent rule.)
+                "pointer_type",
+                "slice_type",
+                "array_type",
+                "map_type",
+                "channel_type",
+                "function_type",
+                "parenthesized_type",
+                "qualified_type",
+            }:
+                return
             if any(contains(parent.child_by_field_name(field)) for field in excluded_fields):
                 return
             current = parent
@@ -533,7 +599,7 @@ class TreeSitterExtractor:
         language: str,
         index: _DefinitionIndex,
         line_index: _LineIndex,
-        parameter_nodes: dict[int, Node],
+        parameter_nodes: dict[int, list[Node]],
     ) -> list[ExtractedDeclarationShape]:
         rows: list[ExtractedDeclarationShape] = []
         for definition in index.definitions:
@@ -557,7 +623,29 @@ class TreeSitterExtractor:
         return rows
 
     @staticmethod
-    def _parameter_shapes(language: str, parameters: Node | None) -> list[ParameterShape]:
+    def _parameter_shapes(
+        language: str, parameters: Node | None | Sequence[Node | None]
+    ) -> list[ParameterShape]:
+        """Shapes for one definition's captured parameter list(s).
+
+        Most languages capture a single `parameters` node and this is the
+        flat loop it always was. Go's methods capture two lists in source
+        order (receiver first, then parameters); processing them
+        sequentially puts the receiver at slot 0, mirroring Python's `self`.
+        """
+        if parameters is None:
+            return []
+        nodes = list(parameters) if not isinstance(parameters, Node) else [parameters]
+        rows: list[ParameterShape] = []
+        for node in nodes:
+            rows.extend(TreeSitterExtractor._one_parameter_list(language, node))
+        # Slot positions are semantic (signature-compat analysis compares them
+        # caller-to-callee), so they are renumbered over the MERGED lists --
+        # Go's receiver+parameters pair would otherwise both start at 0.
+        return [row.model_copy(update={"position": index}) for index, row in enumerate(rows)]
+
+    @staticmethod
+    def _one_parameter_list(language: str, parameters: Node | None) -> list[ParameterShape]:
         if parameters is None:
             return []
         rows: list[ParameterShape] = []
@@ -618,6 +706,10 @@ class TreeSitterExtractor:
             ):
                 kind = "variadic"
                 name = name.removeprefix("*").removeprefix("...")
+            elif child.type == "variadic_parameter_declaration":
+                # Go's `opts ...string` -- a genuine variadic slot.
+                kind = "variadic"
+                name = name.removeprefix("*")
             elif child.type == "dictionary_splat_pattern":
                 kind = "keyword_variadic"
                 name = name.removeprefix("**")
@@ -844,6 +936,17 @@ class TreeSitterExtractor:
             "augmented_assignment_expression",
         }:
             return parent.child_by_field_name("left") == node
+        # Go wraps each assignment side in an `expression_list` (`s.next =
+        # nil`). The list itself is never a symbol; peek one level out without
+        # touching the Python/JS shapes, whose LHS identifiers are direct
+        # children of their assignment nodes.
+        if parent.type == "expression_list":
+            grandparent = parent.parent
+            if grandparent is not None and grandparent.type in {
+                "assignment_statement",
+                "augmented_assignment",
+            }:
+                return grandparent.child_by_field_name("left") == parent
         return False
 
     @staticmethod
@@ -1292,6 +1395,276 @@ class TreeSitterExtractor:
                     target_name=_capture_name(source, target),
                     written_name=_capture_name(source, target),
                 )
+
+    # Go's predeclared identifiers name no project declaration; a type_use for
+    # them is an unmatched row forever, so the descent stops at them instead.
+    _GO_PREDECLARED_TYPES: Final = frozenset(
+        {
+            "bool",
+            "byte",
+            "complex64",
+            "complex128",
+            "error",
+            "float32",
+            "float64",
+            "int",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "rune",
+            "string",
+            "uint",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "uintptr",
+            "any",
+        }
+    )
+
+    @staticmethod
+    def _go_descend_type_names(node: Node | None) -> list[Node]:
+        """Descend a Go type expression to its naming `type_identifier` leaves.
+
+        Unwraps pointer/slice/array/map/channel/function wrappers and
+        `qualified_type` down to leaf names (`pkg.Widget` contributes only its
+        final identifier -- the package qualifier is a namespace spelling, not
+        a symbol). Predeclared types (`string`, `error`, ...) yield nothing:
+        they can never be project declarations. Anything else yields nothing.
+        """
+        if node is None:
+            return []
+        if node.type == "type_identifier":
+            return [node]
+        if node.type == "qualified_type":
+            return TreeSitterExtractor._go_descend_type_names(node.child_by_field_name("type"))
+        if node.type in {
+            "pointer_type",
+            "slice_type",
+            "array_type",
+            "map_type",
+            "channel_type",
+            "parenthesized_type",
+        }:
+            names: list[Node] = []
+            for child in node.named_children:
+                names.extend(TreeSitterExtractor._go_descend_type_names(child))
+            return names
+        if node.type == "function_type":
+            # Parameter/result lists are binding contexts of the function
+            # type itself; its result type still names something.
+            return TreeSitterExtractor._go_descend_type_names(node.child_by_field_name("result"))
+        return []
+
+    @staticmethod
+    def _go_emit_type_uses(
+        node: Node | None, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        """Emit one `type_use` per Go type-name leaf reached from *node*."""
+        for name_node in TreeSitterExtractor._go_descend_type_names(node):
+            written = _capture_name(source, name_node)
+            if written in TreeSitterExtractor._GO_PREDECLARED_TYPES:
+                continue
+            add_reference("type_use", name_node, target_name=written, written_name=written)
+
+    def _go_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "import_spec":
+            path_node = node.child_by_field_name("path")
+            module_path = (
+                _capture_name(source, path_node).strip("'\"") if path_node is not None else None
+            )
+            alias_node = node.child_by_field_name("name")
+            imported_name = (module_path or "").rsplit("/", 1)[-1]
+            if alias_node is not None and alias_node.type == "dot":
+                # Dot-imports bind every exported name without any local
+                # spelling -- wildcard semantics.
+                add_reference(
+                    "import",
+                    node,
+                    target_name="*",
+                    written_name="*",
+                    module_path=module_path,
+                    imported_name="*",
+                    alias=None,
+                )
+                return
+            alias = _capture_name(source, alias_node) if alias_node is not None else None
+            # A Go import binds a whole package (a namespace), never a single
+            # symbol, so `imported_name` stays None -- mirroring Python's plain
+            # `import x.y`; member access goes through selector receivers.
+            add_reference(
+                "import",
+                node,
+                target_name=alias or imported_name,
+                written_name=alias or imported_name,
+                module_path=module_path,
+                imported_name=None,
+                alias=alias,
+            )
+        elif node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is None:
+                return
+            receiver = (
+                function.child_by_field_name("operand")
+                if function.type == "selector_expression"
+                else None
+            )
+            add_reference(
+                "call",
+                function,
+                target_name=_capture_name(source, function),
+                written_name=_capture_name(source, function),
+                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+                call_shape=self._call_shape(node),
+            )
+        elif node.type == "selector_expression":
+            parent = node.parent
+            if (
+                parent is not None
+                and parent.type == "call_expression"
+                and parent.child_by_field_name("function") == node
+            ):
+                # The call row above already owns this span.
+                return
+            field = node.child_by_field_name("field")
+            if field is None:
+                return
+            text = _capture_name(source, node)
+            kind: ReferenceKind = (
+                "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
+            )
+            add_reference(kind, node, target_name=text, written_name=text)
+        elif node.type == "type_spec":
+            declared = node.child_by_field_name("type")
+            if declared is None:
+                return
+            if declared.type == "struct_type":
+                fields = declared.child_by_field_name("body")
+                if fields is not None:
+                    self._go_fields(fields, source, add_reference)
+            elif declared.type == "interface_type":
+                self._go_interface(declared, source, add_reference)
+            else:
+                self._go_emit_type_uses(declared, source, add_reference)
+        elif node.type == "type_alias":
+            self._go_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
+        elif node.type == "field_declaration":
+            # Reached for anonymous-struct fields inside var specs (nested
+            # struct_type fields), and harmlessly alongside the type_spec
+            # walk for ordinary struct members -- add_reference dedupes.
+            self._go_field_declaration(node, source, add_reference)
+        elif node.type in {
+            "var_spec",
+            "parameter_declaration",
+            "variadic_parameter_declaration",
+            "composite_literal",
+        }:
+            self._go_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
+        elif node.type == "qualified_type":
+            self._go_emit_type_uses(node, source, add_reference)
+        elif node.type in {
+            "function_declaration",
+            "method_declaration",
+            "var_declaration",
+            "const_declaration",
+            "type_declaration",
+        }:
+            self._go_exports(node, source, add_reference)
+
+    def _go_fields(self, fields: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        for field in fields.named_children:
+            if field.is_extra:
+                continue
+            self._go_field_declaration(field, source, add_reference)
+
+    def _go_field_declaration(
+        self, node: Node, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        named = node.child_by_field_name("name")
+        declared = node.child_by_field_name("type")
+        if named is None and declared is not None:
+            # Embedded field (`Reader` inside a struct): promoted methods are
+            # inherited, so this is an inheritance edge, not a field typing.
+            self._go_embedded(declared, source, add_reference)
+            return
+        self._go_emit_type_uses(declared, source, add_reference)
+
+    @staticmethod
+    def _go_embedded(declared: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        head = TreeSitterExtractor._go_head_identifier(declared)
+        if head is None:
+            return
+        written = _capture_name(source, head)
+        if written in TreeSitterExtractor._GO_PREDECLARED_TYPES:
+            return
+        add_reference("inheritance", head, target_name=written, written_name=written)
+
+    @staticmethod
+    def _go_head_identifier(node: Node | None) -> Node | None:
+        """The first naming leaf of an embedded-type expression."""
+        current: Node | None = node
+        while current is not None:
+            if current.type == "type_identifier":
+                return current
+            if current.type == "qualified_type":
+                current = current.child_by_field_name("type")
+                continue
+            named = current.named_children
+            if not named:
+                return None
+            candidate = _first_named_child(current)
+            if candidate is None or candidate is current:
+                return None
+            current = candidate
+        return None
+
+    def _go_interface(self, interface: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        for element in interface.named_children:
+            if element.is_extra:
+                continue
+            if element.type == "method_elem":
+                # Method names are declaration-site spellings, not uses; only
+                # the parameter/result types are real references.
+                self._go_emit_type_uses(
+                    element.child_by_field_name("parameters"), source, add_reference
+                )
+                self._go_emit_type_uses(
+                    element.child_by_field_name("result"), source, add_reference
+                )
+            else:
+                # Embedded interface (`io.Reader`): an inheritance edge.
+                self._go_embedded(element, source, add_reference)
+
+    def _go_exports(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        """Export rows for top-level declarations with capitalized names.
+
+        Go exports by capitalization alone; lowercase declarations are
+        package-private and must gain no export row. The `source_file`
+        anchoring in go.scm keeps this to top-level declarations only --
+        nested function literals are not matched here at all.
+        """
+        specs: list[tuple[Node | None, Node | None]] = []
+        if node.type in {"method_declaration", "function_declaration"}:
+            specs.append((node.child_by_field_name("name"), None))
+        elif node.type == "type_declaration":
+            for spec in node.named_children:
+                if spec.type in {"type_spec", "type_alias"} and not spec.is_extra:
+                    specs.append((spec.child_by_field_name("name"), spec))
+        elif node.type in {"var_declaration", "const_declaration"}:
+            for spec in node.named_children:
+                if spec.is_extra:
+                    continue
+                specs.append((spec.child_by_field_name("name"), spec))
+        for name_node, _spec in specs:
+            if name_node is None:
+                continue
+            exported = _capture_name(source, name_node)
+            if not exported[:1].isupper():
+                continue
+            add_reference("export", name_node, target_name=exported, written_name=exported)
 
     def _definitions(self, language_name: str, root: Node, source: bytes) -> list[_Definition]:
         matches = QueryCursor(self._query(language_name)).matches(root)

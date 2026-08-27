@@ -734,7 +734,7 @@ def test_an_unanalyzable_language_makes_the_analysis_incomplete(tmp_path: Path) 
         tmp_path,
         {
             "auth.py": "def authorize(user):\n    return user\n",
-            "client.go": "package main\n\nfunc Run() int {\n\treturn 1\n}\n",
+            "client.c": "int Run(void) {\n\treturn 1;\n}\n",
         },
     )
 
@@ -748,24 +748,51 @@ def test_an_unanalyzable_language_makes_the_analysis_incomplete(tmp_path: Path) 
 
 
 def test_a_declaration_without_reference_extraction_is_refused(tmp_path: Path) -> None:
-    """Answering at all would mean reporting "rename one line" for a Go function
+    """Answering at all would mean reporting "rename one line" for a C function
     whose callers this index never looked at."""
 
     service, project_id = _indexed_service(
         tmp_path,
         {
-            "svc.go": "package main\n\nfunc Authorize(u string) string {\n\treturn u\n}\n",
-            "use.go": 'package main\n\nfunc Run() string {\n\treturn Authorize("a")\n}\n',
+            "svc.c": "int Authorize(const char *u) {\n\treturn 1;\n}\n",
+            "use.c": 'int Run(void) {\n\treturn Authorize("a");\n}\n',
         },
     )
 
     with pytest.raises(CodeIndexingError) as raised:
         service.analyze_refactor(
-            DeclarationSelector(project=project_id, path="svc.go", qualified_symbol="Authorize"),
+            DeclarationSelector(project=project_id, path="svc.c", qualified_symbol="Authorize"),
             RenameOperation(new_name="Permit"),
         )
 
     assert raised.value.code is ErrorCode.UNSUPPORTED_LANGUAGE
+
+
+def test_a_go_rename_analysis_covers_its_same_package_caller(tmp_path: Path) -> None:
+    """Go joined the structural languages, so a rename answers instead of
+    refusing -- and the intra-package call site binds exactly."""
+
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "svc.go": ("package main\n\nfunc Authorize(u string) string {\n\treturn u\n}\n"),
+            "use.go": ('package main\n\nfunc Run() string {\n\treturn Authorize("a")\n}\n'),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="svc.go", qualified_symbol="Authorize"),
+        RenameOperation(new_name="Permit"),
+    )
+
+    assert analysis.completeness.state == "complete"
+    edited_paths = {
+        (item.path, item.written_name)
+        for item in analysis.must_change
+        if item.edit_required and item.written_name == "Authorize"
+    }
+    assert ("svc.go", "Authorize") in edited_paths
+    assert ("use.go", "Authorize") in edited_paths
 
 
 def test_an_unproven_call_keeps_the_analysis_out_of_the_complete_state(

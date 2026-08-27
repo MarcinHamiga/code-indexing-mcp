@@ -915,3 +915,152 @@ def test_js_destructured_rest_binding_survives_a_leading_comment() -> None:
     exported = next(reference for reference in references if reference.kind == "export")
 
     assert exported.written_name == "rest"
+
+
+# ---------------------------------------------------------------------------
+# Go structural references (language step 1)
+# ---------------------------------------------------------------------------
+
+
+def _go_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.go"), "go", source.encode())
+
+
+def test_go_extracts_import_shapes() -> None:
+    """Plain, aliased, grouped, and dot imports produce one row each with
+    namespace semantics: `module_path` is the import path and the bound local
+    spelling is the alias or the conventional package name."""
+    source = (
+        "package sample\n\n"
+        'import "fmt"\n'
+        'import st "app/store"\n'
+        "import (\n"
+        '\t"bytes"\n'
+        '\t. "app/util"\n'
+        ")\n"
+    )
+
+    refs = {r.written_name: r for r in _go_result(source).references if r.kind == "import"}
+
+    assert refs["fmt"].module_path == "fmt"
+    assert refs["fmt"].imported_name is None and refs["fmt"].alias is None
+    assert (refs["st"].module_path, refs["st"].alias) == ("app/store", "st")
+    assert refs["bytes"].module_path == "bytes"
+    dot = refs["*"]
+    assert (dot.module_path, dot.imported_name, dot.alias) == ("app/util", "*", None)
+
+
+def test_go_calls_and_call_shapes() -> None:
+    source = "package sample\n\nfunc run() {\n\tbuild(1)\n\tw.Draw(true)\n}\n"
+
+    calls = {r.target_name: r for r in _go_result(source).references if r.kind == "call"}
+
+    assert calls["build"].receiver_text is None
+    assert calls["build"].call_shape is not None
+    assert calls["build"].call_shape.positional_count == 1
+    assert calls["w.Draw"].receiver_text == "w"
+    assert calls["w.Draw"].source_qualified_symbol == "run"
+    assert calls["w.Draw"].call_shape is not None
+    assert calls["w.Draw"].call_shape.positional_count == 1
+
+
+def test_go_method_receiver_is_parameter_slot_zero() -> None:
+    source = (
+        "package sample\n\n"
+        "func (s *Store) Get(key string) (int, error) {\n"
+        "\treturn 0, nil\n"
+        "}\n"
+        "func Total(items ...string) int {\n"
+        "\treturn len(items)\n"
+        "}\n"
+    )
+
+    declarations = {d.qualified_symbol: d for d in _go_result(source).declarations}
+
+    get_params = [(p.name, p.kind, p.required, p.position) for p in declarations["Get"].parameters]
+    assert get_params == [("s", "positional", True, 0), ("key", "positional", True, 1)]
+    total = [(p.name, p.kind, p.required, p.position) for p in declarations["Total"].parameters]
+    assert total == [("items", "variadic", False, 0)]
+    receiver_type_use = next(
+        r
+        for r in _go_result(source).references
+        if r.kind == "type_use" and r.target_name == "Store"
+    )
+    assert receiver_type_use.source_qualified_symbol == "Get"
+
+
+def test_go_member_access_reads_and_writes() -> None:
+    source = "package sample\n\nfunc set(s *Store) {\n\ts.next = nil\n\t_ = s.items\n}\n"
+
+    refs = _go_result(source).references
+    write = next(r for r in refs if r.kind == "write")
+    assert write.target_name == "s.next"
+    read = next(r for r in refs if r.kind == "read" and "." in r.target_name)
+    assert read.target_name == "s.items"
+
+
+def test_go_short_var_and_assignment_lefts_are_not_reads() -> None:
+    """`:=` declares, `=` writes -- neither side's bare identifiers may claim a
+    bogus read; the selector on an assignment's left still becomes a write.
+    A *later* use of the bound name (`if ok`) stays a genuine read."""
+    source = (
+        "package sample\n\n"
+        "func go_around(counter Counter) {\n"
+        "\ttotal, ok := counter.Count()\n"
+        "\tcounter.Total = total\n"
+        "\tif ok {\n"
+        "\t\t_ = total\n"
+        "\t}\n"
+        "}\n"
+    )
+
+    refs = [r for r in _go_result(source).references if r.source_qualified_symbol == "go_around"]
+    assert not any(r.kind == "read" and r.start_byte == source.index("total, ok") for r in refs)
+    write = next(r for r in refs if r.kind == "write")
+    assert write.target_name == "counter.Total"
+    assert [r.start_byte for r in refs if r.kind == "read" and r.written_name == "ok"] == [
+        source.index("if ok") + len("if ")
+    ]
+
+
+def test_go_embedded_fields_are_inheritance_edges() -> None:
+    source = "package sample\n\ntype Store struct {\n\tReader\n\tname string\n}\n"
+
+    inheritance = [r for r in _go_result(source).references if r.kind == "inheritance"]
+
+    assert [r.written_name for r in inheritance] == ["Reader"]
+    assert all(r.source_qualified_symbol == "Store" for r in inheritance)
+
+
+def test_go_types_become_type_use_rows() -> None:
+    """Parameter/result/field/var/composite-literal types emit one type_use per
+    project type; predeclared types (`string`, `int`) stay out."""
+    source = (
+        "package sample\n\n"
+        "var cache map[string]Widget\n\n"
+        "func build(w Widget) *Widget {\n"
+        "\tout := &Widget{}\n"
+        "\treturn out\n"
+        "}\n"
+    )
+
+    type_uses = [r for r in _go_result(source).references if r.kind == "type_use"]
+    names = [r.written_name for r in type_uses]
+    assert names.count("Widget") >= 3
+    assert not any(name in {"string", "int"} for name in names)
+
+
+def test_go_exports_capitalized_top_level_names_only() -> None:
+    source = (
+        "package sample\n\n"
+        "const Limit = 10\n"
+        "var total int\n"
+        "type Widget struct{}\n"
+        "type helper struct{}\n"
+        "func Build() {}\n"
+        "func internal() {}\n"
+    )
+
+    exports = [r for r in _go_result(source).references if r.kind == "export"]
+
+    assert sorted(r.written_name for r in exports) == ["Build", "Limit", "Widget"]
