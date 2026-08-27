@@ -488,11 +488,17 @@ class TreeSitterExtractor:
                 "type_alias",
                 "field_declaration",
                 "method_elem",
-                # A var spec's annotated type is emitted as `type_use` by the
-                # handler; the spec's own name is a binding.
+                # A var/const spec's annotated type is emitted as `type_use` by
+                # the handler; the spec's own name is a binding.
                 "var_spec",
+                "const_spec",
             }:
-                excluded_fields = ("name", "type")
+                # `result` covers a function/method's bare result type
+                # (`func load() Store`): the handler owns its `type_use` row,
+                # so a parallel plain read would only duplicate it with the
+                # wrong kind. Parameters are cut by the parameter_list walk
+                # above; parenthesized results by it too.
+                excluded_fields = ("name", "type", "result")
             elif parent.type in {
                 "assignment",
                 "assignment_expression",
@@ -512,6 +518,13 @@ class TreeSitterExtractor:
                 "range_clause",
             }:
                 excluded_fields = ("left", "name")
+            elif parent.type in {"inc_statement", "dec_statement"}:
+                # Go `x++`: the bare operand is mutated in place, and the
+                # selector handler owns the write row for `p.x++` -- the same
+                # single-representation rule as the assignment LHS above (the
+                # statement has no named field to exclude, hence the direct
+                # return).
+                return
             elif parent.type in {"arrow_function", "lambda"}:
                 # `parameter` covers a parenless single-identifier arrow param
                 # (`x => x`), which has no `formal_parameters` wrapper of its
@@ -939,15 +952,20 @@ class TreeSitterExtractor:
         # Go wraps each assignment side in an `expression_list` (`s.next =
         # nil`). The list itself is never a symbol; peek one level out without
         # touching the Python/JS shapes, whose LHS identifiers are direct
-        # children of their assignment nodes.
+        # children of their assignment nodes. `short_var_declaration` counts
+        # too: `a, p.z := 1, 2` re-assigns the existing `p.z`, so its selector
+        # operand is a write, not a read.
         if parent.type == "expression_list":
             grandparent = parent.parent
             if grandparent is not None and grandparent.type in {
                 "assignment_statement",
                 "augmented_assignment",
+                "short_var_declaration",
             }:
                 return grandparent.child_by_field_name("left") == parent
-        return False
+        # Go's `p.x++` / `p.x--`: the statement wraps its single operand
+        # without a named field, and the operand is exactly the write target.
+        return parent.type in {"inc_statement", "dec_statement"}
 
     @staticmethod
     def _emit_member_access(node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
@@ -1439,7 +1457,10 @@ class TreeSitterExtractor:
         if node.type == "type_identifier":
             return [node]
         if node.type == "qualified_type":
-            return TreeSitterExtractor._go_descend_type_names(node.child_by_field_name("type"))
+            # tree-sitter-go names the two sides `package` and `name` -- there
+            # is no `type` field, so descending it silently dropped every
+            # `pkg.Type` annotation. The naming leaf is the `name` field.
+            return TreeSitterExtractor._go_descend_type_names(node.child_by_field_name("name"))
         if node.type in {
             "pointer_type",
             "slice_type",
@@ -1565,13 +1586,16 @@ class TreeSitterExtractor:
             self._go_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
         elif node.type == "qualified_type":
             self._go_emit_type_uses(node, source, add_reference)
-        elif node.type in {
-            "function_declaration",
-            "method_declaration",
-            "var_declaration",
-            "const_declaration",
-            "type_declaration",
-        }:
+        elif node.type in {"function_declaration", "method_declaration"}:
+            self._go_exports(node, source, add_reference)
+            # A bare result type (`func load() Store`) hangs directly off the
+            # declaration, so nothing else captures it; the identifier
+            # fallback now cuts it, and this owns its `type_use` row. Pointer
+            # results reach the descent the same way, and parenthesized
+            # result lists are covered by the `parameter_declaration`
+            # captures inside them.
+            self._go_emit_type_uses(node.child_by_field_name("result"), source, add_reference)
+        elif node.type in {"var_declaration", "const_declaration", "type_declaration"}:
             self._go_exports(node, source, add_reference)
 
     def _go_fields(self, fields: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
@@ -1610,7 +1634,9 @@ class TreeSitterExtractor:
             if current.type == "type_identifier":
                 return current
             if current.type == "qualified_type":
-                current = current.child_by_field_name("type")
+                # The type name sits in the `name` field; `type` does not exist
+                # on `qualified_type` in this grammar (see the descent above).
+                current = current.child_by_field_name("name")
                 continue
             named = current.named_children
             if not named:
@@ -1621,6 +1647,30 @@ class TreeSitterExtractor:
             current = candidate
         return None
 
+    @staticmethod
+    def _go_emit_listed_type_uses(
+        node: Node | None, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        """Type uses for a Go parameter/result list -- or a single bare type.
+
+        `method_elem`'s `parameters`/`result` fields usually hold a
+        `parameter_list` wrapping `parameter_declaration` nodes, which the
+        leaf-level descent cannot enter (it only unwraps type expressions);
+        unwrap the declarations' `type` fields here. A bare unparenthesized
+        result (`Read() Error`) is a plain type node and descends directly.
+        """
+        if node is None:
+            return
+        if node.type == "parameter_list":
+            for child in node.named_children:
+                if child.is_extra:
+                    continue
+                TreeSitterExtractor._go_emit_type_uses(
+                    child.child_by_field_name("type"), source, add_reference
+                )
+            return
+        TreeSitterExtractor._go_emit_type_uses(node, source, add_reference)
+
     def _go_interface(self, interface: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
         for element in interface.named_children:
             if element.is_extra:
@@ -1628,10 +1678,10 @@ class TreeSitterExtractor:
             if element.type == "method_elem":
                 # Method names are declaration-site spellings, not uses; only
                 # the parameter/result types are real references.
-                self._go_emit_type_uses(
+                self._go_emit_listed_type_uses(
                     element.child_by_field_name("parameters"), source, add_reference
                 )
-                self._go_emit_type_uses(
+                self._go_emit_listed_type_uses(
                     element.child_by_field_name("result"), source, add_reference
                 )
             else:
@@ -1656,6 +1706,15 @@ class TreeSitterExtractor:
         elif node.type in {"var_declaration", "const_declaration"}:
             for spec in node.named_children:
                 if spec.is_extra:
+                    continue
+                if spec.type.endswith("_spec_list"):
+                    # Grouped declarations (`var ( A = 1 )`): the grammar wraps
+                    # `var` specs in a `var_spec_list`, while const/type groups
+                    # keep their specs as direct named children. Unwrap so the
+                    # grouped form exports exactly like the flat one.
+                    for inner in spec.named_children:
+                        if not inner.is_extra:
+                            specs.append((inner.child_by_field_name("name"), inner))
                     continue
                 specs.append((spec.child_by_field_name("name"), spec))
         for name_node, _spec in specs:

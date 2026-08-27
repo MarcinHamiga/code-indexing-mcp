@@ -3577,6 +3577,86 @@
         "349eda6c08023b69",
         "9ad3c3b5ddd16a57",
         "5cb0142abbe57bfd"
+      ],
+      [
+        "module",
+        null,
+        null,
+        null,
+        565,
+        602,
+        47,
+        52,
+        0,
+        "ada71b867c525156",
+        "4777ac4d4229787c",
+        "0b7bc9692f2596f4",
+        "37293aea0ba7e3ad",
+        "4d4a9032e7cb4505"
+      ],
+      [
+        "class",
+        "Handler",
+        "Handler",
+        null,
+        602,
+        707,
+        54,
+        59,
+        0,
+        "1eb2aefd42a938da",
+        "4f6774a4b09640d1",
+        "caeb5811fa0b1ce8",
+        "52a9466c51222568",
+        "cb7fdbc3cd5fd3ff"
+      ],
+      [
+        "class",
+        "Store",
+        "Store",
+        null,
+        709,
+        752,
+        61,
+        64,
+        0,
+        "b9582c8917521458",
+        "2969168bdb67bd2d",
+        "5e79826f4dbf3dfd",
+        "0b74dd4ef173d7d7",
+        "9ae15782af9173a9"
+      ],
+      [
+        "function",
+        "Load",
+        "Load",
+        null,
+        754,
+        790,
+        66,
+        68,
+        0,
+        "4a1acad5159aff38",
+        "7a1c1b5c0c056842",
+        "a2e9d7d561a328ba",
+        "c80a9f15e3eb48ed",
+        "4a790a4e79685a2c"
+      ],
+      [
+        "function",
+        "Tick",
+        "Tick",
+        null,
+        792,
+        884,
+        70,
+        76,
+        0,
+        "1716f9c39a3ef28c",
+        "2343b90e59a47006",
+        "6feeb6441a2a8d96",
+        "55cd47859e3e48bc",
+        "61477398743b828a"
       ]
     ],
     "declarations": [
@@ -3646,6 +3726,33 @@
             0
           ]
         ]
+      ],
+      [
+        "Handler",
+        "class",
+        []
+      ],
+      [
+        "Store",
+        "class",
+        []
+      ],
+      [
+        "Load",
+        "function",
+        []
+      ],
+      [
+        "Tick",
+        "function",
+        [
+          [
+            "item",
+            "positional",
+            true,
+            0
+          ]
+        ]
       ]
     ],
     "has_errors": false,
@@ -3688,18 +3795,6 @@
       ],
       [
         "export",
-        "Version",
-        "Version",
-        null,
-        null,
-        null,
-        71,
-        78,
-        "Version",
-        null
-      ],
-      [
-        "read",
         "Version",
         "Version",
         null,
@@ -3779,6 +3874,18 @@
         null,
         222,
         229,
+        "NewUser",
+        null
+      ],
+      [
+        "type_use",
+        "User",
+        "User",
+        null,
+        null,
+        null,
+        233,
+        237,
         "NewUser",
         null
       ],
@@ -3875,18 +3982,6 @@
         null,
         339,
         347,
-        "Fallback",
-        null
-      ],
-      [
-        "read",
-        "string",
-        "string",
-        null,
-        null,
-        null,
-        350,
-        356,
         "Fallback",
         null
       ],
@@ -4042,18 +4137,6 @@
         null
       ],
       [
-        "read",
-        "error",
-        "error",
-        null,
-        null,
-        null,
-        451,
-        456,
-        "Run",
-        null
-      ],
-      [
         "call",
         "NewUser",
         "NewUser",
@@ -4180,6 +4263,234 @@
         547,
         551,
         "Run",
+        null
+      ],
+      [
+        "export",
+        "Counter",
+        "Counter",
+        null,
+        null,
+        null,
+        574,
+        581,
+        null,
+        null
+      ],
+      [
+        "export",
+        "Handler",
+        "Handler",
+        null,
+        null,
+        null,
+        607,
+        614,
+        "Handler",
+        null
+      ],
+      [
+        "type_use",
+        "Item",
+        "Item",
+        null,
+        null,
+        null,
+        637,
+        641,
+        "Handler",
+        null
+      ],
+      [
+        "type_use",
+        "Item",
+        "Item",
+        null,
+        null,
+        null,
+        664,
+        668,
+        "Handler",
+        null
+      ],
+      [
+        "type_use",
+        "Result",
+        "Result",
+        null,
+        null,
+        null,
+        673,
+        679,
+        "Handler",
+        null
+      ],
+      [
+        "inheritance",
+        "Closer",
+        "Closer",
+        null,
+        null,
+        null,
+        699,
+        705,
+        "Handler",
+        null
+      ],
+      [
+        "type_use",
+        "Closer",
+        "Closer",
+        null,
+        null,
+        null,
+        699,
+        705,
+        "Handler",
+        null
+      ],
+      [
+        "export",
+        "Store",
+        "Store",
+        null,
+        null,
+        null,
+        714,
+        719,
+        "Store",
+        null
+      ],
+      [
+        "inheritance",
+        "Config",
+        "Config",
+        null,
+        null,
+        null,
+        733,
+        739,
+        "Store",
+        null
+      ],
+      [
+        "type_use",
+        "Config",
+        "Config",
+        null,
+        null,
+        null,
+        733,
+        739,
+        "Store",
+        null
+      ],
+      [
+        "export",
+        "Load",
+        "Load",
+        null,
+        null,
+        null,
+        759,
+        763,
+        "Load",
+        null
+      ],
+      [
+        "type_use",
+        "Item",
+        "Item",
+        null,
+        null,
+        null,
+        766,
+        770,
+        "Load",
+        null
+      ],
+      [
+        "read",
+        "Counter",
+        "Counter",
+        null,
+        null,
+        null,
+        781,
+        788,
+        "Load",
+        null
+      ],
+      [
+        "export",
+        "Tick",
+        "Tick",
+        null,
+        null,
+        null,
+        797,
+        801,
+        "Tick",
+        null
+      ],
+      [
+        "type_use",
+        "Item",
+        "Item",
+        null,
+        null,
+        null,
+        807,
+        811,
+        "Tick",
+        null
+      ],
+      [
+        "write",
+        "item.count",
+        "item.count",
+        null,
+        null,
+        null,
+        816,
+        826,
+        "Tick",
+        null
+      ],
+      [
+        "read",
+        "Counter",
+        "Counter",
+        null,
+        null,
+        null,
+        841,
+        848,
+        "Tick",
+        null
+      ],
+      [
+        "read",
+        "counter",
+        "counter",
+        null,
+        null,
+        null,
+        865,
+        872,
+        "Tick",
+        null
+      ],
+      [
+        "read",
+        "item",
+        "item",
+        null,
+        null,
+        null,
+        878,
+        882,
+        "Tick",
         null
       ]
     ]

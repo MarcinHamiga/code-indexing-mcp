@@ -64,10 +64,11 @@ class _ModuleIndex(NamedTuple):
     `files_by_directory` lists the files indexed directly inside each such
     directory (Go packages span files, so one directory is many candidates),
     and `receiver_names` maps `(file_id, enclosing qualified symbol)` to its
-    first parameter name (Go methods put their receiver there), which powers
-    the Go receiver-name rule. Python and JavaScript resolution ignore the
-    index entirely; only callers whose language has a directory-suffix or
-    receiver rule consult it.
+    first parameter name for method declarations only (Go methods put their
+    receiver there; a plain function's first parameter is not a receiver),
+    which powers the Go receiver-name rule. Python and JavaScript resolution
+    ignore the index entirely; only callers whose language has a
+    directory-suffix or receiver rule consult it.
     """
 
     directories_by_suffix: dict[tuple[str, ...], tuple[str, ...]]
@@ -1356,7 +1357,9 @@ class ReferenceService:
                         "The receiver is a known imported namespace.",
                     )
             # Go receiver-name rule: `s.Handle()` inside a method whose own
-            # receiver parameter is also named `s`. The variable provably holds
+            # receiver parameter is also named `s` (only method declarations
+            # are recorded in `receiver_names`, so a same-named first parameter
+            # of a plain function never matches). The variable provably holds
             # that method's receiver type only when the name resolves
             # project-wide uniquely (two same-named methods on different types
             # keep this at `likely` -- flat Go method names cannot prove which
@@ -1417,8 +1420,10 @@ class ReferenceService:
         # package. A same-named symbol in another package cannot leak into
         # this spelling -- reaching it requires an import (an explicit alias
         # the branches above would have matched) or a dot-import (held at
-        # `unresolved` by the wildcard gate), and local shadowing is filtered
-        # above. Uniqueness is still required: Go allows a function and a
+        # `unresolved` by the wildcard gate). Local shadowing is NOT modeled:
+        # a same-named local binding in the using function keeps the `exact`
+        # verdict, the same known cap `same_file_symbol` has always carried.
+        # Uniqueness is still required: Go allows a function and a
         # method to share a name, and only then does this stay `likely`.
         if (
             row["language"] == "go"
@@ -1603,13 +1608,20 @@ class ReferenceService:
         unproven by design.
 
         `declarations` (when the caller already has them) feeds the Go
-        receiver-name map; callers that lack them simply leave it empty.
+        receiver-name map, which records method declarations only; callers
+        that lack them simply leave it empty.
         """
         directories_by_suffix: dict[tuple[str, ...], set[str]] = {}
         files_by_directory: dict[str, set[str]] = {}
         receiver_names: dict[tuple[str, str], str] = {}
         if declarations is not None:
             for declaration in declarations:
+                if declaration["kind"] != "method":
+                    # Only a method's first parameter is a receiver. A plain
+                    # function's first parameter (`func handle(w http.Writer)`)
+                    # just happens to share the name shape; treating it as a
+                    # receiver upgraded unrelated stdlib calls to `exact`.
+                    continue
                 parameters = declaration["shape_json"]
                 qualified = declaration["source_qualified_symbol"]
                 if not parameters or not qualified:

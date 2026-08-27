@@ -45,3 +45,32 @@ func Run(r Reader) error {
 	_ = user
 	return nil
 }
+
+var (
+	Counter = 1
+	hidden  = 2
+)
+
+type Handler interface {
+	Serve(st.Item) error
+	Named(item st.Item) st.Result
+	Plain() error
+	st.Closer
+}
+
+type Store struct {
+	st.Config
+	open bool
+}
+
+func Load() Item {
+	return Counter
+}
+
+func Tick(item Item) {
+	item.count++
+	counter := Counter
+	counter--
+	_ = counter
+	_ = item
+}

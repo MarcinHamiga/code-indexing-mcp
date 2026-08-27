@@ -1064,3 +1064,122 @@ def test_go_exports_capitalized_top_level_names_only() -> None:
     exports = [r for r in _go_result(source).references if r.kind == "export"]
 
     assert sorted(r.written_name for r in exports) == ["Build", "Limit", "Widget"]
+
+
+def test_go_qualified_type_annotations_name_their_type_identifier() -> None:
+    """`pkg.Type` must contribute its final identifier as a `type_use`.
+
+    tree-sitter-go names the two `qualified_type` sides `package`/`name` --
+    there is no `type` field, so descending it silently dropped every
+    cross-package type annotation."""
+    source = (
+        "package sample\n\n"
+        'import st "app/store"\n\n'
+        "var view st.View\n\n"
+        "func build(s st.Store) *st.Item {\n"
+        "\treturn nil\n"
+        "}\n"
+    )
+
+    type_uses = [r for r in _go_result(source).references if r.kind == "type_use"]
+
+    assert sorted(r.written_name for r in type_uses) == ["Item", "Store", "View"]
+
+
+def test_go_qualified_embedding_is_an_inheritance_edge() -> None:
+    """A qualified embedded type (`st.Config` in a struct, `st.Closer` in an
+    interface) is promoted just like an unqualified one."""
+    source = (
+        "package sample\n\n"
+        'import st "app/store"\n\n'
+        "type Local struct {\n"
+        "\tst.Config\n"
+        "}\n\n"
+        "type Handler interface {\n"
+        "\tst.Closer\n"
+        "\tPlain() error\n"
+        "}\n"
+    )
+
+    inheritance = [r for r in _go_result(source).references if r.kind == "inheritance"]
+
+    assert sorted(r.written_name for r in inheritance) == ["Closer", "Config"]
+
+
+def test_go_grouped_var_exports_like_the_flat_form() -> None:
+    """`var ( ... )` wraps its specs in a `var_spec_list`, unlike const/type
+    groups whose specs sit directly under the declaration -- the group must
+    still export exactly its capitalized names."""
+    source = "package sample\n\nvar (\n\tCounter = 1\n\thidden = 2\n)\n"
+
+    exports = [r for r in _go_result(source).references if r.kind == "export"]
+
+    assert [r.written_name for r in exports] == ["Counter"]
+
+
+def test_go_const_spec_names_are_bindings_not_reads() -> None:
+    """A const spec's own name must not leak a `read` row at the declaration
+    site (the var_spec equivalent was always cut); a real use of the const
+    stays a read."""
+    source = "package sample\n\nconst Limit = 10\n\nfunc use() int {\n\treturn Limit\n}\n"
+
+    refs = _go_result(source).references
+
+    assert not any(r.kind == "read" and r.source_qualified_symbol is None for r in refs)
+    use_reads = [r for r in refs if r.kind == "read" and r.target_name == "Limit"]
+    assert [r.source_qualified_symbol for r in use_reads] == ["use"]
+
+
+def test_go_inc_dec_statements_are_writes() -> None:
+    """`item.count++` mutates through the selector, so it is a write; the bare
+    operand of `counter--` is likewise a mutation site, not a read."""
+    source = (
+        "package sample\n\n"
+        "func tick(item Item) {\n"
+        "\titem.count++\n"
+        "\tcounter := 0\n"
+        "\tcounter--\n"
+        "\t_ = counter\n"
+        "}\n"
+    )
+
+    refs = [r for r in _go_result(source).references if r.source_qualified_symbol == "tick"]
+
+    writes = [r for r in refs if r.kind == "write"]
+    assert [r.target_name for r in writes] == ["item.count"]
+    assert not any(r.kind == "read" and r.start_byte == source.index("counter--") for r in refs)
+
+
+def test_go_bare_result_type_is_a_type_use() -> None:
+    """`func Load() Item`: the unparenthesized result hangs directly off the
+    declaration, so the handler owns its `type_use` -- and the identifier
+    fallback must not double it as a plain read."""
+    source = "package sample\n\ntype Item struct{}\n\nfunc Load() Item {\n\treturn Item{}\n}\n"
+
+    refs = _go_result(source).references
+    result_use = next(r for r in refs if r.kind == "type_use" and r.written_name == "Item")
+
+    assert result_use.source_qualified_symbol == "Load"
+    assert not any(
+        r.kind == "read" and r.written_name == "Item" and r.start_byte == result_use.start_byte
+        for r in refs
+    )
+
+
+def test_go_interface_method_elem_types_are_type_uses() -> None:
+    """Interface method elements contribute their parameter and result types
+    -- through the `parameter_list` wrappers, qualified names included --
+    but never their method names."""
+    source = (
+        "package sample\n\n"
+        'import st "app/store"\n\n'
+        "type Handler interface {\n"
+        "\tServe(st.Item) error\n"
+        "\tNamed(item st.Item) st.Result\n"
+        "\tPlain() error\n"
+        "}\n"
+    )
+
+    type_uses = [r for r in _go_result(source).references if r.kind == "type_use"]
+
+    assert sorted(r.written_name for r in type_uses) == ["Item", "Item", "Result"]
