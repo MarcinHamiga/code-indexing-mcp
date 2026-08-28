@@ -40,6 +40,11 @@ _LIMITATION_REASONS: Final = frozenset(
     {"wildcard_import", "unknown_receiver", "ambiguous_symbol", "unproven_reexport"}
 )
 
+# Reason codes that are only a limitation when they did NOT resolve exactly:
+# an `on_demand_import` hit that proved the binding exactly is a result, not
+# a gap, so it stays out of the limitation list.
+_CONDITIONAL_LIMITATION_REASONS: Final = frozenset({"on_demand_import"})
+
 # Bound re-export traversal so malformed or unusually deep barrel chains are
 # reported as unproven rather than walked indefinitely.
 _MAX_REEXPORT_DEPTH: Final = 4
@@ -75,6 +80,10 @@ class _ModuleIndex(NamedTuple):
 
     directories_by_suffix: dict[tuple[str, ...], tuple[str, ...]]
     files_by_directory: dict[str, tuple[str, ...]]
+    java_files_by_directory: dict[str, tuple[str, ...]]
+    namespace_by_path: dict[str, str]
+    files_by_namespace: dict[str, tuple[str, ...]]
+    names_by_namespace: dict[str, frozenset[str]]
     receiver_names: dict[tuple[str, str], str]
     rust_crate_roots: dict[str, str]
 
@@ -457,7 +466,9 @@ class ReferenceService:
                 known_paths,
                 module_index,
             )
-            if reason in _LIMITATION_REASONS:
+            if reason in _LIMITATION_REASONS or (
+                reason in _CONDITIONAL_LIMITATION_REASONS and resolution != "exact"
+            ):
                 limitations.append(
                     ReferenceLimitation(code=reason, explanation=explanation, path=row["path"])
                 )
@@ -1285,6 +1296,18 @@ class ReferenceService:
         if row["kind"] == "import" and self._is_namespace_import(row):
             return False
         spelling = row["receiver_text"] or row["written_name"]
+        # A Java file with an on-demand import keeps every row that spells
+        # the selected symbol eligible: `_java_on_demand` (D3) is what decides
+        # between `exact` and `likely`, so the pre-filter must not drop them.
+        if (
+            row["language"] == "java"
+            and spelling == selected.symbol
+            and any(
+                item["language"] == "java" and item["imported_name"] == "*"
+                for item in imports.get(row["file_id"], [])
+            )
+        ):
+            return True
         return any(
             (item["alias"] or item["written_name"] or item["imported_name"]) == spelling
             and (
@@ -1332,8 +1355,13 @@ class ReferenceService:
         module_index: _ModuleIndex | None = None,
     ) -> tuple[str, str, str]:
         source_imports = imports.get(row["file_id"], [])
+        # Java's on-demand imports (`import a.b.*`) are wildcard-shaped but
+        # resolve under their own, evidence-based rule (D3) -- never through
+        # this gate, which holds genuinely dynamic wildcards unresolved.
         if any(
-            item["imported_name"] == "*" and not self._is_namespace_import(item)
+            item["imported_name"] == "*"
+            and not self._is_namespace_import(item)
+            and item["language"] != "java"
             for item in source_imports
         ):
             return (
@@ -1383,6 +1411,16 @@ class ReferenceService:
                     "same_receiver_member",
                     "The receiver variable names the enclosing method's receiver parameter.",
                 )
+            # Java static calls through a type imported on demand
+            # (`Item.build()` under `import a.b.*`): the receiver is the
+            # selected type's spelling, so D3's evidence rule applies here
+            # too instead of dropping to `unknown_receiver`.
+            if row["language"] == "java":
+                verdict = self._java_on_demand(
+                    row, source_imports, selected, target_candidates, known_paths, module_index
+                )
+                if verdict is not None:
+                    return verdict
             return (
                 "likely",
                 "unknown_receiver",
@@ -1418,26 +1456,67 @@ class ReferenceService:
             )
         if row["file_id"] == selected.file_id:
             return "exact", "same_file_symbol", "The call is in the declaration's source file."
-        # Go's intra-package default: a bare name used inside another file of
-        # the same directory needs no import, because one directory IS one Go
-        # package. A same-named symbol in another package cannot leak into
-        # this spelling -- reaching it requires an import (an explicit alias
-        # the branches above would have matched) or a dot-import (held at
-        # `unresolved` by the wildcard gate). Local shadowing is NOT modeled:
-        # a same-named local binding in the using function keeps the `exact`
-        # verdict, the same known cap `same_file_symbol` has always carried.
-        # Uniqueness is still required: Go allows a function and a
-        # method to share a name, and only then does this stay `likely`.
+        # Go's and Java's intra-package default: a bare name used inside
+        # another file of the same directory needs no import, because one
+        # directory IS one package in both languages. A same-named symbol in
+        # another package cannot leak into this spelling -- reaching it
+        # requires an import (an explicit alias the branches above would have
+        # matched) or a wildcard/on-demand import (Go dot-imports are held at
+        # `unresolved` by the wildcard gate; Java's ride the D3 branch below).
+        # Local shadowing is NOT modeled: a same-named local binding in the
+        # using function keeps the `exact` verdict, the same known cap
+        # `same_file_symbol` has always carried. Uniqueness is still required:
+        # Go allows a function and a method, and Java allows same-named
+        # members, to share a name -- only then does this stay `likely`.
         if (
-            row["language"] == "go"
+            row["language"] in {"go", "java"}
             and len(target_candidates) == 1
             and PurePosixPath(row["path"]).parent == PurePosixPath(selected.path).parent
         ):
             return (
                 "exact",
                 "same_package_symbol",
-                "The use sits in the declaration's own Go package directory.",
+                "The use sits in the declaration's own package directory.",
             )
+        # C#'s intra-namespace default: a bare name used in another file of
+        # the same declared namespace needs no using -- namespace identity is
+        # the package boundary, proven from the export rows (D2). Uniqueness
+        # is still required, mirroring the Go/Java directory rule above.
+        if row["language"] == "csharp" and len(target_candidates) == 1 and module_index is not None:
+            row_namespace = module_index.namespace_by_path.get(row["path"])
+            if row_namespace and row_namespace == module_index.namespace_by_path.get(selected.path):
+                return (
+                    "exact",
+                    "same_package_symbol",
+                    "The use sits in the declaration's own namespace.",
+                )
+        # Java on-demand imports over a bare name (D3): the package edge is
+        # proven when its directory resolves to indexed files, and the name
+        # binds exactly when the selected declaration is that name's only
+        # indexed declaration project-wide; anything weaker stays `likely`
+        # with the same reason.
+        if row["language"] == "java":
+            verdict = self._java_on_demand(
+                row, source_imports, selected, target_candidates, known_paths, module_index
+            )
+            if verdict is not None:
+                return verdict
+        # C# plain/`static` usings over a bare name (D2 on-demand semantics):
+        # a using provably binds when the selected declaration lives in the
+        # used namespace (namespace form) or on the used type (static form).
+        # Exactness requires, like Java's D3 and the same-namespace rule
+        # above, that the name has exactly one indexed declaration
+        # project-wide -- otherwise a same-named declaration in the consumer's
+        # own namespace or class (which C# name resolution prefers over any
+        # using) would silently earn `exact`. More than one proven binding
+        # among the file's usings is the ambiguity a compiler would reject,
+        # so it stays `likely` too.
+        if row["language"] == "csharp":
+            verdict = self._csharp_using(
+                row, source_imports, selected, target_candidates, module_index
+            )
+            if verdict is not None:
+                return verdict
         # `target_candidates` is already the project-wide set of
         # declarations sharing `selected.symbol` (fetched once, above, via
         # `target_name_candidates`), so no further filtering by name is
@@ -1544,9 +1623,173 @@ class ReferenceService:
     @staticmethod
     def _is_namespace_import(item: ReferenceRecord) -> bool:
         imported = item["imported_name"]
-        return (imported == "*" and item["alias"] is not None) or (
-            item["language"] == "python" and imported is None and item["module_path"] is not None
+        return (
+            (imported == "*" and item["alias"] is not None)
+            or (
+                item["language"] == "python"
+                and imported is None
+                and item["module_path"] is not None
+            )
+            or (
+                # C# plain/`static`/`global` usings bind names without a
+                # local spelling -- on-demand semantics, never a dynamic
+                # wildcard, so the wildcard gate must not hold them.
+                item["language"] == "csharp" and imported == "*" and item["module_path"] is not None
+            )
         )
+
+    def _java_on_demand(
+        self,
+        row: ReferenceRecord,
+        source_imports: list[ReferenceRecord],
+        selected: SelectedDeclaration,
+        target_candidates: list[ReferenceRecord],
+        known_paths: frozenset[str],
+        module_index: _ModuleIndex | None,
+    ) -> tuple[str, str, str] | None:
+        """D3: classify a Java row against the file's on-demand imports.
+
+        `import a.b.*` (and its `static` form) can bind the selected symbol
+        only when the row actually spells that symbol (a bare name or a
+        receiver that is the type's simple name), the package resolves to
+        indexed files, and exactly one indexed declaration carries the name
+        project-wide. Anything weaker -- several indexed declarations of the
+        name, or an unresolvable package -- stays `likely` with the same
+        `on_demand_import` reason rather than gambling on one of them.
+        Returns None when no on-demand import could be in play for this row,
+        leaving every other branch in charge.
+        """
+        on_demand = [
+            item
+            for item in source_imports
+            if item["language"] == "java" and item["imported_name"] == "*"
+        ]
+        if not on_demand:
+            return None
+        spelling = row["receiver_text"] or row["written_name"]
+        if spelling != selected.symbol:
+            return None
+        proven = len(target_candidates) == 1 and any(
+            item["module_path"] is not None
+            and self._java_package_files(row["path"], item["module_path"], module_index)
+            for item in on_demand
+        )
+        if proven:
+            return (
+                "exact",
+                "on_demand_import",
+                "The on-demand import's package resolves to indexed files and this name has "
+                "exactly one indexed declaration.",
+            )
+        return (
+            "likely",
+            "on_demand_import",
+            "An on-demand import could bind this name, but the package holds several indexed "
+            "declarations of it (or none).",
+        )
+
+    @staticmethod
+    def _java_package_files(
+        source_path: str, module_path: str, module_index: _ModuleIndex | None
+    ) -> set[str]:
+        """Indexed `.java` files a package path resolves to, by directory suffix.
+
+        The same module-prefix-agnostic suffix match the Go arm uses: a
+        package's segment tuple must equal some known directory's trailing
+        segments, and that directory must hold at least one indexed `.java`
+        file. Never touches the filesystem -- the index snapshot is the only
+        evidence.
+        """
+        if module_index is None:
+            return set()
+        segments = tuple(part for part in module_path.split(".") if part and part != ".")
+        if not segments:
+            return set()
+        files: set[str] = set()
+        for directory in module_index.directories_by_suffix.get(segments, ()):
+            files.update(module_index.java_files_by_directory.get(directory, ()))
+        return files
+
+    def _csharp_using(
+        self,
+        row: ReferenceRecord,
+        source_imports: list[ReferenceRecord],
+        selected: SelectedDeclaration,
+        target_candidates: list[ReferenceRecord],
+        module_index: _ModuleIndex | None,
+    ) -> tuple[str, str, str] | None:
+        """D2: classify a C# row against the file's plain/`static` usings.
+
+        The row must actually spell the selected symbol (a bare name or a
+        receiver that is the type's simple name). A namespace-form using
+        (`using Demo.Catalog;`) provably binds when the selected declaration
+        is exported from exactly that namespace; a `using static A.B.Errors`
+        provably binds a member when the selected declaration's owner is the
+        FQN's tail type and that tail is exported from the FQN's namespace
+        prefix. Exactness additionally requires the name to be the only
+        indexed declaration of that name project-wide -- the same uniqueness
+        evidence Java's D3 rule uses -- because C# name resolution prefers a
+        same-named declaration in the consumer's own namespace or class over
+        anything a using imports, so a second candidate can never be proven
+        away. Two proven bindings among the file's usings are ambiguous in
+        real C#, so the verdict degrades to `likely` rather than picking one;
+        zero proven bindings returns None so the ordinary fallbacks decide.
+        """
+        if module_index is None:
+            return None
+        usings = [
+            item
+            for item in source_imports
+            if item["language"] == "csharp" and item["imported_name"] == "*"
+        ]
+        if not usings:
+            return None
+        spelling = row["receiver_text"] or row["written_name"]
+        if spelling != selected.symbol:
+            return None
+        selected_namespace = module_index.namespace_by_path.get(selected.path)
+        selected_owner = (
+            selected.qualified_symbol.rsplit(".", 1)[0] if "." in selected.qualified_symbol else ""
+        )
+        bindings: set[str] = set()
+        for item in usings:
+            module_path = item["module_path"]
+            if module_path is None:
+                continue
+            if module_path in module_index.names_by_namespace:
+                # Namespace form: binds iff the declaration is exported from
+                # exactly that namespace.
+                if selected_namespace == module_path:
+                    bindings.add(module_path)
+                continue
+            segments = [part for part in module_path.split(".") if part]
+            if len(segments) < 2:
+                continue
+            namespace = ".".join(segments[:-1])
+            tail = segments[-1]
+            # Static form: the declaration must live on the named type in the
+            # named namespace.
+            if (
+                namespace in module_index.names_by_namespace
+                and tail in module_index.names_by_namespace[namespace]
+                and selected_namespace == namespace
+                and selected_owner == tail
+            ):
+                bindings.add(module_path)
+        if len(bindings) == 1 and len(target_candidates) == 1:
+            return (
+                "exact",
+                "on_demand_import",
+                "The using directive's namespace provably declares this declaration.",
+            )
+        if bindings:
+            return (
+                "likely",
+                "on_demand_import",
+                "A using directive could bind this name, but other same-named "
+                "declarations keep the binding unproven.",
+            )
+        return None
 
     @staticmethod
     def _same_owner(row: ReferenceRecord, selected: SelectedDeclaration) -> bool:
@@ -1616,6 +1859,10 @@ class ReferenceService:
         """
         directories_by_suffix: dict[tuple[str, ...], set[str]] = {}
         files_by_directory: dict[str, set[str]] = {}
+        java_files_by_directory: dict[str, set[str]] = {}
+        namespace_by_path: dict[str, str] = {}
+        files_by_namespace: dict[str, set[str]] = {}
+        names_by_namespace: dict[str, set[str]] = {}
         receiver_names: dict[tuple[str, str], str] = {}
         rust_directories: set[str] = set()
         rust_crate_markers: set[str] = set()
@@ -1641,10 +1888,26 @@ class ReferenceService:
         for row in records:
             path = PurePosixPath(row["path"])
             directory = path.parent
+            if (
+                row["record_kind"] == "reference"
+                and row["kind"] == "export"
+                and row["module_path"]
+                and row["target_name"]
+            ):
+                # D2: a C# file's declared namespace rides its top-level
+                # types' export rows -- the one per-file fact the resolver
+                # needs; namespaces never map to directories. This must not
+                # depend on the file's directory: a root-level `.cs` file
+                # declares its namespace just the same.
+                namespace_by_path.setdefault(row["path"], row["module_path"])
+                files_by_namespace.setdefault(row["module_path"], set()).add(row["path"])
+                names_by_namespace.setdefault(row["module_path"], set()).add(row["target_name"])
             if str(directory) == ".":
                 continue
             if path.suffix == ".go":
                 files_by_directory.setdefault(str(directory), set()).add(row["path"])
+            if path.suffix == ".java":
+                java_files_by_directory.setdefault(str(directory), set()).add(row["path"])
             if path.suffix == ".rs":
                 rust_directories.add(str(directory))
                 if path.name in {"lib.rs", "main.rs"}:
@@ -1661,6 +1924,17 @@ class ReferenceService:
             },
             files_by_directory={
                 directory: tuple(sorted(files)) for directory, files in files_by_directory.items()
+            },
+            java_files_by_directory={
+                directory: tuple(sorted(files))
+                for directory, files in java_files_by_directory.items()
+            },
+            namespace_by_path=namespace_by_path,
+            files_by_namespace={
+                namespace: tuple(sorted(files)) for namespace, files in files_by_namespace.items()
+            },
+            names_by_namespace={
+                namespace: frozenset(names) for namespace, names in names_by_namespace.items()
             },
             receiver_names=receiver_names,
             rust_crate_roots=ReferenceService._rust_crate_roots(
@@ -1764,6 +2038,49 @@ class ReferenceService:
             if directory_candidates and root_candidates:
                 return directory_candidates & root_candidates
             return directory_candidates | root_candidates
+        if language == "java":
+            # `import a.b.C` is pure path arithmetic: a type FQN's package
+            # segments suffix-match known directories (module-prefix agnostic,
+            # exactly like Go) and the final segment names `Stem.java` inside
+            # one of them. On-demand imports never reach this arm -- their
+            # rows carry `imported_name="*"`, which `_import_targets_symbol`
+            # rejects before matching, and the D3 branch uses
+            # `_java_package_files` instead.
+            if module_index is None:
+                return set()
+            segments = tuple(part for part in module_path.split(".") if part and part != ".")
+            if len(segments) < 2:
+                # At least one package segment plus the type stem is needed;
+                # the default package has no directory to suffix-match.
+                return set()
+            package, type_stem = segments[:-1], segments[-1]
+            java_candidates: set[PurePosixPath] = set()
+            for directory in module_index.directories_by_suffix.get(package, ()):
+                candidate = f"{directory}/{type_stem}.java"
+                if candidate in known_paths:
+                    java_candidates.add(PurePosixPath(candidate))
+            return java_candidates
+        if language == "csharp":
+            # Namespaces never map to directories (D2): a csharp module_path
+            # is a declared namespace (`using Demo.Catalog;`) or a type FQN
+            # (`using W = Acme.Gadget;` / `using static Acme.Errors;`),
+            # resolved through the export rows that carry each file's
+            # declared namespace.
+            if module_index is None:
+                return set()
+            namespace_candidates: set[PurePosixPath] = {
+                PurePosixPath(path) for path in module_index.files_by_namespace.get(module_path, ())
+            }
+            parts = [part for part in module_path.split(".") if part]
+            if len(parts) >= 2:
+                namespace = ".".join(parts[:-1])
+                tail = parts[-1]
+                if tail in module_index.names_by_namespace.get(namespace, frozenset()):
+                    namespace_candidates.update(
+                        PurePosixPath(path)
+                        for path in module_index.files_by_namespace.get(namespace, ())
+                    )
+            return namespace_candidates
         if language == "python":
             dots = len(module_path) - len(module_path.lstrip("."))
             suffix = module_path[dots:]

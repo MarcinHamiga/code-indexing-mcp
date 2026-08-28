@@ -636,3 +636,229 @@ def test_rust_trait_impl_is_an_inheritance_edge(tmp_path: Path) -> None:
     inheritance = next(hit for hit in response.hits if hit.kind == "inheritance")
     assert inheritance.resolution == "exact"
     assert inheritance.reason_code == "same_file_symbol"
+
+
+# ---------------------------------------------------------------------------
+# Java: language step 3 -- imports, on-demand semantics, same package, this.
+# ---------------------------------------------------------------------------
+
+
+def test_java_single_type_import_resolves_exactly(tmp_path: Path) -> None:
+    """`Item.build()` and a `Item marker;` field bind through a single-type
+    import: the receiver rides `known_namespace_member`, the plain type use
+    rides `direct_import_alias`."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "java" / "single_type_import_exact"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id, path="com/example/util/Item.java", qualified_symbol="Item"
+        )
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "Main.java" and hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "known_namespace_member"
+    type_use = next(hit for hit in response.hits if hit.kind == "type_use")
+    assert type_use.resolution == "exact"
+    assert type_use.reason_code == "direct_import_alias"
+
+
+def test_java_on_demand_import_resolves_exactly_when_unique(tmp_path: Path) -> None:
+    """`new Stamp()` under `import com.example.util.*`: the package resolves
+    to indexed files and `Stamp` has exactly one indexed declaration, so D3
+    proves the binding exactly."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "java" / "on_demand_unique_exact"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id, path="com/example/util/Stamp.java", qualified_symbol="Stamp"
+        )
+    )
+
+    constructor = next(hit for hit in response.hits if hit.kind == "call")
+    assert constructor.resolution == "exact"
+    assert constructor.reason_code == "on_demand_import"
+    type_use = next(hit for hit in response.hits if hit.kind == "type_use")
+    assert type_use.resolution == "exact"
+    assert type_use.reason_code == "on_demand_import"
+
+
+def test_java_on_demand_import_stays_likely_when_ambiguous(tmp_path: Path) -> None:
+    """Two indexed `Stamp` declarations: the on-demand import cannot prove
+    which one binds, so the use stays `likely` with the same reason."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "java" / "on_demand_ambiguous_likely"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id,
+            path="com/example/util/Stamp.java",
+            qualified_symbol="Stamp",
+        )
+    )
+
+    type_use = next(hit for hit in response.hits if hit.kind == "type_use")
+    assert type_use.resolution == "likely"
+    assert type_use.reason_code == "on_demand_import"
+    assert any(item.code == "on_demand_import" for item in response.limitations)
+
+
+def test_java_static_import_resolves_exactly(tmp_path: Path) -> None:
+    """A bare `fail(...)` call binds through `import static ...Errors.fail`:
+    the member is the imported name and the host type's file resolves."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "java" / "static_import")
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id,
+            path="com/example/util/Errors.java",
+            qualified_symbol="Errors.fail",
+        )
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "direct_import_alias"
+
+
+def test_java_same_package_call_resolves_exactly(tmp_path: Path) -> None:
+    """A bare intra-package call needs no import: one directory IS one Java
+    package, mirroring Go's same-package rule."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "java" / "same_package_exact")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="Auth.java", qualified_symbol="Auth.authorize")
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "Main.java" and hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "same_package_symbol"
+
+
+def test_java_this_receiver_resolves_exactly(tmp_path: Path) -> None:
+    """`this.reset()` inside `Widget.bump` carries the enclosing owner, so
+    the receiver matches the declaration's owner exactly."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "java" / "this_receiver_exact")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="Widget.java", qualified_symbol="Widget.reset")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "known_owner_member"
+
+
+# ---------------------------------------------------------------------------
+# C#: language step 4 -- usings, namespace identity, receivers.
+# ---------------------------------------------------------------------------
+
+
+def test_csharp_using_namespace_resolves_exactly(tmp_path: Path) -> None:
+    """`new Gadget()` under `using Demo.Catalog;`: the namespace provably
+    declares Gadget via its export rows, so both uses bind exactly."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "csharp" / "using_namespace_exact"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id, path="Demo/Catalog/Gadget.cs", qualified_symbol="Gadget"
+        )
+    )
+
+    constructor = next(hit for hit in response.hits if hit.kind == "call")
+    assert constructor.resolution == "exact"
+    assert constructor.reason_code == "on_demand_import"
+    type_use = next(hit for hit in response.hits if hit.kind == "type_use")
+    assert type_use.resolution == "exact"
+    assert type_use.reason_code == "on_demand_import"
+
+
+def test_csharp_using_alias_resolves_exactly(tmp_path: Path) -> None:
+    """`Widget x = new Widget();` under `using Widget = Acme.Widgets.Gadget;`:
+    the alias's target FQN tail names the declaration, so the uses bind
+    exactly through the ordinary import machinery."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "csharp" / "using_alias_exact")
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id, path="Acme/Widgets/Gadget.cs", qualified_symbol="Gadget"
+        )
+    )
+
+    for hit in (h for h in response.hits if h.kind in {"call", "type_use"}):
+        assert hit.resolution == "exact"
+        assert hit.reason_code == "direct_import_alias"
+
+
+def test_csharp_file_scoped_namespace_resolves_exactly(tmp_path: Path) -> None:
+    """Types in file-scoped namespaces bind across directories through
+    namespace identity alone -- directories never matter (D2)."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "csharp" / "file_scoped_namespace"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="Demo/Shop/Order.cs", qualified_symbol="Order")
+    )
+
+    hit = next(h for h in response.hits if h.path == "Demo/Stock/Program.cs")
+    assert hit.resolution == "exact"
+    assert hit.reason_code == "same_package_symbol"
+
+
+def test_csharp_using_static_resolves_exactly(tmp_path: Path) -> None:
+    """A bare `Fail(...)` call binds through `using static Acme.Util.Errors;`:
+    the selected member's owner is the named type in the named namespace."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "csharp" / "using_static")
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id, path="Acme/Util/Errors.cs", qualified_symbol="Errors.Fail"
+        )
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "on_demand_import"
+
+
+def test_csharp_var_typed_receiver_stays_likely(tmp_path: Path) -> None:
+    """`gadget.Start()` where the local holds a `var`: receiver type inference
+    is outside this syntax-only index, so uniqueness alone cannot bind."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "csharp" / "var_receiver_likely")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="Program.cs", qualified_symbol="Gadget.Start")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "likely"
+    assert call.reason_code == "unknown_receiver"
+    assert any(item.code == "unknown_receiver" for item in response.limitations)
+
+
+def test_csharp_partial_class_this_receiver_resolves_exactly(tmp_path: Path) -> None:
+    """`this.Count` in another file of a `partial` class carries the enclosing
+    owner, so the receiver matches the declaration's owner exactly -- even
+    though a same-named `Count` in another namespace keeps the name ambiguous
+    project-wide."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "csharp" / "partial_this_receiver_exact"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id, path="Demo/Widget.cs", qualified_symbol="Widget.Count"
+        )
+    )
+
+    write = next(hit for hit in response.hits if hit.kind == "write")
+    assert write.resolution == "exact"
+    assert write.reason_code == "known_owner_member"

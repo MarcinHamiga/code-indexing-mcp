@@ -1387,3 +1387,409 @@ def test_rust_types_become_type_use_rows() -> None:
         assert expected in type_uses
     assert "str" not in type_uses
     assert "u32" not in type_uses
+
+
+# ---------------------------------------------------------------------------
+# Java structural references (language step 3)
+# ---------------------------------------------------------------------------
+
+
+def _java_result(source: str):
+    return TreeSitterExtractor().extract(Path("Sample.java"), "java", source.encode())
+
+
+def test_java_extracts_import_shapes() -> None:
+    """Single-type, static, on-demand, and static-on-demand imports produce
+    one row each: a single-type import's `module_path` is the full FQN, a
+    static import's is the member's host type, and both on-demand forms carry
+    `imported_name="*"` so the resolver's D3 branch owns them."""
+    source = (
+        "import com.example.util.Item;\n"
+        "import com.example.util.*;\n"
+        "import static com.example.util.Errors.fail;\n"
+        "import static com.example.util.Errors.*;\n"
+    )
+
+    rows = [r for r in _java_result(source).references if r.kind == "import"]
+    by_module = {r.module_path: r for r in rows}
+
+    single = by_module["com.example.util.Item"]
+    assert (single.imported_name, single.alias) == ("Item", None)
+    assert by_module["com.example.util"].imported_name == "*"
+    # Both static forms share the host type as their module path; the member
+    # name (or the wildcard) is what differs.
+    statics = {r.imported_name: r for r in rows if r.module_path == "com.example.util.Errors"}
+    assert statics["fail"].alias is None
+    assert statics["*"].alias is None
+
+
+def test_java_calls_and_call_shapes() -> None:
+    """Bare, receiver, and static calls become call rows whose span covers
+    the callee (never the argument list); constructor creations carry the
+    constructor shape."""
+    source = (
+        "class Sample {\n"
+        "    void run(Widget widget) {\n"
+        "        prepare(1);\n"
+        "        widget.draw(true);\n"
+        "        Item.build();\n"
+        "        Item item = new Item(widget);\n"
+        "    }\n"
+        "}\n"
+    )
+
+    calls = {r.target_name: r for r in _java_result(source).references if r.kind == "call"}
+
+    assert calls["prepare"].receiver_text is None
+    assert calls["prepare"].call_shape is not None
+    assert calls["prepare"].call_shape.positional_count == 1
+    assert calls["draw"].receiver_text == "widget"
+    assert calls["draw"].source_qualified_symbol == "Sample.run"
+    assert calls["draw"].call_shape.type_argument_count is None
+    assert calls["build"].receiver_text == "Item"
+    assert calls["build"].source_qualified_symbol == "Sample.run"
+    constructor = calls["Item"]
+    assert constructor.receiver_text is None
+    assert constructor.call_shape is not None
+    assert constructor.call_shape.constructor is True
+    assert constructor.call_shape.positional_count == 1
+
+
+def test_java_member_access_reads_and_writes() -> None:
+    source = (
+        "class Sample {\n"
+        "    void set(Widget widget) {\n"
+        "        widget.count = 1;\n"
+        "        int seen = widget.total;\n"
+        "    }\n"
+        "}\n"
+    )
+
+    refs = _java_result(source).references
+
+    write = next(r for r in refs if r.kind == "write")
+    assert write.target_name == "widget.count"
+    assert write.receiver_text == "widget"
+    read = next(r for r in refs if r.kind == "read" and "." in r.target_name)
+    assert read.target_name == "widget.total"
+    assert read.receiver_text == "widget"
+
+
+def test_java_bindings_are_not_reads() -> None:
+    """Local variables, parameters, enhanced-for heads, catch formals, lambda
+    parameters, and pattern variables bind; none may leak a read row. A real
+    use of the same spelling still does."""
+    source = (
+        "class Sample {\n"
+        "    void run(Widget widget) {\n"
+        "        int total = widget.count;\n"
+        "        for (Item item : widget.items()) {\n"
+        "            total += item.size();\n"
+        "        }\n"
+        "        try {\n"
+        "            widget.wait();\n"
+        "        } catch (IllegalStateException error) {\n"
+        "            error.printStackTrace();\n"
+        "        }\n"
+        "        Runnable task = () -> widget.flush();\n"
+        "        if (task instanceof Runnable named) {\n"
+        "            task.run();\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+
+    refs = _java_result(source).references
+
+    # Each binding's declaration-site spelling (its first occurrence in the
+    # source) must carry no read row spanning it; later genuine uses do.
+    for binding in ("total", "item", "error", "task", "named"):
+        first = source.index(binding)
+        assert not any(
+            r.kind == "read" and r.start_byte <= first and first < r.end_byte for r in refs
+        ), binding
+
+
+def test_java_method_and_varargs_parameter_shapes() -> None:
+    source = "class Sample {\n    void run(Widget widget, String... parts) {}\n}\n"
+
+    declarations = {d.qualified_symbol: d for d in _java_result(source).declarations}
+
+    run = declarations["Sample.run"]
+    params = [(p.name, p.kind, p.required, p.position) for p in run.parameters]
+    assert params == [
+        ("widget", "positional", True, 0),
+        ("parts", "variadic", False, 1),
+    ]
+
+
+def test_java_types_become_type_use_rows() -> None:
+    """Field, parameter, return, local, generic, array, and scoped types emit
+    one `type_use` per naming leaf; a scoped type (`Map.Entry`) contributes
+    only its final segment."""
+    source = (
+        "import java.util.Map;\n"
+        "class Sample {\n"
+        "    Map<String, Widget>[] cache;\n"
+        "    Widget load(Map.Entry<String, Item> pair) {\n"
+        "        Widget local = pair.value;\n"
+        "        return local;\n"
+        "    }\n"
+        "}\n"
+    )
+
+    type_uses = [r.written_name for r in _java_result(source).references if r.kind == "type_use"]
+
+    assert type_uses.count("Widget") >= 3
+    assert type_uses.count("Map") == 1
+    assert type_uses.count("Entry") == 1
+    assert "String" in type_uses
+    assert "Item" in type_uses
+
+
+def test_java_inheritance_throws_and_annotations() -> None:
+    """`extends`/`implements` are inheritance edges, `throws` and bounds are
+    type uses, and annotations are decorator rows."""
+    source = (
+        "class Sample extends Base implements Runnable, Closeable {\n"
+        "    <T extends Widget> void run() throws IOException, Failure {}\n"
+        "}\n"
+        "@Deprecated\n"
+        "class Old extends Sample {}\n"
+    )
+
+    refs = _java_result(source).references
+
+    inheritance = sorted(r.written_name for r in refs if r.kind == "inheritance")
+    assert inheritance == ["Base", "Closeable", "Runnable", "Sample"]
+    type_uses = sorted(r.written_name for r in refs if r.kind == "type_use")
+    assert type_uses == ["Failure", "IOException", "Widget"]
+    decorators = [r.written_name for r in refs if r.kind == "decorator"]
+    assert decorators == ["Deprecated"]
+
+
+def test_java_exports_public_top_level_types_only() -> None:
+    """Only `public` top-level types gain export rows; package-private types,
+    nested types, and members never do."""
+    source = (
+        "public class Open {}\n"
+        "class Hidden {}\n"
+        "public interface Trait {}\n"
+        "public enum Color {}\n"
+        "public record Pair(int a) {}\n"
+        "public class Outer {\n"
+        "    class Nested {}\n"
+        "}\n"
+    )
+
+    exports = sorted(r.written_name for r in _java_result(source).references if r.kind == "export")
+
+    assert exports == ["Color", "Open", "Outer", "Pair", "Trait"]
+
+
+def test_java_qualified_static_call_rows_carry_the_receiver() -> None:
+    """`Item.build()` spans `Item.build` (not the arguments) and records the
+    receiver, so the resolver can bind it through a single-type import."""
+    source = "class Sample {\n    void run() {\n        Item.build(1);\n    }\n}\n"
+
+    call = next(r for r in _java_result(source).references if r.kind == "call")
+
+    assert call.written_name == "build"
+    assert call.receiver_text == "Item"
+    assert call.start_byte == source.index("Item.build")
+    assert source[call.start_byte : call.end_byte] == "Item.build"
+
+
+# ---------------------------------------------------------------------------
+# C# structural references (language step 4)
+# ---------------------------------------------------------------------------
+
+
+def _csharp_result(source: str):
+    return TreeSitterExtractor().extract(Path("Sample.cs"), "csharp", source.encode())
+
+
+def test_csharp_extracts_using_shapes() -> None:
+    """Plain, global, static, and alias usings produce one row each: plain
+    and static directives bind names without a local spelling (wildcard
+    semantics) while an alias binds the target FQN's tail."""
+    source = (
+        "using System;\n"
+        "using System.Collections.Generic;\n"
+        "using static Acme.Util.Errors;\n"
+        "global using Acme.Shared;\n"
+        "using Widget = Acme.Widgets.Gadget;\n"
+    )
+
+    rows = [r for r in _csharp_result(source).references if r.kind == "import"]
+    by_module = {r.module_path: r for r in rows}
+
+    wildcard = [r for r in rows if r.imported_name == "*" and r.alias is None]
+    assert sorted(r.module_path for r in wildcard) == [
+        "Acme.Shared",
+        "Acme.Util.Errors",
+        "System",
+        "System.Collections.Generic",
+    ]
+    alias = by_module["Acme.Widgets.Gadget"]
+    assert (alias.alias, alias.imported_name) == ("Widget", "Gadget")
+
+
+def test_csharp_calls_and_call_shapes() -> None:
+    source = (
+        "class Sample {\n"
+        "    void Run(Widget widget) {\n"
+        "        Build(1);\n"
+        "        widget.Draw(true);\n"
+        "        Item.Create();\n"
+        "        Widget local = new Widget(widget);\n"
+        "    }\n"
+        "}\n"
+    )
+
+    calls = {r.target_name: r for r in _csharp_result(source).references if r.kind == "call"}
+
+    assert calls["Build"].receiver_text is None
+    assert calls["Build"].call_shape is not None
+    assert calls["Build"].call_shape.positional_count == 1
+    assert calls["widget.Draw"].receiver_text == "widget"
+    assert calls["widget.Draw"].source_qualified_symbol == "Sample.Run"
+    assert calls["Item.Create"].receiver_text == "Item"
+    constructor = calls["Widget"]
+    assert constructor.call_shape is not None
+    assert constructor.call_shape.constructor is True
+    assert constructor.call_shape.positional_count == 1
+
+
+def test_csharp_member_access_reads_and_writes() -> None:
+    source = (
+        "class Sample {\n"
+        "    void Set(Widget widget) {\n"
+        "        widget.Count = 1;\n"
+        "        int seen = widget.Total;\n"
+        "    }\n"
+        "}\n"
+    )
+
+    refs = _csharp_result(source).references
+
+    write = next(r for r in refs if r.kind == "write")
+    assert write.target_name == "widget.Count"
+    read = next(r for r in refs if r.kind == "read" and "." in r.target_name)
+    assert read.target_name == "widget.Total"
+
+
+def test_csharp_bindings_are_not_reads() -> None:
+    """Local variables, foreach heads, catch formals, lambda parameters, and
+    out declarations bind; none may leak a read row at the binding site."""
+    source = (
+        "class Sample {\n"
+        "    void Run(Widget widget) {\n"
+        "        int total = widget.Count;\n"
+        "        foreach (Gadget item in widget.Items()) {\n"
+        "            total += item.Size();\n"
+        "        }\n"
+        "        try {\n"
+        "            widget.Wait();\n"
+        "        } catch (InvalidOperationException error) {\n"
+        "            Log(error);\n"
+        "        }\n"
+        "        Func<int> measure = () => widget.Size();\n"
+        "        Read(out var other);\n"
+        "    }\n"
+        "}\n"
+    )
+
+    refs = _csharp_result(source).references
+
+    for binding in ("total", "item", "error", "measure", "other"):
+        first = source.index(binding)
+        assert not any(
+            r.kind == "read" and r.start_byte <= first and first < r.end_byte for r in refs
+        ), binding
+
+
+def test_csharp_types_become_type_use_rows() -> None:
+    """Field, property, parameter, local, return, generic, array, nullable,
+    and cast types emit one `type_use` per naming leaf; a qualified type
+    (`Acme.Gadget`) contributes only its final segment."""
+    source = (
+        "class Sample {\n"
+        "    Dictionary<string, Gadget>[] cache;\n"
+        "    Gadget? maybe;\n"
+        "    Gadget Load(Acme.Gadget arg) {\n"
+        "        Gadget local = (Gadget)arg;\n"
+        "        return local;\n"
+        "    }\n"
+        "}\n"
+    )
+
+    type_uses = [r.written_name for r in _csharp_result(source).references if r.kind == "type_use"]
+
+    assert type_uses.count("Gadget") >= 5
+    assert type_uses.count("Dictionary") == 1
+    assert "string" not in type_uses
+    assert not any(name == "Acme" for name in type_uses)
+
+
+def test_csharp_inheritance_attributes_and_constraints() -> None:
+    """Base lists are inheritance edges, attributes are decorators, and
+    generic constraints are type uses."""
+    source = (
+        "class Sample : Base, IThing {\n"
+        "    [Obsolete]\n"
+        "    T Pick<T>() where T : Widget { return default; }\n"
+        "}\n"
+    )
+
+    refs = _csharp_result(source).references
+
+    inheritance = sorted(r.written_name for r in refs if r.kind == "inheritance")
+    assert inheritance == ["Base", "IThing"]
+    decorators = [r.written_name for r in refs if r.kind == "decorator"]
+    assert decorators == ["Obsolete"]
+    type_uses = [r.written_name for r in refs if r.kind == "type_use"]
+    assert "Widget" in type_uses
+    # The method's return type is the type parameter itself (`T Pick<T>()`),
+    # which is a genuine type use; the constraint head (`where T :`) is not.
+    assert type_uses.count("T") == 1
+
+
+def test_csharp_exports_carry_the_declared_namespace() -> None:
+    """Top-level types export with the declared namespace as their module
+    path, for both block and file-scoped namespaces; nested types and any
+    accessibility stay in (internal is project-visible)."""
+    source = (
+        "using System;\n"
+        "namespace Demo.Catalog\n"
+        "{\n"
+        "    public class Open {}\n"
+        "    class Hidden {}\n"
+        "    public class Outer { class Nested {} }\n"
+        "}\n"
+        "namespace Demo.Flat;\n"
+        "public struct Room {}\n"
+        "public interface IThing {}\n"
+    )
+
+    exports = {r.written_name: r for r in _csharp_result(source).references if r.kind == "export"}
+
+    assert exports["Open"].module_path == "Demo.Catalog"
+    assert exports["Hidden"].module_path == "Demo.Catalog"
+    assert exports["Room"].module_path == "Demo.Flat"
+    assert exports["IThing"].module_path == "Demo.Flat"
+    assert "Nested" not in exports
+    assert "Open" in exports
+
+
+def test_csharp_this_receiver_writes_are_member_rows() -> None:
+    source = "class Sample {\n    void Bump() {\n        this.Count = this.Count + 1;\n    }\n}\n"
+
+    refs = _csharp_result(source).references
+
+    writes = [r for r in refs if r.kind == "write"]
+    assert [r.target_name for r in writes] == ["this.Count"]
+    assert all(r.receiver_text == "this" for r in writes)
+    reads = [r for r in refs if r.kind == "read"]
+    assert [r.target_name for r in reads] == ["this.Count"]
+    assert all(r.receiver_text == "this" for r in reads)

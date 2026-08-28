@@ -1,0 +1,7 @@
+import com.example.util.*;
+
+public class Main {
+    void run() {
+        Stamp stamp;
+    }
+}
