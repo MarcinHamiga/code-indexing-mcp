@@ -59,7 +59,9 @@ _CONTAINER_KINDS: Final = frozenset(
 )
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 _QUOTE_CHARACTERS: Final = ("'", '"')
-STRUCTURAL_LANGUAGES: Final = frozenset({"python", "javascript", "typescript", "tsx", "go", "rust"})
+STRUCTURAL_LANGUAGES: Final = frozenset(
+    {"python", "javascript", "typescript", "tsx", "go", "rust", "java", "csharp"}
+)
 # Per-language handler for the non-`reference.identifier` captures of that
 # language's structural query. Both handlers share one signature
 # `(node, source, add_reference)` and re-dispatch on `node.type`, so a new
@@ -71,6 +73,8 @@ _STRUCTURAL_RECORD_HANDLERS: Final[dict[str, str]] = {
     "tsx": "_javascript_records",
     "go": "_go_records",
     "rust": "_rust_records",
+    "java": "_java_records",
+    "csharp": "_csharp_records",
 }
 _PACK_DOWNLOAD_ATTEMPTS: Final = 6
 _PACK_DOWNLOAD_BACKOFF_SECONDS: Final = 1.0
@@ -366,8 +370,13 @@ class TreeSitterExtractor:
             alias: str | None = None,
             receiver_text: str | None = None,
             call_shape: CallShape | None = None,
+            span: tuple[int, int] | None = None,
         ) -> None:
-            key = (kind, node.start_byte, node.end_byte)
+            # `span` overrides the recorded range for references whose callee
+            # is not a single grammar node (Java's `receiver . name` spans two
+            # siblings); everything else keys off the node itself.
+            start_byte, end_byte = span if span is not None else (node.start_byte, node.end_byte)
+            key = (kind, start_byte, end_byte)
             if key in seen:
                 return
             seen.add(key)
@@ -382,10 +391,10 @@ class TreeSitterExtractor:
                     imported_name=imported_name,
                     alias=alias,
                     receiver_text=receiver_text,
-                    start_byte=node.start_byte,
-                    end_byte=node.end_byte,
-                    start_line=line_index.line_at(node.start_byte),
-                    end_line=line_index.line_at(max(node.start_byte, node.end_byte - 1)),
+                    start_byte=start_byte,
+                    end_byte=end_byte,
+                    start_line=line_index.line_at(start_byte),
+                    end_line=line_index.line_at(max(start_byte, end_byte - 1)),
                     call_shape=call_shape,
                 )
             )
@@ -442,6 +451,20 @@ class TreeSitterExtractor:
                 # `&self`/`&mut self` receivers are not reads of a `self`
                 # symbol (method-body `self` reads ride field expressions).
                 "self_parameter",
+                # Java import/package paths and annotation names are owned by
+                # the import and decorator rows; nothing under them is a read.
+                "import_declaration",
+                "package_declaration",
+                "marker_annotation",
+                "annotation",
+            }:
+                return
+            if language == "csharp" and parent.type in {
+                # C# using directives and attributes: the import and
+                # decorator rows own their namespells. (`attribute` exists in
+                # Python too, as a member access -- never blanket-cut there.)
+                "using_directive",
+                "attribute",
             }:
                 return
             if parent.type in {
@@ -450,6 +473,9 @@ class TreeSitterExtractor:
                 "lambda_parameters",
                 "parameter_list",
                 "closure_parameters",
+                # Java's `(a, b) -> a` shape and C#'s bare `x => x`.
+                "inferred_parameters",
+                "implicit_parameter",
             }:
                 parameter = node
                 while parameter.parent is not None and parameter.parent != parent:
@@ -467,6 +493,21 @@ class TreeSitterExtractor:
                 else:
                     return
             excluded_fields: tuple[str, ...] = ()
+            if (
+                language == "csharp"
+                and current is node
+                and parent.type == "method_declaration"
+                and parent.child_by_field_name("name") != node
+            ):
+                # Must win over the shared `method_declaration` owner branch
+                # below: the grammar names no return-type field, so the
+                # identifier directly before the name (the return type, owned
+                # by the handler's `type_use`) would otherwise leak a plain
+                # read. The name is cut by the shared branch's `name` field.
+                # `current is node` keeps this to the identifier's immediate
+                # parent -- the climb revisits ancestors for deeper reads,
+                # which must survive.
+                return
             if parent.type in {
                 "function_definition",
                 "function_expression",
@@ -550,6 +591,90 @@ class TreeSitterExtractor:
                 # binding; the optional `: Type` annotation is the handler's
                 # `type_use` and the value stays a plain read.
                 excluded_fields = ("pattern",)
+            elif language == "java" and parent.type in {
+                "record_declaration",
+                "enum_declaration",
+                "annotation_type_declaration",
+                "constructor_declaration",
+                "compact_constructor_declaration",
+                "annotation_type_element_declaration",
+                "enum_constant",
+                "local_variable_declaration",
+                "constant_declaration",
+            }:
+                # Java named owners: the declaration's own name is a binding
+                # and its `type` field (a return type, a field/variable type)
+                # is owned by the handler's `type_use` row, mirroring the
+                # Python/JS/Go owners in the branch above.
+                excluded_fields = ("name", "type")
+            elif language == "java" and parent.type in {
+                "method_invocation",
+                "field_access",
+                "catch_formal_parameter",
+                # `if (x instanceof Widget w)` binds `w` through `name`; the
+                # instanceof type stays a plain read (no handler row owns it).
+                "instanceof_expression",
+            }:
+                # The invocation/field name is owned by the call/member row
+                # spanning the whole access; a catch or pattern variable is a
+                # fresh binding.
+                excluded_fields = ("name", "field")
+            elif language == "java" and parent.type == "enhanced_for_statement":
+                # `for (Item item : items)`: the loop variable is a new
+                # binding and the element type is the handler's `type_use`;
+                # the iterated value stays a read.
+                excluded_fields = ("name", "type")
+            elif language == "java" and parent.type == "lambda_expression":
+                # A parenless single-identifier lambda parameter (`x -> x`).
+                excluded_fields = ("parameters",)
+            elif language == "java" and parent.type == "object_creation_expression":
+                # `new Widget()`: the created type is owned by the
+                # constructor-shaped call row.
+                excluded_fields = ("type",)
+            elif language == "csharp" and parent.type in {
+                "record_declaration",
+                "struct_declaration",
+                "enum_declaration",
+                "constructor_declaration",
+                "property_declaration",
+                "enum_member_declaration",
+                "namespace_declaration",
+                "delegate_declaration",
+                # Field/local/using declarations carry their type on the
+                # `variable_declaration` wrapper the handler owns.
+                "variable_declaration",
+            }:
+                # C# named owners: the declaration's own name is a binding;
+                # the type position is owned by the handler's `type_use` row.
+                excluded_fields = ("name", "type")
+            elif language == "csharp" and parent.type == "catch_declaration":
+                # The caught variable is a fresh binding and the caught type
+                # is the handler's `type_use`.
+                excluded_fields = ("name", "type")
+            elif language == "csharp" and parent.type in {
+                "member_access_expression",
+                # `M(out var x)` binds x through `name`; the `implicit_type`
+                # keyword yields nothing to descend.
+                "declaration_expression",
+            }:
+                # The accessed member is owned by the member/call row that
+                # spans the whole access.
+                excluded_fields = ("name",)
+            elif language == "csharp" and parent.type == "method_declaration":
+                # The grammar names no return-type field: the identifier
+                # before the name IS the return type, owned by the handler's
+                # `type_use`; the name itself is a binding. Nothing directly
+                # under the declaration is a read.
+                return
+            elif language == "csharp" and parent.type == "cast_expression":
+                # `(Widget) value`: the cast type is the handler's `type_use`;
+                # the value stays a read.
+                excluded_fields = ("type",)
+            elif language == "csharp" and parent.type == "foreach_statement":
+                # `foreach (Gadget item in items)`: the loop variable is a
+                # new binding and the element type is the handler's
+                # `type_use`; the iterated value stays a read.
+                excluded_fields = ("left", "type")
             elif parent.type == "scoped_identifier":
                 # Path segments are namespace spellings; the final `name` may
                 # be a real value read (`State::Ready`) and stays eligible.
@@ -584,6 +709,13 @@ class TreeSitterExtractor:
                 excluded_fields = ("attribute", "property")
             elif parent.type in {"call", "call_expression", "new_expression"}:
                 excluded_fields = ("function", "constructor")
+            elif language == "csharp" and parent.type in {
+                "invocation_expression",
+                "object_creation_expression",
+            }:
+                # C#: the invoked function / created type is owned by the
+                # call row spanning it.
+                excluded_fields = ("function", "type")
             elif parent.type == "keyword_argument":
                 excluded_fields = ("name",)
             elif parent.type in {"as_pattern", "catch_clause"}:
@@ -598,27 +730,68 @@ class TreeSitterExtractor:
                 "keyed_element",
             }:
                 excluded_fields = ("key",)
-            elif language != "python" and parent.type in {
-                # Go/Rust type wrappers: every identifier directly inside one
-                # is a type position, already emitted as `type_use` by the
-                # handler -- a parallel plain read would only duplicate it.
-                # (An array length expression nested deeper is untouched by
-                # this direct-parent rule.)
-                "pointer_type",
-                "slice_type",
-                "array_type",
-                "map_type",
-                "channel_type",
-                "function_type",
-                "parenthesized_type",
-                "qualified_type",
-                "reference_type",
-                "tuple_type",
-                "scoped_type_identifier",
-                "dynamic_type",
-                "type_arguments",
-                "ordered_field_declaration_list",
-            }:
+            elif (
+                (
+                    language != "python"
+                    and parent.type
+                    in {
+                        # Go/Rust type wrappers: every identifier directly inside one
+                        # is a type position, already emitted as `type_use` by the
+                        # handler -- a parallel plain read would only duplicate it.
+                        # (An array length expression nested deeper is untouched by
+                        # this direct-parent rule.)
+                        "pointer_type",
+                        "slice_type",
+                        "array_type",
+                        "map_type",
+                        "channel_type",
+                        "function_type",
+                        "parenthesized_type",
+                        "qualified_type",
+                        "reference_type",
+                        "tuple_type",
+                        "scoped_type_identifier",
+                        "dynamic_type",
+                        "type_arguments",
+                        "ordered_field_declaration_list",
+                    }
+                )
+                or (
+                    language == "java"
+                    and parent.type
+                    in {
+                        # Java type positions the handler owns: heritage and
+                        # throws lists, catch types, type-parameter bounds,
+                        # and varargs element types -- every identifier
+                        # directly inside one is a type spelling already
+                        # emitted as `type_use`/`inheritance`.
+                        "superclass",
+                        "type_list",
+                        "throws",
+                        "catch_type",
+                        "type_parameter",
+                        "type_bound",
+                        "spread_parameter",
+                    }
+                )
+                or (
+                    language == "csharp"
+                    and parent.type
+                    in {
+                        # C# type positions the handler owns: base lists,
+                        # generic/qualified/nullable/array types, and constraint
+                        # clauses (whose head identifier names the constrained
+                        # type parameter, a binding).
+                        "base_list",
+                        "generic_name",
+                        "qualified_name",
+                        "type_argument_list",
+                        "array_type",
+                        "nullable_type",
+                        "type_parameter_constraints_clause",
+                    }
+                )
+            ):
                 return
             if any(contains(parent.child_by_field_name(field)) for field in excluded_fields):
                 return
@@ -736,6 +909,15 @@ class TreeSitterExtractor:
                 or child.child_by_field_name("name")
                 or child.child_by_field_name("pattern")
             )
+            if name_node is None and child.type == "spread_parameter":
+                # Java varargs (`String... parts`): the element type and the
+                # declarator hang off the parameter as unnamed children, so
+                # the name lives inside the trailing `variable_declarator`.
+                declarator = next(
+                    (item for item in child.named_children if item.type == "variable_declarator"),
+                    None,
+                )
+                name_node = declarator.child_by_field_name("name") if declarator else None
             if name_node is None:
                 # e.g. a bare `rest_pattern` (`...rest`) -- its identifier is
                 # a plain child, not a named field. A leading comment
@@ -771,6 +953,9 @@ class TreeSitterExtractor:
                 # Go's `opts ...string` -- a genuine variadic slot.
                 kind = "variadic"
                 name = name.removeprefix("*")
+            elif child.type == "spread_parameter":
+                # Java's `String... parts` -- same variadic slot shape.
+                kind = "variadic"
             elif child.type == "dictionary_splat_pattern":
                 kind = "keyword_variadic"
                 name = name.removeprefix("**")
@@ -2059,6 +2244,548 @@ class TreeSitterExtractor:
             names: list[Node] = []
             for child in node.named_children:
                 names.extend(TreeSitterExtractor._rust_descend_type_names(child))
+            return names
+        return []
+
+    # Java declarations whose `type` field is a use of some project type; the
+    # handler descends it to `type_use` leaves (a `void_type`/`integral_type`
+    # keyword yields nothing on its own).
+    _JAVA_DECLARATION_TYPE_NODES: Final = frozenset(
+        {
+            "method_declaration",
+            "field_declaration",
+            "local_variable_declaration",
+            "constant_declaration",
+            "formal_parameter",
+            "spread_parameter",
+            "enhanced_for_statement",
+        }
+    )
+
+    def _java_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "import_declaration":
+            self._java_import(node, source, add_reference)
+        elif node.type == "method_invocation":
+            self._java_call(node, source, add_reference)
+        elif node.type == "object_creation_expression":
+            self._java_constructor_call(node, source, add_reference)
+        elif node.type == "field_access":
+            text = _capture_name(source, node)
+            kind: ReferenceKind = (
+                "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
+            )
+            add_reference(kind, node, target_name=text, written_name=text)
+        elif node.type == "superclass":
+            names = TreeSitterExtractor._java_descend_type_names(node)
+            if names:
+                head, *rest = names
+                add_reference(
+                    "inheritance",
+                    head,
+                    target_name=_capture_name(source, head),
+                    written_name=_capture_name(source, head),
+                )
+                for leaf in rest:
+                    written = _capture_name(source, leaf)
+                    add_reference("type_use", leaf, target_name=written, written_name=written)
+        elif node.type in {"super_interfaces", "extends_interfaces"}:
+            # `implements Runnable, Closeable` / `extends AutoCloseable`:
+            # every listed type is an inheritance edge.
+            for leaf in TreeSitterExtractor._java_descend_type_names(node):
+                written = _capture_name(source, leaf)
+                add_reference("inheritance", leaf, target_name=written, written_name=written)
+        elif node.type in {
+            "throws",
+            "type_bound",
+            "catch_type",
+            "generic_type",
+            "scoped_type_identifier",
+            "array_type",
+        }:
+            self._java_emit_type_uses(node, source, add_reference)
+        elif node.type in {"marker_annotation", "annotation"}:
+            name = node.child_by_field_name("name")
+            if name is not None:
+                written = _capture_name(source, name)
+                add_reference("decorator", name, target_name=written, written_name=written)
+        elif node.type in TreeSitterExtractor._JAVA_DECLARATION_TYPE_NODES:
+            if node.type == "spread_parameter":
+                # `String... parts`: the grammar hangs the element type and
+                # the declarator off the parameter as unnamed children.
+                for child in node.named_children:
+                    if child.type != "variable_declarator" and not child.is_extra:
+                        self._java_emit_type_uses(child, source, add_reference)
+            else:
+                self._java_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
+        elif node.type in {
+            "class_declaration",
+            "interface_declaration",
+            "record_declaration",
+            "enum_declaration",
+            "annotation_type_declaration",
+        }:
+            self._java_exports(node, source, add_reference)
+
+    def _java_import(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        path_node = next(
+            (child for child in node.named_children if child.type == "scoped_identifier"), None
+        )
+        if path_node is None:
+            return
+        segments = TreeSitterExtractor._java_path_segments(path_node, source)
+        if not segments:
+            return
+        if any(child.type == "asterisk" for child in node.children):
+            # On-demand imports bind every name in the package without a
+            # local spelling -- wildcard semantics; the resolver's Java
+            # branch decides what they can prove (D3).
+            add_reference(
+                "import",
+                node,
+                target_name="*",
+                written_name="*",
+                module_path=".".join(segments),
+                imported_name="*",
+                alias=None,
+            )
+            return
+        if any(child.type == "static" for child in node.children):
+            # `import static a.b.Errors.fail`: the module path is the member's
+            # host type and the imported name is the member itself.
+            module_path = ".".join(segments[:-1]) or None
+        else:
+            # A single-type import's module path is the full FQN; resolution
+            # is pure path arithmetic against known files.
+            module_path = ".".join(segments)
+        imported = segments[-1]
+        add_reference(
+            "import",
+            node,
+            target_name=imported,
+            written_name=imported,
+            module_path=module_path,
+            imported_name=imported,
+            alias=None,
+        )
+
+    def _java_call(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        name = node.child_by_field_name("name")
+        if name is None:
+            return
+        receiver = node.child_by_field_name("object")
+        written = _capture_name(source, name)
+        # The callee spans two sibling nodes (`object . name`), so the row's
+        # range is the callee expression without the argument list -- the same
+        # shape Go's selector calls record. A bare call spans its name alone.
+        span = (
+            (receiver.start_byte, name.end_byte)
+            if receiver is not None
+            else (name.start_byte, name.end_byte)
+        )
+        add_reference(
+            "call",
+            node,
+            target_name=written,
+            written_name=written,
+            receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+            call_shape=self._call_shape(node),
+            span=span,
+        )
+
+    def _java_constructor_call(
+        self, node: Node, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        type_node = node.child_by_field_name("type")
+        if type_node is None:
+            return
+        names = TreeSitterExtractor._java_descend_type_names(type_node)
+        if not names:
+            return
+        written = _capture_name(source, names[0])
+        shape = self._call_shape(node).model_copy(update={"constructor": True})
+        add_reference(
+            "call",
+            node,
+            target_name=written,
+            written_name=written,
+            call_shape=shape,
+            span=(type_node.start_byte, type_node.end_byte),
+        )
+
+    def _java_exports(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        """Export rows for `public` top-level types.
+
+        The java.scm export captures are `program`-anchored, so nested types
+        never reach this.         Package-private top-level types are not exported to
+        the world (imports cannot name them), matching Java's own visibility
+        rule; `internal` visibility (C#'s project-wide bar) has no Java
+        equivalent.
+        """
+        # `modifiers` is a named child but not a named field in this grammar.
+        modifiers = next(
+            (child for child in node.named_children if child.type == "modifiers"), None
+        )
+        if modifiers is None or not any(child.type == "public" for child in modifiers.children):
+            return
+        name = node.child_by_field_name("name")
+        if name is None:
+            return
+        exported = _capture_name(source, name)
+        add_reference("export", name, target_name=exported, written_name=exported)
+
+    def _java_emit_type_uses(
+        self, node: Node | None, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        for leaf in TreeSitterExtractor._java_descend_type_names(node):
+            written = _capture_name(source, leaf)
+            add_reference("type_use", leaf, target_name=written, written_name=written)
+
+    @staticmethod
+    def _java_path_segments(node: Node | None, source: bytes) -> list[str]:
+        """Flatten a dotted Java name into its spelling segments."""
+        if node is None:
+            return []
+        if node.type in {"identifier", "type_identifier"}:
+            return [_capture_name(source, node)]
+        if node.type == "scoped_identifier":
+            return TreeSitterExtractor._java_path_segments(
+                node.child_by_field_name("scope"), source
+            ) + TreeSitterExtractor._java_path_segments(node.child_by_field_name("name"), source)
+        return []
+
+    @staticmethod
+    def _java_descend_type_names(node: Node | None) -> list[Node]:
+        """Descend a Java type expression to its naming leaves.
+
+        Unwraps `generic_type` (the head name plus one entry per type
+        argument), `type_arguments`, `type_bound`, and `array_type` (its
+        element) down to `type_identifier`/`identifier` leaves. A
+        `scoped_type_identifier` (`Map.Entry`) contributes only its final
+        segment -- the earlier segments are namespace spellings, not symbols.
+        Keyword types (`int`, `void`) are not identifiers and yield nothing.
+        The Java grammar names none of these wrapper children, so descent is
+        positional: the head of a `generic_type`/`array_type` is its first
+        named child.
+        """
+        if node is None:
+            return []
+        if node.type in {"type_identifier", "identifier"}:
+            return [node]
+
+        def named_children(inner: Node) -> list[Node]:
+            return [child for child in inner.named_children if not child.is_extra]
+
+        # Heritage/throws/catch wrappers are pure pass-throughs: every named
+        # child is a type expression (`type_list` under `implements` too).
+        # A `generic_type`'s children are its head name and its type
+        # arguments; `type_arguments`/`type_bound` list their entries the
+        # same positional way.
+        if node.type in {
+            "superclass",
+            "super_interfaces",
+            "extends_interfaces",
+            "throws",
+            "catch_type",
+            "type_list",
+            "generic_type",
+            "type_arguments",
+            "type_bound",
+        }:
+            names: list[Node] = []
+            for child in named_children(node):
+                names.extend(TreeSitterExtractor._java_descend_type_names(child))
+            return names
+        if node.type == "array_type":
+            named = named_children(node)
+            return TreeSitterExtractor._java_descend_type_names(named[0]) if named else []
+        if node.type == "scoped_type_identifier":
+            named = named_children(node)
+            return TreeSitterExtractor._java_descend_type_names(named[-1]) if named else []
+        return []
+
+    def _csharp_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "using_directive":
+            self._csharp_using(node, source, add_reference)
+        elif node.type == "invocation_expression":
+            self._csharp_call(node, source, add_reference)
+        elif node.type == "object_creation_expression":
+            self._csharp_constructor_call(node, source, add_reference)
+        elif node.type == "member_access_expression":
+            parent = node.parent
+            if (
+                parent is not None
+                and parent.type == "invocation_expression"
+                and parent.child_by_field_name("function") == node
+            ):
+                # The call row above already owns this span.
+                return
+            if parent is not None and parent.type == "qualified_name":
+                # A namespace/type spell, not a runtime member access; the
+                # using, namespace, and base-list handlers own these.
+                return
+            text = _capture_name(source, node)
+            kind: ReferenceKind = (
+                "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
+            )
+            add_reference(kind, node, target_name=text, written_name=text)
+        elif node.type == "base_list":
+            # `: Base, IThing` -- every listed type is an inheritance edge.
+            for leaf in TreeSitterExtractor._csharp_descend_type_names(node):
+                written = _capture_name(source, leaf)
+                add_reference("inheritance", leaf, target_name=written, written_name=written)
+        elif node.type == "attribute":
+            name = node.child_by_field_name("name")
+            if name is not None:
+                written = _capture_name(source, name)
+                add_reference("decorator", name, target_name=written, written_name=written)
+        elif node.type == "type_parameter_constraints_clause":
+            # `where G : IThing`: the clause's bare identifier head names the
+            # constrained type parameter (a binding); the constraints are the
+            # type uses.
+            for child in node.named_children:
+                if child.type != "identifier" and not child.is_extra:
+                    self._csharp_emit_type_uses(child, source, add_reference)
+        elif node.type in {"generic_name", "array_type", "nullable_type", "cast_expression"}:
+            self._csharp_emit_type_uses(node, source, add_reference)
+        elif node.type == "qualified_name":
+            # Nested qualified names under a using directive (`System.Collections`
+            # inside `System.Collections.Generic`) are namespace spells owned by
+            # the import row, as are namespace declaration names; a qualified
+            # base is owned by the base-list descent.
+            current = node.parent
+            while current is not None and current.type == "qualified_name":
+                current = current.parent
+            if current is not None and current.type in {
+                "using_directive",
+                "namespace_declaration",
+                "file_scoped_namespace_declaration",
+                "base_list",
+            }:
+                return
+            self._csharp_emit_type_uses(node, source, add_reference)
+        elif node.type in TreeSitterExtractor._CSHARP_DECLARATION_TYPE_NODES:
+            if node.type == "method_declaration":
+                # The grammar names neither the return type nor most other
+                # children: the type sits immediately before the name.
+                name = node.child_by_field_name("name")
+                if name is not None:
+                    named = [child for child in node.named_children if not child.is_extra]
+                    position = named.index(name)
+                    if position >= 1:
+                        self._csharp_emit_type_uses(named[position - 1], source, add_reference)
+            else:
+                self._csharp_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
+        elif node.type in {
+            "class_declaration",
+            "struct_declaration",
+            "interface_declaration",
+            "record_declaration",
+            "enum_declaration",
+            "delegate_declaration",
+        }:
+            self._csharp_exports(node, source, add_reference)
+
+    def _csharp_using(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        alias_node = node.child_by_field_name("name")
+        names = [
+            child for child in node.named_children if child.type in {"identifier", "qualified_name"}
+        ]
+        target = next(
+            (child for child in names if alias_node is None or child.id != alias_node.id), None
+        )
+        if target is None:
+            return
+        module_path = _capture_name(source, target)
+        if alias_node is not None:
+            # `using Widget = Acme.Gadget`: the alias binds one specific type
+            # -- the FQN's tail.
+            alias = _capture_name(source, alias_node)
+            add_reference(
+                "import",
+                node,
+                target_name=alias,
+                written_name=alias,
+                module_path=module_path,
+                imported_name=module_path.rsplit(".", 1)[-1],
+                alias=alias,
+            )
+            return
+        # Plain, `using static`, and `global using` directives bind names
+        # without a local spelling -- on-demand semantics; the resolver's C#
+        # branch decides what they can prove (D2: namespaces come from export
+        # rows, never from directories).
+        add_reference(
+            "import",
+            node,
+            target_name="*",
+            written_name="*",
+            module_path=module_path,
+            imported_name="*",
+            alias=None,
+        )
+
+    def _csharp_call(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        function = node.child_by_field_name("function")
+        if function is None:
+            return
+        receiver = (
+            function.child_by_field_name("expression")
+            if function.type == "member_access_expression"
+            else None
+        )
+        add_reference(
+            "call",
+            function,
+            target_name=_capture_name(source, function),
+            written_name=_capture_name(source, function),
+            receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+            call_shape=self._call_shape(node),
+        )
+
+    def _csharp_constructor_call(
+        self, node: Node, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        type_node = node.child_by_field_name("type")
+        if type_node is None:
+            return
+        names = TreeSitterExtractor._csharp_descend_type_names(type_node)
+        if not names:
+            return
+        written = _capture_name(source, names[0])
+        shape = self._call_shape(node).model_copy(update={"constructor": True})
+        add_reference(
+            "call",
+            node,
+            target_name=written,
+            written_name=written,
+            call_shape=shape,
+            span=(type_node.start_byte, type_node.end_byte),
+        )
+
+    def _csharp_exports(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        """Export rows for top-level types, carrying the declared namespace.
+
+        Any accessibility exports: `internal` types are visible project-wide.
+        The namespace comes from the enclosing `namespace_declaration` or
+        `file_scoped_namespace_declaration` (D2) -- the one per-file fact the
+        resolver needs; namespaces never map to directories.
+        """
+        if not TreeSitterExtractor._csharp_is_top_level(node):
+            return
+        name = node.child_by_field_name("name")
+        if name is None:
+            return
+        exported = _capture_name(source, name)
+        add_reference(
+            "export",
+            name,
+            target_name=exported,
+            written_name=exported,
+            module_path=TreeSitterExtractor._csharp_namespace_of(node, source),
+        )
+
+    @staticmethod
+    def _csharp_is_top_level(node: Node) -> bool:
+        current = node.parent
+        while current is not None:
+            if current.type in {
+                "compilation_unit",
+                "namespace_declaration",
+                "file_scoped_namespace_declaration",
+            }:
+                return True
+            if current.type in {
+                "class_declaration",
+                "struct_declaration",
+                "interface_declaration",
+                "record_declaration",
+                "enum_declaration",
+            }:
+                return False
+            current = current.parent
+        return False
+
+    @staticmethod
+    def _csharp_namespace_of(node: Node, source: bytes) -> str | None:
+        current: Node | None = node
+        while current is not None:
+            if current.type == "namespace_declaration":
+                name = current.child_by_field_name("name")
+                return _capture_name(source, name) if name is not None else None
+            if current.parent is not None and current.parent.type == "compilation_unit":
+                # A file-scoped namespace does not wrap its types: they sit
+                # after it as later siblings under the compilation unit, so
+                # the namespace is the nearest preceding sibling declaration.
+                preceding: list[Node] = []
+                sibling: Node | None = current.prev_named_sibling
+                while sibling is not None:
+                    preceding.append(sibling)
+                    sibling = sibling.prev_named_sibling
+                for sibling_node in preceding:
+                    if sibling_node.type == "file_scoped_namespace_declaration":
+                        scoped_name = sibling_node.child_by_field_name("name")
+                        return (
+                            _capture_name(source, scoped_name) if scoped_name is not None else None
+                        )
+            current = current.parent
+        return None
+
+    def _csharp_emit_type_uses(
+        self, node: Node | None, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        for leaf in TreeSitterExtractor._csharp_descend_type_names(node):
+            written = _capture_name(source, leaf)
+            add_reference("type_use", leaf, target_name=written, written_name=written)
+
+    # C# declarations whose type position the handler owns; the grammar names
+    # most of these children, except a method's return type (positional, see
+    # the handler).
+    _CSHARP_DECLARATION_TYPE_NODES: Final = frozenset(
+        {
+            "method_declaration",
+            "property_declaration",
+            "variable_declaration",
+            "parameter",
+            "catch_declaration",
+            "foreach_statement",
+        }
+    )
+
+    @staticmethod
+    def _csharp_descend_type_names(node: Node | None) -> list[Node]:
+        """Descend a C# type expression to its naming `identifier` leaves.
+
+        Unwraps `generic_name` (head plus one entry per type argument),
+        `type_argument_list`, `array_type`, and `nullable_type` down to
+        `identifier` leaves; a `qualified_name` (`Acme.Gadget`) contributes
+        only its final segment -- the earlier segments are namespace
+        spellings. Keyword types (`string`, `int`) are `predefined_type`
+        tokens and yield nothing.
+        """
+        if node is None:
+            return []
+        if node.type == "identifier":
+            return [node]
+
+        def named_children(inner: Node) -> list[Node]:
+            return [child for child in inner.named_children if not child.is_extra]
+
+        if node.type == "qualified_name":
+            named = named_children(node)
+            return TreeSitterExtractor._csharp_descend_type_names(named[-1]) if named else []
+        if node.type in {
+            "generic_name",
+            "type_argument_list",
+            "array_type",
+            "nullable_type",
+            # A base list's children are the heritage types themselves; a
+            # constraint wraps its `where` type the same way.
+            "base_list",
+            "type_parameter_constraint",
+        }:
+            names: list[Node] = []
+            for child in named_children(node):
+                names.extend(TreeSitterExtractor._csharp_descend_type_names(child))
             return names
         return []
 
