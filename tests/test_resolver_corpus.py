@@ -842,3 +842,23 @@ def test_csharp_var_typed_receiver_stays_likely(tmp_path: Path) -> None:
     assert call.resolution == "likely"
     assert call.reason_code == "unknown_receiver"
     assert any(item.code == "unknown_receiver" for item in response.limitations)
+
+
+def test_csharp_partial_class_this_receiver_resolves_exactly(tmp_path: Path) -> None:
+    """`this.Count` in another file of a `partial` class carries the enclosing
+    owner, so the receiver matches the declaration's owner exactly -- even
+    though a same-named `Count` in another namespace keeps the name ambiguous
+    project-wide."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "csharp" / "partial_this_receiver_exact"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id, path="Demo/Widget.cs", qualified_symbol="Widget.Count"
+        )
+    )
+
+    write = next(hit for hit in response.hits if hit.kind == "write")
+    assert write.resolution == "exact"
+    assert write.reason_code == "known_owner_member"

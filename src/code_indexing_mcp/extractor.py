@@ -2270,11 +2270,22 @@ class TreeSitterExtractor:
         elif node.type == "object_creation_expression":
             self._java_constructor_call(node, source, add_reference)
         elif node.type == "field_access":
+            receiver = node.child_by_field_name("object")
             text = _capture_name(source, node)
             kind: ReferenceKind = (
                 "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
             )
-            add_reference(kind, node, target_name=text, written_name=text)
+            # The receiver rides the row like Python/JS member access (E5):
+            # `this.<field>` can reach `known_owner_member` and any other
+            # receiver is held at `likely/unknown_receiver` instead of
+            # leaking through to `same_file_symbol`.
+            add_reference(
+                kind,
+                node,
+                target_name=text,
+                written_name=text,
+                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+            )
         elif node.type == "superclass":
             names = TreeSitterExtractor._java_descend_type_names(node)
             if names:
@@ -2416,7 +2427,7 @@ class TreeSitterExtractor:
         """Export rows for `public` top-level types.
 
         The java.scm export captures are `program`-anchored, so nested types
-        never reach this.         Package-private top-level types are not exported to
+        never reach this. Package-private top-level types are not exported to
         the world (imports cannot name them), matching Java's own visibility
         rule; `internal` visibility (C#'s project-wide bar) has no Java
         equivalent.
@@ -2527,7 +2538,18 @@ class TreeSitterExtractor:
             kind: ReferenceKind = (
                 "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
             )
-            add_reference(kind, node, target_name=text, written_name=text)
+            # Same receiver discipline as the Java/Python/JS member rows: a
+            # `this.<member>` row can reach `known_owner_member`, and any
+            # other receiver stays `likely/unknown_receiver` rather than
+            # leaking through to `same_file_symbol`.
+            receiver = node.child_by_field_name("expression")
+            add_reference(
+                kind,
+                node,
+                target_name=text,
+                written_name=text,
+                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+            )
         elif node.type == "base_list":
             # `: Base, IThing` -- every listed type is an inheritance edge.
             for leaf in TreeSitterExtractor._csharp_descend_type_names(node):

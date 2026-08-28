@@ -1022,3 +1022,135 @@ def test_csharp_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) 
         if item.code == "unsupported_language" and "svc.c" in item.explanation
     ]
     assert c_gaps
+
+
+def test_csharp_using_never_binds_an_ambiguous_name_exactly(tmp_path: Path) -> None:
+    """C# name resolution prefers a same-named type in the consumer's own
+    namespace over anything a using imports, so a second indexed declaration
+    of the name keeps the using-imported one at `likely`."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "demo_gadget.cs": "namespace Demo {\n    public class Gadget { }\n}\n",
+            "local_gadget.cs": "namespace Local {\n    public class Gadget { }\n}\n",
+            "Program.cs": (
+                "using Demo;\n\nnamespace Local {\n"
+                "    class Program {\n        Gadget gadget = new Gadget();\n    }\n}\n"
+            ),
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="demo_gadget.cs", qualified_symbol="Gadget")
+    )
+
+    for hit in (h for h in response.hits if h.path == "Program.cs"):
+        assert hit.resolution == "likely"
+        assert hit.reason_code == "on_demand_import"
+
+
+def test_csharp_namespace_using_never_binds_a_member_of_its_types(tmp_path: Path) -> None:
+    """A namespace using imports types, never members: a bare call to the
+    consumer's own same-named method must not bind to a method of a type in
+    the used namespace."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "widget.cs": (
+                "namespace Demo {\n    public class Widget {\n"
+                "        public void Bump() { }\n    }\n}\n"
+            ),
+            "Program.cs": (
+                "using Demo;\n\nnamespace App {\n    class Program {\n"
+                "        void Bump() { }\n        void Run() {\n            Bump();\n        }\n"
+                "    }\n}\n"
+            ),
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="widget.cs", qualified_symbol="Widget.Bump")
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "Program.cs" and hit.kind == "call")
+    assert call.resolution == "likely"
+    assert call.reason_code == "on_demand_import"
+
+
+def test_csharp_using_static_never_shadows_an_own_method_exactly(tmp_path: Path) -> None:
+    """`using static` members lose to the consumer's own same-named methods in
+    C#, so the call stays `likely` when both are indexed."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "errors.cs": (
+                "namespace Acme.Util {\n    public static class Errors {\n"
+                "        public static void Fail() { }\n    }\n}\n"
+            ),
+            "Program.cs": (
+                "using static Acme.Util.Errors;\n\nnamespace App {\n    class Program {\n"
+                "        void Fail() { }\n        void Run() {\n            Fail();\n        }\n"
+                "    }\n}\n"
+            ),
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="errors.cs", qualified_symbol="Errors.Fail")
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "Program.cs" and hit.kind == "call")
+    assert call.resolution == "likely"
+    assert call.reason_code == "on_demand_import"
+
+
+def test_csharp_member_write_on_unrelated_receiver_is_never_exact(tmp_path: Path) -> None:
+    """The member-write mirror of `test_unknown_member_receiver_is_never_exact`:
+    `other.Size = 5` in the same file as an unrelated `Size` declaration must
+    ride the receiver branch (`likely/unknown_receiver`), not leak through to
+    `same_file_symbol`."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "catalog.cs": (
+                "namespace Demo {\n"
+                "    class Panel {\n        public int Size { get; set; }\n    }\n"
+                "    class Program {\n        void Run(Other other) {\n"
+                "            other.Size = 5;\n        }\n    }\n"
+                "    class Other {\n        public int Size { get; set; }\n    }\n}\n"
+            )
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="catalog.cs", qualified_symbol="Panel.Size")
+    )
+
+    write = next(hit for hit in response.hits if hit.kind == "write")
+    assert write.resolution == "likely"
+    assert write.reason_code == "unknown_receiver"
+
+
+def test_java_member_write_on_unrelated_receiver_is_never_exact(tmp_path: Path) -> None:
+    """A Java field write through another object must not bind exactly to a
+    same-named method declaration in the same file."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "Svc.java": (
+                "package demo;\n\npublic class Svc {\n"
+                "    int total;\n\n"
+                "    int total() {\n        return total;\n    }\n\n"
+                "    void bump(Other other) {\n        other.total = 1;\n    }\n"
+                "}\n\nclass Other {\n    int total;\n}\n"
+            )
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="Svc.java", qualified_symbol="Svc.total")
+    )
+
+    write = next(hit for hit in response.hits if hit.kind == "write")
+    assert write.resolution == "likely"
+    assert write.reason_code == "unknown_receiver"

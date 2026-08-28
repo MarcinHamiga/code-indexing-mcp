@@ -1503,11 +1503,18 @@ class ReferenceService:
                 return verdict
         # C# plain/`static` usings over a bare name (D2 on-demand semantics):
         # a using provably binds when the selected declaration lives in the
-        # used namespace (namespace form) or on the used type (static form);
-        # more than one proven binding among the file's usings is the
-        # ambiguity a compiler would reject, so it stays `likely`.
+        # used namespace (namespace form) or on the used type (static form).
+        # Exactness requires, like Java's D3 and the same-namespace rule
+        # above, that the name has exactly one indexed declaration
+        # project-wide -- otherwise a same-named declaration in the consumer's
+        # own namespace or class (which C# name resolution prefers over any
+        # using) would silently earn `exact`. More than one proven binding
+        # among the file's usings is the ambiguity a compiler would reject,
+        # so it stays `likely` too.
         if row["language"] == "csharp":
-            verdict = self._csharp_using(row, source_imports, selected, module_index)
+            verdict = self._csharp_using(
+                row, source_imports, selected, target_candidates, module_index
+            )
             if verdict is not None:
                 return verdict
         # `target_candidates` is already the project-wide set of
@@ -1708,6 +1715,7 @@ class ReferenceService:
         row: ReferenceRecord,
         source_imports: list[ReferenceRecord],
         selected: SelectedDeclaration,
+        target_candidates: list[ReferenceRecord],
         module_index: _ModuleIndex | None,
     ) -> tuple[str, str, str] | None:
         """D2: classify a C# row against the file's plain/`static` usings.
@@ -1718,7 +1726,12 @@ class ReferenceService:
         is exported from exactly that namespace; a `using static A.B.Errors`
         provably binds a member when the selected declaration's owner is the
         FQN's tail type and that tail is exported from the FQN's namespace
-        prefix. Two proven bindings among the file's usings are ambiguous in
+        prefix. Exactness additionally requires the name to be the only
+        indexed declaration of that name project-wide -- the same uniqueness
+        evidence Java's D3 rule uses -- because C# name resolution prefers a
+        same-named declaration in the consumer's own namespace or class over
+        anything a using imports, so a second candidate can never be proven
+        away. Two proven bindings among the file's usings are ambiguous in
         real C#, so the verdict degrades to `likely` rather than picking one;
         zero proven bindings returns None so the ordinary fallbacks decide.
         """
@@ -1763,18 +1776,18 @@ class ReferenceService:
                 and selected_owner == tail
             ):
                 bindings.add(module_path)
-        if len(bindings) == 1:
+        if len(bindings) == 1 and len(target_candidates) == 1:
             return (
                 "exact",
                 "on_demand_import",
                 "The using directive's namespace provably declares this declaration.",
             )
-        if len(bindings) > 1:
+        if bindings:
             return (
                 "likely",
                 "on_demand_import",
-                "More than one using directive could bind this name, so the binding "
-                "cannot be proven.",
+                "A using directive could bind this name, but other same-named "
+                "declarations keep the binding unproven.",
             )
         return None
 
@@ -1875,12 +1888,6 @@ class ReferenceService:
         for row in records:
             path = PurePosixPath(row["path"])
             directory = path.parent
-            if str(directory) == ".":
-                continue
-            if path.suffix == ".go":
-                files_by_directory.setdefault(str(directory), set()).add(row["path"])
-            if path.suffix == ".java":
-                java_files_by_directory.setdefault(str(directory), set()).add(row["path"])
             if (
                 row["record_kind"] == "reference"
                 and row["kind"] == "export"
@@ -1889,10 +1896,18 @@ class ReferenceService:
             ):
                 # D2: a C# file's declared namespace rides its top-level
                 # types' export rows -- the one per-file fact the resolver
-                # needs; namespaces never map to directories.
+                # needs; namespaces never map to directories. This must not
+                # depend on the file's directory: a root-level `.cs` file
+                # declares its namespace just the same.
                 namespace_by_path.setdefault(row["path"], row["module_path"])
                 files_by_namespace.setdefault(row["module_path"], set()).add(row["path"])
                 names_by_namespace.setdefault(row["module_path"], set()).add(row["target_name"])
+            if str(directory) == ".":
+                continue
+            if path.suffix == ".go":
+                files_by_directory.setdefault(str(directory), set()).add(row["path"])
+            if path.suffix == ".java":
+                java_files_by_directory.setdefault(str(directory), set()).add(row["path"])
             if path.suffix == ".rs":
                 rust_directories.add(str(directory))
                 if path.name in {"lib.rs", "main.rs"}:

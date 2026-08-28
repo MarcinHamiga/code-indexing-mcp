@@ -59,8 +59,9 @@ proven by an import, namespace, owner, or uniqueness fact — never by name shap
 
 - `reference_queries/java.scm` + `_java_records`: single-type/static/on-demand/static-on-demand
   imports, calls whose span covers the two-sibling `receiver . name` callee, constructor-shaped
-  `new` calls, field-access read/write rows, `extends`/`implements` inheritance edges, throws and
-  bounds as type uses, annotations as decorators, and `public` top-level-type export rows.
+  `new` calls, field-access read/write rows carrying their receiver, `extends`/`implements`
+  inheritance edges, throws and bounds as type uses, annotations as decorators, and `public`
+  top-level-type export rows.
 - The Java grammar names few of its children, so descent is positional: wrappers
   (`generic_type`, `scoped_type_identifier`, `array_type`, heritage/throws/catch lists) unwrap by
   named children, and a `method_declaration`'s return type is the named child before its name.
@@ -83,11 +84,18 @@ proven by an import, namespace, owner, or uniqueness fact — never by name shap
   `files_by_namespace`, and `names_by_namespace` from these rows.
 - Resolver: plain/`static` usings bind `exact/on_demand_import` when the selected declaration is
   provably the one declaration in the used namespace (or, for `using static`, a member of the
-  named type); more than one proven binding — the case a C# compiler rejects as ambiguous —
-  degrades to `likely`. Alias usings (`using W = Acme.Gadget;`) bind through the ordinary
-  import machinery by FQN tail. Same-namespace uses resolve `same_package_symbol`, keyed on
-  namespace identity rather than directories. `var`-typed and extension receivers stay
-  `likely/unknown_receiver` untouched.
+  named type); exactness additionally requires the name to be project-wide unique — the same
+  evidence Java's D3 rule uses — because C# name resolution prefers a same-named declaration in
+  the consumer's own namespace or class over anything a using imports. More than one proven
+  binding — the case a C# compiler rejects as ambiguous — degrades to `likely`. Alias usings
+  (`using W = Acme.Gadget;`) bind through the ordinary import machinery by FQN tail.
+  Same-namespace uses resolve `same_package_symbol`, keyed on namespace identity rather than
+  directories. `var`-typed and extension receivers stay `likely/unknown_receiver` untouched.
+- **Review follow-up:** member read/write rows now carry `receiver_text` (as Python/JS/Go-call
+  rows do), so `this.<member>` reaches `exact/known_owner_member` — including C# `partial`
+  classes across files — and member accesses on any other receiver are held at
+  `likely/unknown_receiver` instead of leaking to `same_file_symbol` on a same-file
+  name coincidence.
 
 ### Documentation sweep (Step 5)
 

@@ -1469,8 +1469,10 @@ def test_java_member_access_reads_and_writes() -> None:
 
     write = next(r for r in refs if r.kind == "write")
     assert write.target_name == "widget.count"
+    assert write.receiver_text == "widget"
     read = next(r for r in refs if r.kind == "read" and "." in r.target_name)
     assert read.target_name == "widget.total"
+    assert read.receiver_text == "widget"
 
 
 def test_java_bindings_are_not_reads() -> None:
@@ -1787,5 +1789,7 @@ def test_csharp_this_receiver_writes_are_member_rows() -> None:
 
     writes = [r for r in refs if r.kind == "write"]
     assert [r.target_name for r in writes] == ["this.Count"]
+    assert all(r.receiver_text == "this" for r in writes)
     reads = [r for r in refs if r.kind == "read"]
     assert [r.target_name for r in reads] == ["this.Count"]
+    assert all(r.receiver_text == "this" for r in reads)
