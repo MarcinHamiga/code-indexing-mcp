@@ -59,7 +59,7 @@ _CONTAINER_KINDS: Final = frozenset(
 )
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 _QUOTE_CHARACTERS: Final = ("'", '"')
-STRUCTURAL_LANGUAGES: Final = frozenset({"python", "javascript", "typescript", "tsx", "go"})
+STRUCTURAL_LANGUAGES: Final = frozenset({"python", "javascript", "typescript", "tsx", "go", "rust"})
 # Per-language handler for the non-`reference.identifier` captures of that
 # language's structural query. Both handlers share one signature
 # `(node, source, add_reference)` and re-dispatch on `node.type`, so a new
@@ -70,6 +70,7 @@ _STRUCTURAL_RECORD_HANDLERS: Final[dict[str, str]] = {
     "typescript": "_javascript_records",
     "tsx": "_javascript_records",
     "go": "_go_records",
+    "rust": "_rust_records",
 }
 _PACK_DOWNLOAD_ATTEMPTS: Final = 6
 _PACK_DOWNLOAD_BACKOFF_SECONDS: Final = 1.0
@@ -432,6 +433,15 @@ class TreeSitterExtractor:
                 "generic_type",
                 "class_heritage",
                 "extends_type_clause",
+                # Rust `use` trees bind spellings; the import rows own them.
+                "use_declaration",
+                "use_as_clause",
+                "scoped_use_list",
+                "use_list",
+                "use_wildcard",
+                # `&self`/`&mut self` receivers are not reads of a `self`
+                # symbol (method-body `self` reads ride field expressions).
+                "self_parameter",
             }:
                 return
             if parent.type in {
@@ -439,6 +449,7 @@ class TreeSitterExtractor:
                 "formal_parameters",
                 "lambda_parameters",
                 "parameter_list",
+                "closure_parameters",
             }:
                 parameter = node
                 while parameter.parent is not None and parameter.parent != parent:
@@ -492,13 +503,27 @@ class TreeSitterExtractor:
                 # the handler; the spec's own name is a binding.
                 "var_spec",
                 "const_spec",
+                # Rust named owners are bindings; their type fields are owned
+                # by the handler (`return_type` covers the bare `-> Widget`
+                # form, `trait` the implemented trait of an `impl`).
+                "function_item",
+                "function_signature_item",
+                "struct_item",
+                "enum_item",
+                "trait_item",
+                "mod_item",
+                "const_item",
+                "static_item",
+                "enum_variant",
+                "impl_item",
+                "struct_expression",
             }:
                 # `result` covers a function/method's bare result type
                 # (`func load() Store`): the handler owns its `type_use` row,
                 # so a parallel plain read would only duplicate it with the
                 # wrong kind. Parameters are cut by the parameter_list walk
                 # above; parenthesized results by it too.
-                excluded_fields = ("name", "type", "result")
+                excluded_fields = ("name", "type", "result", "return_type", "trait")
             elif parent.type in {
                 "assignment",
                 "assignment_expression",
@@ -516,8 +541,25 @@ class TreeSitterExtractor:
                 "assignment_statement",
                 "short_var_declaration",
                 "range_clause",
+                # Rust `count += 1` mutates the existing binding.
+                "compound_assignment_expr",
             }:
                 excluded_fields = ("left", "name")
+            elif parent.type in {"let_declaration", "for_expression"}:
+                # Rust `let x = ...` / `for x in ...`: the pattern names a new
+                # binding; the optional `: Type` annotation is the handler's
+                # `type_use` and the value stays a plain read.
+                excluded_fields = ("pattern",)
+            elif parent.type == "scoped_identifier":
+                # Path segments are namespace spellings; the final `name` may
+                # be a real value read (`State::Ready`) and stays eligible.
+                # Inside a `use` tree the climb above still cuts the leaf.
+                excluded_fields = ("path",)
+            elif parent.type == "field_initializer":
+                # `Widget { label: text }` -- the field key is a binding, not
+                # a read of a `label` symbol (a shorthand `Widget { label }`
+                # keeps its read: the identifier is the initializer there).
+                excluded_fields = ("field",)
             elif parent.type in {"inc_statement", "dec_statement"}:
                 # Go `x++`: the bare operand is mutated in place, and the
                 # selector handler owns the write row for `p.x++` -- the same
@@ -557,11 +599,11 @@ class TreeSitterExtractor:
             }:
                 excluded_fields = ("key",)
             elif language != "python" and parent.type in {
-                # Go type wrappers: every identifier directly inside one is a
-                # type position, already emitted as `type_use` by the handler
-                # -- a parallel plain read would only duplicate it. (An array
-                # length expression nested deeper is untouched by this
-                # direct-parent rule.)
+                # Go/Rust type wrappers: every identifier directly inside one
+                # is a type position, already emitted as `type_use` by the
+                # handler -- a parallel plain read would only duplicate it.
+                # (An array length expression nested deeper is untouched by
+                # this direct-parent rule.)
                 "pointer_type",
                 "slice_type",
                 "array_type",
@@ -570,6 +612,12 @@ class TreeSitterExtractor:
                 "function_type",
                 "parenthesized_type",
                 "qualified_type",
+                "reference_type",
+                "tuple_type",
+                "scoped_type_identifier",
+                "dynamic_type",
+                "type_arguments",
+                "ordered_field_declaration_list",
             }:
                 return
             if any(contains(parent.child_by_field_name(field)) for field in excluded_fields):
@@ -947,6 +995,8 @@ class TreeSitterExtractor:
             "augmented_assignment",
             "assignment_expression",
             "augmented_assignment_expression",
+            # Rust `count += 1` -- the field operand is the write target.
+            "compound_assignment_expr",
         }:
             return parent.child_by_field_name("left") == node
         # Go wraps each assignment side in an `expression_list` (`s.next =
@@ -1725,6 +1775,293 @@ class TreeSitterExtractor:
                 continue
             add_reference("export", name_node, target_name=exported, written_name=exported)
 
+    def _rust_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "use_declaration":
+            self._rust_use(node, source, add_reference)
+            self._rust_exports(node, source, add_reference)
+            return
+        if node.type == "call_expression":
+            self._rust_call(node, source, add_reference)
+            return
+        if node.type == "field_expression":
+            parent = node.parent
+            if (
+                parent is not None
+                and parent.type == "call_expression"
+                and parent.child_by_field_name("function") == node
+            ):
+                # The call row above already owns this span.
+                return
+            text = _capture_name(source, node)
+            kind: ReferenceKind = (
+                "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
+            )
+            add_reference(kind, node, target_name=text, written_name=text)
+            return
+        if node.type == "impl_item":
+            # `impl Draw for Widget`: the trait is an inheritance edge, the
+            # self type a plain type use. The methods' `Type.method`
+            # qualification happens in `_symbol_context`.
+            self._rust_emit_type_uses(
+                node.child_by_field_name("trait"), source, add_reference, kind="inheritance"
+            )
+            self._rust_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
+            return
+        if node.type == "struct_expression":
+            self._rust_emit_type_uses(node.child_by_field_name("name"), source, add_reference)
+            return
+        if node.type in {"function_item", "function_signature_item"}:
+            self._rust_emit_type_uses(
+                node.child_by_field_name("return_type"), source, add_reference
+            )
+            parameters = node.child_by_field_name("parameters")
+            if parameters is not None:
+                for child in parameters.named_children:
+                    if child.type != "self_parameter" and not child.is_extra:
+                        self._rust_emit_type_uses(
+                            child.child_by_field_name("type"), source, add_reference
+                        )
+            self._rust_exports(node, source, add_reference)
+            return
+        if node.type in {"let_declaration", "field_declaration", "parameter"}:
+            self._rust_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
+            return
+        if node.type in {"const_item", "static_item"}:
+            self._rust_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
+            self._rust_exports(node, source, add_reference)
+            return
+        if node.type == "enum_variant":
+            self._rust_emit_type_uses(node.child_by_field_name("body"), source, add_reference)
+            return
+        self._rust_exports(node, source, add_reference)
+
+    def _rust_use(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        argument = node.child_by_field_name("argument")
+        if argument is None:
+            return
+        for anchor, module_path, imported_name, alias in self._rust_use_bindings(
+            argument, source, []
+        ):
+            spelling = alias or imported_name
+            # A `use` binds a whole path to one local spelling; the module
+            # path minus its final segment is what module resolution anchors.
+            add_reference(
+                "import",
+                anchor,
+                target_name=spelling,
+                written_name=spelling,
+                module_path=module_path,
+                imported_name=imported_name,
+                alias=alias,
+            )
+
+    def _rust_use_bindings(
+        self, node: Node, source: bytes, prefix: list[str]
+    ) -> list[tuple[Node, str | None, str, str | None]]:
+        """Flatten one `use` argument into `(anchor, module_path, name, alias)` rows.
+
+        Nested groups expand one row per leaf (`use a::{b::C, d}`), `as`
+        renames carry their alias, and globs carry `imported_name="*"` so the
+        wildcard gate holds them unresolved.
+        """
+        bindings: list[tuple[Node, str | None, str, str | None]] = []
+        if node.type == "scoped_identifier":
+            segments = prefix + self._rust_path_segments(node, source)
+            if len(segments) == 1:
+                bindings.append((node, None, segments[0], None))
+            elif segments:
+                bindings.append((node, "::".join(segments[:-1]), segments[-1], None))
+        elif node.type == "identifier":
+            name = _capture_name(source, node)
+            if prefix:
+                bindings.append((node, "::".join(prefix), name, None))
+            else:
+                bindings.append((node, None, name, None))
+        elif node.type == "use_as_clause":
+            path = node.child_by_field_name("path")
+            alias_node = node.child_by_field_name("alias")
+            segments = prefix + self._rust_path_segments(path, source)
+            if segments:
+                module_path = "::".join(segments[:-1]) or None
+                alias = _capture_name(source, alias_node) if alias_node is not None else None
+                bindings.append((node, module_path, segments[-1], alias))
+        elif node.type == "use_wildcard":
+            inner = next((child for child in node.named_children if child.type != "*"), None)
+            segments = prefix + self._rust_path_segments(inner, source)
+            if segments:
+                bindings.append((node, "::".join(segments), "*", None))
+        elif node.type == "scoped_use_list":
+            path = node.child_by_field_name("path")
+            use_list = node.child_by_field_name("list")
+            for binding in self._rust_use_bindings_list(
+                use_list, source, prefix + self._rust_path_segments(path, source)
+            ):
+                bindings.append(binding)
+        elif node.type == "use_list":
+            for binding in self._rust_use_bindings_list(node, source, prefix):
+                bindings.append(binding)
+        return bindings
+
+    def _rust_use_bindings_list(
+        self, node: Node | None, source: bytes, prefix: list[str]
+    ) -> list[tuple[Node, str | None, str, str | None]]:
+        bindings: list[tuple[Node, str | None, str, str | None]] = []
+        if node is None:
+            return bindings
+        for child in node.named_children:
+            if child.is_extra:
+                continue
+            bindings.extend(self._rust_use_bindings(child, source, prefix))
+        return bindings
+
+    def _rust_call(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        function = node.child_by_field_name("function")
+        if function is None:
+            return
+        if function.type == "identifier":
+            name = _capture_name(source, function)
+            add_reference(
+                "call",
+                function,
+                target_name=name,
+                written_name=name,
+                call_shape=self._call_shape(node),
+            )
+        elif function.type == "scoped_identifier":
+            segments = self._rust_path_segments(function, source)
+            if not segments:
+                return
+            # Rows join path segments with dots (Python/Go convention) so the
+            # written-name tail math and rename trimming keep one shape; the
+            # receiver keeps its `::` spelling and resolves only through an
+            # explicit import, which is exactly the honest bar here.
+            add_reference(
+                "call",
+                function,
+                target_name=".".join(segments),
+                written_name=".".join(segments),
+                receiver_text="::".join(segments[:-1]) or None,
+                call_shape=self._call_shape(node),
+            )
+        elif function.type == "field_expression":
+            receiver = function.child_by_field_name("value")
+            add_reference(
+                "call",
+                function,
+                target_name=_capture_name(source, function),
+                written_name=_capture_name(source, function),
+                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+                call_shape=self._call_shape(node),
+            )
+
+    def _rust_exports(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        """Export rows for `pub` items; `pub use` rows carry the module path.
+
+        The rust.scm export captures are `source_file`-anchored, so nested
+        impl methods and module-private items never reach this. `pub use`
+        exports mirror their import rows (module path, imported name, alias)
+        so the re-export chain walker can hop through them unchanged.
+        """
+        if not any(child.type == "visibility_modifier" for child in node.children):
+            return
+        if node.type == "use_declaration":
+            argument = node.child_by_field_name("argument")
+            if argument is None:
+                return
+            for anchor, module_path, imported_name, alias in self._rust_use_bindings(
+                argument, source, []
+            ):
+                spelling = alias or imported_name
+                add_reference(
+                    "export",
+                    anchor,
+                    target_name=spelling,
+                    written_name=spelling,
+                    module_path=module_path,
+                    imported_name=imported_name,
+                    alias=alias,
+                )
+            return
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+        exported = _capture_name(source, name_node)
+        add_reference("export", name_node, target_name=exported, written_name=exported)
+
+    def _rust_emit_type_uses(
+        self,
+        node: Node | None,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        kind: ReferenceKind = "type_use",
+    ) -> None:
+        for leaf in TreeSitterExtractor._rust_descend_type_names(node):
+            name = _capture_name(source, leaf)
+            add_reference(kind, leaf, target_name=name, written_name=name)
+
+    @staticmethod
+    def _rust_path_segments(node: Node | None, source: bytes) -> list[str]:
+        """Flatten a `::` path into its spelling segments.
+
+        `crate`/`super`/`self` are keyword tokens, not identifiers, and a
+        turbofish segment (`Vec::<u8>::new`) hides the head type behind a
+        `generic_type` -- its type arguments are type parameters, not path
+        segments.
+        """
+        if node is None:
+            return []
+        if node.type in {"identifier", "type_identifier"}:
+            return [_capture_name(source, node)]
+        if node.type in {"crate", "super", "self"}:
+            return [node.type]
+        if node.type == "scoped_identifier":
+            segments = TreeSitterExtractor._rust_path_segments(
+                node.child_by_field_name("path"), source
+            )
+            name = node.child_by_field_name("name")
+            if name is not None:
+                segments.append(_capture_name(source, name))
+            return segments
+        if node.type == "generic_type":
+            return TreeSitterExtractor._rust_path_segments(node.child_by_field_name("type"), source)
+        return []
+
+    @staticmethod
+    def _rust_descend_type_names(node: Node | None) -> list[Node]:
+        """Descend a Rust type expression to its naming `type_identifier` leaves.
+
+        Unwraps reference/pointer/slice/array/tuple/parenthesized wrappers,
+        `generic_type` (head plus one entry per type argument), `dyn` traits,
+        and `scoped_type_identifier` down to leaf names -- a qualified leaf
+        contributes only its final identifier, the path being a namespace
+        spelling. Primitive types yield nothing: they can never be project
+        declarations.
+        """
+        if node is None:
+            return []
+        if node.type == "type_identifier":
+            return [node]
+        if node.type == "scoped_type_identifier":
+            return TreeSitterExtractor._rust_descend_type_names(node.child_by_field_name("name"))
+        if node.type in {
+            "reference_type",
+            "pointer_type",
+            "slice_type",
+            "array_type",
+            "tuple_type",
+            "parenthesized_type",
+            "generic_type",
+            "dynamic_type",
+            "impl_trait_type",
+            "type_arguments",
+            "ordered_field_declaration_list",
+        }:
+            names: list[Node] = []
+            for child in node.named_children:
+                names.extend(TreeSitterExtractor._rust_descend_type_names(child))
+            return names
+        return []
+
     def _definitions(self, language_name: str, root: Node, source: bytes) -> list[_Definition]:
         matches = QueryCursor(self._query(language_name)).matches(root)
         found: dict[tuple[int, int, str], _Definition] = {}
@@ -1774,6 +2111,16 @@ class TreeSitterExtractor:
             candidate = index.by_node_id.get(parent.id)
             if candidate is not None:
                 chain.append(candidate)
+            elif parent.type == "impl_item":
+                # Rust methods live in impl blocks, which are naming scopes but
+                # deliberately not chunked definitions (an `impl_item` capture
+                # would duplicate the self type's `struct` chunk). Synthesizing
+                # a container named by the self type qualifies `fn draw` inside
+                # `impl Runner for Widget` as `Widget.draw`, so `self.draw()`
+                # resolves exactly through `_same_owner` like Python/TS.
+                name = TreeSitterExtractor._impl_self_type_name(parent)
+                if name is not None:
+                    chain.append(_Definition(parent, "struct", name))
             parent = parent.parent
         chain.reverse()
         if any(item.kind in _CALLABLE_KINDS for item in chain):
@@ -1786,6 +2133,21 @@ class TreeSitterExtractor:
         if scope and scope[-1].kind in _CONTAINER_KINDS and kind == "function":
             kind = "method"
         return kind, parent_name, qualified
+
+    @staticmethod
+    def _impl_self_type_name(impl: Node) -> str | None:
+        type_node = impl.child_by_field_name("type")
+        if type_node is None:
+            return None
+        if type_node.type == "type_identifier":
+            return (type_node.text or b"").decode("utf-8", errors="replace")
+        # A generic self type (`impl<T> Pool<T>`) names its head type.
+        current: Node | None = type_node
+        while current is not None:
+            if current.type == "type_identifier":
+                return (current.text or b"").decode("utf-8", errors="replace")
+            current = current.named_children[0] if current.named_children else None
+        return None
 
     @staticmethod
     def _content_range(

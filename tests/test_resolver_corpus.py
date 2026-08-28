@@ -522,3 +522,117 @@ def test_go_embedded_interface_is_an_inheritance_edge(tmp_path: Path) -> None:
 
     assert len(embedded) == 1
     assert embedded[0]["source_qualified_symbol"] == "LogStore"
+
+
+def test_rust_crate_relative_use_resolves_exactly(tmp_path: Path) -> None:
+    """`Save()` through `use crate::app::store::save::Save` anchors at the
+    known crate root and binds the module file exactly."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "rust" / "crate_relative_use")
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id, path="src/app/store/save.rs", qualified_symbol="Save"
+        )
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "src/lib.rs" and hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "direct_import_alias"
+
+
+def test_rust_self_and_super_paths_resolve_exactly(tmp_path: Path) -> None:
+    """`use self::inner::ping` anchors at the file's own directory and
+    `use super::outer::pong` pops one directory from a `mod.rs` file."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "rust" / "self_super_paths")
+
+    ping = service.find_references(
+        DeclarationSelector(project=project_id, path="src/app/inner.rs", qualified_symbol="ping")
+    )
+    ping_hit = next(hit for hit in ping.hits if hit.path == "src/app/mod.rs" and hit.kind == "call")
+    assert ping_hit.resolution == "exact"
+    assert ping_hit.reason_code == "direct_import_alias"
+
+    pong = service.find_references(
+        DeclarationSelector(project=project_id, path="src/app/outer.rs", qualified_symbol="pong")
+    )
+    pong_hit = next(
+        hit for hit in pong.hits if hit.path == "src/app/wrap/mod.rs" and hit.kind == "call"
+    )
+    assert pong_hit.resolution == "exact"
+    assert pong_hit.reason_code == "direct_import_alias"
+
+
+def test_rust_pub_use_reexport_chain_resolves_exactly(tmp_path: Path) -> None:
+    """An importer reaches `Kick` through a `pub use` barrel: the chain walker
+    follows the export row's module path to the defining file."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "rust" / "pub_use_reexport_chain"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="src/core/kick.rs", qualified_symbol="Kick")
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "src/lib.rs" and hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "reexport_chain"
+
+
+def test_rust_glob_use_is_unresolved_with_a_wildcard_reason(tmp_path: Path) -> None:
+    """`use crate::util::*` binds every exported name dynamically, so the
+    wildcard gate holds the call unresolved with a reason -- the same honest
+    answer Go's dot imports and Python's star imports ship."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "rust" / "glob_use_unresolved")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="src/util.rs", qualified_symbol="limit")
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "src/lib.rs" and hit.kind == "call")
+    assert call.resolution == "unresolved"
+    assert call.reason_code == "wildcard_import"
+
+
+def test_rust_unprefixed_use_with_divergent_anchors_stays_likely(tmp_path: Path) -> None:
+    """A plain first segment is edition-ambiguous: both the current-directory
+    and crate-root readings exist here and disagree, so the binding cannot be
+    proven and stays `likely` (unproven re-export) rather than gambling."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "rust" / "unprefixed_ambiguous")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="src/shared.rs", qualified_symbol="Tool")
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "src/app/mod.rs" and hit.kind == "call")
+    assert call.resolution == "likely"
+    assert call.reason_code == "unproven_reexport"
+
+
+def test_rust_self_call_resolves_exactly_through_the_impl_owner(tmp_path: Path) -> None:
+    """`self.helper()` inside `impl Widget` carries the `Widget.run` enclosing
+    symbol, so the receiver matches the declaration's owner exactly."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "rust" / "self_call_exact")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="src/lib.rs", qualified_symbol="Widget.helper")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "known_owner_member"
+
+
+def test_rust_trait_impl_is_an_inheritance_edge(tmp_path: Path) -> None:
+    """`impl Draw for Widget` records the trait as an inheritance reference
+    and binds it exactly (same file, same name)."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "rust" / "trait_impl_inheritance"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="src/lib.rs", qualified_symbol="Draw")
+    )
+
+    inheritance = next(hit for hit in response.hits if hit.kind == "inheritance")
+    assert inheritance.resolution == "exact"
+    assert inheritance.reason_code == "same_file_symbol"

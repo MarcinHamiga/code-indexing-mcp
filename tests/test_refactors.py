@@ -795,6 +795,36 @@ def test_a_go_rename_analysis_covers_its_same_package_caller(tmp_path: Path) -> 
     assert ("use.go", "Authorize") in edited_paths
 
 
+def test_a_rust_rename_analysis_covers_its_imported_caller(tmp_path: Path) -> None:
+    """Rust joined the structural languages, so a rename answers instead of
+    refusing -- and the crate-relative import binds exactly."""
+
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "src/lib.rs": (
+                "mod auth;\n\nuse crate::auth::Authorize;\n\n"
+                "pub fn run() -> u32 {\n    Authorize(1)\n}\n"
+            ),
+            "src/auth.rs": "pub fn Authorize(user: u32) -> u32 {\n    user\n}\n",
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="src/auth.rs", qualified_symbol="Authorize"),
+        RenameOperation(new_name="Permit"),
+    )
+
+    assert analysis.completeness.state == "complete"
+    edited_paths = {
+        (item.path, item.written_name)
+        for item in analysis.must_change
+        if item.edit_required and item.written_name == "Authorize"
+    }
+    assert ("src/auth.rs", "Authorize") in edited_paths
+    assert ("src/lib.rs", "Authorize") in edited_paths
+
+
 def test_an_unproven_call_keeps_the_analysis_out_of_the_complete_state(
     tmp_path: Path,
 ) -> None:

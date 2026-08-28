@@ -655,6 +655,41 @@ def test_go_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> N
     assert c_gaps
 
 
+def test_rust_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> None:
+    """Coverage flips only for the newly supported language.
+
+    Indexing a mixed Python + Rust + C project must stop reporting
+    `unsupported_language` for the Rust files while the C files stay
+    reported, proving the flip is scoped to the language that gained
+    extraction.
+    """
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "main.rs": "pub fn main() {\n    let x = 1;\n}\n",
+            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    )
+
+    rust_gaps = [
+        item
+        for item in response.limitations
+        if item.code == "unsupported_language" and "main.rs" in item.explanation
+    ]
+    assert not rust_gaps
+    c_gaps = [
+        item
+        for item in response.limitations
+        if item.code == "unsupported_language" and "svc.c" in item.explanation
+    ]
+    assert c_gaps
+
+
 def test_go_method_receiver_name_binds_a_unique_member_exactly(tmp_path: Path) -> None:
     """`c.Handle()` inside a method whose receiver is also named `c` is exact.
 

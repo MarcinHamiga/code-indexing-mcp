@@ -57,7 +57,7 @@ _MAX_LIMITATION_PATHS: Final = 10
 class _ModuleIndex(NamedTuple):
     """Path arithmetic over one query's snapshot, precomputed instead of rescanned.
 
-    Three lookups the language resolvers need repeatedly:
+    The lookups the language resolvers need repeatedly:
     `directories_by_suffix` maps an import path's segment tuple to every known
     directory whose trailing segments equal it (module-prefix agnostic -- the
     shape Go package imports resolve against without reading go.mod),
@@ -66,14 +66,17 @@ class _ModuleIndex(NamedTuple):
     and `receiver_names` maps `(file_id, enclosing qualified symbol)` to its
     first parameter name for method declarations only (Go methods put their
     receiver there; a plain function's first parameter is not a receiver),
-    which powers the Go receiver-name rule. Python and JavaScript resolution
-    ignore the index entirely; only callers whose language has a
-    directory-suffix or receiver rule consult it.
+    which powers the Go receiver-name rule. `rust_crate_roots` maps every
+    Rust directory to the nearest ancestor containing a `lib.rs`/`main.rs`,
+    which anchors `crate::` paths without reading Cargo.toml. Python and
+    JavaScript resolution ignore the index entirely; only callers whose
+    language has a directory-suffix or receiver rule consult it.
     """
 
     directories_by_suffix: dict[tuple[str, ...], tuple[str, ...]]
     files_by_directory: dict[str, tuple[str, ...]]
     receiver_names: dict[tuple[str, str], str]
+    rust_crate_roots: dict[str, str]
 
 
 class _ReferenceQuery(NamedTuple):
@@ -1614,6 +1617,8 @@ class ReferenceService:
         directories_by_suffix: dict[tuple[str, ...], set[str]] = {}
         files_by_directory: dict[str, set[str]] = {}
         receiver_names: dict[tuple[str, str], str] = {}
+        rust_directories: set[str] = set()
+        rust_crate_markers: set[str] = set()
         if declarations is not None:
             for declaration in declarations:
                 if declaration["kind"] != "method":
@@ -1640,6 +1645,10 @@ class ReferenceService:
                 continue
             if path.suffix == ".go":
                 files_by_directory.setdefault(str(directory), set()).add(row["path"])
+            if path.suffix == ".rs":
+                rust_directories.add(str(directory))
+                if path.name in {"lib.rs", "main.rs"}:
+                    rust_crate_markers.add(str(directory))
             parts = directory.parts
             # Every trailing-segment view of this directory is one potential
             # import-path match: `app/store` also matches the suffix ("store",)
@@ -1654,7 +1663,30 @@ class ReferenceService:
                 directory: tuple(sorted(files)) for directory, files in files_by_directory.items()
             },
             receiver_names=receiver_names,
+            rust_crate_roots=ReferenceService._rust_crate_roots(
+                rust_directories, rust_crate_markers
+            ),
         )
+
+    @staticmethod
+    def _rust_crate_roots(directories: set[str], markers: set[str]) -> dict[str, str]:
+        """Map each Rust directory to the nearest ancestor holding a crate root.
+
+        `crate::` paths anchor at the shallowest ancestor directory (the file's
+        own directory included) that contains `lib.rs` or `main.rs`; a
+        directory with no such ancestor -- a standalone script, a fixtures
+        tree without a crate root -- maps nowhere and every `crate::` import
+        from it stays unproven (`likely` at best), never falsely exact.
+        """
+        roots: dict[str, str] = {}
+        for directory in sorted(directories):
+            parts = PurePosixPath(directory).parts
+            for depth in range(len(parts), 0, -1):
+                candidate = str(PurePosixPath(*parts[:depth]))
+                if candidate in markers:
+                    roots[directory] = candidate
+                    break
+        return roots
 
     @staticmethod
     def _module_candidates(
@@ -1683,6 +1715,55 @@ class ReferenceService:
                     # could carry the declaration the import binds.
                     candidates.add(PurePosixPath(file_path))
             return candidates
+        if language == "rust":
+            if module_index is None:
+                return set()
+            parts = [part for part in module_path.split("::") if part and part != "."]
+            if not parts:
+                return set()
+            source_directory = str(source.parent)
+            crate_root = module_index.rust_crate_roots.get(source_directory)
+
+            def under(base: str, tail: list[str]) -> set[PurePosixPath]:
+                # `a::b` is `a/b.rs` or `a/b/mod.rs` under its anchor; plain
+                # `mod x;` needs no row because this directory arithmetic
+                # already covers it.
+                if not tail:
+                    return set()
+                module = "/".join(tail)
+                return {
+                    PurePosixPath(f"{base}/{module}.rs"),
+                    PurePosixPath(f"{base}/{module}/mod.rs"),
+                }
+
+            head = parts[0]
+            if head == "crate":
+                # `crate::` anchors at the nearest known crate root; with no
+                # `lib.rs`/`main.rs` in the snapshot the path stays unproven.
+                return under(crate_root, parts[1:]) if crate_root else set()
+            if head in {"self", "super"}:
+                base = PurePosixPath(source_directory)
+                rest = list(parts)
+                while rest and rest[0] in {"self", "super"}:
+                    keyword = rest.pop(0)
+                    if keyword == "super":
+                        if len(base.parts) <= 1:
+                            # `super::` past the project root can never match
+                            # an in-project target.
+                            return set()
+                        base = base.parent
+                return under(str(base), rest)
+            # A plain first segment is edition-ambiguous: 2018 anchors it at
+            # the crate root, 2015 `mod` trees at the current directory.
+            # Both readings are generated; when both are non-empty and
+            # disjoint the binding cannot be proven, and the empty
+            # intersection keeps the classification at `likely` instead of
+            # gambling on either anchor.
+            directory_candidates = under(source_directory, parts)
+            root_candidates = under(crate_root, parts) if crate_root else set()
+            if directory_candidates and root_candidates:
+                return directory_candidates & root_candidates
+            return directory_candidates | root_candidates
         if language == "python":
             dots = len(module_path) - len(module_path.lstrip("."))
             suffix = module_path[dots:]
