@@ -84,7 +84,7 @@ CANDIDATE_GROUP_COUNT = 256
 # Version 5 adds Go to STRUCTURAL_LANGUAGES. Every language's version-bump step
 # is what makes parse-only reference backfill re-extract that language's files
 # (Go files already carried version-4 coverage rows with zero occurrences).
-REFERENCE_SCHEMA_VERSION = 5
+REFERENCE_SCHEMA_VERSION = 6
 
 # Failures caused by the environment rather than by a file's own content. They
 # abort the run instead of being recorded against whichever file was in flight.

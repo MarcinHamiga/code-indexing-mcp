@@ -1183,3 +1183,207 @@ def test_go_interface_method_elem_types_are_type_uses() -> None:
     type_uses = [r for r in _go_result(source).references if r.kind == "type_use"]
 
     assert sorted(r.written_name for r in type_uses) == ["Item", "Item", "Result"]
+
+
+# ---------------------------------------------------------------------------
+# Rust structural references (language step 2)
+# ---------------------------------------------------------------------------
+
+
+def _rust_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.rs"), "rust", source.encode())
+
+
+def test_rust_extracts_use_shapes() -> None:
+    """Plain, grouped, aliased, glob, and crate/super/self uses produce one
+    row per binding; `module_path` is the path minus its final segment and a
+    glob carries `imported_name="*"` so the wildcard gate owns it."""
+    source = (
+        "use crate::app::store::Saver;\n"
+        "use crate::app::{util::limit, fmt::show};\n"
+        "use std::io::Result as IoResult;\n"
+        "use crate::app::util::*;\n"
+        "use super::helper::assist;\n"
+        "use self::inner::Local;\n"
+    )
+
+    refs = {r.written_name: r for r in _rust_result(source).references if r.kind == "import"}
+
+    assert refs["Saver"].module_path == "crate::app::store"
+    assert refs["limit"].module_path == "crate::app::util"
+    assert refs["show"].module_path == "crate::app::fmt"
+    assert (refs["IoResult"].module_path, refs["IoResult"].alias) == ("std::io", "IoResult")
+    assert refs["IoResult"].imported_name == "Result"
+    glob = refs["*"]
+    assert (glob.module_path, glob.imported_name, glob.alias) == ("crate::app::util", "*", None)
+    assert refs["assist"].module_path == "super::helper"
+    assert refs["Local"].module_path == "self::inner"
+
+
+def test_rust_calls_and_call_shapes() -> None:
+    """Plain, path-qualified, method, and turbofish calls all carry a shape;
+    path segments join with dots (Python/Go convention) and the receiver
+    keeps its `::` spelling."""
+    source = (
+        "fn run(input: u32) {\n"
+        "\tbuild(input);\n"
+        "\tSaver::save(&input);\n"
+        "\tw.draw();\n"
+        "\tlet xs = Vec::<u8>::new();\n"
+        "}\n"
+    )
+
+    calls = {r.target_name: r for r in _rust_result(source).references if r.kind == "call"}
+
+    assert calls["build"].receiver_text is None
+    assert calls["build"].call_shape is not None
+    assert calls["build"].call_shape.positional_count == 1
+    assert calls["Saver.save"].receiver_text == "Saver"
+    assert calls["Saver.save"].source_qualified_symbol == "run"
+    assert calls["w.draw"].receiver_text == "w"
+    turbofish = calls["Vec.new"]
+    assert turbofish.receiver_text == "Vec"
+    assert turbofish.call_shape is not None
+    assert turbofish.call_shape.positional_count == 0
+
+
+def test_rust_impl_methods_qualify_and_self_calls_carry_the_owner() -> None:
+    """Methods inside `impl Widget` qualify `Widget.method`, so a
+    `self.helper()` call carries the owner-qualified enclosing symbol that
+    `_same_owner` needs for an exact verdict."""
+    source = (
+        "struct Widget;\n\n"
+        "impl Widget {\n"
+        "\tfn helper(&self) -> u32 {\n\t\t1\n\t}\n"
+        "\tfn run(&self) -> u32 {\n"
+        "\t\tself.helper()\n"
+        "\t}\n"
+        "}\n"
+    )
+
+    result = _rust_result(source)
+    declarations = {d.qualified_symbol: d for d in result.declarations}
+
+    assert set(declarations) == {"Widget", "Widget.helper", "Widget.run"}
+    assert declarations["Widget.run"].kind == "method"
+    helper_call = next(
+        r for r in result.references if r.kind == "call" and r.target_name == "self.helper"
+    )
+    assert helper_call.source_qualified_symbol == "Widget.run"
+
+
+def test_rust_method_parameters_and_self_slot_zero() -> None:
+    source = (
+        "struct Store;\n\n"
+        "impl Store {\n"
+        "\tfn get(&self, key: &str) -> u32 {\n\t\t0\n\t}\n"
+        "}\n"
+        "fn total(items: Vec<String>) -> usize {\n\titems.len()\n}\n"
+    )
+
+    declarations = {d.qualified_symbol: d for d in _rust_result(source).declarations}
+
+    get_params = [
+        (p.name, p.kind, p.required, p.position) for p in declarations["Store.get"].parameters
+    ]
+    assert get_params == [("self", "positional", True, 0), ("key", "positional", True, 1)]
+    total = [(p.name, p.kind, p.required, p.position) for p in declarations["total"].parameters]
+    assert total == [("items", "positional", True, 0)]
+
+
+def test_rust_member_access_reads_and_writes() -> None:
+    source = "fn set(s: &mut Store) {\n\ts.count = 0;\n\tlet n = s.count;\n}\n"
+
+    refs = _rust_result(source).references
+    write = next(r for r in refs if r.kind == "write")
+    assert write.target_name == "s.count"
+    read = next(r for r in refs if r.kind == "read" and "." in r.target_name)
+    assert read.target_name == "s.count"
+
+
+def test_rust_let_and_assignment_bindings_are_not_reads() -> None:
+    """`let` declares, `=` and `+=` write -- pattern names may not claim
+    reads, and a later use of the binding stays a genuine read."""
+    source = (
+        "fn go_around(counter: Counter) {\n"
+        "\tlet total = counter.count();\n"
+        "\tlet mut ok = false;\n"
+        "\tok = true;\n"
+        "\tok += counter.more();\n"
+        "\tif ok {\n"
+        "\t\tlet _ = total;\n"
+        "\t}\n"
+        "}\n"
+    )
+
+    refs = [r for r in _rust_result(source).references if r.source_qualified_symbol == "go_around"]
+    ok_reads = [r.start_byte for r in refs if r.kind == "read" and r.written_name == "ok"]
+    assert ok_reads == [source.index("if ok") + len("if ")]
+    total_reads = [r.start_byte for r in refs if r.kind == "read" and r.written_name == "total"]
+    assert total_reads == [source.index("= total") + len("= ")]
+    # A bare LHS identifier is a pure binding, not a write row -- only member
+    # writes become rows (the same rule Go and Python ship).
+    assert not any(r.kind == "write" for r in refs)
+
+
+def test_rust_trait_impl_is_an_inheritance_edge() -> None:
+    source = (
+        "trait Draw { fn draw(&self) -> String; }\n"
+        "struct Widget;\n"
+        "impl Draw for Widget {\n"
+        "\tfn draw(&self) -> String {\n\t\tString::new()\n\t}\n"
+        "}\n"
+    )
+
+    inheritance = [r for r in _rust_result(source).references if r.kind == "inheritance"]
+
+    assert [r.written_name for r in inheritance] == ["Draw"]
+
+
+def test_rust_exports_pub_items_only() -> None:
+    source = (
+        "pub struct Client;\n"
+        "struct Hidden;\n"
+        "pub enum Mode {\n\tOn\n}\n"
+        "pub fn serve() {}\n"
+        "fn helper() {}\n"
+        "pub const LIMIT: u32 = 1;\n"
+        "const PRIVATE: u32 = 2;\n"
+    )
+
+    exports = [r.written_name for r in _rust_result(source).references if r.kind == "export"]
+
+    assert exports == ["Client", "Mode", "serve", "LIMIT"]
+
+
+def test_rust_pub_use_export_carries_the_module_path() -> None:
+    """A `pub use` re-export emits an export row with its module path, import
+    name, and alias so the re-export chain walker can hop through it."""
+    source = "pub use crate::app::api::publicate as publish;\n"
+
+    refs = _rust_result(source).references
+    export = next(r for r in refs if r.kind == "export")
+    assert (export.written_name, export.alias) == ("publish", "publish")
+    assert (export.module_path, export.imported_name) == ("crate::app::api", "publicate")
+
+
+def test_rust_types_become_type_use_rows() -> None:
+    """Types in fields, parameters, returns, `let` annotations, generic
+    arguments, and trait objects become `type_use`; primitives never do."""
+    source = (
+        "struct Pair<T> {\n"
+        "\tleft: T,\n"
+        "\tright: Vec<Box<dyn Draw>>,\n"
+        "}\n"
+        "fn load(input: &str) -> Option<Pair<u32>> {\n"
+        "\tlet local: Pair<u32> = load_pair();\n"
+        "\tSome(local)\n"
+        "}\n"
+    )
+
+    type_uses = [r.written_name for r in _rust_result(source).references if r.kind == "type_use"]
+
+    for expected in ("T", "Vec", "Box", "Draw", "Pair", "Option"):
+        assert expected in type_uses
+    assert "str" not in type_uses
+    assert "u32" not in type_uses
