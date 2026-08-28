@@ -75,12 +75,22 @@ def test_refactoring_workflows_state_language_coverage_and_completeness(skill_na
     agent which languages those tools actually cover, what an unsupported
     language returns, and how to read the completeness contract -- otherwise
     the agent has no way to know a rename check that came back clean was
-    silently skipped for, say, a Go or Rust file.
+    silently skipped for, say, a C or Lua file. Pinned to the full
+    `STRUCTURAL_LANGUAGES` set so a new language step must sweep the skills
+    in the same change.
     """
     text = (SKILLS_DIR / skill_name / "SKILL.md").read_text(encoding="utf-8")
 
-    assert "Python" in text
-    assert "TypeScript" in text
-    assert "TSX" in text
+    for language in (
+        "C#",
+        "Go",
+        "Java",
+        "JavaScript",
+        "Python",
+        "Rust",
+        "TSX",
+        "TypeScript",
+    ):
+        assert language in text
     assert "UNSUPPORTED_LANGUAGE" in text
     assert "completeness" in text.lower()
