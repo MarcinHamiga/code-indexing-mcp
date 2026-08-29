@@ -11,7 +11,9 @@ from code_indexing_mcp.models import (
     DeclarationSelector,
     ParameterShape,
     RefactorPatch,
+    ReferenceHit,
     RenameOperation,
+    SelectedDeclaration,
     SignatureChangeOperation,
 )
 from code_indexing_mcp.projects import initialize_project
@@ -37,7 +39,7 @@ def _indexed_service(tmp_path: Path, files: dict[str, str]) -> tuple[ReferenceSe
     for path, source in files.items():
         destination = root / path
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(source)
+        destination.write_bytes(source.encode("utf-8"))
     project = initialize_project(root)
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     Indexer(
@@ -198,6 +200,102 @@ def test_rename_validation_uses_the_selected_language(tmp_path: Path) -> None:
 
     assert python_analysis.operation.new_name == "_answer"
     assert javascript_analysis.operation.new_name == "$answer"
+
+
+@pytest.mark.parametrize(
+    ("language", "new_name"),
+    [
+        ("javascript", "class"),
+        ("typescript", "import"),
+        ("tsx", "await"),
+        ("go", "func"),
+        ("rust", "match"),
+        ("java", "class"),
+        ("csharp", "namespace"),
+    ],
+)
+def test_rename_rejects_reserved_words_for_the_selected_language(
+    language: str, new_name: str
+) -> None:
+    selected = SelectedDeclaration(
+        project_id="project",
+        file_id="file",
+        path="source",
+        language=language,
+        symbol="answer",
+        qualified_symbol="answer",
+        kind="function",
+        start_line=1,
+        end_line=1,
+    )
+
+    with pytest.raises(CodeIndexingError) as raised:
+        ReferenceService._validate_rename(selected, RenameOperation(new_name=new_name))
+
+    assert raised.value.code is ErrorCode.INVALID_REFACTOR
+
+
+def test_rename_rejects_a_noop() -> None:
+    selected = SelectedDeclaration(
+        project_id="project",
+        file_id="file",
+        path="source.py",
+        language="python",
+        symbol="answer",
+        qualified_symbol="answer",
+        kind="function",
+        start_line=1,
+        end_line=1,
+    )
+
+    with pytest.raises(CodeIndexingError) as raised:
+        ReferenceService._validate_rename(selected, RenameOperation(new_name="answer"))
+
+    assert raised.value.code is ErrorCode.INVALID_REFACTOR
+
+
+def test_package_import_that_does_not_spell_the_symbol_is_evidence(tmp_path: Path) -> None:
+    service = ReferenceService(LanceStore(tmp_path / "data", vector_dimension=4))
+    selected = SelectedDeclaration(
+        project_id="project",
+        file_id="target",
+        path="auth.py",
+        language="python",
+        symbol="authorize",
+        qualified_symbol="authorize",
+        kind="function",
+        start_line=1,
+        end_line=1,
+    )
+    package_import = ReferenceHit(
+        reference_id="import:auth",
+        project_id="project",
+        path="consumer.py",
+        language="python",
+        kind="import",
+        start_line=1,
+        end_line=1,
+        start_byte=0,
+        end_byte=11,
+        snippet="import auth",
+        written_name="auth",
+        resolution="exact",
+        reason_code="known_namespace_import",
+        explanation="The import binds the target module.",
+    )
+
+    findings = service._classify_refactor_hits(
+        selected,
+        RenameOperation(new_name="validate"),
+        [package_import],
+        {},
+        [],
+        None,
+        {},
+    )
+
+    assert findings.must_change == []
+    assert [item.reference_id for item in findings.evidence] == ["import:auth"]
 
 
 def test_refactor_analysis_pagination_is_independent_of_completeness_and_counts(
@@ -1172,7 +1270,7 @@ def test_the_emitted_patch_applies_with_git(tmp_path: Path) -> None:
     worktree = tmp_path / "apply"
     worktree.mkdir()
     for name, source in files.items():
-        (worktree / name).write_text(source)
+        (worktree / name).write_bytes(source.encode("utf-8"))
 
     def git(*arguments: str) -> None:
         run = subprocess.run(
@@ -1183,13 +1281,13 @@ def test_the_emitted_patch_applies_with_git(tmp_path: Path) -> None:
     git("init", "-q")
     git("add", ".")
     git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
-    (worktree / "rename.diff").write_text(result.patch)
+    (worktree / "rename.diff").write_bytes(result.patch.encode("utf-8"))
     git("apply", "rename.diff")
 
-    assert (worktree / "auth.py").read_text() == "def validate(user):\n    return user\n"
+    assert (worktree / "auth.py").read_bytes() == b"def validate(user):\n    return user\n"
     assert (
         worktree / "consumer.py"
-    ).read_text() == "from auth import validate\n\ndef run(user):\n    return validate(user)\n"
+    ).read_bytes() == b"from auth import validate\n\ndef run(user):\n    return validate(user)\n"
 
 
 def test_emit_refactor_patch_replaces_only_the_imported_name_not_the_alias(
@@ -1294,6 +1392,7 @@ def test_a_stale_touched_file_is_conflicted_and_omitted_until_reindexed(
         "     return user\n"
     )
     assert result.applied == 1
+    assert any(item.code == "stale_file" for item in result.limitations)
     assert result.completeness.state == "incomplete"
 
     # After a reindex the fresh offsets are served and the hunks appear.
@@ -1386,6 +1485,39 @@ def test_a_slice_mismatch_conflicts_the_finding(tmp_path: Path) -> None:
     assert all("no longer spell" in item.explanation for item in conflicted)
     assert result.applied == 1
     assert result.edits[0].path == "auth.py"
+
+
+def test_emission_rereads_files_after_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "consumer.py": (
+                "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+            ),
+        },
+    )
+    consumer = tmp_path / "repo" / "consumer.py"
+    analyze = service._rename_analysis
+
+    def mutate_after_analysis(*args: object, **kwargs: object) -> object:
+        result = analyze(*args, **kwargs)
+        consumer.write_text(
+            "from auth import authorize\n\n\ndef run(user):\n    return authorize(user)\n"
+        )
+        return result
+
+    monkeypatch.setattr(service, "_rename_analysis", mutate_after_analysis)
+
+    result = _emit(service, project_id, "auth.py", "authorize", "validate")
+
+    assert "diff --git a/consumer.py" not in result.patch
+    assert any(
+        item.path == "consumer.py" and item.reason_code == "stale_file"
+        for item in result.conflicted
+    )
 
 
 def test_an_overlapping_edit_is_omitted_not_merged(tmp_path: Path) -> None:

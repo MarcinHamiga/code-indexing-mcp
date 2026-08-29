@@ -548,6 +548,7 @@ class RefactorPatch(FrozenModel):
     snapshot_version: int = 0
     slot_id: str | None = None
     operation_digest: str
+    limitations: list[ReferenceLimitation] = Field(default_factory=list)
     completeness: CompletenessReport = Field(default_factory=CompletenessReport)
 
 

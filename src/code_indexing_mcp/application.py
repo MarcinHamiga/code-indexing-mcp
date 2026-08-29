@@ -83,7 +83,7 @@ from .projects import (
     read_project_marker,
     same_project_root,
 )
-from .reference_service import ReferenceService
+from .reference_service import ReferenceService, validate_patch_request
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
@@ -1838,6 +1838,7 @@ class Application:
                 cursor=cursor,
                 backfill=report,
                 partition=partition,
+                root=target.project.root,
             )
 
     def analyze_refactor(
@@ -1879,6 +1880,7 @@ class Application:
                 cursor=cursor,
                 backfill=report,
                 partition=partition,
+                root=target.project.root,
             )
 
     def emit_refactor_patch(
@@ -1889,6 +1891,7 @@ class Application:
         context_lines: int = 3,
         roots: list[Path] | None = None,
     ) -> RefactorPatch:
+        validate_patch_request(operation, context_lines)
         resolved = self._resolve_reference_project(selector, roots)
         return self._run_repository_stable_query(
             [resolved],
@@ -1916,6 +1919,7 @@ class Application:
                 context_lines=context_lines,
                 backfill=report,
                 partition=partition,
+                root=target.project.root,
             )
 
     def _resolve_reference_project(

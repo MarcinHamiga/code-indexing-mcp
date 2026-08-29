@@ -2,6 +2,7 @@
 
 import pytest
 
+import code_indexing_mcp.patching as patching
 from code_indexing_mcp.patching import ByteEdit, apply_edits, render_unified_diff
 
 _BOM = b"\xef\xbb\xbf"
@@ -230,3 +231,45 @@ def test_unsorted_edits_are_applied_in_offset_order() -> None:
     edited = apply_edits(original, [ByteEdit(9, 13, b"BETA"), ByteEdit(0, 5, b"ALPHA")])
 
     assert edited == b"ALPHA();\nBETA();\n"
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [ByteEdit(-1, 2, b"x"), ByteEdit(1, 99, b"x"), ByteEdit(99, 100, b"x")],
+)
+def test_edits_outside_the_source_raise(edit: ByteEdit) -> None:
+    with pytest.raises(ValueError, match="outside"):
+        apply_edits(b"abcdef", [edit])
+
+
+@pytest.mark.parametrize("context_lines", [-1, 51])
+def test_context_lines_outside_the_public_bounds_raise(context_lines: int) -> None:
+    with pytest.raises(ValueError, match="between 0 and 50"):
+        render_unified_diff("a.py", b"old\n", b"new\n", context_lines=context_lines)
+
+
+@pytest.mark.parametrize(
+    ("path", "quoted"),
+    [("tab\tname.py", '"a/tab\\tname.py"'), ("line\nbreak.py", '"a/line\\nbreak.py"')],
+)
+def test_unusual_paths_are_quoted_for_git(path: str, quoted: str) -> None:
+    patch = render_unified_diff(path, b"old\n", b"new\n")
+
+    assert patch is not None
+    assert patch.startswith(f"diff --git {quoted} {quoted.replace('a/', 'b/', 1)}\n")
+
+
+def test_repeated_lines_keep_difflibs_popularity_heuristic(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_matcher = patching.difflib.SequenceMatcher
+    settings: list[bool] = []
+
+    def matcher(*args: object, **kwargs: object) -> object:
+        settings.append(bool(kwargs.get("autojunk", True)))
+        return original_matcher(*args, **kwargs)
+
+    monkeypatch.setattr(patching.difflib, "SequenceMatcher", matcher)
+    original = b"same\n" * 1_000 + b"authorize\n"
+    edited = b"same\n" * 1_000 + b"validate\n"
+
+    assert render_unified_diff("repeated.py", original, edited) is not None
+    assert settings == [True]

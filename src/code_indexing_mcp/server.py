@@ -51,6 +51,7 @@ from .models import (
     SymbolResponse,
 )
 from .projects import same_project_root
+from .reference_service import validate_patch_request
 from .settings import IndexMode, IndexSettings
 
 logger = logging.getLogger(__name__)
@@ -1529,6 +1530,7 @@ def create_server(
             Field(ge=0, le=50, description="Context lines around each diff hunk."),
         ] = 3,
     ) -> RefactorPatch:
+        validate_patch_request(operation, context_lines)
         roots = await _startup_roots(ctx, discover=True)
         return await asyncio.to_thread(
             app.emit_refactor_patch,

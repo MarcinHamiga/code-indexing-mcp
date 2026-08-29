@@ -2290,6 +2290,55 @@ def test_emit_refactor_patch_returns_the_applyable_subset(tmp_path: Path) -> Non
     assert result.completeness.state == "complete"
 
 
+def test_reference_tools_read_the_selected_worktree_root(tmp_path: Path) -> None:
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "-b", "refactor", str(worktree), cwd=root)
+    (worktree / "auth.py").write_text("def authorize(user):\n    return user\n")
+    (worktree / "consumer.py").write_text(
+        "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+    )
+    run_git("add", "auth.py", "consumer.py", cwd=worktree)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "refactor fixture",
+        cwd=worktree,
+    )
+    app.init_project(worktree)
+    app.index_project(project.id, roots=[worktree])
+    selector = DeclarationSelector(
+        project=project.id,
+        path="auth.py",
+        qualified_symbol="authorize",
+    )
+
+    references = app.find_references(selector, roots=[worktree])
+    analysis = app.analyze_refactor(
+        selector, RenameOperation(new_name="validate"), roots=[worktree]
+    )
+    patch = app.emit_refactor_patch(
+        selector, RenameOperation(new_name="validate"), roots=[worktree]
+    )
+
+    assert {item.path for item in references.hits} == {"consumer.py"}
+    assert analysis.counts.must_change == 3
+    assert patch.applied == 3
+    assert patch.completeness.state == "complete"
+
+
 def test_emit_refactor_patch_rejects_signature_changes(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
@@ -2312,3 +2361,44 @@ def test_emit_refactor_patch_rejects_signature_changes(tmp_path: Path) -> None:
             ),
         )
     assert raised.value.code is ErrorCode.UNSUPPORTED_OPERATION
+
+
+@pytest.mark.parametrize(
+    ("operation", "context_lines", "error_code"),
+    [
+        (
+            SignatureChangeOperation(parameters=[]),
+            3,
+            ErrorCode.UNSUPPORTED_OPERATION,
+        ),
+        (RenameOperation(new_name="result"), 51, ErrorCode.INVALID_FILTER),
+    ],
+)
+def test_patch_request_validation_precedes_project_resolution(
+    tmp_path: Path,
+    operation: RenameOperation | SignatureChangeOperation,
+    context_lines: int,
+    error_code: ErrorCode,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+
+    with pytest.raises(CodeIndexingError) as raised:
+        app.emit_refactor_patch(
+            DeclarationSelector(
+                project=str(root),
+                path="main.py",
+                qualified_symbol="answer",
+            ),
+            operation,
+            context_lines=context_lines,
+        )
+
+    assert raised.value.code is error_code
+    assert app.list_projects() == []
+    assert not (root / ".ci-mcp").exists()

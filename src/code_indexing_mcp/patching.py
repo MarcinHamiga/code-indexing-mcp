@@ -15,6 +15,8 @@ from typing import Final, NamedTuple
 # difflib renders a missing final terminator as nothing, but `git apply`
 # needs the marker to know the resulting file does not end in a newline.
 _NO_NEWLINE_MARKER: Final = b"\\ No newline at end of file\n"
+MIN_CONTEXT_LINES: Final = 0
+MAX_CONTEXT_LINES: Final = 50
 
 
 class ByteEdit(NamedTuple):
@@ -36,6 +38,10 @@ def apply_edits(original: bytes, edits: Sequence[ByteEdit]) -> bytes:
     parts: list[bytes] = []
     cursor = 0
     for edit in sorted(edits):
+        if edit.start < 0 or edit.end > len(original):
+            raise ValueError(
+                f"edit span [{edit.start}, {edit.end}) falls outside {len(original)} source bytes"
+            )
         if edit.end < edit.start:
             raise ValueError(f"edit span [{edit.start}, {edit.end}) is negative")
         if edit.start < cursor:
@@ -74,6 +80,27 @@ def _append_lines(out: list[bytes], prefix: bytes, lines: Sequence[bytes]) -> No
         out.append(_NO_NEWLINE_MARKER)
 
 
+def _quote_git_path(prefix: str, path: str) -> str:
+    """Quote path characters that would split or corrupt a Git diff header."""
+    value = f"{prefix}/{path}"
+    if not any(character in value for character in '\\"\t\n\r') and all(
+        ord(character) >= 32 and ord(character) != 127 for character in value
+    ):
+        return value
+    escaped: list[str] = []
+    for character in value:
+        replacement = {"\\": "\\\\", '"': '\\"', "\t": "\\t", "\n": "\\n", "\r": "\\r"}.get(
+            character
+        )
+        if replacement is not None:
+            escaped.append(replacement)
+        elif ord(character) < 32 or ord(character) == 127:
+            escaped.extend(f"\\{byte:03o}" for byte in character.encode("utf-8"))
+        else:
+            escaped.append(character)
+    return f'"{"".join(escaped)}"'
+
+
 def render_unified_diff(
     path: str,
     original: bytes,
@@ -86,15 +113,21 @@ def render_unified_diff(
     survive untouched. Returns None when the byte strings are identical, so
     callers render one diff per changed file and concatenate the results.
     """
+    if not MIN_CONTEXT_LINES <= context_lines <= MAX_CONTEXT_LINES:
+        raise ValueError(
+            f"context_lines must be between {MIN_CONTEXT_LINES} and {MAX_CONTEXT_LINES}"
+        )
     if original == edited:
         return None
     original_lines = original.splitlines(keepends=True)
     edited_lines = edited.splitlines(keepends=True)
-    matcher = difflib.SequenceMatcher(a=original_lines, b=edited_lines, autojunk=False)
+    matcher = difflib.SequenceMatcher(a=original_lines, b=edited_lines, autojunk=True)
+    old_path = _quote_git_path("a", path)
+    new_path = _quote_git_path("b", path)
     out: list[bytes] = [
-        f"diff --git a/{path} b/{path}\n".encode(),
-        f"--- a/{path}\n".encode(),
-        f"+++ b/{path}\n".encode(),
+        f"diff --git {old_path} {new_path}\n".encode(),
+        f"--- {old_path}\n".encode(),
+        f"+++ {new_path}\n".encode(),
     ]
     for group in matcher.get_grouped_opcodes(context_lines):
         first, last = group[0], group[-1]

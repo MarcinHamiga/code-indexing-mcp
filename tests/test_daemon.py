@@ -70,6 +70,66 @@ def test_length_prefixed_json_frame_round_trip() -> None:
         right.close()
 
 
+def test_protocol_three_introduces_chunked_responses() -> None:
+    assert daemon.PROTOCOL_VERSION == 3
+
+
+def test_chunked_response_round_trip_is_transparent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daemon, "MAX_FRAME_BYTES", 1_024)
+    monkeypatch.setattr(daemon, "MAX_RESPONSE_CHUNK_BYTES", 128)
+    monkeypatch.setattr(daemon, "MAX_RESPONSE_BYTES", 8_192)
+    payload = {"id": "request-1", "result": {"patch": "x" * 4_096}}
+    left, right = socket.socketpair()
+    sender = threading.Thread(target=daemon._send_response, args=(left, payload))
+    try:
+        sender.start()
+        assert daemon._receive_response(right) == payload
+        sender.join(timeout=2)
+        assert not sender.is_alive()
+    finally:
+        left.close()
+        right.close()
+
+
+def test_response_total_size_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daemon, "MAX_RESPONSE_BYTES", 64)
+    left, right = socket.socketpair()
+    try:
+        with pytest.raises(CodeIndexingError, match="maximum message size") as raised:
+            daemon._send_response(left, {"id": "request-1", "result": "x" * 100})
+    finally:
+        left.close()
+        right.close()
+
+    assert raised.value.code is ErrorCode.PROTOCOL_ERROR
+
+
+@requires_local_sockets
+def test_broker_reassembles_a_chunked_daemon_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(daemon, "MAX_FRAME_BYTES", 1_024)
+    monkeypatch.setattr(daemon, "MAX_RESPONSE_CHUNK_BYTES", 128)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    root = tmp_path / "repo"
+    root.mkdir()
+    application = Application(paths, embedder=TinyEmbedder(), cwd=root)
+    application.init_project(root, name="project-" + "x" * 4_096)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=root)
+
+    try:
+        projects = broker.list_projects()
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+    assert projects[0].name == "project-" + "x" * 4_096
+
+
 @requires_local_sockets
 def test_broker_application_calls_one_daemon_backend(tmp_path: Path) -> None:
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
@@ -729,7 +789,7 @@ def test_a_stale_daemon_is_reported_running_and_retired(tmp_path: Path) -> None:
     paths.data.mkdir(parents=True)
     (paths.data / "daemon.token").write_text("shared-token")
     endpoint = daemon_endpoint(paths)
-    old_protocol = daemon.PROTOCOL_VERSION - 1
+    old_protocol = 2
 
     def old_daemon() -> None:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:

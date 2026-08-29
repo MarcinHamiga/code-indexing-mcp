@@ -1910,6 +1910,38 @@ async def test_tool_error_carries_code_and_details(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_unsupported_patch_operation_does_not_register_client_roots(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "emit_refactor_patch",
+            {
+                "selector": {
+                    "project": str(root),
+                    "path": "main.py",
+                    "qualified_symbol": "answer",
+                },
+                "operation": {"kind": "signature_change", "parameters": []},
+            },
+        )
+
+    assert result.isError
+    assert not (root / ".ci-mcp").exists()
+    assert app.list_projects() == []
+
+
+@pytest.mark.asyncio
 async def test_index_project_reports_file_counts_while_it_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
