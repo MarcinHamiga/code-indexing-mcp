@@ -1279,6 +1279,7 @@ def test_the_emitted_patch_applies_with_git(tmp_path: Path) -> None:
         assert run.returncode == 0, run.stderr
 
     git("init", "-q")
+    git("config", "core.autocrlf", "false")
     git("add", ".")
     git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
     (worktree / "rename.diff").write_bytes(result.patch.encode("utf-8"))

@@ -2267,9 +2267,9 @@ def test_init_project_unifies_a_legacy_duplicate_worktree_registration(
 def test_emit_refactor_patch_returns_the_applyable_subset(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "auth.py").write_text("def authorize(user):\n    return user\n")
-    (root / "main.py").write_text(
-        "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+    (root / "auth.py").write_bytes(b"def authorize(user):\n    return user\n")
+    (root / "main.py").write_bytes(
+        b"from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
     )
     app = Application(
         RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
