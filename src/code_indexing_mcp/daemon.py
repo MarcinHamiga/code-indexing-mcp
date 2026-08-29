@@ -39,6 +39,7 @@ from .models import (
     ProjectStatus,
     RefactorAnalysis,
     RefactorOperation,
+    RefactorPatch,
     ReferenceResponse,
     RemovalReport,
     ScanInspectionPage,
@@ -410,6 +411,10 @@ class DaemonServer:
             selector = DeclarationSelector.model_validate(params.pop("selector"))
             operation = _REFACTOR_OPERATION.validate_python(params.pop("operation"))
             return app.analyze_refactor(selector, operation, roots=roots, **params)
+        if method == "emit_refactor_patch":
+            selector = DeclarationSelector.model_validate(params.pop("selector"))
+            operation = _REFACTOR_OPERATION.validate_python(params.pop("operation"))
+            return app.emit_refactor_patch(selector, operation, roots=roots, **params)
         if method == "model_status":
             # Answered by the daemon rather than the caller, because the daemon
             # is the process that will actually run indexing.
@@ -691,6 +696,13 @@ class BrokerApplication:
     ) -> RefactorAnalysis:
         return RefactorAnalysis.model_validate(
             self._call("analyze_refactor", selector=selector, operation=operation, **params)
+        )
+
+    def emit_refactor_patch(
+        self, selector: DeclarationSelector, operation: RefactorOperation, **params: Any
+    ) -> RefactorPatch:
+        return RefactorPatch.model_validate(
+            self._call("emit_refactor_patch", selector=selector, operation=operation, **params)
         )
 
     def model_status(self) -> ModelStatus:

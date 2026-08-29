@@ -41,6 +41,7 @@ from .models import (
     ProjectStatus,
     RefactorAnalysis,
     RefactorOperation,
+    RefactorPatch,
     ReferenceKind,
     ReferenceResponse,
     RemovalReport,
@@ -1492,6 +1493,48 @@ def create_server(
             operation,
             limit=limit,
             cursor=cursor,
+            roots=roots,
+        )
+
+    @mcp.tool(
+        title="Emit refactor patch",
+        description=(
+            "Turn the deterministic findings of a rename analysis into a byte-exact unified "
+            "diff the caller can review and apply with `git apply` or their own edit tooling. "
+            "This tool never edits source files: emission is analysis, application stays with "
+            "the caller. Rename operations only; a signature change returns "
+            "UNSUPPORTED_OPERATION because synthesized argument lists are language-specific "
+            "and easy to get silently wrong. Findings that need judgement (likely_change, "
+            "review) and stale or unverifiable files never enter the patch: they are reported "
+            "in `unapplied` and `conflicted`, so review them after running `analyze_refactor` "
+            "and before applying. Always read `completeness`: only the state 'complete' means "
+            "every verified finding is in the patch, and a partial patch can never read as a "
+            "finished rename."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def emit_refactor_patch(
+        ctx: ServerContext,
+        selector: Annotated[
+            DeclarationSelector,
+            Field(description="Declaration selected by chunk id or stable source location."),
+        ],
+        operation: Annotated[
+            RefactorOperation,
+            Field(description="Discriminated rename or signature-change operation."),
+        ],
+        context_lines: Annotated[
+            int,
+            Field(ge=0, le=50, description="Context lines around each diff hunk."),
+        ] = 3,
+    ) -> RefactorPatch:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(
+            app.emit_refactor_patch,
+            selector,
+            operation,
+            context_lines=context_lines,
             roots=roots,
         )
 

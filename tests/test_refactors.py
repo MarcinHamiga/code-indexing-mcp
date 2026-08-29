@@ -1,3 +1,5 @@
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,7 @@ from code_indexing_mcp.indexing import Indexer
 from code_indexing_mcp.models import (
     DeclarationSelector,
     ParameterShape,
+    RefactorPatch,
     RenameOperation,
     SignatureChangeOperation,
 )
@@ -1097,3 +1100,437 @@ def test_analyze_refactor_suppresses_edit_spans_from_a_stale_file(tmp_path: Path
         for item in analysis.limitations
     )
     assert analysis.completeness.state == "incomplete"
+
+
+def _emit(
+    service: ReferenceService, project_id: str, path: str, symbol: str, new_name: str
+) -> RefactorPatch:
+    return service.emit_refactor_patch(
+        DeclarationSelector(project=project_id, path=path, qualified_symbol=symbol),
+        RenameOperation(new_name=new_name),
+    )
+
+
+def test_emit_refactor_patch_renders_a_multi_file_rename(tmp_path: Path) -> None:
+    files = {
+        "auth.py": "def authorize(user):\n    return user\n",
+        "consumer.py": (
+            "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+        ),
+    }
+    service, project_id = _indexed_service(tmp_path, files)
+
+    result = _emit(service, project_id, "auth.py", "authorize", "validate")
+
+    assert result.applied == 3
+    # Files render in sorted path order, each under a/ and b/ headers.
+    assert result.patch == (
+        "diff --git a/auth.py b/auth.py\n"
+        "--- a/auth.py\n"
+        "+++ b/auth.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-def authorize(user):\n"
+        "+def validate(user):\n"
+        "     return user\n"
+        "diff --git a/consumer.py b/consumer.py\n"
+        "--- a/consumer.py\n"
+        "+++ b/consumer.py\n"
+        "@@ -1,4 +1,4 @@\n"
+        "-from auth import authorize\n"
+        "+from auth import validate\n"
+        " \n"
+        " def run(user):\n"
+        "-    return authorize(user)\n"
+        "+    return validate(user)\n"
+    )
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize"),
+        RenameOperation(new_name="validate"),
+    )
+    assert sorted(
+        (edit.path, edit.edit_start_byte, edit.edit_end_byte) for edit in result.edits
+    ) == sorted(
+        (item.path, item.edit_start_byte, item.edit_end_byte) for item in analysis.must_change
+    )
+    assert result.unapplied == []
+    assert result.conflicted == []
+    assert result.completeness.state == "complete"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_the_emitted_patch_applies_with_git(tmp_path: Path) -> None:
+    files = {
+        "auth.py": "def authorize(user):\n    return user\n",
+        "consumer.py": (
+            "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+        ),
+    }
+    service, project_id = _indexed_service(tmp_path, files)
+
+    result = _emit(service, project_id, "auth.py", "authorize", "validate")
+
+    worktree = tmp_path / "apply"
+    worktree.mkdir()
+    for name, source in files.items():
+        (worktree / name).write_text(source)
+
+    def git(*arguments: str) -> None:
+        run = subprocess.run(
+            ("git", *arguments), cwd=worktree, check=False, capture_output=True, text=True
+        )
+        assert run.returncode == 0, run.stderr
+
+    git("init", "-q")
+    git("add", ".")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
+    (worktree / "rename.diff").write_text(result.patch)
+    git("apply", "rename.diff")
+
+    assert (worktree / "auth.py").read_text() == "def validate(user):\n    return user\n"
+    assert (
+        worktree / "consumer.py"
+    ).read_text() == "from auth import validate\n\ndef run(user):\n    return validate(user)\n"
+
+
+def test_emit_refactor_patch_replaces_only_the_imported_name_not_the_alias(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "consumer.py": (
+                "from auth import authorize as check\n\ndef run(user):\n    return check(user)\n"
+            ),
+        },
+    )
+
+    result = _emit(service, project_id, "auth.py", "authorize", "validate")
+
+    assert result.applied == 2
+    assert "+from auth import validate as check\n" in result.patch
+    # The alias call binds exactly but needs no spelling change, so it stays
+    # out of the patch entirely.
+    assert "    return check(user)\n" in result.patch
+    assert "+    return validate" not in result.patch
+
+
+def test_emit_refactor_patch_replaces_only_the_member_of_a_qualified_call(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "consumer.py": "import auth\n\ndef run(u):\n    return auth.authorize(u)\n",
+        },
+    )
+
+    result = _emit(service, project_id, "auth.py", "authorize", "validate")
+
+    assert result.applied == 2
+    assert "+    return auth.validate(u)\n" in result.patch
+    assert "auth.authorize" not in result.patch.replace("-    return auth.authorize(u)", "")
+
+
+def test_likely_findings_never_reach_the_patch_but_always_reach_unapplied(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "base.py": "class Base:\n    def handle(self):\n        return 1\n",
+            "child.py": (
+                "from base import Base\n\n\nclass Child(Base):\n    def handle(self):\n"
+                "        return 2\n"
+            ),
+        },
+    )
+
+    result = _emit(service, project_id, "base.py", "Base.handle", "process")
+
+    assert result.applied >= 1
+    override = next(
+        item
+        for item in result.unapplied
+        if item.path == "child.py" and item.reason_code == "override_of_renamed_method"
+    )
+    # Overrides need human judgement even when their offsets are known, so
+    # they are reported verbatim instead of being rendered.
+    assert override.resolution == "likely"
+    assert "child.py" not in result.patch
+    assert result.completeness.state == "complete_with_dynamic_limitations"
+
+
+def test_a_stale_touched_file_is_conflicted_and_omitted_until_reindexed(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "consumer.py": (
+                "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+            ),
+        },
+    )
+    # consumer.py changed on disk without a reindex, exactly as in the
+    # analyze_refactor suppression test above.
+    (tmp_path / "repo" / "consumer.py").write_text(
+        "from auth import authorize\n\n\ndef run(user):\n    return authorize(user)\n"
+    )
+
+    result = _emit(service, project_id, "auth.py", "authorize", "validate")
+
+    stale = [item for item in result.conflicted if item.path == "consumer.py"]
+    assert stale and all(item.reason_code == "stale_file" for item in stale)
+    assert result.patch == (
+        "diff --git a/auth.py b/auth.py\n"
+        "--- a/auth.py\n"
+        "+++ b/auth.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-def authorize(user):\n"
+        "+def validate(user):\n"
+        "     return user\n"
+    )
+    assert result.applied == 1
+    assert result.completeness.state == "incomplete"
+
+    # After a reindex the fresh offsets are served and the hunks appear.
+    store = LanceStore(tmp_path / "data2", vector_dimension=4)
+    Indexer(
+        store=store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=TinyEmbedder(),
+        lock_directory=tmp_path / "locks2",
+    ).index(initialize_project(tmp_path / "repo"))
+    fresh = ReferenceService(store)
+    reindexed = _emit(
+        fresh, initialize_project(tmp_path / "repo").id, "auth.py", "authorize", "validate"
+    )
+    assert reindexed.conflicted == []
+    assert reindexed.applied == 3
+    assert "consumer.py" in reindexed.patch
+
+
+def test_a_stale_selected_file_conflicts_its_declaration_edit(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "consumer.py": (
+                "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+            ),
+        },
+    )
+    (tmp_path / "repo" / "auth.py").write_text("def authorize(user, level):\n    return user\n")
+
+    result = _emit(service, project_id, "auth.py", "authorize", "validate")
+
+    declaration = [item for item in result.conflicted if item.kind == "write"]
+    assert declaration and all(item.reason_code == "stale_file" for item in declaration)
+    assert "diff --git a/auth.py" not in result.patch
+    # consumer.py is fresh, so its hunks still render.
+    assert "diff --git a/consumer.py" in result.patch
+    assert result.completeness.state == "incomplete"
+
+
+def test_a_slice_mismatch_conflicts_the_finding(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "consumer.py": (
+                "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+            ),
+        },
+    )
+    operation = RenameOperation(new_name="validate")
+    selector = DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize")
+    analysis, query = service._rename_analysis(
+        selector,
+        operation,
+        limit=500,
+        cursor=None,
+        backfill=None,
+        partition=None,
+        paginate=False,
+    )
+    # Shift one finding's span by one byte: the slice no longer spells the
+    # identifier the resolver matched, so the edit must be refused.
+    shifted_source = "consumer.py"
+    victim = next(item for item in analysis.must_change if item.path == shifted_source)
+    assert victim.edit_start_byte is not None and victim.edit_end_byte is not None
+    mutated = analysis.model_copy(
+        update={
+            "must_change": [
+                item.model_copy(
+                    update={
+                        "edit_start_byte": item.edit_start_byte + 1,
+                        "edit_end_byte": item.edit_end_byte + 1,
+                    }
+                )
+                if item.path == shifted_source
+                else item
+                for item in analysis.must_change
+            ]
+        }
+    )
+
+    result = service._render_patch(mutated, query, operation, context_lines=3)
+
+    conflicted = [item for item in result.conflicted if item.path == shifted_source]
+    # Both consumer.py findings (import and call) carried the shifted span.
+    assert len(conflicted) == 2
+    assert all("no longer spell" in item.explanation for item in conflicted)
+    assert result.applied == 1
+    assert result.edits[0].path == "auth.py"
+
+
+def test_an_overlapping_edit_is_omitted_not_merged(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "main.py": (
+                "from auth import authorize\n\n\n"
+                "def run(u):\n    return authorize(u) + authorize(u)\n"
+            ),
+        },
+    )
+    operation = RenameOperation(new_name="validate")
+    selector = DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize")
+    analysis, query = service._rename_analysis(
+        selector,
+        operation,
+        limit=500,
+        cursor=None,
+        backfill=None,
+        partition=None,
+        paginate=False,
+    )
+    main_calls = [
+        item for item in analysis.must_change if item.path == "main.py" and item.kind == "call"
+    ]
+    assert len(main_calls) == 2
+    first, second = main_calls
+    assert first.edit_start_byte is not None and first.edit_end_byte is not None
+    assert second.edit_start_byte is not None and second.edit_end_byte is not None
+    # Point the second call's span exactly at the first's: a duplicate the
+    # span dedupe missed. The slice still spells the identifier, so the
+    # overlap defense is what must refuse it -- omitted, never merged.
+    mutated = analysis.model_copy(
+        update={
+            "must_change": [
+                item.model_copy(
+                    update={
+                        "edit_start_byte": first.edit_start_byte,
+                        "edit_end_byte": first.edit_end_byte,
+                    }
+                )
+                if item is second
+                else item
+                for item in analysis.must_change
+            ]
+        }
+    )
+
+    result = service._render_patch(mutated, query, operation, context_lines=3)
+
+    overlap = [
+        item for item in result.conflicted if "overlaps an already accepted" in item.explanation
+    ]
+    assert len(overlap) == 1
+    # Declaration (auth.py), import (main.py), and the first call render; the
+    # overlapping second call is left out entirely.
+    assert result.applied == 3
+    assert "+    return validate(u) + validate(u)\n" not in result.patch
+
+
+def test_signature_change_emission_is_rejected(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path, {"mail.py": "def send(message):\n    return message\n"}
+    )
+
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.emit_refactor_patch(
+            DeclarationSelector(project=project_id, path="mail.py", qualified_symbol="send"),
+            SignatureChangeOperation(
+                parameters=[
+                    ParameterShape(name="body", kind="positional", required=True, position=0)
+                ]
+            ),
+        )
+    assert excinfo.value.code == ErrorCode.UNSUPPORTED_OPERATION
+
+
+def test_a_crlf_file_emits_a_crlf_hunk(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path, {"auth.py": "def authorize(user):\r\n    return user\r\n"}
+    )
+
+    result = _emit(service, project_id, "auth.py", "authorize", "validate")
+
+    assert result.patch == (
+        "diff --git a/auth.py b/auth.py\n"
+        "--- a/auth.py\n"
+        "+++ b/auth.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-def authorize(user):\r\n"
+        "+def validate(user):\r\n"
+        "     return user\r\n"
+    )
+
+
+def test_a_non_ascii_identifier_emits_a_byte_exact_hunk(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path, {" café.py": "def café_x(user):\n    return user\n"}
+    )
+
+    result = _emit(service, project_id, " café.py", "café_x", "cafe_x")
+
+    assert result.patch == (
+        "diff --git a/ café.py b/ café.py\n"
+        "--- a/ café.py\n"
+        "+++ b/ café.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-def café_x(user):\n"
+        "+def cafe_x(user):\n"
+        "     return user\n"
+    )
+
+
+def test_emission_is_deterministic(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "consumer.py": (
+                "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+            ),
+        },
+    )
+
+    first = _emit(service, project_id, "auth.py", "authorize", "validate")
+    second = _emit(service, project_id, "auth.py", "authorize", "validate")
+
+    assert first == second
+
+
+def test_emission_returns_every_finding_regardless_of_page_limit(tmp_path: Path) -> None:
+    callers = "".join(f"def caller_{index}():\n    return authorize()\n\n" for index in range(11))
+    service, project_id = _indexed_service(
+        tmp_path, {"lib.py": f"def authorize():\n    return 42\n\n{callers}"}
+    )
+    selector = DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="authorize")
+    operation = RenameOperation(new_name="validate")
+
+    first_page = service.analyze_refactor(selector, operation, limit=1)
+    total = service.analyze_refactor(selector, operation).counts.must_change
+    result = service.emit_refactor_patch(selector, operation)
+
+    assert len(first_page.must_change) < total
+    assert result.applied == total
+    assert result.unapplied == []
+    assert result.completeness.state == "complete"

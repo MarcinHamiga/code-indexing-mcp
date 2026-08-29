@@ -22,11 +22,13 @@ from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.git_state import GitProbeOutcome, GitState, SelectorKind
 from code_indexing_mcp.models import (
     DeclarationSelector,
+    ParameterShape,
     ProjectInfo,
     ReferenceBackfillReport,
     RenameOperation,
     SearchHit,
     SearchResponse,
+    SignatureChangeOperation,
 )
 from code_indexing_mcp.projects import existing_marker_path, initialize_project
 from code_indexing_mcp.settings import IndexSettings
@@ -2260,3 +2262,53 @@ def test_init_project_unifies_a_legacy_duplicate_worktree_registration(
     wt_status = app.project_status(project.id, roots=[worktree])
     assert wt_status.state == "ready"
     assert wt_status.file_count == 1
+
+
+def test_emit_refactor_patch_returns_the_applyable_subset(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "auth.py").write_text("def authorize(user):\n    return user\n")
+    (root / "main.py").write_text(
+        "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+    )
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    result = app.emit_refactor_patch(
+        DeclarationSelector(project=project.id, path="auth.py", qualified_symbol="authorize"),
+        RenameOperation(new_name="validate"),
+    )
+
+    assert result.applied == 3
+    assert result.patch.startswith("diff --git a/auth.py b/auth.py\n")
+    assert "+def validate(user):\n" in result.patch
+    assert result.completeness.state == "complete"
+
+
+def test_emit_refactor_patch_rejects_signature_changes(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    with pytest.raises(CodeIndexingError) as raised:
+        app.emit_refactor_patch(
+            DeclarationSelector(project=project.id, path="main.py", qualified_symbol="answer"),
+            SignatureChangeOperation(
+                parameters=[
+                    ParameterShape(name="value", kind="positional", required=True, position=0)
+                ]
+            ),
+        )
+    assert raised.value.code is ErrorCode.UNSUPPORTED_OPERATION

@@ -55,6 +55,7 @@ from .models import (
     ProjectStorageStats,
     RefactorAnalysis,
     RefactorOperation,
+    RefactorPatch,
     ReferenceBackfillReport,
     ReferenceResponse,
     RemovalReport,
@@ -1876,6 +1877,43 @@ class Application:
                 operation,
                 limit=limit,
                 cursor=cursor,
+                backfill=report,
+                partition=partition,
+            )
+
+    def emit_refactor_patch(
+        self,
+        selector: DeclarationSelector,
+        operation: RefactorOperation,
+        *,
+        context_lines: int = 3,
+        roots: list[Path] | None = None,
+    ) -> RefactorPatch:
+        resolved = self._resolve_reference_project(selector, roots)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._emit_refactor_patch_for_target(
+                selector,
+                operation,
+                self._primary_target(targets, resolved.id),
+                context_lines=context_lines,
+            ),
+        )
+
+    def _emit_refactor_patch_for_target(
+        self,
+        selector: DeclarationSelector,
+        operation: RefactorOperation,
+        target: ActiveIndexTarget,
+        *,
+        context_lines: int,
+    ) -> RefactorPatch:
+        selector, report, partition = self._prepare_reference_query(selector, target)
+        with self.store.partition_access(report.project_id, partition_id=partition.partition_id):
+            return self.references.emit_refactor_patch(
+                selector,
+                operation,
+                context_lines=context_lines,
                 backfill=report,
                 partition=partition,
             )

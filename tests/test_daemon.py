@@ -801,3 +801,41 @@ def test_broker_forwards_scan_inspection(tmp_path: Path) -> None:
     assert len(second.items) == 1
     assert second.items[0].path != first.items[0].path
     assert {item.path.as_posix() for item in eligible.items} == {"main.py"}
+
+
+@requires_local_sockets
+def test_broker_round_trips_a_refactor_patch(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text(
+        "def answer():\n    return 42\n\ncallback = answer\n\ndef caller():\n    return answer()\n"
+    )
+    application = Application(paths, embedder=TinyEmbedder(), cwd=root)
+    project = application.init_project(root)
+    application.index_project(project.id)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=root)
+
+    try:
+        result = broker.emit_refactor_patch(
+            DeclarationSelector(
+                project=project.id,
+                path="main.py",
+                qualified_symbol="answer",
+            ),
+            RenameOperation(new_name="result"),
+        )
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+    # The patch crosses the socket as a validated RefactorPatch model.
+    assert result.applied == 3
+    assert result.patch.startswith("diff --git a/main.py b/main.py\n")
+    assert result.completeness.state == "complete"
+    assert len(result.operation_digest) == 16
+    assert result.slot_id
