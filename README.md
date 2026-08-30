@@ -257,7 +257,7 @@ A generic MCP client configuration looks like this:
 }
 ```
 
-The server exposes twelve tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
+The server exposes seventeen tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
 so hosts may auto-approve them. The other query tools are not: on a root the server has not seen
 before they register it first, which writes a `.ci-mcp/project.toml` marker, and the four code
 queries also build its initial index. `remove_project` is annotated `destructiveHint`;
@@ -276,6 +276,7 @@ overwrite a marker and orphan the previous index.
 | `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
 | `find_references` | read, registers and indexes | Structural references to one selected C#, Go, Java, JavaScript, Python, Rust, TSX, or TypeScript declaration. |
 | `analyze_refactor` | read, registers and indexes | Read-only rename or signature-change impact analysis for one selected declaration. |
+| `emit_refactor_patch` | read, registers and indexes | Emit a `git apply`-able unified diff from the deterministic subset of a rename analysis; never edits source. |
 | `file_outline` | read, registers and indexes | One file's declared symbols, metadata only. |
 | `get_chunk` | read only | Full stored text for one `chunk_id`. |
 
@@ -329,6 +330,17 @@ which cover just the identifier — a finding's `start_byte`/`end_byte` span the
 they include the receiver in `auth.authorize` and the alias in `authorize as check`. When the
 identifier could not be located unambiguously both edit offsets are null and the edit has to be made
 by hand.
+
+For the deterministic subset, `emit_refactor_patch` takes the same selector and rename operation and
+returns a byte-exact unified diff ready for `git apply`, plus a structured `edits` list. The
+workflow is: run `analyze_refactor`, review `likely_change` and `review` (and the `limitations`
+list), then call `emit_refactor_patch` for the findings that were proven. The tool never edits
+source files — producing a patch is analysis, and applying it stays with the caller's tooling.
+Findings that were not proven current (including files that changed on disk after indexing) never
+enter the patch: they come back in `unapplied` and `conflicted`, and `completeness` degrades so a
+partial patch can never read as a finished rename. Signature changes are refused with
+`UNSUPPORTED_OPERATION`, because synthesized argument lists are language-specific and easy to get
+silently wrong.
 
 ## Project workflow
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import json
 import logging
@@ -39,6 +41,7 @@ from .models import (
     ProjectStatus,
     RefactorAnalysis,
     RefactorOperation,
+    RefactorPatch,
     ReferenceResponse,
     RemovalReport,
     ScanInspectionPage,
@@ -51,12 +54,15 @@ from .settings import IndexSettings
 
 logger = logging.getLogger(__name__)
 
-# Bumped whenever the RPC surface changes shape (version 2 added the `trigger`
+# Bumped whenever the RPC surface changes shape (version 3 added chunked
+# responses; version 2 added the `trigger`
 # parameter to index_project): a long-lived daemon from a previous release must
 # reject requests it cannot dispatch instead of failing inside them, and the
 # mismatch is what tells ensure_daemon to retire it and start a current one.
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_FRAME_BYTES = 16 * 1024**2
+MAX_RESPONSE_BYTES = 256 * 1024**2
+MAX_RESPONSE_CHUNK_BYTES = 8 * 1024**2
 _REFACTOR_OPERATION: TypeAdapter[RefactorOperation] = TypeAdapter(RefactorOperation)
 
 # Looked up dynamically because Windows' socket stubs have no AF_UNIX at all,
@@ -147,7 +153,7 @@ def send_frame(connection: socket.socket, payload: Mapping[str, Any]) -> None:
     if len(encoded) > MAX_FRAME_BYTES:
         raise CodeIndexingError(
             ErrorCode.PROTOCOL_ERROR,
-            "Local daemon request exceeds the maximum frame size",
+            "Local daemon frame exceeds the maximum size",
             maximum_bytes=MAX_FRAME_BYTES,
         )
     connection.sendall(struct.pack("!I", len(encoded)) + encoded)
@@ -164,6 +170,76 @@ def receive_frame(connection: socket.socket) -> dict[str, Any]:
     value = json.loads(_receive_exact(connection, size))
     if not isinstance(value, dict):
         raise ValueError("Daemon frame must contain a JSON object")
+    return value
+
+
+def _send_response(connection: socket.socket, payload: Mapping[str, Any]) -> None:
+    """Send one response, chunking its encoded JSON when it exceeds one frame."""
+    encoded = json.dumps(payload, separators=(",", ":")).encode()
+    if len(encoded) > MAX_RESPONSE_BYTES:
+        raise CodeIndexingError(
+            ErrorCode.PROTOCOL_ERROR,
+            "Local daemon response exceeds the maximum message size",
+            maximum_bytes=MAX_RESPONSE_BYTES,
+        )
+    if len(encoded) <= MAX_FRAME_BYTES:
+        send_frame(connection, payload)
+        return
+    # Base64 expands by 4/3. The additional frame headroom covers the id,
+    # chunk markers, and JSON punctuation even when tests lower the frame cap.
+    frame_budget = max(1, (MAX_FRAME_BYTES - 256) * 3 // 4)
+    chunk_size = min(MAX_RESPONSE_CHUNK_BYTES, frame_budget)
+    request_id = payload.get("id")
+    for start in range(0, len(encoded), chunk_size):
+        end = min(start + chunk_size, len(encoded))
+        send_frame(
+            connection,
+            {
+                "id": request_id,
+                "response_chunk": base64.b64encode(encoded[start:end]).decode("ascii"),
+                "more": end < len(encoded),
+            },
+        )
+
+
+def _receive_response(connection: socket.socket) -> dict[str, Any]:
+    """Receive one ordinary or transparently chunked daemon response."""
+    frame = receive_frame(connection)
+    if "response_chunk" not in frame:
+        return frame
+    request_id = frame.get("id")
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        if frame.get("id") != request_id or not isinstance(frame.get("response_chunk"), str):
+            raise CodeIndexingError(ErrorCode.PROTOCOL_ERROR, "Invalid local daemon response chunk")
+        try:
+            chunk = base64.b64decode(frame["response_chunk"], validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise CodeIndexingError(
+                ErrorCode.PROTOCOL_ERROR, "Invalid local daemon response chunk encoding"
+            ) from exc
+        size += len(chunk)
+        if size > MAX_RESPONSE_BYTES:
+            raise CodeIndexingError(
+                ErrorCode.PROTOCOL_ERROR,
+                "Local daemon response exceeds the maximum message size",
+                maximum_bytes=MAX_RESPONSE_BYTES,
+            )
+        chunks.append(chunk)
+        more = frame.get("more")
+        if more is False:
+            break
+        if more is not True:
+            raise CodeIndexingError(
+                ErrorCode.PROTOCOL_ERROR, "Invalid local daemon response chunk marker"
+            )
+        frame = receive_frame(connection)
+    value = json.loads(b"".join(chunks))
+    if not isinstance(value, dict):
+        raise CodeIndexingError(
+            ErrorCode.PROTOCOL_ERROR, "Daemon response must contain a JSON object"
+        )
     return value
 
 
@@ -325,9 +401,9 @@ class DaemonServer:
                         "Local daemon authentication failed",
                     )
                 result = self._dispatch(str(request.get("method")), request.get("params") or {})
-                send_frame(connection, {"id": request_id, "result": _jsonable(result)})
+                _send_response(connection, {"id": request_id, "result": _jsonable(result)})
             except CodeIndexingError as exc:
-                send_frame(
+                _send_response(
                     connection,
                     {
                         "id": request_id,
@@ -339,7 +415,7 @@ class DaemonServer:
                     },
                 )
             except BaseException as exc:
-                send_frame(
+                _send_response(
                     connection,
                     {
                         "id": request_id,
@@ -410,6 +486,10 @@ class DaemonServer:
             selector = DeclarationSelector.model_validate(params.pop("selector"))
             operation = _REFACTOR_OPERATION.validate_python(params.pop("operation"))
             return app.analyze_refactor(selector, operation, roots=roots, **params)
+        if method == "emit_refactor_patch":
+            selector = DeclarationSelector.model_validate(params.pop("selector"))
+            operation = _REFACTOR_OPERATION.validate_python(params.pop("operation"))
+            return app.emit_refactor_patch(selector, operation, roots=roots, **params)
         if method == "model_status":
             # Answered by the daemon rather than the caller, because the daemon
             # is the process that will actually run indexing.
@@ -461,7 +541,7 @@ class BrokerApplication:
                     "params": _jsonable(params),
                 },
             )
-            response = receive_frame(connection)
+            response = _receive_response(connection)
         error = response.get("error")
         if error:
             try:
@@ -691,6 +771,13 @@ class BrokerApplication:
     ) -> RefactorAnalysis:
         return RefactorAnalysis.model_validate(
             self._call("analyze_refactor", selector=selector, operation=operation, **params)
+        )
+
+    def emit_refactor_patch(
+        self, selector: DeclarationSelector, operation: RefactorOperation, **params: Any
+    ) -> RefactorPatch:
+        return RefactorPatch.model_validate(
+            self._call("emit_refactor_patch", selector=selector, operation=operation, **params)
         )
 
     def model_status(self) -> ModelStatus:

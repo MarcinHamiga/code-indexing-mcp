@@ -140,10 +140,11 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "find_symbol",
         "find_references",
         "analyze_refactor",
+        "emit_refactor_patch",
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 16
+    assert len(tools) == 17
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -1661,6 +1662,7 @@ AUTO_REGISTERING_TOOLS = frozenset(
         "find_symbol",
         "find_references",
         "analyze_refactor",
+        "emit_refactor_patch",
         "file_outline",
     }
 )
@@ -1824,6 +1826,14 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
     }
     analyze_limit = analyze_refactor_schema["properties"]["limit"]
     assert (analyze_limit["minimum"], analyze_limit["maximum"]) == (1, 500)
+    emit_patch_schema = tools["emit_refactor_patch"].inputSchema
+    assert set(emit_patch_schema["properties"]) == {
+        "selector",
+        "operation",
+        "context_lines",
+    }
+    context_lines = emit_patch_schema["properties"]["context_lines"]
+    assert (context_lines["minimum"], context_lines["maximum"]) == (0, 50)
 
 
 @pytest.mark.asyncio
@@ -1850,6 +1860,32 @@ async def test_analyze_refactor_description_credits_signature_change_evidence(
 
 
 @pytest.mark.asyncio
+async def test_emit_refactor_patch_description_states_the_emission_contract(
+    tmp_path: Path,
+) -> None:
+    """The patch tool must read as emission-only and rename-only.
+
+    The description is the contract callers act on: it must say the tool
+    never edits source files, that a signature change is refused (with the
+    stable code), and that a partial patch can never read as a finished
+    rename -- the callers who skip `analyze_refactor`'s review step otherwise
+    apply unproven edits on the tool's apparent authority.
+    """
+    tools = {
+        tool.name: tool
+        for tool in await create_server(_tiny_application(tmp_path), auto_index=False).list_tools()
+    }
+    description = tools["emit_refactor_patch"].description or ""
+
+    lowered = description.lower()
+    assert "never edits source" in lowered
+    assert "git apply" in lowered
+    assert "unsupported_operation" in lowered
+    assert "unapplied" in lowered and "conflicted" in lowered
+    assert "completeness" in lowered
+
+
+@pytest.mark.asyncio
 async def test_search_across_projects_schema_rejects_one_project(tmp_path: Path) -> None:
     server = create_server(_tiny_application(tmp_path), auto_index=False)
 
@@ -1871,6 +1907,38 @@ async def test_tool_error_carries_code_and_details(tmp_path: Path) -> None:
     assert "CHUNK_NOT_FOUND" in message
     assert "chunk_id=missing" in message
     assert "search_code or find_symbol" in message
+
+
+@pytest.mark.asyncio
+async def test_unsupported_patch_operation_does_not_register_client_roots(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "emit_refactor_patch",
+            {
+                "selector": {
+                    "project": str(root),
+                    "path": "main.py",
+                    "qualified_symbol": "answer",
+                },
+                "operation": {"kind": "signature_change", "parameters": []},
+            },
+        )
+
+    assert result.isError
+    assert not (root / ".ci-mcp").exists()
+    assert app.list_projects() == []
 
 
 @pytest.mark.asyncio

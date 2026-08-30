@@ -518,6 +518,40 @@ class RefactorAnalysis(FrozenModel):
         return [*self.must_change, *self.likely_change, *self.review, *self.evidence]
 
 
+class PatchEdit(FrozenModel):
+    """One verified identifier replacement inside a patch, in raw file bytes."""
+
+    path: str
+    edit_start_byte: int
+    edit_end_byte: int
+    old_text: str
+    new_text: str
+
+
+class RefactorPatch(FrozenModel):
+    """The deterministic subset of a rename analysis, rendered as a unified diff.
+
+    `patch` is the `git apply`-able diff text and is empty when nothing was
+    applied. Findings that could not be proven current stay out of the patch
+    and are reported verbatim in `unapplied` (not deterministic edits) and
+    `conflicted` (stale or unverifiable), so a partial patch can never read
+    as a finished rename.
+    """
+
+    selected: SelectedDeclaration
+    operation: RefactorOperation
+    patch: str
+    edits: list[PatchEdit] = Field(default_factory=list)
+    applied: int = 0
+    unapplied: list[RefactorFinding] = Field(default_factory=list)
+    conflicted: list[RefactorFinding] = Field(default_factory=list)
+    snapshot_version: int = 0
+    slot_id: str | None = None
+    operation_digest: str
+    limitations: list[ReferenceLimitation] = Field(default_factory=list)
+    completeness: CompletenessReport = Field(default_factory=CompletenessReport)
+
+
 class StoredFile(FrozenModel):
     file_id: str
     project_id: str

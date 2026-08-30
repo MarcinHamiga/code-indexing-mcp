@@ -16,10 +16,12 @@ from .indexing import REFERENCE_SCHEMA_VERSION, _digest
 from .models import (
     CompletenessReport,
     DeclarationSelector,
+    PatchEdit,
     RefactorAnalysis,
     RefactorCounts,
     RefactorFinding,
     RefactorOperation,
+    RefactorPatch,
     ReferenceBackfillReport,
     ReferenceHit,
     ReferenceLimitation,
@@ -27,6 +29,13 @@ from .models import (
     RenameOperation,
     SelectedDeclaration,
     SignatureChangeOperation,
+)
+from .patching import (
+    MAX_CONTEXT_LINES,
+    MIN_CONTEXT_LINES,
+    ByteEdit,
+    apply_edits,
+    render_unified_diff,
 )
 from .storage import LanceStore, PartitionRef, ReferenceRecord
 
@@ -57,6 +66,299 @@ _BOM: Final = b"\xef\xbb\xbf"
 
 # How many individual paths a coverage limitation names before it summarizes.
 _MAX_LIMITATION_PATHS: Final = 10
+
+_ECMASCRIPT_RESERVED_WORDS: Final = frozenset(
+    {
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "instanceof",
+        "interface",
+        "let",
+        "new",
+        "null",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "static",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    }
+)
+_GO_RESERVED_WORDS: Final = frozenset(
+    {
+        "break",
+        "case",
+        "chan",
+        "const",
+        "continue",
+        "default",
+        "defer",
+        "else",
+        "fallthrough",
+        "for",
+        "func",
+        "go",
+        "goto",
+        "if",
+        "import",
+        "interface",
+        "map",
+        "package",
+        "range",
+        "return",
+        "select",
+        "struct",
+        "switch",
+        "type",
+        "var",
+    }
+)
+_RUST_RESERVED_WORDS: Final = frozenset(
+    {
+        "Self",
+        "abstract",
+        "as",
+        "async",
+        "await",
+        "become",
+        "box",
+        "break",
+        "const",
+        "continue",
+        "crate",
+        "do",
+        "dyn",
+        "else",
+        "enum",
+        "extern",
+        "false",
+        "final",
+        "fn",
+        "for",
+        "gen",
+        "if",
+        "impl",
+        "in",
+        "let",
+        "loop",
+        "macro",
+        "match",
+        "mod",
+        "move",
+        "mut",
+        "override",
+        "priv",
+        "pub",
+        "ref",
+        "return",
+        "self",
+        "static",
+        "struct",
+        "super",
+        "trait",
+        "true",
+        "try",
+        "type",
+        "typeof",
+        "union",
+        "unsafe",
+        "unsized",
+        "use",
+        "virtual",
+        "where",
+        "while",
+        "yield",
+    }
+)
+_JAVA_RESERVED_WORDS: Final = frozenset(
+    {
+        "_",
+        "abstract",
+        "assert",
+        "boolean",
+        "break",
+        "byte",
+        "case",
+        "catch",
+        "char",
+        "class",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extends",
+        "false",
+        "final",
+        "finally",
+        "float",
+        "for",
+        "goto",
+        "if",
+        "implements",
+        "import",
+        "instanceof",
+        "int",
+        "interface",
+        "long",
+        "native",
+        "new",
+        "null",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "short",
+        "static",
+        "strictfp",
+        "super",
+        "switch",
+        "synchronized",
+        "this",
+        "throw",
+        "throws",
+        "transient",
+        "true",
+        "try",
+        "void",
+        "volatile",
+        "while",
+    }
+)
+_CSHARP_RESERVED_WORDS: Final = frozenset(
+    {
+        "abstract",
+        "as",
+        "base",
+        "bool",
+        "break",
+        "byte",
+        "case",
+        "catch",
+        "char",
+        "checked",
+        "class",
+        "const",
+        "continue",
+        "decimal",
+        "default",
+        "delegate",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "event",
+        "explicit",
+        "extern",
+        "false",
+        "finally",
+        "fixed",
+        "float",
+        "for",
+        "foreach",
+        "goto",
+        "if",
+        "implicit",
+        "in",
+        "int",
+        "interface",
+        "internal",
+        "is",
+        "lock",
+        "long",
+        "namespace",
+        "new",
+        "null",
+        "object",
+        "operator",
+        "out",
+        "override",
+        "params",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "ref",
+        "return",
+        "sbyte",
+        "sealed",
+        "short",
+        "sizeof",
+        "stackalloc",
+        "static",
+        "string",
+        "struct",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "uint",
+        "ulong",
+        "unchecked",
+        "unsafe",
+        "ushort",
+        "using",
+        "virtual",
+        "void",
+        "volatile",
+        "while",
+    }
+)
+
+
+def validate_patch_request(operation: RefactorOperation, context_lines: int) -> None:
+    """Reject unsupported patch requests before repository preparation begins."""
+    if not isinstance(operation, RenameOperation):
+        raise CodeIndexingError(
+            ErrorCode.UNSUPPORTED_OPERATION,
+            "Patch emission supports only rename operations. A signature change "
+            "needs synthesized argument lists, which are language-specific and "
+            "easy to get silently wrong; run analyze_refactor for the analysis "
+            "and apply its findings by hand.",
+        )
+    if not MIN_CONTEXT_LINES <= context_lines <= MAX_CONTEXT_LINES:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_FILTER,
+            f"context_lines must be between {MIN_CONTEXT_LINES} and {MAX_CONTEXT_LINES}",
+        )
 
 
 class _ModuleIndex(NamedTuple):
@@ -147,6 +449,7 @@ class ReferenceService:
         backfill: ReferenceBackfillReport | None = None,
         operation_digest: str | None = None,
         partition: PartitionRef | None = None,
+        root: Path | None = None,
     ) -> ReferenceResponse:
         """Resolve references for `selector`, one page at a time.
 
@@ -161,6 +464,7 @@ class ReferenceService:
             backfill=backfill,
             operation_digest=operation_digest,
             partition=partition,
+            root=root,
         ).response
 
     def _find_references_with_records(
@@ -173,6 +477,7 @@ class ReferenceService:
         backfill: ReferenceBackfillReport | None = None,
         operation_digest: str | None = None,
         partition: PartitionRef | None = None,
+        root: Path | None = None,
     ) -> _ReferenceQuery:
         """`find_references`'s body, also returning everything it computed along the way.
 
@@ -297,7 +602,7 @@ class ReferenceService:
             raise CodeIndexingError(
                 ErrorCode.STALE_CURSOR, "Reference cursor snapshot expired"
             ) from error
-        root = self._project_root(selected.project_id)
+        root = root or self._project_root(selected.project_id)
         sources: dict[str, tuple[bytes, int]] = {}
         hits, limitations = self._hits_and_limitations(
             selected,
@@ -540,7 +845,43 @@ class ReferenceService:
         cursor: str | None = None,
         backfill: ReferenceBackfillReport | None = None,
         partition: PartitionRef | None = None,
+        root: Path | None = None,
     ) -> RefactorAnalysis:
+        analysis, _query = self._rename_analysis(
+            selector,
+            operation,
+            limit=limit,
+            cursor=cursor,
+            backfill=backfill,
+            partition=partition,
+            paginate=True,
+            root=root,
+        )
+        return analysis
+
+    def _rename_analysis(
+        self,
+        selector: DeclarationSelector,
+        operation: RefactorOperation,
+        *,
+        limit: int,
+        cursor: str | None,
+        backfill: ReferenceBackfillReport | None,
+        partition: PartitionRef | None,
+        paginate: bool,
+        root: Path | None = None,
+    ) -> tuple[RefactorAnalysis, _ReferenceQuery]:
+        """`analyze_refactor`'s body, also returning the pinned-snapshot query.
+
+        `emit_refactor_patch` re-derives the very same findings so the two
+        tools cannot disagree about what is `must_change`, but it needs the
+        *full* finding lists plus the query (source cache, coverage rows, slot
+        identity) to verify and render them. Page-filtering its way through
+        `analyze_refactor` would re-materialize that once per 500-hit page,
+        so the pagination tail is a flag: `analyze_refactor` runs it with
+        `paginate=True` and unchanged behavior, emission with `paginate=False`
+        and `cursor=None` (it always wants every finding).
+        """
         query = self._find_references_with_records(
             selector,
             limit=limit,
@@ -548,6 +889,7 @@ class ReferenceService:
             backfill=backfill,
             operation_digest=self._operation_digest(operation),
             partition=partition,
+            root=root,
         )
         response = query.response
         records = query.records
@@ -626,11 +968,17 @@ class ReferenceService:
         override_findings = _dedupe_edit_spans(override_findings, required_edit_spans)
         full_likely = _dedupe_edit_spans(full_likely, required_edit_spans)
 
-        page_ids = {hit.reference_id for hit in response.hits}
-        must_change = [finding for finding in full_must if finding.reference_id in page_ids]
-        likely_change = [finding for finding in full_likely if finding.reference_id in page_ids]
-        review = [finding for finding in full_review if finding.reference_id in page_ids]
-        evidence = [finding for finding in full_evidence if finding.reference_id in page_ids]
+        if paginate:
+            page_ids = {hit.reference_id for hit in response.hits}
+            must_change = [finding for finding in full_must if finding.reference_id in page_ids]
+            likely_change = [finding for finding in full_likely if finding.reference_id in page_ids]
+            review = [finding for finding in full_review if finding.reference_id in page_ids]
+            evidence = [finding for finding in full_evidence if finding.reference_id in page_ids]
+        else:
+            must_change = full_must
+            likely_change = full_likely
+            review = full_review
+            evidence = full_evidence
         if cursor is None:
             if declaration_finding is not None:
                 must_change = [declaration_finding, *must_change]
@@ -643,7 +991,7 @@ class ReferenceService:
             review=len(full_review),
             evidence=len(full_evidence),
         )
-        return RefactorAnalysis(
+        analysis = RefactorAnalysis(
             selected=response.selected,
             operation=operation,
             must_change=must_change,
@@ -660,16 +1008,268 @@ class ReferenceService:
                 override_findings,
             ),
         )
+        return analysis, query
+
+    def emit_refactor_patch(
+        self,
+        selector: DeclarationSelector,
+        operation: RefactorOperation,
+        *,
+        context_lines: int = 3,
+        backfill: ReferenceBackfillReport | None = None,
+        partition: PartitionRef | None = None,
+        root: Path | None = None,
+    ) -> RefactorPatch:
+        """Render the deterministic subset of a rename as a `git apply`-able diff.
+
+        The patch is produced from the same analysis `analyze_refactor` serves,
+        so the two tools cannot disagree about what is `must_change`. Anything
+        that cannot be proven current stays out of the patch: findings without
+        a located identifier, dynamic-review findings, files whose bytes no
+        longer match what the rows were extracted from (the serve-time
+        coverage gate, recomputed here over every file the analysis read),
+        findings whose byte
+        slice no longer spells the identifier, and findings whose span
+        overlaps an already accepted edit. Those surface in `unapplied` and
+        `conflicted` with the analysis reason vocabulary, and `completeness`
+        degrades before any hunk is trusted. Nothing is written to disk:
+        emission is analysis, application stays with the caller.
+        """
+        validate_patch_request(operation, context_lines)
+        assert isinstance(operation, RenameOperation)
+        analysis, query = self._rename_analysis(
+            selector,
+            operation,
+            limit=500,
+            cursor=None,
+            backfill=backfill,
+            partition=partition,
+            paginate=False,
+            root=root,
+        )
+        return self._render_patch(analysis, query, operation, context_lines=context_lines)
+
+    def _render_patch(
+        self,
+        analysis: RefactorAnalysis,
+        query: _ReferenceQuery,
+        operation: RenameOperation,
+        *,
+        context_lines: int,
+    ) -> RefactorPatch:
+        """Verify, splice, and render one rename analysis into a `RefactorPatch`.
+
+        Split from `emit_refactor_patch` so tests can feed synthetic findings
+        through the verification defenses directly, against a real query.
+        """
+        selected = analysis.selected
+        old_name = selected.symbol
+        new_name = operation.new_name
+        old_bytes = old_name.encode("utf-8")
+        new_bytes = new_name.encode("utf-8")
+
+        candidates: list[tuple[RefactorFinding, int, int]] = []
+        unapplied: list[RefactorFinding] = []
+        for finding in analysis.must_change:
+            if finding.edit_start_byte is None or finding.edit_end_byte is None:
+                unapplied.append(finding)
+            else:
+                candidates.append((finding, finding.edit_start_byte, finding.edit_end_byte))
+        # likely_change carries overrides and dynamic-review candidates; their
+        # arguments need human judgement, so they are never rendered.
+        unapplied.extend(analysis.likely_change)
+        unapplied.extend(analysis.review)
+
+        # The serve-time gate already suppressed every stale file's hits, so
+        # a stale file usually has no findings at all -- but its path must
+        # still be reported, or a patch that silently omits it would read as
+        # finished. Recompute the gate over every file the analysis read (the
+        # sources cache holds exactly that set) plus the candidate files, from
+        # the same coverage rows the gate used.
+        coverage_hashes = {
+            row["path"]: row["content_hash"]
+            for row in query.records
+            if row["record_kind"] == "coverage" and row["content_hash"]
+        }
+        digests: dict[str, str] = {}
+        stale_paths: set[str] = set()
+        render_sources: dict[str, tuple[bytes, int]] = {}
+        candidate_paths = {finding.path for finding, _start, _end in candidates}
+        for path in sorted(candidate_paths | set(query.sources)):
+            source, bom = self._file_bytes(query.root, path, render_sources)
+            if not self._matches_coverage(path, coverage_hashes, source, bom, digests):
+                stale_paths.add(path)
+
+        conflicted: list[RefactorFinding] = []
+        accepted: dict[str, list[ByteEdit]] = {}
+        for finding, raw_start, raw_end in sorted(
+            candidates, key=lambda item: (item[0].path, item[1], item[2])
+        ):
+            if finding.path in stale_paths:
+                conflicted.append(
+                    finding.model_copy(
+                        update={
+                            "reason_code": "stale_file",
+                            "explanation": (
+                                f"{finding.explanation} The file changed on disk after its "
+                                "structural rows were extracted, so the recorded offsets "
+                                "are stale and the edit was left out of the patch."
+                            ),
+                        }
+                    )
+                )
+                continue
+            source, bom = self._file_bytes(query.root, finding.path, render_sources)
+            start = raw_start - bom
+            end = raw_end - bom
+            # Defense against resolver regressions: the span the resolver
+            # classified must still spell the identifier (as `_edit_span`
+            # matched it), or the replacement would corrupt neighboring text.
+            if start < 0 or end > len(source) or source[start:end] != old_bytes:
+                conflicted.append(
+                    finding.model_copy(
+                        update={
+                            "explanation": (
+                                f"{finding.explanation} The bytes at the recorded offsets "
+                                "no longer spell the identifier the analysis resolved, so "
+                                "the edit was left out of the patch."
+                            )
+                        }
+                    )
+                )
+                continue
+            path_edits = accepted.setdefault(finding.path, [])
+            if path_edits and start < path_edits[-1].end - bom:
+                conflicted.append(
+                    finding.model_copy(
+                        update={
+                            "explanation": (
+                                f"{finding.explanation} The edit span overlaps an already "
+                                "accepted edit in the same file, so it was omitted rather "
+                                "than merged."
+                            )
+                        }
+                    )
+                )
+                continue
+            path_edits.append(ByteEdit(raw_start, raw_end, new_bytes))
+
+        # Stale files the gate had already suppressed carry no findings, so
+        # the loop above never saw them. Synthesize one conflicted entry per
+        # path, shaped like a finding (the `_rename_findings` precedent for
+        # synthetic ids), so the omitted file is reported instead of silent.
+        languages_by_path: dict[str, str] = {}
+        for row in query.records:
+            if row["record_kind"] == "reference":
+                languages_by_path.setdefault(row["path"], row["language"] or "")
+        for path in sorted(stale_paths - candidate_paths):
+            conflicted.append(
+                RefactorFinding(
+                    reference_id=f"stale:{path}",
+                    project_id=selected.project_id,
+                    path=path,
+                    language=languages_by_path.get(path, ""),
+                    kind="read",
+                    start_line=0,
+                    end_line=0,
+                    start_byte=0,
+                    end_byte=0,
+                    snippet="",
+                    resolution="unresolved",
+                    reason_code="stale_file",
+                    explanation=(
+                        "This file changed on disk after its structural rows were "
+                        "extracted, so its recorded offsets were suppressed as stale "
+                        "and none of its edits could be verified for the patch."
+                    ),
+                    edit_required=True,
+                )
+            )
+
+        patch_parts: list[str] = []
+        patch_edits: list[PatchEdit] = []
+        for path in sorted(accepted):
+            source, bom = self._file_bytes(query.root, path, render_sources)
+            # Edit offsets are raw-absolute (`_edit_span` adds the removed
+            # BOM length back), so rendering splices against the raw bytes
+            # with the byte-order mark re-prepended.
+            original = (_BOM + source) if bom else source
+            file_edits = accepted[path]
+            edited = apply_edits(original, file_edits)
+            diff = render_unified_diff(path, original, edited, context_lines)
+            if diff is not None:
+                patch_parts.append(diff)
+            for edit in file_edits:
+                patch_edits.append(
+                    PatchEdit(
+                        path=path,
+                        edit_start_byte=edit.start,
+                        edit_end_byte=edit.end,
+                        old_text=old_name,
+                        new_text=new_name,
+                    )
+                )
+
+        if analysis.completeness.state == "incomplete":
+            completeness = analysis.completeness
+        elif unapplied or conflicted:
+            completeness = CompletenessReport(
+                state="complete_with_dynamic_limitations",
+                explanation=(
+                    "The patch covers only the deterministic, verified subset of the "
+                    "rename. Review unapplied and conflicted before treating the "
+                    "rename as finished."
+                ),
+            )
+        else:
+            completeness = CompletenessReport(
+                state="complete",
+                explanation="Every finding was verified against current bytes and applied.",
+            )
+        return RefactorPatch(
+            selected=selected,
+            operation=operation,
+            patch="".join(patch_parts),
+            edits=patch_edits,
+            applied=len(patch_edits),
+            unapplied=unapplied,
+            conflicted=conflicted,
+            snapshot_version=query.response.snapshot_version,
+            slot_id=query.slot_id,
+            operation_digest=self._operation_digest(operation),
+            limitations=analysis.limitations,
+            completeness=completeness,
+        )
 
     @staticmethod
     def _validate_rename(selected: SelectedDeclaration, operation: RenameOperation) -> None:
-        valid_identifier = (
-            operation.new_name.isidentifier() and not keyword_module.iskeyword(operation.new_name)
-            if selected.language == "python"
-            else bool(re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", operation.new_name))
-        )
+        name = operation.new_name
+        if name == selected.symbol:
+            raise CodeIndexingError(ErrorCode.INVALID_REFACTOR, "Rename must change the name")
+        if selected.language == "python":
+            valid_identifier = name.isidentifier() and not keyword_module.iskeyword(name)
+        elif selected.language in {"javascript", "typescript", "tsx"}:
+            valid_identifier = name.replace("$", "_").isidentifier() and (
+                name not in _ECMASCRIPT_RESERVED_WORDS
+            )
+        elif selected.language == "go":
+            valid_identifier = name.isidentifier() and name not in _GO_RESERVED_WORDS
+        elif selected.language == "rust":
+            valid_identifier = name.isidentifier() and name not in _RUST_RESERVED_WORDS
+        elif selected.language == "java":
+            valid_identifier = name.isidentifier() and name not in _JAVA_RESERVED_WORDS
+        elif selected.language == "csharp":
+            body = name[1:] if name.startswith("@") else name
+            valid_identifier = body.isidentifier() and (
+                name.startswith("@") or body not in _CSHARP_RESERVED_WORDS
+            )
+        else:
+            valid_identifier = False
         if not valid_identifier:
-            raise CodeIndexingError(ErrorCode.INVALID_REFACTOR, "Invalid identifier for rename")
+            raise CodeIndexingError(
+                ErrorCode.INVALID_REFACTOR,
+                f"Invalid {selected.language} identifier for rename",
+            )
 
     def _rename_findings(
         self,
@@ -752,10 +1352,12 @@ class ReferenceService:
                 continue
             if isinstance(operation, RenameOperation):
                 written = hit.written_name or hit.snippet
-                needs_edit = written.rsplit(".", 1)[-1] == selected.symbol or hit.kind in {
-                    "import",
-                    "export",
-                }
+                row = shapes_by_id.get(hit.reference_id)
+                needs_edit = written.rsplit(".", 1)[-1] == selected.symbol or (
+                    hit.kind in {"import", "export"}
+                    and row is not None
+                    and row["imported_name"] == selected.symbol
+                )
                 if not needs_edit:
                     evidence.append(finding)
                     continue

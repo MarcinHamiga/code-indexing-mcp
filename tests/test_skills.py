@@ -66,6 +66,10 @@ def test_refactoring_workflows_name_the_structural_analysis_tools(skill_name: st
 
     assert "mcp__code-indexing-mcp__find_references" in text
     assert "mcp__code-indexing-mcp__analyze_refactor" in text
+    # The patch-production step belongs beside the analysis tools: skills that
+    # plan renames should route the mechanical edits through emission instead
+    # of hand-applying offsets.
+    assert "mcp__code-indexing-mcp__emit_refactor_patch" in text
 
 
 @pytest.mark.parametrize("skill_name", ["impact-analysis", "feature-dev"])
