@@ -139,12 +139,13 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "search_across_projects",
         "find_symbol",
         "find_references",
+        "impact_radius",
         "analyze_refactor",
         "emit_refactor_patch",
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 17
+    assert len(tools) == 18
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -1618,6 +1619,7 @@ def test_server_instructions_guide_index_first_usage(tmp_path: Path) -> None:
         "search_across_projects",
         "find_symbol",
         "find_references",
+        "impact_radius",
         "analyze_refactor",
         "file_outline",
         "get_chunk",
@@ -1663,6 +1665,7 @@ AUTO_REGISTERING_TOOLS = frozenset(
         "search_across_projects",
         "find_symbol",
         "find_references",
+        "impact_radius",
         "analyze_refactor",
         "emit_refactor_patch",
         "file_outline",
@@ -1819,6 +1822,28 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "prefix",
         "contains",
     ]
+    impact_schema = tools["impact_radius"].inputSchema
+    assert set(impact_schema["properties"]) == {
+        "selector",
+        "max_depth",
+        "include_likely",
+        "kinds",
+        "max_nodes",
+        "limit",
+        "cursor",
+    }
+    assert (
+        impact_schema["properties"]["max_depth"]["minimum"],
+        impact_schema["properties"]["max_depth"]["maximum"],
+    ) == (1, 10)
+    assert (
+        impact_schema["properties"]["max_nodes"]["minimum"],
+        impact_schema["properties"]["max_nodes"]["maximum"],
+    ) == (1, 2000)
+    assert (
+        impact_schema["properties"]["limit"]["minimum"],
+        impact_schema["properties"]["limit"]["maximum"],
+    ) == (1, 500)
     analyze_refactor_schema = tools["analyze_refactor"].inputSchema
     assert set(analyze_refactor_schema["properties"]) == {
         "selector",
@@ -1836,6 +1861,18 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
     }
     context_lines = emit_patch_schema["properties"]["context_lines"]
     assert (context_lines["minimum"], context_lines["maximum"]) == (0, 50)
+
+
+@pytest.mark.asyncio
+async def test_impact_radius_description_states_safety_contract(tmp_path: Path) -> None:
+    tools = {
+        tool.name: tool
+        for tool in await create_server(_tiny_application(tmp_path), auto_index=False).list_tools()
+    }
+    description = (tools["impact_radius"].description or "").lower()
+
+    for term in ("layers", "taint", "review", "budget", "completeness"):
+        assert term in description
 
 
 @pytest.mark.asyncio

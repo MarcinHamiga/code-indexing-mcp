@@ -275,6 +275,7 @@ overwrite a marker and orphan the previous index.
 | `search_across_projects` | read, registers and indexes | Globally ranked search across at least two explicitly selected projects. |
 | `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
 | `find_references` | read, registers and indexes | Structural references to one selected C#, Go, Java, JavaScript, Python, Rust, TSX, or TypeScript declaration. |
+| `impact_radius` | read, registers and indexes | Bounded, layered transitive dependents of one selected declaration. |
 | `analyze_refactor` | read, registers and indexes | Read-only rename or signature-change impact analysis for one selected declaration. |
 | `emit_refactor_patch` | read, registers and indexes | Emit a `git apply`-able unified diff from the deterministic subset of a rename analysis; never edits source. |
 | `file_outline` | read, registers and indexes | One file's declared symbols, metadata only. |
@@ -295,6 +296,14 @@ the explicit `project`, `path`, and `qualified_symbol` selector). Reference resu
 an opaque cursor that stays bound to the original structural-table snapshot. They distinguish
 `exact` bindings from `likely` and `unresolved` evidence; callers must review the latter and the
 reported limitations rather than treating them as safe edits.
+
+`impact_radius` expands those structural references breadth-first and groups dependents by hop
+depth. Exact edges are traversed by default; `include_likely=true` also traverses possible edges
+and marks every downstream edge reached through one as `tainted`. Unresolved references and uses
+that cannot be attributed uniquely to an enclosing declaration remain in each layer's `review`
+list. `max_nodes` bounds resolver work and reports `budget_exhaustion` explicitly instead of
+silently truncating the graph. Results are paged with a cursor bound to the selector, filters,
+depth, budget, structural snapshot, and active slot epoch.
 
 Structural references are extracted during the normal parse and are backfilled parse-only for an
 older semantic index—no second embedding pass is needed. The first reference query may therefore

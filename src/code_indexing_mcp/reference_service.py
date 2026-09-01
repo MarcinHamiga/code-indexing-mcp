@@ -16,6 +16,11 @@ from .indexing import REFERENCE_SCHEMA_VERSION, _digest
 from .models import (
     CompletenessReport,
     DeclarationSelector,
+    ImpactBudgetExhaustion,
+    ImpactEdge,
+    ImpactLayer,
+    ImpactRadiusResponse,
+    ImpactReview,
     PatchEdit,
     RefactorAnalysis,
     RefactorCounts,
@@ -24,6 +29,7 @@ from .models import (
     RefactorPatch,
     ReferenceBackfillReport,
     ReferenceHit,
+    ReferenceKind,
     ReferenceLimitation,
     ReferenceResponse,
     RenameOperation,
@@ -478,6 +484,7 @@ class ReferenceService:
         operation_digest: str | None = None,
         partition: PartitionRef | None = None,
         root: Path | None = None,
+        snapshot_version: int | None = None,
     ) -> _ReferenceQuery:
         """`find_references`'s body, also returning everything it computed along the way.
 
@@ -546,9 +553,11 @@ class ReferenceService:
                 "Run ensure_reference_index (or reindex) before querying references.",
                 project=selected.project_id,
             )
-        version = self.store.reference_version(
-            selected.project_id, partition_id=partition.partition_id
-        )
+        version = snapshot_version
+        if version is None:
+            version = self.store.reference_version(
+                selected.project_id, partition_id=partition.partition_id
+            )
         offset = 0
         if payload is not None:
             if payload["project_id"] != selected.project_id or payload["path"] != selected.path:
@@ -653,6 +662,317 @@ class ReferenceService:
             partition.partition_id,
             partition.slot_id,
             partition.activation_epoch,
+        )
+
+    def impact_radius(
+        self,
+        selector: DeclarationSelector,
+        *,
+        max_depth: int = 2,
+        include_likely: bool = False,
+        kinds: set[str] | None = None,
+        max_nodes: int = 500,
+        limit: int = 100,
+        cursor: str | None = None,
+        backfill: ReferenceBackfillReport | None = None,
+        partition: PartitionRef | None = None,
+        root: Path | None = None,
+    ) -> ImpactRadiusResponse:
+        """Return the bounded transitive dependents of one declaration."""
+        for value, lower, upper, name in (
+            (max_depth, 1, 10, "max_depth"),
+            (max_nodes, 1, 2000, "max_nodes"),
+            (limit, 1, 500, "limit"),
+        ):
+            if value < lower or value > upper:
+                raise CodeIndexingError(
+                    ErrorCode.INVALID_FILTER,
+                    f"{name} must be between {lower} and {upper}",
+                )
+
+        selector_project_id = selector.project
+        if selector_project_id is None and selector.chunk_id is not None:
+            selector_project_id = self.store._chunk_project_id(selector.chunk_id)
+        if partition is None and selector_project_id is not None:
+            partition = self.store.active_partition(selector_project_id)
+        if (
+            partition is not None
+            and selector_project_id is not None
+            and partition.project_id != selector_project_id
+        ):
+            raise ValueError("reference partition does not belong to selector project")
+        payload = self._decode_impact_cursor(cursor) if cursor is not None else None
+        if payload is not None and partition is not None:
+            if payload["slot_id"] != partition.slot_id:
+                raise CodeIndexingError(
+                    ErrorCode.STALE_CURSOR, "Impact cursor belongs to an inactive index slot"
+                )
+            if payload["activation_epoch"] != partition.activation_epoch:
+                raise CodeIndexingError(
+                    ErrorCode.STALE_CURSOR,
+                    "Impact cursor belongs to an earlier slot activation",
+                )
+
+        selected = self._select(
+            selector,
+            partition_id=None if partition is None else partition.partition_id,
+        )
+        partition = partition or self.store.active_partition(selected.project_id)
+        offset = 0
+        version: int | None = None
+        if payload is not None:
+            expected = {
+                "project_id": selected.project_id,
+                "path": selected.path,
+                "qualified_symbol": selected.qualified_symbol,
+                "max_depth": max_depth,
+                "include_likely": include_likely,
+                "kinds": sorted(kinds or set()),
+                "max_nodes": max_nodes,
+                "limit": limit,
+            }
+            if any(payload[key] != value for key, value in expected.items()):
+                raise CodeIndexingError(
+                    ErrorCode.INVALID_CURSOR, "cursor does not match the impact-radius request"
+                )
+            offset = cast(int, payload["offset"])
+            version = cast(int, payload["version"])
+
+        first_query = self._find_references_with_records(
+            DeclarationSelector(
+                project=selected.project_id,
+                path=selected.path,
+                qualified_symbol=selected.qualified_symbol,
+            ),
+            kinds=kinds,
+            limit=500,
+            backfill=backfill,
+            partition=partition,
+            root=root,
+            snapshot_version=version,
+        )
+        version = first_query.response.snapshot_version
+        root = first_query.root
+
+        def node_key(node: SelectedDeclaration) -> tuple[str, str, str]:
+            return (node.project_id, node.path, node.qualified_symbol)
+
+        visited: dict[tuple[str, str, str], int] = {node_key(selected): 0}
+        frontier: list[tuple[SelectedDeclaration, bool]] = [(selected, False)]
+        all_layers: list[ImpactLayer] = []
+        limitations: list[ReferenceLimitation] = []
+        exhaustion: ImpactBudgetExhaustion | None = None
+
+        for depth in range(1, max_depth + 1):
+            grouped_edges: dict[
+                tuple[tuple[str, str, str], tuple[str, str, str]],
+                dict[str, object],
+            ] = {}
+            review: list[ImpactReview] = []
+            candidates: dict[tuple[str, str, str], tuple[SelectedDeclaration, bool]] = {}
+            for source, source_tainted in sorted(frontier, key=lambda item: node_key(item[0])):
+                query = (
+                    first_query
+                    if depth == 1 and node_key(source) == node_key(selected)
+                    else self._find_references_with_records(
+                        DeclarationSelector(
+                            project=source.project_id,
+                            path=source.path,
+                            qualified_symbol=source.qualified_symbol,
+                        ),
+                        kinds=kinds,
+                        limit=500,
+                        backfill=backfill,
+                        partition=partition,
+                        root=root,
+                        snapshot_version=version,
+                    )
+                )
+                limitations.extend(query.response.limitations)
+                rows = {
+                    row["reference_id"]: row
+                    for row in query.records
+                    if row["record_kind"] == "reference"
+                }
+                for hit in query.hits:
+                    row = rows.get(hit.reference_id)
+                    qualified_symbol = None if row is None else row["source_qualified_symbol"]
+                    target: SelectedDeclaration | None = None
+                    if qualified_symbol:
+                        try:
+                            target = self._select(
+                                DeclarationSelector(
+                                    project=selected.project_id,
+                                    path=hit.path,
+                                    qualified_symbol=qualified_symbol,
+                                ),
+                                partition_id=partition.partition_id,
+                            )
+                        except CodeIndexingError as error:
+                            if error.code is not ErrorCode.AMBIGUOUS_SYMBOL:
+                                raise
+                    traversable = hit.resolution == "exact" or (
+                        include_likely and hit.resolution == "likely"
+                    )
+                    if target is None or not traversable:
+                        review.append(ImpactReview(source=source, hit=hit))
+                        continue
+
+                    source_key = node_key(source)
+                    target_key = node_key(target)
+                    possible = hit.resolution == "likely"
+                    tainted = source_tainted or possible
+                    cycle_to_depth = visited.get(target_key)
+                    edge_key = (source_key, target_key)
+                    edge = grouped_edges.get(edge_key)
+                    if edge is None:
+                        grouped_edges[edge_key] = {
+                            "source": source,
+                            "target": target,
+                            "kinds": {hit.kind},
+                            "possible": possible,
+                            "tainted": tainted,
+                            "cycle_to_depth": cycle_to_depth,
+                        }
+                    else:
+                        cast(set[str], edge["kinds"]).add(hit.kind)
+                        edge["possible"] = cast(bool, edge["possible"]) and possible
+                        edge["tainted"] = cast(bool, edge["tainted"]) and tainted
+                    if cycle_to_depth is None:
+                        prior = candidates.get(target_key)
+                        if prior is None or (prior[1] and not tainted):
+                            candidates[target_key] = (target, tainted)
+
+            candidate_keys = sorted(candidates)
+            available = max_nodes - len(visited)
+            allowed_keys = set(candidate_keys[:available])
+            if len(candidate_keys) > available:
+                first_unvisited = candidates[candidate_keys[available]][0]
+                exhaustion = ImpactBudgetExhaustion(
+                    depth=depth,
+                    node=first_unvisited,
+                    unvisited_frontier=len(candidate_keys) - available,
+                )
+                grouped_edges = {
+                    key: edge
+                    for key, edge in grouped_edges.items()
+                    if key[1] in visited or key[1] in allowed_keys
+                }
+
+            edges = [
+                ImpactEdge(
+                    source=cast(SelectedDeclaration, edge["source"]),
+                    target=cast(SelectedDeclaration, edge["target"]),
+                    kinds=cast(list[ReferenceKind], sorted(cast(set[str], edge["kinds"]))),
+                    possible=cast(bool, edge["possible"]),
+                    tainted=cast(bool, edge["tainted"]),
+                    cycle_to_depth=cast(int | None, edge["cycle_to_depth"]),
+                )
+                for _, edge in sorted(grouped_edges.items())
+            ]
+            review.sort(
+                key=lambda item: (
+                    node_key(item.source),
+                    item.hit.path,
+                    item.hit.start_line,
+                    item.hit.start_byte,
+                    item.hit.reference_id,
+                )
+            )
+            all_layers.append(ImpactLayer(depth=depth, edges=edges, review=review))
+            for key in allowed_keys:
+                visited[key] = depth
+            if exhaustion is not None:
+                break
+            frontier = [candidates[key] for key in candidate_keys]
+            if not frontier:
+                break
+
+        entries: list[tuple[int, str, ImpactEdge | ImpactReview]] = []
+        for layer in all_layers:
+            entries.extend((layer.depth, "edge", edge) for edge in layer.edges)
+            entries.extend((layer.depth, "review", item) for item in layer.review)
+        page = entries[offset : offset + limit]
+        page_layers: dict[int, dict[str, list[ImpactEdge] | list[ImpactReview]]] = {
+            layer.depth: {"edges": [], "review": []} for layer in all_layers
+        }
+        for depth, kind, item in page:
+            page_layer = page_layers.setdefault(depth, {"edges": [], "review": []})
+            if kind == "edge":
+                cast(list[ImpactEdge], page_layer["edges"]).append(cast(ImpactEdge, item))
+            else:
+                cast(list[ImpactReview], page_layer["review"]).append(cast(ImpactReview, item))
+
+        next_cursor = None
+        if offset + len(page) < len(entries):
+            next_cursor = self._encode_cursor(
+                {
+                    "version": version,
+                    "project_id": selected.project_id,
+                    "path": selected.path,
+                    "qualified_symbol": selected.qualified_symbol,
+                    "max_depth": max_depth,
+                    "include_likely": include_likely,
+                    "kinds": sorted(kinds or set()),
+                    "max_nodes": max_nodes,
+                    "offset": offset + len(page),
+                    "limit": limit,
+                    "slot_id": partition.slot_id,
+                    "activation_epoch": partition.activation_epoch,
+                }
+            )
+
+        unique_limitations = {
+            (item.code, item.explanation, item.path): item for item in limitations
+        }
+        sorted_limitations = sorted(
+            unique_limitations.values(), key=lambda item: (item.code, item.path or "")
+        )
+        full_review = any(layer.review for layer in all_layers)
+        dynamic_edges = any(
+            edge.possible or edge.tainted for layer in all_layers for edge in layer.edges
+        )
+        if exhaustion is not None or any(
+            item.code in _COVERAGE_GAP_CODES for item in sorted_limitations
+        ):
+            completeness = CompletenessReport(
+                state="incomplete",
+                explanation=(
+                    "The radius was truncated by its node budget or some files could not be "
+                    "analyzed. See budget_exhaustion and limitations."
+                ),
+            )
+        elif sorted_limitations or full_review or dynamic_edges:
+            completeness = CompletenessReport(
+                state="complete_with_dynamic_limitations",
+                explanation=(
+                    "Every indexed file was analyzed, but some dependency edges could not be "
+                    "proven exactly. See review and limitations."
+                ),
+            )
+        else:
+            completeness = CompletenessReport(
+                state="complete",
+                explanation="Every traversed dependency edge was resolved exactly.",
+            )
+
+        return ImpactRadiusResponse(
+            selected=selected,
+            layers=[
+                ImpactLayer(
+                    depth=depth,
+                    edges=cast(list[ImpactEdge], layer["edges"]),
+                    review=cast(list[ImpactReview], layer["review"]),
+                )
+                for depth, layer in sorted(page_layers.items())
+            ],
+            visited=len(visited),
+            budget_exhausted=exhaustion is not None,
+            budget_exhaustion=exhaustion,
+            limitations=sorted_limitations,
+            cursor=next_cursor,
+            snapshot_version=version,
+            completeness=completeness,
         )
 
     def _hits_and_limitations(
@@ -2913,6 +3233,57 @@ class ReferenceService:
             "activation_epoch",
         }
     )
+
+    _IMPACT_CURSOR_FIELDS: Final = frozenset(
+        {
+            "version",
+            "project_id",
+            "path",
+            "qualified_symbol",
+            "max_depth",
+            "include_likely",
+            "kinds",
+            "max_nodes",
+            "offset",
+            "limit",
+            "slot_id",
+            "activation_epoch",
+        }
+    )
+
+    @staticmethod
+    def _decode_impact_cursor(cursor: str) -> dict[str, object]:
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid impact cursor") from exc
+
+        def invalid() -> CodeIndexingError:
+            return CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid impact cursor")
+
+        if not isinstance(payload, dict) or set(payload) != ReferenceService._IMPACT_CURSOR_FIELDS:
+            raise invalid()
+        for int_field in (
+            "version",
+            "max_depth",
+            "max_nodes",
+            "offset",
+            "limit",
+            "activation_epoch",
+        ):
+            value = payload[int_field]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise invalid()
+        for str_field in ("project_id", "path", "qualified_symbol", "slot_id"):
+            if not isinstance(payload[str_field], str):
+                raise invalid()
+        if not isinstance(payload["include_likely"], bool):
+            raise invalid()
+        kinds = payload["kinds"]
+        if not isinstance(kinds, list) or not all(isinstance(item, str) for item in kinds):
+            raise invalid()
+        return payload
 
     @staticmethod
     def _decode_cursor(cursor: str) -> dict[str, object]:

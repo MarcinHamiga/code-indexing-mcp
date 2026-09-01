@@ -493,6 +493,44 @@ class CompletenessReport(FrozenModel):
     explanation: str = "All indexed structural candidates were considered."
 
 
+class ImpactEdge(FrozenModel):
+    source: SelectedDeclaration
+    target: SelectedDeclaration
+    kinds: list[ReferenceKind] = Field(default_factory=list)
+    possible: bool = False
+    tainted: bool = False
+    cycle_to_depth: int | None = None
+
+
+class ImpactReview(FrozenModel):
+    source: SelectedDeclaration
+    hit: ReferenceHit
+
+
+class ImpactLayer(FrozenModel):
+    depth: int
+    edges: list[ImpactEdge] = Field(default_factory=list)
+    review: list[ImpactReview] = Field(default_factory=list)
+
+
+class ImpactBudgetExhaustion(FrozenModel):
+    depth: int
+    node: SelectedDeclaration
+    unvisited_frontier: int
+
+
+class ImpactRadiusResponse(FrozenModel):
+    selected: SelectedDeclaration
+    layers: list[ImpactLayer] = Field(default_factory=list)
+    visited: int = 0
+    budget_exhausted: bool = False
+    budget_exhaustion: ImpactBudgetExhaustion | None = None
+    limitations: list[ReferenceLimitation] = Field(default_factory=list)
+    cursor: str | None = None
+    snapshot_version: int = 0
+    completeness: CompletenessReport = Field(default_factory=CompletenessReport)
+
+
 class RefactorCounts(FrozenModel):
     must_change: int = 0
     likely_change: int = 0

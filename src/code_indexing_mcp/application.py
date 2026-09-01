@@ -44,6 +44,7 @@ from .models import (
     CodeChunk,
     DeclarationSelector,
     HistoryPage,
+    ImpactRadiusResponse,
     IndexReport,
     IndexTrigger,
     MaintenanceProjectResult,
@@ -1834,6 +1835,60 @@ class Application:
             return self.references.find_references(
                 selector,
                 kinds=kinds,
+                limit=limit,
+                cursor=cursor,
+                backfill=report,
+                partition=partition,
+                root=target.project.root,
+            )
+
+    def impact_radius(
+        self,
+        selector: DeclarationSelector,
+        *,
+        max_depth: int = 2,
+        include_likely: bool = False,
+        kinds: set[str] | None = None,
+        max_nodes: int = 500,
+        limit: int = 100,
+        cursor: str | None = None,
+        roots: list[Path] | None = None,
+    ) -> ImpactRadiusResponse:
+        resolved = self._resolve_reference_project(selector, roots)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._impact_radius_for_target(
+                selector,
+                self._primary_target(targets, resolved.id),
+                max_depth=max_depth,
+                include_likely=include_likely,
+                kinds=kinds,
+                max_nodes=max_nodes,
+                limit=limit,
+                cursor=cursor,
+            ),
+        )
+
+    def _impact_radius_for_target(
+        self,
+        selector: DeclarationSelector,
+        target: ActiveIndexTarget,
+        *,
+        max_depth: int,
+        include_likely: bool,
+        kinds: set[str] | None,
+        max_nodes: int,
+        limit: int,
+        cursor: str | None,
+    ) -> ImpactRadiusResponse:
+        selector, report, partition = self._prepare_reference_query(selector, target)
+        with self.store.partition_access(report.project_id, partition_id=partition.partition_id):
+            return self.references.impact_radius(
+                selector,
+                max_depth=max_depth,
+                include_likely=include_likely,
+                kinds=kinds,
+                max_nodes=max_nodes,
                 limit=limit,
                 cursor=cursor,
                 backfill=report,

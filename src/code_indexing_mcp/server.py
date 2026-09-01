@@ -32,6 +32,7 @@ from .models import (
     CodeChunk,
     DeclarationSelector,
     HistoryPage,
+    ImpactRadiusResponse,
     IndexReport,
     IndexTrigger,
     LanguageName,
@@ -60,8 +61,9 @@ SERVER_INSTRUCTIONS = (
     "Local Tree-sitter code indexing and hybrid search. "
     "When exploring code, prefer these index tools over grep-style file reading: "
     "search_code (semantic natural-language queries), find_symbol (definitions), "
-    "find_references (structural uses of a selected declaration), analyze_refactor "
-    "(rename or signature impact), file_outline (file structure before reading), "
+    "find_references (structural uses of a selected declaration), impact_radius "
+    "(transitive dependents), analyze_refactor (rename or signature impact), file_outline "
+    "(file structure before reading), "
     "get_chunk (exact code for a "
     "search hit). When correlating code across explicitly related services, use list_projects "
     "to discover them and search_across_projects to search the selected repositories together. "
@@ -1454,6 +1456,66 @@ def create_server(
             app.find_references,
             selector,
             kinds=set[str](kinds) if kinds else None,
+            limit=limit,
+            cursor=cursor,
+            roots=roots,
+        )
+
+    @mcp.tool(
+        title="Find transitive impact radius",
+        description=(
+            "Find the bounded transitive dependents of one structural declaration, grouped into "
+            "layers by hop depth. Exact edges are traversed by default; include_likely also "
+            "traverses possible edges and taints every downstream result reached through one. "
+            "Unresolved or unattributable uses stay in review rather than becoming graph edges. "
+            "The traversal is pinned to one structural snapshot, deduplicates cycles, and reports "
+            "node-budget exhaustion explicitly. Always inspect completeness and limitations "
+            "before treating the radius as exhaustive."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def impact_radius(
+        ctx: ServerContext,
+        selector: Annotated[
+            DeclarationSelector,
+            Field(description="Declaration selected by chunk id or stable source location."),
+        ],
+        max_depth: Annotated[
+            int, Field(ge=1, le=10, description="Maximum dependency hops to traverse.")
+        ] = 2,
+        include_likely: Annotated[
+            bool,
+            Field(description="Traverse likely edges as possible and taint their descendants."),
+        ] = False,
+        kinds: Annotated[
+            list[ReferenceKind] | None,
+            Field(description="Optional reference kinds to keep at every hop."),
+        ] = None,
+        max_nodes: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=2000,
+                description="Maximum declarations to visit before reporting budget exhaustion.",
+            ),
+        ] = 500,
+        limit: Annotated[
+            int,
+            Field(ge=1, le=500, description="Maximum edges and review findings per page."),
+        ] = 100,
+        cursor: Annotated[
+            str | None, Field(description="Opaque impact-radius page cursor.")
+        ] = None,
+    ) -> ImpactRadiusResponse:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(
+            app.impact_radius,
+            selector,
+            max_depth=max_depth,
+            include_likely=include_likely,
+            kinds=set[str](kinds) if kinds else None,
+            max_nodes=max_nodes,
             limit=limit,
             cursor=cursor,
             roots=roots,
