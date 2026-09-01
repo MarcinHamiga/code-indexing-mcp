@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from conftest import run_git
@@ -152,6 +152,24 @@ def test_subdirectory_root_reports_prefix_and_resolves_relative_directories(
     assert state.untracked_paths == ("inner.py",)
 
 
+def test_case_insensitive_subdirectory_alias_keeps_git_identity(
+    tmp_path: Path, case_insensitive_path_alias: Callable[[Path], Path]
+) -> None:
+    root = _repo(tmp_path, "repo")
+    project_root = root / "source"
+    project_root.mkdir()
+    alias = case_insensitive_path_alias(project_root)
+
+    canonical = probe_git_state(project_root)
+    from_alias = probe_git_state(alias)
+
+    assert from_alias.probe is GitProbeOutcome.GIT
+    assert from_alias.repository_identity == canonical.repository_identity
+    assert from_alias.checkout_identity == canonical.checkout_identity
+    assert from_alias.project_prefix == canonical.project_prefix == "source"
+    assert slot_id("project", from_alias) == slot_id("project", canonical)
+
+
 def test_subdirectory_status_does_not_match_a_similarly_prefixed_path(
     tmp_path: Path,
 ) -> None:
@@ -170,7 +188,7 @@ def test_git_probe_rejects_a_toplevel_outside_the_registered_root(tmp_path: Path
     root = _repo(tmp_path, "repo")
     outside = tmp_path / "outside"
     outside.mkdir()
-    identities = "\n".join([str(root / ".git"), str(root / ".git"), str(outside)])
+    identities = _identity_output(root / ".git", root / ".git", outside)
     runner = _scripted({_IDENTITIES: GitCommandResult(returncode=0, stdout=identities)})
 
     state = probe_git_state(root, runner=runner)
@@ -238,10 +256,21 @@ def test_slow_git_is_reported_as_a_timeout(tmp_path: Path) -> None:
     assert state.selector_kind is SelectorKind.WORKSPACE
 
 
-_IDENTITIES = ("git", "rev-parse", "--git-common-dir", "--git-dir", "--show-toplevel")
+_IDENTITIES = (
+    "git",
+    "rev-parse",
+    "--git-common-dir",
+    "--git-dir",
+    "--show-toplevel",
+    "--show-prefix",
+)
 _HEAD = ("git", "rev-parse", "HEAD")
 _SYMBOLIC_REF = ("git", "symbolic-ref", "-q", "HEAD")
 _STATUS = ("git", "status", "--porcelain=v1", "-z", "--untracked-files=all")
+
+
+def _identity_output(common: Path, git_dir: Path, toplevel: Path, prefix: str = "") -> str:
+    return "\n".join([str(common), str(git_dir), str(toplevel), prefix, ""])
 
 
 def test_malformed_identity_output_is_invalid(tmp_path: Path) -> None:
@@ -264,7 +293,7 @@ def test_git_directory_without_a_repository_is_not_git(tmp_path: Path) -> None:
 
 def test_damaged_head_metadata_is_invalid(tmp_path: Path) -> None:
     root = _repo(tmp_path, "repo")
-    identities = "\n".join([str(root / ".git"), str(root / ".git"), str(root)])
+    identities = _identity_output(root / ".git", root / ".git", root)
     runner = _scripted(
         {
             _IDENTITIES: GitCommandResult(returncode=0, stdout=identities),
@@ -280,7 +309,7 @@ def test_damaged_head_metadata_is_invalid(tmp_path: Path) -> None:
 
 def test_status_failure_leaves_the_probe_usable(tmp_path: Path) -> None:
     root = _repo(tmp_path, "repo")
-    identities = "\n".join([str(root / ".git"), str(root / ".git"), str(root)])
+    identities = _identity_output(root / ".git", root / ".git", root)
     runner = _scripted(
         {
             _IDENTITIES: GitCommandResult(returncode=0, stdout=identities),

@@ -133,7 +133,15 @@ def probe_git_state(
     resolved = root.resolve()
     try:
         identities = run(
-            ["git", "rev-parse", "--git-common-dir", "--git-dir", "--show-toplevel"], root
+            [
+                "git",
+                "rev-parse",
+                "--git-common-dir",
+                "--git-dir",
+                "--show-toplevel",
+                "--show-prefix",
+            ],
+            root,
         )
     except GitTimeout:
         return _fallback_state(root, GitProbeOutcome.TIMEOUT)
@@ -142,17 +150,19 @@ def probe_git_state(
     if identities.returncode != 0:
         return _fallback_state(root, GitProbeOutcome.NOT_GIT)
     lines = [line.strip() for line in identities.stdout.splitlines()]
-    if len(lines) != 3 or not all(lines):
+    if len(lines) != 4 or not all(lines[:3]):
         return _fallback_state(root, GitProbeOutcome.INVALID)
-    common = _resolve_query_directory(lines[0], root)
-    git_dir = _resolve_query_directory(lines[1], root)
     toplevel = Path(lines[2])
     if not toplevel.is_absolute():
         return _fallback_state(root, GitProbeOutcome.INVALID)
+    toplevel = toplevel.resolve()
     try:
-        project_prefix = _project_prefix(resolved, toplevel.resolve())
+        project_prefix = _project_prefix(resolved, toplevel, lines[3])
     except ValueError:
         return _fallback_state(root, GitProbeOutcome.INVALID)
+    query_root = toplevel / Path(project_prefix)
+    common = _resolve_query_directory(lines[0], query_root)
+    git_dir = _resolve_query_directory(lines[1], query_root)
 
     try:
         symbolic = run(["git", "symbolic-ref", "-q", "HEAD"], root)
@@ -196,7 +206,7 @@ def probe_git_state(
         head_oid=head_oid,
         repository_identity=str(common),
         checkout_identity=str(git_dir),
-        toplevel=str(toplevel.resolve()),
+        toplevel=str(toplevel),
         project_prefix=project_prefix,
         worktree=worktree,
         dirty_paths=dirty,
@@ -313,14 +323,17 @@ def _resolve_query_directory(value: str, root: Path) -> Path:
     return path.resolve()
 
 
-def _project_prefix(root: Path, toplevel: Path) -> str:
-    relative = os.path.relpath(root, toplevel)
-    parts = Path(relative).parts
-    if relative == ".":
-        return ""
-    if parts and parts[0] == "..":
-        raise ValueError(f"{root} is outside the worktree {toplevel}")
-    return Path(relative).as_posix()
+def _project_prefix(root: Path, toplevel: Path, value: str) -> str:
+    relative = Path(value.removesuffix("/"))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"invalid Git project prefix: {value!r}")
+    project_root = (toplevel / relative).resolve()
+    try:
+        if not project_root.samefile(root):
+            raise ValueError(f"{root} is outside the worktree {toplevel}")
+    except OSError as exc:
+        raise ValueError(f"cannot verify Git project root {root}") from exc
+    return relative.as_posix() if value else ""
 
 
 def _looks_like_oid(value: str) -> bool:
