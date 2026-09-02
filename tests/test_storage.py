@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import stat
 import threading
 import time
 from collections.abc import Callable
@@ -2735,6 +2737,22 @@ def _git_repo(tmp_path: Path, name: str) -> Path:
     return root
 
 
+def _remove_repo(root: Path) -> None:
+    """Delete a git checkout, including its read-only object files.
+
+    Git writes `.git/objects` files read-only, which Windows' rmtree refuses
+    to remove; chmod them writable and retry the failed operation.
+    """
+
+    def _writable_retry(
+        function: Callable[[str], object], target: str, _error: BaseException
+    ) -> None:
+        os.chmod(target, stat.S_IWRITE)
+        function(target)
+
+    shutil.rmtree(root, onexc=_writable_retry)
+
+
 def test_active_pointers_are_per_checkout_of_one_project(tmp_path: Path) -> None:
     """Two checkouts of one shared registration keep two active slots at once."""
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
@@ -2869,7 +2887,7 @@ def test_upsert_project_accepts_a_move_once_the_old_root_is_gone(tmp_path: Path)
     project = initialize_project(root)
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
     store.upsert_project(project, model_id="test/model")
-    shutil.rmtree(root)
+    _remove_repo(root)
 
     new_root = tmp_path / "moved"
     new_root.mkdir()

@@ -512,7 +512,9 @@ def test_scan_paths_classifies_exactly_the_listed_candidates(tmp_path: Path) -> 
             )
         }
     )
-    (root / "ok.py").write_text("v = 1\n")
+    # Bytes, not text: write_text would translate the newline to CRLF on
+    # Windows and the size assertion below is about bytes on disk.
+    (root / "ok.py").write_bytes(b"v = 1\n")
     (root / "large.py").write_text("0123456789")
     (root / "notes.md").write_text("not source\n")
     (root / "excluded.py").write_text("value = 2\n")
@@ -538,7 +540,7 @@ def test_scan_paths_classifies_exactly_the_listed_candidates(tmp_path: Path) -> 
     assert set(by_path) == {"ok.py", "large.py", "notes.md", "excluded.py", "link.py"}
     ok = by_path["ok.py"]
     assert isinstance(ok, ScannedFile)
-    assert ok.size == len("v = 1\n")
+    assert ok.size == len(b"v = 1\n")
     assert ok.mtime_ns == (root / "ok.py").stat().st_mtime_ns
     assert ok.content is None
     assert by_path["large.py"].reason == "oversized"

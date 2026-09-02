@@ -568,6 +568,7 @@ def test_a_dispatch_failure_reaches_the_client_as_internal_error(
         thread.join(timeout=2)
 
 
+@requires_local_sockets
 def test_a_daemon_killed_mid_request_reaches_the_client_as_daemon_unavailable(
     tmp_path: Path,
 ) -> None:
