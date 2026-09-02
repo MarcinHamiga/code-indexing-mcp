@@ -98,6 +98,89 @@ def run_git(command: Sequence[str], cwd: Path) -> GitCommandResult:
     )
 
 
+def checkout_head(directory: Path) -> str | None:
+    """Return the checked-out revision of *directory*, reading files first.
+
+    ``git rev-parse`` is the last resort only: the update-check serve path
+    this feeds has to cost microseconds, and the plain-file layout covers
+    every case a managed install can be in.
+
+    Moved here from ``update_check.py`` (D3 in
+    docs/plans/2026-09-02-review-remediation-5-application-split-plan.md):
+    reading ``.git`` directly is Git state, not an update-check concern.
+    ``update_check.py`` imports it back so ``update_check.checkout_head(...)``
+    keeps working for ``cli.py``, ``daemon.py``, and ``benchmark.py``.
+    """
+    try:
+        git_directory = _git_directory(directory)
+        if git_directory is None:
+            return None
+        head = (git_directory / "HEAD").read_text(encoding="utf-8").strip()
+        if not head.startswith("ref:"):
+            return head or None
+        reference = head[len("ref:") :].strip()
+        sha = _reference_sha(git_directory, reference)
+        if sha is not None:
+            return sha
+        return _rev_parse(directory)
+    except (OSError, ValueError):
+        return None
+
+
+def _git_directory(directory: Path) -> Path | None:
+    candidate = directory / ".git"
+    if candidate.is_dir():
+        return candidate
+    if not candidate.is_file():
+        return None
+    content = candidate.read_text(encoding="utf-8").strip()
+    if not content.startswith("gitdir:"):
+        return None
+    target = Path(content[len("gitdir:") :].strip())
+    return target if target.is_absolute() else directory / target
+
+
+def _reference_sha(git_directory: Path, reference: str) -> str | None:
+    try:
+        return (git_directory / reference).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        pass
+    try:
+        packed = (git_directory / "packed-refs").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in packed.splitlines():
+        if line.startswith(("#", "^")):
+            continue
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == reference:
+            return parts[0]
+    return None
+
+
+def _rev_parse(directory: Path) -> str | None:
+    """Last-resort revision lookup when ``.git``'s ref files did not resolve one.
+
+    Calls ``subprocess.run`` directly rather than this module's own
+    ``run_git``: ``run_git`` never raises on a non-zero exit and never applies
+    ``GIT_OPTIONAL_LOCKS``-style environment overrides, which would change what
+    a failing ``rev-parse`` reports here. This mirrors the exact subprocess
+    call ``update_check._rev_parse`` used before the move.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout.strip() or None
+
+
 class GitState(FrozenModel):
     """Immutable snapshot of one registered root's Git state."""
 
@@ -296,6 +379,81 @@ def changed_paths_between(
         if relative is not None:
             changed.add(relative)
     return frozenset(changed)
+
+
+def head_snapshot(state: GitState) -> tuple[SelectorKind, str, str | None] | None:
+    """Read a resolved target's current selector and HEAD without spawning Git.
+
+    Used to detect a mid-request repository move (a checkout or a commit)
+    after an operation runs, in place of a second full ``probe_git_state``
+    call. Reads exactly the files Git itself would consult: the checkout's
+    ``HEAD`` file, then the referenced loose ref (checkout-local, then the
+    common directory for a linked worktree), then ``packed-refs``. Any read
+    failure, unparseable content, or an unresolvable selector returns
+    ``None`` so the caller falls back to a full probe rather than risk acting
+    on a wrong answer; an attached branch with no commit yet (an unborn
+    branch) is not a failure and comes back with a ``None`` head OID, exactly
+    as :func:`probe_git_state` reports it.
+    """
+    if state.checkout_identity is None:
+        return None
+    checkout = Path(state.checkout_identity)
+    try:
+        content = (checkout / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if content.startswith("ref:"):
+        ref = content.removeprefix("ref:").strip()
+        if not ref.startswith("refs/"):
+            return None
+        oid = _resolve_ref(checkout, state.repository_identity, ref)
+        return (SelectorKind.REF, ref, oid)
+    if _looks_like_oid(content):
+        return (SelectorKind.COMMIT, content, content)
+    return None
+
+
+def _resolve_ref(checkout: Path, repository_identity: str | None, ref: str) -> str | None:
+    """Resolve one ref name to an OID via a loose file, then packed-refs.
+
+    Mirrors where Git itself looks: the checkout-local ref first (relevant
+    only for a linked worktree, which can carry its own per-worktree refs),
+    then the shared common directory's loose ref, then its ``packed-refs``.
+    Returns ``None`` when the ref names nothing yet -- an unborn branch --
+    which is not an error.
+    """
+    oid = _read_loose_ref(checkout / ref)
+    if oid is not None:
+        return oid
+    if repository_identity is None:
+        return None
+    common = Path(repository_identity)
+    oid = _read_loose_ref(common / ref)
+    if oid is not None:
+        return oid
+    return _read_packed_ref(common, ref)
+
+
+def _read_loose_ref(path: Path) -> str | None:
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return content if _looks_like_oid(content) else None
+
+
+def _read_packed_ref(common: Path, ref: str) -> str | None:
+    try:
+        content = (common / "packed-refs").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in content.splitlines():
+        if not line or line[0] in "#^":
+            continue
+        oid, _, name = line.partition(" ")
+        if name == ref and _looks_like_oid(oid):
+            return oid
+    return None
 
 
 def _fallback_state(root: Path, outcome: GitProbeOutcome) -> GitState:

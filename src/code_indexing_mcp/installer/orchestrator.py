@@ -53,6 +53,11 @@ class InstallResult:
     launcher: LauncherResult | None = None
     profiles_updated: tuple[Path, ...] = ()
     checks: tuple[verify.Check, ...] = ()
+    # The env updates actually applied to the configured harnesses, accelerator
+    # additions included -- exposed so a caller (D6: `configure`) can tell
+    # whether a daemon-consumed setting changed without recomputing the
+    # accelerator merge itself.
+    env_written: Mapping[str, str | None] = field(default_factory=dict)
 
     @property
     def warnings(self) -> tuple[verify.Check, ...]:
@@ -161,6 +166,7 @@ def run_install(
         launcher=launcher,
         profiles_updated=profiles_updated,
         checks=checks,
+        env_written=env_updates,
     )
 
 

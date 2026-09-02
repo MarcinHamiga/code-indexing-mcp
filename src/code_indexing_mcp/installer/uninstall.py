@@ -68,6 +68,12 @@ def data_directories(
 # Files and directories the server itself creates under its data or cache
 # directory. One of these present is what distinguishes "our index lives here"
 # from "the user pointed the setting at a directory that holds other things".
+# ".code-indexing-mcp" is the sentinel `RuntimePaths.ensure_private` (in
+# application.py) writes into both data and cache the moment either is first
+# used -- it is what makes a cache directory recognisable before anything
+# else (models, backend-probes.json) has actually been populated into it.
+# Not imported from application.py: that module pulls in the embedding and
+# vector-store stack, which uninstall has no other reason to load.
 _DATA_MARKERS = (
     "lancedb",
     "locks",
@@ -76,6 +82,7 @@ _DATA_MARKERS = (
     "daemon.token",
     "daemon.log",
     "models",
+    ".code-indexing-mcp",
 )
 
 
@@ -105,8 +112,12 @@ def _refuse_reason(directory: Path, *, checkout: bool, home: Path | None = None)
         if not (resolved / "src" / "code_indexing_mcp").is_dir():
             return "does not look like a code-indexing-mcp checkout (no src/code_indexing_mcp)"
         return None
-    if resolved.name == "code-indexing-mcp":
-        return None
+    # A directory merely named "code-indexing-mcp" is not evidence: a user's
+    # own project can share that name, and `--purge`/`--remove-checkout`
+    # resolve their targets from settings and flags that could point there.
+    # Only actual markers this server writes -- one of _DATA_MARKERS, or the
+    # sentinel every data/cache directory gets from RuntimePaths.ensure_private
+    # -- prove the directory is ours to delete.
     if any((resolved / marker).exists() for marker in _DATA_MARKERS):
         return None
     return "holds no code-indexing-mcp index or cache, so it is not ours to delete"

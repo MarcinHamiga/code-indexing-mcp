@@ -1,5 +1,8 @@
 import shutil
+import stat
+import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -59,6 +62,46 @@ class OtherModelTinyEmbedder:
 
     def embed_query(self, text: str) -> list[float]:
         return [1.0, 0.0, 0.0, float(len(text))]
+
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX file permissions only")
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+@posix_only
+def test_application_creates_private_data_and_cache_directories(tmp_path: Path) -> None:
+    """A fresh CODE_INDEXING_DATA_DIR/CACHE_DIR is created 0700, not at the umask."""
+    data = tmp_path / "data"
+    cache = tmp_path / "cache"
+
+    Application(RuntimePaths(data=data, cache=cache), embedder=TinyEmbedder())
+
+    assert _mode(data) == 0o700
+    assert _mode(cache) == 0o700
+    # The sentinel is what lets the uninstaller recognise an otherwise-empty
+    # cache directory as ours (installer/uninstall.py's _DATA_MARKERS).
+    assert (data / ".code-indexing-mcp").is_file()
+    assert (cache / ".code-indexing-mcp").is_file()
+
+
+@posix_only
+def test_application_tightens_a_preexisting_loose_directory(tmp_path: Path) -> None:
+    """A directory an older release (or the user) left world-readable is narrowed."""
+    data = tmp_path / "data"
+    cache = tmp_path / "cache"
+    data.mkdir()
+    cache.mkdir()
+    # mkdir's mode is filtered by the process umask; set the loose mode directly.
+    data.chmod(0o755)
+    cache.chmod(0o755)
+
+    Application(RuntimePaths(data=data, cache=cache), embedder=TinyEmbedder())
+
+    assert _mode(data) == 0o700
+    assert _mode(cache) == 0o700
 
 
 def test_concurrent_init_project_registers_one_project(tmp_path: Path) -> None:
@@ -269,6 +312,77 @@ def test_search_rejects_a_second_repository_transition(tmp_path: Path) -> None:
         app.search_code("answer", projects=[project.id])
 
     assert excinfo.value.code is ErrorCode.REPOSITORY_CHANGED
+
+
+def test_repository_stable_query_retries_when_head_moves_mid_operation(tmp_path: Path) -> None:
+    """The real ``_target_changed`` (not mocked) must still catch a mid-request move.
+
+    ``_target_changed`` now reads HEAD off disk via ``head_snapshot`` instead
+    of re-running the full probe; this exercises that path end to end by
+    committing from inside the operation callable, the way a concurrent
+    writer would.
+    """
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    original_search_code = app.search.search_code
+    calls: list[int] = []
+
+    def moving_search_code(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            (root / "main.py").write_text("def main_branch():\n    return 2\n")
+            run_git("add", "main.py", cwd=root)
+            run_git(
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "moved",
+                cwd=root,
+            )
+        return original_search_code(*args, **kwargs)
+
+    with patch.object(app.search, "search_code", side_effect=moving_search_code):
+        response = app.search_code("main_branch", projects=[project.id])
+
+    assert len(calls) == 2
+    assert response.query == "main_branch"
+
+
+def test_probe_git_state_runs_once_per_project_when_nothing_moves(tmp_path: Path) -> None:
+    """A normal query resolves once and detects no post-operation move without
+    spawning a second full Git probe -- ``_target_changed`` reads HEAD off disk
+    instead."""
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+
+    from code_indexing_mcp import application as application_module
+
+    original_probe = application_module.probe_git_state
+    calls: list[int] = []
+
+    def counting_probe(*args, **kwargs):
+        calls.append(1)
+        return original_probe(*args, **kwargs)
+
+    with patch("code_indexing_mcp.application.probe_git_state", side_effect=counting_probe):
+        app.search_code("main_branch", projects=[project.id])
+
+    assert len(calls) == 1
 
 
 def test_application_can_ensure_the_structural_index_without_a_semantic_search(
@@ -703,6 +817,50 @@ def test_application_supports_explicit_cross_project_search(tmp_path: Path) -> N
     assert {hit.project_id for hit in all_projects.hits} == set(ids)
 
 
+def test_resolve_active_targets_probes_multiple_projects_in_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A multi-project scope resolves concurrently (D5): each project probes
+    Git and takes its own per-project lock, so there is nothing to serialize
+    on, and the wall-clock cost must not scale with the project count."""
+    from code_indexing_mcp import application as application_module
+
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    infos = []
+    for name in ("c", "a", "b"):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "main.py").write_text(f"def {name}():\n    return True\n")
+        project = app.init_project(root)
+        app.index_project(project.id)
+        infos.append(project)
+
+    real_probe = application_module.probe_git_state
+
+    def slow_probe(*args, **kwargs):
+        time.sleep(0.05)
+        return real_probe(*args, **kwargs)
+
+    monkeypatch.setattr("code_indexing_mcp.application.probe_git_state", slow_probe)
+
+    started = time.monotonic()
+    grouped = app._resolve_active_targets(infos)
+    elapsed = time.monotonic() - started
+
+    # Three probes at 50ms each: comfortably under half the sequential total,
+    # generously under any flakiness this machine might add.
+    assert elapsed < 0.05 * len(infos)
+    # Reassembly is still keyed and ordered exactly as the sequential loop
+    # would have produced: sorted by project id, one checkout per project.
+    assert list(grouped) == sorted(project.id for project in infos)
+    for project in infos:
+        assert [target.project.id for target in grouped[project.id]] == [project.id]
+
+
 def test_duplicate_live_project_marker_is_rejected_but_moved_checkout_is_adopted(
     tmp_path: Path,
 ) -> None:
@@ -881,7 +1039,9 @@ def test_a_backend_that_failed_once_is_not_attempted_again(tmp_path: Path) -> No
     resolved = app.backend_selection
     assert app.effective_backend_selection is resolved
 
-    app._remember_fallback(resolved.fell_back_to(CPU_BACKEND, "the device fell off the bus"))
+    app.backends._remember_fallback(
+        resolved.fell_back_to(CPU_BACKEND, "the device fell off the bus")
+    )
 
     assert app.effective_backend_selection is not resolved
     assert app.effective_backend_selection.accelerator is Accelerator.CPU
@@ -896,7 +1056,7 @@ def test_model_status_reports_a_runtime_fallback_rather_than_the_original_choice
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
 
-    app._remember_fallback(
+    app.backends._remember_fallback(
         app.backend_selection.fell_back_to(CPU_BACKEND, "the accelerator died on load")
     )
 
@@ -951,14 +1111,14 @@ def test_auto_selects_a_prepared_accelerator_this_process_cannot_execute_itself(
 def _measure(app: Application, *, cpu: float, accelerator: float, load_ns: int) -> None:
     """Record the calibration a first run would have left behind."""
     app.probe_cache.store(
-        app._build_probe_key(app.embedder),
+        app.backends._build_probe_key(app.embedder),
         batch_size=8,
         dimension=app.embedder.dimension,
         characters_per_second=accelerator,
         load_ns=load_ns,
     )
     app.probe_cache.store(
-        app._cpu_probe_key(),
+        app.backends._cpu_probe_key(),
         batch_size=1,
         dimension=app.embedder.dimension,
         characters_per_second=cpu,
@@ -1058,7 +1218,7 @@ def test_a_batch_size_a_ceiling_overrun_reduced_is_reported_as_reduced(
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
     app.probe_cache.store(
-        app._build_probe_key(app.embedder),
+        app.backends._build_probe_key(app.embedder),
         batch_size=1,
         dimension=app.embedder.dimension,
         characters_per_second=500.0,
@@ -1080,7 +1240,7 @@ def test_a_prepared_accelerator_runs_in_its_own_interpreter(tmp_path: Path) -> N
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
 
-    launcher = app._accelerator_launcher(app.backend_selection.descriptor)
+    launcher = app.backends._accelerator_launcher(app.backend_selection.descriptor)
 
     assert isinstance(launcher, ExternalInterpreterLauncher)
     assert launcher.executable == interpreter
@@ -1098,7 +1258,9 @@ def test_a_backend_this_process_already_offers_needs_no_second_environment(
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
     in_process = replace(app.backend_selection.descriptor, provider=app.serving_providers[0])
 
-    assert not isinstance(app._accelerator_launcher(in_process), ExternalInterpreterLauncher)
+    assert not isinstance(
+        app.backends._accelerator_launcher(in_process), ExternalInterpreterLauncher
+    )
 
 
 def test_a_refused_record_explains_the_cpu_outcome(tmp_path: Path) -> None:
@@ -1544,7 +1706,10 @@ def test_scheduled_maintenance_is_serialized_across_applications(tmp_path: Path)
     other = Application(app.paths, embedder=TinyEmbedder(), cwd=tmp_path)
     entered = threading.Event()
     release = threading.Event()
-    original = app.maintain_storage
+    # maybe_run_maintenance calls maintain_storage on MaintenanceService, not on
+    # Application (see maintenance.py D2): the patch has to target the
+    # collaborator that actually makes the call, not Application's delegate.
+    original = app.maintenance.maintain_storage
     outcomes: list[object] = []
 
     def slow_maintenance(
@@ -1566,9 +1731,9 @@ def test_scheduled_maintenance_is_serialized_across_applications(tmp_path: Path)
         )
 
     with (
-        patch.object(app, "maintain_storage", side_effect=slow_maintenance),
+        patch.object(app.maintenance, "maintain_storage", side_effect=slow_maintenance),
         patch.object(
-            other,
+            other.maintenance,
             "maintain_storage",
             side_effect=AssertionError("the cadence lock must suppress a duplicate pass"),
         ),
@@ -1918,6 +2083,95 @@ def test_edits_are_detected_on_the_next_status_check(
     assert app.project_status(project.id).state == "ready"
     app.invalidate_freshness(project.id)
     assert app.project_status(project.id).state == "stale"
+
+
+def test_dirty_worktree_freshness_uses_only_the_changed_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dirty-worktree fast path (D2/D3) answers from a stat of only the
+    paths that could have changed -- ``iter_scan`` (the whole-tree walk) is
+    never called -- while still catching every genuine change: a further
+    edit to the already-dirty file, a revert back to HEAD (which needs the
+    *stored* dirty-path list, not just today's status, since the revert
+    makes the path disappear from ``git status`` entirely), and a brand-new
+    untracked file.
+    """
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    assert app.project_status(project.id).state == "ready"
+    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 0.0)
+    scans = _counted_scanner_scans(app, monkeypatch)
+
+    # (a) Dirty one file and re-index it; a same-fingerprint status check
+    # afterwards resolves from the dirty-path subset alone. (Indexing itself
+    # scans, so the counter is reset after it -- only the status check that
+    # follows is under test.)
+    (root / "main.py").write_text("def main_branch():\n    return 22\n")
+    app.index_project(project.id)
+    scans[0] = 0
+
+    assert app.project_status(project.id).state == "ready"
+    assert scans[0] == 0
+
+    # (b) Editing the still-dirty file again keeps the same status
+    # fingerprint (the same path is dirty either way) and must still be
+    # caught stale.
+    (root / "main.py").write_text("def main_branch():\n    return 333\n")
+    assert app.project_status(project.id).state == "stale"
+    assert scans[0] == 0
+
+    # (c) Reverting the file back to HEAD changes the status fingerprint (the
+    # dirty path vanishes from `git status`); only the *stored* dirty-path
+    # list -- not today's now-empty dirty set -- can catch this.
+    run_git("checkout", "-q", "--", "main.py", cwd=root)
+    assert app.project_status(project.id).state == "stale"
+    assert scans[0] == 0
+
+    # Re-index to a known-clean baseline before the untracked-file case.
+    app.index_project(project.id)
+    scans[0] = 0
+    assert app.project_status(project.id).state == "ready"
+    assert scans[0] == 0
+
+    # (d) A brand-new untracked file is never in the index and must be caught.
+    (root / "extra.py").write_text("def extra():\n    return 4\n")
+    assert app.project_status(project.id).state == "stale"
+    assert scans[0] == 0
+
+
+def test_a_slot_without_a_stored_fingerprint_takes_the_full_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slot registered before this track (no stored status fingerprint) must
+    keep working correctly -- it simply pays for a full scan until the next
+    index run stamps one."""
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 0.0)
+    scans = _counted_scanner_scans(app, monkeypatch)
+    slot_id = app.project_status(project.id).active_slot_id
+    slot = app.store.get_slot(slot_id)
+    assert slot is not None
+    app.store.upsert_slot(
+        slot.model_copy(update={"indexed_status_fingerprint": None, "indexed_status_paths": None})
+    )
+
+    (root / "main.py").write_text("def main_branch():\n    return two()\n")
+
+    assert app.project_status(project.id).state == "stale"
+    assert scans[0] == 1
 
 
 def test_inspect_scan_paginates_and_filters(tmp_path: Path) -> None:

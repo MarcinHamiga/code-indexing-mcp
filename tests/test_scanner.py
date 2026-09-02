@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 from pathspec import GitIgnoreSpec
 
-from code_indexing_mcp.models import DEFAULT_INCLUDES, ScanConfig
+from code_indexing_mcp.models import DEFAULT_INCLUDES, ScanConfig, ScannedFile
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import LANGUAGES, SourceScanner, _GitEnumerationError
 
@@ -494,6 +494,69 @@ def test_scanner_rejects_oversized_and_symlink_files_without_reading(tmp_path: P
     assert "encoding" not in reasons
     # binary.py is 3 bytes, so it now passes the stat-only scan.
     assert {item.path.as_posix() for item in result.files} == {"binary.py"}
+
+
+def test_scan_paths_classifies_exactly_the_listed_candidates(tmp_path: Path) -> None:
+    """scan_paths answers the freshness fast path: stat only the named paths.
+
+    Mirrors what iter_scan would report for each of these paths individually,
+    without walking the rest of the tree.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    project = project.model_copy(
+        update={
+            "scan": project.scan.model_copy(
+                update={"max_file_bytes": 9, "exclude": ["excluded.py"]}
+            )
+        }
+    )
+    # Bytes, not text: write_text would translate the newline to CRLF on
+    # Windows and the size assertion below is about bytes on disk.
+    (root / "ok.py").write_bytes(b"v = 1\n")
+    (root / "large.py").write_text("0123456789")
+    (root / "notes.md").write_text("not source\n")
+    (root / "excluded.py").write_text("value = 2\n")
+    target = tmp_path / "target.py"
+    target.write_text("x = 1\n")
+    (root / "link.py").symlink_to(target)
+
+    results = list(
+        SourceScanner().scan_paths(
+            project,
+            [
+                "ok.py",
+                "large.py",
+                "notes.md",
+                "excluded.py",
+                "link.py",
+                "missing.py",
+            ],
+        )
+    )
+
+    by_path = {item.path.as_posix(): item for item in results}
+    assert set(by_path) == {"ok.py", "large.py", "notes.md", "excluded.py", "link.py"}
+    ok = by_path["ok.py"]
+    assert isinstance(ok, ScannedFile)
+    assert ok.size == len(b"v = 1\n")
+    assert ok.mtime_ns == (root / "ok.py").stat().st_mtime_ns
+    assert ok.content is None
+    assert by_path["large.py"].reason == "oversized"
+    assert by_path["notes.md"].reason == "unsupported"
+    assert by_path["excluded.py"].reason == "ignored"
+    assert by_path["link.py"].reason == "symlink"
+
+
+def test_scan_paths_yields_nothing_for_a_missing_path(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+
+    results = list(SourceScanner().scan_paths(project, ["does-not-exist.py"]))
+
+    assert results == []
 
 
 def test_scanner_does_not_read_file_contents(

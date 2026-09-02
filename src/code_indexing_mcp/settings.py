@@ -166,6 +166,12 @@ class IndexSettings:
     # evicts the least recently used. Protection of the active, indexing, or
     # recovery-pending slots can exceed it temporarily.
     branch_cache_limit: int = 4
+    # When true, the embedder never reaches out to fetch model files, using
+    # only what is already cached. Moved here from a direct `os.environ` read
+    # in `Application.__init__` (D5 in
+    # docs/plans/2026-09-02-review-remediation-5-application-split-plan.md) so
+    # every indexing-affecting environment variable is read in one place.
+    offline: bool = False
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> IndexSettings:
@@ -262,4 +268,9 @@ class IndexSettings:
                 MAX_VERSION_RETENTION_HOURS,
             ),
             branch_cache_limit=_integer(environment, "CODE_INDEXING_BRANCH_CACHE_LIMIT", 4, 1, 32),
+            # Deliberately lenient, unlike `_boolean`: any value other than
+            # "1"/"true"/"yes" (including "0", "off", or unset) reads as
+            # False rather than raising, matching the check this replaces
+            # (`Application.__init__` read `CODE_INDEXING_OFFLINE` directly).
+            offline=environment.get("CODE_INDEXING_OFFLINE", "").lower() in {"1", "true", "yes"},
         )

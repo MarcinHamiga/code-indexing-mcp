@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import stat
 import threading
 import time
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import lancedb
@@ -16,6 +19,7 @@ import pytest
 from conftest import run_git
 from lancedb.expr import Expr
 from lancedb.merge import LanceMergeInsertBuilder
+from lancedb.query import LanceHybridQueryBuilder
 from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
@@ -442,7 +446,115 @@ def test_reference_indexes_cover_every_exact_filter(tmp_path: Path) -> None:
         "kind",
         "source_qualified_symbol",
         "schema_version",
+        # written_name/receiver_text back the reference-pushdown superset
+        # condition's `= S` terms (D1/D6 of the reference-pushdown plan).
+        "written_name",
+        "receiver_text",
     } <= indexed_columns
+
+
+def test_list_reference_records_kinds_and_extra_condition_push_down_like_and_in(
+    tmp_path: Path,
+) -> None:
+    """`kinds` and `extra_condition` (D1/D2) narrow the same way as `record_kinds`.
+
+    Also a probe that DataFusion accepts `LIKE` and `IN` in a LanceDB `where`
+    on the references table: both already work elsewhere in this module
+    (`find_symbol_chunks`'s `LIKE`, `declarations_for_files`'s `IN`), but the
+    reference-pushdown candidate condition (D1) is the first caller to use
+    them together against `written_name`/`receiver_text`, so this pins it
+    directly rather than relying on those other tests to catch a regression.
+    """
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    record = stored_file(project.id)
+    coverage = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="coverage",
+        record_kind="coverage",
+        kind=None,
+        source_qualified_symbol=None,
+        written_name=None,
+        target_name=None,
+        shape_json=None,
+    )
+    imported = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="import",
+        kind="import",
+        module_path="package",
+        target_name="answer",
+        written_name="answer",
+    )
+    exported = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="export",
+        kind="export",
+        module_path="package",
+        target_name="answer",
+        written_name="answer",
+    )
+    call_by_name = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="call-by-name",
+        kind="call",
+        target_name="answer",
+        written_name="answer",
+    )
+    call_by_receiver = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="call-by-receiver",
+        kind="call",
+        target_name="other.answer",
+        written_name="other.answer",
+        receiver_text="answer",
+    )
+    unrelated_call = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="unrelated-call",
+        kind="call",
+        target_name="unrelated",
+        written_name="unrelated",
+    )
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_batches=(),
+        reference_batches=[
+            (
+                ["file-1"],
+                reference_table(
+                    coverage, imported, exported, call_by_name, call_by_receiver, unrelated_call
+                ),
+            )
+        ],
+    )
+
+    # `kinds` filters the `kind` column independently of `record_kinds`.
+    assert store.list_reference_records(
+        project.id, record_kinds=("reference",), kinds=("import", "export")
+    ) == [exported, imported]
+    assert store.list_reference_records(project.id, kinds=()) == []
+
+    # `extra_condition` is ANDed in verbatim, exercising both LIKE and IN
+    # against written_name/receiver_text -- the D1 candidate condition shape.
+    condition = (
+        "target_name = 'answer' OR written_name = 'answer' "
+        "OR target_name LIKE '%.answer' OR written_name LIKE '%.answer' "
+        "OR receiver_text IN ('answer') OR written_name IN ('answer')"
+    )
+    assert store.list_reference_records(
+        project.id, record_kinds=("reference",), extra_condition=condition
+    ) == [call_by_name, call_by_receiver, exported, imported]
 
 
 def test_v1_store_is_backed_up_and_registered_for_lazy_rebuild(tmp_path: Path) -> None:
@@ -634,6 +746,106 @@ def test_hybrid_search_spans_content_and_identifier_terms(tmp_path: Path) -> Non
     # miss would leave the FTS-matched chunk behind. It must rank first.
     assert terms_hit[0]["chunk_id"] == chunk_terms_only.chunk_id
     assert content_hit[0]["chunk_id"] == chunk_content_only.chunk_id
+
+
+def _seed_hybrid_target(store: LanceStore, root: Path) -> ProjectInfo:
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id).model_dump()], schema=LanceStore.file_arrow_schema()
+        ),
+        chunk_batches=[(["file-1"], _chunk_table(project.id, "file-1", 2))],
+    )
+    store.ensure_indexes(project.id)
+    return project
+
+
+def test_hybrid_query_vector_knobs_follow_the_index_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hybrid query must ask the vector index for the accuracy it owes.
+
+    In exact mode it bypasses the vector index entirely. In hnsw mode it must
+    issue the measured ef and refine_factor: queried with defaults, the
+    quantised index loses ~13% of recall@10 against an exact scan, and
+    ef=100 + refine_factor=2 restores 0.999 (see
+    docs/plans/2026-09-02-vector-index-gate-shipped.md).
+    """
+    calls: list[tuple[str, tuple[float, ...]]] = []
+    for knob in ("bypass_vector_index", "ef", "refine_factor"):
+        original = getattr(LanceHybridQueryBuilder, knob)
+
+        def spy(
+            builder: LanceHybridQueryBuilder,
+            *args: float,
+            _original: object = original,
+            _knob: str = knob,
+            **kwargs: float,
+        ) -> object:
+            calls.append((_knob, args))
+            return cast(Any, _original)(builder, *args, **kwargs)
+
+        monkeypatch.setattr(LanceHybridQueryBuilder, knob, spy)
+
+    exact = LanceStore(tmp_path / "exact", vector_dimension=4)
+    exact_project = _seed_hybrid_target(exact, tmp_path / "repo")
+    exact.hybrid_search("pass", [1.0, 0.0, 0.0, 0.0], [exact_project.id], None, 5)
+    assert ("bypass_vector_index", ()) in calls
+    assert [name for name, _ in calls if name != "bypass_vector_index"] == []
+
+    hnsw = LanceStore(tmp_path / "hnsw", vector_dimension=4, vector_index="hnsw")
+    hnsw_project = _seed_hybrid_target(hnsw, tmp_path / "hnsw-repo")
+    calls.clear()
+    hnsw.hybrid_search("pass", [1.0, 0.0, 0.0, 0.0], [hnsw_project.id], None, 5)
+    assert ("ef", (storage_module.VECTOR_INDEX_EF,)) in calls
+    assert ("refine_factor", (storage_module.VECTOR_INDEX_REFINE_FACTOR,)) in calls
+    assert ("bypass_vector_index", ()) not in calls
+
+
+def test_vector_index_gate_reads_vector_index_min_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ensure_indexes builds the approximate vector index only in hnsw mode
+    and only at or above VECTOR_INDEX_MIN_ROWS."""
+    hnsw = LanceStore(tmp_path / "hnsw", vector_dimension=4, vector_index="hnsw")
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    hnsw.upsert_project(project, model_id="test/model")
+    hnsw.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id).model_dump()], schema=LanceStore.file_arrow_schema()
+        ),
+        chunk_batches=[(["file-1"], _chunk_table(project.id, "file-1", 2))],
+    )
+
+    # Below the gate: no vector index is created.
+    hnsw.ensure_indexes(project.id)
+    tables = hnsw._existing_tables(project.id)
+    assert tables is not None
+    assert not any("vector" in index.columns for index in tables.chunks.list_indices())
+
+    # At the gate: the index is created (count_rows is the only caller in
+    # ensure_indexes' vector branch; patching the table class fakes the size).
+    monkeypatch.setattr(LanceTable, "count_rows", lambda self: storage_module.VECTOR_INDEX_MIN_ROWS)
+    hnsw.ensure_indexes(project.id)
+    assert any("vector" in index.columns for index in tables.chunks.list_indices())
+    # And the query path runs end to end through the built index with the
+    # accuracy knobs rather than only on the flat fallback.
+    hits = hnsw.hybrid_search("pass", [1.0, 0.0, 0.0, 0.0], [project.id], None, 5)
+    assert hits
+
+    # Exact mode never builds one, whatever the size.
+    exact = LanceStore(tmp_path / "exact", vector_dimension=4)
+    exact.upsert_project(project, model_id="test/model")
+    exact.ensure_indexes(project.id)
+    exact_tables = exact._existing_tables(project.id)
+    assert exact_tables is not None
+    assert not any("vector" in index.columns for index in exact_tables.chunks.list_indices())
 
 
 def test_maintenance_keeps_versions_inside_the_retention_window(tmp_path: Path) -> None:
@@ -2117,6 +2329,36 @@ def test_slot_registry_round_trip_is_idempotent(tmp_path: Path) -> None:
     assert store.get_slot("missing") is None
 
 
+def test_slot_round_trips_the_status_fingerprint_and_paths(tmp_path: Path) -> None:
+    """A slot written with a git status fingerprint keeps both new columns."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    slot = _slot("project-a", "slot-a").model_copy(
+        update={
+            "indexed_status_fingerprint": "abc123",
+            "indexed_status_paths": json.dumps(["a.py", "b.py"], separators=(",", ":")),
+        }
+    )
+
+    store.upsert_slot(slot)
+
+    reread = store.get_slot("slot-a")
+    assert reread is not None
+    assert reread.indexed_status_fingerprint == "abc123"
+    assert reread.indexed_status_paths == json.dumps(["a.py", "b.py"], separators=(",", ":"))
+
+
+def test_encode_status_paths_falls_back_to_none_past_the_cap(tmp_path: Path) -> None:
+    """A changeset too large to store cheaply drops the path list, not the fingerprint."""
+    small = storage_module.encode_status_paths(["b.py", "a.py"])
+    assert small == json.dumps(["a.py", "b.py"], separators=(",", ":"))
+    assert storage_module.decode_status_paths(small) == frozenset({"a.py", "b.py"})
+
+    huge = [f"file{i}.py" for i in range(storage_module.MAX_PERSISTED_STATUS_PATHS + 1)]
+    assert storage_module.encode_status_paths(huge) is None
+    assert storage_module.decode_status_paths(None) is None
+    assert storage_module.decode_status_paths("not json") is None
+
+
 def test_activate_slot_publishes_the_pointer_only_after_the_row_exists(tmp_path: Path) -> None:
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
 
@@ -2387,6 +2629,104 @@ def test_branch_cache_limit_evicts_the_oldest_inactive_slot(tmp_path: Path) -> N
     assert store.active_slot("project-a").slot_id == "slot-a"
 
 
+def test_touch_slot_buffers_without_writing(tmp_path: Path) -> None:
+    """touch_slot must not bump the registry table version on every call (D6)."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a"))
+    version = store._project_slots.version
+
+    store.touch_slot("slot-a")
+    store.touch_slot("slot-a")
+    store.touch_slot("slot-a")
+
+    assert store._project_slots.version == version
+    # A reader still sees the buffered timestamp even though nothing was
+    # written yet.
+    slot = store.get_slot("slot-a")
+    assert slot is not None
+    assert slot.last_used_at > 1
+
+
+def test_flush_slot_touches_writes_one_version(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a", partition_id="partition-a"))
+    store.upsert_slot(_slot("project-a", "slot-b", partition_id="partition-b"))
+    version = store._project_slots.version
+
+    store.touch_slot("slot-a")
+    store.touch_slot("slot-b")
+    store.flush_slot_touches()
+
+    assert store._project_slots.version == version + 1
+    reopened = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    slot_a = reopened.get_slot("slot-a")
+    slot_b = reopened.get_slot("slot-b")
+    assert slot_a is not None and slot_a.last_used_at > 1
+    assert slot_b is not None and slot_b.last_used_at > 1
+
+    # Nothing pending: a second flush must not churn the version again.
+    store.flush_slot_touches()
+    assert store._project_slots.version == version + 1
+
+
+def test_touch_slot_flushes_inline_once_the_oldest_pending_touch_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a"))
+    store.upsert_slot(_slot("project-a", "slot-b", partition_id="partition-b"))
+    monkeypatch.setattr(storage_module, "SLOT_TOUCH_FLUSH_SECONDS", 60.0)
+    version = store._project_slots.version
+    # Simulate a touch that has been sitting in the buffer well past the
+    # flush interval.
+    store._pending_slot_touches["slot-b"] = time.time_ns() - (120 * 1_000_000_000)
+
+    store.touch_slot("slot-a")
+
+    assert store._project_slots.version == version + 1
+    assert store._pending_slot_touches == {}
+
+
+def test_branch_cache_limit_respects_an_unflushed_touch(tmp_path: Path) -> None:
+    """LRU eviction (list_slots) must overlay a buffered touch, not just the
+    on-disk last_used_at, or a just-touched slot could be evicted as if it
+    were the oldest.
+
+    Uses the ``workspace`` selector kind so the slots are not also flagged by
+    the unrelated obsolete-slot-key cleanup (that check only looks at
+    ``ref``/``commit`` slots) -- this test is only about the LRU limit.
+    """
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4, branch_cache_limit=1)
+    store.upsert_slot(
+        _slot("project-a", "slot-a", partition_id="partition-a", selector_kind="workspace")
+    )
+    store.upsert_slot(
+        _slot(
+            "project-a", "slot-b", partition_id="partition-b", selector_kind="workspace"
+        ).model_copy(update={"last_used_at": 2})
+    )
+    store.upsert_slot(
+        _slot(
+            "project-a", "slot-c", partition_id="partition-c", selector_kind="workspace"
+        ).model_copy(update={"last_used_at": 1})
+    )
+    store.activate_slot("project-a", "slot-a", checkout_key="checkout")
+    store._tables("partition-a")
+    store._tables("partition-b")
+    store._tables("partition-c")
+    # slot-c looks older than slot-b on disk, but an unflushed touch makes it
+    # the more recently used of the two candidates.
+    store.touch_slot("slot-c")
+
+    assert store.maintain_project(
+        "project-a", cleanup_older_than=timedelta(hours=1), branch_cache_limit=1
+    )
+
+    remaining = {slot.slot_id for slot in store.list_slots("project-a")}
+    assert remaining == {"slot-a", "slot-c"}
+    assert not (store.directory / "projects" / "partition-b").exists()
+
+
 def _git_repo(tmp_path: Path, name: str) -> Path:
     root = tmp_path / name
     root.mkdir()
@@ -2395,6 +2735,22 @@ def _git_repo(tmp_path: Path, name: str) -> Path:
     run_git("add", "main.py", cwd=root)
     run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "initial", cwd=root)
     return root
+
+
+def _remove_repo(root: Path) -> None:
+    """Delete a git checkout, including its read-only object files.
+
+    Git writes `.git/objects` files read-only, which Windows' rmtree refuses
+    to remove; chmod them writable and retry the failed operation.
+    """
+
+    def _writable_retry(
+        function: Callable[[str], object], target: str, _error: BaseException
+    ) -> None:
+        os.chmod(target, stat.S_IWRITE)
+        function(target)
+
+    shutil.rmtree(root, onexc=_writable_retry)
 
 
 def test_active_pointers_are_per_checkout_of_one_project(tmp_path: Path) -> None:
@@ -2525,6 +2881,89 @@ def test_upsert_project_still_conflicts_for_a_copied_tree(tmp_path: Path) -> Non
     assert excinfo.value.code == ErrorCode.PROJECT_ID_CONFLICT
 
 
+def test_upsert_project_accepts_a_move_once_the_old_root_is_gone(tmp_path: Path) -> None:
+    """A registered root that no longer exists at all is a legitimate move."""
+    root = _git_repo(tmp_path, "repo")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model")
+    _remove_repo(root)
+
+    new_root = tmp_path / "moved"
+    new_root.mkdir()
+    moved = ProjectInfo(id=project.id, name=project.name, root=new_root)
+    store.upsert_project(moved, model_id="test/model")
+
+    stored = ProjectInfo.model_validate_json(
+        str(store._rows(store._projects, f"id = '{project.id}'")[0]["payload"])
+    )
+    assert stored.root == new_root.resolve()
+
+
+def test_upsert_project_conflicts_when_the_registered_root_survives_without_its_marker(
+    tmp_path: Path,
+) -> None:
+    """A directory that still exists but lost its marker is ambiguous, not a move."""
+    root = _git_repo(tmp_path, "repo")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model")
+    shutil.rmtree(root / ".ci-mcp")
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    duplicate = ProjectInfo(id=project.id, name=project.name, root=unrelated)
+    with pytest.raises(storage_module.CodeIndexingError) as excinfo:
+        store.upsert_project(duplicate, model_id="test/model")
+
+    assert excinfo.value.code == ErrorCode.PROJECT_ID_CONFLICT
+    assert "remove_project" in str(excinfo.value)
+    assert "force_new_id" in str(excinfo.value)
+
+
+def test_upsert_project_still_accepts_a_worktree_once_its_marker_is_gone(
+    tmp_path: Path,
+) -> None:
+    """A linked worktree is recognised from git identity, not the marker file."""
+    root = _git_repo(tmp_path, "repo")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model")
+    shutil.rmtree(root / ".ci-mcp")
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=root)
+
+    checkout = ProjectInfo(id=project.id, name=project.name, root=worktree)
+    store.upsert_project(checkout, model_id="test/model")
+
+    stored = ProjectInfo.model_validate_json(
+        str(store._rows(store._projects, f"id = '{project.id}'")[0]["payload"])
+    )
+    assert stored.root == root.resolve()
+
+
+def test_removing_the_registered_project_lets_the_id_be_reclaimed(tmp_path: Path) -> None:
+    """remove_project resolves the ambiguity so the id can register elsewhere."""
+    root = _git_repo(tmp_path, "repo")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model")
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    duplicate = ProjectInfo(id=project.id, name=project.name, root=unrelated)
+    with pytest.raises(storage_module.CodeIndexingError):
+        store.upsert_project(duplicate, model_id="test/model")
+
+    store.remove_project(project.id)
+    store.upsert_project(duplicate, model_id="test/model")
+
+    stored = ProjectInfo.model_validate_json(
+        str(store._rows(store._projects, f"id = '{project.id}'")[0]["payload"])
+    )
+    assert stored.root == unrelated.resolve()
+
+
 def test_active_slots_registry_gains_the_checkout_key_in_place(tmp_path: Path) -> None:
     """A pre-worktree active_slots table is migrated without losing its pointer."""
     import lancedb
@@ -2556,3 +2995,63 @@ def test_active_slots_registry_gains_the_checkout_key_in_place(tmp_path: Path) -
     assert store.active_slot("p").slot_id == "slot-old"
     reopened = LanceStore(data, vector_dimension=4)
     assert reopened.active_slot("p").slot_id == "slot-old"
+
+
+def test_project_slots_registry_gains_status_columns_in_place(tmp_path: Path) -> None:
+    """A pre-fingerprint project_slots table opens and reads the new columns as None."""
+    data = tmp_path / "data"
+    database = lancedb.connect(data / "registry")
+    legacy_schema = pa.schema(
+        [
+            ("slot_id", pa.string()),
+            ("project_id", pa.string()),
+            ("partition_id", pa.string()),
+            ("selector_kind", pa.string()),
+            ("selector_value", pa.string()),
+            ("repository_identity", pa.string()),
+            ("checkout_identity", pa.string()),
+            ("project_prefix", pa.string()),
+            ("indexed_head", pa.string()),
+            ("indexed_clean", pa.bool_()),
+            ("scan_config_hash", pa.string()),
+            ("model_id", pa.string()),
+            ("vector_dimension", pa.int32()),
+            ("schema_version", pa.int32()),
+            ("state", pa.string()),
+            ("created_at", pa.int64()),
+            ("last_used_at", pa.int64()),
+        ]
+    )
+    legacy = database.create_table("project_slots", schema=legacy_schema)
+    legacy.add(
+        [
+            {
+                "slot_id": "slot-old",
+                "project_id": "p",
+                "partition_id": "slot-old",
+                "selector_kind": "ref",
+                "selector_value": "refs/heads/main",
+                "repository_identity": "/repo/.git",
+                "checkout_identity": "/repo/.git",
+                "project_prefix": "",
+                "indexed_head": "deadbeef",
+                "indexed_clean": True,
+                "scan_config_hash": "hash",
+                "model_id": "test/model",
+                "vector_dimension": 4,
+                "schema_version": storage_module.SCHEMA_VERSION,
+                "state": "ready",
+                "created_at": 1,
+                "last_used_at": 1,
+            }
+        ]
+    )
+
+    store = LanceStore(data, vector_dimension=4)
+
+    slot = store.get_slot("slot-old")
+    assert slot is not None
+    assert slot.indexed_head == "deadbeef"
+    assert slot.indexed_clean is True
+    assert slot.indexed_status_fingerprint is None
+    assert slot.indexed_status_paths is None

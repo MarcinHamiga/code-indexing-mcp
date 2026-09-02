@@ -10,6 +10,7 @@ from code_indexing_mcp.models import (
     LEGACY_DEFAULT_INCLUDES_V1,
     LEGACY_DEFAULT_INCLUDES_V2,
     LEGACY_DEFAULT_INCLUDES_V3,
+    MAX_FILE_BYTES_CEILING,
 )
 from code_indexing_mcp.projects import (
     ProjectResolver,
@@ -112,6 +113,47 @@ def test_custom_marker_includes_are_preserved(tmp_path: Path) -> None:
     project = read_project_marker(root)
 
     assert project.scan.include == ["src/**/*.py"]
+
+
+def _write_marker_with_max_file_bytes(root: Path, max_file_bytes: int) -> None:
+    marker = root / ".ci-mcp" / "project.toml"
+    marker.parent.mkdir()
+    marker.write_text(
+        tomli_w.dumps(
+            {
+                "version": 1,
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "demo",
+                "scan": {
+                    "include": ["src/**/*.py"],
+                    "exclude": [],
+                    "max_file_bytes": max_file_bytes,
+                },
+            }
+        )
+    )
+
+
+def test_marker_max_file_bytes_above_the_ceiling_is_rejected_by_name(tmp_path: Path) -> None:
+    root = tmp_path / "demo"
+    root.mkdir()
+    _write_marker_with_max_file_bytes(root, MAX_FILE_BYTES_CEILING + 1)
+
+    with pytest.raises(CodeIndexingError) as excinfo:
+        read_project_marker(root)
+
+    assert excinfo.value.code == ErrorCode.PROJECT_NOT_FOUND
+    assert "max_file_bytes" in str(excinfo.value)
+
+
+def test_marker_max_file_bytes_at_the_ceiling_loads(tmp_path: Path) -> None:
+    root = tmp_path / "demo"
+    root.mkdir()
+    _write_marker_with_max_file_bytes(root, MAX_FILE_BYTES_CEILING)
+
+    project = read_project_marker(root)
+
+    assert project.scan.max_file_bytes == MAX_FILE_BYTES_CEILING
 
 
 def test_resolver_prefers_explicit_project(tmp_path: Path) -> None:

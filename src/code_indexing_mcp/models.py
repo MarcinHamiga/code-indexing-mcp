@@ -1,5 +1,6 @@
 """Immutable domain models."""
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Annotated, Literal
@@ -26,6 +27,38 @@ class _PathAsPlainString:
 
 
 SerializablePath = Annotated[Path, _PathAsPlainString()]
+
+# Bump only when the normalized structural-row contract changes. Coverage rows
+# make a new generation discoverable without coupling it to project metadata.
+# Version 4 puts the reference kind in the row identity. Bumping it also
+# discards any generation written by version 3, whose colliding ids are what
+# made a project unindexable.
+# Version 5 adds Go to STRUCTURAL_LANGUAGES. Every language's version-bump step
+# is what makes parse-only reference backfill re-extract that language's files
+# (Go files already carried version-4 coverage rows with zero occurrences).
+# Version 6 adds Rust; version 7 adds Java, with on-demand-import semantics.
+# Version 8 adds C#, with namespace identity carried on export rows.
+#
+# Lives here rather than in indexing.py (originally its home) because
+# reference_service.py needs it too and importing it from indexing.py made
+# that a sideways dependency between two peer services -- see D3 in
+# docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
+# indexing.py re-exports the name for one release so nothing importing it from
+# there breaks.
+REFERENCE_SCHEMA_VERSION = 8
+
+
+def content_digest(value: str | bytes) -> str:
+    """Return the sha256 hex digest of *value*, encoding text as UTF-8 first.
+
+    Identifies file content and derives stable ids for chunks, structural rows,
+    and reference rows. Public (moved here from indexing.py's private
+    ``_digest`` per D3) because reference_service.py computes the same digest
+    independently of indexing.py's own pipeline.
+    """
+    data = value.encode() if isinstance(value, str) else value
+    return hashlib.sha256(data).hexdigest()
+
 
 LEGACY_DEFAULT_INCLUDES_V1 = [
     "**/*.py",
@@ -74,6 +107,12 @@ DEFAULT_INCLUDES = [
     "**/*.hxx",
     "**/*.lua",
 ]
+
+# A repository-shipped marker is trusted input up to this point: a project.toml
+# committed to a repo the user opens is honoured without prompting, so its
+# `max_file_bytes` cannot be allowed to raise the ceiling arbitrarily high and
+# turn a single oversized file into an unbounded read and embed.
+MAX_FILE_BYTES_CEILING = 16 * 1024 * 1024
 
 # The kinds TreeSitterExtractor emits, plus the "_part" variants it produces when a
 # definition is split across chunks. Closed so MCP clients get an enum instead of a
@@ -185,7 +224,7 @@ IndexTrigger = Literal[
 class ScanConfig(FrozenModel):
     include: list[str] = Field(default_factory=lambda: list(DEFAULT_INCLUDES))
     exclude: list[str] = Field(default_factory=list)
-    max_file_bytes: int = Field(default=1_048_576, gt=0)
+    max_file_bytes: int = Field(default=1_048_576, gt=0, le=MAX_FILE_BYTES_CEILING)
 
 
 class ProjectInfo(FrozenModel):
@@ -643,6 +682,10 @@ class ChunkPreview(FrozenModel):
 
     chunk_id: str
     project_id: str
+    # Optional and unset by most producers (search/outline previews never
+    # needed it); `LanceStore.find_declarations` sets it so `_select` can
+    # build a `SelectedDeclaration` without a second lookup.
+    file_id: str | None = None
     path: str
     language: str
     kind: str
@@ -1115,6 +1158,13 @@ class ProjectSlot(FrozenModel):
     # clean then. A null HEAD or clean state forces full freshness validation.
     indexed_head: str | None = None
     indexed_clean: bool | None = None
+    # The `git status` fingerprint at index time, and the JSON-encoded sorted
+    # list of paths that were dirty or untracked then (or null when that list
+    # exceeded MAX_PERSISTED_STATUS_PATHS). Together they let a freshness
+    # check on a dirty checkout stat only the paths that could have changed
+    # instead of walking the whole tree; either being null forces a full walk.
+    indexed_status_fingerprint: str | None = None
+    indexed_status_paths: str | None = None
     scan_config_hash: str = ""
     model_id: str = ""
     vector_dimension: int = 0

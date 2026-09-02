@@ -527,7 +527,17 @@ def test_required_rename_edits_are_deduplicated_by_span(tmp_path: Path) -> None:
 def test_analyze_refactor_fetches_the_reference_table_only_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """analyze_refactor must reuse find_references' fetch, not re-scan (S4)."""
+    """analyze_refactor must reuse find_references' fetch, not re-scan (S4).
+
+    Since the reference-pushdown track (D1-D4), one `find_references`/
+    `analyze_refactor` lookup no longer makes a single full-table fetch: it
+    loads a `_ReferenceContext` (coverage rows, then import/export rows --
+    two narrow fetches) and one SQL-pushed-down candidate fetch. Three calls
+    total is that same "no re-scan" guarantee restated for the new shape --
+    still zero *additional* calls beyond what one `_find_references_with_records`
+    already makes, since `_override_findings` never fires here (`authorize`
+    has no owner class).
+    """
     service, project_id = _indexed_service(
         tmp_path, {"auth.py": "def authorize(user):\n    return user\n"}
     )
@@ -538,18 +548,10 @@ def test_analyze_refactor_fetches_the_reference_table_only_once(
         project: str,
         *,
         version: int | None = None,
-        schema_version: int | None = None,
-        record_kinds: object = None,
-        partition_id: str | None = None,
+        **kwargs: object,
     ) -> list[object]:
         calls.append(version)
-        return real_list_reference_records(
-            project,
-            version=version,
-            schema_version=schema_version,
-            record_kinds=record_kinds,
-            partition_id=partition_id,
-        )
+        return real_list_reference_records(project, version=version, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(service.store, "list_reference_records", counting_list_reference_records)
 
@@ -558,7 +560,7 @@ def test_analyze_refactor_fetches_the_reference_table_only_once(
         RenameOperation(new_name="permit"),
     )
 
-    assert len(calls) == 1, f"expected exactly one full-table fetch, got {calls}"
+    assert len(calls) == 3, f"expected exactly one context+candidate fetch set, got {calls}"
 
 
 def test_analyze_refactor_classifies_the_full_hit_list_only_once(
@@ -1484,6 +1486,67 @@ def test_a_slice_mismatch_conflicts_the_finding(tmp_path: Path) -> None:
     # Both consumer.py findings (import and call) carried the shifted span.
     assert len(conflicted) == 2
     assert all("no longer spell" in item.explanation for item in conflicted)
+    assert result.applied == 1
+    assert result.edits[0].path == "auth.py"
+
+
+def test_a_path_that_escapes_the_root_is_conflicted_and_never_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row whose recorded path would resolve outside the project root is a
+    defense against a corrupted or crafted row, not a case that happens today:
+    every path emission reads comes from index rows the extractor wrote as
+    root-relative. The declaration path is monkeypatched to `../outside.py`
+    to exercise the guard directly."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "auth.py": "def authorize(user):\n    return user\n",
+            "consumer.py": (
+                "from auth import authorize\n\ndef run(user):\n    return authorize(user)\n"
+            ),
+        },
+    )
+    outside = tmp_path / "outside.py"
+    outside.write_text("SECRET = 'must never be read'\n")
+
+    operation = RenameOperation(new_name="validate")
+    selector = DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize")
+    analysis, query = service._rename_analysis(
+        selector,
+        operation,
+        limit=500,
+        cursor=None,
+        backfill=None,
+        partition=None,
+        paginate=False,
+    )
+    escaped_path = "../outside.py"
+    mutated = analysis.model_copy(
+        update={
+            "must_change": [
+                item.model_copy(update={"path": escaped_path})
+                if item.path == "consumer.py"
+                else item
+                for item in analysis.must_change
+            ]
+        }
+    )
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(self: Path, *args: object, **kwargs: object) -> bytes:
+        assert self.resolve() != outside.resolve(), "must not read a file outside the root"
+        return original_read_bytes(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+
+    result = service._render_patch(mutated, query, operation, context_lines=3)
+
+    conflicted = [item for item in result.conflicted if item.path == escaped_path]
+    assert conflicted
+    assert all(item.reason_code == "path_escapes_root" for item in conflicted)
+    assert all(edit.path != escaped_path for edit in result.edits)
+    assert "outside.py" not in result.patch
     assert result.applied == 1
     assert result.edits[0].path == "auth.py"
 

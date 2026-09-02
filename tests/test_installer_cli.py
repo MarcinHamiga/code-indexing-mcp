@@ -91,6 +91,101 @@ def test_reconfigure_keeps_backend_and_prefills_harnesses(
     assert recorded[0].harness_slugs == ("kimi-code",)
 
 
+def _stub_configured_pipeline(
+    monkeypatch: pytest.MonkeyPatch, *, env_written: dict[str, str | None]
+) -> list:
+    """Stand in for a `run_install` that actually wrote a harness config.
+
+    `env_written` mirrors what `orchestrator.run_install` reports on
+    `InstallResult.env_written` after merging accelerator additions in --
+    the D6 restart decision reads that field, not the CLI's own parsed
+    `--set`/`--unset` pairs, so the stub must supply it directly.
+    """
+
+    import code_indexing_mcp.installer.cli as cli
+
+    def fake_run_install(plan, on_event=lambda event: None, should_continue=lambda: True):
+        return orchestrator.InstallResult(
+            None,
+            (("kimi-code", Path("/tmp/kimi-code.json")),),
+            (),
+            (),
+            env_written=env_written,
+        )
+
+    monkeypatch.setattr(cli, "run_install", fake_run_install)
+    calls: list = []
+    monkeypatch.setattr(
+        cli,
+        "stop_daemon",
+        lambda paths, *, reason: calls.append((paths, reason)) or ("ok", "stopped for test"),
+    )
+    return calls
+
+
+def test_configure_restarts_a_running_daemon_when_a_managed_setting_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D6: a config write to a daemon-consumed setting stops the running daemon."""
+
+    calls = _stub_configured_pipeline(monkeypatch, env_written={"CODE_INDEXING_EMBED_THREADS": "2"})
+    code = main(
+        [
+            "--install-dir",
+            str(tmp_path),
+            "--reconfigure",
+            "--set",
+            "CODE_INDEXING_EMBED_THREADS=2",
+            "--no-prompt",
+        ]
+    )
+    assert code == 0
+    assert len(calls) == 1
+    assert calls[0][1] == "settings"
+    assert "[daemon] ok: stopped for test" in capsys.readouterr().out
+
+
+def test_configure_leaves_the_daemon_alone_when_nothing_daemon_relevant_changed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--bin-dir` alone (no `--set`/`--unset`) never touches a managed setting."""
+
+    calls = _stub_configured_pipeline(monkeypatch, env_written={})
+    code = main(
+        [
+            "--install-dir",
+            str(tmp_path),
+            "--reconfigure",
+            "--bin-dir",
+            str(tmp_path / "bin"),
+            "--no-prompt",
+        ]
+    )
+    assert code == 0
+    assert calls == []
+    assert "[daemon]" not in capsys.readouterr().out
+
+
+def test_fresh_install_never_restarts_a_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A plain (non-reconfigure) install has nothing running yet to go stale."""
+
+    calls = _stub_configured_pipeline(monkeypatch, env_written={"CODE_INDEXING_EMBED_THREADS": "2"})
+    code = main(
+        [
+            "--install-dir",
+            str(tmp_path),
+            "--set",
+            "CODE_INDEXING_EMBED_THREADS=2",
+            "--no-prompt",
+        ]
+    )
+    assert code == 0
+    assert calls == []
+    assert "[daemon]" not in capsys.readouterr().out
+
+
 def test_main_reports_installer_errors(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

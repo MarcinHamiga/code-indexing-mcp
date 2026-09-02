@@ -163,9 +163,16 @@ def read_project_marker(root: Path) -> ProjectInfo:
             scan=scan,
         )
     except (OSError, KeyError, TypeError, ValueError, ValidationError) as exc:
+        message = f"Invalid or missing project marker: {path}"
+        if isinstance(exc, ValidationError):
+            # Name the offending field (e.g. a marker's `max_file_bytes` above the
+            # ceiling) so the user can fix the file instead of just re-initializing.
+            fields = sorted({str(error["loc"][-1]) for error in exc.errors() if error["loc"]})
+            if fields:
+                message += f" (invalid field: {', '.join(fields)})"
         raise CodeIndexingError(
             ErrorCode.PROJECT_NOT_FOUND,
-            f"Invalid or missing project marker: {path}",
+            message,
             path=str(path),
         ) from exc
 

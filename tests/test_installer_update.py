@@ -13,7 +13,7 @@ import pytest
 from conftest import create_test_remote, run_git
 from filelock import FileLock
 
-from code_indexing_mcp.installer import update
+from code_indexing_mcp.installer import daemon_control, update
 from code_indexing_mcp.installer.accelerator import (
     ACCELERATOR_EXTRAS,
     AcceleratorPlan,
@@ -381,7 +381,7 @@ def _record_accelerator(
 
 def _quiet_finalize(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(update, "load_prefill", lambda: _Prefill())
-    monkeypatch.setattr(update, "daemon_supported", lambda: False)
+    monkeypatch.setattr(daemon_control, "daemon_supported", lambda: False)
 
 
 class _Prefill:
@@ -394,7 +394,7 @@ def test_finalize_relinks_only_skill_directories_owned_by_this_checkout(
 ) -> None:
     installation = _install(tmp_path, monkeypatch)
     monkeypatch.setattr(update, "prepared_accelerator", lambda directory: None)
-    monkeypatch.setattr(update, "daemon_supported", lambda: False)
+    monkeypatch.setattr(daemon_control, "daemon_supported", lambda: False)
 
     class ConfiguredPrefill:
         configured_slugs = ("codex", "kimi-code", "opencode")
@@ -553,11 +553,13 @@ def test_finalize_stops_a_running_daemon_after_a_real_change(
     installation = _install(tmp_path, monkeypatch)
     monkeypatch.setattr(update, "prepared_accelerator", lambda directory: None)
     monkeypatch.setattr(update, "load_prefill", lambda: _Prefill())
-    monkeypatch.setattr(update, "daemon_supported", lambda: True)
+    monkeypatch.setattr(daemon_control, "daemon_supported", lambda: True)
     _FakeBroker.stops = []
     states = [{"running": True}, {"running": False}]
-    monkeypatch.setattr(update, "daemon_status", lambda paths: states.pop(0) if states else states)
-    monkeypatch.setattr(update, "BrokerApplication", _FakeBroker)
+    monkeypatch.setattr(
+        daemon_control, "daemon_status", lambda paths: states.pop(0) if states else states
+    )
+    monkeypatch.setattr(daemon_control, "BrokerApplication", _FakeBroker)
 
     assert (
         update.update_main(
@@ -581,10 +583,10 @@ def test_finalize_leaves_the_daemon_alone_when_nothing_changed(
     installation = _install(tmp_path, monkeypatch)
     monkeypatch.setattr(update, "prepared_accelerator", lambda directory: None)
     monkeypatch.setattr(update, "load_prefill", lambda: _Prefill())
-    monkeypatch.setattr(update, "daemon_supported", lambda: True)
+    monkeypatch.setattr(daemon_control, "daemon_supported", lambda: True)
     _FakeBroker.stops = []
-    monkeypatch.setattr(update, "daemon_status", lambda paths: {"running": True})
-    monkeypatch.setattr(update, "BrokerApplication", _FakeBroker)
+    monkeypatch.setattr(daemon_control, "daemon_status", lambda paths: {"running": True})
+    monkeypatch.setattr(daemon_control, "BrokerApplication", _FakeBroker)
 
     assert (
         update.update_main(
@@ -744,3 +746,65 @@ def test_check_fails_when_the_remote_cannot_be_reached(
 
     assert code == 1
     assert "could not reach origin" in capsys.readouterr().err
+
+
+def test_daemon_relevant_settings_changed_is_true_for_any_managed_setting(
+    tmp_path: Path,
+) -> None:
+    """Every `--set`/`--unset`-able key is one the daemon reads at startup (D6).
+
+    There is currently nothing installer-only in the managed catalog (that
+    lives outside it, e.g. CODE_INDEXING_MCP_BIN_DIR, which never reaches
+    this function), so any non-empty update counts.
+    """
+
+    assert daemon_control.daemon_relevant_settings_changed({}) is False
+    assert (
+        daemon_control.daemon_relevant_settings_changed({"CODE_INDEXING_EMBED_THREADS": "2"})
+        is True
+    )
+    assert daemon_control.daemon_relevant_settings_changed({"CODE_INDEXING_BROKER": None}) is True
+
+
+def test_stop_daemon_reports_the_reason_it_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`update` and `configure` share this function and get its wording back verbatim."""
+
+    from code_indexing_mcp.application import RuntimePaths
+    from code_indexing_mcp.daemon import CodeIndexingError, ErrorCode
+
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    monkeypatch.setattr(daemon_control, "daemon_supported", lambda: True)
+    monkeypatch.setattr(daemon_control, "daemon_status", lambda p: {"running": False})
+
+    status, detail = daemon_control.stop_daemon(paths, reason="settings")
+    assert status == "skipped"
+    assert "no daemon is running" in detail
+
+    stops: list[Path] = []
+
+    class _FakeBroker:
+        def __init__(self, paths: RuntimePaths) -> None:
+            self._paths = paths
+
+        def stop(self) -> dict[str, Any]:
+            stops.append(self._paths.data)
+            return {"stopped": True}
+
+    states = iter([{"running": True}, {"running": False}])
+    monkeypatch.setattr(daemon_control, "daemon_status", lambda p: next(states))
+    monkeypatch.setattr(daemon_control, "BrokerApplication", _FakeBroker)
+
+    status, detail = daemon_control.stop_daemon(paths, reason="settings")
+    assert status == "ok"
+    assert detail == "stopped; it restarts on the updated settings with the next client"
+    assert stops == [paths.data]
+
+    def _raise(p: RuntimePaths) -> dict[str, Any]:
+        raise CodeIndexingError(ErrorCode.DAEMON_UNAVAILABLE, "boom")
+
+    monkeypatch.setattr(daemon_control, "daemon_status", _raise)
+    status, detail = daemon_control.stop_daemon(paths, reason="settings")
+    assert status == "warning"
+    assert "boom" in detail

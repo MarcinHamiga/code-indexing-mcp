@@ -1,0 +1,1172 @@
+{
+  "schema_version": 1,
+  "label": "branch",
+  "source_revision": "c2cd048 (/Users/mhamiga/Projects/mcps/code-indexing-mcp)",
+  "repository": "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/django",
+  "repository_head": "5180f82f48b589f93cddc7be7896f654a9aec1ad",
+  "index_mode": "lazy",
+  "vector_index": "exact",
+  "iterations": 10,
+  "index": {
+    "wall_s": 0.9,
+    "discovered_files": 3122,
+    "indexed_files": 0,
+    "unchanged_files": 3122,
+    "embedded_chunks": 0,
+    "embedding_backend": "cpu",
+    "errors": 0,
+    "file_count": 3122,
+    "chunk_count": 49618
+  },
+  "gap_seconds": 6.0,
+  "gap_iterations": 5,
+  "scenarios": {
+    "warmup.search_code": {
+      "calls": 1,
+      "wall_ms": {
+        "min": 617.83,
+        "median": 617.83,
+        "mean": 617.83,
+        "p90": 617.83,
+        "max": 617.83
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 7
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 1
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "clean.embed_query": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 6.63,
+        "median": 7.12,
+        "mean": 7.36,
+        "p90": 7.84,
+        "max": 9.17
+      },
+      "git_spawns": {
+        "min": 0,
+        "max": 0,
+        "total": 0
+      },
+      "data_files_changed": {
+        "min": 0,
+        "max": 0,
+        "total": 0
+      },
+      "git_commands_first_call": []
+    },
+    "clean.burst.status_only": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 146.1,
+        "median": 150.03,
+        "mean": 152.87,
+        "p90": 157.07,
+        "max": 174.08
+      },
+      "git_spawns": {
+        "min": 4,
+        "max": 4,
+        "total": 40
+      },
+      "data_files_changed": {
+        "min": 0,
+        "max": 0,
+        "total": 0
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1"
+      ]
+    },
+    "clean.gapped.status_only": {
+      "calls": 5,
+      "wall_ms": {
+        "min": 146.69,
+        "median": 163.75,
+        "mean": 158.3,
+        "p90": 168.56,
+        "max": 168.56
+      },
+      "git_spawns": {
+        "min": 4,
+        "max": 4,
+        "total": 20
+      },
+      "data_files_changed": {
+        "min": 0,
+        "max": 0,
+        "total": 0
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1"
+      ]
+    },
+    "clean.burst.search_code": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 222.1,
+        "median": 226.76,
+        "mean": 228.07,
+        "p90": 230.92,
+        "max": 245.43
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 70
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 10
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "clean.gapped.search_code": {
+      "calls": 5,
+      "wall_ms": {
+        "min": 239.51,
+        "median": 246.43,
+        "mean": 258.71,
+        "p90": 303.66,
+        "max": 303.66
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 35
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 5
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "clean.burst.find_symbol": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 205.1,
+        "median": 208.65,
+        "mean": 214.84,
+        "p90": 232.54,
+        "max": 232.78
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 70
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 10
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "clean.burst.file_outline": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 202.38,
+        "median": 204.47,
+        "mean": 205.76,
+        "p90": 210.69,
+        "max": 214.01
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 70
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 10
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "dirty.first.search_code": {
+      "calls": 1,
+      "wall_ms": {
+        "min": 1607.33,
+        "median": 1607.33,
+        "mean": 1607.33,
+        "p90": 1607.33,
+        "max": 1607.33
+      },
+      "git_spawns": {
+        "min": 23,
+        "max": 23,
+        "total": 23
+      },
+      "data_files_changed": {
+        "min": 38,
+        "max": 38,
+        "total": 38
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git -C /private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/django",
+        "git -C /private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/django",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ],
+      "noticed": true
+    },
+    "dirty.burst.search_code": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 233.12,
+        "median": 237.8,
+        "mean": 241.64,
+        "p90": 257.49,
+        "max": 257.51
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 70
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 10
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "dirty.gapped.search_code": {
+      "calls": 5,
+      "wall_ms": {
+        "min": 250.47,
+        "median": 253.92,
+        "mean": 253.36,
+        "p90": 256.97,
+        "max": 256.97
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 35
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 5
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ],
+      "cprofile_cumulative_top": "         48751 function calls (48391 primitive calls) in 0.276 seconds\n\n   Ordered by: cumulative time\n   List reduced from 768 to 30 due to restriction <30>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n      2/1    0.000    0.000    0.276    0.276 /Users/mhamiga/Projects/mcps/code-indexing-mcp/scripts/profile_query_path.py:335(search)\n        1    0.000    0.000    0.276    0.276 /Users/mhamiga/Projects/mcps/code-indexing-mcp/scripts/profile_query_path.py:322(lazy_tool_call)\n        1    0.000    0.000    0.276    0.276 /Users/mhamiga/Projects/mcps/code-indexing-mcp/scripts/profile_query_path.py:337(<lambda>)\n        2    0.000    0.000    0.261    0.130 /Users/mhamiga/Projects/mcps/code-indexing-mcp/src/code_indexing_mcp/application.py:816(_run_repository_stable_query)\n        2    0.000    0.000    0.219    0.110 /Users/mhamiga/Projects/mcps/code-indexing-mcp/src/code_indexing_mcp/application.py:734(_resolve_active_targets)\n        2    0.000    0.000    0.219    0.109 /Users/mhamiga/Projects/mcps/code-indexing-mcp/src/code_indexing_mcp/application.py:762(resolve)\n        2    0.000    0.000    0.219    0.109 /Users/mhamiga/Projects/mcps/code-indexing-mcp/src/code_indexing_mcp/application.py:673(_resolve_active_target)\n        2    0.000    0.000    0.207    0.104 /Users/mhamiga/Projects/mcps/code-indexing-mcp/src/code_indexing_mcp/git_state.py:203(probe_git_state)\n        7    0.000    0.000    0.206    0.029 /Users/mhamiga/Projects/mcps/code-indexing-mcp/src/code_indexing_mcp/git_state.py:74(run_git)\n        7    0.001    0.000    0.205    0.029 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/subprocess.py:506(run)\n    84/45    0.000    0.000    0.202    0.004 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py:428(result)\n    87/47    0.000    0.000    0.202    0.004 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/threading.py:323(wait)\n      3/2    0.000    0.000    0.201    0.101 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/concurrent/futures/thread.py:54(run)\n        2    0.000    0.000    0.193    0.096 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py:612(result_iterator)\n        1    0.000    0.000    0.193    0.193 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py:314(_result_or_cancel)\n        1    0.000    0.000    0.193    0.193 /Users/mhamiga/Projects/mcps/code-indexing-mcp/src/code_indexing_mcp/application.py:937(project_status)\n        7    0.000    0.000    0.153    0.022 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/subprocess.py:1165(communicate)\n        7    0.000    0.000    0.153    0.022 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/subprocess.py:2062(_communicate)\n       14    0.000    0.000    0.151    0.011 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/selectors.py:402(select)\n       14    0.151    0.011    0.151    0.011 {method 'poll' of 'select.poll' objects}\n        1    0.000    0.000    0.083    0.083 /Users/mhamiga/Projects/mcps/code-indexing-mcp/src/code_indexing_mcp/application.py:1367(search_code)\n        1    0.000    0.000    0.080    0.080 /Users/mhamiga/Projects/mcps/code-indexing-mcp/src/code_indexing_mcp/application.py:1382(search)\n        7    0.000    0.000    0.051    0.007 /Users/mhamiga/Projects/mcps/code-indexing-mcp/scripts/profile_query_path.py:84(__init__)\n        7    0.000    0.000    0.051    0.007 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/subprocess.py:807(__init__)\n        7    0.001    0.000    0.050    0.007 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/subprocess.py:1791(_execute_child)\n      401    0.001    0.000    0.046    0.000 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/asyncio/base_events.py:1922(_run_once)\n       12    0.008    0.001    0.044    0.004 /Users/mhamiga/Projects/mcps/code-indexing-mcp/.venv/lib/python3.12/site-packages/lancedb/query.py:1030(to_list)\n    81/78    0.001    0.000    0.040    0.001 /Users/mhamiga/Projects/mcps/code-indexing-mcp/.venv/lib/python3.12/site-packages/lancedb/background_loop.py:30(run)\n       11    0.000    0.000    0.040    0.004 /Users/mhamiga/Projects/mcps/code-indexing-mcp/src/code_indexing_mcp/storage.py:2759(_rows)\n      401    0.001    0.000    0.039    0.000 /Users/mhamiga/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/python3.12/selectors.py:558(select)\n\n\n"
+    },
+    "dirty.burst.find_symbol": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 217.04,
+        "median": 221.54,
+        "mean": 226.64,
+        "p90": 242.8,
+        "max": 244.87
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 70
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 10
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "head.first.search_code": {
+      "calls": 1,
+      "wall_ms": {
+        "min": 1214.11,
+        "median": 1214.11,
+        "mean": 1214.11,
+        "p90": 1214.11,
+        "max": 1214.11
+      },
+      "git_spawns": {
+        "min": 24,
+        "max": 24,
+        "total": 24
+      },
+      "data_files_changed": {
+        "min": 22,
+        "max": 22,
+        "total": 22
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git diff --name-only",
+        "git -C /private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/django",
+        "git -C /private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/django",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "head.burst.search_code": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 232.72,
+        "median": 236.76,
+        "mean": 241.35,
+        "p90": 254.23,
+        "max": 256.9
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 70
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 10
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "head.gapped.search_code": {
+      "calls": 5,
+      "wall_ms": {
+        "min": 251.87,
+        "median": 260.87,
+        "mean": 262.55,
+        "p90": 283.75,
+        "max": 283.75
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 35
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 5
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "head.burst.find_symbol": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 223.83,
+        "median": 232.71,
+        "mean": 236.29,
+        "p90": 252.53,
+        "max": 257.3
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 70
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 10
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "head_return.first.search_code": {
+      "calls": 1,
+      "wall_ms": {
+        "min": 1605.21,
+        "median": 1605.21,
+        "mean": 1605.21,
+        "p90": 1605.21,
+        "max": 1605.21
+      },
+      "git_spawns": {
+        "min": 24,
+        "max": 24,
+        "total": 24
+      },
+      "data_files_changed": {
+        "min": 30,
+        "max": 30,
+        "total": 30
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git diff --name-only",
+        "git -C /private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/django",
+        "git -C /private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/django",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ],
+      "noticed": true
+    },
+    "head_return.burst.search_code": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 236.1,
+        "median": 248.19,
+        "mean": 249.59,
+        "p90": 265.5,
+        "max": 267.75
+      },
+      "git_spawns": {
+        "min": 7,
+        "max": 7,
+        "total": 70
+      },
+      "data_files_changed": {
+        "min": 1,
+        "max": 1,
+        "total": 10
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "multi8.burst.search_code": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 438.75,
+        "median": 443.62,
+        "mean": 449.05,
+        "p90": 462.21,
+        "max": 475.71
+      },
+      "git_spawns": {
+        "min": 56,
+        "max": 56,
+        "total": 560
+      },
+      "data_files_changed": {
+        "min": 8,
+        "max": 9,
+        "total": 81
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD"
+      ]
+    },
+    "multi8.gapped.search_code": {
+      "calls": 5,
+      "wall_ms": {
+        "min": 444.97,
+        "median": 449.67,
+        "mean": 461.27,
+        "p90": 486.63,
+        "max": 486.63
+      },
+      "git_spawns": {
+        "min": 56,
+        "max": 56,
+        "total": 280
+      },
+      "data_files_changed": {
+        "min": 8,
+        "max": 8,
+        "total": 40
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD"
+      ]
+    },
+    "multi8.with_repo.burst.search_code": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 567.42,
+        "median": 594.84,
+        "mean": 593.12,
+        "p90": 608.1,
+        "max": 628.63
+      },
+      "git_spawns": {
+        "min": 63,
+        "max": 63,
+        "total": 630
+      },
+      "data_files_changed": {
+        "min": 9,
+        "max": 9,
+        "total": 90
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "multi8.dirty.first.search_code": {
+      "calls": 1,
+      "wall_ms": {
+        "min": 831.51,
+        "median": 831.51,
+        "mean": 831.51,
+        "p90": 831.51,
+        "max": 831.51
+      },
+      "git_spawns": {
+        "min": 72,
+        "max": 72,
+        "total": 72
+      },
+      "data_files_changed": {
+        "min": 45,
+        "max": 45,
+        "total": 45
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git -C /private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/small-0",
+        "git -C /private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/small-0",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD"
+      ],
+      "noticed": true
+    },
+    "multi8.dirty.burst.search_code": {
+      "calls": 10,
+      "wall_ms": {
+        "min": 439.82,
+        "median": 455.75,
+        "mean": 455.55,
+        "p90": 460.27,
+        "max": 475.84
+      },
+      "git_spawns": {
+        "min": 56,
+        "max": 56,
+        "total": 560
+      },
+      "data_files_changed": {
+        "min": 8,
+        "max": 8,
+        "total": 80
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD"
+      ]
+    },
+    "multi8.dirty.gapped.search_code": {
+      "calls": 5,
+      "wall_ms": {
+        "min": 459.46,
+        "median": 469.79,
+        "mean": 471.99,
+        "p90": 482.64,
+        "max": 482.64
+      },
+      "git_spawns": {
+        "min": 56,
+        "max": 56,
+        "total": 280
+      },
+      "data_files_changed": {
+        "min": 8,
+        "max": 8,
+        "total": 40
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse --git-common-dir",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD"
+      ]
+    },
+    "multi8.restored.first.search_code": {
+      "calls": 1,
+      "wall_ms": {
+        "min": 811.8,
+        "median": 811.8,
+        "mean": 811.8,
+        "p90": 811.8,
+        "max": 811.8
+      },
+      "git_spawns": {
+        "min": 72,
+        "max": 72,
+        "total": 72
+      },
+      "data_files_changed": {
+        "min": 34,
+        "max": 34,
+        "total": 34
+      },
+      "git_commands_first_call": [
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git -C /private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/small-0",
+        "git -C /private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/small-0",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git status --porcelain=v1",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git rev-parse --git-common-dir",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD",
+        "git symbolic-ref -q",
+        "git symbolic-ref -q",
+        "git rev-parse HEAD",
+        "git rev-parse HEAD"
+      ]
+    }
+  }
+}

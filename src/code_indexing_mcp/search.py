@@ -195,7 +195,7 @@ class SearchService:
         return OutlineResponse(project_id=project_id, path=path, items=items)
 
     def get_chunk(self, chunk_id: str, *, partition: PartitionRef | None = None) -> CodeChunk:
-        project_id = self.store._chunk_project_id(chunk_id)
+        project_id = self.store.chunk_project_id(chunk_id)
         if project_id is None:
             chunk = None
         else:

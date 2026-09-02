@@ -60,7 +60,7 @@ from .models import (
     StoredFile,
     TableStorageStats,
 )
-from .projects import existing_marker_path, rooted_under, same_project_root
+from .projects import rooted_under, same_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,31 @@ MAX_CACHED_PARTITIONS = 16
 # concurrency than this has not shown a latency win in benchmarks and raises
 # contention on the shared partition cache, so the pool stays small and bounded.
 _SEARCH_CONCURRENCY = 8
+
+# touch_slot buffers last-use timestamps in memory instead of writing on every
+# call (a read-heavy workload touches its active slot on every query, and a
+# write there would bump the project_slots table version once per query). A
+# touch is flushed inline once the oldest pending one has waited this long, so
+# a long-idle-but-still-running process does not lose LRU history indefinitely
+# if nothing else ever flushes it.
+SLOT_TOUCH_FLUSH_SECONDS = 300.0
+
+# The IVF_HNSW_SQ vector index is built once a partition holds this many chunk
+# rows, and only when the operator opted into hnsw. A flat cosine scan of the
+# 56k-chunk measurement index costs ~6 ms while a whole search call costs
+# ~230 ms, so no measured size argued for moving the gate; the constant exists
+# so the next measurement has one place to change
+# (docs/plans/2026-09-02-vector-index-gate-shipped.md).
+VECTOR_INDEX_MIN_ROWS = 20_000
+
+# hnsw-mode query settings, chosen by the same benchmark. Queried with
+# defaults, the quantised index loses ~13% of recall@10 against an exact scan:
+# the loss is scalar quantisation plus the default beam width, not IVF
+# partitioning (nprobes changed nothing). ef=100 with a refine pass over the
+# stored float16 vectors restores 0.999 for ~0.3 ms at 56k rows. Module
+# constants rather than settings: CODE_INDEXING_VECTOR_INDEX is enough surface.
+VECTOR_INDEX_EF = 100
+VECTOR_INDEX_REFINE_FACTOR = 2
 
 # Columns get_chunk reads. The vector and the identifier-terms column are
 # excluded: nothing outside indexing and ranking can use them, and reading them
@@ -140,6 +165,34 @@ def _quoted(value: str) -> str:
 
 def _optional_str(value: Any) -> str | None:
     return None if value is None else str(value)
+
+
+# A registry row past this many dirty/untracked paths would bloat every
+# registry read for a rare, very large changeset; beyond the cap the slot's
+# status-paths column is stored as null and the freshness fast path (see
+# Application._project_status_for_target) falls back to a full scan instead.
+MAX_PERSISTED_STATUS_PATHS = 2000
+
+
+def encode_status_paths(paths: Iterable[str]) -> str | None:
+    """JSON-encode the sorted, de-duplicated path list, or None past the cap."""
+    ordered = sorted(set(paths))
+    if len(ordered) > MAX_PERSISTED_STATUS_PATHS:
+        return None
+    return json.dumps(ordered, separators=(",", ":"), ensure_ascii=True)
+
+
+def decode_status_paths(value: str | None) -> frozenset[str] | None:
+    """Decode a slot's stored status-paths column, or None if absent or unusable."""
+    if value is None:
+        return None
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+        return None
+    return frozenset(decoded)
 
 
 def _legacy_slot_id(project_id: str) -> str:
@@ -492,6 +545,7 @@ class LanceStore:
         directory.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(directory / "registry", read_consistency_interval=timedelta(0))
         self._migrate_active_checkouts(directory / "registry")
+        self._migrate_project_slot_status_columns(directory / "registry")
         self._projects = self._table(self._db, "projects", self._project_schema())
         self._project_slots = self._table(self._db, "project_slots", self._project_slot_schema())
         self._active_slots = self._table(self._db, "active_slots", self._active_slot_schema())
@@ -500,6 +554,10 @@ class LanceStore:
         # Serializes legacy adoption inside this process; see _ensure_adopted
         # for why it is not the cross-process project writer lock.
         self._adoption_lock = threading.Lock()
+        # Buffered touch_slot timestamps, keyed by slot_id; see touch_slot and
+        # flush_slot_touches.
+        self._pending_slot_touches: dict[str, int] = {}
+        self._touch_lock = threading.Lock()
         for row in legacy_rows:
             row = {
                 **row,
@@ -518,11 +576,19 @@ class LanceStore:
             same_root = same_project_root(registered_root, incoming_root)
             if same_root:
                 project = project.model_copy(update={"root": registered_root})
-            elif existing_marker_path(registered_root) is not None:
+            elif registered_root.exists():
+                # The registered directory is still there -- whether or not its
+                # marker survives in it -- so a different, unrelated root
+                # claiming this id is ambiguous rather than a move: it could be
+                # a stale marker, a directory copy, or someone reusing an id.
+                # Only a directory that has vanished entirely (checked below by
+                # falling through) is the legitimate "the user moved it" case.
                 if not self._shares_repository(registered_root, incoming_root):
                     raise CodeIndexingError(
                         ErrorCode.PROJECT_ID_CONFLICT,
-                        "The project ID is already active at another path",
+                        "The project ID is already active at another path. Run "
+                        "remove_project on the registered root, or init_project "
+                        "with force_new_id here.",
                         project=project.id,
                         registered_root=str(registered_root),
                         incoming_root=str(incoming_root),
@@ -605,19 +671,73 @@ class LanceStore:
 
     def get_slot(self, slot_id: str) -> ProjectSlot | None:
         rows = self._rows(self._project_slots, f"slot_id = {_quoted(slot_id)}")
-        return self._slot_from_row(rows[0]) if rows else None
+        return self._overlay_pending_touch(self._slot_from_row(rows[0])) if rows else None
 
     def list_slots(self, project_id: str) -> list[ProjectSlot]:
         rows = self._rows(self._project_slots, f"project_id = {_quoted(project_id)}")
-        return [self._slot_from_row(row) for row in rows]
+        return [self._overlay_pending_touch(self._slot_from_row(row)) for row in rows]
+
+    def _overlay_pending_touch(self, slot: ProjectSlot) -> ProjectSlot:
+        """Apply a buffered touch_slot timestamp not yet written to disk.
+
+        Every LRU-retention reader goes through get_slot or list_slots, so
+        overlaying here (rather than in each reader) is enough to make
+        eviction order correct even when nothing has explicitly called
+        flush_slot_touches yet.
+        """
+        with self._touch_lock:
+            pending = self._pending_slot_touches.get(slot.slot_id)
+        if pending is None or pending <= slot.last_used_at:
+            return slot
+        return slot.model_copy(update={"last_used_at": pending})
 
     def touch_slot(self, slot_id: str) -> None:
-        """Stamp a slot's last-use time for least-recently-used retention."""
-        slot = self.get_slot(slot_id)
-        if slot is None:
+        """Stamp a slot's last-use time for least-recently-used retention.
+
+        Buffered in memory rather than written immediately: a read-heavy
+        workload touches its active slot on every query, and a write on every
+        touch would bump the project_slots table version -- and its on-disk
+        footprint -- once per query (see the query-path-overhead remediation
+        plan). flush_slot_touches merges every buffered touch in one write;
+        this also flushes inline once the oldest pending touch has waited
+        past SLOT_TOUCH_FLUSH_SECONDS, so a long-lived process without an
+        explicit flush call still bounds how much history a crash could lose.
+        """
+        now = time.time_ns()
+        with self._touch_lock:
+            self._pending_slot_touches[slot_id] = now
+            oldest = min(self._pending_slot_touches.values())
+        if (now - oldest) / 1_000_000_000 > SLOT_TOUCH_FLUSH_SECONDS:
+            self.flush_slot_touches()
+
+    def flush_slot_touches(self) -> None:
+        """Write every buffered touch_slot timestamp in one merge.
+
+        The buffer is drained before the write, not after: a touch that
+        arrives while this is running is left pending for the next flush
+        rather than lost or double-counted.
+        """
+        with self._touch_lock:
+            pending = dict(self._pending_slot_touches)
+            self._pending_slot_touches.clear()
+        if not pending:
             return
-        row = self._slot_row(slot.model_copy(update={"last_used_at": time.time_ns()}))
-        self._merge(self._project_slots, "slot_id", [row])
+        rows: list[dict[str, Any]] = []
+        for slot_id, touched_at in pending.items():
+            slot = self.get_slot(slot_id)
+            if slot is None:
+                continue
+            rows.append(self._slot_row(slot.model_copy(update={"last_used_at": touched_at})))
+        if rows:
+            self._merge(self._project_slots, "slot_id", rows)
+
+    def close(self) -> None:
+        """Release in-memory state that must not outlive the process.
+
+        Flushes every buffered slot touch so a later process's LRU decision
+        never mistakes an unflushed touch for genuine inactivity.
+        """
+        self.flush_slot_touches()
 
     def set_slot_state(
         self,
@@ -643,9 +763,15 @@ class LanceStore:
                 updates["indexed_clean"] = (
                     None if git.worktree.value == "unknown" else git.worktree.value == "clean"
                 )
+                updates["indexed_status_fingerprint"] = git.status_fingerprint
+                updates["indexed_status_paths"] = encode_status_paths(
+                    {*git.dirty_paths, *git.untracked_paths}
+                )
             else:
                 updates["indexed_head"] = None
                 updates["indexed_clean"] = None
+                updates["indexed_status_fingerprint"] = None
+                updates["indexed_status_paths"] = None
             # The generation identity the next freshness check compares against:
             # scan configuration, model, dimension, and schema as of this
             # commit. The caller's upsert_project has already refreshed the
@@ -775,7 +901,7 @@ class LanceStore:
         if not rows:
             raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {project.id}")
         desired = self._slot_for_git_state(rows[0], state)
-        active = self._active_partition_ref(project.id, checkout_key=selected_key)
+        active = self.active_partition_ref(project.id, checkout_key=selected_key)
         existing = self.get_slot(desired.slot_id)
         if existing is None:
             desired = desired.model_copy(update={"state": "pending"})
@@ -793,16 +919,20 @@ class LanceStore:
         self.upsert_slot(selected)
         if active is None or active.slot_id != selected.slot_id:
             self.activate_slot(project.id, selected.slot_id, checkout_key=selected_key)
-        active = self._active_partition_ref(project.id, checkout_key=selected_key)
+        active = self.active_partition_ref(project.id, checkout_key=selected_key)
         if active is None:
             raise CodeIndexingError(
                 ErrorCode.PROJECT_NOT_FOUND,
                 f"Project {project.id} has no active index slot",
             )
         self.touch_slot(active.slot_id)
+        # This path already writes (upsert_slot, possibly activate_slot), so
+        # flushing the touch here costs nothing extra and keeps activation
+        # durable rather than leaving it in the in-memory buffer.
+        self.flush_slot_touches()
         return active
 
-    def _active_partition_ref(
+    def active_partition_ref(
         self, project_id: str, *, checkout_key: str | None = None
     ) -> PartitionRef | None:
         slot_row = self._selected_pointer_row(project_id, checkout_key)
@@ -817,6 +947,18 @@ class LanceStore:
             partition_id=slot.partition_id,
             activation_epoch=int(slot_row["activation_epoch"]),
         )
+
+    def _active_partition_ref(
+        self, project_id: str, *, checkout_key: str | None = None
+    ) -> PartitionRef | None:
+        """Deprecated alias for :meth:`active_partition_ref`.
+
+        Kept for one release (D4 in
+        docs/plans/2026-09-02-review-remediation-5-application-split-plan.md):
+        this was a private the review found being called from outside the
+        class, so the contract it already was is now the public name.
+        """
+        return self.active_partition_ref(project_id, checkout_key=checkout_key)
 
     def _slot_for_git_state(self, row: dict[str, Any], state: GitState) -> ProjectSlot:
         project = ProjectInfo.model_validate_json(str(row["payload"]))
@@ -972,6 +1114,8 @@ class LanceStore:
             "project_prefix": slot.project_prefix,
             "indexed_head": slot.indexed_head,
             "indexed_clean": slot.indexed_clean,
+            "indexed_status_fingerprint": slot.indexed_status_fingerprint,
+            "indexed_status_paths": slot.indexed_status_paths,
             "scan_config_hash": slot.scan_config_hash,
             "model_id": slot.model_id,
             "vector_dimension": slot.vector_dimension,
@@ -996,6 +1140,8 @@ class LanceStore:
             indexed_clean=(
                 None if row.get("indexed_clean") is None else bool(row["indexed_clean"])
             ),
+            indexed_status_fingerprint=_optional_str(row.get("indexed_status_fingerprint")),
+            indexed_status_paths=_optional_str(row.get("indexed_status_paths")),
             scan_config_hash=str(row.get("scan_config_hash") or ""),
             model_id=str(row.get("model_id") or ""),
             vector_dimension=int(row.get("vector_dimension") or 0),
@@ -1065,7 +1211,7 @@ class LanceStore:
         row["state"] = "rebuild_required"
         row["updated_at"] = time.time_ns()
         self._merge(self._projects, "id", [row])
-        active = self._active_partition_ref(project_id)
+        active = self.active_partition_ref(project_id)
         if active is not None:
             slot = self.get_slot(active.slot_id)
             if slot is not None and slot.state != "rebuild_required":
@@ -1358,6 +1504,8 @@ class LanceStore:
         version: int | None = None,
         schema_version: int | None = None,
         record_kinds: Iterable[str] | None = None,
+        kinds: Iterable[str] | None = None,
+        extra_condition: str | None = None,
         partition_id: str | None = None,
     ) -> list[ReferenceRecord]:
         """Return structural rows from the requested immutable table version.
@@ -1366,17 +1514,34 @@ class LanceStore:
         Omitting them deliberately returns every row for recovery and raw-storage
         callers. Reference classification requests reference and coverage rows;
         declarations are fetched separately through narrower methods below.
+
+        `kinds` filters the `kind` column (e.g. narrowing `record_kind =
+        'reference'` rows to just `import`/`export`), independent of
+        `record_kinds`. `extra_condition` is one raw, already-assembled SQL
+        boolean expression ANDed onto the rest -- the reference-pushdown
+        candidate fetch (`_load_reference_context`/D1) builds a condition from
+        selector-specific spellings this generic method has no business
+        knowing about, so it is passed through verbatim rather than grown a
+        selector-shaped parameter here.
         """
         self._validate_schema_version(schema_version)
         conditions: list[str] = []
         if schema_version is not None:
             conditions.append(f"schema_version = {schema_version}")
         if record_kinds is not None:
-            kinds = sorted(set(record_kinds))
-            if not kinds:
+            record_kind_values = sorted(set(record_kinds))
+            if not record_kind_values:
                 return []
-            values = ", ".join(_quoted(kind) for kind in kinds)
+            values = ", ".join(_quoted(kind) for kind in record_kind_values)
             conditions.append(f"record_kind IN ({values})")
+        if kinds is not None:
+            kind_values = sorted(set(kinds))
+            if not kind_values:
+                return []
+            values = ", ".join(_quoted(kind) for kind in kind_values)
+            conditions.append(f"kind IN ({values})")
+        if extra_condition is not None:
+            conditions.append(f"({extra_condition})")
         condition = " AND ".join(conditions) if conditions else None
         return self._reference_rows(
             project_id, condition, version=version, partition_id=partition_id
@@ -1531,7 +1696,7 @@ class LanceStore:
         # id, one whose prefix names no project, or one from a pre-migration
         # generation is treated as unknown -- consistent with the existing
         # contract that chunk ids change when a file is re-indexed.
-        project_id = self._chunk_project_id(chunk_id)
+        project_id = self.chunk_project_id(chunk_id)
         if project_id is None:
             return None
         tables = self._project_existing_tables(project_id, partition_id=partition_id)
@@ -1560,7 +1725,7 @@ class LanceStore:
             return None
         return prefix
 
-    def _chunk_project_id(self, chunk_id: str) -> str | None:
+    def chunk_project_id(self, chunk_id: str) -> str | None:
         """Resolve a chunk id's routing prefix through the logical registry."""
         prefix = self._chunk_id_prefix(chunk_id)
         if prefix is None:
@@ -1568,6 +1733,16 @@ class LanceStore:
         if self._rows(self._projects, f"id = {_quoted(prefix)}"):
             return prefix
         return None
+
+    def _chunk_project_id(self, chunk_id: str) -> str | None:
+        """Deprecated alias for :meth:`chunk_project_id`.
+
+        Kept for one release (D4 in
+        docs/plans/2026-09-02-review-remediation-5-application-split-plan.md):
+        this was a private the review found being called from outside the
+        class, so the contract it already was is now the public name.
+        """
+        return self.chunk_project_id(chunk_id)
 
     def count_chunks(
         self,
@@ -1711,6 +1886,11 @@ class LanceStore:
         )
         if self.vector_index == "exact":
             query = query.bypass_vector_index()
+        else:
+            # The approximate index is only correct to the extent the query
+            # pays for accuracy: defaults cost 13% of recall@10, and the ef +
+            # refine pair above restores it (see VECTOR_INDEX_EF).
+            query = query.ef(VECTOR_INDEX_EF).refine_factor(VECTOR_INDEX_REFINE_FACTOR)
         # project_id is not stored on chunk rows; it belongs to the
         # partition being searched, so it is injected per project.
         query_rows = cast(list[dict[str, Any]], query.to_list())
@@ -1796,6 +1976,61 @@ class LanceStore:
             row["project_id"] = project_id
         return [ChunkPreview.model_validate(row) for row in rows]
 
+    def find_declarations(
+        self,
+        project_id: str,
+        path: str,
+        qualified_symbol: str,
+        *,
+        partition_id: str | None = None,
+    ) -> list[ChunkPreview]:
+        """Return declaration chunks at exactly this path and qualified symbol.
+
+        `ReferenceService._select` used to call `list_chunks` -- a full,
+        unfiltered scan and decode of every chunk in the project, vectors
+        excluded but everything else included -- just to filter two columns
+        in Python (perf-major 5). `path`/`qualified_symbol` equality is
+        pushed into the query instead, so a lookup costs O(matches) rather
+        than O(project chunks).
+        """
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return []
+        condition = f"path = {_quoted(path)} AND qualified_symbol = {_quoted(qualified_symbol)}"
+        rows = self._projected_chunks(tables.chunks, condition, limit=None, content=False)
+        for row in rows:
+            row["project_id"] = project_id
+        return [ChunkPreview.model_validate(row) for row in rows]
+
+    def declaration_symbols_by_tail(
+        self, project_id: str, tail: str, *, partition_id: str | None = None
+    ) -> list[str]:
+        """Every declaration's qualified_symbol whose own last `.`-segment is *tail*.
+
+        Feeds `_select`'s "did you mean" suggestion when no declaration
+        exactly matches the selector. The code being pushed down here
+        (`chunk.qualified_symbol.rsplit(".", 1)[-1] == tail`) genuinely
+        searches the whole project, not just one path -- deviation from the
+        original plan text, which described a path-scoped suggestion; the
+        actual behaviour being preserved is project-wide, so this is pushed
+        down as the same superset `= tail OR LIKE '%.tail'` pattern D1 uses
+        for reference candidates, rather than narrowed to a path that would
+        change what callers see.
+        """
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return []
+        condition = (
+            f"qualified_symbol = {_quoted(tail)} OR qualified_symbol LIKE {_quoted('%.' + tail)}"
+        )
+        rows = self._projected_chunks(
+            tables.chunks,
+            condition,
+            limit=None,
+            content=False,
+        )
+        return sorted({str(row["qualified_symbol"]) for row in rows if row.get("qualified_symbol")})
+
     def ensure_indexes(self, project_id: str, *, partition_id: str | None = None) -> None:
         """Create missing search indexes on the write path.
 
@@ -1831,7 +2066,7 @@ class LanceStore:
         if self.vector_index == "exact":
             for index in vector_indices:
                 chunks.drop_index(index.name)
-        elif not vector_indices and chunks.count_rows() >= 20_000:
+        elif not vector_indices and chunks.count_rows() >= VECTOR_INDEX_MIN_ROWS:
             chunks.create_index(
                 "vector",
                 config=HnswSq(distance_type="cosine"),
@@ -1851,6 +2086,12 @@ class LanceStore:
             "kind",
             "source_qualified_symbol",
             "schema_version",
+            # written_name/receiver_text back the reference-pushdown superset
+            # condition's `= S` terms (D1/D6); the `LIKE '%.S'` terms on
+            # target_name/written_name still scan, but over an
+            # already-indexed, narrow column.
+            "written_name",
+            "receiver_text",
         ):
             if column not in indexed_reference_columns:
                 tables.references.create_index(column, config=BTree(), replace=False)
@@ -2025,6 +2266,8 @@ class LanceStore:
                 ("project_prefix", pa.string()),
                 ("indexed_head", pa.string()),
                 ("indexed_clean", pa.bool_()),
+                ("indexed_status_fingerprint", pa.string()),
+                ("indexed_status_paths", pa.string()),
                 ("scan_config_hash", pa.string()),
                 ("model_id", pa.string()),
                 ("vector_dimension", pa.int32()),
@@ -2382,7 +2625,7 @@ class LanceStore:
         installation-wide report can resolve every project once and then
         collect each partition without N+1 registry reads.
         """
-        active = partition_ref or self._active_partition_ref(project.id)
+        active = partition_ref or self.active_partition_ref(project.id)
         if active is not None and active.project_id != project.id:
             raise ValueError("partition does not belong to project")
         partition_id = project.id if active is None else active.partition_id
@@ -2592,9 +2835,13 @@ class LanceStore:
         order_by: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         # project_id is deliberately absent: it is not stored on chunk rows
-        # and belongs to the owning partition, so callers inject it.
+        # and belongs to the owning partition, so callers inject it. file_id
+        # is included (unused by ChunkPreview, ignored on validation) because
+        # find_declarations needs it and adding one string column here is
+        # cheaper than a second projected-column list just for that.
         columns = [
             "chunk_id",
+            "file_id",
             "path",
             "language",
             "kind",
@@ -2668,3 +2915,52 @@ class LanceStore:
             ]
             if migrated:
                 self._merge(fresh, ["project_id", "checkout_key"], migrated)
+
+    def _migrate_project_slot_status_columns(self, registry_directory: Path) -> None:
+        """Add the status-fingerprint and status-paths columns to an older registry.
+
+        Existing rows keep every other field verbatim; the two new columns
+        come back null, which simply disables the freshness fast path for
+        that slot until the next index run stamps it (see D1/D2 of the
+        query-path-overhead remediation plan).
+        """
+        lock_directory = registry_directory.parent.parent / "locks"
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        with FileLock(lock_directory / ".project-slots-migrate.lock"):
+            try:
+                existing = self._db.open_table("project_slots")
+            except (ValueError, FileNotFoundError):
+                return
+            if "indexed_status_fingerprint" in {field.name for field in existing.schema}:
+                return
+            rows = self._rows(cast(LanceTable, existing))
+            self._db.drop_table("project_slots")
+            fresh = self._table(self._db, "project_slots", self._project_slot_schema())
+            migrated = [
+                {
+                    "slot_id": str(row["slot_id"]),
+                    "project_id": str(row["project_id"]),
+                    "partition_id": str(row["partition_id"]),
+                    "selector_kind": str(row["selector_kind"]),
+                    "selector_value": str(row["selector_value"]),
+                    "repository_identity": _optional_str(row.get("repository_identity")),
+                    "checkout_identity": _optional_str(row.get("checkout_identity")),
+                    "project_prefix": str(row.get("project_prefix") or ""),
+                    "indexed_head": _optional_str(row.get("indexed_head")),
+                    "indexed_clean": (
+                        None if row.get("indexed_clean") is None else bool(row["indexed_clean"])
+                    ),
+                    "indexed_status_fingerprint": None,
+                    "indexed_status_paths": None,
+                    "scan_config_hash": str(row.get("scan_config_hash") or ""),
+                    "model_id": str(row.get("model_id") or ""),
+                    "vector_dimension": int(row.get("vector_dimension") or 0),
+                    "schema_version": int(row.get("schema_version") or 0),
+                    "state": str(row.get("state") or "pending"),
+                    "created_at": int(row.get("created_at") or 0),
+                    "last_used_at": int(row.get("last_used_at") or 0),
+                }
+                for row in rows
+            ]
+            if migrated:
+                self._merge(fresh, "slot_id", migrated)

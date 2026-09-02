@@ -1,0 +1,591 @@
+{
+  "schema_version": 1,
+  "model_id": "jinaai/jina-embeddings-v2-base-code",
+  "dimension": 768,
+  "real_vectors": 56266,
+  "sources": [
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-3c52ddb724ff64fe36b24680835e7188",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-41632c94ff325e4f1c1915fce252f901",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-4c754cbc747705d82c23faa2968a8643",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-70a06d5984b6725e17a3c630fbc24523",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-7f48cde978514a1cb2ecc125036c5677",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-8e85e6b0da456844690edb9666ad3313",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-d8089dbc77d5bf70542c52ab71d761f4",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-dccab4f3513eb8df71a8831d4f13722c",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-f9f1d167a919e8e2a3b9d6ffd892777b"
+  ],
+  "queries": {
+    "handwritten": 40,
+    "derived": 160
+  },
+  "top_k": 10,
+  "augment_sigma": 0.05,
+  "sizes": [
+    {
+      "rows": 20000,
+      "flat": {
+        "latency_ms": {
+          "median": 3.22,
+          "p90": 3.42,
+          "max": 23.31
+        },
+        "recall": 0.9995
+      },
+      "hnsw": {
+        "build_s": 0.54,
+        "index_bytes": 17789934,
+        "variants": {
+          "nprobes=default,ef=default,refine=none": {
+            "nprobes": null,
+            "ef": null,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 0.72,
+              "p90": 1.34,
+              "max": 5.0
+            },
+            "recall": 0.871
+          },
+          "nprobes=default,ef=default,refine=2": {
+            "nprobes": null,
+            "ef": null,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.03,
+              "p90": 1.13,
+              "max": 1.4
+            },
+            "recall": 0.9645
+          },
+          "nprobes=default,ef=default,refine=5": {
+            "nprobes": null,
+            "ef": null,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.2,
+              "p90": 1.3,
+              "max": 1.85
+            },
+            "recall": 0.99
+          },
+          "nprobes=default,ef=default,refine=10": {
+            "nprobes": null,
+            "ef": null,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.53,
+              "p90": 1.64,
+              "max": 1.88
+            },
+            "recall": 0.999
+          },
+          "nprobes=default,ef=100,refine=none": {
+            "nprobes": null,
+            "ef": 100,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 0.73,
+              "p90": 0.79,
+              "max": 1.02
+            },
+            "recall": 0.9705
+          },
+          "nprobes=default,ef=100,refine=2": {
+            "nprobes": null,
+            "ef": 100,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.03,
+              "p90": 1.12,
+              "max": 1.38
+            },
+            "recall": 0.995
+          },
+          "nprobes=default,ef=100,refine=5": {
+            "nprobes": null,
+            "ef": 100,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.2,
+              "p90": 1.32,
+              "max": 2.02
+            },
+            "recall": 0.995
+          },
+          "nprobes=default,ef=100,refine=10": {
+            "nprobes": null,
+            "ef": 100,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.48,
+              "p90": 1.58,
+              "max": 1.95
+            },
+            "recall": 0.995
+          },
+          "nprobes=default,ef=300,refine=none": {
+            "nprobes": null,
+            "ef": 300,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 0.85,
+              "p90": 0.94,
+              "max": 1.18
+            },
+            "recall": 0.973
+          },
+          "nprobes=default,ef=300,refine=2": {
+            "nprobes": null,
+            "ef": 300,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.17,
+              "p90": 1.33,
+              "max": 1.65
+            },
+            "recall": 0.9995
+          },
+          "nprobes=default,ef=300,refine=5": {
+            "nprobes": null,
+            "ef": 300,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.34,
+              "p90": 1.44,
+              "max": 1.66
+            },
+            "recall": 0.9995
+          },
+          "nprobes=default,ef=300,refine=10": {
+            "nprobes": null,
+            "ef": 300,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.63,
+              "p90": 1.76,
+              "max": 1.95
+            },
+            "recall": 0.9995
+          },
+          "nprobes=50,ef=default,refine=none": {
+            "nprobes": 50,
+            "ef": null,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 0.67,
+              "p90": 0.69,
+              "max": 0.87
+            },
+            "recall": 0.871
+          },
+          "nprobes=50,ef=default,refine=2": {
+            "nprobes": 50,
+            "ef": null,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 0.98,
+              "p90": 1.07,
+              "max": 1.3
+            },
+            "recall": 0.9645
+          },
+          "nprobes=50,ef=default,refine=5": {
+            "nprobes": 50,
+            "ef": null,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.19,
+              "p90": 1.31,
+              "max": 1.53
+            },
+            "recall": 0.99
+          },
+          "nprobes=50,ef=default,refine=10": {
+            "nprobes": 50,
+            "ef": null,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.63,
+              "p90": 1.83,
+              "max": 2.57
+            },
+            "recall": 0.999
+          },
+          "nprobes=50,ef=100,refine=none": {
+            "nprobes": 50,
+            "ef": 100,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 0.79,
+              "p90": 0.9,
+              "max": 1.02
+            },
+            "recall": 0.9705
+          },
+          "nprobes=50,ef=100,refine=2": {
+            "nprobes": 50,
+            "ef": 100,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.03,
+              "p90": 1.11,
+              "max": 1.29
+            },
+            "recall": 0.995
+          },
+          "nprobes=50,ef=100,refine=5": {
+            "nprobes": 50,
+            "ef": 100,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.2,
+              "p90": 1.32,
+              "max": 1.9
+            },
+            "recall": 0.995
+          },
+          "nprobes=50,ef=100,refine=10": {
+            "nprobes": 50,
+            "ef": 100,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.5,
+              "p90": 1.63,
+              "max": 1.97
+            },
+            "recall": 0.995
+          },
+          "nprobes=50,ef=300,refine=none": {
+            "nprobes": 50,
+            "ef": 300,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 0.95,
+              "p90": 1.09,
+              "max": 1.32
+            },
+            "recall": 0.973
+          },
+          "nprobes=50,ef=300,refine=2": {
+            "nprobes": 50,
+            "ef": 300,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.25,
+              "p90": 1.42,
+              "max": 1.63
+            },
+            "recall": 0.9995
+          },
+          "nprobes=50,ef=300,refine=5": {
+            "nprobes": 50,
+            "ef": 300,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.39,
+              "p90": 1.53,
+              "max": 5.39
+            },
+            "recall": 0.9995
+          },
+          "nprobes=50,ef=300,refine=10": {
+            "nprobes": 50,
+            "ef": 300,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.7,
+              "p90": 1.92,
+              "max": 2.61
+            },
+            "recall": 0.9995
+          }
+        }
+      },
+      "synthetic": false,
+      "real_rows": 20000
+    },
+    {
+      "rows": 56266,
+      "flat": {
+        "latency_ms": {
+          "median": 6.36,
+          "p90": 6.82,
+          "max": 8.72
+        },
+        "recall": 1.0
+      },
+      "hnsw": {
+        "build_s": 1.99,
+        "index_bytes": 49794298,
+        "variants": {
+          "nprobes=default,ef=default,refine=none": {
+            "nprobes": null,
+            "ef": null,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 0.78,
+              "p90": 0.87,
+              "max": 11.96
+            },
+            "recall": 0.8685
+          },
+          "nprobes=default,ef=default,refine=2": {
+            "nprobes": null,
+            "ef": null,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.04,
+              "p90": 1.13,
+              "max": 1.56
+            },
+            "recall": 0.9575
+          },
+          "nprobes=default,ef=default,refine=5": {
+            "nprobes": null,
+            "ef": null,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.26,
+              "p90": 1.36,
+              "max": 1.66
+            },
+            "recall": 0.996
+          },
+          "nprobes=default,ef=default,refine=10": {
+            "nprobes": null,
+            "ef": null,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.64,
+              "p90": 1.77,
+              "max": 1.94
+            },
+            "recall": 0.9995
+          },
+          "nprobes=default,ef=100,refine=none": {
+            "nprobes": null,
+            "ef": 100,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 0.83,
+              "p90": 0.93,
+              "max": 1.1
+            },
+            "recall": 0.9725
+          },
+          "nprobes=default,ef=100,refine=2": {
+            "nprobes": null,
+            "ef": 100,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.1,
+              "p90": 1.24,
+              "max": 1.37
+            },
+            "recall": 0.9985
+          },
+          "nprobes=default,ef=100,refine=5": {
+            "nprobes": null,
+            "ef": 100,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.33,
+              "p90": 1.47,
+              "max": 1.7
+            },
+            "recall": 0.9985
+          },
+          "nprobes=default,ef=100,refine=10": {
+            "nprobes": null,
+            "ef": 100,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.59,
+              "p90": 1.73,
+              "max": 2.06
+            },
+            "recall": 0.9985
+          },
+          "nprobes=default,ef=300,refine=none": {
+            "nprobes": null,
+            "ef": 300,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 1.03,
+              "p90": 1.15,
+              "max": 1.36
+            },
+            "recall": 0.973
+          },
+          "nprobes=default,ef=300,refine=2": {
+            "nprobes": null,
+            "ef": 300,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.33,
+              "p90": 1.47,
+              "max": 1.63
+            },
+            "recall": 0.9995
+          },
+          "nprobes=default,ef=300,refine=5": {
+            "nprobes": null,
+            "ef": 300,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.49,
+              "p90": 1.66,
+              "max": 1.85
+            },
+            "recall": 0.9995
+          },
+          "nprobes=default,ef=300,refine=10": {
+            "nprobes": null,
+            "ef": 300,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.81,
+              "p90": 2.0,
+              "max": 2.38
+            },
+            "recall": 0.9995
+          },
+          "nprobes=50,ef=default,refine=none": {
+            "nprobes": 50,
+            "ef": null,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 0.71,
+              "p90": 0.8,
+              "max": 0.96
+            },
+            "recall": 0.8685
+          },
+          "nprobes=50,ef=default,refine=2": {
+            "nprobes": 50,
+            "ef": null,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.03,
+              "p90": 1.13,
+              "max": 1.3
+            },
+            "recall": 0.9575
+          },
+          "nprobes=50,ef=default,refine=5": {
+            "nprobes": 50,
+            "ef": null,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.29,
+              "p90": 1.41,
+              "max": 2.01
+            },
+            "recall": 0.996
+          },
+          "nprobes=50,ef=default,refine=10": {
+            "nprobes": 50,
+            "ef": null,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.69,
+              "p90": 1.79,
+              "max": 2.03
+            },
+            "recall": 0.9995
+          },
+          "nprobes=50,ef=100,refine=none": {
+            "nprobes": 50,
+            "ef": 100,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 0.85,
+              "p90": 0.94,
+              "max": 1.08
+            },
+            "recall": 0.9725
+          },
+          "nprobes=50,ef=100,refine=2": {
+            "nprobes": 50,
+            "ef": 100,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.18,
+              "p90": 1.32,
+              "max": 1.81
+            },
+            "recall": 0.9985
+          },
+          "nprobes=50,ef=100,refine=5": {
+            "nprobes": 50,
+            "ef": 100,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.32,
+              "p90": 1.46,
+              "max": 1.79
+            },
+            "recall": 0.9985
+          },
+          "nprobes=50,ef=100,refine=10": {
+            "nprobes": 50,
+            "ef": 100,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.59,
+              "p90": 1.69,
+              "max": 4.11
+            },
+            "recall": 0.9985
+          },
+          "nprobes=50,ef=300,refine=none": {
+            "nprobes": 50,
+            "ef": 300,
+            "refine_factor": null,
+            "latency_ms": {
+              "median": 1.03,
+              "p90": 1.16,
+              "max": 1.31
+            },
+            "recall": 0.973
+          },
+          "nprobes=50,ef=300,refine=2": {
+            "nprobes": 50,
+            "ef": 300,
+            "refine_factor": 2,
+            "latency_ms": {
+              "median": 1.33,
+              "p90": 1.48,
+              "max": 1.86
+            },
+            "recall": 0.9995
+          },
+          "nprobes=50,ef=300,refine=5": {
+            "nprobes": 50,
+            "ef": 300,
+            "refine_factor": 5,
+            "latency_ms": {
+              "median": 1.56,
+              "p90": 1.75,
+              "max": 2.88
+            },
+            "recall": 0.9995
+          },
+          "nprobes=50,ef=300,refine=10": {
+            "nprobes": 50,
+            "ef": 300,
+            "refine_factor": 10,
+            "latency_ms": {
+              "median": 1.81,
+              "p90": 1.97,
+              "max": 2.21
+            },
+            "recall": 0.9995
+          }
+        }
+      },
+      "synthetic": false,
+      "real_rows": 56266
+    }
+  ]
+}

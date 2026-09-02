@@ -8,11 +8,14 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from ..application import RuntimePaths
 from .accelerator import ACCELERATOR_CHOICES
 from .config_files import InstallerError
+from .daemon_control import daemon_relevant_settings_changed, stop_daemon
 from .harnesses import HARNESS_CHOICES, parse_harness_selection
 from .orchestrator import (
     InstallPlan,
+    InstallResult,
     StepEvent,
     default_install_directory,
     run_install,
@@ -115,6 +118,23 @@ def parse_settings(pairs: Sequence[str], unsets: Sequence[str]) -> dict[str, str
 def _print_event(event: StepEvent) -> None:
     stream = sys.stderr if event.status in {"warning", "failed"} else sys.stdout
     print(f"[{event.step}] {event.status}: {event.detail}", file=stream)
+
+
+def _restart_daemon_if_settings_changed(result: InstallResult) -> None:
+    """D6: a running daemon serves stale settings once a config write changes one.
+
+    Only reached for the reconfigure/``configure`` path (see the call site):
+    a fresh install has nothing running yet to be stale, and repair
+    deliberately writes back the settings already in place, so nothing here
+    would find a change to act on. Nothing is printed when no harness was
+    actually configured (the write this guards never happened) or no managed
+    setting changed.
+    """
+
+    if not result.configured or not daemon_relevant_settings_changed(result.env_written):
+        return
+    status, detail = stop_daemon(RuntimePaths.from_environment(), reason="settings")
+    _print_event(StepEvent("daemon", status, detail))
 
 
 def _prompt_harnesses(
@@ -241,6 +261,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             modify_shell_profiles=not args.no_modify_path,
         )
         result = run_install(plan, on_event=_print_event)
+        if args.reconfigure:
+            _restart_daemon_if_settings_changed(result)
     except InstallerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

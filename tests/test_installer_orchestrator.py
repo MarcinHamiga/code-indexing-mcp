@@ -95,6 +95,13 @@ def test_run_install_emits_step_events_in_order(
     assert result.failures == ()
     assert result.accelerator_plan is not None
     assert result.accelerator_plan.accelerator == "cpu"
+    # D6 (installer/daemon_control.py): configure reads this back to decide
+    # whether a daemon-consumed setting changed, so it must include the
+    # accelerator-driven addition, not just the caller's own env_updates.
+    assert result.env_written == {
+        "CODE_INDEXING_OFFLINE": "1",
+        EMBED_ACCELERATOR_SETTING: "cpu",
+    }
 
 
 @pytest.mark.parametrize(
