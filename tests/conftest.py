@@ -15,7 +15,7 @@ def case_insensitive_path_alias() -> Callable[[Path], Path]:
 
     def alias(path: Path) -> Path:
         candidate = path.with_name(path.name.swapcase())
-        if candidate == path or not candidate.exists() or not candidate.samefile(path):
+        if candidate.name == path.name or not candidate.exists() or not candidate.samefile(path):
             pytest.skip("test requires a case-insensitive filesystem")
         return candidate
 

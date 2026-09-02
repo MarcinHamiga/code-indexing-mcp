@@ -149,7 +149,7 @@ def probe_git_state(
         return _fallback_state(root, GitProbeOutcome.UNAVAILABLE)
     if identities.returncode != 0:
         return _fallback_state(root, GitProbeOutcome.NOT_GIT)
-    lines = [line.strip() for line in identities.stdout.splitlines()]
+    lines = identities.stdout.splitlines()
     if len(lines) != 4 or not all(lines[:3]):
         return _fallback_state(root, GitProbeOutcome.INVALID)
     toplevel = Path(lines[2])

@@ -152,6 +152,18 @@ def test_subdirectory_root_reports_prefix_and_resolves_relative_directories(
     assert state.untracked_paths == ("inner.py",)
 
 
+def test_subdirectory_prefix_preserves_leading_whitespace(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    project_root = root / " leading-space"
+    project_root.mkdir()
+
+    state = probe_git_state(project_root)
+
+    assert state.probe is GitProbeOutcome.GIT
+    assert state.project_prefix == " leading-space"
+    assert state.repository_identity == str((root / ".git").resolve())
+
+
 def test_case_insensitive_subdirectory_alias_keeps_git_identity(
     tmp_path: Path, case_insensitive_path_alias: Callable[[Path], Path]
 ) -> None:
