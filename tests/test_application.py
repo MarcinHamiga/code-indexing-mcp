@@ -322,6 +322,13 @@ def test_reference_query_reports_an_incomplete_structural_index(tmp_path: Path) 
                 qualified_symbol="answer",
             )
         )
+        radius = app.impact_radius(
+            DeclarationSelector(
+                project=project.id,
+                path="main.py",
+                qualified_symbol="answer",
+            )
+        )
         analysis = app.analyze_refactor(
             DeclarationSelector(
                 project=project.id,
@@ -333,6 +340,7 @@ def test_reference_query_reports_an_incomplete_structural_index(tmp_path: Path) 
 
     limitation = next(item for item in response.limitations if item.code == "parse_error")
     assert "broken.py" in limitation.explanation
+    assert radius.completeness.state == "incomplete"
     assert analysis.completeness.state == "incomplete"
 
 
@@ -362,11 +370,13 @@ def test_reference_queries_prepare_selectors_once(tmp_path: Path) -> None:
     ) as ensure_reference_index:
         for selector in selectors:
             response = app.find_references(selector)
+            radius = app.impact_radius(selector)
             analysis = app.analyze_refactor(selector, RenameOperation(new_name="result"))
 
             assert response.selected.qualified_symbol == "answer"
+            assert radius.selected.qualified_symbol == "answer"
             assert analysis.selected.qualified_symbol == "answer"
-    assert ensure_reference_index.call_count == 4
+    assert ensure_reference_index.call_count == 6
     assert {call.args[0] for call in ensure_reference_index.call_args_list} == {project.id}
 
 
@@ -2347,6 +2357,7 @@ def test_reference_tools_read_the_selected_worktree_root(tmp_path: Path) -> None
     )
 
     references = app.find_references(selector, roots=[worktree])
+    radius = app.impact_radius(selector, roots=[worktree])
     analysis = app.analyze_refactor(
         selector, RenameOperation(new_name="validate"), roots=[worktree]
     )
@@ -2355,6 +2366,7 @@ def test_reference_tools_read_the_selected_worktree_root(tmp_path: Path) -> None
     )
 
     assert {item.path for item in references.hits} == {"consumer.py"}
+    assert radius.layers[0].edges[0].target.qualified_symbol == "run"
     assert analysis.counts.must_change == 3
     assert patch.applied == 3
     assert patch.completeness.state == "complete"

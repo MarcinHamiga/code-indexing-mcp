@@ -6,7 +6,7 @@ import pytest
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
-from code_indexing_mcp.models import DeclarationSelector
+from code_indexing_mcp.models import DeclarationSelector, SelectedDeclaration
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.reference_service import ReferenceService
 from code_indexing_mcp.scanner import SourceScanner
@@ -24,7 +24,12 @@ class TinyEmbedder:
         return [1.0, 0.0, 0.0, float(len(text))]
 
 
-def _indexed_service(tmp_path: Path, files: dict[str, str]) -> tuple[ReferenceService, str]:
+def _indexed_service(
+    tmp_path: Path,
+    files: dict[str, str],
+    *,
+    extractor: TreeSitterExtractor | None = None,
+) -> tuple[ReferenceService, str]:
     root = tmp_path / "repo"
     root.mkdir()
     for path, source in files.items():
@@ -36,7 +41,7 @@ def _indexed_service(tmp_path: Path, files: dict[str, str]) -> tuple[ReferenceSe
     indexer = Indexer(
         store=store,
         scanner=SourceScanner(),
-        extractor=TreeSitterExtractor(),
+        extractor=extractor or TreeSitterExtractor(),
         embedder=TinyEmbedder(),
         lock_directory=tmp_path / "locks",
     )
@@ -1154,3 +1159,240 @@ def test_java_member_write_on_unrelated_receiver_is_never_exact(tmp_path: Path) 
     write = next(hit for hit in response.hits if hit.kind == "write")
     assert write.resolution == "likely"
     assert write.reason_code == "unknown_receiver"
+
+
+def test_impact_radius_returns_layers_for_a_dependency_chain(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "graph.py": (
+                "def base():\n    return 1\n\n"
+                "def middle():\n    return base()\n\n"
+                "def outer():\n    return middle()\n"
+            )
+        },
+    )
+
+    result = service.impact_radius(
+        DeclarationSelector(project=project_id, path="graph.py", qualified_symbol="base")
+    )
+
+    assert [[edge.target.qualified_symbol for edge in layer.edges] for layer in result.layers] == [
+        ["middle"],
+        ["outer"],
+    ]
+    assert result.visited == 3
+    assert result.completeness.state == "complete"
+
+
+def test_impact_radius_preserves_identity_for_split_declarations(tmp_path: Path) -> None:
+    body = "".join(f"    value_{index} = {index}\n" for index in range(20))
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "graph.py": (
+                f"def base():\n{body}    return 1\n\ndef dependent():\n{body}    return base()\n"
+            )
+        },
+        extractor=TreeSitterExtractor(max_chars=120, max_lines=6, overlap_lines=1),
+    )
+    chunks = service.store.list_chunks([project_id])
+    base_chunks = [chunk for chunk in chunks if chunk.qualified_symbol == "base"]
+    dependent_chunks = [chunk for chunk in chunks if chunk.qualified_symbol == "dependent"]
+    assert len(base_chunks) > 1
+    assert len(dependent_chunks) > 1
+
+    result = service.impact_radius(DeclarationSelector(chunk_id=base_chunks[0].chunk_id))
+
+    assert [edge.target.qualified_symbol for edge in result.layers[0].edges] == ["dependent"]
+    assert result.visited == 2
+    assert result.completeness.state == "complete"
+
+
+def test_impact_radius_deduplicates_diamonds_and_reports_cycles(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "graph.py": (
+                "def base():\n    return 1\n\n"
+                "def left():\n    return base()\n\n"
+                "def right():\n    return base()\n\n"
+                "def top():\n    return left() + right()\n\n"
+                "def self_ref():\n    return self_ref()\n"
+            )
+        },
+    )
+    selector = DeclarationSelector(project=project_id, path="graph.py", qualified_symbol="base")
+
+    diamond = service.impact_radius(selector)
+
+    assert diamond.visited == 4
+    assert [edge.target.qualified_symbol for edge in diamond.layers[0].edges] == ["left", "right"]
+    assert [edge.target.qualified_symbol for edge in diamond.layers[1].edges] == ["top", "top"]
+
+    self_cycle = service.impact_radius(
+        DeclarationSelector(
+            project=project_id,
+            path="graph.py",
+            qualified_symbol="self_ref",
+        )
+    )
+    assert self_cycle.layers[0].edges[0].cycle_to_depth == 0
+    assert self_cycle.visited == 1
+
+    cycle_root = tmp_path / "cycle"
+    cycle_root.mkdir()
+    cyclic, cyclic_project_id = _indexed_service(
+        cycle_root,
+        {"graph.py": ("def first():\n    return second()\n\ndef second():\n    return first()\n")},
+    )
+    cycle = cyclic.impact_radius(
+        DeclarationSelector(
+            project=cyclic_project_id,
+            path="graph.py",
+            qualified_symbol="first",
+        )
+    )
+
+    assert cycle.layers[1].edges[0].target.qualified_symbol == "first"
+    assert cycle.layers[1].edges[0].cycle_to_depth == 0
+    assert cycle.visited == 2
+
+
+def test_impact_radius_likely_edges_are_opt_in_and_taint_descendants(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "graph.py": (
+                "def base():\n    return 1\n\n"
+                "def maybe(value):\n    return value.base()\n\n"
+                "def downstream():\n    return maybe(None)\n"
+            )
+        },
+    )
+    selector = DeclarationSelector(project=project_id, path="graph.py", qualified_symbol="base")
+
+    exact_only = service.impact_radius(selector)
+    included = service.impact_radius(selector, include_likely=True)
+
+    assert exact_only.layers[0].edges == []
+    assert exact_only.layers[0].review[0].hit.resolution == "likely"
+    assert included.layers[0].edges[0].possible is True
+    assert included.layers[0].edges[0].tainted is True
+    assert included.layers[1].edges[0].possible is False
+    assert included.layers[1].edges[0].tainted is True
+    assert included.completeness.state == "complete_with_dynamic_limitations"
+
+
+def test_impact_radius_aggregates_kinds_and_keeps_unattributed_hits_in_review(
+    tmp_path: Path,
+) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "graph.py": (
+                "def base():\n    return 1\n\n"
+                "def caller():\n    callback = base\n    return base()\n\n"
+                "base()\n"
+            )
+        },
+    )
+    selector = DeclarationSelector(project=project_id, path="graph.py", qualified_symbol="base")
+
+    result = service.impact_radius(selector)
+    calls_only = service.impact_radius(selector, kinds={"call"})
+
+    assert result.layers[0].edges[0].kinds == ["call", "read"]
+    assert result.layers[0].review[0].hit.start_line == 8
+    assert calls_only.layers[0].edges[0].kinds == ["call"]
+
+
+def test_impact_radius_reports_and_enforces_the_node_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependents = "\n\n".join(f"def dependent_{index}():\n    return base()" for index in range(50))
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"graph.py": f"def base():\n    return 1\n\n{dependents}\n"},
+    )
+    selector = DeclarationSelector(project=project_id, path="graph.py", qualified_symbol="base")
+    select_calls = 0
+    real_select = service._select
+
+    def counting_select(
+        selected: DeclarationSelector, *, partition_id: str | None = None
+    ) -> SelectedDeclaration:
+        nonlocal select_calls
+        select_calls += 1
+        return real_select(selected, partition_id=partition_id)
+
+    monkeypatch.setattr(service, "_select", counting_select)
+
+    result = service.impact_radius(selector, max_nodes=2)
+
+    assert result.visited == 2
+    assert result.budget_exhausted is True
+    assert result.budget_exhaustion is not None
+    assert result.budget_exhaustion.depth == 1
+    assert result.budget_exhaustion.unvisited_frontier == 49
+    assert len(result.layers[0].edges) == 1
+    assert result.completeness.state == "incomplete"
+    assert select_calls == 1
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.impact_radius(selector, max_nodes=2001)
+    assert excinfo.value.code is ErrorCode.INVALID_FILTER
+
+
+def test_impact_radius_cursor_is_request_bound_and_slot_bound(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "graph.py": (
+                "def base():\n    return 1\n\n"
+                "def a():\n    return base()\n\n"
+                "def b():\n    return base()\n"
+            )
+        },
+    )
+    selector = DeclarationSelector(project=project_id, path="graph.py", qualified_symbol="base")
+    first = service.impact_radius(selector, limit=1)
+    assert first.cursor is not None
+
+    file_id = service.store.list_files(project_id)[0].file_id
+    service.store.replace_files_from_arrow(
+        project_id,
+        files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+        chunk_batches=(),
+        reference_batches=[
+            ([file_id], pa.Table.from_batches([], schema=LanceStore.reference_arrow_schema()))
+        ],
+    )
+    second = service.impact_radius(selector, limit=1, cursor=first.cursor)
+    assert second.layers[0].edges
+    assert second.snapshot_version == first.snapshot_version
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.impact_radius(selector, max_depth=1, limit=1, cursor=first.cursor)
+    assert excinfo.value.code is ErrorCode.INVALID_CURSOR
+
+    payload = service._decode_impact_cursor(first.cursor)
+    payload["slot_id"] = "inactive-slot"
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.impact_radius(selector, limit=1, cursor=service._encode_cursor(payload))
+    assert excinfo.value.code is ErrorCode.STALE_CURSOR
+
+
+def test_impact_radius_coverage_gaps_degrade_completeness(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "graph.py": "def base():\n    return 1\n",
+            "native.c": "int caller(void) { return 1; }\n",
+        },
+    )
+
+    result = service.impact_radius(
+        DeclarationSelector(project=project_id, path="graph.py", qualified_symbol="base")
+    )
+
+    assert any(item.code == "unsupported_language" for item in result.limitations)
+    assert result.completeness.state == "incomplete"

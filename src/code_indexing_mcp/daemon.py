@@ -32,6 +32,7 @@ from .models import (
     CodeChunk,
     DeclarationSelector,
     HistoryPage,
+    ImpactRadiusResponse,
     IndexReport,
     IndexTrigger,
     MaintenanceReport,
@@ -54,12 +55,12 @@ from .settings import IndexSettings
 
 logger = logging.getLogger(__name__)
 
-# Bumped whenever the RPC surface changes shape (version 3 added chunked
-# responses; version 2 added the `trigger`
+# Bumped whenever the RPC surface changes shape (version 4 added impact_radius;
+# version 3 added chunked responses; version 2 added the `trigger`
 # parameter to index_project): a long-lived daemon from a previous release must
 # reject requests it cannot dispatch instead of failing inside them, and the
 # mismatch is what tells ensure_daemon to retire it and start a current one.
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_FRAME_BYTES = 16 * 1024**2
 MAX_RESPONSE_BYTES = 256 * 1024**2
 MAX_RESPONSE_CHUNK_BYTES = 8 * 1024**2
@@ -482,6 +483,12 @@ class DaemonServer:
             return app.find_references(
                 selector, kinds=set(kinds) if kinds is not None else None, roots=roots, **params
             )
+        if method == "impact_radius":
+            selector = DeclarationSelector.model_validate(params.pop("selector"))
+            kinds = params.pop("kinds", None)
+            return app.impact_radius(
+                selector, kinds=set(kinds) if kinds is not None else None, roots=roots, **params
+            )
         if method == "analyze_refactor":
             selector = DeclarationSelector.model_validate(params.pop("selector"))
             operation = _REFACTOR_OPERATION.validate_python(params.pop("operation"))
@@ -764,6 +771,11 @@ class BrokerApplication:
     def find_references(self, selector: DeclarationSelector, **params: Any) -> ReferenceResponse:
         return ReferenceResponse.model_validate(
             self._call("find_references", selector=selector, **params)
+        )
+
+    def impact_radius(self, selector: DeclarationSelector, **params: Any) -> ImpactRadiusResponse:
+        return ImpactRadiusResponse.model_validate(
+            self._call("impact_radius", selector=selector, **params)
         )
 
     def analyze_refactor(
