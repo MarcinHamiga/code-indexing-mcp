@@ -2126,6 +2126,27 @@ def test_a_worktree_joins_the_registration_and_keeps_its_own_slot(
     assert {hit.project_id for hit in merged.hits} == {project.id}
 
 
+def test_case_insensitive_worktree_alias_joins_the_registration(
+    tmp_path: Path, case_insensitive_path_alias: Callable[[Path], Path]
+) -> None:
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    worktree = tmp_path / "worktree"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=root)
+    alias = case_insensitive_path_alias(worktree)
+
+    joined = app.init_project(alias)
+
+    assert joined.id == project.id
+    assert len(app.list_projects()) == 1
+    assert app.project_status(project.id, roots=[alias]).git_probe == GitProbeOutcome.GIT.value
+
+
 def test_search_merges_slots_of_all_requested_checkouts(tmp_path: Path) -> None:
     root, _ = _git_repo_with_main(tmp_path)
     app = Application(

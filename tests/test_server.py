@@ -1096,12 +1096,14 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
             await client.list_tools()
             await _wait_until(embedder.started.is_set, timeout=30)
 
+            # The startup embedder stays blocked until finally, so a generous
+            # CI bound still catches an accidental wait on that unrelated job.
             result = await asyncio.wait_for(
                 client.call_tool(
                     "search_code",
                     {"query": "answer", "projects": [ready_project.id]},
                 ),
-                timeout=0.5,
+                timeout=5,
             )
 
             assert not result.isError
