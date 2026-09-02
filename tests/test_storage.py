@@ -2653,6 +2653,89 @@ def test_upsert_project_still_conflicts_for_a_copied_tree(tmp_path: Path) -> Non
     assert excinfo.value.code == ErrorCode.PROJECT_ID_CONFLICT
 
 
+def test_upsert_project_accepts_a_move_once_the_old_root_is_gone(tmp_path: Path) -> None:
+    """A registered root that no longer exists at all is a legitimate move."""
+    root = _git_repo(tmp_path, "repo")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model")
+    shutil.rmtree(root)
+
+    new_root = tmp_path / "moved"
+    new_root.mkdir()
+    moved = ProjectInfo(id=project.id, name=project.name, root=new_root)
+    store.upsert_project(moved, model_id="test/model")
+
+    stored = ProjectInfo.model_validate_json(
+        str(store._rows(store._projects, f"id = '{project.id}'")[0]["payload"])
+    )
+    assert stored.root == new_root.resolve()
+
+
+def test_upsert_project_conflicts_when_the_registered_root_survives_without_its_marker(
+    tmp_path: Path,
+) -> None:
+    """A directory that still exists but lost its marker is ambiguous, not a move."""
+    root = _git_repo(tmp_path, "repo")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model")
+    shutil.rmtree(root / ".ci-mcp")
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    duplicate = ProjectInfo(id=project.id, name=project.name, root=unrelated)
+    with pytest.raises(storage_module.CodeIndexingError) as excinfo:
+        store.upsert_project(duplicate, model_id="test/model")
+
+    assert excinfo.value.code == ErrorCode.PROJECT_ID_CONFLICT
+    assert "remove_project" in str(excinfo.value)
+    assert "force_new_id" in str(excinfo.value)
+
+
+def test_upsert_project_still_accepts_a_worktree_once_its_marker_is_gone(
+    tmp_path: Path,
+) -> None:
+    """A linked worktree is recognised from git identity, not the marker file."""
+    root = _git_repo(tmp_path, "repo")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model")
+    shutil.rmtree(root / ".ci-mcp")
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=root)
+
+    checkout = ProjectInfo(id=project.id, name=project.name, root=worktree)
+    store.upsert_project(checkout, model_id="test/model")
+
+    stored = ProjectInfo.model_validate_json(
+        str(store._rows(store._projects, f"id = '{project.id}'")[0]["payload"])
+    )
+    assert stored.root == root.resolve()
+
+
+def test_removing_the_registered_project_lets_the_id_be_reclaimed(tmp_path: Path) -> None:
+    """remove_project resolves the ambiguity so the id can register elsewhere."""
+    root = _git_repo(tmp_path, "repo")
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_project(project, model_id="test/model")
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    duplicate = ProjectInfo(id=project.id, name=project.name, root=unrelated)
+    with pytest.raises(storage_module.CodeIndexingError):
+        store.upsert_project(duplicate, model_id="test/model")
+
+    store.remove_project(project.id)
+    store.upsert_project(duplicate, model_id="test/model")
+
+    stored = ProjectInfo.model_validate_json(
+        str(store._rows(store._projects, f"id = '{project.id}'")[0]["payload"])
+    )
+    assert stored.root == unrelated.resolve()
+
+
 def test_active_slots_registry_gains_the_checkout_key_in_place(tmp_path: Path) -> None:
     """A pre-worktree active_slots table is migrated without losing its pointer."""
     import lancedb

@@ -286,7 +286,7 @@ class DaemonServer:
         self._maintenance_thread: threading.Thread | None = None
 
     def serve(self) -> None:
-        self.paths.data.mkdir(parents=True, exist_ok=True)
+        self.paths.ensure_private()
         lock_directory = self.paths.data / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
         lifetime_lock = FileLock(lock_directory / "daemon.lock")
@@ -844,7 +844,7 @@ def ensure_daemon(paths: RuntimePaths, *, timeout_seconds: float = 10) -> Broker
     status = daemon_status(paths)
     if status["running"] and status.get("protocol") == PROTOCOL_VERSION:
         return BrokerApplication(paths)
-    paths.data.mkdir(parents=True, exist_ok=True)
+    paths.ensure_private()
     (paths.data / "locks").mkdir(parents=True, exist_ok=True)
     log_path = paths.data / "daemon.log"
     with FileLock(paths.data / "locks" / "daemon-start.lock"):

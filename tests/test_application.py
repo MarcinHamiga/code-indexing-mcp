@@ -1,4 +1,6 @@
 import shutil
+import stat
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -60,6 +62,46 @@ class OtherModelTinyEmbedder:
 
     def embed_query(self, text: str) -> list[float]:
         return [1.0, 0.0, 0.0, float(len(text))]
+
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX file permissions only")
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+@posix_only
+def test_application_creates_private_data_and_cache_directories(tmp_path: Path) -> None:
+    """A fresh CODE_INDEXING_DATA_DIR/CACHE_DIR is created 0700, not at the umask."""
+    data = tmp_path / "data"
+    cache = tmp_path / "cache"
+
+    Application(RuntimePaths(data=data, cache=cache), embedder=TinyEmbedder())
+
+    assert _mode(data) == 0o700
+    assert _mode(cache) == 0o700
+    # The sentinel is what lets the uninstaller recognise an otherwise-empty
+    # cache directory as ours (installer/uninstall.py's _DATA_MARKERS).
+    assert (data / ".code-indexing-mcp").is_file()
+    assert (cache / ".code-indexing-mcp").is_file()
+
+
+@posix_only
+def test_application_tightens_a_preexisting_loose_directory(tmp_path: Path) -> None:
+    """A directory an older release (or the user) left world-readable is narrowed."""
+    data = tmp_path / "data"
+    cache = tmp_path / "cache"
+    data.mkdir()
+    cache.mkdir()
+    # mkdir's mode is filtered by the process umask; set the loose mode directly.
+    data.chmod(0o755)
+    cache.chmod(0o755)
+
+    Application(RuntimePaths(data=data, cache=cache), embedder=TinyEmbedder())
+
+    assert _mode(data) == 0o700
+    assert _mode(cache) == 0o700
 
 
 def test_concurrent_init_project_registers_one_project(tmp_path: Path) -> None:

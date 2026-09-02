@@ -75,6 +75,12 @@ DEFAULT_INCLUDES = [
     "**/*.lua",
 ]
 
+# A repository-shipped marker is trusted input up to this point: a project.toml
+# committed to a repo the user opens is honoured without prompting, so its
+# `max_file_bytes` cannot be allowed to raise the ceiling arbitrarily high and
+# turn a single oversized file into an unbounded read and embed.
+MAX_FILE_BYTES_CEILING = 16 * 1024 * 1024
+
 # The kinds TreeSitterExtractor emits, plus the "_part" variants it produces when a
 # definition is split across chunks. Closed so MCP clients get an enum instead of a
 # free-text field; extend both halves together when a query file gains a capture.
@@ -185,7 +191,7 @@ IndexTrigger = Literal[
 class ScanConfig(FrozenModel):
     include: list[str] = Field(default_factory=lambda: list(DEFAULT_INCLUDES))
     exclude: list[str] = Field(default_factory=list)
-    max_file_bytes: int = Field(default=1_048_576, gt=0)
+    max_file_bytes: int = Field(default=1_048_576, gt=0, le=MAX_FILE_BYTES_CEILING)
 
 
 class ProjectInfo(FrozenModel):

@@ -913,7 +913,8 @@ def create_server(
             "the same HEAD costs no scan at all, and a dirty checkout re-checks only its changed "
             "files rather than the whole tree. Returns per-phase counts and durations plus any "
             "per-file errors. Indexes supported source files in the checked-out working tree, "
-            "skipping symlinks, binaries, and files over 1 MiB."
+            "skipping symlinks, binaries, and files over the project's max_file_bytes "
+            "(1 MiB by default, and no marker may raise it past 16 MiB)."
         ),
         annotations=_WRITES,
     )

@@ -192,6 +192,35 @@ def _rate(record: ProbeRecord | None) -> float | None:
     return record.characters_per_second
 
 
+# Written into `data` and `cache` by `RuntimePaths.ensure_private()`. Its
+# presence is what tells the uninstaller "this directory is ours to delete"
+# even when neither directory has been populated with anything else yet
+# (installer/uninstall.py's `_DATA_MARKERS`).
+_PRIVATE_DIRECTORY_SENTINEL = ".code-indexing-mcp"
+
+
+def _tighten_if_owned(directory: Path) -> None:
+    """Chmod *directory* to 0700 when this process owns it and it is looser.
+
+    A pre-existing directory (a user-provided `CODE_INDEXING_DATA_DIR`, or one
+    created by an older release before this method existed) keeps whatever
+    mode it has today; this only narrows it, and only when doing so is safe.
+    Foreign ownership -- a directory on a filesystem without real POSIX
+    ownership, or one the current account merely has access to -- is left
+    alone rather than refused, so an odd filesystem still works, just without
+    the tightening. Never raises: a chmod failure here must not stop the
+    server from starting.
+    """
+    if not hasattr(os, "getuid"):
+        return  # Windows: mkdir(mode=) already applied what the platform honours.
+    try:
+        info = directory.lstat()
+        if info.st_uid == os.getuid() and info.st_mode & 0o077:
+            os.chmod(directory, 0o700)
+    except OSError:
+        logger.debug("Could not tighten permissions on %s", directory, exc_info=True)
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     data: Path
@@ -204,6 +233,29 @@ class RuntimePaths:
             os.environ.get("CODE_INDEXING_CACHE_DIR", user_cache_path("code-indexing-mcp"))
         )
         return cls(data=data.expanduser().resolve(), cache=cache.expanduser().resolve())
+
+    def ensure_private(self) -> None:
+        """Create `data` and `cache` as user-private directories.
+
+        Both hold chunk text, embeddings, and (for `data`) the daemon's auth
+        token -- an indexed repository can be private even when the account
+        running the server is shared, so these must not be left at whatever
+        the process umask happens to allow. A directory is created `0700`
+        outright; one that already existed looser is tightened in place
+        rather than refused, since a first run against an
+        already-provisioned `CODE_INDEXING_DATA_DIR` must still work.
+        Subdirectories underneath keep their own, default modes: a `0700`
+        parent already denies traversal into them from outside this account.
+        """
+        for directory in (self.data, self.cache):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _tighten_if_owned(directory)
+            sentinel = directory / _PRIVATE_DIRECTORY_SENTINEL
+            if not sentinel.exists():
+                try:
+                    sentinel.write_text("", encoding="utf-8")
+                except OSError:
+                    logger.debug("Could not write sentinel file in %s", directory, exc_info=True)
 
 
 PROJECT_SHAPE_MARKERS = {
@@ -227,6 +279,7 @@ class Application:
         settings: IndexSettings | None = None,
     ) -> None:
         self.paths = paths
+        paths.ensure_private()
         self.cwd = (cwd or Path.cwd()).resolve()
         self.settings = settings or IndexSettings.from_environment()
         if embedder is None:

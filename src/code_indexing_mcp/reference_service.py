@@ -1438,9 +1438,16 @@ class ReferenceService:
         }
         digests: dict[str, str] = {}
         stale_paths: set[str] = set()
+        escaped_paths: set[str] = set()
         render_sources: dict[str, tuple[bytes, int]] = {}
         candidate_paths = {finding.path for finding, _start, _end in candidates}
         for path in sorted(candidate_paths | set(query.sources)):
+            # A path that resolves outside the project root is never read --
+            # not even to check staleness -- so this check comes before the
+            # only place `_render_patch` turns a stored path into a read.
+            if self._path_escapes_root(query.root, path):
+                escaped_paths.add(path)
+                continue
             source, bom = self._file_bytes(query.root, path, render_sources)
             if not self._matches_coverage(path, coverage_hashes, source, bom, digests):
                 stale_paths.add(path)
@@ -1450,6 +1457,20 @@ class ReferenceService:
         for finding, raw_start, raw_end in sorted(
             candidates, key=lambda item: (item[0].path, item[1], item[2])
         ):
+            if finding.path in escaped_paths:
+                conflicted.append(
+                    finding.model_copy(
+                        update={
+                            "reason_code": "path_escapes_root",
+                            "explanation": (
+                                f"{finding.explanation} The recorded path resolves outside "
+                                "the project root, so no file was read and the edit was "
+                                "left out of the patch."
+                            ),
+                        }
+                    )
+                )
+                continue
             if finding.path in stale_paths:
                 conflicted.append(
                     finding.model_copy(
@@ -1526,6 +1547,32 @@ class ReferenceService:
                         "This file changed on disk after its structural rows were "
                         "extracted, so its recorded offsets were suppressed as stale "
                         "and none of its edits could be verified for the patch."
+                    ),
+                    edit_required=True,
+                )
+            )
+        # An escaped path outside the candidate set (e.g. one that only ever
+        # appeared in query.sources) gets the same synthetic treatment, so a
+        # path that resolves outside the root is always reported rather than
+        # silently dropped.
+        for path in sorted(escaped_paths - candidate_paths):
+            conflicted.append(
+                RefactorFinding(
+                    reference_id=f"escaped:{path}",
+                    project_id=selected.project_id,
+                    path=path,
+                    language=languages_by_path.get(path, ""),
+                    kind="read",
+                    start_line=0,
+                    end_line=0,
+                    start_byte=0,
+                    end_byte=0,
+                    snippet="",
+                    resolution="unresolved",
+                    reason_code="path_escapes_root",
+                    explanation=(
+                        "This path resolves outside the project root, so no file was "
+                        "read and none of its edits could be verified for the patch."
                     ),
                     edit_required=True,
                 )
@@ -3142,6 +3189,20 @@ class ReferenceService:
             digest = _digest(raw)
             digests[path] = digest
         return digest == expected
+
+    @staticmethod
+    def _path_escapes_root(root: Path | None, path: str) -> bool:
+        """Whether an index-recorded relative path would read outside its root.
+
+        Every row path is written by the extractor as root-relative, so a
+        traversal like `../outside.py` cannot occur today; this guard makes
+        that invariant explicit and testable at the one place patch emission
+        turns a stored path back into a filesystem read, rather than relying
+        on it never being violated upstream.
+        """
+        if root is None:
+            return False
+        return not (root / path).resolve().is_relative_to(root.resolve())
 
     @staticmethod
     def _file_bytes(

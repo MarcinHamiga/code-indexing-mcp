@@ -10,6 +10,16 @@ network access is the initial download of the default
 `jinaai/jina-embeddings-v2-base-code` model (approximately 640 MB). Once cached, indexing and
 search work offline.
 
+## Trust boundary
+
+The MCP client is fully trusted: it can register, index, search, and remove any directory the
+user running it can read. A checked-in `.ci-mcp/project.toml` is honoured as part of opening that
+repository, within a fixed size ceiling on `max_file_bytes` and the id-conflict rule that stops a
+known project id from silently moving to an unrelated, still-existing root. Because git is
+executed inside the repositories being indexed, repository-local git configuration applies to
+those invocations. The index stores chunk text and embeddings under a data directory private to
+the user running the server.
+
 ## Install
 
 - [Git](https://git-scm.com/)

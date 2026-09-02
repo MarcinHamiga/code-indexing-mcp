@@ -287,6 +287,56 @@ def test_run_uninstall_purges_data_directories_when_asked(tmp_path: Path) -> Non
     assert not data.exists() and not cache.exists()
 
 
+def test_purge_refuses_a_directory_merely_named_code_indexing_mcp(tmp_path: Path) -> None:
+    """The old name-based short-circuit is gone: a name alone is not evidence."""
+
+    data = tmp_path / "somewhere" / "code-indexing-mcp"
+    cache = tmp_path / "elsewhere" / "code-indexing-mcp"
+    data.mkdir(parents=True)
+    cache.mkdir(parents=True)
+
+    result = run_uninstall(
+        UninstallPlan(
+            install_directory=_checkout(tmp_path), remove_launcher=False, remove_data=True
+        ),
+        home=tmp_path,
+        environment={
+            "CODE_INDEXING_DATA_DIR": str(data),
+            "CODE_INDEXING_CACHE_DIR": str(cache),
+            "SHELL": "/bin/zsh",
+        },
+    )
+
+    assert result.directories_removed == ()
+    assert data.is_dir() and cache.is_dir()
+    assert result.failures
+
+
+def test_purge_accepts_a_directory_bearing_only_the_private_sentinel(tmp_path: Path) -> None:
+    """A never-populated directory is still recognised by RuntimePaths.ensure_private's marker."""
+
+    data = tmp_path / "data" / "code-indexing-mcp"
+    cache = tmp_path / "cache" / "code-indexing-mcp"
+    for directory in (data, cache):
+        directory.mkdir(parents=True)
+        (directory / ".code-indexing-mcp").write_text("", encoding="utf-8")
+
+    result = run_uninstall(
+        UninstallPlan(
+            install_directory=_checkout(tmp_path), remove_launcher=False, remove_data=True
+        ),
+        home=tmp_path,
+        environment={
+            "CODE_INDEXING_DATA_DIR": str(data),
+            "CODE_INDEXING_CACHE_DIR": str(cache),
+            "SHELL": "/bin/zsh",
+        },
+    )
+
+    assert set(result.directories_removed) == {data, cache}
+    assert not data.exists() and not cache.exists()
+
+
 def test_purge_refuses_a_directory_that_holds_nothing_of_ours(tmp_path: Path) -> None:
     """A setting can point anywhere; a confirmation prompt is not a safety net."""
 

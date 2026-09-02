@@ -99,3 +99,11 @@ reason and no read happens outside the root.
 
 **Step 5 — D6.** README section. Also add the ceiling to the `index_project` tool
 description's size sentence only if it mentions the default cap as fixed.
+
+## Completion note (2026-09-02)
+
+All seven decisions implemented as designed; no deviations from D1–D7. Sentinel filename
+constant is intentionally duplicated as a literal in `installer/uninstall.py` rather than
+imported from `application.py`, to keep the installer's uninstall path from pulling in the
+embedding/vector-store stack — noted in a comment at both ends. Baseline green: 1651 passed,
+8 skipped (11 new tests over the 1640-passed baseline).

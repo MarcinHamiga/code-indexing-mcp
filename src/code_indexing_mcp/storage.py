@@ -60,7 +60,7 @@ from .models import (
     StoredFile,
     TableStorageStats,
 )
-from .projects import existing_marker_path, rooted_under, same_project_root
+from .projects import rooted_under, same_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -559,11 +559,19 @@ class LanceStore:
             same_root = same_project_root(registered_root, incoming_root)
             if same_root:
                 project = project.model_copy(update={"root": registered_root})
-            elif existing_marker_path(registered_root) is not None:
+            elif registered_root.exists():
+                # The registered directory is still there -- whether or not its
+                # marker survives in it -- so a different, unrelated root
+                # claiming this id is ambiguous rather than a move: it could be
+                # a stale marker, a directory copy, or someone reusing an id.
+                # Only a directory that has vanished entirely (checked below by
+                # falling through) is the legitimate "the user moved it" case.
                 if not self._shares_repository(registered_root, incoming_root):
                     raise CodeIndexingError(
                         ErrorCode.PROJECT_ID_CONFLICT,
-                        "The project ID is already active at another path",
+                        "The project ID is already active at another path. Run "
+                        "remove_project on the registered root, or init_project "
+                        "with force_new_id here.",
                         project=project.id,
                         registered_root=str(registered_root),
                         incoming_root=str(incoming_root),
