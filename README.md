@@ -405,9 +405,10 @@ adoption-gate thresholds with their evaluated booleans.
 Those gates passed for `float16` storage with exact search at both 40 and 20,000 passages —
 no measurable recall or rank loss, roughly half the vector bytes — so chunk vectors are now
 stored as `float16` by default. Set `CODE_INDEXING_VECTOR_STORAGE=float32` to restore the
-previous layout; either change marks existing partitions for an automatic rebuild. The
-HNSW-SQ8 gates did not pass and approximate indexing remains opt-in via
-`CODE_INDEXING_VECTOR_INDEX=hnsw`.
+previous layout; either change marks existing partitions for an automatic rebuild. Approximate
+vector indexing remains opt-in via `CODE_INDEXING_VECTOR_INDEX=hnsw`: the measured flat scan is
+cheap enough that no size argued for it by default, and when it is on the store queries the index
+with settings that keep recall@10 at 0.999.
 
 Initialization creates `.ci-mcp/project.toml` and a self-ignoring `.ci-mcp/.gitignore`. The
 marker carries the project's shared UUID and scanning configuration. It is not intended to be
@@ -724,6 +725,14 @@ indexing runs. Memory the host already held when the worker started — the daem
 open Lance datasets — is not charged to the budget, so a warm daemon can still index. `IndexReport`
 reports both the budget and the true combined peak, plus a scan/parse/embed/commit duration split.
 
+`CODE_INDEXING_VECTOR_INDEX` selects the vector search strategy. `exact` (the default) scans every
+vector without an index: a full cosine scan of the 56k-chunk measurement index costs about 6 ms,
+roughly a fortieth of the tool call around it, so there is nothing to approximate at the sizes
+measured. `hnsw` builds an `IVF_HNSW_SQ` index once a partition holds 20,000 chunks and is meant
+for indexes well past that. When it is on, searches run with the measured accuracy settings
+(`ef=100` plus a refine pass over the stored vectors), which hold recall@10 at 0.999 against exact
+search at every size benchmarked; without them the quantised index loses about 13% of the top ten.
+
 Microbatches are bounded by three things at once: the item count above, the token budget per window,
 and the padded matrix `item_count × longest_padded_tokens`, which is what a batch actually
 materializes. That last budget scales with `CODE_INDEXING_EMBED_MEMORY_MB` — it is memory charged to the
@@ -1038,8 +1047,9 @@ it changes. Environment failures — `MODEL_UNAVAILABLE`, `INDEX_RESOURCE_LIMIT`
 caller instead of silently leaving that file permanently unindexed.
 
 `CODE_INDEXING_INDEX_EXECUTION=in-process` is a temporary diagnostic rollback. It does not enforce the
-worker ceiling. `CODE_INDEXING_VECTOR_INDEX=hnsw` opts into approximate vector indexing; exact search is
-the safer default.
+worker ceiling. `CODE_INDEXING_VECTOR_INDEX=hnsw` opts into approximate vector indexing with the
+measured accuracy settings; `exact` stays the default because the flat scan it avoids is cheap at
+every size measured so far.
 
 All stdio adapters use the per-user daemon by default. Administrative commands are:
 

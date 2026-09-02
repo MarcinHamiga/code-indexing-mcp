@@ -97,6 +97,23 @@ _SEARCH_CONCURRENCY = 8
 # if nothing else ever flushes it.
 SLOT_TOUCH_FLUSH_SECONDS = 300.0
 
+# The IVF_HNSW_SQ vector index is built once a partition holds this many chunk
+# rows, and only when the operator opted into hnsw. A flat cosine scan of the
+# 56k-chunk measurement index costs ~6 ms while a whole search call costs
+# ~230 ms, so no measured size argued for moving the gate; the constant exists
+# so the next measurement has one place to change
+# (docs/plans/2026-09-02-vector-index-gate-shipped.md).
+VECTOR_INDEX_MIN_ROWS = 20_000
+
+# hnsw-mode query settings, chosen by the same benchmark. Queried with
+# defaults, the quantised index loses ~13% of recall@10 against an exact scan:
+# the loss is scalar quantisation plus the default beam width, not IVF
+# partitioning (nprobes changed nothing). ef=100 with a refine pass over the
+# stored float16 vectors restores 0.999 for ~0.3 ms at 56k rows. Module
+# constants rather than settings: CODE_INDEXING_VECTOR_INDEX is enough surface.
+VECTOR_INDEX_EF = 100
+VECTOR_INDEX_REFINE_FACTOR = 2
+
 # Columns get_chunk reads. The vector and the identifier-terms column are
 # excluded: nothing outside indexing and ranking can use them, and reading them
 # made a single-chunk fetch an order of magnitude larger than the code it
@@ -1869,6 +1886,11 @@ class LanceStore:
         )
         if self.vector_index == "exact":
             query = query.bypass_vector_index()
+        else:
+            # The approximate index is only correct to the extent the query
+            # pays for accuracy: defaults cost 13% of recall@10, and the ef +
+            # refine pair above restores it (see VECTOR_INDEX_EF).
+            query = query.ef(VECTOR_INDEX_EF).refine_factor(VECTOR_INDEX_REFINE_FACTOR)
         # project_id is not stored on chunk rows; it belongs to the
         # partition being searched, so it is injected per project.
         query_rows = cast(list[dict[str, Any]], query.to_list())
@@ -2044,7 +2066,7 @@ class LanceStore:
         if self.vector_index == "exact":
             for index in vector_indices:
                 chunks.drop_index(index.name)
-        elif not vector_indices and chunks.count_rows() >= 20_000:
+        elif not vector_indices and chunks.count_rows() >= VECTOR_INDEX_MIN_ROWS:
             chunks.create_index(
                 "vector",
                 config=HnswSq(distance_type="cosine"),

@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import lancedb
@@ -16,6 +17,7 @@ import pytest
 from conftest import run_git
 from lancedb.expr import Expr
 from lancedb.merge import LanceMergeInsertBuilder
+from lancedb.query import LanceHybridQueryBuilder
 from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
@@ -742,6 +744,106 @@ def test_hybrid_search_spans_content_and_identifier_terms(tmp_path: Path) -> Non
     # miss would leave the FTS-matched chunk behind. It must rank first.
     assert terms_hit[0]["chunk_id"] == chunk_terms_only.chunk_id
     assert content_hit[0]["chunk_id"] == chunk_content_only.chunk_id
+
+
+def _seed_hybrid_target(store: LanceStore, root: Path) -> ProjectInfo:
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id).model_dump()], schema=LanceStore.file_arrow_schema()
+        ),
+        chunk_batches=[(["file-1"], _chunk_table(project.id, "file-1", 2))],
+    )
+    store.ensure_indexes(project.id)
+    return project
+
+
+def test_hybrid_query_vector_knobs_follow_the_index_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hybrid query must ask the vector index for the accuracy it owes.
+
+    In exact mode it bypasses the vector index entirely. In hnsw mode it must
+    issue the measured ef and refine_factor: queried with defaults, the
+    quantised index loses ~13% of recall@10 against an exact scan, and
+    ef=100 + refine_factor=2 restores 0.999 (see
+    docs/plans/2026-09-02-vector-index-gate-shipped.md).
+    """
+    calls: list[tuple[str, tuple[float, ...]]] = []
+    for knob in ("bypass_vector_index", "ef", "refine_factor"):
+        original = getattr(LanceHybridQueryBuilder, knob)
+
+        def spy(
+            builder: LanceHybridQueryBuilder,
+            *args: float,
+            _original: object = original,
+            _knob: str = knob,
+            **kwargs: float,
+        ) -> object:
+            calls.append((_knob, args))
+            return cast(Any, _original)(builder, *args, **kwargs)
+
+        monkeypatch.setattr(LanceHybridQueryBuilder, knob, spy)
+
+    exact = LanceStore(tmp_path / "exact", vector_dimension=4)
+    exact_project = _seed_hybrid_target(exact, tmp_path / "repo")
+    exact.hybrid_search("pass", [1.0, 0.0, 0.0, 0.0], [exact_project.id], None, 5)
+    assert ("bypass_vector_index", ()) in calls
+    assert [name for name, _ in calls if name != "bypass_vector_index"] == []
+
+    hnsw = LanceStore(tmp_path / "hnsw", vector_dimension=4, vector_index="hnsw")
+    hnsw_project = _seed_hybrid_target(hnsw, tmp_path / "hnsw-repo")
+    calls.clear()
+    hnsw.hybrid_search("pass", [1.0, 0.0, 0.0, 0.0], [hnsw_project.id], None, 5)
+    assert ("ef", (storage_module.VECTOR_INDEX_EF,)) in calls
+    assert ("refine_factor", (storage_module.VECTOR_INDEX_REFINE_FACTOR,)) in calls
+    assert ("bypass_vector_index", ()) not in calls
+
+
+def test_vector_index_gate_reads_vector_index_min_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ensure_indexes builds the approximate vector index only in hnsw mode
+    and only at or above VECTOR_INDEX_MIN_ROWS."""
+    hnsw = LanceStore(tmp_path / "hnsw", vector_dimension=4, vector_index="hnsw")
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    hnsw.upsert_project(project, model_id="test/model")
+    hnsw.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist(
+            [stored_file(project.id).model_dump()], schema=LanceStore.file_arrow_schema()
+        ),
+        chunk_batches=[(["file-1"], _chunk_table(project.id, "file-1", 2))],
+    )
+
+    # Below the gate: no vector index is created.
+    hnsw.ensure_indexes(project.id)
+    tables = hnsw._existing_tables(project.id)
+    assert tables is not None
+    assert not any("vector" in index.columns for index in tables.chunks.list_indices())
+
+    # At the gate: the index is created (count_rows is the only caller in
+    # ensure_indexes' vector branch; patching the table class fakes the size).
+    monkeypatch.setattr(LanceTable, "count_rows", lambda self: storage_module.VECTOR_INDEX_MIN_ROWS)
+    hnsw.ensure_indexes(project.id)
+    assert any("vector" in index.columns for index in tables.chunks.list_indices())
+    # And the query path runs end to end through the built index with the
+    # accuracy knobs rather than only on the flat fallback.
+    hits = hnsw.hybrid_search("pass", [1.0, 0.0, 0.0, 0.0], [project.id], None, 5)
+    assert hits
+
+    # Exact mode never builds one, whatever the size.
+    exact = LanceStore(tmp_path / "exact", vector_dimension=4)
+    exact.upsert_project(project, model_id="test/model")
+    exact.ensure_indexes(project.id)
+    exact_tables = exact._existing_tables(project.id)
+    assert exact_tables is not None
+    assert not any("vector" in index.columns for index in exact_tables.chunks.list_indices())
 
 
 def test_maintenance_keeps_versions_inside_the_retention_window(tmp_path: Path) -> None:
