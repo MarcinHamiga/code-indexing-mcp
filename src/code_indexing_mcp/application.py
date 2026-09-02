@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Protocol, TypeVar, cast
@@ -20,27 +17,17 @@ from typing import Protocol, TypeVar, cast
 from filelock import FileLock, Timeout
 from platformdirs import user_cache_path, user_data_path
 
-from .accelerator_env import apply_environment, load_environment
-from .backends import (
-    CPU_BACKEND,
-    BackendDescriptor,
-    BackendSelection,
-    available_execution_providers,
-    backend_for,
-    describe_environment,
-    platform_fingerprint,
-    runtime_version,
-    select_backend,
-)
-from .calibration import LIMITED_BY_MEMORY, crossover_characters
+from .accelerator_env import EnvironmentStatus
+from .backend_coordinator import BackendCoordinator
+from .backends import BackendSelection
 from .embedding import Embedder, FastEmbedder, SegmentPlan
-from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
 from .git_state import GitProbeOutcome, GitState, WorktreeStatus, head_snapshot, probe_git_state
 from .git_state import slot_id as git_slot_id
 from .history import HistoryStore
 from .indexing import Indexer
+from .maintenance import MaintenanceService
 from .models import (
     SCAN_SKIP_REASONS,
     CodeChunk,
@@ -49,14 +36,12 @@ from .models import (
     ImpactRadiusResponse,
     IndexReport,
     IndexTrigger,
-    MaintenanceProjectResult,
     MaintenanceReport,
     ModelStatus,
     OutlineResponse,
     ProjectInfo,
     ProjectSlot,
     ProjectStatus,
-    ProjectStorageStats,
     RefactorAnalysis,
     RefactorOperation,
     RefactorPatch,
@@ -72,10 +57,9 @@ from .models import (
     StorageStatus,
     StoredFile,
     SymbolResponse,
-    TableStorageStats,
 )
 from .passage_backend import PassageBackendSession
-from .probe_cache import ProbeCache, ProbeKey, ProbeRecord, model_artifact_fingerprint
+from .probe_cache import ProbeCache
 from .progress import IndexProgress, read_progress
 from .projects import (
     ProjectResolver,
@@ -91,18 +75,15 @@ from .reference_service import ReferenceService, validate_patch_request
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
-from .staging import pending_recovery, recover_staged_commits
+from .staging import recover_staged_commits
 from .storage import (
     ActiveIndexTarget,
     LanceStore,
     PartitionRef,
     decode_status_paths,
-    overlap_warnings,
     overlapping_registration,
-    worktree_warnings,
 )
 from .token_batching import max_token_product_for
-from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
 logger = logging.getLogger(__name__)
 
@@ -112,10 +93,6 @@ _Result = TypeVar("_Result")
 # whole of an index run. Wait only long enough to lose a race against a commit
 # that is about to finish; a run genuinely in flight is left to a later start.
 RECOVERY_LOCK_TIMEOUT_SECONDS = 5.0
-
-# Automatic maintenance repeats its overdue check at most this often. The check
-# itself is gated by the persisted last-successful-maintenance timestamp.
-MAINTENANCE_CHECK_INTERVAL = timedelta(hours=24)
 
 # Upper bound on how many projects a multi-project scope resolves in parallel.
 # Each project probes Git and takes its own per-project file lock, so there is
@@ -130,67 +107,6 @@ RESOLVE_TARGET_MAX_WORKERS = 8
 FRESHNESS_CACHE_SECONDS = 5.0
 
 SCAN_INSPECTION_MAX_LIMIT = 200
-
-MAINTENANCE_TIMESTAMP_FILE = "maintenance.json"
-MAINTENANCE_LOCK_FILE = "maintenance-schedule.lock"
-
-
-def _read_maintenance_timestamp(path: Path) -> datetime | None:
-    """Return the last successful maintenance time, or None when unreadable."""
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        timestamp = datetime.fromisoformat(payload["last_maintenance_at"])
-        return timestamp if timestamp.utcoffset() is not None else None
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-
-
-def _write_maintenance_timestamp(path: Path) -> None:
-    """Persist the maintenance timestamp atomically so readers never parse a partial file."""
-    payload = json.dumps(
-        {
-            "schema_version": 1,
-            "last_maintenance_at": datetime.now(UTC).isoformat(),
-        },
-        sort_keys=True,
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(payload)
-        os.replace(temporary, path)
-    except BaseException:
-        Path(temporary).unlink(missing_ok=True)
-        raise
-
-
-def _estimate_reclaimable(stats: ProjectStorageStats) -> int:
-    """Estimate bytes a table could reclaim: physical minus logical, floor zero."""
-    return sum(max(0, table.physical_bytes - table.logical_bytes) for table in stats.tables)
-
-
-def _versions_removed(before: ProjectStorageStats, after: ProjectStorageStats) -> int:
-    """Sum retained versions removed across the tables shared by both snapshots."""
-    removed = 0
-    after_by_name = {table.name: table for table in after.tables}
-    for table in before.tables:
-        after_table = after_by_name.get(table.name)
-        if after_table is not None:
-            removed += max(0, table.retained_version_count - after_table.retained_version_count)
-    return removed
-
-
-def _rate(record: ProbeRecord | None) -> float | None:
-    """Return a measured rate, or None for one that was never measured.
-
-    A stored zero means the record predates its measurement, and reporting it
-    as zero characters per second would describe a backend that never finishes.
-    """
-    if record is None or record.characters_per_second <= 0:
-        return None
-    return record.characters_per_second
-
 
 # Written into `data` and `cache` by `RuntimePaths.ensure_private()`. Its
 # presence is what tells the uninstaller "this directory is ours to delete"
@@ -453,10 +369,9 @@ class Application:
         self.cwd = (cwd or Path.cwd()).resolve()
         self.settings = settings or IndexSettings.from_environment()
         if embedder is None:
-            offline = os.environ.get("CODE_INDEXING_OFFLINE", "").lower() in {"1", "true", "yes"}
             embedder = FastEmbedder(
                 paths.cache / "models",
-                offline=offline,
+                offline=self.settings.offline,
                 threads=self.settings.embedding_threads,
                 enable_cpu_mem_arena=self.settings.embedding_cpu_arena,
             )
@@ -495,48 +410,30 @@ class Application:
                 "Skipping staged-commit recovery: an index run holds the global lock. "
                 "Any commit interrupted earlier is rolled back on a later start."
             )
-        # Passage embedding is the only role acceleration targets. The query
-        # model stays in this process on CPU so a search never waits on a
-        # worker spawning or a model loading onto a device.
-        #
-        # An accelerator usually lives in a second environment the installer
-        # prepared, so what this process can execute is not the whole story:
-        # the providers that environment reported are candidates too, and a
-        # backend chosen from them runs in its interpreter rather than ours.
-        self.serving_providers = available_execution_providers()
-        self.accelerator_environment = load_environment(paths.data)
-        self.backend_selection = self._select_backend()
-        self.probe_cache = ProbeCache(paths.cache / "backend-probes.json")
-        self._probe_key: ProbeKey | None = None
-        # Set when a run actually tried the selected accelerator and it failed.
-        # Only successful probes are cached, so without this memo every index
-        # run in a long-lived daemon would re-spawn a known-dead backend and
-        # reload its model onto the device before giving up again.
-        self._runtime_fallback: BackendSelection | None = None
+        # Backend and accelerator selection, with batch-size and crossover
+        # calibration, is owned by BackendCoordinator (D1 in the split plan).
+        # `self.backends` is the collaborator; the properties and methods
+        # below it (`backend_selection`, `effective_backend_selection`,
+        # `embedding_batch_size`, `batch_calibration`, `serving_providers`,
+        # `accelerator_environment`, `probe_cache`, `model_status`,
+        # `crossover_characters`) are thin delegates kept for every public
+        # member `server.py`, `cli.py`, `daemon.py`, `benchmark.py`, or the
+        # tests reference on `Application` itself.
+        self.backends = BackendCoordinator(paths, self.settings, embedder)
         # Negative freshness results, keyed by project id: the monotonic
         # deadline and the scan-config fingerprint the answer was computed for.
         # Read and written from asyncio.to_thread workers and daemon request
         # threads, so every access goes through _freshness_lock.
         self._clean_freshness_until: dict[tuple[str, str], tuple[float, str]] = {}
         self._freshness_lock = threading.Lock()
-        self.embedding_batch_size = self.settings.embedding_batch_size
-        self.batch_calibration = "explicit"
-        if self.settings.embedding_batch_auto:
-            self.batch_calibration = "default"
-            if self.backend_selection.uses_accelerator:
-                self._probe_key = self._build_probe_key(embedder)
-                cached = self.probe_cache.load(self._probe_key)
-                if cached is not None and cached.batch_size > 0:
-                    self.embedding_batch_size = cached.batch_size
-                    # A size something forced down is not the size calibration
-                    # chose, and a machine pinned low by one bad run has to be
-                    # able to say so. Which kind of ceiling stopped it is a
-                    # question for the recommendation, not for this label.
-                    self.batch_calibration = "reduced" if cached.limited_by else "measured"
 
         passage_session_factory: Callable[[], PassageBackendSession] | None = None
         if isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker":
-            passage_session_factory = self._passage_session_factory(embedder)
+            # `segment_plan` is read lazily because `self.indexer` (below)
+            # does not exist yet -- see BackendCoordinator._passage_session_factory.
+            passage_session_factory = self.backends._passage_session_factory(
+                embedder, segment_plan=lambda: self.indexer.segment_plan
+            )
         self.indexer = Indexer(
             store=self.store,
             scanner=SourceScanner(),
@@ -564,314 +461,71 @@ class Application:
         )
         self.search = SearchService(self.store, embedder)
         self.references = ReferenceService(self.store)
-
-    def _select_backend(self) -> BackendSelection:
-        """Choose a backend from everything this machine can actually execute."""
-        record = self.accelerator_environment.environment
-        providers = list(self.serving_providers)
-        if record is not None:
-            # The prepared environment vouches for the one accelerator it was
-            # probed for, not for every provider its runtime happens to ship.
-            # Widening any further would offer a backend on the strength of a
-            # record that never exercised it -- and would let selection land on
-            # an accelerator whose device and driver this record cannot describe.
-            prepared = backend_for(record.accelerator)
-            if prepared is not None and prepared.provider in record.providers:
-                providers.append(prepared.provider)
-        selection = select_backend(
-            self.settings.embedding_accelerator, available_providers=providers
-        )
-        if record is not None and selection.uses_accelerator:
-            selection = selection.described_as(apply_environment(selection.descriptor, record))
-        rejection = self.accelerator_environment.reason
-        if rejection is not None and not selection.uses_accelerator:
-            # A record that was found and refused explains the CPU outcome far
-            # better than "no accelerator is prepared" does.
-            selection = selection.diagnosed(rejection)
-        return selection
-
-    def _runs_externally(self, descriptor: BackendDescriptor) -> bool:
-        """Whether a worker for *descriptor* needs the prepared environment.
-
-        A provider this interpreter already exposes needs no second environment
-        -- an explicitly requested Core ML on macOS runs in the serving
-        environment's own runtime. Anything offered only by the prepared
-        accelerator environment runs in that environment's interpreter.
-        """
-        record = self.accelerator_environment.environment
-        return record is not None and descriptor.provider not in self.serving_providers
-
-    def _accelerator_launcher(self, descriptor: BackendDescriptor) -> WorkerLauncher:
-        """Return where a worker for *descriptor* has to be started."""
-        record = self.accelerator_environment.environment
-        if record is None or not self._runs_externally(descriptor):
-            return default_launcher()
-        return ExternalInterpreterLauncher(
-            record.interpreter,
-            environment_name=f"{record.accelerator.value} environment",
+        # Storage maintenance is owned by MaintenanceService (D2). It needs
+        # target resolution only Application can provide -- which projects are
+        # registered, resolving a selector to a ProjectInfo, and resolving the
+        # live ActiveIndexTarget(s) behind one -- passed as explicit callables
+        # so the dependency is visible rather than handing over `self`.
+        self.maintenance = MaintenanceService(
+            store=self.store,
+            paths=paths,
+            settings=self.settings,
+            list_projects=self.list_projects,
+            resolve_project=self._resolve,
+            resolve_active_target=lambda project, lock_held: self._resolve_active_target(
+                project, lock_held=lock_held
+            ),
+            resolve_active_targets=lambda projects, include_status: self._resolve_active_targets(
+                projects, include_status=include_status
+            ),
+            run_repository_stable_query=self._run_repository_stable_query,
         )
 
     @property
+    def backend_selection(self) -> BackendSelection:
+        """The backend the current process resolved to from static capability."""
+        return self.backends.backend_selection
+
+    @property
     def effective_backend_selection(self) -> BackendSelection:
-        """The backend the next run will attempt, after any runtime fallback.
+        """The backend the next run will attempt, after any runtime fallback."""
+        return self.backends.effective_backend_selection
 
-        ``backend_selection`` records what selection resolved to from static
-        capability alone. Once a run has tried it and been degraded, that
-        verdict stands for the life of this process.
-        """
-        return self._runtime_fallback or self.backend_selection
+    @property
+    def embedding_batch_size(self) -> int:
+        return self.backends.embedding_batch_size
 
-    def _remember_fallback(self, degraded: BackendSelection) -> None:
-        logger.warning(
-            "Pinning passage embedding to CPU for the rest of this process: %s",
-            degraded.fallback_reason,
-        )
-        self._runtime_fallback = degraded
+    @property
+    def batch_calibration(self) -> str:
+        return self.backends.batch_calibration
 
-    def _build_probe_key(self, embedder: Embedder) -> ProbeKey:
-        descriptor = self.backend_selection.descriptor
-        cache_directory = getattr(embedder, "cache_directory", self.paths.cache / "models")
-        return ProbeKey(
-            model_id=embedder.model_id,
-            model_artifact=model_artifact_fingerprint(Path(cache_directory), embedder.model_id),
-            accelerator=descriptor.accelerator.value,
-            provider=descriptor.provider,
-            # The record's version describes the environment that will run the
-            # backend; this process's own runtime is only the fallback answer.
-            runtime_version=descriptor.runtime_version or runtime_version(descriptor.runtime),
-            platform=platform_fingerprint(),
-            device=descriptor.device,
-            driver_version=descriptor.driver_version,
-        )
+    @property
+    def serving_providers(self) -> tuple[str, ...]:
+        return self.backends.serving_providers
 
-    def _cpu_probe_key(self) -> ProbeKey:
-        """The key CPU's own calibration is stored under.
+    @property
+    def accelerator_environment(self) -> EnvironmentStatus:
+        return self.backends.accelerator_environment
 
-        CPU needs no probe to be trusted, but the crossover is a comparison and
-        a comparison needs both sides measured -- under a key that moves when
-        the model, the platform, or this process's runtime does, for the same
-        reasons the accelerator's does.
-        """
-        cache_directory = getattr(self.embedder, "cache_directory", self.paths.cache / "models")
-        return ProbeKey(
-            model_id=self.embedder.model_id,
-            model_artifact=model_artifact_fingerprint(
-                Path(cache_directory), self.embedder.model_id
-            ),
-            accelerator=CPU_BACKEND.accelerator.value,
-            provider=CPU_BACKEND.provider,
-            runtime_version=runtime_version(CPU_BACKEND.runtime),
-            platform=platform_fingerprint(),
-            device=CPU_BACKEND.device,
-        )
-
-    def _cpu_max_items(self) -> int:
-        """Return the microbatch size measured for CPU, if one was.
-
-        0 means CPU keeps whatever the indexer planned, which is correct both
-        when nothing has been measured and when the operator set a size
-        explicitly -- an explicit size is a size for the whole installation.
-        """
-        if not self.settings.embedding_batch_auto:
-            return 0
-        record = self.probe_cache.load(self._cpu_probe_key())
-        return 0 if record is None else record.batch_size
-
-    def _measurements(self) -> tuple[ProbeRecord | None, ProbeRecord | None]:
-        """Return what calibration recorded for CPU and for the accelerator."""
-        selection = self.effective_backend_selection
-        if not selection.uses_accelerator:
-            return self.probe_cache.load(self._cpu_probe_key()), None
-        key = self._probe_key or self._build_probe_key(self.embedder)
-        return self.probe_cache.load(self._cpu_probe_key()), self.probe_cache.load(key)
+    @property
+    def probe_cache(self) -> ProbeCache:
+        return self.backends.probe_cache
 
     def crossover_characters(self) -> int | None:
         """Return the run size below which this machine should stay on CPU.
 
-        0 means "start the accelerator immediately", which is the answer when
-        the operator turned deferral off and also when nothing has been measured
-        yet -- the first run on a machine is what does the measuring, and it
-        cannot defer on numbers it is in the middle of producing.
-
-        ``None`` means the accelerator never overtakes CPU, so no run is large
-        enough to be worth starting it for. That is not the same statement as a
-        very large threshold, and reporting it as one would name a size some run
-        could conceivably pass -- and would collide with an operator who pinned
-        that size deliberately.
-
-        Strict mode is a third such answer. It exists for a caller who would
-        rather fail than quietly index at CPU speed, and a deferral is quiet
-        CPU indexing that no degradation reports -- so under strict mode the
-        accelerator that was asked for is the one that runs, whatever the run
-        turns out to cost.
+        Delegates to :class:`~.backend_coordinator.BackendCoordinator`; see D1
+        in docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
         """
-        if self.settings.embedding_strict:
-            return 0
-        if not self.settings.embedding_crossover_auto:
-            return self.settings.embedding_crossover_characters
-        cpu, accelerator = self._measurements()
-        if cpu is None or accelerator is None:
-            return 0
-        return self._measured_crossover()
-
-    def _measured_crossover(self) -> int | None:
-        """Return the crossover the recorded measurements imply, if both exist.
-
-        What the machine measured, with no policy applied. ``model status``
-        reports this, so an explicit threshold or strict mode changes which runs
-        defer without changing what this machine was found to be.
-        """
-        cpu, accelerator = self._measurements()
-        if cpu is None or accelerator is None:
-            return None
-        return crossover_characters(
-            accelerator_load_ns=accelerator.load_ns,
-            cpu_load_ns=cpu.load_ns,
-            cpu_characters_per_second=cpu.characters_per_second,
-            accelerator_characters_per_second=accelerator.characters_per_second,
-        )
-
-    def _recommended_override(
-        self, cpu: ProbeRecord | None, accelerator: ProbeRecord | None
-    ) -> str | None:
-        """Return the one setting change the measurements argue for, if any.
-
-        Only a memory ceiling has a setting behind it. A batch that took the
-        worker down with it was reduced just the same, but raising the ceiling
-        is not what answers a device that could not make the allocation, so
-        that case is reported without advice attached.
-        """
-        if accelerator is not None and accelerator.limited_by == LIMITED_BY_MEMORY:
-            return (
-                "CODE_INDEXING_EMBED_MEMORY_MB (a batch overran the ceiling and was reduced to "
-                f"{accelerator.batch_size})"
-            )
-        if (
-            cpu is not None
-            and accelerator is not None
-            and cpu.characters_per_second > 0
-            and accelerator.characters_per_second > 0
-            and accelerator.characters_per_second <= cpu.characters_per_second
-        ):
-            return (
-                "CODE_INDEXING_EMBED_ACCELERATOR=cpu (the accelerator measured no faster than CPU "
-                "on this machine)"
-            )
-        return None
-
-    def _passage_session_factory(
-        self, embedder: FastEmbedder
-    ) -> Callable[[], PassageBackendSession]:
-        """Build the factory that opens one passage session per index run.
-
-        Both backends are described up front, but neither process is started
-        until indexing asks for one, and the accelerator's is only started if
-        the selection actually chose it.
-        """
-        ceiling_bytes = self.settings.index_memory_bytes
-        strict = self.settings.embedding_strict
-        probe_key = self._probe_key
-
-        def worker_config(providers: tuple[str, ...], accelerator: str) -> WorkerConfig:
-            return WorkerConfig(
-                cache_directory=str(embedder.cache_directory),
-                offline=embedder.offline,
-                threads=self.settings.embedding_threads,
-                enable_cpu_mem_arena=self.settings.embedding_cpu_arena,
-                dimension=embedder.dimension,
-                model_id=embedder.model_id,
-                providers=providers,
-                accelerator=accelerator,
-            )
-
-        descriptor = self.backend_selection.descriptor
-        accelerator_config = worker_config(descriptor.providers, descriptor.accelerator.value)
-        cpu_config = worker_config(CPU_BACKEND.providers, CPU_BACKEND.accelerator.value)
-        accelerator_launcher = self._accelerator_launcher(descriptor)
-
-        def session(config: WorkerConfig, launcher: WorkerLauncher) -> EmbeddingWorkerSession:
-            return EmbeddingWorkerSession(
-                config, configured_ceiling_bytes=ceiling_bytes, launcher=launcher
-            )
-
-        def new_passage_session() -> PassageBackendSession:
-            return PassageBackendSession(
-                # Read per run, not captured: a fallback recorded by an earlier
-                # run keeps this one from paying for the same dead backend.
-                self.effective_backend_selection,
-                accelerator_factory=lambda: session(accelerator_config, accelerator_launcher),
-                # The fallback never depends on a prepared environment: it is
-                # what a failed accelerator falls back *to*.
-                cpu_factory=lambda: session(cpu_config, default_launcher()),
-                strict=strict,
-                probe_cache=self.probe_cache,
-                probe_key=probe_key,
-                cpu_probe_key=self._cpu_probe_key(),
-                # Only calibration establishes one. A configured default
-                # recorded here would make ``model status`` report it as a
-                # measurement that never ran.
-                calibrated_batch_size=0,
-                dimension=embedder.dimension,
-                on_degrade=self._remember_fallback,
-                # Read per run: the first run on a machine writes the numbers
-                # every later run defers on, and a daemon must not have to be
-                # restarted to start using them.
-                crossover_characters=self.crossover_characters(),
-                calibration_plan=(
-                    self.indexer.segment_plan if self.settings.embedding_calibrate else None
-                ),
-                # The plan the indexer builds is packed for the accelerator,
-                # because that is whose batch size calibration adopted. A run
-                # that defers or degrades to CPU is packed for CPU instead.
-                cpu_max_items=self._cpu_max_items(),
-            )
-
-        return new_passage_session
+        return self.backends.crossover_characters()
 
     def model_status(self) -> ModelStatus:
-        """Report the resolved embedding stack without loading or probing it."""
-        selection: BackendSelection = self.effective_backend_selection
-        descriptor = describe_environment(selection.descriptor)
-        if not selection.uses_accelerator:
-            # CPU is the reference backend; it needs no probe to be trusted.
-            probe_state = "not-applicable"
-        else:
-            key = self._probe_key or self._build_probe_key(self.embedder)
-            probe_state = self.probe_cache.state(key)
-        record = self.accelerator_environment.environment
-        external = selection.uses_accelerator and self._runs_externally(descriptor)
-        cpu, accelerator = self._measurements()
-        # What was measured, not what policy does with it: an explicit setting
-        # or strict mode changes which runs defer, and neither changes what this
-        # machine turned out to be.
-        measured_crossover = self._measured_crossover()
-        return ModelStatus(
-            embedding_model=self.embedder.model_id,
-            dimension=self.embedder.dimension,
-            requested_accelerator=selection.requested.value,
-            resolved_accelerator=descriptor.accelerator.value,
-            device=descriptor.device,
-            execution_provider=descriptor.provider,
-            available_providers=list(selection.available_providers),
-            stability=descriptor.stability.value,
-            precision=descriptor.precision.value,
-            runtime_version=descriptor.runtime_version,
-            driver_version=descriptor.driver_version,
-            # Where passage embedding will run. None means this process's own
-            # environment, which is always the answer for CPU.
-            accelerator_environment=str(record.interpreter) if external and record else None,
-            accelerator_prepared=None if record is None else record.accelerator.value,
-            batch_size=self.embedding_batch_size,
-            batch_calibration=self.batch_calibration,
-            probe_cache_state=probe_state,
-            strict=self.settings.embedding_strict,
-            fallback_reason=selection.fallback_reason,
-            cpu_characters_per_second=_rate(cpu),
-            accelerator_characters_per_second=_rate(accelerator),
-            accelerator_load_ms=None if accelerator is None else accelerator.load_ns // 1_000_000,
-            crossover_characters=measured_crossover,
-            recommended_override=self._recommended_override(cpu, accelerator),
-        )
+        """Report the resolved embedding stack without loading or probing it.
+
+        Delegates to :class:`~.backend_coordinator.BackendCoordinator`; see D1
+        in docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
+        """
+        return self.backends.model_status()
 
     @classmethod
     def from_environment(cls, *, cwd: Path | None = None) -> Application:
@@ -1029,7 +683,7 @@ class Application:
         lock_directory.mkdir(parents=True, exist_ok=True)
 
         def current_target() -> ActiveIndexTarget | None:
-            partition = self.store._active_partition_ref(project.id)
+            partition = self.store.active_partition_ref(project.id)
             if partition is None or partition.slot_id != git_slot_id(project.id, git):
                 return None
             slot = self.store.get_slot(partition.slot_id)
@@ -1459,51 +1113,10 @@ class Application:
     ) -> StorageStatus:
         """Read-only storage statistics for one project or the whole installation.
 
-        Resolving the current checkout may create or activate an empty pending
-        slot, but reads never materialize its physical partition. Root-overlap
-        and shared-Git worktree warnings are advisory and best-effort.
+        Delegates to :class:`~.maintenance.MaintenanceService`; see D2 in
+        docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
         """
-        registered = self.list_projects()
-        if project is not None:
-            resolved = self._resolve(project, roots)
-            scope = [resolved]
-        else:
-            scope = registered
-
-        def collect(targets: Mapping[str, Sequence[ActiveIndexTarget]]) -> StorageStatus:
-            snapshot_at = datetime.now(UTC).isoformat()
-            registry_before = self.store.registry_stats()
-            project_stats = [
-                self.store.storage_stats_for(
-                    registered_project,
-                    partition_ref=self._primary_target(targets, registered_project.id).partition,
-                )
-                for registered_project in scope
-            ]
-            registry_after = self.store.registry_stats()
-            partition_bytes: dict[str, int] = {}
-            for stats in project_stats:
-                if stats.slots:
-                    partition_bytes.update(
-                        {slot.partition_id: slot.physical_bytes for slot in stats.slots}
-                    )
-                else:
-                    partition_bytes[stats.project.id] = stats.partition_physical_bytes
-            return StorageStatus(
-                snapshot_at=snapshot_at,
-                registry=registry_after,
-                projects=project_stats,
-                physical_bytes_total=registry_after.physical_bytes + sum(partition_bytes.values()),
-                consistent=registry_before.current_version == registry_after.current_version
-                and all(stats.consistent for stats in project_stats),
-                overlap_warnings=overlap_warnings(registered),
-                worktree_warnings=worktree_warnings(registered),
-            )
-
-        return self._run_repository_stable_query(
-            scope,
-            collect,
-        )
+        return self.maintenance.storage_status(project, roots=roots)
 
     def maintain_storage(
         self,
@@ -1516,298 +1129,24 @@ class Application:
     ) -> MaintenanceReport:
         """Compact tables and remove verified versions older than the retention window.
 
-        Runs under the same global and per-project writer locks indexing uses,
-        so a pass never races a commit. Automatic passes attempt the locks
-        without waiting and record busy projects as skipped; manual passes wait
-        them out. A dry run collects the before statistics, a reclaimable-bytes
-        estimate, and no after statistics (``after`` stays null) but mutates
-        nothing and takes no locks.
-
-        ``trigger`` labels the pass as ``manual`` or ``scheduled`` for audit
-        purposes. The registry is maintained once under the global lock; when an
-        automatic pass cannot get that lock, the registry is reported without
-        maintenance rather than failing the whole run.
+        Delegates to :class:`~.maintenance.MaintenanceService`; see D2 in
+        docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
         """
-        # Retention reads last_used_at for LRU eviction; a buffered touch that
-        # never made it to disk must not make a recently used slot look old
-        # enough to evict.
-        self.store.flush_slot_touches()
-        started = time.monotonic_ns()
-        started_at = datetime.now(UTC).isoformat()
-        retention = timedelta(hours=self.settings.version_retention_hours)
-        registered = self.list_projects()
-        if project is not None:
-            resolved = self._resolve(project, roots)
-            scope: list[ProjectInfo] = [resolved]
-        else:
-            scope = registered
-        targets = self._resolve_active_targets(scope) if dry_run else {}
-        lock_directory = self.paths.data / "locks"
-        lock_directory.mkdir(parents=True, exist_ok=True)
-
-        def acquire(lock: FileLock) -> bool:
-            if wait_for_lock:
-                lock.acquire()
-                return True
-            try:
-                lock.acquire(timeout=0)
-            except Timeout:
-                return False
-            return True
-
-        results: list[MaintenanceProjectResult] = []
-        for registered_project in scope:
-            before: ProjectStorageStats | None = None
-            estimate = 0
-            if dry_run:
-                try:
-                    before = self.store.storage_stats_for(
-                        registered_project,
-                        partition_ref=self._primary_target(
-                            targets, registered_project.id
-                        ).partition,
-                    )
-                    estimate = _estimate_reclaimable(before)
-                    if before.partition_open_failed:
-                        results.append(
-                            MaintenanceProjectResult(
-                                project=registered_project,
-                                before=before,
-                                status="error",
-                                error="Partition exists but its tables could not be opened",
-                                reclaimable_bytes_estimate=estimate,
-                            )
-                        )
-                    else:
-                        results.append(
-                            MaintenanceProjectResult(
-                                project=registered_project,
-                                before=before,
-                                skip_reason="not-indexed" if not before.tables else "dry-run",
-                                reclaimable_bytes_estimate=estimate,
-                            )
-                        )
-                except Exception as exc:
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            status="error",
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                    )
-                continue
-
-            global_lock = FileLock(lock_directory / "index-global.lock")
-            project_lock = FileLock(lock_directory / f"{registered_project.id}.lock")
-            global_acquired = False
-            project_acquired = False
-            try:
-                global_acquired = acquire(global_lock)
-                if not global_acquired:
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            skip_reason="busy",
-                        )
-                    )
-                    continue
-                project_acquired = acquire(project_lock)
-                if not project_acquired:
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            skip_reason="busy",
-                        )
-                    )
-                    continue
-                target = self._resolve_active_target(registered_project, lock_held=True)
-                recovery = pending_recovery(self.paths.data / "staging", registered_project.id)
-                if recovery.project_wide:
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            skip_reason="recovery-pending",
-                        )
-                    )
-                    continue
-                before = self.store.storage_stats_for(
-                    registered_project,
-                    partition_ref=target.partition,
-                )
-                estimate = _estimate_reclaimable(before)
-                if before.partition_open_failed:
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            before=before,
-                            status="error",
-                            error="Partition exists but its tables could not be opened",
-                            reclaimable_bytes_estimate=estimate,
-                        )
-                    )
-                    continue
-                if not before.tables and not any(slot.physical_bytes > 0 for slot in before.slots):
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            before=before,
-                            skip_reason="not-indexed",
-                            reclaimable_bytes_estimate=estimate,
-                        )
-                    )
-                    continue
-                self.store.maintain_project(
-                    registered_project.id,
-                    cleanup_older_than=retention,
-                    branch_cache_limit=self.settings.branch_cache_limit,
-                    protected_slot_ids=recovery.slot_ids,
-                )
-                after = self.store.storage_stats_for(
-                    registered_project,
-                    partition_ref=target.partition,
-                )
-                if after.partition_open_failed:
-                    raise RuntimeError("Partition became unreadable during maintenance")
-                results.append(
-                    MaintenanceProjectResult(
-                        project=registered_project,
-                        before=before,
-                        after=after,
-                        status="ok",
-                        versions_removed=_versions_removed(before, after),
-                        bytes_reclaimed=max(
-                            0, before.partition_physical_bytes - after.partition_physical_bytes
-                        ),
-                        reclaimable_bytes_estimate=estimate,
-                    )
-                )
-            except Exception as exc:  # one project must not abort the pass
-                results.append(
-                    MaintenanceProjectResult(
-                        project=registered_project,
-                        before=before,
-                        status="error",
-                        error=f"{type(exc).__name__}: {exc}",
-                        reclaimable_bytes_estimate=estimate,
-                    )
-                )
-            finally:
-                if project_acquired:
-                    project_lock.release()
-                if global_acquired:
-                    global_lock.release()
-
-        registry_before: TableStorageStats | None = None
-        registry_after: TableStorageStats | None = None
-        registry_status = "skipped"
-        registry_skip_reason: str | None = "dry-run" if dry_run else None
-        registry_error: str | None = None
-        registry_versions_removed = 0
-        registry_bytes_reclaimed = 0
-        if dry_run:
-            registry_before = self.store.registry_stats()
-        else:
-            global_lock = FileLock(lock_directory / "index-global.lock")
-            global_acquired = False
-            try:
-                global_acquired = acquire(global_lock)
-                if not global_acquired:
-                    registry_skip_reason = "busy"
-                else:
-                    registry_before = self.store.registry_stats()
-                    self.store.maintain_registry(cleanup_older_than=retention)
-                    registry_after = self.store.registry_stats()
-                    registry_status = "ok"
-                    registry_versions_removed = max(
-                        0,
-                        registry_before.retained_version_count
-                        - registry_after.retained_version_count,
-                    )
-                    registry_bytes_reclaimed = max(
-                        0, registry_before.physical_bytes - registry_after.physical_bytes
-                    )
-            except Exception as exc:
-                registry_status = "error"
-                registry_error = f"{type(exc).__name__}: {exc}"
-            finally:
-                if global_acquired:
-                    global_lock.release()
-
-        finished_at = datetime.now(UTC).isoformat()
-        duration_ms = (time.monotonic_ns() - started) // 1_000_000
-        skipped = [
-            result.project.id
-            for result in results
-            if result.status == "skipped" and result.skip_reason != "busy"
-        ]
-        busy = [
-            result.project.id
-            for result in results
-            if result.status == "skipped" and result.skip_reason == "busy"
-        ]
-        failed = [result.project.id for result in results if result.status == "error"]
-        return MaintenanceReport(
-            trigger=trigger,
+        return self.maintenance.maintain_storage(
+            project,
+            roots=roots,
             dry_run=dry_run,
-            retention_hours=self.settings.version_retention_hours,
-            started_at=started_at,
-            finished_at=finished_at,
-            duration_ms=duration_ms,
-            projects=results,
-            registry_before=registry_before,
-            registry_after=registry_after,
-            registry_status=registry_status,
-            registry_skip_reason=registry_skip_reason,
-            registry_error=registry_error,
-            registry_versions_removed=registry_versions_removed,
-            registry_bytes_reclaimed=registry_bytes_reclaimed,
-            versions_removed_total=sum(result.versions_removed for result in results),
-            bytes_reclaimed_total=sum(result.bytes_reclaimed for result in results),
-            reclaimable_bytes_estimate_total=sum(
-                result.reclaimable_bytes_estimate for result in results
-            ),
-            skipped_projects=skipped,
-            busy_projects=busy,
-            failed_projects=failed,
+            wait_for_lock=wait_for_lock,
+            trigger=trigger,
         )
 
     def maybe_run_maintenance(self) -> MaintenanceReport | None:
-        """Run scheduled maintenance when it is due, persisting the last-run stamp.
+        """Run scheduled maintenance when it is due.
 
-        Gated by ``CODE_INDEXING_AUTO_MAINTENANCE`` and checked at most once per
-        24 hours, using the timestamp of the last complete pass. Runs in any
-        indexing mode: maintenance never scans source files or creates a new
-        logical generation, so lazy, eager, and manual modes are all eligible.
-        Busy, damaged, or recovery-dependent projects leave the stamp stale so
-        a later startup retries them instead of waiting another 24 hours.
+        Delegates to :class:`~.maintenance.MaintenanceService`; see D2 in
+        docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
         """
-        if not self.settings.auto_maintenance:
-            return None
-        timestamp_path = self.paths.data / MAINTENANCE_TIMESTAMP_FILE
-        lock_directory = self.paths.data / "locks"
-        lock_directory.mkdir(parents=True, exist_ok=True)
-        schedule_lock = FileLock(lock_directory / MAINTENANCE_LOCK_FILE)
-        try:
-            schedule_lock.acquire(timeout=0)
-        except Timeout:
-            return None
-        try:
-            # Re-check after acquiring the cross-process lock: another startup
-            # may have completed the overdue pass while this process waited to run.
-            last = _read_maintenance_timestamp(timestamp_path)
-            if last is not None and datetime.now(UTC) - last < MAINTENANCE_CHECK_INTERVAL:
-                return None
-            report = self.maintain_storage(dry_run=False, wait_for_lock=False, trigger="scheduled")
-            projects_complete = all(
-                result.status == "ok"
-                or (result.status == "skipped" and result.skip_reason == "not-indexed")
-                for result in report.projects
-            )
-            if report.registry_status == "ok" and projects_complete:
-                _write_maintenance_timestamp(timestamp_path)
-            return report
-        finally:
-            schedule_lock.release()
+        return self.maintenance.maybe_run_maintenance()
 
     def project_is_stale(
         self, project: str | None = None, *, roots: list[Path] | None = None
@@ -2117,7 +1456,7 @@ class Application:
         return self.search.file_outline(path, target.project.id, partition=target.partition)
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
-        project_id = self.store._chunk_project_id(chunk_id)
+        project_id = self.store.chunk_project_id(chunk_id)
         if project_id is None:
             return self.search.get_chunk(chunk_id)
         resolved = self._resolve(project_id, None)
@@ -2140,7 +1479,7 @@ class Application:
         if selector.project is not None:
             selector = selector.model_copy(update={"project": target.project.id})
         else:
-            chunk_project_id = self.store._chunk_project_id(selector.chunk_id or "")
+            chunk_project_id = self.store.chunk_project_id(selector.chunk_id or "")
             if chunk_project_id is None:
                 # Preserve the established CHUNK_NOT_FOUND error contract for
                 # malformed and retired chunk ids.
@@ -2353,7 +1692,7 @@ class Application:
     ) -> ProjectInfo:
         if selector.project is not None:
             return self._resolve(selector.project, roots)
-        project_id = self.store._chunk_project_id(selector.chunk_id or "")
+        project_id = self.store.chunk_project_id(selector.chunk_id or "")
         if project_id is None:
             self.search.get_chunk(selector.chunk_id or "")
             raise AssertionError("get_chunk unexpectedly returned without a project id")

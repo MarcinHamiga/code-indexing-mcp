@@ -23,6 +23,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+# checkout_head reads .git directly, which is Git state, not an update-check
+# concern; it moved to git_state.py (D3 in
+# docs/plans/2026-09-02-review-remediation-5-application-split-plan.md) and is
+# imported back here so `update_check.checkout_head(...)` keeps working for
+# cli.py, daemon.py, benchmark.py, and this module's own use below.
+from .git_state import checkout_head as checkout_head
+
 CACHE_FILENAME = "update-check.json"
 # Once a day: the checkout only ever moves when a human runs an update, and the
 # notice is a convenience rather than a security signal.
@@ -81,29 +88,6 @@ def install_context(*, environment: Mapping[str, str] | None = None) -> Path | N
     except OSError:
         return None
     return resolved
-
-
-def checkout_head(directory: Path) -> str | None:
-    """Return the checked-out revision of *directory*, reading files first.
-
-    ``git rev-parse`` is the last resort only: on the serve path this has to
-    cost microseconds, and the plain-file layout covers every case a managed
-    install can be in.
-    """
-    try:
-        git_directory = _git_directory(directory)
-        if git_directory is None:
-            return None
-        head = (git_directory / "HEAD").read_text(encoding="utf-8").strip()
-        if not head.startswith("ref:"):
-            return head or None
-        reference = head[len("ref:") :].strip()
-        sha = _reference_sha(git_directory, reference)
-        if sha is not None:
-            return sha
-        return _rev_parse(directory)
-    except (OSError, ValueError):
-        return None
 
 
 def read_cache(cache_directory: Path) -> UpdateStatus | None:
@@ -232,45 +216,6 @@ def notice(cache_directory: Path) -> str | None:
 def _disabled(environment: Mapping[str, str] | None = None) -> bool:
     values = os.environ if environment is None else environment
     return values.get(DISABLE_VARIABLE, "").strip().lower() in _DISABLED_VALUES
-
-
-def _git_directory(directory: Path) -> Path | None:
-    candidate = directory / ".git"
-    if candidate.is_dir():
-        return candidate
-    if not candidate.is_file():
-        return None
-    content = candidate.read_text(encoding="utf-8").strip()
-    if not content.startswith("gitdir:"):
-        return None
-    target = Path(content[len("gitdir:") :].strip())
-    return target if target.is_absolute() else directory / target
-
-
-def _reference_sha(git_directory: Path, reference: str) -> str | None:
-    try:
-        return (git_directory / reference).read_text(encoding="utf-8").strip() or None
-    except OSError:
-        pass
-    try:
-        packed = (git_directory / "packed-refs").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    for line in packed.splitlines():
-        if line.startswith(("#", "^")):
-            continue
-        parts = line.split()
-        if len(parts) == 2 and parts[1] == reference:
-            return parts[0]
-    return None
-
-
-def _rev_parse(directory: Path) -> str | None:
-    try:
-        completed = _run_git(["git", "rev-parse", "HEAD"], directory, LS_REMOTE_TIMEOUT_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return completed.stdout.strip() or None
 
 
 def _run_git(command: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[str]:

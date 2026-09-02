@@ -98,6 +98,89 @@ def run_git(command: Sequence[str], cwd: Path) -> GitCommandResult:
     )
 
 
+def checkout_head(directory: Path) -> str | None:
+    """Return the checked-out revision of *directory*, reading files first.
+
+    ``git rev-parse`` is the last resort only: the update-check serve path
+    this feeds has to cost microseconds, and the plain-file layout covers
+    every case a managed install can be in.
+
+    Moved here from ``update_check.py`` (D3 in
+    docs/plans/2026-09-02-review-remediation-5-application-split-plan.md):
+    reading ``.git`` directly is Git state, not an update-check concern.
+    ``update_check.py`` imports it back so ``update_check.checkout_head(...)``
+    keeps working for ``cli.py``, ``daemon.py``, and ``benchmark.py``.
+    """
+    try:
+        git_directory = _git_directory(directory)
+        if git_directory is None:
+            return None
+        head = (git_directory / "HEAD").read_text(encoding="utf-8").strip()
+        if not head.startswith("ref:"):
+            return head or None
+        reference = head[len("ref:") :].strip()
+        sha = _reference_sha(git_directory, reference)
+        if sha is not None:
+            return sha
+        return _rev_parse(directory)
+    except (OSError, ValueError):
+        return None
+
+
+def _git_directory(directory: Path) -> Path | None:
+    candidate = directory / ".git"
+    if candidate.is_dir():
+        return candidate
+    if not candidate.is_file():
+        return None
+    content = candidate.read_text(encoding="utf-8").strip()
+    if not content.startswith("gitdir:"):
+        return None
+    target = Path(content[len("gitdir:") :].strip())
+    return target if target.is_absolute() else directory / target
+
+
+def _reference_sha(git_directory: Path, reference: str) -> str | None:
+    try:
+        return (git_directory / reference).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        pass
+    try:
+        packed = (git_directory / "packed-refs").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in packed.splitlines():
+        if line.startswith(("#", "^")):
+            continue
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == reference:
+            return parts[0]
+    return None
+
+
+def _rev_parse(directory: Path) -> str | None:
+    """Last-resort revision lookup when ``.git``'s ref files did not resolve one.
+
+    Calls ``subprocess.run`` directly rather than this module's own
+    ``run_git``: ``run_git`` never raises on a non-zero exit and never applies
+    ``GIT_OPTIONAL_LOCKS``-style environment overrides, which would change what
+    a failing ``rev-parse`` reports here. This mirrors the exact subprocess
+    call ``update_check._rev_parse`` used before the move.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout.strip() or None
+
+
 class GitState(FrozenModel):
     """Immutable snapshot of one registered root's Git state."""
 

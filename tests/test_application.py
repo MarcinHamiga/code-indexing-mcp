@@ -1039,7 +1039,9 @@ def test_a_backend_that_failed_once_is_not_attempted_again(tmp_path: Path) -> No
     resolved = app.backend_selection
     assert app.effective_backend_selection is resolved
 
-    app._remember_fallback(resolved.fell_back_to(CPU_BACKEND, "the device fell off the bus"))
+    app.backends._remember_fallback(
+        resolved.fell_back_to(CPU_BACKEND, "the device fell off the bus")
+    )
 
     assert app.effective_backend_selection is not resolved
     assert app.effective_backend_selection.accelerator is Accelerator.CPU
@@ -1054,7 +1056,7 @@ def test_model_status_reports_a_runtime_fallback_rather_than_the_original_choice
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
 
-    app._remember_fallback(
+    app.backends._remember_fallback(
         app.backend_selection.fell_back_to(CPU_BACKEND, "the accelerator died on load")
     )
 
@@ -1109,14 +1111,14 @@ def test_auto_selects_a_prepared_accelerator_this_process_cannot_execute_itself(
 def _measure(app: Application, *, cpu: float, accelerator: float, load_ns: int) -> None:
     """Record the calibration a first run would have left behind."""
     app.probe_cache.store(
-        app._build_probe_key(app.embedder),
+        app.backends._build_probe_key(app.embedder),
         batch_size=8,
         dimension=app.embedder.dimension,
         characters_per_second=accelerator,
         load_ns=load_ns,
     )
     app.probe_cache.store(
-        app._cpu_probe_key(),
+        app.backends._cpu_probe_key(),
         batch_size=1,
         dimension=app.embedder.dimension,
         characters_per_second=cpu,
@@ -1216,7 +1218,7 @@ def test_a_batch_size_a_ceiling_overrun_reduced_is_reported_as_reduced(
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
     app.probe_cache.store(
-        app._build_probe_key(app.embedder),
+        app.backends._build_probe_key(app.embedder),
         batch_size=1,
         dimension=app.embedder.dimension,
         characters_per_second=500.0,
@@ -1238,7 +1240,7 @@ def test_a_prepared_accelerator_runs_in_its_own_interpreter(tmp_path: Path) -> N
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
 
-    launcher = app._accelerator_launcher(app.backend_selection.descriptor)
+    launcher = app.backends._accelerator_launcher(app.backend_selection.descriptor)
 
     assert isinstance(launcher, ExternalInterpreterLauncher)
     assert launcher.executable == interpreter
@@ -1256,7 +1258,9 @@ def test_a_backend_this_process_already_offers_needs_no_second_environment(
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
     in_process = replace(app.backend_selection.descriptor, provider=app.serving_providers[0])
 
-    assert not isinstance(app._accelerator_launcher(in_process), ExternalInterpreterLauncher)
+    assert not isinstance(
+        app.backends._accelerator_launcher(in_process), ExternalInterpreterLauncher
+    )
 
 
 def test_a_refused_record_explains_the_cpu_outcome(tmp_path: Path) -> None:
@@ -1702,7 +1706,10 @@ def test_scheduled_maintenance_is_serialized_across_applications(tmp_path: Path)
     other = Application(app.paths, embedder=TinyEmbedder(), cwd=tmp_path)
     entered = threading.Event()
     release = threading.Event()
-    original = app.maintain_storage
+    # maybe_run_maintenance calls maintain_storage on MaintenanceService, not on
+    # Application (see maintenance.py D2): the patch has to target the
+    # collaborator that actually makes the call, not Application's delegate.
+    original = app.maintenance.maintain_storage
     outcomes: list[object] = []
 
     def slow_maintenance(
@@ -1724,9 +1731,9 @@ def test_scheduled_maintenance_is_serialized_across_applications(tmp_path: Path)
         )
 
     with (
-        patch.object(app, "maintain_storage", side_effect=slow_maintenance),
+        patch.object(app.maintenance, "maintain_storage", side_effect=slow_maintenance),
         patch.object(
-            other,
+            other.maintenance,
             "maintain_storage",
             side_effect=AssertionError("the cadence lock must suppress a duplicate pass"),
         ),

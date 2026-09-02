@@ -37,12 +37,22 @@ from .git_state import (
     GitProbeOutcome,
     GitState,
     changed_paths_between,
+    checkout_head,
     probe_git_state,
 )
 from .git_state import (
     slot_id as git_slot_id,
 )
 from .history import HistoryStore
+
+# REFERENCE_SCHEMA_VERSION and content_digest (as `_digest`) moved to models.py
+# (D3 in docs/plans/2026-09-02-review-remediation-5-application-split-plan.md):
+# reference_service.py needs both too, and importing them from here made that a
+# sideways dependency between two peer services. Imported here so
+# `from .indexing import REFERENCE_SCHEMA_VERSION` (daemon.py) still works.
+from .models import (
+    REFERENCE_SCHEMA_VERSION as REFERENCE_SCHEMA_VERSION,  # re-exported, see comment above
+)
 from .models import (
     ExtractedChunk,
     ExtractedDeclarationShape,
@@ -58,11 +68,11 @@ from .models import (
     SkippedFile,
     StoredFile,
 )
+from .models import content_digest as _digest
 from .progress import IndexProgress, ProgressPublisher
 from .scanner import SourceScanner
 from .staging import ChunkRow, ReferenceRow, StagingJob
 from .storage import SCHEMA_VERSION, ActiveIndexTarget, LanceStore, PartitionRef
-from .update_check import checkout_head
 
 logger = logging.getLogger(__name__)
 
@@ -75,18 +85,6 @@ SEGMENT_TEXT_GROWTH_LIMIT = 2
 # into thousands of chunks, and keeps a retry from re-embedding the whole file.
 CANDIDATE_GROUP_CHARS = 256 * 1024
 CANDIDATE_GROUP_COUNT = 256
-
-# Bump only when the normalized structural-row contract changes. Coverage rows
-# make a new generation discoverable without coupling it to project metadata.
-# Version 4 puts the reference kind in the row identity. Bumping it also
-# discards any generation written by version 3, whose colliding ids are what
-# made a project unindexable.
-# Version 5 adds Go to STRUCTURAL_LANGUAGES. Every language's version-bump step
-# is what makes parse-only reference backfill re-extract that language's files
-# (Go files already carried version-4 coverage rows with zero occurrences).
-# Version 6 adds Rust; version 7 adds Java, with on-demand-import semantics.
-# Version 8 adds C#, with namespace identity carried on export rows.
-REFERENCE_SCHEMA_VERSION = 8
 
 # Failures caused by the environment rather than by a file's own content. They
 # abort the run instead of being recorded against whichever file was in flight.
@@ -138,11 +136,6 @@ def _candidate_groups(
         characters += len(candidate.chunk.content)
     if group:
         yield group
-
-
-def _digest(value: str | bytes) -> str:
-    data = value.encode() if isinstance(value, str) else value
-    return hashlib.sha256(data).hexdigest()
 
 
 def _content_rejection(source: bytes) -> str | None:

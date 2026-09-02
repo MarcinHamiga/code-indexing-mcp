@@ -14,8 +14,8 @@ from typing import Any, Final, Literal, NamedTuple, cast
 
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import STRUCTURAL_LANGUAGES
-from .indexing import REFERENCE_SCHEMA_VERSION, _digest
 from .models import (
+    REFERENCE_SCHEMA_VERSION,
     CompletenessReport,
     DeclarationSelector,
     ImpactBudgetExhaustion,
@@ -38,6 +38,7 @@ from .models import (
     SelectedDeclaration,
     SignatureChangeOperation,
 )
+from .models import content_digest as _digest
 from .patching import (
     MAX_CONTEXT_LINES,
     MIN_CONTEXT_LINES,
@@ -628,7 +629,7 @@ class ReferenceService:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, "limit must be between 1 and 500")
         selector_project_id = selector.project
         if selector_project_id is None and selector.chunk_id is not None:
-            selector_project_id = self.store._chunk_project_id(selector.chunk_id)
+            selector_project_id = self.store.chunk_project_id(selector.chunk_id)
         if partition is None and selector_project_id is not None:
             partition = self.store.active_partition(selector_project_id)
         if (
@@ -1004,7 +1005,7 @@ class ReferenceService:
 
         selector_project_id = selector.project
         if selector_project_id is None and selector.chunk_id is not None:
-            selector_project_id = self.store._chunk_project_id(selector.chunk_id)
+            selector_project_id = self.store.chunk_project_id(selector.chunk_id)
         if partition is None and selector_project_id is not None:
             partition = self.store.active_partition(selector_project_id)
         if (

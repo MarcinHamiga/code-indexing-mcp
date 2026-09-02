@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import os
+from dataclasses import replace
+from pathlib import Path
+
 import pytest
 
+from code_indexing_mcp.application import Application, RuntimePaths
 from code_indexing_mcp.backends import Accelerator
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.settings import IndexMode, IndexSettings
@@ -299,3 +304,50 @@ def test_branch_cache_limit_has_a_bounded_maximum(monkeypatch: pytest.MonkeyPatc
         IndexSettings.from_environment()
 
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "Yes"])
+def test_offline_recognizes_truthy_values(raw: str) -> None:
+    assert IndexSettings.from_environment({"CODE_INDEXING_OFFLINE": raw}).offline is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", "off", "on", "garbage", ""])
+def test_offline_defaults_to_false_for_anything_else(raw: str) -> None:
+    """Deliberately lenient, unlike `_boolean`: an unrecognized value reads as
+    False rather than raising, matching what `Application.__init__` did
+    before this was folded into IndexSettings (D5)."""
+    assert IndexSettings.from_environment({"CODE_INDEXING_OFFLINE": raw}).offline is False
+
+
+def test_offline_is_false_when_unset() -> None:
+    assert IndexSettings.from_environment({}).offline is False
+
+
+def test_application_never_reads_offline_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Application.__init__ must read `settings.offline`, not
+    `CODE_INDEXING_OFFLINE` itself (D5): the environment is monkeypatched to
+    raise if that key is ever consulted, so a regression back to a direct
+    `os.environ` read fails loudly instead of only failing when the two
+    disagree.
+    """
+    real_environ = dict(os.environ)
+
+    class _RaisingOnOffline(dict):
+        def get(self, key: str, default: object = None) -> object:
+            if key == "CODE_INDEXING_OFFLINE":
+                raise AssertionError(
+                    "Application.__init__ must not read CODE_INDEXING_OFFLINE directly"
+                )
+            return super().get(key, default)
+
+    monkeypatch.setattr(os, "environ", _RaisingOnOffline(real_environ))
+
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        settings=replace(IndexSettings.from_environment({}), offline=True),
+        cwd=tmp_path,
+    )
+
+    assert app.embedder.offline is True

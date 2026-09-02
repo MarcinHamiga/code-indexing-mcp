@@ -1,5 +1,6 @@
 """Immutable domain models."""
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Annotated, Literal
@@ -26,6 +27,38 @@ class _PathAsPlainString:
 
 
 SerializablePath = Annotated[Path, _PathAsPlainString()]
+
+# Bump only when the normalized structural-row contract changes. Coverage rows
+# make a new generation discoverable without coupling it to project metadata.
+# Version 4 puts the reference kind in the row identity. Bumping it also
+# discards any generation written by version 3, whose colliding ids are what
+# made a project unindexable.
+# Version 5 adds Go to STRUCTURAL_LANGUAGES. Every language's version-bump step
+# is what makes parse-only reference backfill re-extract that language's files
+# (Go files already carried version-4 coverage rows with zero occurrences).
+# Version 6 adds Rust; version 7 adds Java, with on-demand-import semantics.
+# Version 8 adds C#, with namespace identity carried on export rows.
+#
+# Lives here rather than in indexing.py (originally its home) because
+# reference_service.py needs it too and importing it from indexing.py made
+# that a sideways dependency between two peer services -- see D3 in
+# docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
+# indexing.py re-exports the name for one release so nothing importing it from
+# there breaks.
+REFERENCE_SCHEMA_VERSION = 8
+
+
+def content_digest(value: str | bytes) -> str:
+    """Return the sha256 hex digest of *value*, encoding text as UTF-8 first.
+
+    Identifies file content and derives stable ids for chunks, structural rows,
+    and reference rows. Public (moved here from indexing.py's private
+    ``_digest`` per D3) because reference_service.py computes the same digest
+    independently of indexing.py's own pipeline.
+    """
+    data = value.encode() if isinstance(value, str) else value
+    return hashlib.sha256(data).hexdigest()
+
 
 LEGACY_DEFAULT_INCLUDES_V1 = [
     "**/*.py",

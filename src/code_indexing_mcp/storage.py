@@ -884,7 +884,7 @@ class LanceStore:
         if not rows:
             raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {project.id}")
         desired = self._slot_for_git_state(rows[0], state)
-        active = self._active_partition_ref(project.id, checkout_key=selected_key)
+        active = self.active_partition_ref(project.id, checkout_key=selected_key)
         existing = self.get_slot(desired.slot_id)
         if existing is None:
             desired = desired.model_copy(update={"state": "pending"})
@@ -902,7 +902,7 @@ class LanceStore:
         self.upsert_slot(selected)
         if active is None or active.slot_id != selected.slot_id:
             self.activate_slot(project.id, selected.slot_id, checkout_key=selected_key)
-        active = self._active_partition_ref(project.id, checkout_key=selected_key)
+        active = self.active_partition_ref(project.id, checkout_key=selected_key)
         if active is None:
             raise CodeIndexingError(
                 ErrorCode.PROJECT_NOT_FOUND,
@@ -915,7 +915,7 @@ class LanceStore:
         self.flush_slot_touches()
         return active
 
-    def _active_partition_ref(
+    def active_partition_ref(
         self, project_id: str, *, checkout_key: str | None = None
     ) -> PartitionRef | None:
         slot_row = self._selected_pointer_row(project_id, checkout_key)
@@ -930,6 +930,18 @@ class LanceStore:
             partition_id=slot.partition_id,
             activation_epoch=int(slot_row["activation_epoch"]),
         )
+
+    def _active_partition_ref(
+        self, project_id: str, *, checkout_key: str | None = None
+    ) -> PartitionRef | None:
+        """Deprecated alias for :meth:`active_partition_ref`.
+
+        Kept for one release (D4 in
+        docs/plans/2026-09-02-review-remediation-5-application-split-plan.md):
+        this was a private the review found being called from outside the
+        class, so the contract it already was is now the public name.
+        """
+        return self.active_partition_ref(project_id, checkout_key=checkout_key)
 
     def _slot_for_git_state(self, row: dict[str, Any], state: GitState) -> ProjectSlot:
         project = ProjectInfo.model_validate_json(str(row["payload"]))
@@ -1182,7 +1194,7 @@ class LanceStore:
         row["state"] = "rebuild_required"
         row["updated_at"] = time.time_ns()
         self._merge(self._projects, "id", [row])
-        active = self._active_partition_ref(project_id)
+        active = self.active_partition_ref(project_id)
         if active is not None:
             slot = self.get_slot(active.slot_id)
             if slot is not None and slot.state != "rebuild_required":
@@ -1667,7 +1679,7 @@ class LanceStore:
         # id, one whose prefix names no project, or one from a pre-migration
         # generation is treated as unknown -- consistent with the existing
         # contract that chunk ids change when a file is re-indexed.
-        project_id = self._chunk_project_id(chunk_id)
+        project_id = self.chunk_project_id(chunk_id)
         if project_id is None:
             return None
         tables = self._project_existing_tables(project_id, partition_id=partition_id)
@@ -1696,7 +1708,7 @@ class LanceStore:
             return None
         return prefix
 
-    def _chunk_project_id(self, chunk_id: str) -> str | None:
+    def chunk_project_id(self, chunk_id: str) -> str | None:
         """Resolve a chunk id's routing prefix through the logical registry."""
         prefix = self._chunk_id_prefix(chunk_id)
         if prefix is None:
@@ -1704,6 +1716,16 @@ class LanceStore:
         if self._rows(self._projects, f"id = {_quoted(prefix)}"):
             return prefix
         return None
+
+    def _chunk_project_id(self, chunk_id: str) -> str | None:
+        """Deprecated alias for :meth:`chunk_project_id`.
+
+        Kept for one release (D4 in
+        docs/plans/2026-09-02-review-remediation-5-application-split-plan.md):
+        this was a private the review found being called from outside the
+        class, so the contract it already was is now the public name.
+        """
+        return self.chunk_project_id(chunk_id)
 
     def count_chunks(
         self,
@@ -2581,7 +2603,7 @@ class LanceStore:
         installation-wide report can resolve every project once and then
         collect each partition without N+1 registry reads.
         """
-        active = partition_ref or self._active_partition_ref(project.id)
+        active = partition_ref or self.active_partition_ref(project.id)
         if active is not None and active.project_id != project.id:
             raise ValueError("partition does not belong to project")
         partition_id = project.id if active is None else active.partition_id
