@@ -8,6 +8,7 @@ import stat
 import threading
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -618,6 +619,14 @@ def test_system_exit_inside_dispatch_is_not_swallowed(
         raise SystemExit(1)
 
     application.list_projects = exiting_list_projects  # type: ignore[method-assign]
+    # SystemExit escapes the request thread uncaught; capture it through the
+    # thread excepthook so the test asserts on it directly instead of leaving
+    # it for pytest to report as an unhandled thread exception against
+    # whichever test happens to be running when the thread unwinds.
+    escaped: list[BaseException] = []
+    monkeypatch.setattr(
+        threading, "excepthook", lambda args: escaped.append(cast(BaseException, args.exc_value))
+    )
     server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
     thread = threading.Thread(target=server.serve, daemon=True)
     thread.start()
@@ -625,17 +634,17 @@ def test_system_exit_inside_dispatch_is_not_swallowed(
     broker = BrokerApplication(paths, cwd=tmp_path)
 
     try:
-        # SystemExit propagates out of the request thread uncaught (pytest
-        # turns that into a warning rather than crashing the test session --
-        # not asserted on directly here, since it fires from a background
-        # thread on its own schedule). What this test asserts on is the
-        # client-visible effect: the connection drops with no response at
-        # all, which is what proves SystemExit was never turned into an
-        # error frame -- an INTERNAL_ERROR reply would mean it had been
-        # caught and swallowed as if it were a plain Exception.
+        # The client-visible effect: the connection drops with no response at
+        # all, which is what proves SystemExit was never turned into an error
+        # frame -- an INTERNAL_ERROR reply would mean it had been caught and
+        # swallowed as if it were a plain Exception.
         with pytest.raises(CodeIndexingError) as raised:
             broker.list_projects()
         assert raised.value.code is ErrorCode.DAEMON_UNAVAILABLE
+        deadline = time.monotonic() + 2
+        while not escaped and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(escaped) == 1 and isinstance(escaped[0], SystemExit)
     finally:
         broker.stop()
         thread.join(timeout=2)

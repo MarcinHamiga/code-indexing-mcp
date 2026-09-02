@@ -387,7 +387,11 @@ class DaemonServer:
                 ErrorCode.INDEX_BUSY, "The per-user indexing daemon is already running"
             ) from exc
         self._token = self._load_or_create_token()
-        if self.endpoint.exists():
+        # A retiring daemon closes its listener before it unlinks the path, and
+        # ensure_daemon starts the replacement the moment a connect is refused,
+        # so both processes can reach for the same stale path at once. Losing
+        # that race must not kill the new daemon before it ever binds.
+        with contextlib.suppress(FileNotFoundError):
             self.endpoint.unlink()
         listener = _local_socket()
         self._listener = listener
@@ -471,7 +475,7 @@ class DaemonServer:
                 self._model_warmup_thread.join()
                 self._model_warmup_thread = None
             self._listener = None
-            if self.endpoint.exists():
+            with contextlib.suppress(FileNotFoundError):
                 self.endpoint.unlink()
             # Buffered slot touches (touch_slot) must not be lost when the
             # daemon exits: the next process's LRU retention decision reads
