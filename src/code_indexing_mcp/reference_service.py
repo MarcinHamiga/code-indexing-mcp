@@ -401,11 +401,13 @@ class _ReferenceQuery(NamedTuple):
 
     The full hit list and source cache let refactor analysis compute page-independent
     counts without repeating classification. Records contain reference and coverage
-    rows; declarations are fetched separately through narrowed queries.
+    rows; declarations are fetched separately through narrowed queries and retained
+    for impact traversal.
     """
 
     response: ReferenceResponse
     records: list[ReferenceRecord]
+    declarations: list[ReferenceRecord]
     hits: list[ReferenceHit]
     root: Path | None
     sources: dict[str, tuple[bytes, int]]
@@ -485,6 +487,7 @@ class ReferenceService:
         partition: PartitionRef | None = None,
         root: Path | None = None,
         snapshot_version: int | None = None,
+        preselected: SelectedDeclaration | None = None,
     ) -> _ReferenceQuery:
         """`find_references`'s body, also returning everything it computed along the way.
 
@@ -524,10 +527,12 @@ class ReferenceService:
                 raise CodeIndexingError(
                     ErrorCode.STALE_CURSOR, "Reference cursor belongs to an earlier slot activation"
                 )
-        selected = self._select(
-            selector,
-            partition_id=None if partition is None else partition.partition_id,
-        )
+        selected = preselected
+        if selected is None:
+            selected = self._select(
+                selector,
+                partition_id=None if partition is None else partition.partition_id,
+            )
         partition = partition or self.store.active_partition(selected.project_id)
         if selected.language not in STRUCTURAL_LANGUAGES:
             raise CodeIndexingError(
@@ -613,7 +618,7 @@ class ReferenceService:
             ) from error
         root = root or self._project_root(selected.project_id)
         sources: dict[str, tuple[bytes, int]] = {}
-        hits, limitations = self._hits_and_limitations(
+        hits, limitations, declarations = self._hits_and_limitations(
             selected,
             kinds,
             records,
@@ -656,6 +661,7 @@ class ReferenceService:
         return _ReferenceQuery(
             response,
             records,
+            declarations,
             hits,
             root,
             sources,
@@ -739,17 +745,14 @@ class ReferenceService:
             version = cast(int, payload["version"])
 
         first_query = self._find_references_with_records(
-            DeclarationSelector(
-                project=selected.project_id,
-                path=selected.path,
-                qualified_symbol=selected.qualified_symbol,
-            ),
+            selector,
             kinds=kinds,
             limit=500,
             backfill=backfill,
             partition=partition,
             root=root,
             snapshot_version=version,
+            preselected=selected,
         )
         version = first_query.response.snapshot_version
         root = first_query.root
@@ -786,6 +789,7 @@ class ReferenceService:
                         partition=partition,
                         root=root,
                         snapshot_version=version,
+                        preselected=source,
                     )
                 )
                 limitations.extend(query.response.limitations)
@@ -794,23 +798,44 @@ class ReferenceService:
                     for row in query.records
                     if row["record_kind"] == "reference"
                 }
+                declarations: dict[tuple[str, str], list[ReferenceRecord]] = {}
+                for declaration in query.declarations:
+                    qualified = declaration["source_qualified_symbol"]
+                    if qualified is not None:
+                        declaration_key = (declaration["file_id"], qualified)
+                        declarations.setdefault(declaration_key, []).append(declaration)
                 for hit in query.hits:
                     row = rows.get(hit.reference_id)
                     qualified_symbol = None if row is None else row["source_qualified_symbol"]
                     target: SelectedDeclaration | None = None
-                    if qualified_symbol:
-                        try:
-                            target = self._select(
-                                DeclarationSelector(
-                                    project=selected.project_id,
-                                    path=hit.path,
-                                    qualified_symbol=qualified_symbol,
-                                ),
-                                partition_id=partition.partition_id,
+                    target_declarations = (
+                        []
+                        if row is None or qualified_symbol is None
+                        else declarations.get((row["file_id"], qualified_symbol), [])
+                    )
+                    if qualified_symbol is not None and len(target_declarations) == 1:
+                        declaration = target_declarations[0]
+                        symbol = declaration["target_name"]
+                        kind = declaration["kind"]
+                        start_line = declaration["start_line"]
+                        end_line = declaration["end_line"]
+                        if (
+                            symbol is not None
+                            and kind is not None
+                            and start_line is not None
+                            and end_line is not None
+                        ):
+                            target = SelectedDeclaration(
+                                project_id=declaration["project_id"],
+                                file_id=declaration["file_id"],
+                                path=declaration["path"],
+                                language=declaration["language"],
+                                symbol=symbol,
+                                qualified_symbol=qualified_symbol,
+                                kind=kind,
+                                start_line=start_line,
+                                end_line=end_line,
                             )
-                        except CodeIndexingError as error:
-                            if error.code is not ErrorCode.AMBIGUOUS_SYMBOL:
-                                raise
                     traversable = hit.resolution == "exact" or (
                         include_likely and hit.resolution == "likely"
                     )
@@ -986,7 +1011,7 @@ class ReferenceService:
         version: int,
         *,
         partition_id: str,
-    ) -> tuple[list[ReferenceHit], list[ReferenceLimitation]]:
+    ) -> tuple[list[ReferenceHit], list[ReferenceLimitation], list[ReferenceRecord]]:
         """Classify every reference row into a sorted, unsliced hit list.
 
         Shared by `find_references` (which then slices a page from the
@@ -1154,7 +1179,7 @@ class ReferenceService:
                 )
             )
         hits.sort(key=lambda hit: (hit.path, hit.start_line, hit.start_byte, hit.reference_id))
-        return hits, limitations
+        return hits, limitations, declarations
 
     def analyze_refactor(
         self,

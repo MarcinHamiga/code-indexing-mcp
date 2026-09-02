@@ -6,7 +6,7 @@ import pytest
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
-from code_indexing_mcp.models import DeclarationSelector
+from code_indexing_mcp.models import DeclarationSelector, SelectedDeclaration
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.reference_service import ReferenceService
 from code_indexing_mcp.scanner import SourceScanner
@@ -24,7 +24,12 @@ class TinyEmbedder:
         return [1.0, 0.0, 0.0, float(len(text))]
 
 
-def _indexed_service(tmp_path: Path, files: dict[str, str]) -> tuple[ReferenceService, str]:
+def _indexed_service(
+    tmp_path: Path,
+    files: dict[str, str],
+    *,
+    extractor: TreeSitterExtractor | None = None,
+) -> tuple[ReferenceService, str]:
     root = tmp_path / "repo"
     root.mkdir()
     for path, source in files.items():
@@ -36,7 +41,7 @@ def _indexed_service(tmp_path: Path, files: dict[str, str]) -> tuple[ReferenceSe
     indexer = Indexer(
         store=store,
         scanner=SourceScanner(),
-        extractor=TreeSitterExtractor(),
+        extractor=extractor or TreeSitterExtractor(),
         embedder=TinyEmbedder(),
         lock_directory=tmp_path / "locks",
     )
@@ -1180,6 +1185,30 @@ def test_impact_radius_returns_layers_for_a_dependency_chain(tmp_path: Path) -> 
     assert result.completeness.state == "complete"
 
 
+def test_impact_radius_preserves_identity_for_split_declarations(tmp_path: Path) -> None:
+    body = "".join(f"    value_{index} = {index}\n" for index in range(20))
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "graph.py": (
+                f"def base():\n{body}    return 1\n\ndef dependent():\n{body}    return base()\n"
+            )
+        },
+        extractor=TreeSitterExtractor(max_chars=120, max_lines=6, overlap_lines=1),
+    )
+    chunks = service.store.list_chunks([project_id])
+    base_chunks = [chunk for chunk in chunks if chunk.qualified_symbol == "base"]
+    dependent_chunks = [chunk for chunk in chunks if chunk.qualified_symbol == "dependent"]
+    assert len(base_chunks) > 1
+    assert len(dependent_chunks) > 1
+
+    result = service.impact_radius(DeclarationSelector(chunk_id=base_chunks[0].chunk_id))
+
+    assert [edge.target.qualified_symbol for edge in result.layers[0].edges] == ["dependent"]
+    assert result.visited == 2
+    assert result.completeness.state == "complete"
+
+
 def test_impact_radius_deduplicates_diamonds_and_reports_cycles(tmp_path: Path) -> None:
     service, project_id = _indexed_service(
         tmp_path,
@@ -1278,19 +1307,26 @@ def test_impact_radius_aggregates_kinds_and_keeps_unattributed_hits_in_review(
     assert calls_only.layers[0].edges[0].kinds == ["call"]
 
 
-def test_impact_radius_reports_and_enforces_the_node_budget(tmp_path: Path) -> None:
+def test_impact_radius_reports_and_enforces_the_node_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependents = "\n\n".join(f"def dependent_{index}():\n    return base()" for index in range(50))
     service, project_id = _indexed_service(
         tmp_path,
-        {
-            "graph.py": (
-                "def base():\n    return 1\n\n"
-                "def a():\n    return base()\n\n"
-                "def b():\n    return base()\n\n"
-                "def c():\n    return base()\n"
-            )
-        },
+        {"graph.py": f"def base():\n    return 1\n\n{dependents}\n"},
     )
     selector = DeclarationSelector(project=project_id, path="graph.py", qualified_symbol="base")
+    select_calls = 0
+    real_select = service._select
+
+    def counting_select(
+        selected: DeclarationSelector, *, partition_id: str | None = None
+    ) -> SelectedDeclaration:
+        nonlocal select_calls
+        select_calls += 1
+        return real_select(selected, partition_id=partition_id)
+
+    monkeypatch.setattr(service, "_select", counting_select)
 
     result = service.impact_radius(selector, max_nodes=2)
 
@@ -1298,9 +1334,10 @@ def test_impact_radius_reports_and_enforces_the_node_budget(tmp_path: Path) -> N
     assert result.budget_exhausted is True
     assert result.budget_exhaustion is not None
     assert result.budget_exhaustion.depth == 1
-    assert result.budget_exhaustion.unvisited_frontier == 2
+    assert result.budget_exhaustion.unvisited_frontier == 49
     assert len(result.layers[0].edges) == 1
     assert result.completeness.state == "incomplete"
+    assert select_calls == 1
     with pytest.raises(CodeIndexingError) as excinfo:
         service.impact_radius(selector, max_nodes=2001)
     assert excinfo.value.code is ErrorCode.INVALID_FILTER
