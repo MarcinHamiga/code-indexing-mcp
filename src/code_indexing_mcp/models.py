@@ -649,6 +649,10 @@ class ChunkPreview(FrozenModel):
 
     chunk_id: str
     project_id: str
+    # Optional and unset by most producers (search/outline previews never
+    # needed it); `LanceStore.find_declarations` sets it so `_select` can
+    # build a `SelectedDeclaration` without a second lookup.
+    file_id: str | None = None
     path: str
     language: str
     kind: str

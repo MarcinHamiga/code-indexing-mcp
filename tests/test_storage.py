@@ -442,7 +442,115 @@ def test_reference_indexes_cover_every_exact_filter(tmp_path: Path) -> None:
         "kind",
         "source_qualified_symbol",
         "schema_version",
+        # written_name/receiver_text back the reference-pushdown superset
+        # condition's `= S` terms (D1/D6 of the reference-pushdown plan).
+        "written_name",
+        "receiver_text",
     } <= indexed_columns
+
+
+def test_list_reference_records_kinds_and_extra_condition_push_down_like_and_in(
+    tmp_path: Path,
+) -> None:
+    """`kinds` and `extra_condition` (D1/D2) narrow the same way as `record_kinds`.
+
+    Also a probe that DataFusion accepts `LIKE` and `IN` in a LanceDB `where`
+    on the references table: both already work elsewhere in this module
+    (`find_symbol_chunks`'s `LIKE`, `declarations_for_files`'s `IN`), but the
+    reference-pushdown candidate condition (D1) is the first caller to use
+    them together against `written_name`/`receiver_text`, so this pins it
+    directly rather than relying on those other tests to catch a regression.
+    """
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    record = stored_file(project.id)
+    coverage = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="coverage",
+        record_kind="coverage",
+        kind=None,
+        source_qualified_symbol=None,
+        written_name=None,
+        target_name=None,
+        shape_json=None,
+    )
+    imported = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="import",
+        kind="import",
+        module_path="package",
+        target_name="answer",
+        written_name="answer",
+    )
+    exported = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="export",
+        kind="export",
+        module_path="package",
+        target_name="answer",
+        written_name="answer",
+    )
+    call_by_name = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="call-by-name",
+        kind="call",
+        target_name="answer",
+        written_name="answer",
+    )
+    call_by_receiver = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="call-by-receiver",
+        kind="call",
+        target_name="other.answer",
+        written_name="other.answer",
+        receiver_text="answer",
+    )
+    unrelated_call = reference_record(
+        project.id,
+        record.file_id,
+        reference_id="unrelated-call",
+        kind="call",
+        target_name="unrelated",
+        written_name="unrelated",
+    )
+    store.replace_files_from_arrow(
+        project.id,
+        files=pa.Table.from_pylist([record.model_dump()], schema=LanceStore.file_arrow_schema()),
+        chunk_batches=(),
+        reference_batches=[
+            (
+                ["file-1"],
+                reference_table(
+                    coverage, imported, exported, call_by_name, call_by_receiver, unrelated_call
+                ),
+            )
+        ],
+    )
+
+    # `kinds` filters the `kind` column independently of `record_kinds`.
+    assert store.list_reference_records(
+        project.id, record_kinds=("reference",), kinds=("import", "export")
+    ) == [exported, imported]
+    assert store.list_reference_records(project.id, kinds=()) == []
+
+    # `extra_condition` is ANDed in verbatim, exercising both LIKE and IN
+    # against written_name/receiver_text -- the D1 candidate condition shape.
+    condition = (
+        "target_name = 'answer' OR written_name = 'answer' "
+        "OR target_name LIKE '%.answer' OR written_name LIKE '%.answer' "
+        "OR receiver_text IN ('answer') OR written_name IN ('answer')"
+    )
+    assert store.list_reference_records(
+        project.id, record_kinds=("reference",), extra_condition=condition
+    ) == [call_by_name, call_by_receiver, exported, imported]
 
 
 def test_v1_store_is_backed_up_and_registered_for_lazy_rebuild(tmp_path: Path) -> None:

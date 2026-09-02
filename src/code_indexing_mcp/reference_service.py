@@ -7,6 +7,8 @@ import hashlib
 import json
 import keyword as keyword_module
 import re
+import threading
+from collections import OrderedDict
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal, NamedTuple, cast
 
@@ -69,6 +71,38 @@ _MAX_REEXPORT_DEPTH: Final = 4
 _COVERAGE_GAP_CODES: Final = frozenset({"unsupported_language", "parse_error", "stale_file"})
 
 _BOM: Final = b"\xef\xbb\xbf"
+
+# D1's guard before a symbol is trusted inside a raw `LIKE`/`IN` `where`
+# fragment: identifier characters only (Unicode letters/digits and
+# underscore, matching `\w` on a `str` pattern). An underscore is a `LIKE`
+# wildcard this LanceDB/DataFusion version gives no escape syntax for, but
+# that only ever widens the superset the storage condition returns (D1), so
+# it is accepted rather than rejected. Anything else -- a symbol containing
+# `%`, whitespace, or other punctuation, which no supported language's
+# declaration name syntax actually produces -- falls back to an unfiltered
+# candidate fetch instead of risking an unsound `where` fragment.
+_SAFE_SYMBOL_PATTERN: Final = re.compile(r"^\w+$")
+
+# Test-only escape hatch (Step 5 of the reference-pushdown plan): flipping
+# this to False makes `_candidate_condition` always fall back to an
+# unfiltered candidate fetch, with every other part of `_candidate_records`
+# (context assembly, classification) unchanged. The regression suite uses it
+# to prove the "one principle" holds by construction -- `find_references`
+# output is identical whether or not the storage-layer superset condition
+# actually narrows anything. Never read outside tests.
+_PUSHDOWN_ENABLED = True
+
+
+def _sql_literal(value: str) -> str:
+    """Quote a string for one raw `extra_condition` fragment.
+
+    Mirrors `storage._quoted`, kept private to that module; duplicated here
+    (rather than imported) because it is a one-line string operation, not a
+    storage concern, and every value passed through it here already comes
+    from indexed identifier text, never unvalidated external input.
+    """
+    return "'" + value.replace("'", "''") + "'"
+
 
 # How many individual paths a coverage limitation names before it summarizes.
 _MAX_LIMITATION_PATHS: Final = 10
@@ -396,6 +430,38 @@ class _ModuleIndex(NamedTuple):
     rust_crate_roots: dict[str, str]
 
 
+class _ReferenceContext(NamedTuple):
+    """The small, snapshot-stable rows every reference query needs (D2).
+
+    `coverage_rows` (one per indexed file) and `import_rows`/`export_rows`
+    are O(files) and O(imports) respectively -- orders of magnitude smaller
+    than the whole reference table for a project of any size -- and are
+    exactly what every consumer of `_find_references_with_records`'s
+    assembled `records` other than the classified candidate rows themselves
+    ever reads (see the audit in `_candidate_records`). `known_paths` and
+    `module_index` are derived from `coverage_rows`/`export_rows` alone: a
+    full rebuild over every kind of row would produce the identical result
+    for every field except `_ModuleIndex.receiver_names` (Go method
+    receivers, which need a query's own narrower `declarations` fetch), so
+    this context leaves `receiver_names` empty and callers that need it
+    merge it in per query with `_ModuleIndex._replace`.
+
+    Fetched once per pinned `(project_id, partition_id, version)` and reused
+    for the rest of that fetch (a single `find_references`/`analyze_refactor`
+    call) or, for `impact_radius`, for the whole traversal (D4) instead of
+    once per frontier node.
+    """
+
+    project_id: str
+    partition_id: str
+    version: int
+    coverage_rows: list[ReferenceRecord]
+    import_rows: list[ReferenceRecord]
+    export_rows: list[ReferenceRecord]
+    known_paths: frozenset[str]
+    module_index: _ModuleIndex
+
+
 class _ReferenceQuery(NamedTuple):
     """Pinned-snapshot data shared by reference and refactor responses.
 
@@ -414,6 +480,46 @@ class _ReferenceQuery(NamedTuple):
     partition_id: str
     slot_id: str
     activation_epoch: int
+    context: _ReferenceContext
+
+
+# impact_radius traversal cache key (D4): every parameter that changes what
+# one full, unpaginated traversal computes. `offset`/`limit` are
+# deliberately absent -- they slice the cached result, they do not change it.
+_ImpactTraversalKey = tuple[
+    str,  # project_id
+    str,  # partition_id
+    int,  # version
+    str,  # selected.path
+    str,  # selected.qualified_symbol
+    int,  # max_depth
+    bool,  # include_likely
+    tuple[str, ...],  # sorted kinds
+    int,  # max_nodes
+]
+
+# Small on purpose: this only needs to survive the handful of cursor pages
+# one client works through before moving to a different declaration, not
+# serve as a general result cache across unrelated queries.
+_IMPACT_TRAVERSAL_CACHE_SIZE: Final = 8
+
+
+class _ImpactTraversal(NamedTuple):
+    """One full impact_radius traversal (every depth), cached across cursor pages (D4).
+
+    Pagination re-ran this whole traversal from scratch on every page before
+    this cache existed, even though only its `offset`/`limit` slice changes
+    between pages. Caching the traversal itself, keyed by every parameter
+    that actually changes its result, means a later page reuses the computed
+    layers outright -- it touches neither the store nor the classifier again.
+    """
+
+    version: int
+    root: Path | None
+    all_layers: list[ImpactLayer]
+    limitations: list[ReferenceLimitation]
+    exhaustion: ImpactBudgetExhaustion | None
+    visited_count: int
 
 
 class _ClassifiedFindings(NamedTuple):
@@ -446,6 +552,15 @@ class ReferenceService:
 
     def __init__(self, store: LanceStore) -> None:
         self.store = store
+        # Process-local page cache for impact_radius traversals (D4): a
+        # cursor page re-ran the whole traversal from scratch before this
+        # existed. `OrderedDict` gives cheap LRU via move-to-end on hit and
+        # popitem(last=False) on overflow; the lock guards it against
+        # concurrent MCP tool calls sharing one `Application`/`ReferenceService`.
+        self._impact_traversal_cache: OrderedDict[_ImpactTraversalKey, _ImpactTraversal] = (
+            OrderedDict()
+        )
+        self._impact_traversal_cache_lock = threading.Lock()
 
     def find_references(
         self,
@@ -488,6 +603,7 @@ class ReferenceService:
         root: Path | None = None,
         snapshot_version: int | None = None,
         preselected: SelectedDeclaration | None = None,
+        context: _ReferenceContext | None = None,
     ) -> _ReferenceQuery:
         """`find_references`'s body, also returning everything it computed along the way.
 
@@ -500,6 +616,13 @@ class ReferenceService:
         second full-table materialization and a second classification pass
         over data already in hand (S4/E1); this lets `analyze_refactor` reuse
         the one fetch and one classification pass made here instead.
+
+        `context` (D2-D4 of the reference-pushdown plan) is the small,
+        snapshot-stable row set (coverage/import/export rows) every query
+        needs; when `None` it is loaded here, once, for this one call.
+        `impact_radius` instead loads it once for a whole traversal and
+        passes it to every frontier node's call, so the coverage/import/
+        export fetch happens once per traversal rather than once per node.
         """
         if limit < 1 or limit > 500:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, "limit must be between 1 and 500")
@@ -605,13 +728,21 @@ class ReferenceService:
             # (`declarations_for_files`/`target_name_candidates`) against the
             # same pinned `version`, so this call no longer has to pull the
             # whole project's declaration table into every page.
-            records = self.store.list_reference_records(
-                selected.project_id,
-                version=version,
-                schema_version=REFERENCE_SCHEMA_VERSION,
-                record_kinds=("reference", "coverage"),
-                partition_id=partition.partition_id,
-            )
+            #
+            # The whole reference table is no longer fetched here either
+            # (perf-major 4): `context` supplies the small coverage/import/
+            # export rows (loaded once, here, when the caller has not
+            # already loaded one -- `impact_radius` loads one before its
+            # frontier loop and passes it to every node instead, D4), and
+            # `_candidate_records` fetches only the `reference` rows a
+            # superset `where` condition (D1) proves `_may_refer` could ever
+            # accept -- everything after that remains the arbiter of
+            # correctness (the one principle).
+            if context is None:
+                context = self._load_reference_context(
+                    selected.project_id, partition_id=partition.partition_id, version=version
+                )
+            records = self._candidate_records(selected, context, version, partition.partition_id)
         except (FileNotFoundError, ValueError) as error:
             raise CodeIndexingError(
                 ErrorCode.STALE_CURSOR, "Reference cursor snapshot expired"
@@ -668,7 +799,182 @@ class ReferenceService:
             partition.partition_id,
             partition.slot_id,
             partition.activation_epoch,
+            context,
         )
+
+    def _load_reference_context(
+        self, project_id: str, *, partition_id: str, version: int
+    ) -> _ReferenceContext:
+        """Fetch the small, snapshot-stable rows a reference query needs (D2).
+
+        Coverage rows (one per indexed file) and import/export rows are
+        orders of magnitude fewer than the full reference table; every
+        `.records` consumer other than the classified candidates themselves
+        reads only these three kinds (the audit in `_candidate_records`), so
+        this is the two narrow queries that replace "the whole table per
+        call" -- the candidate fetch itself happens per selection, in
+        `_candidate_records`.
+        """
+        coverage_rows = self.store.list_reference_records(
+            project_id,
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+            record_kinds=("coverage",),
+            partition_id=partition_id,
+        )
+        import_export_rows = self.store.list_reference_records(
+            project_id,
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+            record_kinds=("reference",),
+            kinds=("import", "export"),
+            partition_id=partition_id,
+        )
+        import_rows = [row for row in import_export_rows if row["kind"] == "import"]
+        export_rows = [row for row in import_export_rows if row["kind"] == "export"]
+        # `_build_module_index`'s directory/namespace arithmetic reads only a
+        # row's bare `path` (every file already has one via its own coverage
+        # row) and `export`-kind rows -- never `declarations`, which is
+        # per-query and merged in separately below -- so this context-level
+        # build is not a superset of a full rebuild, it is exactly equal to
+        # one for every field but `receiver_names` (left empty here).
+        module_index = self._build_module_index(coverage_rows + export_rows, None)
+        return _ReferenceContext(
+            project_id=project_id,
+            partition_id=partition_id,
+            version=version,
+            coverage_rows=coverage_rows,
+            import_rows=import_rows,
+            export_rows=export_rows,
+            known_paths=self._known_paths(coverage_rows),
+            module_index=module_index,
+        )
+
+    @staticmethod
+    def _candidate_condition(selected: SelectedDeclaration, spellings: set[str]) -> str | None:
+        """Build D1's superset `where` fragment, or `None` to fetch unfiltered.
+
+        `selected.symbol` (`S`) drives the `= S`/`LIKE '%.S'` terms;
+        `spellings` (`A`, computed by `_candidate_records` from the context's
+        import rows) drives the `IN` terms binding an aliased/re-exported
+        reference. `None` when `S` is not safe to place in a `LIKE` pattern
+        (D1) -- the caller then fetches every `reference` row for this
+        version unfiltered, exactly today's behaviour, so this is a pure
+        narrowing: it can only ever return fewer rows than the fallback, never
+        different ones, since the Python filters (`_may_refer` onward) are
+        unchanged either way.
+        """
+        if not _PUSHDOWN_ENABLED:
+            return None
+        symbol = selected.symbol
+        if not symbol or not _SAFE_SYMBOL_PATTERN.match(symbol):
+            return None
+        quoted_symbol = _sql_literal(symbol)
+        quoted_tail = _sql_literal(f"%.{symbol}")
+        terms = [
+            f"target_name = {quoted_symbol}",
+            f"written_name = {quoted_symbol}",
+            f"receiver_text = {quoted_symbol}",
+            f"target_name LIKE {quoted_tail}",
+            f"written_name LIKE {quoted_tail}",
+        ]
+        if spellings:
+            # `IN` values are compared for exact equality, not pattern-matched
+            # (unlike the `LIKE` terms above), so an arbitrary spelling is
+            # safe here once quoted -- no identifier-character restriction
+            # applies to A the way it does to S.
+            values = ", ".join(_sql_literal(value) for value in sorted(spellings))
+            terms.append(f"receiver_text IN ({values})")
+            terms.append(f"written_name IN ({values})")
+        return " OR ".join(terms)
+
+    def _candidate_records(
+        self,
+        selected: SelectedDeclaration,
+        context: _ReferenceContext,
+        version: int,
+        partition_id: str,
+    ) -> list[ReferenceRecord]:
+        """Assemble one query's `records` from `context` plus a superset candidate fetch.
+
+        ### `.records` consumer audit (D3, Step 0)
+
+        Every reader of the assembled `records` (the local `records` inside
+        this class, and `_ReferenceQuery.records`/`query.records` outside it)
+        was checked against exactly what this function puts there --
+        `context.coverage_rows + context.import_rows + context.export_rows +
+        candidate_rows`, deduplicated by `reference_id`:
+
+        - `_hits_and_limitations`'s main classification loop, its
+          `reference_file_ids`/`coverage_hashes` locals, and
+          `_coverage_limitations`: read only `coverage` rows, `import`/
+          `export` rows, or rows that already passed `_may_refer` -- exactly
+          the four groups assembled here.
+        - `_imports_by_file`, `_reexport_rows_by_path`, `_known_paths`,
+          `_build_module_index`: read only `coverage`/`import`/`export` rows
+          (or, for `_build_module_index`'s directory arithmetic, any row's
+          bare `path`, which every file already contributes through its own
+          `coverage` row) -- never a reference row outside the candidate set.
+        - `impact_radius`'s per-hit `rows`/`declarations` lookups: read only
+          rows already reachable through `query.hits`, themselves derived
+          from these same candidate rows, so nothing wider is needed.
+        - `_rename_analysis`'s `shapes_by_id`: looked up only by a hit's own
+          `reference_id`, so never a row outside the candidate set.
+        - `_render_patch`'s `coverage_hashes` and `languages_by_path`: read
+          `coverage` rows and reference rows respectively, both already
+          assembled (the `languages_by_path` fallback of `""` already
+          tolerated a miss before this change).
+        - `_override_findings`'s `imports`/`known_paths`/`module_index` are
+          satisfied the same way; its `inheritance_rows` is the one genuine
+          exception (D3) -- the transitive-subclass walk needs *every*
+          `inheritance` row project-wide, including ones whose spelling never
+          matched the originally selected symbol, so it fetches its own
+          `kind = 'inheritance'` set directly rather than reading it out of
+          `records` (see `_override_findings`).
+
+        No consumer needs a fetch this function does not already provide.
+        """
+        reexport_rows = self._reexport_rows_by_path(context.import_rows + context.export_rows)
+        spellings: set[str] = set()
+        for item in context.import_rows:
+            binding = item["alias"] or item["written_name"] or item["imported_name"]
+            if binding is None:
+                continue
+            if self._import_targets(
+                item, selected, context.known_paths, context.module_index
+            ) or self._reexport_targets_symbol(
+                item,
+                selected.symbol,
+                selected.path,
+                reexport_rows,
+                context.known_paths,
+                context.module_index,
+            ):
+                spellings.add(binding)
+        condition = self._candidate_condition(selected, spellings)
+        candidate_rows = self.store.list_reference_records(
+            selected.project_id,
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+            record_kinds=("reference",),
+            extra_condition=condition,
+            partition_id=partition_id,
+        )
+        seen: set[str] = set()
+        records: list[ReferenceRecord] = []
+        for group in (
+            context.coverage_rows,
+            context.import_rows,
+            context.export_rows,
+            candidate_rows,
+        ):
+            for row in group:
+                reference_id = row["reference_id"]
+                if reference_id in seen:
+                    continue
+                seen.add(reference_id)
+                records.append(row)
+        return records
 
     def impact_radius(
         self,
@@ -744,6 +1050,199 @@ class ReferenceService:
             offset = cast(int, payload["offset"])
             version = cast(int, payload["version"])
 
+        if version is None:
+            # A resolved version is needed to build the traversal cache key
+            # (D4) before running anything below. This mirrors
+            # `_find_references_with_records`'s own missing-table check and
+            # version resolution exactly, so the error behaviour for a
+            # project whose reference index was never built is unchanged
+            # regardless of which path resolves the version first.
+            if not self.store.has_reference_table(
+                selected.project_id, partition_id=partition.partition_id
+            ):
+                raise CodeIndexingError(
+                    ErrorCode.REFERENCE_INDEX_UNAVAILABLE,
+                    "The reference index has not been built for this project. "
+                    "Run ensure_reference_index (or reindex) before querying references.",
+                    project=selected.project_id,
+                )
+            version = self.store.reference_version(
+                selected.project_id, partition_id=partition.partition_id
+            )
+
+        cache_key: _ImpactTraversalKey = (
+            selected.project_id,
+            partition.partition_id,
+            version,
+            selected.path,
+            selected.qualified_symbol,
+            max_depth,
+            include_likely,
+            tuple(sorted(kinds or ())),
+            max_nodes,
+        )
+        traversal = self._impact_traversal_cache_get(cache_key)
+        if traversal is None:
+            # A STALE_CURSOR cursor's version is checked against the slot's
+            # current activation above (payload["activation_epoch"]), and the
+            # cache is keyed by version, so a cursor whose snapshot has since
+            # been superseded can never be served a stale traversal from here.
+            traversal = self._run_impact_traversal(
+                selector,
+                selected,
+                partition,
+                version,
+                max_depth=max_depth,
+                include_likely=include_likely,
+                kinds=kinds,
+                max_nodes=max_nodes,
+                backfill=backfill,
+                root=root,
+            )
+            self._impact_traversal_cache_put(cache_key, traversal)
+
+        version = traversal.version
+        root = traversal.root
+        all_layers = traversal.all_layers
+        limitations = traversal.limitations
+        exhaustion = traversal.exhaustion
+        visited_count = traversal.visited_count
+
+        entries: list[tuple[int, str, ImpactEdge | ImpactReview]] = []
+        for layer in all_layers:
+            entries.extend((layer.depth, "edge", edge) for edge in layer.edges)
+            entries.extend((layer.depth, "review", item) for item in layer.review)
+        page = entries[offset : offset + limit]
+        page_layers: dict[int, dict[str, list[ImpactEdge] | list[ImpactReview]]] = {
+            layer.depth: {"edges": [], "review": []} for layer in all_layers
+        }
+        for depth, kind, item in page:
+            page_layer = page_layers.setdefault(depth, {"edges": [], "review": []})
+            if kind == "edge":
+                cast(list[ImpactEdge], page_layer["edges"]).append(cast(ImpactEdge, item))
+            else:
+                cast(list[ImpactReview], page_layer["review"]).append(cast(ImpactReview, item))
+
+        next_cursor = None
+        if offset + len(page) < len(entries):
+            next_cursor = self._encode_cursor(
+                {
+                    "version": version,
+                    "project_id": selected.project_id,
+                    "path": selected.path,
+                    "qualified_symbol": selected.qualified_symbol,
+                    "max_depth": max_depth,
+                    "include_likely": include_likely,
+                    "kinds": sorted(kinds or set()),
+                    "max_nodes": max_nodes,
+                    "offset": offset + len(page),
+                    "limit": limit,
+                    "slot_id": partition.slot_id,
+                    "activation_epoch": partition.activation_epoch,
+                }
+            )
+
+        unique_limitations = {
+            (item.code, item.explanation, item.path): item for item in limitations
+        }
+        sorted_limitations = sorted(
+            unique_limitations.values(), key=lambda item: (item.code, item.path or "")
+        )
+        full_review = any(layer.review for layer in all_layers)
+        dynamic_edges = any(
+            edge.possible or edge.tainted for layer in all_layers for edge in layer.edges
+        )
+        if exhaustion is not None or any(
+            item.code in _COVERAGE_GAP_CODES for item in sorted_limitations
+        ):
+            completeness = CompletenessReport(
+                state="incomplete",
+                explanation=(
+                    "The radius was truncated by its node budget or some files could not be "
+                    "analyzed. See budget_exhaustion and limitations."
+                ),
+            )
+        elif sorted_limitations or full_review or dynamic_edges:
+            completeness = CompletenessReport(
+                state="complete_with_dynamic_limitations",
+                explanation=(
+                    "Every indexed file was analyzed, but some dependency edges could not be "
+                    "proven exactly. See review and limitations."
+                ),
+            )
+        else:
+            completeness = CompletenessReport(
+                state="complete",
+                explanation="Every traversed dependency edge was resolved exactly.",
+            )
+
+        return ImpactRadiusResponse(
+            selected=selected,
+            layers=[
+                ImpactLayer(
+                    depth=depth,
+                    edges=cast(list[ImpactEdge], layer["edges"]),
+                    review=cast(list[ImpactReview], layer["review"]),
+                )
+                for depth, layer in sorted(page_layers.items())
+            ],
+            visited=visited_count,
+            budget_exhausted=exhaustion is not None,
+            budget_exhaustion=exhaustion,
+            limitations=sorted_limitations,
+            cursor=next_cursor,
+            snapshot_version=version,
+            completeness=completeness,
+        )
+
+    def _impact_traversal_cache_get(self, key: _ImpactTraversalKey) -> _ImpactTraversal | None:
+        """Look up a cached traversal, refreshing its LRU position on a hit."""
+        with self._impact_traversal_cache_lock:
+            traversal = self._impact_traversal_cache.get(key)
+            if traversal is not None:
+                self._impact_traversal_cache.move_to_end(key)
+            return traversal
+
+    def _impact_traversal_cache_put(
+        self, key: _ImpactTraversalKey, traversal: _ImpactTraversal
+    ) -> None:
+        """Store one traversal, evicting the least-recently-used entry past the cap."""
+        with self._impact_traversal_cache_lock:
+            self._impact_traversal_cache[key] = traversal
+            self._impact_traversal_cache.move_to_end(key)
+            while len(self._impact_traversal_cache) > _IMPACT_TRAVERSAL_CACHE_SIZE:
+                self._impact_traversal_cache.popitem(last=False)
+
+    def _run_impact_traversal(
+        self,
+        selector: DeclarationSelector,
+        selected: SelectedDeclaration,
+        partition: PartitionRef,
+        version: int,
+        *,
+        max_depth: int,
+        include_likely: bool,
+        kinds: set[str] | None,
+        max_nodes: int,
+        backfill: ReferenceBackfillReport | None,
+        root: Path | None,
+    ) -> _ImpactTraversal:
+        """Run one full, unpaginated impact-radius traversal (every depth).
+
+        Split out of `impact_radius` so its page cache (D4) can short-circuit
+        a repeat call -- most often a later cursor page, which used to re-run
+        this whole traversal from scratch -- without touching pagination.
+
+        Loads one `_ReferenceContext` up front and passes it to every
+        frontier node's `_find_references_with_records` call (D4): the
+        coverage/import/export fetch that used to repeat, unfiltered, once
+        per node now happens once per traversal, and each node's own fetch
+        narrows to `_candidate_records`'s SQL-pushed-down superset (D1/D2)
+        instead of the whole reference table.
+        """
+        context = self._load_reference_context(
+            selected.project_id, partition_id=partition.partition_id, version=version
+        )
         first_query = self._find_references_with_records(
             selector,
             kinds=kinds,
@@ -753,8 +1252,8 @@ class ReferenceService:
             root=root,
             snapshot_version=version,
             preselected=selected,
+            context=context,
         )
-        version = first_query.response.snapshot_version
         root = first_query.root
 
         def node_key(node: SelectedDeclaration) -> tuple[str, str, str]:
@@ -790,6 +1289,7 @@ class ReferenceService:
                         root=root,
                         snapshot_version=version,
                         preselected=source,
+                        context=context,
                     )
                 )
                 limitations.extend(query.response.limitations)
@@ -913,91 +1413,13 @@ class ReferenceService:
             if not frontier:
                 break
 
-        entries: list[tuple[int, str, ImpactEdge | ImpactReview]] = []
-        for layer in all_layers:
-            entries.extend((layer.depth, "edge", edge) for edge in layer.edges)
-            entries.extend((layer.depth, "review", item) for item in layer.review)
-        page = entries[offset : offset + limit]
-        page_layers: dict[int, dict[str, list[ImpactEdge] | list[ImpactReview]]] = {
-            layer.depth: {"edges": [], "review": []} for layer in all_layers
-        }
-        for depth, kind, item in page:
-            page_layer = page_layers.setdefault(depth, {"edges": [], "review": []})
-            if kind == "edge":
-                cast(list[ImpactEdge], page_layer["edges"]).append(cast(ImpactEdge, item))
-            else:
-                cast(list[ImpactReview], page_layer["review"]).append(cast(ImpactReview, item))
-
-        next_cursor = None
-        if offset + len(page) < len(entries):
-            next_cursor = self._encode_cursor(
-                {
-                    "version": version,
-                    "project_id": selected.project_id,
-                    "path": selected.path,
-                    "qualified_symbol": selected.qualified_symbol,
-                    "max_depth": max_depth,
-                    "include_likely": include_likely,
-                    "kinds": sorted(kinds or set()),
-                    "max_nodes": max_nodes,
-                    "offset": offset + len(page),
-                    "limit": limit,
-                    "slot_id": partition.slot_id,
-                    "activation_epoch": partition.activation_epoch,
-                }
-            )
-
-        unique_limitations = {
-            (item.code, item.explanation, item.path): item for item in limitations
-        }
-        sorted_limitations = sorted(
-            unique_limitations.values(), key=lambda item: (item.code, item.path or "")
-        )
-        full_review = any(layer.review for layer in all_layers)
-        dynamic_edges = any(
-            edge.possible or edge.tainted for layer in all_layers for edge in layer.edges
-        )
-        if exhaustion is not None or any(
-            item.code in _COVERAGE_GAP_CODES for item in sorted_limitations
-        ):
-            completeness = CompletenessReport(
-                state="incomplete",
-                explanation=(
-                    "The radius was truncated by its node budget or some files could not be "
-                    "analyzed. See budget_exhaustion and limitations."
-                ),
-            )
-        elif sorted_limitations or full_review or dynamic_edges:
-            completeness = CompletenessReport(
-                state="complete_with_dynamic_limitations",
-                explanation=(
-                    "Every indexed file was analyzed, but some dependency edges could not be "
-                    "proven exactly. See review and limitations."
-                ),
-            )
-        else:
-            completeness = CompletenessReport(
-                state="complete",
-                explanation="Every traversed dependency edge was resolved exactly.",
-            )
-
-        return ImpactRadiusResponse(
-            selected=selected,
-            layers=[
-                ImpactLayer(
-                    depth=depth,
-                    edges=cast(list[ImpactEdge], layer["edges"]),
-                    review=cast(list[ImpactReview], layer["review"]),
-                )
-                for depth, layer in sorted(page_layers.items())
-            ],
-            visited=len(visited),
-            budget_exhausted=exhaustion is not None,
-            budget_exhaustion=exhaustion,
-            limitations=sorted_limitations,
-            cursor=next_cursor,
-            snapshot_version=version,
-            completeness=completeness,
+        return _ImpactTraversal(
+            version=version,
+            root=root,
+            all_layers=all_layers,
+            limitations=limitations,
+            exhaustion=exhaustion,
+            visited_count=len(visited),
         )
 
     def _hits_and_limitations(
@@ -1949,6 +2371,15 @@ class ReferenceService:
         `base_decl` and each `override_decl` below are looked up by their own
         exact `source_qualified_symbol` via `declaration_shapes`, from the
         same pinned `version` `records` was fetched from.
+
+        `inheritance_rows` (D3) is fetched directly from the store rather
+        than filtered out of `records`: the BFS below walks *every* subclass
+        transitively, so at each hop it needs inheritance rows whose base
+        name matches that hop's own class -- not just rows whose spelling
+        happened to match the originally selected symbol, which is all
+        `records`' candidate condition (D1) guarantees. `kind = 'inheritance'`
+        rows are one per class declaration with a base clause, project-wide,
+        so this stays a narrow query rather than the whole table.
         """
 
         if "." not in selected.qualified_symbol:
@@ -1980,11 +2411,14 @@ class ReferenceService:
             if row["record_kind"] == "coverage" and row["content_hash"]
         }
         digests: dict[str, str] = {}
-        inheritance_rows = [
-            row
-            for row in records
-            if row["record_kind"] == "reference" and row["kind"] == "inheritance"
-        ]
+        inheritance_rows = self.store.list_reference_records(
+            selected.project_id,
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+            record_kinds=("reference",),
+            kinds=("inheritance",),
+            partition_id=partition_id,
+        )
         findings: list[RefactorFinding] = []
         visited: set[tuple[str, str]] = {(selected.file_id, owner_symbol)}
         queue: list[tuple[str, str, str]] = [(selected.file_id, owner_symbol, base_decl["path"])]
@@ -2147,15 +2581,14 @@ class ReferenceService:
             )
         assert selector.project is not None and selector.path is not None
         assert selector.qualified_symbol is not None
-        indexed = self.store.list_chunks(
-            [selector.project],
-            partition_ids=None if partition_id is None else {selector.project: partition_id},
+        # `path`/`qualified_symbol` equality is pushed into the query (D5)
+        # instead of scanning and decoding every chunk in the project
+        # (perf-major 5): `list_chunks` had no other production caller left
+        # once this changed, and its own vector-free projection was already
+        # more than this lookup ever needed.
+        chunks = self.store.find_declarations(
+            selector.project, selector.path, selector.qualified_symbol, partition_id=partition_id
         )
-        chunks = [
-            chunk
-            for chunk in indexed
-            if chunk.path == selector.path and chunk.qualified_symbol == selector.qualified_symbol
-        ]
         if len(chunks) > 1:
             raise CodeIndexingError(
                 ErrorCode.AMBIGUOUS_SYMBOL,
@@ -2176,14 +2609,17 @@ class ReferenceService:
         if not chunks:
             # Distinguish a typo from a symbol this project genuinely lacks:
             # "no declaration" and "no references" are different answers.
-            near = sorted(
-                {
-                    chunk.qualified_symbol
-                    for chunk in indexed
-                    if chunk.qualified_symbol is not None
-                    and chunk.qualified_symbol.rsplit(".", 1)[-1]
-                    == selector.qualified_symbol.rsplit(".", 1)[-1]
-                }
+            #
+            # DEVIATION from the plan's D5 text (recorded here, not silently):
+            # the plan described this suggestion as scoped to `path = ?`, but
+            # the code it replaces searched every chunk in the whole project
+            # for a matching tail, not just this one file's -- so the pushdown
+            # preserves that project-wide search (`declaration_symbols_by_tail`)
+            # rather than narrowing what callers actually see.
+            near = self.store.declaration_symbols_by_tail(
+                selector.project,
+                selector.qualified_symbol.rsplit(".", 1)[-1],
+                partition_id=partition_id,
             )
             raise CodeIndexingError(
                 ErrorCode.AMBIGUOUS_SYMBOL,
@@ -2193,7 +2629,11 @@ class ReferenceService:
                 candidates=near[:_MAX_LIMITATION_PATHS],
             )
         located_chunk = chunks[0]
-        if located_chunk.symbol is None or located_chunk.qualified_symbol is None:
+        if (
+            located_chunk.symbol is None
+            or located_chunk.qualified_symbol is None
+            or located_chunk.file_id is None
+        ):
             raise CodeIndexingError(
                 ErrorCode.AMBIGUOUS_SYMBOL,
                 f"{selector.qualified_symbol} in {selector.path} is not a declaration",

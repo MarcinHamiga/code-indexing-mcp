@@ -829,11 +829,11 @@ def test_find_references_narrows_the_declaration_fetch_to_files_with_a_reference
 
     monkeypatch.setattr(service.store, "target_name_candidates", spy_target_name_candidates)
 
-    record_kinds_seen: list[object] = []
+    fetch_calls: list[dict[str, object]] = []
     real_list_reference_records = service.store.list_reference_records
 
     def spy_list_reference_records(project: str, **kwargs: object) -> list[object]:
-        record_kinds_seen.append(kwargs.get("record_kinds"))
+        fetch_calls.append(dict(kwargs))
         return real_list_reference_records(project, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(service.store, "list_reference_records", spy_list_reference_records)
@@ -845,7 +845,20 @@ def test_find_references_narrows_the_declaration_fetch_to_files_with_a_reference
     # The pushdowns were actually used, not just left available.
     assert len(declaration_calls) == 1
     assert target_calls == [("answer", "declaration")]
-    assert record_kinds_seen == [("reference", "coverage")]
+    # D1-D3: no call fetches every reference row unfiltered any more. The
+    # context is two narrow fetches -- coverage rows, then import/export
+    # rows -- and the candidate fetch carries an `extra_condition` naming
+    # the selected symbol rather than pulling every `reference` row.
+    assert len(fetch_calls) == 3
+    assert fetch_calls[0]["record_kinds"] == ("coverage",)
+    assert fetch_calls[0].get("extra_condition") is None
+    assert fetch_calls[1]["record_kinds"] == ("reference",)
+    assert fetch_calls[1]["kinds"] == ("import", "export")
+    assert fetch_calls[1].get("extra_condition") is None
+    assert fetch_calls[2]["record_kinds"] == ("reference",)
+    assert fetch_calls[2].get("kinds") is None
+    candidate_condition = fetch_calls[2].get("extra_condition")
+    assert isinstance(candidate_condition, str) and "answer" in candidate_condition
 
     # And the narrowing is real: the fetched file set excludes the file with
     # no candidate reference, while still covering the one that matters.

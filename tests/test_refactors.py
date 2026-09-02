@@ -527,7 +527,17 @@ def test_required_rename_edits_are_deduplicated_by_span(tmp_path: Path) -> None:
 def test_analyze_refactor_fetches_the_reference_table_only_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """analyze_refactor must reuse find_references' fetch, not re-scan (S4)."""
+    """analyze_refactor must reuse find_references' fetch, not re-scan (S4).
+
+    Since the reference-pushdown track (D1-D4), one `find_references`/
+    `analyze_refactor` lookup no longer makes a single full-table fetch: it
+    loads a `_ReferenceContext` (coverage rows, then import/export rows --
+    two narrow fetches) and one SQL-pushed-down candidate fetch. Three calls
+    total is that same "no re-scan" guarantee restated for the new shape --
+    still zero *additional* calls beyond what one `_find_references_with_records`
+    already makes, since `_override_findings` never fires here (`authorize`
+    has no owner class).
+    """
     service, project_id = _indexed_service(
         tmp_path, {"auth.py": "def authorize(user):\n    return user\n"}
     )
@@ -538,18 +548,10 @@ def test_analyze_refactor_fetches_the_reference_table_only_once(
         project: str,
         *,
         version: int | None = None,
-        schema_version: int | None = None,
-        record_kinds: object = None,
-        partition_id: str | None = None,
+        **kwargs: object,
     ) -> list[object]:
         calls.append(version)
-        return real_list_reference_records(
-            project,
-            version=version,
-            schema_version=schema_version,
-            record_kinds=record_kinds,
-            partition_id=partition_id,
-        )
+        return real_list_reference_records(project, version=version, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(service.store, "list_reference_records", counting_list_reference_records)
 
@@ -558,7 +560,7 @@ def test_analyze_refactor_fetches_the_reference_table_only_once(
         RenameOperation(new_name="permit"),
     )
 
-    assert len(calls) == 1, f"expected exactly one full-table fetch, got {calls}"
+    assert len(calls) == 3, f"expected exactly one context+candidate fetch set, got {calls}"
 
 
 def test_analyze_refactor_classifies_the_full_hit_list_only_once(

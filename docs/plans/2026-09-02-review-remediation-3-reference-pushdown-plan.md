@@ -129,3 +129,54 @@ this test to force the unfiltered path).
 
 **Step 6 — Docs.** No tool description changes expected. Note the change in
 `docs/plans/2026-08-07-reference-index-hardening.md`'s follow-ups list if one exists.
+
+## Completion note (2026-09-02)
+
+Implemented Steps 0-6 in full, including D1-D3 applied to every caller of
+`_find_references_with_records`. Baseline green at the end: `ruff format
+--check`, `ruff check`, `mypy src`, `pytest -n auto` all pass. The four
+contract files (`test_resolver_corpus.py`, `test_references.py`,
+`test_refactors.py`, `test_reference_extraction.py`) were touched only where
+the coordinator explicitly narrowed the "do not edit" rule: two spy/mock
+call-shape assertions (`test_references.py`'s `spy_list_reference_records`
+and its `record_kinds_seen` assertion, `test_refactors.py`'s
+`counting_list_reference_records`) were updated to match the new fetch
+shape, with every correctness assertion (hits, kinds, limitations, patch
+bytes, the narrowed declaration file set) left unchanged.
+
+**Final design.** `_find_references_with_records` always loads a
+`_ReferenceContext` (when the caller has not already supplied one) and
+fetches candidates through `_candidate_records`'s SQL-pushed-down D1
+superset condition -- no code path fetches the whole reference table
+unfiltered any more. `find_references` and `analyze_refactor`'s single
+lookup now costs 3 `list_reference_records` calls (coverage rows,
+import/export rows, one candidate query carrying an `extra_condition` naming
+the selected symbol) instead of one unfiltered full-table call; the row
+*count* those calls return is what actually shrank. `emit_refactor_patch`
+reuses the same `_rename_analysis` fetch, so it benefits identically.
+`impact_radius` still loads one context per whole traversal and reuses it
+across every frontier node (D4), and its cursor page cache is unchanged.
+`_context_from_records` (the interim single-fetch-derived context used while
+the two contract tests were unmodifiable) is deleted as dead code.
+
+**D5 deviation (unchanged, still applies):** the "did you mean" suggestion in
+`_select` searches every declaration in the project for a matching name
+tail, not just the requested path (the plan's text described it as
+path-scoped); the code it replaced already searched project-wide, so the
+pushdown (`LanceStore.declaration_symbols_by_tail`) preserves that behaviour
+rather than narrowing what callers see.
+
+**Row-count reduction measured by the regression guard:** in a fixture with
+~50 files and ~800 `reference`-kind rows where only 5 rows can refer to the
+selected symbol, plain `find_references`, `analyze_refactor`, and
+`impact_radius` at `max_depth=1` each pull under 200 rows total across every
+`LanceStore._reference_rows` call -- versus the ~800 an unfiltered fetch
+would have pulled. `_load_reference_context` is called exactly once for a
+20+ node, `max_depth=3` `impact_radius` traversal (not once per frontier
+node), and a second cursor page of that traversal calls
+`_find_references_with_records` zero times (served from the page cache).
+The on/off equality guard (`_PUSHDOWN_ENABLED`) still covers every
+selectable declaration in the resolver corpus, now exercised through the
+same code path `find_references` itself runs.
+
+Nothing else from the plan was left undone.

@@ -1475,6 +1475,8 @@ class LanceStore:
         version: int | None = None,
         schema_version: int | None = None,
         record_kinds: Iterable[str] | None = None,
+        kinds: Iterable[str] | None = None,
+        extra_condition: str | None = None,
         partition_id: str | None = None,
     ) -> list[ReferenceRecord]:
         """Return structural rows from the requested immutable table version.
@@ -1483,17 +1485,34 @@ class LanceStore:
         Omitting them deliberately returns every row for recovery and raw-storage
         callers. Reference classification requests reference and coverage rows;
         declarations are fetched separately through narrower methods below.
+
+        `kinds` filters the `kind` column (e.g. narrowing `record_kind =
+        'reference'` rows to just `import`/`export`), independent of
+        `record_kinds`. `extra_condition` is one raw, already-assembled SQL
+        boolean expression ANDed onto the rest -- the reference-pushdown
+        candidate fetch (`_load_reference_context`/D1) builds a condition from
+        selector-specific spellings this generic method has no business
+        knowing about, so it is passed through verbatim rather than grown a
+        selector-shaped parameter here.
         """
         self._validate_schema_version(schema_version)
         conditions: list[str] = []
         if schema_version is not None:
             conditions.append(f"schema_version = {schema_version}")
         if record_kinds is not None:
-            kinds = sorted(set(record_kinds))
-            if not kinds:
+            record_kind_values = sorted(set(record_kinds))
+            if not record_kind_values:
                 return []
-            values = ", ".join(_quoted(kind) for kind in kinds)
+            values = ", ".join(_quoted(kind) for kind in record_kind_values)
             conditions.append(f"record_kind IN ({values})")
+        if kinds is not None:
+            kind_values = sorted(set(kinds))
+            if not kind_values:
+                return []
+            values = ", ".join(_quoted(kind) for kind in kind_values)
+            conditions.append(f"kind IN ({values})")
+        if extra_condition is not None:
+            conditions.append(f"({extra_condition})")
         condition = " AND ".join(conditions) if conditions else None
         return self._reference_rows(
             project_id, condition, version=version, partition_id=partition_id
@@ -1913,6 +1932,61 @@ class LanceStore:
             row["project_id"] = project_id
         return [ChunkPreview.model_validate(row) for row in rows]
 
+    def find_declarations(
+        self,
+        project_id: str,
+        path: str,
+        qualified_symbol: str,
+        *,
+        partition_id: str | None = None,
+    ) -> list[ChunkPreview]:
+        """Return declaration chunks at exactly this path and qualified symbol.
+
+        `ReferenceService._select` used to call `list_chunks` -- a full,
+        unfiltered scan and decode of every chunk in the project, vectors
+        excluded but everything else included -- just to filter two columns
+        in Python (perf-major 5). `path`/`qualified_symbol` equality is
+        pushed into the query instead, so a lookup costs O(matches) rather
+        than O(project chunks).
+        """
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return []
+        condition = f"path = {_quoted(path)} AND qualified_symbol = {_quoted(qualified_symbol)}"
+        rows = self._projected_chunks(tables.chunks, condition, limit=None, content=False)
+        for row in rows:
+            row["project_id"] = project_id
+        return [ChunkPreview.model_validate(row) for row in rows]
+
+    def declaration_symbols_by_tail(
+        self, project_id: str, tail: str, *, partition_id: str | None = None
+    ) -> list[str]:
+        """Every declaration's qualified_symbol whose own last `.`-segment is *tail*.
+
+        Feeds `_select`'s "did you mean" suggestion when no declaration
+        exactly matches the selector. The code being pushed down here
+        (`chunk.qualified_symbol.rsplit(".", 1)[-1] == tail`) genuinely
+        searches the whole project, not just one path -- deviation from the
+        original plan text, which described a path-scoped suggestion; the
+        actual behaviour being preserved is project-wide, so this is pushed
+        down as the same superset `= tail OR LIKE '%.tail'` pattern D1 uses
+        for reference candidates, rather than narrowed to a path that would
+        change what callers see.
+        """
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return []
+        condition = (
+            f"qualified_symbol = {_quoted(tail)} OR qualified_symbol LIKE {_quoted('%.' + tail)}"
+        )
+        rows = self._projected_chunks(
+            tables.chunks,
+            condition,
+            limit=None,
+            content=False,
+        )
+        return sorted({str(row["qualified_symbol"]) for row in rows if row.get("qualified_symbol")})
+
     def ensure_indexes(self, project_id: str, *, partition_id: str | None = None) -> None:
         """Create missing search indexes on the write path.
 
@@ -1968,6 +2042,12 @@ class LanceStore:
             "kind",
             "source_qualified_symbol",
             "schema_version",
+            # written_name/receiver_text back the reference-pushdown superset
+            # condition's `= S` terms (D1/D6); the `LIKE '%.S'` terms on
+            # target_name/written_name still scan, but over an
+            # already-indexed, narrow column.
+            "written_name",
+            "receiver_text",
         ):
             if column not in indexed_reference_columns:
                 tables.references.create_index(column, config=BTree(), replace=False)
@@ -2711,9 +2791,13 @@ class LanceStore:
         order_by: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         # project_id is deliberately absent: it is not stored on chunk rows
-        # and belongs to the owning partition, so callers inject it.
+        # and belongs to the owning partition, so callers inject it. file_id
+        # is included (unused by ChunkPreview, ignored on validation) because
+        # find_declarations needs it and adding one string column here is
+        # cheaper than a second projected-column list just for that.
         columns = [
             "chunk_id",
+            "file_id",
             "path",
             "language",
             "kind",
