@@ -23,7 +23,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 from watchfiles import awatch
 
-from .application import Application
+from .application import Application, ApplicationLike
 from .daemon import BrokerApplication
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import STRUCTURAL_LANGUAGES
@@ -125,7 +125,7 @@ class _StartupJob:
 class StartupCoordinator:
     def __init__(
         self,
-        application: Application | BrokerApplication,
+        application: ApplicationLike,
         task_group: anyio.abc.TaskGroup,
         *,
         mode: IndexMode,
@@ -516,7 +516,7 @@ class _ProgressStream:
     """
 
     ctx: ServerContext
-    application: Application | BrokerApplication
+    application: ApplicationLike
     project_ids: list[str]
     message: str
     highest: float = 0.0
@@ -553,7 +553,7 @@ class _ProgressStream:
 @asynccontextmanager
 async def _reporting_index_progress(
     ctx: ServerContext,
-    application: Application | BrokerApplication,
+    application: ApplicationLike,
     project_ids: list[str],
     *,
     message: str,
@@ -705,7 +705,7 @@ def _structural_language_phrase() -> str:
 class AutoIndexingMCP(FastMCP):
     def __init__(
         self,
-        application: Application | BrokerApplication,
+        application: ApplicationLike,
         *,
         mode: IndexMode,
         wait_seconds: int = 300,
@@ -755,7 +755,14 @@ class AutoIndexingMCP(FastMCP):
         manual mode has no startup indexing to wait for.
         """
         try:
-            if isinstance(self.application, BrokerApplication):
+            # `maybe_run_maintenance` is not part of ApplicationLike -- it is
+            # Application-only, deliberately (a daemon-backed process runs its
+            # own startup maintenance instead, see the docstring above) -- so
+            # this narrows on the positive case rather than excluding
+            # BrokerApplication, which no longer implies "therefore Application"
+            # once self.application's static type is the open ApplicationLike
+            # protocol instead of a closed two-member union.
+            if not isinstance(self.application, Application):
                 return
             if coordinator.mode is IndexMode.EAGER:
                 await coordinator.wait_for_startup_settled()
@@ -799,7 +806,7 @@ def _with_error_details[**P, R](
 
 
 def create_server(
-    application: Application | BrokerApplication | None = None,
+    application: ApplicationLike | None = None,
     *,
     auto_index: bool | None = None,
 ) -> FastMCP:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import socket
@@ -11,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from code_indexing_mcp import daemon, embedding
-from code_indexing_mcp.application import Application, RuntimePaths
+from code_indexing_mcp.application import Application, ApplicationLike, RuntimePaths
 from code_indexing_mcp.daemon import (
     BrokerApplication,
     DaemonServer,
@@ -435,6 +436,211 @@ def test_daemon_does_not_idle_exit_while_request_is_active(tmp_path: Path) -> No
     daemon_thread.join(timeout=2)
 
 
+@requires_local_sockets
+def test_a_silent_connection_is_dropped_after_the_receive_timeout_and_the_daemon_still_idles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D3: a client that connects and never sends a request cannot hold the daemon open."""
+    monkeypatch.setattr(daemon, "REQUEST_RECEIVE_TIMEOUT_SECONDS", 0.2)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=0.5)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.connect(str(server.endpoint))
+        # Never send anything: the receive timeout, not a client hang-up, must
+        # be what ends this connection.
+        frame = receive_frame(connection)
+        assert frame["error"]["code"] == ErrorCode.PROTOCOL_ERROR.value
+        assert connection.recv(1) == b""
+
+    # The now-closed connection must not have pinned the idle timer open.
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+
+
+@requires_local_sockets
+def test_client_call_raises_daemon_unavailable_after_the_query_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D3: a wedged dispatch fails the client fast instead of hanging forever."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    original = application.list_projects
+
+    def blocking_list_projects():  # type: ignore[no-untyped-def]
+        started.set()
+        assert release.wait(timeout=5)
+        return original()
+
+    application.list_projects = blocking_list_projects  # type: ignore[method-assign]
+    monkeypatch.setattr(daemon, "DAEMON_QUERY_TIMEOUT_SECONDS", 0.2)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+
+    try:
+        with pytest.raises(CodeIndexingError) as raised:
+            broker.list_projects()
+        assert raised.value.code is ErrorCode.DAEMON_UNAVAILABLE
+        assert raised.value.details["method"] == "list_projects"
+        assert raised.value.details["timeout_seconds"] == 0.2
+        assert started.wait(timeout=2)
+    finally:
+        release.set()
+        BrokerApplication(paths, cwd=tmp_path).stop()
+        thread.join(timeout=2)
+
+
+@requires_local_sockets
+def test_the_request_past_the_concurrency_cap_gets_index_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D4: a request that finds MAX_CONCURRENT_REQUESTS already dispatching is refused, not queued.
+
+    Two permits are held directly (standing in for two requests already
+    in-flight) rather than driven with real blocked dispatch threads: the
+    request/response the daemon's own startup-maintenance and idle-timer
+    machinery generates in the background makes the exact thread-arrival
+    order the semaphore sees non-deterministic, and that ordering is not
+    what this test is about -- only that the (cap + 1)th arrival is refused.
+    """
+    monkeypatch.setattr(daemon, "MAX_CONCURRENT_REQUESTS", 2)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+
+    assert server._request_semaphore.acquire(blocking=False)
+    assert server._request_semaphore.acquire(blocking=False)
+
+    try:
+        with pytest.raises(CodeIndexingError) as raised:
+            BrokerApplication(paths, cwd=tmp_path).list_projects()
+        assert raised.value.code is ErrorCode.INDEX_BUSY
+    finally:
+        server._request_semaphore.release()
+        server._request_semaphore.release()
+    BrokerApplication(paths, cwd=tmp_path).stop()
+    thread.join(timeout=2)
+
+
+@requires_local_sockets
+def test_a_dispatch_failure_reaches_the_client_as_internal_error(
+    tmp_path: Path,
+) -> None:
+    """D5: a dispatch failure is INTERNAL_ERROR, with the type in details, not the message."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    def broken_list_projects() -> None:
+        raise ValueError("boom")
+
+    application.list_projects = broken_list_projects  # type: ignore[method-assign]
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+
+    try:
+        with pytest.raises(CodeIndexingError) as raised:
+            broker.list_projects()
+        assert raised.value.code is ErrorCode.INTERNAL_ERROR
+        assert (
+            str(raised.value)
+            == "INTERNAL_ERROR: The local daemon failed while handling list_projects"
+        )
+        assert raised.value.details == {"type": "ValueError"}
+        assert "boom" not in str(raised.value)
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+
+def test_a_daemon_killed_mid_request_reaches_the_client_as_daemon_unavailable(
+    tmp_path: Path,
+) -> None:
+    """D5: a dropped connection surfaces as DAEMON_UNAVAILABLE, not a raw EOFError."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    paths.data.mkdir(parents=True)
+    (paths.data / "daemon.token").write_text("shared-token")
+    endpoint = daemon_endpoint(paths)
+
+    def dying_daemon() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(endpoint))
+            server.listen()
+            connection, _ = server.accept()
+            with connection:
+                receive_frame(connection)
+                # Killed mid-request: the connection just drops, no response.
+        endpoint.unlink()
+
+    thread = threading.Thread(target=dying_daemon, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while not endpoint.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    broker = BrokerApplication(paths, cwd=tmp_path)
+    with pytest.raises(CodeIndexingError) as raised:
+        broker.list_projects()
+
+    assert raised.value.code is ErrorCode.DAEMON_UNAVAILABLE
+    assert raised.value.details["method"] == "list_projects"
+    assert "log_path" in raised.value.details
+    thread.join(timeout=2)
+
+
+@requires_local_sockets
+def test_system_exit_inside_dispatch_is_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D5: SystemExit is not an Exception -- it must surface as itself, not an error response."""
+    # Startup maintenance also calls list_projects internally; disabled so its
+    # own SystemExit (raised in a different thread, on a different schedule)
+    # cannot race the one this test is actually about.
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    def exiting_list_projects() -> None:
+        raise SystemExit(1)
+
+    application.list_projects = exiting_list_projects  # type: ignore[method-assign]
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+
+    try:
+        # SystemExit propagates out of the request thread uncaught (pytest
+        # turns that into a warning rather than crashing the test session --
+        # not asserted on directly here, since it fires from a background
+        # thread on its own schedule). What this test asserts on is the
+        # client-visible effect: the connection drops with no response at
+        # all, which is what proves SystemExit was never turned into an
+        # error frame -- an INTERNAL_ERROR reply would mean it had been
+        # caught and swallowed as if it were a plain Exception.
+        with pytest.raises(CodeIndexingError) as raised:
+            broker.list_projects()
+        assert raised.value.code is ErrorCode.DAEMON_UNAVAILABLE
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+
 class _CountedVector:
     """A stand-in for a FastEmbed vector, at the real model's dimension."""
 
@@ -775,6 +981,93 @@ def test_daemon_idle_timeout_waits_for_startup_maintenance(tmp_path: Path) -> No
 
 
 @requires_local_sockets
+def test_daemon_startup_warms_the_query_model_once(tmp_path: Path) -> None:
+    """D7: prepare_model runs once after the daemon is ready to serve."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    calls: list[None] = []
+
+    def counted_prepare_model() -> None:
+        calls.append(None)
+
+    application.prepare_model = counted_prepare_model  # type: ignore[method-assign]
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not calls:
+            time.sleep(0.02)
+        assert calls == [None]
+    finally:
+        BrokerApplication(paths, cwd=tmp_path).stop()
+        thread.join(timeout=2)
+
+
+@requires_local_sockets
+def test_model_warmup_failure_is_logged_not_raised(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """D7: offline mode with no cached model (or any other warm-up failure) must not crash it."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    def failing_prepare_model() -> None:
+        raise CodeIndexingError(ErrorCode.MODEL_UNAVAILABLE, "no cached model in offline mode")
+
+    application.prepare_model = failing_prepare_model  # type: ignore[method-assign]
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    with caplog.at_level("WARNING", logger="code_indexing_mcp.daemon"):
+        thread.start()
+        assert server.ready.wait(timeout=2)
+        broker = BrokerApplication(paths, cwd=tmp_path)
+        try:
+            # The daemon must still be able to serve a request after a failed
+            # warm-up -- the whole point of "logged, not raised".
+            assert broker.list_projects() == []
+        finally:
+            broker.stop()
+            thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Model warm-up after daemon startup failed" in message for message in messages)
+
+
+@requires_local_sockets
+def test_daemon_idle_timeout_waits_for_model_warmup(tmp_path: Path) -> None:
+    """D7: a slow warm-up must not let the idle timer reap the daemon mid-load."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_prepare_model() -> None:
+        started.set()
+        assert release.wait(timeout=5)
+
+    application.prepare_model = blocking_prepare_model  # type: ignore[method-assign]
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=0)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    try:
+        assert started.wait(timeout=2)
+        # The listener wakes every 0.5s, comfortably beyond this idle timeout.
+        time.sleep(0.7)
+        assert thread.is_alive()
+    finally:
+        release.set()
+        thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert not server.endpoint.exists()
+
+
+@requires_local_sockets
 def test_broker_application_dispatches_maintain_storage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -896,6 +1189,209 @@ def test_a_stale_daemon_is_reported_running_and_retired(tmp_path: Path) -> None:
     assert daemon.daemon_status(paths)["running"] is False
 
 
+def test_daemon_is_current_treats_a_missing_or_mismatched_build_like_a_protocol_mismatch() -> None:
+    """D1: `build` is checked exactly like `protocol` -- absent or different is stale."""
+    current = {
+        "running": True,
+        "protocol": daemon.PROTOCOL_VERSION,
+        "build": daemon.BUILD_IDENTITY,
+    }
+    assert daemon._daemon_is_current(current) is True
+    assert daemon._daemon_is_current({**current, "build": "a-previous-build"}) is False
+    # A daemon from before D1 answers ping with no `build` key at all.
+    assert daemon._daemon_is_current({k: v for k, v in current.items() if k != "build"}) is False
+    assert daemon._daemon_is_current({**current, "protocol": daemon.PROTOCOL_VERSION - 1}) is False
+    assert daemon._daemon_is_current({**current, "running": False}) is False
+
+
+def test_settings_digest_hashes_only_managed_keys_and_never_the_raw_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_EMBED_THREADS", "7")
+    monkeypatch.setenv("UNRELATED_VARIABLE", "code-indexing-secret")
+    digest = daemon._settings_digest(os.environ)
+    assert set(digest) >= {"CODE_INDEXING_EMBED_THREADS"}
+    assert "UNRELATED_VARIABLE" not in digest
+    assert digest["CODE_INDEXING_EMBED_THREADS"] != "7"
+    assert len(digest["CODE_INDEXING_EMBED_THREADS"]) == 64  # a sha256 hex digest
+    # Deterministic: hashing the same value twice must not shuffle keys apart.
+    assert digest == daemon._settings_digest(os.environ)
+
+
+def test_warn_on_settings_mismatch_logs_once_and_never_the_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """D2: a differing key is named in the warning; its value never is."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    broker = BrokerApplication(paths)
+    monkeypatch.setenv("CODE_INDEXING_EMBED_THREADS", "7")
+    remote = daemon._settings_digest(os.environ)
+
+    with caplog.at_level("WARNING", logger="code_indexing_mcp.daemon"):
+        broker.warn_on_settings_mismatch(remote)
+    assert caplog.records == []
+
+    monkeypatch.setenv("CODE_INDEXING_EMBED_THREADS", "3")
+    with caplog.at_level("WARNING", logger="code_indexing_mcp.daemon"):
+        broker.warn_on_settings_mismatch(remote)
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "CODE_INDEXING_EMBED_THREADS" in message
+    assert "7" not in message
+    assert "3" not in message
+
+
+def test_warn_on_settings_mismatch_ignores_a_non_dict_digest(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A daemon from before D2 answers ping with no `settings_digest` at all."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    broker = BrokerApplication(paths)
+
+    with caplog.at_level("WARNING", logger="code_indexing_mcp.daemon"):
+        broker.warn_on_settings_mismatch(None)
+
+    assert caplog.records == []
+
+
+@requires_local_sockets
+def test_ensure_daemon_warns_but_does_not_restart_on_a_settings_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """D2: differing settings between client and daemon warn once and never restart."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    monkeypatch.setenv("CODE_INDEXING_EMBED_THREADS", "7")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+
+    def fail_popen(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a settings mismatch must warn, not restart the daemon")
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fail_popen)
+    monkeypatch.setenv("CODE_INDEXING_EMBED_THREADS", "3")
+
+    try:
+        with caplog.at_level("WARNING", logger="code_indexing_mcp.daemon"):
+            daemon.ensure_daemon(paths, timeout_seconds=2)
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        assert "CODE_INDEXING_EMBED_THREADS" in message
+        assert "7" not in message
+        assert "3" not in message
+    finally:
+        BrokerApplication(paths).stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
+@requires_local_sockets
+def test_ensure_daemon_reuses_a_daemon_with_a_matching_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+
+    def fail_popen(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a daemon with a matching build must be reused, not respawned")
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fail_popen)
+
+    try:
+        broker = daemon.ensure_daemon(paths, timeout_seconds=2)
+        assert broker.ping()["build"] == daemon.BUILD_IDENTITY
+    finally:
+        BrokerApplication(paths).stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
+@requires_local_sockets
+def test_ensure_daemon_retires_a_running_daemon_with_a_mismatched_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D1: same protocol, different build -- retired and replaced, like a protocol mismatch.
+
+    Mirrors ``test_a_stale_daemon_is_reported_running_and_retired``'s raw-socket
+    stand-in, but on the *current* protocol: the scenario a protocol bump alone
+    cannot catch, because the RPC shape has not changed, only the code or the
+    schema behind it.
+    """
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    paths.data.mkdir(parents=True)
+    (paths.data / "daemon.token").write_text("shared-token")
+    endpoint = daemon_endpoint(paths)
+
+    def old_build_daemon() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(endpoint))
+            server.listen()
+            while True:
+                connection, _ = server.accept()
+                with connection:
+                    request = receive_frame(connection)
+                    if request.get("method") == "stop":
+                        send_frame(
+                            connection, {"id": request.get("id"), "result": {"stopping": True}}
+                        )
+                        break
+                    send_frame(
+                        connection,
+                        {
+                            "id": request.get("id"),
+                            "result": {
+                                "pid": 999999,
+                                "protocol": daemon.PROTOCOL_VERSION,
+                                "build": "a-previous-build",
+                            },
+                        },
+                    )
+        endpoint.unlink()
+
+    old_thread = threading.Thread(target=old_build_daemon, daemon=True)
+    old_thread.start()
+    deadline = time.monotonic() + 2
+    while not endpoint.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    status = daemon.daemon_status(paths)
+    assert status == {
+        "running": True,
+        "pid": 999999,
+        "protocol": daemon.PROTOCOL_VERSION,
+        "build": "a-previous-build",
+    }
+
+    fresh_application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    fresh_server = DaemonServer(paths, application=fresh_application, idle_timeout_seconds=60)
+    fresh_thread: threading.Thread | None = None
+
+    def fake_popen(*args: object, **kwargs: object) -> None:
+        nonlocal fresh_thread
+        fresh_thread = threading.Thread(target=fresh_server.serve, daemon=True)
+        fresh_thread.start()
+        return None
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
+
+    try:
+        broker = daemon.ensure_daemon(paths, timeout_seconds=5)
+        assert broker.ping()["build"] == daemon.BUILD_IDENTITY
+    finally:
+        old_thread.join(timeout=2)
+        assert not old_thread.is_alive()
+        BrokerApplication(paths).stop()
+        if fresh_thread is not None:
+            fresh_thread.join(timeout=2)
+            assert not fresh_thread.is_alive()
+
+
 @requires_local_sockets
 def test_broker_forwards_scan_inspection(tmp_path: Path) -> None:
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
@@ -964,3 +1460,48 @@ def test_broker_round_trips_a_refactor_patch(tmp_path: Path) -> None:
     assert result.completeness.state == "complete"
     assert len(result.operation_digest) == 16
     assert result.slot_id
+
+
+def test_broker_mirrors_application_surface() -> None:
+    """D8: BrokerApplication's shared surface must track Application's, not silently drift.
+
+    The surface checked is `ApplicationLike`'s own declared methods -- the
+    query/project calls `server.py` makes polymorphically on whichever
+    backend it was handed -- so a Protocol edit and this test cannot drift
+    from each other; mypy separately enforces (via `create_server`'s and
+    `AutoIndexingMCP.__init__`'s parameter types) that both `Application` and
+    `BrokerApplication` actually satisfy it.
+
+    `BrokerApplication` forwards most of this surface through `**params:
+    Any`, which is exactly what lets it track an `Application` signature
+    change automatically -- so the check below is not "identical
+    signatures" (that would fail on every such method, by design) but
+    "every parameter BrokerApplication *does* name explicitly still exists,
+    by that name, on Application". A parameter BrokerApplication forwards
+    under a name Application no longer accepts is the drift this exists to
+    catch.
+    """
+    surface = sorted(
+        name
+        for name, member in vars(ApplicationLike).items()
+        if not name.startswith("_") and inspect.isfunction(member)
+    )
+    assert surface, "ApplicationLike must declare at least one method"
+
+    for name in surface:
+        assert hasattr(Application, name), f"Application has no {name}"
+        assert hasattr(BrokerApplication, name), f"BrokerApplication has no {name}"
+        broker_params = {
+            param.name
+            for param in inspect.signature(getattr(BrokerApplication, name)).parameters.values()
+            if param.name != "self" and param.kind is not inspect.Parameter.VAR_KEYWORD
+        }
+        app_params = {
+            param.name
+            for param in inspect.signature(getattr(Application, name)).parameters.values()
+            if param.name != "self"
+        }
+        missing = broker_params - app_params
+        assert not missing, (
+            f"{name}: BrokerApplication names {sorted(missing)} that Application no longer accepts"
+        )

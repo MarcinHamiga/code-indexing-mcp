@@ -121,3 +121,66 @@ and a failure in it is logged, not raised; the daemon is not reaped while it run
 **Step 8 — Docs.** README daemon paragraph: mention that `configure` restarts a
 running daemon when it changes indexing settings, and that a daemon from a previous
 build is replaced automatically.
+
+## Completion note (2026-09-02)
+
+Implemented all eight steps against the tree as it stood after Tracks 1-3, on top of
+the already-green 1700-passed/9-skipped baseline. Final baseline:
+`1722 passed, 9 skipped` (ruff format/check clean, mypy clean on `src`).
+
+Deviations from the plan text, with reasons:
+
+- **D6 test coordinates.** The plan's step-5 test sketch names
+  `--set CODE_INDEXING_MCP_BIN_DIR` as the "no daemon-relevant change" case, but
+  `CODE_INDEXING_MCP_BIN_DIR` is not, and never was, one of the settings
+  `installer.settings_spec.BY_NAME` accepts through `--set` (it is an installer-only
+  env var read directly from the process environment for launcher placement) --
+  `--set CODE_INDEXING_MCP_BIN_DIR` would fail `parse_settings` with "unknown
+  setting". Implemented the equivalent real invocation instead: `configure --bin-dir
+  <path>` alone (no `--set`/`--unset`) does not touch the daemon. Also found that
+  every key `BY_NAME` accepts is in fact daemon-consumed (no installer-only settings
+  are in that catalog today), so `daemon_relevant_settings_changed` is `bool(env_updates)`
+  with a comment explaining why, rather than an explicit exclusion list.
+- **D6 restart scope.** Wired the restart only into the non-interactive
+  `installer/cli.py:main()` path used by `configure_main` and driven by
+  `args.reconfigure`; the `--repair` path (`_repair()`) intentionally writes back
+  unchanged settings so never finds anything to restart over, and the TUI wizard
+  (`installer/tui/panels.py`) was left unwired -- it tracks a fixed set of named
+  progress steps and wiring a "daemon" step into it is a UI change beyond what D6
+  describes ("hook the daemon restart after that write" in `cli.py`/`orchestrator.py`).
+- **D4/D3 ordering.** The plan places D4's concurrency-cap check first in `_handle`,
+  but checking it *before* reading the client's request frame created a real race:
+  the server could reply-and-close before the client's `send_frame` had finished,
+  handing it a raw `BrokenPipeError` instead of a clean `INDEX_BUSY`. Moved the D4
+  check to run *after* the D3 receive (and after the protocol/token checks), which
+  are cheap and cannot block on the network, eliminating the race while keeping the
+  cap's purpose (rejecting before the expensive `_dispatch`) intact.
+- **D5 error-response delivery.** Added `contextlib.suppress(OSError)` around the
+  two error-frame `_send_response` calls in `_handle`: a client that already gave up
+  (D3's own query-budget timeout, or a plain disconnect) leaves nothing to receive
+  the reply, and the resulting `BrokenPipeError`/`ConnectionResetError` was crashing
+  the request thread with an unrelated-looking traceback. Not asked for explicitly,
+  but a direct, load-bearing consequence of D3+D5 landing together.
+- **D8 surface and Protocol.** Built `ApplicationLike` from `Application`'s full
+  signatures (the stricter, closed one) rather than `BrokerApplication`'s -- a
+  `BrokerApplication` method's `**params: Any` catch-all structurally satisfies a
+  protocol with named parameters, but the reverse does not hold, so the Protocol had
+  to mirror the stricter side. Two parameters exist on `Application` but not on the
+  shared surface at all: `index_project`'s `on_progress` (a local callback, cannot
+  cross the daemon socket -- `BrokerApplication.index_progress` polls a published
+  snapshot file instead) and `maintain_storage`'s `trigger` (the daemon's own
+  scheduled-maintenance marker, not a client-settable value). Both are dropped from
+  `ApplicationLike` rather than added to `BrokerApplication`, per the decision's own
+  "widen the Protocol, not change behaviour". Typing `create_server`'s parameter
+  with `ApplicationLike` required also widening `AutoIndexingMCP.__init__`,
+  `StartupCoordinator.__init__`, `_ProgressStream.application`, and
+  `_reporting_index_progress`'s parameter the same way (everything `create_server`
+  hands the value to), and flipping one `isinstance(self.application,
+  BrokerApplication): return` guard in `_run_startup_maintenance` to the positive
+  `isinstance(self.application, Application)` form, since a Protocol-typed variable
+  no longer narrows to "the other member of a two-class union" on exclusion.
+  `test_broker_mirrors_application_surface` derives its checked surface from
+  `ApplicationLike`'s own declared methods rather than a second hand-maintained
+  list, so the Protocol and the drift test cannot drift from each other.
+
+Nothing was left undone; every step (D1-D8) is implemented and covered by tests.

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Protocol, TypeVar, cast
 
 from filelock import FileLock, Timeout
 from platformdirs import user_cache_path, user_data_path
@@ -267,6 +267,176 @@ PROJECT_SHAPE_MARKERS = {
     "tsconfig.json",
     "jsconfig.json",
 }
+
+
+class ApplicationLike(Protocol):
+    """D8: the query/project surface `server.py` calls polymorphically on
+    whichever backend it was handed -- an in-process ``Application`` or a
+    ``BrokerApplication`` fronting the shared daemon.
+
+    Signatures here are ``Application``'s: ``BrokerApplication``'s methods
+    either match exactly or forward through ``**params: Any``, which
+    structurally accepts any keyword this protocol can throw at it. The two
+    exceptions -- ``index_project``'s ``on_progress`` and
+    ``maintain_storage``'s ``trigger`` -- are dropped rather than widened
+    onto the broker: neither crosses the daemon socket (a callback can't,
+    and the daemon's own scheduled-maintenance trigger is not something a
+    client sets), so they are not part of what a caller can rely on through
+    this shared surface. ``tests/test_daemon.py::test_broker_mirrors_application_surface``
+    keeps this list itself honest against both concrete classes.
+    """
+
+    def project_is_stale(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> bool: ...
+
+    def discover_project(self, root: Path) -> ProjectInfo | None: ...
+
+    def index_project(
+        self,
+        project: str | None = None,
+        *,
+        roots: list[Path] | None = None,
+        force: bool = False,
+        wait_for_lock: bool = False,
+        trigger: IndexTrigger = "manual",
+    ) -> IndexReport: ...
+
+    def index_progress(self, project_id: str) -> IndexProgress | None: ...
+
+    def search_code(
+        self,
+        query: str,
+        *,
+        projects: list[str] | None = None,
+        all_projects: bool = False,
+        languages: list[str] | None = None,
+        paths: list[str] | None = None,
+        kinds: list[str] | None = None,
+        limit: int = 8,
+        roots: list[Path] | None = None,
+    ) -> SearchResponse: ...
+
+    def init_project(
+        self,
+        path: Path | str | None = None,
+        name: str | None = None,
+        force_new_id: bool = False,
+        allow_overlap: bool = False,
+        *,
+        roots: list[Path] | None = None,
+    ) -> ProjectInfo: ...
+
+    def resolve_project(
+        self, explicit: str | None, roots: list[Path] | None = None
+    ) -> ProjectInfo: ...
+
+    def project_status(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> ProjectStatus: ...
+
+    def index_history(
+        self,
+        project: str | None = None,
+        *,
+        roots: list[Path] | None = None,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> HistoryPage: ...
+
+    def inspect_scan(
+        self,
+        project: str | None = None,
+        *,
+        roots: list[Path] | None = None,
+        outcome: str | None = None,
+        reason: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> ScanInspectionPage: ...
+
+    def storage_status(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> StorageStatus: ...
+
+    def maintain_storage(
+        self,
+        project: str | None = None,
+        *,
+        roots: list[Path] | None = None,
+        dry_run: bool = False,
+        wait_for_lock: bool = False,
+    ) -> MaintenanceReport: ...
+
+    def list_projects(self) -> list[ProjectInfo]: ...
+
+    def remove_project(self, project: str) -> RemovalReport: ...
+
+    def resolve_scope_checkouts(
+        self,
+        projects: list[str] | None,
+        all_projects: bool,
+        roots: list[Path] | None = None,
+    ) -> list[ProjectInfo]: ...
+
+    def find_symbol(
+        self,
+        name: str,
+        project: str | None = None,
+        *,
+        match: str = "exact",
+        kinds: list[str] | None = None,
+        limit: int = 20,
+        roots: list[Path] | None = None,
+    ) -> SymbolResponse: ...
+
+    def find_references(
+        self,
+        selector: DeclarationSelector,
+        *,
+        kinds: set[str] | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+        roots: list[Path] | None = None,
+    ) -> ReferenceResponse: ...
+
+    def impact_radius(
+        self,
+        selector: DeclarationSelector,
+        *,
+        max_depth: int = 2,
+        include_likely: bool = False,
+        kinds: set[str] | None = None,
+        max_nodes: int = 500,
+        limit: int = 100,
+        cursor: str | None = None,
+        roots: list[Path] | None = None,
+    ) -> ImpactRadiusResponse: ...
+
+    def analyze_refactor(
+        self,
+        selector: DeclarationSelector,
+        operation: RefactorOperation,
+        *,
+        limit: int = 500,
+        cursor: str | None = None,
+        roots: list[Path] | None = None,
+    ) -> RefactorAnalysis: ...
+
+    def emit_refactor_patch(
+        self,
+        selector: DeclarationSelector,
+        operation: RefactorOperation,
+        *,
+        context_lines: int = 3,
+        roots: list[Path] | None = None,
+    ) -> RefactorPatch: ...
+
+    def file_outline(
+        self, path: str, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> OutlineResponse: ...
+
+    def get_chunk(self, chunk_id: str) -> CodeChunk: ...
 
 
 class Application:

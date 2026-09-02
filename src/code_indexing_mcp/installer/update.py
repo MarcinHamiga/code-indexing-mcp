@@ -28,7 +28,6 @@ from filelock import FileLock, Timeout
 
 from .. import update_check
 from ..application import RuntimePaths
-from ..daemon import BrokerApplication, daemon_status, daemon_supported
 from .accelerator import (
     ACCELERATOR_EXTRAS,
     _run_command,
@@ -41,6 +40,7 @@ from .accelerator import (
     server_executable,
 )
 from .config_files import InstallerError
+from .daemon_control import stop_daemon
 from .env_blocks import command_from_entry
 from .harnesses import configuration_path, install_skills, read_server_entry, skill_directory
 from .orchestrator import default_install_directory
@@ -413,32 +413,12 @@ def _reconcile_accelerator(directory: Path, *, skip_accelerator: bool) -> _Accel
     )
 
 
-def _wait_until_stopped(
-    paths: RuntimePaths, *, attempts: int = 100, interval: float = 0.05
-) -> bool:
-    for _ in range(attempts):
-        if not daemon_status(paths)["running"]:
-            return True
-        time.sleep(interval)
-    return False
-
-
 def _stop_daemon(paths: RuntimePaths, *, changed: bool) -> tuple[str, str]:
     """Stop the daemon; the next client respawns it on the updated code."""
 
     if not changed:
         return "skipped", "nothing changed, so the running daemon is already current"
-    if not daemon_supported():
-        return "skipped", "this platform has no shared daemon"
-    try:
-        if not daemon_status(paths)["running"]:
-            return "skipped", "no daemon is running"
-        BrokerApplication(paths).stop()
-        if not _wait_until_stopped(paths):
-            return "warning", "the daemon did not stop; run `code-indexing-mcp daemon stop`"
-    except Exception as exc:
-        return "warning", f"the daemon could not be stopped: {exc}"
-    return "ok", "stopped; it restarts on the updated code with the next client"
+    return stop_daemon(paths, reason="code")
 
 
 def _print_summary(

@@ -1060,6 +1060,14 @@ The daemon needs Unix domain sockets. Where they are unavailable — currently W
 `CODE_INDEXING_BROKER=auto` serves directly and logs a warning; an explicit `CODE_INDEXING_BROKER=on` fails with
 `INVALID_CONFIGURATION` instead of being silently downgraded.
 
+A daemon left running from a previous build is replaced automatically: every `ping` carries a build
+identity derived from the installed code, and a mismatch is retired and restarted exactly like a
+protocol mismatch, with no action needed. `code-indexing-mcp configure` restarts a running daemon
+itself whenever it changes a setting the daemon reads at startup (indexing or embedding behavior,
+the data or cache directory, offline mode); a change that only touches installer-only concerns, such
+as the launcher's bin directory, leaves it running. `update` continues to restart it on every code
+change, as before.
+
 Storage schema v2 keeps a registry plus one flat `projects/` directory of LanceDB partitions, one
 per index slot — the active branch, commit, workspace, or legacy partition — with `project_slots`
 and `active_slots` registry tables mapping each logical project to its slots and current active
