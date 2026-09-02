@@ -298,6 +298,81 @@ def changed_paths_between(
     return frozenset(changed)
 
 
+def head_snapshot(state: GitState) -> tuple[SelectorKind, str, str | None] | None:
+    """Read a resolved target's current selector and HEAD without spawning Git.
+
+    Used to detect a mid-request repository move (a checkout or a commit)
+    after an operation runs, in place of a second full ``probe_git_state``
+    call. Reads exactly the files Git itself would consult: the checkout's
+    ``HEAD`` file, then the referenced loose ref (checkout-local, then the
+    common directory for a linked worktree), then ``packed-refs``. Any read
+    failure, unparseable content, or an unresolvable selector returns
+    ``None`` so the caller falls back to a full probe rather than risk acting
+    on a wrong answer; an attached branch with no commit yet (an unborn
+    branch) is not a failure and comes back with a ``None`` head OID, exactly
+    as :func:`probe_git_state` reports it.
+    """
+    if state.checkout_identity is None:
+        return None
+    checkout = Path(state.checkout_identity)
+    try:
+        content = (checkout / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if content.startswith("ref:"):
+        ref = content.removeprefix("ref:").strip()
+        if not ref.startswith("refs/"):
+            return None
+        oid = _resolve_ref(checkout, state.repository_identity, ref)
+        return (SelectorKind.REF, ref, oid)
+    if _looks_like_oid(content):
+        return (SelectorKind.COMMIT, content, content)
+    return None
+
+
+def _resolve_ref(checkout: Path, repository_identity: str | None, ref: str) -> str | None:
+    """Resolve one ref name to an OID via a loose file, then packed-refs.
+
+    Mirrors where Git itself looks: the checkout-local ref first (relevant
+    only for a linked worktree, which can carry its own per-worktree refs),
+    then the shared common directory's loose ref, then its ``packed-refs``.
+    Returns ``None`` when the ref names nothing yet -- an unborn branch --
+    which is not an error.
+    """
+    oid = _read_loose_ref(checkout / ref)
+    if oid is not None:
+        return oid
+    if repository_identity is None:
+        return None
+    common = Path(repository_identity)
+    oid = _read_loose_ref(common / ref)
+    if oid is not None:
+        return oid
+    return _read_packed_ref(common, ref)
+
+
+def _read_loose_ref(path: Path) -> str | None:
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return content if _looks_like_oid(content) else None
+
+
+def _read_packed_ref(common: Path, ref: str) -> str | None:
+    try:
+        content = (common / "packed-refs").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in content.splitlines():
+        if not line or line[0] in "#^":
+            continue
+        oid, _, name = line.partition(" ")
+        if name == ref and _looks_like_oid(oid):
+            return oid
+    return None
+
+
 def _fallback_state(root: Path, outcome: GitProbeOutcome) -> GitState:
     """Route a non-Git or degraded probe to the checkout-local workspace slot.
 

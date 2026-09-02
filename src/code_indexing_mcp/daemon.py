@@ -361,6 +361,10 @@ class DaemonServer:
             self._listener = None
             if self.endpoint.exists():
                 self.endpoint.unlink()
+            # Buffered slot touches (touch_slot) must not be lost when the
+            # daemon exits: the next process's LRU retention decision reads
+            # last_used_at from disk.
+            self.application.store.close()
             lifetime_lock.release()
             self.ready.set()
 

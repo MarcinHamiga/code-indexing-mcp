@@ -89,6 +89,14 @@ MAX_CACHED_PARTITIONS = 16
 # contention on the shared partition cache, so the pool stays small and bounded.
 _SEARCH_CONCURRENCY = 8
 
+# touch_slot buffers last-use timestamps in memory instead of writing on every
+# call (a read-heavy workload touches its active slot on every query, and a
+# write there would bump the project_slots table version once per query). A
+# touch is flushed inline once the oldest pending one has waited this long, so
+# a long-idle-but-still-running process does not lose LRU history indefinitely
+# if nothing else ever flushes it.
+SLOT_TOUCH_FLUSH_SECONDS = 300.0
+
 # Columns get_chunk reads. The vector and the identifier-terms column are
 # excluded: nothing outside indexing and ranking can use them, and reading them
 # made a single-chunk fetch an order of magnitude larger than the code it
@@ -140,6 +148,34 @@ def _quoted(value: str) -> str:
 
 def _optional_str(value: Any) -> str | None:
     return None if value is None else str(value)
+
+
+# A registry row past this many dirty/untracked paths would bloat every
+# registry read for a rare, very large changeset; beyond the cap the slot's
+# status-paths column is stored as null and the freshness fast path (see
+# Application._project_status_for_target) falls back to a full scan instead.
+MAX_PERSISTED_STATUS_PATHS = 2000
+
+
+def encode_status_paths(paths: Iterable[str]) -> str | None:
+    """JSON-encode the sorted, de-duplicated path list, or None past the cap."""
+    ordered = sorted(set(paths))
+    if len(ordered) > MAX_PERSISTED_STATUS_PATHS:
+        return None
+    return json.dumps(ordered, separators=(",", ":"), ensure_ascii=True)
+
+
+def decode_status_paths(value: str | None) -> frozenset[str] | None:
+    """Decode a slot's stored status-paths column, or None if absent or unusable."""
+    if value is None:
+        return None
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+        return None
+    return frozenset(decoded)
 
 
 def _legacy_slot_id(project_id: str) -> str:
@@ -492,6 +528,7 @@ class LanceStore:
         directory.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(directory / "registry", read_consistency_interval=timedelta(0))
         self._migrate_active_checkouts(directory / "registry")
+        self._migrate_project_slot_status_columns(directory / "registry")
         self._projects = self._table(self._db, "projects", self._project_schema())
         self._project_slots = self._table(self._db, "project_slots", self._project_slot_schema())
         self._active_slots = self._table(self._db, "active_slots", self._active_slot_schema())
@@ -500,6 +537,10 @@ class LanceStore:
         # Serializes legacy adoption inside this process; see _ensure_adopted
         # for why it is not the cross-process project writer lock.
         self._adoption_lock = threading.Lock()
+        # Buffered touch_slot timestamps, keyed by slot_id; see touch_slot and
+        # flush_slot_touches.
+        self._pending_slot_touches: dict[str, int] = {}
+        self._touch_lock = threading.Lock()
         for row in legacy_rows:
             row = {
                 **row,
@@ -605,19 +646,73 @@ class LanceStore:
 
     def get_slot(self, slot_id: str) -> ProjectSlot | None:
         rows = self._rows(self._project_slots, f"slot_id = {_quoted(slot_id)}")
-        return self._slot_from_row(rows[0]) if rows else None
+        return self._overlay_pending_touch(self._slot_from_row(rows[0])) if rows else None
 
     def list_slots(self, project_id: str) -> list[ProjectSlot]:
         rows = self._rows(self._project_slots, f"project_id = {_quoted(project_id)}")
-        return [self._slot_from_row(row) for row in rows]
+        return [self._overlay_pending_touch(self._slot_from_row(row)) for row in rows]
+
+    def _overlay_pending_touch(self, slot: ProjectSlot) -> ProjectSlot:
+        """Apply a buffered touch_slot timestamp not yet written to disk.
+
+        Every LRU-retention reader goes through get_slot or list_slots, so
+        overlaying here (rather than in each reader) is enough to make
+        eviction order correct even when nothing has explicitly called
+        flush_slot_touches yet.
+        """
+        with self._touch_lock:
+            pending = self._pending_slot_touches.get(slot.slot_id)
+        if pending is None or pending <= slot.last_used_at:
+            return slot
+        return slot.model_copy(update={"last_used_at": pending})
 
     def touch_slot(self, slot_id: str) -> None:
-        """Stamp a slot's last-use time for least-recently-used retention."""
-        slot = self.get_slot(slot_id)
-        if slot is None:
+        """Stamp a slot's last-use time for least-recently-used retention.
+
+        Buffered in memory rather than written immediately: a read-heavy
+        workload touches its active slot on every query, and a write on every
+        touch would bump the project_slots table version -- and its on-disk
+        footprint -- once per query (see the query-path-overhead remediation
+        plan). flush_slot_touches merges every buffered touch in one write;
+        this also flushes inline once the oldest pending touch has waited
+        past SLOT_TOUCH_FLUSH_SECONDS, so a long-lived process without an
+        explicit flush call still bounds how much history a crash could lose.
+        """
+        now = time.time_ns()
+        with self._touch_lock:
+            self._pending_slot_touches[slot_id] = now
+            oldest = min(self._pending_slot_touches.values())
+        if (now - oldest) / 1_000_000_000 > SLOT_TOUCH_FLUSH_SECONDS:
+            self.flush_slot_touches()
+
+    def flush_slot_touches(self) -> None:
+        """Write every buffered touch_slot timestamp in one merge.
+
+        The buffer is drained before the write, not after: a touch that
+        arrives while this is running is left pending for the next flush
+        rather than lost or double-counted.
+        """
+        with self._touch_lock:
+            pending = dict(self._pending_slot_touches)
+            self._pending_slot_touches.clear()
+        if not pending:
             return
-        row = self._slot_row(slot.model_copy(update={"last_used_at": time.time_ns()}))
-        self._merge(self._project_slots, "slot_id", [row])
+        rows: list[dict[str, Any]] = []
+        for slot_id, touched_at in pending.items():
+            slot = self.get_slot(slot_id)
+            if slot is None:
+                continue
+            rows.append(self._slot_row(slot.model_copy(update={"last_used_at": touched_at})))
+        if rows:
+            self._merge(self._project_slots, "slot_id", rows)
+
+    def close(self) -> None:
+        """Release in-memory state that must not outlive the process.
+
+        Flushes every buffered slot touch so a later process's LRU decision
+        never mistakes an unflushed touch for genuine inactivity.
+        """
+        self.flush_slot_touches()
 
     def set_slot_state(
         self,
@@ -643,9 +738,15 @@ class LanceStore:
                 updates["indexed_clean"] = (
                     None if git.worktree.value == "unknown" else git.worktree.value == "clean"
                 )
+                updates["indexed_status_fingerprint"] = git.status_fingerprint
+                updates["indexed_status_paths"] = encode_status_paths(
+                    {*git.dirty_paths, *git.untracked_paths}
+                )
             else:
                 updates["indexed_head"] = None
                 updates["indexed_clean"] = None
+                updates["indexed_status_fingerprint"] = None
+                updates["indexed_status_paths"] = None
             # The generation identity the next freshness check compares against:
             # scan configuration, model, dimension, and schema as of this
             # commit. The caller's upsert_project has already refreshed the
@@ -800,6 +901,10 @@ class LanceStore:
                 f"Project {project.id} has no active index slot",
             )
         self.touch_slot(active.slot_id)
+        # This path already writes (upsert_slot, possibly activate_slot), so
+        # flushing the touch here costs nothing extra and keeps activation
+        # durable rather than leaving it in the in-memory buffer.
+        self.flush_slot_touches()
         return active
 
     def _active_partition_ref(
@@ -972,6 +1077,8 @@ class LanceStore:
             "project_prefix": slot.project_prefix,
             "indexed_head": slot.indexed_head,
             "indexed_clean": slot.indexed_clean,
+            "indexed_status_fingerprint": slot.indexed_status_fingerprint,
+            "indexed_status_paths": slot.indexed_status_paths,
             "scan_config_hash": slot.scan_config_hash,
             "model_id": slot.model_id,
             "vector_dimension": slot.vector_dimension,
@@ -996,6 +1103,8 @@ class LanceStore:
             indexed_clean=(
                 None if row.get("indexed_clean") is None else bool(row["indexed_clean"])
             ),
+            indexed_status_fingerprint=_optional_str(row.get("indexed_status_fingerprint")),
+            indexed_status_paths=_optional_str(row.get("indexed_status_paths")),
             scan_config_hash=str(row.get("scan_config_hash") or ""),
             model_id=str(row.get("model_id") or ""),
             vector_dimension=int(row.get("vector_dimension") or 0),
@@ -2025,6 +2134,8 @@ class LanceStore:
                 ("project_prefix", pa.string()),
                 ("indexed_head", pa.string()),
                 ("indexed_clean", pa.bool_()),
+                ("indexed_status_fingerprint", pa.string()),
+                ("indexed_status_paths", pa.string()),
                 ("scan_config_hash", pa.string()),
                 ("model_id", pa.string()),
                 ("vector_dimension", pa.int32()),
@@ -2668,3 +2779,52 @@ class LanceStore:
             ]
             if migrated:
                 self._merge(fresh, ["project_id", "checkout_key"], migrated)
+
+    def _migrate_project_slot_status_columns(self, registry_directory: Path) -> None:
+        """Add the status-fingerprint and status-paths columns to an older registry.
+
+        Existing rows keep every other field verbatim; the two new columns
+        come back null, which simply disables the freshness fast path for
+        that slot until the next index run stamps it (see D1/D2 of the
+        query-path-overhead remediation plan).
+        """
+        lock_directory = registry_directory.parent.parent / "locks"
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        with FileLock(lock_directory / ".project-slots-migrate.lock"):
+            try:
+                existing = self._db.open_table("project_slots")
+            except (ValueError, FileNotFoundError):
+                return
+            if "indexed_status_fingerprint" in {field.name for field in existing.schema}:
+                return
+            rows = self._rows(cast(LanceTable, existing))
+            self._db.drop_table("project_slots")
+            fresh = self._table(self._db, "project_slots", self._project_slot_schema())
+            migrated = [
+                {
+                    "slot_id": str(row["slot_id"]),
+                    "project_id": str(row["project_id"]),
+                    "partition_id": str(row["partition_id"]),
+                    "selector_kind": str(row["selector_kind"]),
+                    "selector_value": str(row["selector_value"]),
+                    "repository_identity": _optional_str(row.get("repository_identity")),
+                    "checkout_identity": _optional_str(row.get("checkout_identity")),
+                    "project_prefix": str(row.get("project_prefix") or ""),
+                    "indexed_head": _optional_str(row.get("indexed_head")),
+                    "indexed_clean": (
+                        None if row.get("indexed_clean") is None else bool(row["indexed_clean"])
+                    ),
+                    "indexed_status_fingerprint": None,
+                    "indexed_status_paths": None,
+                    "scan_config_hash": str(row.get("scan_config_hash") or ""),
+                    "model_id": str(row.get("model_id") or ""),
+                    "vector_dimension": int(row.get("vector_dimension") or 0),
+                    "schema_version": int(row.get("schema_version") or 0),
+                    "state": str(row.get("state") or "pending"),
+                    "created_at": int(row.get("created_at") or 0),
+                    "last_used_at": int(row.get("last_used_at") or 0),
+                }
+                for row in rows
+            ]
+            if migrated:
+                self._merge(fresh, "slot_id", migrated)

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import queue
+import stat as stat_module
 import subprocess
 import threading
 import time
@@ -172,6 +173,41 @@ class SourceScanner:
             else:
                 skipped.append(item)
         return ScanResult(files=files, skipped=skipped)
+
+    def scan_paths(
+        self,
+        project: ProjectInfo,
+        relative_paths: Iterable[str],
+        known_files: dict[str, StoredFile] | None = None,
+    ) -> Iterator[ScannedFile | SkippedFile]:
+        """Classify and stat exactly the given candidate paths, not the whole tree.
+
+        Used by the freshness fast path on a dirty checkout: Git already named
+        every path that could have changed (the stored dirty set plus the
+        current status), so proving the index current needs only those paths,
+        never a walk of the rest of the tree. Ignore rules are deliberately
+        not re-applied -- the candidates already came from ``git status``,
+        which already applied them -- matching the same ``run_check_ignore
+        =False`` handling ``iter_scan`` uses on its own worktree path. A path
+        that no longer exists on disk yields nothing, same as ``iter_scan``.
+        """
+        known_files = known_files or {}
+        root = project.root.resolve()
+        config_excludes = GitIgnoreSpec.from_lines(project.scan.exclude)
+        include_spec = GitIgnoreSpec.from_lines(project.scan.include)
+        items: list[tuple[Path, list[tuple[Path, GitIgnoreSpec]]]] = [
+            (root / relative, []) for relative in relative_paths
+        ]
+        yield from self._scan_candidates(
+            items,
+            root=root,
+            include_spec=include_spec,
+            config_excludes=config_excludes,
+            max_file_bytes=project.scan.max_file_bytes,
+            known_files=known_files,
+            read_contents=False,
+            run_check_ignore=False,
+        )
 
     def iter_scan(
         self,
@@ -561,11 +597,21 @@ class SourceScanner:
         """
         if SourceScanner._in_hard_excluded_directory(relative):
             return None, None
-        if absolute.is_symlink():
+        # A single lstat replaces the separate is_symlink() and is_file()
+        # calls Path would otherwise make on the same path (D8): once a path
+        # is known not to be a symlink, lstat and stat agree, so one syscall
+        # answers both questions. Any error (missing path, permission) is
+        # treated exactly as Path.is_symlink()/is_file() would: not eligible,
+        # with no recorded skip reason.
+        try:
+            mode = os.lstat(absolute).st_mode
+        except OSError:
+            return None, None
+        if stat_module.S_ISLNK(mode):
             if absolute.suffix.lower() in LANGUAGES:
                 return None, "symlink"
             return None, None
-        if not absolute.is_file():
+        if not stat_module.S_ISREG(mode):
             return None, None
         language = LANGUAGES.get(absolute.suffix.lower())
         if language is None or not include_spec.match_file(relative.as_posix()):

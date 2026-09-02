@@ -1115,6 +1115,13 @@ class ProjectSlot(FrozenModel):
     # clean then. A null HEAD or clean state forces full freshness validation.
     indexed_head: str | None = None
     indexed_clean: bool | None = None
+    # The `git status` fingerprint at index time, and the JSON-encoded sorted
+    # list of paths that were dirty or untracked then (or null when that list
+    # exceeded MAX_PERSISTED_STATUS_PATHS). Together they let a freshness
+    # check on a dirty checkout stat only the paths that could have changed
+    # instead of walking the whole tree; either being null forces a full walk.
+    indexed_status_fingerprint: str | None = None
+    indexed_status_paths: str | None = None
     scan_config_hash: str = ""
     model_id: str = ""
     vector_dimension: int = 0

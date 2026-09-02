@@ -152,6 +152,37 @@ def test_broker_application_calls_one_daemon_backend(tmp_path: Path) -> None:
 
 
 @requires_local_sockets
+def test_stopping_the_daemon_flushes_buffered_slot_touches(tmp_path: Path) -> None:
+    """touch_slot is buffered in memory (D6); a stopped daemon must not lose it."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    daemon_server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=daemon_server.serve, daemon=True)
+    thread.start()
+    assert daemon_server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=tmp_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+
+    project = broker.init_project(root)
+    broker.index_project(project.id)
+    broker.project_status(project.id)
+
+    # index_project's own activation already flushed once; a later status
+    # check's touch_slot still buffers, so there is something left to lose.
+    assert application.store._pending_slot_touches
+    version = application.store._project_slots.version
+
+    broker.stop()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert application.store._pending_slot_touches == {}
+    assert application.store._project_slots.version > version
+
+
+@requires_local_sockets
 def test_broker_forwards_allow_overlap_to_the_daemon(tmp_path: Path) -> None:
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)

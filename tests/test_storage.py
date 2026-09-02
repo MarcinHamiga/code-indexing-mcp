@@ -2117,6 +2117,36 @@ def test_slot_registry_round_trip_is_idempotent(tmp_path: Path) -> None:
     assert store.get_slot("missing") is None
 
 
+def test_slot_round_trips_the_status_fingerprint_and_paths(tmp_path: Path) -> None:
+    """A slot written with a git status fingerprint keeps both new columns."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    slot = _slot("project-a", "slot-a").model_copy(
+        update={
+            "indexed_status_fingerprint": "abc123",
+            "indexed_status_paths": json.dumps(["a.py", "b.py"], separators=(",", ":")),
+        }
+    )
+
+    store.upsert_slot(slot)
+
+    reread = store.get_slot("slot-a")
+    assert reread is not None
+    assert reread.indexed_status_fingerprint == "abc123"
+    assert reread.indexed_status_paths == json.dumps(["a.py", "b.py"], separators=(",", ":"))
+
+
+def test_encode_status_paths_falls_back_to_none_past_the_cap(tmp_path: Path) -> None:
+    """A changeset too large to store cheaply drops the path list, not the fingerprint."""
+    small = storage_module.encode_status_paths(["b.py", "a.py"])
+    assert small == json.dumps(["a.py", "b.py"], separators=(",", ":"))
+    assert storage_module.decode_status_paths(small) == frozenset({"a.py", "b.py"})
+
+    huge = [f"file{i}.py" for i in range(storage_module.MAX_PERSISTED_STATUS_PATHS + 1)]
+    assert storage_module.encode_status_paths(huge) is None
+    assert storage_module.decode_status_paths(None) is None
+    assert storage_module.decode_status_paths("not json") is None
+
+
 def test_activate_slot_publishes_the_pointer_only_after_the_row_exists(tmp_path: Path) -> None:
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
 
@@ -2387,6 +2417,104 @@ def test_branch_cache_limit_evicts_the_oldest_inactive_slot(tmp_path: Path) -> N
     assert store.active_slot("project-a").slot_id == "slot-a"
 
 
+def test_touch_slot_buffers_without_writing(tmp_path: Path) -> None:
+    """touch_slot must not bump the registry table version on every call (D6)."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a"))
+    version = store._project_slots.version
+
+    store.touch_slot("slot-a")
+    store.touch_slot("slot-a")
+    store.touch_slot("slot-a")
+
+    assert store._project_slots.version == version
+    # A reader still sees the buffered timestamp even though nothing was
+    # written yet.
+    slot = store.get_slot("slot-a")
+    assert slot is not None
+    assert slot.last_used_at > 1
+
+
+def test_flush_slot_touches_writes_one_version(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a", partition_id="partition-a"))
+    store.upsert_slot(_slot("project-a", "slot-b", partition_id="partition-b"))
+    version = store._project_slots.version
+
+    store.touch_slot("slot-a")
+    store.touch_slot("slot-b")
+    store.flush_slot_touches()
+
+    assert store._project_slots.version == version + 1
+    reopened = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    slot_a = reopened.get_slot("slot-a")
+    slot_b = reopened.get_slot("slot-b")
+    assert slot_a is not None and slot_a.last_used_at > 1
+    assert slot_b is not None and slot_b.last_used_at > 1
+
+    # Nothing pending: a second flush must not churn the version again.
+    store.flush_slot_touches()
+    assert store._project_slots.version == version + 1
+
+
+def test_touch_slot_flushes_inline_once_the_oldest_pending_touch_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a"))
+    store.upsert_slot(_slot("project-a", "slot-b", partition_id="partition-b"))
+    monkeypatch.setattr(storage_module, "SLOT_TOUCH_FLUSH_SECONDS", 60.0)
+    version = store._project_slots.version
+    # Simulate a touch that has been sitting in the buffer well past the
+    # flush interval.
+    store._pending_slot_touches["slot-b"] = time.time_ns() - (120 * 1_000_000_000)
+
+    store.touch_slot("slot-a")
+
+    assert store._project_slots.version == version + 1
+    assert store._pending_slot_touches == {}
+
+
+def test_branch_cache_limit_respects_an_unflushed_touch(tmp_path: Path) -> None:
+    """LRU eviction (list_slots) must overlay a buffered touch, not just the
+    on-disk last_used_at, or a just-touched slot could be evicted as if it
+    were the oldest.
+
+    Uses the ``workspace`` selector kind so the slots are not also flagged by
+    the unrelated obsolete-slot-key cleanup (that check only looks at
+    ``ref``/``commit`` slots) -- this test is only about the LRU limit.
+    """
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4, branch_cache_limit=1)
+    store.upsert_slot(
+        _slot("project-a", "slot-a", partition_id="partition-a", selector_kind="workspace")
+    )
+    store.upsert_slot(
+        _slot(
+            "project-a", "slot-b", partition_id="partition-b", selector_kind="workspace"
+        ).model_copy(update={"last_used_at": 2})
+    )
+    store.upsert_slot(
+        _slot(
+            "project-a", "slot-c", partition_id="partition-c", selector_kind="workspace"
+        ).model_copy(update={"last_used_at": 1})
+    )
+    store.activate_slot("project-a", "slot-a", checkout_key="checkout")
+    store._tables("partition-a")
+    store._tables("partition-b")
+    store._tables("partition-c")
+    # slot-c looks older than slot-b on disk, but an unflushed touch makes it
+    # the more recently used of the two candidates.
+    store.touch_slot("slot-c")
+
+    assert store.maintain_project(
+        "project-a", cleanup_older_than=timedelta(hours=1), branch_cache_limit=1
+    )
+
+    remaining = {slot.slot_id for slot in store.list_slots("project-a")}
+    assert remaining == {"slot-a", "slot-c"}
+    assert not (store.directory / "projects" / "partition-b").exists()
+
+
 def _git_repo(tmp_path: Path, name: str) -> Path:
     root = tmp_path / name
     root.mkdir()
@@ -2556,3 +2684,63 @@ def test_active_slots_registry_gains_the_checkout_key_in_place(tmp_path: Path) -
     assert store.active_slot("p").slot_id == "slot-old"
     reopened = LanceStore(data, vector_dimension=4)
     assert reopened.active_slot("p").slot_id == "slot-old"
+
+
+def test_project_slots_registry_gains_status_columns_in_place(tmp_path: Path) -> None:
+    """A pre-fingerprint project_slots table opens and reads the new columns as None."""
+    data = tmp_path / "data"
+    database = lancedb.connect(data / "registry")
+    legacy_schema = pa.schema(
+        [
+            ("slot_id", pa.string()),
+            ("project_id", pa.string()),
+            ("partition_id", pa.string()),
+            ("selector_kind", pa.string()),
+            ("selector_value", pa.string()),
+            ("repository_identity", pa.string()),
+            ("checkout_identity", pa.string()),
+            ("project_prefix", pa.string()),
+            ("indexed_head", pa.string()),
+            ("indexed_clean", pa.bool_()),
+            ("scan_config_hash", pa.string()),
+            ("model_id", pa.string()),
+            ("vector_dimension", pa.int32()),
+            ("schema_version", pa.int32()),
+            ("state", pa.string()),
+            ("created_at", pa.int64()),
+            ("last_used_at", pa.int64()),
+        ]
+    )
+    legacy = database.create_table("project_slots", schema=legacy_schema)
+    legacy.add(
+        [
+            {
+                "slot_id": "slot-old",
+                "project_id": "p",
+                "partition_id": "slot-old",
+                "selector_kind": "ref",
+                "selector_value": "refs/heads/main",
+                "repository_identity": "/repo/.git",
+                "checkout_identity": "/repo/.git",
+                "project_prefix": "",
+                "indexed_head": "deadbeef",
+                "indexed_clean": True,
+                "scan_config_hash": "hash",
+                "model_id": "test/model",
+                "vector_dimension": 4,
+                "schema_version": storage_module.SCHEMA_VERSION,
+                "state": "ready",
+                "created_at": 1,
+                "last_used_at": 1,
+            }
+        ]
+    )
+
+    store = LanceStore(data, vector_dimension=4)
+
+    slot = store.get_slot("slot-old")
+    assert slot is not None
+    assert slot.indexed_head == "deadbeef"
+    assert slot.indexed_clean is True
+    assert slot.indexed_status_fingerprint is None
+    assert slot.indexed_status_paths is None

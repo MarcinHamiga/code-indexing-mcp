@@ -440,6 +440,14 @@ a stored `ready` or `partial` index has drifted from the source tree. Every proj
 operation resolves the checkout's active index slot before touching the index — see
 [Branch-aware indexing](#branch-aware-indexing).
 
+**Freshness.** A clean Git checkout at the slot's indexed `HEAD` costs no scan at all: the
+comparison above is skipped outright. A dirty checkout does not fall back to walking the whole
+tree either — it stats only the paths Git already reports as changed (plus, when the working tree
+has changed shape since the last index, the paths that were dirty back then), so a large repository
+with one edited file answers a status check or a query about as fast as a clean one. Only a
+registration with no recorded Git status yet (a slot from before this fast path existed) pays for a
+full walk, and only once, until the next index run.
+
 Two things can make an automatic refresh wait: another root queued ahead of it in the same session,
 and another process holding the global index lock. One budget covers both. The refresh retries with
 exponential backoff for up to five minutes, then fails the waiting query with `INDEX_BUSY` rather

@@ -909,8 +909,9 @@ def create_server(
             "Incrementally index a project: scan for supported source files, parse changed files "
             "with Tree-sitter, embed their chunks, and commit them. Files whose size, mtime, and "
             "content hash are unchanged are skipped without being re-read; a selector switch "
-            "indexes the newly active slot, and returning to a clean cached slot at "
-            "the same HEAD costs no scan at all. Returns per-phase counts and durations plus any "
+            "indexes the newly active slot, returning to a clean cached slot at "
+            "the same HEAD costs no scan at all, and a dirty checkout re-checks only its changed "
+            "files rather than the whole tree. Returns per-phase counts and durations plus any "
             "per-file errors. Indexes supported source files in the checked-out working tree, "
             "skipping symlinks, binaries, and files over 1 MiB."
         ),

@@ -17,6 +17,7 @@ from code_indexing_mcp.git_state import (
     WorktreeStatus,
     changed_paths_between,
     checkout_key,
+    head_snapshot,
     partition_id,
     probe_git_state,
     slot_id,
@@ -494,3 +495,60 @@ def test_changed_paths_between_returns_none_for_unreachable_commits(tmp_path: Pa
     root = _repo(tmp_path, "repo")
 
     assert changed_paths_between(root, "0" * 40, "1" * 40) is None
+
+
+def test_head_snapshot_reads_a_loose_ref(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    state = probe_git_state(root)
+
+    assert head_snapshot(state) == (SelectorKind.REF, "refs/heads/main", _head_oid(root))
+
+
+def test_head_snapshot_reads_a_packed_ref(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    state = probe_git_state(root)
+    run_git("pack-refs", "--all", "--prune", cwd=root)
+    assert not (root / ".git" / "refs" / "heads" / "main").exists()
+
+    assert head_snapshot(state) == (SelectorKind.REF, "refs/heads/main", _head_oid(root))
+
+
+def test_head_snapshot_reads_a_detached_head(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    run_git("checkout", "-q", "--detach", cwd=root)
+    state = probe_git_state(root)
+    oid = _head_oid(root)
+
+    assert head_snapshot(state) == (SelectorKind.COMMIT, oid, oid)
+
+
+def test_head_snapshot_reports_no_head_oid_for_an_unborn_branch(tmp_path: Path) -> None:
+    root = tmp_path / "unborn"
+    root.mkdir()
+    run_git("init", "-q", "--initial-branch", "feature", str(root))
+    state = probe_git_state(root)
+
+    assert head_snapshot(state) == (SelectorKind.REF, "refs/heads/feature", None)
+
+
+def test_head_snapshot_resolves_a_linked_worktree_through_the_common_directory(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path, "repo")
+    worktree = tmp_path / "wt"
+    run_git("worktree", "add", "-q", str(worktree), cwd=root)
+    state = probe_git_state(worktree)
+
+    assert head_snapshot(state) == (
+        state.selector_kind,
+        state.selector_value,
+        _head_oid(worktree),
+    )
+
+
+def test_head_snapshot_returns_none_for_a_corrupt_head(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    state = probe_git_state(root)
+    (root / ".git" / "HEAD").write_text("garbage\n")
+
+    assert head_snapshot(state) is None

@@ -7,8 +7,10 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -35,7 +37,7 @@ from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
-from .git_state import GitProbeOutcome, WorktreeStatus, probe_git_state
+from .git_state import GitProbeOutcome, GitState, WorktreeStatus, head_snapshot, probe_git_state
 from .git_state import slot_id as git_slot_id
 from .history import HistoryStore
 from .indexing import Indexer
@@ -52,6 +54,7 @@ from .models import (
     ModelStatus,
     OutlineResponse,
     ProjectInfo,
+    ProjectSlot,
     ProjectStatus,
     ProjectStorageStats,
     RefactorAnalysis,
@@ -93,6 +96,7 @@ from .storage import (
     ActiveIndexTarget,
     LanceStore,
     PartitionRef,
+    decode_status_paths,
     overlap_warnings,
     overlapping_registration,
     worktree_warnings,
@@ -112,6 +116,12 @@ RECOVERY_LOCK_TIMEOUT_SECONDS = 5.0
 # Automatic maintenance repeats its overdue check at most this often. The check
 # itself is gated by the persisted last-successful-maintenance timestamp.
 MAINTENANCE_CHECK_INTERVAL = timedelta(hours=24)
+
+# Upper bound on how many projects a multi-project scope resolves in parallel.
+# Each project probes Git and takes its own per-project file lock, so there is
+# no cross-project contention to bound against; this simply caps thread count
+# for a scope naming many projects at once.
+RESOLVE_TARGET_MAX_WORKERS = 8
 
 # Negative freshness answers are cached briefly so a burst of tool calls in one
 # agent interaction does not walk the same clean repository once per call. The
@@ -282,7 +292,10 @@ class Application:
         self._runtime_fallback: BackendSelection | None = None
         # Negative freshness results, keyed by project id: the monotonic
         # deadline and the scan-config fingerprint the answer was computed for.
+        # Read and written from asyncio.to_thread workers and daemon request
+        # threads, so every access goes through _freshness_lock.
         self._clean_freshness_until: dict[tuple[str, str], tuple[float, str]] = {}
+        self._freshness_lock = threading.Lock()
         self.embedding_batch_size = self.settings.embedding_batch_size
         self.batch_calibration = "explicit"
         if self.settings.embedding_batch_auto:
@@ -851,17 +864,38 @@ class Application:
         a query can read every requested branch slot together. Sorting keeps
         the logical-project lock order fixed while remaining stable within a
         project, preserving the request's checkout order.
+
+        A scope naming more than one checkout resolves them concurrently:
+        each probes Git and takes its own per-project file lock, so there is
+        nothing to serialize on, and a multi-project scope otherwise pays the
+        full per-project probe cost once per project in sequence.
+        ``ThreadPoolExecutor.map`` returns results in submission order, so the
+        reassembly below sees exactly the sorted, de-duplicated order the
+        sequential loop would have produced.
         """
-        grouped: dict[str, list[ActiveIndexTarget]] = {}
+        ordered: list[ProjectInfo] = []
         seen: set[tuple[str, str]] = set()
         for project in sorted(projects, key=lambda item: item.id):
             key = (project.id, project_root_identity(project.root))
             if key in seen:
                 continue
             seen.add(key)
-            grouped.setdefault(project.id, []).append(
-                self._resolve_active_target(project, include_status=include_status)
-            )
+            ordered.append(project)
+
+        def resolve(project: ProjectInfo) -> ActiveIndexTarget:
+            return self._resolve_active_target(project, include_status=include_status)
+
+        if len(ordered) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(RESOLVE_TARGET_MAX_WORKERS, len(ordered))
+            ) as pool:
+                resolved = list(pool.map(resolve, ordered))
+        else:
+            resolved = [resolve(project) for project in ordered]
+
+        grouped: dict[str, list[ActiveIndexTarget]] = {}
+        for project, target in zip(ordered, resolved, strict=True):
+            grouped.setdefault(project.id, []).append(target)
         return grouped
 
     @staticmethod
@@ -879,10 +913,27 @@ class Application:
 
     @staticmethod
     def _target_changed(target: ActiveIndexTarget) -> bool:
-        current = probe_git_state(target.project.root)
+        """Whether the resolved target's repository selector or HEAD moved.
+
+        Reads ``HEAD`` directly (``head_snapshot``) instead of re-running the
+        full multi-spawn probe on every checked call; only a read failure it
+        cannot make sense of falls back to :func:`probe_git_state`. Selector
+        kind, selector value, and head OID are compared exactly as the full
+        probe path always has -- see ``head_snapshot`` for why that is
+        equivalent to comparing slot identity.
+        """
+        snapshot = head_snapshot(target.git_state)
+        if snapshot is None:
+            current = probe_git_state(target.project.root)
+            return (
+                git_slot_id(target.project.id, current) != target.slot.slot_id
+                or current.head_oid != target.git_state.head_oid
+            )
+        selector_kind, selector_value, head_oid = snapshot
         return (
-            git_slot_id(target.project.id, current) != target.slot.slot_id
-            or current.head_oid != target.git_state.head_oid
+            selector_kind != target.git_state.selector_kind
+            or selector_value != target.git_state.selector_value
+            or head_oid != target.git_state.head_oid
         )
 
     def _run_repository_stable_query(
@@ -1041,6 +1092,21 @@ class Application:
             is None
         )
 
+    def _cached_freshness(self, cache_key: tuple[str, str]) -> tuple[float, str] | None:
+        with self._freshness_lock:
+            return self._clean_freshness_until.get(cache_key)
+
+    def _set_cached_freshness(self, cache_key: tuple[str, str], fingerprint: str) -> None:
+        with self._freshness_lock:
+            self._clean_freshness_until[cache_key] = (
+                time.monotonic() + FRESHNESS_CACHE_SECONDS,
+                fingerprint,
+            )
+
+    def _pop_cached_freshness(self, cache_key: tuple[str, str]) -> None:
+        with self._freshness_lock:
+            self._clean_freshness_until.pop(cache_key, None)
+
     def _project_status_for_target(self, target: ActiveIndexTarget) -> ProjectStatus:
         resolved = target.project
         partition = target.partition
@@ -1056,7 +1122,7 @@ class Application:
             # Keyed per slot, not per project: several worktrees share one
             # registration id and must not thrash each other's cached answer.
             cache_key = (resolved.id, partition.slot_id)
-            cached = self._clean_freshness_until.get(cache_key)
+            cached = self._cached_freshness(cache_key)
             if cached is not None and cached[1] == fingerprint and cached[0] > time.monotonic():
                 # A recent check found this exact slot, activation, HEAD, and
                 # scan configuration clean; do not walk the repository again
@@ -1066,10 +1132,7 @@ class Application:
                 # A clean slot indexed at exactly this HEAD cannot be stale:
                 # the switch-back fast path, with no scanner, parser, or
                 # embedder work at all.
-                self._clean_freshness_until[cache_key] = (
-                    time.monotonic() + FRESHNESS_CACHE_SECONDS,
-                    fingerprint,
-                )
+                self._set_cached_freshness(cache_key, fingerprint)
             elif (
                 git.probe is GitProbeOutcome.GIT
                 and slot.indexed_head is not None
@@ -1080,20 +1143,28 @@ class Application:
                 # change from any metadata walk, so only an index run that
                 # validates the diff can prove the slot current. Lazy and
                 # eager modes schedule exactly that run.
-                self._clean_freshness_until.pop(cache_key, None)
-                state = "stale"
-            elif self._project_is_stale(
-                resolved,
-                {record.path: record for record in files},
-                partition_id=partition.partition_id,
-            ):
-                self._clean_freshness_until.pop(cache_key, None)
+                self._pop_cached_freshness(cache_key)
                 state = "stale"
             else:
-                self._clean_freshness_until[cache_key] = (
-                    time.monotonic() + FRESHNESS_CACHE_SECONDS,
-                    fingerprint,
+                existing_files = {record.path: record for record in files}
+                candidates = self._subset_stale_candidates(slot, git)
+                is_stale = (
+                    self._paths_are_stale(
+                        resolved,
+                        existing_files,
+                        candidates,
+                        partition_id=partition.partition_id,
+                    )
+                    if candidates is not None
+                    else self._project_is_stale(
+                        resolved, existing_files, partition_id=partition.partition_id
+                    )
                 )
+                if is_stale:
+                    self._pop_cached_freshness(cache_key)
+                    state = "stale"
+                else:
+                    self._set_cached_freshness(cache_key, fingerprint)
         return ProjectStatus(
             project=resolved,
             state=state,
@@ -1131,8 +1202,9 @@ class Application:
         a completed index or reference backfill, removal -- and by eager-mode
         watchers the moment a file system event lands.
         """
-        for key in [k for k in self._clean_freshness_until if k[0] == project_id]:
-            self._clean_freshness_until.pop(key, None)
+        with self._freshness_lock:
+            for key in [k for k in self._clean_freshness_until if k[0] == project_id]:
+                self._clean_freshness_until.pop(key, None)
 
     def index_history(
         self,
@@ -1233,6 +1305,10 @@ class Application:
         automatic pass cannot get that lock, the registry is reported without
         maintenance rather than failing the whole run.
         """
+        # Retention reads last_used_at for LRU eviction; a buffered touch that
+        # never made it to disk must not make a recently used slot look old
+        # enough to evict.
+        self.store.flush_slot_touches()
         started = time.monotonic_ns()
         started_at = datetime.now(UTC).isoformat()
         retention = timedelta(hours=self.settings.version_retention_hours)
@@ -1549,6 +1625,79 @@ class Application:
             for path, item in current.items()
         )
 
+    @staticmethod
+    def _subset_stale_candidates(slot: ProjectSlot, git: GitState) -> set[str] | None:
+        """Return the paths a freshness check needs to stat, or None for a full walk.
+
+        D2 of the query-path-overhead plan: a status fingerprint alone is not
+        proof of currency (a file dirty at index time and edited again shares
+        the fingerprint of an untouched dirty file), so the rule is: same HEAD
+        and same fingerprint needs only today's dirty and untracked paths;
+        same HEAD with a different fingerprint also needs the paths that were
+        dirty or untracked *when this slot was indexed* -- a file reverted
+        back to its indexed content, or one that was freshly cleaned, leaves
+        no trace in the current status at all. Anything else (no HEAD match,
+        no stored fingerprint, or a path list too large to have been stored)
+        cannot be answered from a subset and falls back to the full walk.
+        """
+        if (
+            git.probe is not GitProbeOutcome.GIT
+            or slot.indexed_head is None
+            or slot.indexed_head != git.head_oid
+            or slot.indexed_status_fingerprint is None
+            or git.status_fingerprint is None
+        ):
+            return None
+        candidates = set(git.dirty_paths) | set(git.untracked_paths)
+        if slot.indexed_status_fingerprint != git.status_fingerprint:
+            stored = decode_status_paths(slot.indexed_status_paths)
+            if stored is None:
+                return None
+            candidates |= stored
+        return candidates
+
+    def _paths_are_stale(
+        self,
+        project: ProjectInfo,
+        existing: dict[str, StoredFile],
+        candidates: Iterable[str],
+        *,
+        partition_id: str | None = None,
+    ) -> bool:
+        """Whether any of *candidates* differs from what the index holds.
+
+        Only *candidates* is statted -- never the whole tree -- so this is
+        cheap even on a large repository with one dirty file. A candidate
+        that disappeared from disk, or that the index has and the current
+        scan does not (deleted, or newly ineligible), also counts as stale,
+        matching what a full :meth:`_project_is_stale` walk would report for
+        the same path.
+        """
+        relative = {Path(path).as_posix() for path in candidates}
+        if not relative:
+            return False
+        current = {
+            item.path.as_posix(): item
+            for item in self.indexer.scanner.scan_paths(project, relative, existing)
+            if isinstance(item, ScannedFile)
+        }
+        for path in relative:
+            indexed = existing.get(path)
+            scanned = current.get(path)
+            if (indexed is None) != (scanned is None):
+                return True
+            if (
+                indexed is not None
+                and scanned is not None
+                and (
+                    scanned.size != indexed.size
+                    or scanned.mtime_ns != indexed.mtime_ns
+                    or scanned.language != indexed.language
+                )
+            ):
+                return True
+        return False
+
     def inspect_scan(
         self,
         project: str | None = None,
@@ -1638,8 +1787,7 @@ class Application:
 
     def remove_project(self, project: str) -> RemovalReport:
         resolved = self._resolve(project, [])
-        for key in [k for k in self._clean_freshness_until if k[0] == resolved.id]:
-            self._clean_freshness_until.pop(key, None)
+        self.invalidate_freshness(resolved.id)
         lock_directory = self.paths.data / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
         with (
