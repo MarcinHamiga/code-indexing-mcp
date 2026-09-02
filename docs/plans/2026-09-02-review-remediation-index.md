@@ -30,7 +30,13 @@ review suggested.
 | 4 | [Daemon lifecycle](2026-09-02-review-remediation-4-daemon-lifecycle-plan.md) | Stale daemon after non-protocol changes; no read timeouts; `except BaseException`; transport errors bypass the error contract; `configure` leaves the daemon on old settings; cold start |
 | 5 | [Application split](2026-09-02-review-remediation-5-application-split-plan.md) | God facade; sideways imports; store private reach-through; env reads outside `IndexSettings`; broker/application drift |
 
-**Deferred by the review itself:** consolidating per-language rules in `extractor.py`
-and `reference_service.py` (a `_LanguageRules` table) is best done when the next
-language lands; a vector-index size gate needs a recall benchmark at scale first.
-Neither is in these tracks.
+**Deferred by the review itself, now planned separately:**
+
+- Per-language rules table for `extractor.py` and `reference_service.py`:
+  [plan](2026-09-02-language-rules-table-plan.md). Runs on its own branch from `main`
+  after PR #51.
+- Vector-index size gate: [plan](2026-09-02-vector-index-gate-plan.md), measured in
+  [results](2026-09-02-vector-index-gate-shipped.md).
+- Query-path gains measured on a real repository (the release gate for track 1):
+  [plan](2026-09-02-query-path-profiling-plan.md),
+  [results](2026-09-02-query-path-profiling-shipped.md).

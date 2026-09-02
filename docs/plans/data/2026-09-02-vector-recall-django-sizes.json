@@ -1,0 +1,240 @@
+{
+  "schema_version": 1,
+  "model_id": "jinaai/jina-embeddings-v2-base-code",
+  "dimension": 768,
+  "real_vectors": 56266,
+  "sources": [
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-3c52ddb724ff64fe36b24680835e7188",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-41632c94ff325e4f1c1915fce252f901",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-4c754cbc747705d82c23faa2968a8643",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-70a06d5984b6725e17a3c630fbc24523",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-7f48cde978514a1cb2ecc125036c5677",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-8e85e6b0da456844690edb9666ad3313",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-d8089dbc77d5bf70542c52ab71d761f4",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-dccab4f3513eb8df71a8831d4f13722c",
+    "/private/tmp/claude-501/-Users-mhamiga-Projects-mcps-code-indexing-mcp/da37b75d-50f0-4127-baed-6520e3db8066/scratchpad/profile/ws/data-baseline/lancedb/projects/slot-f9f1d167a919e8e2a3b9d6ffd892777b"
+  ],
+  "queries": {
+    "handwritten": 40,
+    "derived": 160
+  },
+  "top_k": 10,
+  "augment_sigma": 0.05,
+  "sizes": [
+    {
+      "rows": 20000,
+      "flat": {
+        "latency_ms": {
+          "median": 3.24,
+          "p90": 3.52,
+          "max": 23.83
+        },
+        "recall": 0.9995
+      },
+      "hnsw": {
+        "build_s": 0.63,
+        "index_bytes": 17795950,
+        "by_nprobes": {
+          "default": {
+            "latency_ms": {
+              "median": 0.73,
+              "p90": 0.88,
+              "max": 5.64
+            },
+            "recall": 0.8595
+          },
+          "50": {
+            "latency_ms": {
+              "median": 0.74,
+              "p90": 0.88,
+              "max": 2.22
+            },
+            "recall": 0.8595
+          },
+          "100": {
+            "latency_ms": {
+              "median": 0.75,
+              "p90": 0.92,
+              "max": 1.16
+            },
+            "recall": 0.8595
+          }
+        }
+      },
+      "synthetic": false,
+      "real_rows": 20000
+    },
+    {
+      "rows": 50000,
+      "flat": {
+        "latency_ms": {
+          "median": 6.93,
+          "p90": 8.82,
+          "max": 16.38
+        },
+        "recall": 0.9995
+      },
+      "hnsw": {
+        "build_s": 1.97,
+        "index_bytes": 44280375,
+        "by_nprobes": {
+          "default": {
+            "latency_ms": {
+              "median": 0.81,
+              "p90": 0.93,
+              "max": 15.34
+            },
+            "recall": 0.854
+          },
+          "50": {
+            "latency_ms": {
+              "median": 0.77,
+              "p90": 0.88,
+              "max": 1.02
+            },
+            "recall": 0.854
+          },
+          "100": {
+            "latency_ms": {
+              "median": 0.78,
+              "p90": 0.9,
+              "max": 1.19
+            },
+            "recall": 0.854
+          }
+        }
+      },
+      "synthetic": false,
+      "real_rows": 50000
+    },
+    {
+      "rows": 56266,
+      "flat": {
+        "latency_ms": {
+          "median": 6.36,
+          "p90": 6.88,
+          "max": 15.02
+        },
+        "recall": 1.0
+      },
+      "hnsw": {
+        "build_s": 2.13,
+        "index_bytes": 49806970,
+        "by_nprobes": {
+          "default": {
+            "latency_ms": {
+              "median": 0.75,
+              "p90": 0.85,
+              "max": 11.54
+            },
+            "recall": 0.847
+          },
+          "50": {
+            "latency_ms": {
+              "median": 0.8,
+              "p90": 0.91,
+              "max": 1.16
+            },
+            "recall": 0.847
+          },
+          "100": {
+            "latency_ms": {
+              "median": 0.75,
+              "p90": 0.83,
+              "max": 0.99
+            },
+            "recall": 0.847
+          }
+        }
+      },
+      "synthetic": false,
+      "real_rows": 56266
+    },
+    {
+      "rows": 100000,
+      "flat": {
+        "latency_ms": {
+          "median": 10.28,
+          "p90": 10.7,
+          "max": 16.33
+        },
+        "recall": 1.0
+      },
+      "hnsw": {
+        "build_s": 4.87,
+        "index_bytes": 84285314,
+        "by_nprobes": {
+          "default": {
+            "latency_ms": {
+              "median": 0.77,
+              "p90": 0.86,
+              "max": 12.17
+            },
+            "recall": 0.842
+          },
+          "50": {
+            "latency_ms": {
+              "median": 0.74,
+              "p90": 0.84,
+              "max": 1.09
+            },
+            "recall": 0.842
+          },
+          "100": {
+            "latency_ms": {
+              "median": 0.73,
+              "p90": 0.84,
+              "max": 1.27
+            },
+            "recall": 0.842
+          }
+        }
+      },
+      "synthetic": true,
+      "real_rows": 56266
+    },
+    {
+      "rows": 200000,
+      "flat": {
+        "latency_ms": {
+          "median": 20.14,
+          "p90": 21.0,
+          "max": 36.73
+        },
+        "recall": 1.0
+      },
+      "hnsw": {
+        "build_s": 10.16,
+        "index_bytes": 163323136,
+        "by_nprobes": {
+          "default": {
+            "latency_ms": {
+              "median": 0.78,
+              "p90": 0.88,
+              "max": 20.73
+            },
+            "recall": 0.8705
+          },
+          "50": {
+            "latency_ms": {
+              "median": 0.73,
+              "p90": 0.83,
+              "max": 0.98
+            },
+            "recall": 0.8705
+          },
+          "100": {
+            "latency_ms": {
+              "median": 0.72,
+              "p90": 0.83,
+              "max": 1.48
+            },
+            "recall": 0.8705
+          }
+        }
+      },
+      "synthetic": true,
+      "real_rows": 56266
+    }
+  ]
+}
