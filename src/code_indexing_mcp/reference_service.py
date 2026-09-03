@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import keyword as keyword_module
 import re
 import threading
 from collections import OrderedDict
@@ -14,6 +13,12 @@ from typing import Any, Final, Literal, NamedTuple, cast
 
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import STRUCTURAL_LANGUAGES
+from .language_rules import (
+    _DEFAULT,
+    LANGUAGE_RULES,
+    _ModuleIndex,
+    _python_package_root,
+)
 from .models import (
     REFERENCE_SCHEMA_VERSION,
     CompletenessReport,
@@ -108,282 +113,6 @@ def _sql_literal(value: str) -> str:
 # How many individual paths a coverage limitation names before it summarizes.
 _MAX_LIMITATION_PATHS: Final = 10
 
-_ECMASCRIPT_RESERVED_WORDS: Final = frozenset(
-    {
-        "await",
-        "break",
-        "case",
-        "catch",
-        "class",
-        "const",
-        "continue",
-        "debugger",
-        "default",
-        "delete",
-        "do",
-        "else",
-        "enum",
-        "export",
-        "extends",
-        "false",
-        "finally",
-        "for",
-        "function",
-        "if",
-        "implements",
-        "import",
-        "in",
-        "instanceof",
-        "interface",
-        "let",
-        "new",
-        "null",
-        "package",
-        "private",
-        "protected",
-        "public",
-        "return",
-        "static",
-        "super",
-        "switch",
-        "this",
-        "throw",
-        "true",
-        "try",
-        "typeof",
-        "var",
-        "void",
-        "while",
-        "with",
-        "yield",
-    }
-)
-_GO_RESERVED_WORDS: Final = frozenset(
-    {
-        "break",
-        "case",
-        "chan",
-        "const",
-        "continue",
-        "default",
-        "defer",
-        "else",
-        "fallthrough",
-        "for",
-        "func",
-        "go",
-        "goto",
-        "if",
-        "import",
-        "interface",
-        "map",
-        "package",
-        "range",
-        "return",
-        "select",
-        "struct",
-        "switch",
-        "type",
-        "var",
-    }
-)
-_RUST_RESERVED_WORDS: Final = frozenset(
-    {
-        "Self",
-        "abstract",
-        "as",
-        "async",
-        "await",
-        "become",
-        "box",
-        "break",
-        "const",
-        "continue",
-        "crate",
-        "do",
-        "dyn",
-        "else",
-        "enum",
-        "extern",
-        "false",
-        "final",
-        "fn",
-        "for",
-        "gen",
-        "if",
-        "impl",
-        "in",
-        "let",
-        "loop",
-        "macro",
-        "match",
-        "mod",
-        "move",
-        "mut",
-        "override",
-        "priv",
-        "pub",
-        "ref",
-        "return",
-        "self",
-        "static",
-        "struct",
-        "super",
-        "trait",
-        "true",
-        "try",
-        "type",
-        "typeof",
-        "union",
-        "unsafe",
-        "unsized",
-        "use",
-        "virtual",
-        "where",
-        "while",
-        "yield",
-    }
-)
-_JAVA_RESERVED_WORDS: Final = frozenset(
-    {
-        "_",
-        "abstract",
-        "assert",
-        "boolean",
-        "break",
-        "byte",
-        "case",
-        "catch",
-        "char",
-        "class",
-        "const",
-        "continue",
-        "default",
-        "do",
-        "double",
-        "else",
-        "enum",
-        "extends",
-        "false",
-        "final",
-        "finally",
-        "float",
-        "for",
-        "goto",
-        "if",
-        "implements",
-        "import",
-        "instanceof",
-        "int",
-        "interface",
-        "long",
-        "native",
-        "new",
-        "null",
-        "package",
-        "private",
-        "protected",
-        "public",
-        "return",
-        "short",
-        "static",
-        "strictfp",
-        "super",
-        "switch",
-        "synchronized",
-        "this",
-        "throw",
-        "throws",
-        "transient",
-        "true",
-        "try",
-        "void",
-        "volatile",
-        "while",
-    }
-)
-_CSHARP_RESERVED_WORDS: Final = frozenset(
-    {
-        "abstract",
-        "as",
-        "base",
-        "bool",
-        "break",
-        "byte",
-        "case",
-        "catch",
-        "char",
-        "checked",
-        "class",
-        "const",
-        "continue",
-        "decimal",
-        "default",
-        "delegate",
-        "do",
-        "double",
-        "else",
-        "enum",
-        "event",
-        "explicit",
-        "extern",
-        "false",
-        "finally",
-        "fixed",
-        "float",
-        "for",
-        "foreach",
-        "goto",
-        "if",
-        "implicit",
-        "in",
-        "int",
-        "interface",
-        "internal",
-        "is",
-        "lock",
-        "long",
-        "namespace",
-        "new",
-        "null",
-        "object",
-        "operator",
-        "out",
-        "override",
-        "params",
-        "private",
-        "protected",
-        "public",
-        "readonly",
-        "ref",
-        "return",
-        "sbyte",
-        "sealed",
-        "short",
-        "sizeof",
-        "stackalloc",
-        "static",
-        "string",
-        "struct",
-        "switch",
-        "this",
-        "throw",
-        "true",
-        "try",
-        "typeof",
-        "uint",
-        "ulong",
-        "unchecked",
-        "unsafe",
-        "ushort",
-        "using",
-        "virtual",
-        "void",
-        "volatile",
-        "while",
-    }
-)
-
 
 def validate_patch_request(operation: RefactorOperation, context_lines: int) -> None:
     """Reject unsupported patch requests before repository preparation begins."""
@@ -400,35 +129,6 @@ def validate_patch_request(operation: RefactorOperation, context_lines: int) -> 
             ErrorCode.INVALID_FILTER,
             f"context_lines must be between {MIN_CONTEXT_LINES} and {MAX_CONTEXT_LINES}",
         )
-
-
-class _ModuleIndex(NamedTuple):
-    """Path arithmetic over one query's snapshot, precomputed instead of rescanned.
-
-    The lookups the language resolvers need repeatedly:
-    `directories_by_suffix` maps an import path's segment tuple to every known
-    directory whose trailing segments equal it (module-prefix agnostic -- the
-    shape Go package imports resolve against without reading go.mod),
-    `files_by_directory` lists the files indexed directly inside each such
-    directory (Go packages span files, so one directory is many candidates),
-    and `receiver_names` maps `(file_id, enclosing qualified symbol)` to its
-    first parameter name for method declarations only (Go methods put their
-    receiver there; a plain function's first parameter is not a receiver),
-    which powers the Go receiver-name rule. `rust_crate_roots` maps every
-    Rust directory to the nearest ancestor containing a `lib.rs`/`main.rs`,
-    which anchors `crate::` paths without reading Cargo.toml. Python and
-    JavaScript resolution ignore the index entirely; only callers whose
-    language has a directory-suffix or receiver rule consult it.
-    """
-
-    directories_by_suffix: dict[tuple[str, ...], tuple[str, ...]]
-    files_by_directory: dict[str, tuple[str, ...]]
-    java_files_by_directory: dict[str, tuple[str, ...]]
-    namespace_by_path: dict[str, str]
-    files_by_namespace: dict[str, tuple[str, ...]]
-    names_by_namespace: dict[str, frozenset[str]]
-    receiver_names: dict[tuple[str, str], str]
-    rust_crate_roots: dict[str, str]
 
 
 class _ReferenceContext(NamedTuple):
@@ -2061,26 +1761,8 @@ class ReferenceService:
         name = operation.new_name
         if name == selected.symbol:
             raise CodeIndexingError(ErrorCode.INVALID_REFACTOR, "Rename must change the name")
-        if selected.language == "python":
-            valid_identifier = name.isidentifier() and not keyword_module.iskeyword(name)
-        elif selected.language in {"javascript", "typescript", "tsx"}:
-            valid_identifier = name.replace("$", "_").isidentifier() and (
-                name not in _ECMASCRIPT_RESERVED_WORDS
-            )
-        elif selected.language == "go":
-            valid_identifier = name.isidentifier() and name not in _GO_RESERVED_WORDS
-        elif selected.language == "rust":
-            valid_identifier = name.isidentifier() and name not in _RUST_RESERVED_WORDS
-        elif selected.language == "java":
-            valid_identifier = name.isidentifier() and name not in _JAVA_RESERVED_WORDS
-        elif selected.language == "csharp":
-            body = name[1:] if name.startswith("@") else name
-            valid_identifier = body.isidentifier() and (
-                name.startswith("@") or body not in _CSHARP_RESERVED_WORDS
-            )
-        else:
-            valid_identifier = False
-        if not valid_identifier:
+        rules = LANGUAGE_RULES.get(selected.language, _DEFAULT)
+        if not rules.identifier_valid(name):
             raise CodeIndexingError(
                 ErrorCode.INVALID_REFACTOR,
                 f"Invalid {selected.language} identifier for rename",
@@ -2283,10 +1965,9 @@ class ReferenceService:
         positional_count = int(shape.get("positional_count", 0))
         keywords = set(shape.get("keywords", []))
         new_by_name = {parameter.name: parameter for parameter in operation.parameters}
-        bound_receiver = (
-            selected.language == "python"
-            and selected.kind == "method"
-            and row["receiver_text"] in {"self", "cls"}
+        rules = LANGUAGE_RULES.get(selected.language, _DEFAULT)
+        bound_receiver = bool(
+            selected.kind == "method" and row["receiver_text"] in rules.bound_receivers
         )
         if bound_receiver:
             new_positional = new_positional[1:]
@@ -3238,40 +2919,8 @@ class ReferenceService:
     def _python_package_root(
         directory: PurePosixPath, known_paths: frozenset[str]
     ) -> PurePosixPath:
-        """The directory an absolute import from a file in `directory` resolves against.
-
-        Python resolves an absolute import from whatever is on `sys.path`,
-        which this syntax-only index never sees directly -- but the parent of
-        the topmost directory in `directory`'s unbroken `__init__.py` chain
-        (its own package, and its package's package, ...) is exactly that
-        directory for any regular (non-namespace) package, `src/`-layout
-        included: `mypkg/a.py` with `mypkg/__init__.py` anchors at the
-        project root; `src/mypkg/a.py` with both `src/mypkg/__init__.py` and
-        no `src/__init__.py` anchors at `src`.
-
-        A directory with no `__init__.py` at all -- either a flat top-level
-        layout (nothing to walk) or a PEP 420 namespace package (no marker
-        file exists to find) -- falls back to the project root. That is
-        already correct for the flat case, and merely non-exact rather than
-        wrong for a namespace package nested under a further sub-root: it
-        never fabricates a false candidate, which is the property this
-        function exists to protect (S2).
-        """
-        parts = list(directory.parts)
-        if not parts or str(PurePosixPath(*parts, "__init__.py")) not in known_paths:
-            # `directory` itself is not a package (no `__init__.py` of its
-            # own) -- either there is nothing to walk (a flat top-level
-            # layout) or it is a namespace package, which leaves no marker
-            # file to find its boundary from. Root-anchoring is exactly
-            # right for the flat case and a safe non-fabricating fallback
-            # for the namespace one; it must not become `directory` itself,
-            # or this collapses back to the sibling-anchor bug this whole
-            # function exists to fix.
-            return PurePosixPath()
-        boundary = len(parts)
-        while boundary > 0 and str(PurePosixPath(*parts[:boundary], "__init__.py")) in known_paths:
-            boundary -= 1
-        return PurePosixPath(*parts[:boundary])
+        """The directory an absolute import from a file in `directory` resolves against."""
+        return _python_package_root(directory, known_paths)
 
     @staticmethod
     def _build_module_index(
@@ -3412,155 +3061,8 @@ class ReferenceService:
         path(s) to keep walking a re-export chain).
         """
         source = PurePosixPath(source_path)
-        if language == "go":
-            if module_index is None:
-                return set()
-            segments = tuple(part for part in PurePosixPath(module_path).parts if part != ".")
-            directories = module_index.directories_by_suffix.get(segments, ())
-            candidates: set[PurePosixPath] = set()
-            for directory in directories:
-                for file_path in module_index.files_by_directory.get(directory, ()):
-                    # A Go package spans files: every known sibling `.go` file
-                    # could carry the declaration the import binds.
-                    candidates.add(PurePosixPath(file_path))
-            return candidates
-        if language == "rust":
-            if module_index is None:
-                return set()
-            parts = [part for part in module_path.split("::") if part and part != "."]
-            if not parts:
-                return set()
-            source_directory = str(source.parent)
-            crate_root = module_index.rust_crate_roots.get(source_directory)
-
-            def under(base: str, tail: list[str]) -> set[PurePosixPath]:
-                # `a::b` is `a/b.rs` or `a/b/mod.rs` under its anchor; plain
-                # `mod x;` needs no row because this directory arithmetic
-                # already covers it.
-                if not tail:
-                    return set()
-                module = "/".join(tail)
-                return {
-                    PurePosixPath(f"{base}/{module}.rs"),
-                    PurePosixPath(f"{base}/{module}/mod.rs"),
-                }
-
-            head = parts[0]
-            if head == "crate":
-                # `crate::` anchors at the nearest known crate root; with no
-                # `lib.rs`/`main.rs` in the snapshot the path stays unproven.
-                return under(crate_root, parts[1:]) if crate_root else set()
-            if head in {"self", "super"}:
-                base = PurePosixPath(source_directory)
-                rest = list(parts)
-                while rest and rest[0] in {"self", "super"}:
-                    keyword = rest.pop(0)
-                    if keyword == "super":
-                        if len(base.parts) <= 1:
-                            # `super::` past the project root can never match
-                            # an in-project target.
-                            return set()
-                        base = base.parent
-                return under(str(base), rest)
-            # A plain first segment is edition-ambiguous: 2018 anchors it at
-            # the crate root, 2015 `mod` trees at the current directory.
-            # Both readings are generated; when both are non-empty and
-            # disjoint the binding cannot be proven, and the empty
-            # intersection keeps the classification at `likely` instead of
-            # gambling on either anchor.
-            directory_candidates = under(source_directory, parts)
-            root_candidates = under(crate_root, parts) if crate_root else set()
-            if directory_candidates and root_candidates:
-                return directory_candidates & root_candidates
-            return directory_candidates | root_candidates
-        if language == "java":
-            # `import a.b.C` is pure path arithmetic: a type FQN's package
-            # segments suffix-match known directories (module-prefix agnostic,
-            # exactly like Go) and the final segment names `Stem.java` inside
-            # one of them. On-demand imports never reach this arm -- their
-            # rows carry `imported_name="*"`, which `_import_targets_symbol`
-            # rejects before matching, and the D3 branch uses
-            # `_java_package_files` instead.
-            if module_index is None:
-                return set()
-            segments = tuple(part for part in module_path.split(".") if part and part != ".")
-            if len(segments) < 2:
-                # At least one package segment plus the type stem is needed;
-                # the default package has no directory to suffix-match.
-                return set()
-            package, type_stem = segments[:-1], segments[-1]
-            java_candidates: set[PurePosixPath] = set()
-            for directory in module_index.directories_by_suffix.get(package, ()):
-                candidate = f"{directory}/{type_stem}.java"
-                if candidate in known_paths:
-                    java_candidates.add(PurePosixPath(candidate))
-            return java_candidates
-        if language == "csharp":
-            # Namespaces never map to directories (D2): a csharp module_path
-            # is a declared namespace (`using Demo.Catalog;`) or a type FQN
-            # (`using W = Acme.Gadget;` / `using static Acme.Errors;`),
-            # resolved through the export rows that carry each file's
-            # declared namespace.
-            if module_index is None:
-                return set()
-            namespace_candidates: set[PurePosixPath] = {
-                PurePosixPath(path) for path in module_index.files_by_namespace.get(module_path, ())
-            }
-            parts = [part for part in module_path.split(".") if part]
-            if len(parts) >= 2:
-                namespace = ".".join(parts[:-1])
-                tail = parts[-1]
-                if tail in module_index.names_by_namespace.get(namespace, frozenset()):
-                    namespace_candidates.update(
-                        PurePosixPath(path)
-                        for path in module_index.files_by_namespace.get(namespace, ())
-                    )
-            return namespace_candidates
-        if language == "python":
-            dots = len(module_path) - len(module_path.lstrip("."))
-            suffix = module_path[dots:]
-            stem = PurePosixPath(*suffix.split(".")) if suffix else PurePosixPath()
-            if dots == 0:
-                # An absolute import is resolved from the package root, not
-                # from the importing file's own directory -- see
-                # `_python_package_root` for how that root is found without
-                # filesystem access (a `src/` layout or another package
-                # sub-root is common, so it is not always the project root).
-                # Blindly anchoring at `source.parent` would let a sibling
-                # file bind falsely (e.g. `mypkg/utils.py` for `from utils
-                # import f` when the real target is the top-level
-                # `utils.py`), which is exactly why this cannot simply walk
-                # every ancestor as an equally-plausible candidate.
-                base = ReferenceService._python_package_root(source.parent, known_paths)
-            else:
-                base = source.parent
-                for _ in range(dots - 1):
-                    base = base.parent
-            return {base / f"{stem}.py", base / stem / "__init__.py"}
-        if not module_path.startswith("."):
-            return set()
-        # Walk `module_path`'s segments against an explicit stack instead of
-        # simply appending them to `source.parent`: a `..` segment must pop
-        # the last resolved directory, not survive as a literal path
-        # component (`PurePosixPath` never resolves `..` on its own, so
-        # `src/app/../utils` never string-equals `src/utils`). A `..` with
-        # nothing left to pop would escape the project root, which no
-        # in-project target can ever match, so that yields no candidates.
-        parts = list(source.parent.parts)
-        for part in PurePosixPath(module_path).parts:
-            if part == ".":
-                continue
-            if part == "..":
-                if not parts:
-                    return set()
-                parts.pop()
-                continue
-            parts.append(part)
-        normalized = PurePosixPath(*parts)
-        extensions = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")
-        candidates = {PurePosixPath(f"{normalized}{extension}") for extension in extensions}
-        candidates.update(normalized / f"index{extension}" for extension in extensions)
-        return candidates
+        rules = LANGUAGE_RULES.get(language, _DEFAULT)
+        return rules.import_candidates(source, module_path, known_paths, module_index)
 
     @staticmethod
     def _module_matches(

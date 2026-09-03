@@ -30,6 +30,7 @@ from tree_sitter import Language, Node, Parser, Query, QueryCursor
 from tree_sitter import Query as StructuralQuery
 from tree_sitter_language_pack import DownloadError, get_language
 
+from .language_rules import _DEFAULT, LANGUAGE_RULES
 from .models import (
     CallShape,
     ExtractedChunk,
@@ -59,9 +60,7 @@ _CONTAINER_KINDS: Final = frozenset(
 )
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 _QUOTE_CHARACTERS: Final = ("'", '"')
-STRUCTURAL_LANGUAGES: Final = frozenset(
-    {"python", "javascript", "typescript", "tsx", "go", "rust", "java", "csharp"}
-)
+STRUCTURAL_LANGUAGES: Final = frozenset(LANGUAGE_RULES)
 # Per-language handler for the non-`reference.identifier` captures of that
 # language's structural query. Both handlers share one signature
 # `(node, source, add_reference)` and re-dispatch on `node.type`, so a new
@@ -421,6 +420,7 @@ class TreeSitterExtractor:
         language: str, node: Node, source: bytes, add_reference: _ReferenceAdder
     ) -> None:
         """Record identifier values while excluding bindings and richer structural uses."""
+        rules = LANGUAGE_RULES.get(language, _DEFAULT)
 
         def contains(outer: Node | None) -> bool:
             return bool(
@@ -431,41 +431,31 @@ class TreeSitterExtractor:
 
         current = node
         while (parent := current.parent) is not None:
-            if parent.type in {
-                "import_statement",
-                "import_from_statement",
-                "export_clause",
-                "namespace_export",
-                "decorator",
-                "type",
-                "type_annotation",
-                "generic_type",
-                "class_heritage",
-                "extends_type_clause",
-                # Rust `use` trees bind spellings; the import rows own them.
-                "use_declaration",
-                "use_as_clause",
-                "scoped_use_list",
-                "use_list",
-                "use_wildcard",
-                # `&self`/`&mut self` receivers are not reads of a `self`
-                # symbol (method-body `self` reads ride field expressions).
-                "self_parameter",
-                # Java import/package paths and annotation names are owned by
-                # the import and decorator rows; nothing under them is a read.
-                "import_declaration",
-                "package_declaration",
-                "marker_annotation",
-                "annotation",
-            }:
-                return
-            if language == "csharp" and parent.type in {
-                # C# using directives and attributes: the import and
-                # decorator rows own their namespells. (`attribute` exists in
-                # Python too, as a member access -- never blanket-cut there.)
-                "using_directive",
-                "attribute",
-            }:
+            if (
+                parent.type
+                in {
+                    "import_statement",
+                    "import_from_statement",
+                    "export_clause",
+                    "namespace_export",
+                    "decorator",
+                    "type",
+                    "type_annotation",
+                    "generic_type",
+                    "class_heritage",
+                    "extends_type_clause",
+                    # Rust `use` trees bind spellings; the import rows own them.
+                    "use_declaration",
+                    "use_as_clause",
+                    "scoped_use_list",
+                    "use_list",
+                    "use_wildcard",
+                    # `&self`/`&mut self` receivers are not reads of a `self`
+                    # symbol (method-body `self` reads ride field expressions).
+                    "self_parameter",
+                }
+                or parent.type in rules.import_owner_parents
+            ):
                 return
             if parent.type in {
                 "parameters",
@@ -494,7 +484,7 @@ class TreeSitterExtractor:
                     return
             excluded_fields: tuple[str, ...] = ()
             if (
-                language == "csharp"
+                rules.method_name_field_excluded
                 and current is node
                 and parent.type == "method_declaration"
                 and parent.child_by_field_name("name") != node
@@ -591,90 +581,20 @@ class TreeSitterExtractor:
                 # binding; the optional `: Type` annotation is the handler's
                 # `type_use` and the value stays a plain read.
                 excluded_fields = ("pattern",)
-            elif language == "java" and parent.type in {
-                "record_declaration",
-                "enum_declaration",
-                "annotation_type_declaration",
-                "constructor_declaration",
-                "compact_constructor_declaration",
-                "annotation_type_element_declaration",
-                "enum_constant",
-                "local_variable_declaration",
-                "constant_declaration",
-            }:
-                # Java named owners: the declaration's own name is a binding
-                # and its `type` field (a return type, a field/variable type)
-                # is owned by the handler's `type_use` row, mirroring the
-                # Python/JS/Go owners in the branch above.
+            elif parent.type in rules.name_and_type_parents:
                 excluded_fields = ("name", "type")
-            elif language == "java" and parent.type in {
-                "method_invocation",
-                "field_access",
-                "catch_formal_parameter",
-                # `if (x instanceof Widget w)` binds `w` through `name`; the
-                # instanceof type stays a plain read (no handler row owns it).
-                "instanceof_expression",
-            }:
-                # The invocation/field name is owned by the call/member row
-                # spanning the whole access; a catch or pattern variable is a
-                # fresh binding.
+            elif parent.type in rules.name_and_field_parents:
                 excluded_fields = ("name", "field")
-            elif language == "java" and parent.type == "enhanced_for_statement":
-                # `for (Item item : items)`: the loop variable is a new
-                # binding and the element type is the handler's `type_use`;
-                # the iterated value stays a read.
-                excluded_fields = ("name", "type")
-            elif language == "java" and parent.type == "lambda_expression":
-                # A parenless single-identifier lambda parameter (`x -> x`).
+            elif parent.type in rules.type_only_parents:
+                excluded_fields = ("type",)
+            elif parent.type in rules.parameters_parents:
                 excluded_fields = ("parameters",)
-            elif language == "java" and parent.type == "object_creation_expression":
-                # `new Widget()`: the created type is owned by the
-                # constructor-shaped call row.
-                excluded_fields = ("type",)
-            elif language == "csharp" and parent.type in {
-                "record_declaration",
-                "struct_declaration",
-                "enum_declaration",
-                "constructor_declaration",
-                "property_declaration",
-                "enum_member_declaration",
-                "namespace_declaration",
-                "delegate_declaration",
-                # Field/local/using declarations carry their type on the
-                # `variable_declaration` wrapper the handler owns.
-                "variable_declaration",
-            }:
-                # C# named owners: the declaration's own name is a binding;
-                # the type position is owned by the handler's `type_use` row.
-                excluded_fields = ("name", "type")
-            elif language == "csharp" and parent.type == "catch_declaration":
-                # The caught variable is a fresh binding and the caught type
-                # is the handler's `type_use`.
-                excluded_fields = ("name", "type")
-            elif language == "csharp" and parent.type in {
-                "member_access_expression",
-                # `M(out var x)` binds x through `name`; the `implicit_type`
-                # keyword yields nothing to descend.
-                "declaration_expression",
-            }:
-                # The accessed member is owned by the member/call row that
-                # spans the whole access.
+            elif parent.type in rules.name_only_parents:
                 excluded_fields = ("name",)
-            elif language == "csharp" and parent.type == "method_declaration":
-                # The grammar names no return-type field: the identifier
-                # before the name IS the return type, owned by the handler's
-                # `type_use`; the name itself is a binding. Nothing directly
-                # under the declaration is a read.
-                return
-            elif language == "csharp" and parent.type == "cast_expression":
-                # `(Widget) value`: the cast type is the handler's `type_use`;
-                # the value stays a read.
-                excluded_fields = ("type",)
-            elif language == "csharp" and parent.type == "foreach_statement":
-                # `foreach (Gadget item in items)`: the loop variable is a
-                # new binding and the element type is the handler's
-                # `type_use`; the iterated value stays a read.
+            elif parent.type in rules.left_and_type_parents:
                 excluded_fields = ("left", "type")
+            elif parent.type in rules.function_and_type_parents:
+                excluded_fields = ("function", "type")
             elif parent.type == "scoped_identifier":
                 # Path segments are namespace spellings; the final `name` may
                 # be a real value read (`State::Ready`) and stays eligible.
@@ -709,89 +629,15 @@ class TreeSitterExtractor:
                 excluded_fields = ("attribute", "property")
             elif parent.type in {"call", "call_expression", "new_expression"}:
                 excluded_fields = ("function", "constructor")
-            elif language == "csharp" and parent.type in {
-                "invocation_expression",
-                "object_creation_expression",
-            }:
-                # C#: the invoked function / created type is owned by the
-                # call row spanning it.
-                excluded_fields = ("function", "type")
             elif parent.type == "keyword_argument":
                 excluded_fields = ("name",)
             elif parent.type in {"as_pattern", "catch_clause"}:
                 excluded_fields = ("alias", "parameter")
             elif parent.type == "export_statement":
                 excluded_fields = ("value",)
-            elif language != "python" and parent.type in {
-                "pair",
-                "pair_pattern",
-                # Go composite-literal keys (`Widget{Name: "x"}`) are field
-                # bindings, not reads.
-                "keyed_element",
-            }:
+            elif parent.type in rules.pair_parents:
                 excluded_fields = ("key",)
-            elif (
-                (
-                    language != "python"
-                    and parent.type
-                    in {
-                        # Go/Rust type wrappers: every identifier directly inside one
-                        # is a type position, already emitted as `type_use` by the
-                        # handler -- a parallel plain read would only duplicate it.
-                        # (An array length expression nested deeper is untouched by
-                        # this direct-parent rule.)
-                        "pointer_type",
-                        "slice_type",
-                        "array_type",
-                        "map_type",
-                        "channel_type",
-                        "function_type",
-                        "parenthesized_type",
-                        "qualified_type",
-                        "reference_type",
-                        "tuple_type",
-                        "scoped_type_identifier",
-                        "dynamic_type",
-                        "type_arguments",
-                        "ordered_field_declaration_list",
-                    }
-                )
-                or (
-                    language == "java"
-                    and parent.type
-                    in {
-                        # Java type positions the handler owns: heritage and
-                        # throws lists, catch types, type-parameter bounds,
-                        # and varargs element types -- every identifier
-                        # directly inside one is a type spelling already
-                        # emitted as `type_use`/`inheritance`.
-                        "superclass",
-                        "type_list",
-                        "throws",
-                        "catch_type",
-                        "type_parameter",
-                        "type_bound",
-                        "spread_parameter",
-                    }
-                )
-                or (
-                    language == "csharp"
-                    and parent.type
-                    in {
-                        # C# type positions the handler owns: base lists,
-                        # generic/qualified/nullable/array types, and constraint
-                        # clauses (whose head identifier names the constrained
-                        # type parameter, a binding).
-                        "base_list",
-                        "generic_name",
-                        "qualified_name",
-                        "type_argument_list",
-                        "array_type",
-                        "nullable_type",
-                        "type_parameter_constraints_clause",
-                    }
-                )
-            ):
+            elif parent.type in rules.handler_owned_type_parents:
                 return
             if any(contains(parent.child_by_field_name(field)) for field in excluded_fields):
                 return
@@ -882,6 +728,7 @@ class TreeSitterExtractor:
     def _one_parameter_list(language: str, parameters: Node | None) -> list[ParameterShape]:
         if parameters is None:
             return []
+        rules = LANGUAGE_RULES.get(language, _DEFAULT)
         rows: list[ParameterShape] = []
         positional_only = False
         keyword_only = False
@@ -976,7 +823,7 @@ class TreeSitterExtractor:
                 or child.child_by_field_name("right") is not None
             )
             required = not default and child.type != "optional_parameter"
-            if language != "python" and kind == "variadic":
+            if rules.variadic_is_optional and kind == "variadic":
                 required = False
             rows.append(
                 ParameterShape(
@@ -987,7 +834,7 @@ class TreeSitterExtractor:
                     destructured=destructured,
                 )
             )
-            if language == "python" and child.type == "list_splat_pattern":
+            if child.type == rules.keyword_only_marker:
                 keyword_only = True
         return rows
 
