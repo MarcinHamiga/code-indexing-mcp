@@ -32,6 +32,7 @@ HARNESS_CHOICES = [
     HarnessChoice("claude-desktop", "Claude Desktop"),
     HarnessChoice("opencode", "OpenCode"),
     HarnessChoice("kilocode", "KiloCode"),
+    HarnessChoice("antigravity", "Antigravity 2"),
 ]
 
 
@@ -52,7 +53,8 @@ def parse_harness_selection(selection: str) -> list[str]:
         if slug is None:
             options = ", ".join(choice.slug for choice in HARNESS_CHOICES)
             raise InstallerError(
-                f"Unknown harness {token!r}; choose 1-6, all, or one of: {options}"
+                f"Unknown harness {token!r}; choose 1-{len(HARNESS_CHOICES)}, all, "
+                f"or one of: {options}"
             )
         if slug not in selected:
             selected.append(slug)
@@ -137,6 +139,12 @@ def configuration_path(
             xdg_config / "kilo",
         )
         return _preferred_json_config(directory, "kilo", default_suffix=".jsonc")
+    if slug == "antigravity":
+        # Antigravity 2 keeps its user-wide state under the shared Gemini home.
+        return (
+            _configured_directory(environment, "ANTIGRAVITY_HOME", home / ".gemini" / "config")
+            / "mcp_config.json"
+        )
     raise InstallerError(f"Unknown harness {slug!r}")
 
 
@@ -208,7 +216,7 @@ def configure_harness(
         }
         if merged_env:
             entry["env"] = merged_env
-    elif slug in {"kimi-code", "claude-desktop"}:
+    elif slug in {"kimi-code", "claude-desktop", "antigravity"}:
         object_key = "mcpServers"
         entry = {"command": str(command), "args": ["serve"]}
         if merged_env:
@@ -364,6 +372,11 @@ def skill_directory(
     if slug == "opencode":
         xdg_config = _configured_directory(environment, "XDG_CONFIG_HOME", home / ".config")
         return xdg_config / "opencode" / "skills"
+    if slug == "antigravity":
+        return (
+            _configured_directory(environment, "ANTIGRAVITY_HOME", home / ".gemini" / "config")
+            / "skills"
+        )
     return None
 
 

@@ -109,6 +109,26 @@ def test_configure_harness_opencode_uses_environment_key(tmp_path: Path) -> None
     assert "env" not in entry
 
 
+def test_configure_harness_antigravity_writes_gemini_config(tmp_path: Path) -> None:
+    configure_harness(
+        "antigravity",
+        Path(SERVER_COMMAND),
+        env={"CODE_INDEXING_OFFLINE": "1"},
+        environment={"ANTIGRAVITY_HOME": str(tmp_path)},
+    )
+    entry = json.loads((tmp_path / "mcp_config.json").read_text())["mcpServers"][
+        "code-indexing-mcp"
+    ]
+    assert entry == {
+        "command": SERVER_COMMAND,
+        "args": ["serve"],
+        "env": {"CODE_INDEXING_OFFLINE": "1"},
+    }
+    reread = read_server_entry("antigravity", environment={"ANTIGRAVITY_HOME": str(tmp_path)})
+    assert reread is not None
+    assert env_from_entry("antigravity", reread) == {"CODE_INDEXING_OFFLINE": "1"}
+
+
 def test_configure_harness_codex_writes_toml_env_table(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     configure_harness(

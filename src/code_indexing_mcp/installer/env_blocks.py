@@ -22,6 +22,7 @@ ENV_KEYS: dict[str, str] = {
     "claude-desktop": "env",
     "opencode": "environment",
     "kilocode": "environment",
+    "antigravity": "env",
 }
 
 OBJECT_KEYS: dict[str, str] = {
@@ -30,6 +31,7 @@ OBJECT_KEYS: dict[str, str] = {
     "claude-desktop": "mcpServers",
     "opencode": "mcp",
     "kilocode": "mcp",
+    "antigravity": "mcpServers",
 }
 
 

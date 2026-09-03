@@ -255,6 +255,7 @@ def test_harness_menu_combines_codex_cli_and_desktop() -> None:
         ("claude-desktop", "Claude Desktop"),
         ("opencode", "OpenCode"),
         ("kilocode", "KiloCode"),
+        ("antigravity", "Antigravity 2"),
     ]
 
 
@@ -268,13 +269,14 @@ def test_harness_selection_accepts_numbers_slugs_duplicates_and_all() -> None:
     assert parse_harness_selection("all") == [choice.slug for choice in HARNESS_CHOICES]
     assert parse_harness_selection("") == []
     with pytest.raises(InstallerError, match="Unknown harness"):
-        parse_harness_selection("7")
+        parse_harness_selection("8")
 
 
 def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None:
     environment = {
         "CODEX_HOME": str(tmp_path / "codex-home"),
         "KIMI_CODE_HOME": str(tmp_path / "kimi-home"),
+        "ANTIGRAVITY_HOME": str(tmp_path / "antigravity-home"),
         "OPENCODE_CONFIG": str(tmp_path / "custom-opencode.jsonc"),
         "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
         "APPDATA": str(tmp_path / "appdata"),
@@ -289,6 +291,12 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
             "kimi-code", home=tmp_path, environment=environment, platform_name="darwin"
         )
         == tmp_path / "kimi-home" / "mcp.json"
+    )
+    assert (
+        configuration_path(
+            "antigravity", home=tmp_path, environment=environment, platform_name="darwin"
+        )
+        == tmp_path / "antigravity-home" / "mcp_config.json"
     )
     assert (
         configuration_path(
@@ -372,6 +380,12 @@ def test_kilocode_honors_config_directory_override(tmp_path: Path) -> None:
             "kimi-code",
             "mcpServers",
             ".kimi-code/mcp.json",
+            {"command": SERVER_COMMAND, "args": ["serve"]},
+        ),
+        (
+            "antigravity",
+            "mcpServers",
+            ".gemini/config/mcp_config.json",
             {"command": SERVER_COMMAND, "args": ["serve"]},
         ),
         (
@@ -821,6 +835,10 @@ def test_skill_directories_cover_supported_harnesses(tmp_path: Path) -> None:
             "opencode", home=tmp_path, environment={"XDG_CONFIG_HOME": str(tmp_path / "xdg")}
         )
         == tmp_path / "xdg" / "opencode" / "skills"
+    )
+    assert (
+        skill_directory("antigravity", home=tmp_path, environment={})
+        == tmp_path / ".gemini" / "config" / "skills"
     )
     assert skill_directory("claude-desktop", home=tmp_path, environment={}) is None
     assert skill_directory("kilocode", home=tmp_path, environment={}) is None

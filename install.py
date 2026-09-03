@@ -194,7 +194,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--harnesses",
         help=(
             "comma-separated harness numbers/slugs or 'all'; omit for the interactive menu "
-            "(codex, claude-code, kimi-code, claude-desktop, opencode, kilocode)"
+            "(codex, claude-code, kimi-code, claude-desktop, opencode, kilocode, antigravity)"
         ),
     )
     parser.add_argument(

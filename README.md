@@ -49,7 +49,8 @@ screen runs everything. Settings you change are written into each client's MCP c
 default is not written anywhere.
 
 The supported clients are Codex (CLI + Desktop, one shared configuration), Claude Code,
-Kimi Code, Claude Desktop, OpenCode, and KiloCode. Configuration changes are limited to the
+Kimi Code, Claude Desktop, OpenCode, KiloCode, and Antigravity 2. Configuration changes are
+limited to the
 `code-indexing-mcp` entry; an existing configuration is backed up alongside the original
 with a `.bak` suffix before it changes, and unrelated keys in the entry's env block are
 preserved. That `.bak` is the file as *you* wrote it and is never overwritten — later
@@ -215,7 +216,7 @@ confirmation prompt is not a safety net for a recursive delete you cannot undo.
 ### Bundled skills
 
 The installer also symlinks five agent skills into skill-capable harnesses
-(Claude Code, Kimi Code, Codex, OpenCode), pointing into the cloned repo so
+(Claude Code, Kimi Code, Codex, OpenCode, Antigravity 2), pointing into the cloned repo so
 they update on every re-install: `codebase-exploration` (index-first
 navigation), `cross-repo-debugging` (evidence-driven debugging across related
 repositories), `feature-dev` (index-grounded feature workflow), `indexed-review`
