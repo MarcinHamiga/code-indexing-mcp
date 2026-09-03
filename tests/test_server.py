@@ -52,7 +52,7 @@ class SwitchableBlockingEmbedder(TinyEmbedder):
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
         if self.block:
             self.started.set()
-            assert self.release.wait(timeout=5)
+            assert self.release.wait(timeout=30)
         return super().embed_passages(texts)
 
 

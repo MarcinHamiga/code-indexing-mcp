@@ -1165,6 +1165,13 @@ uv run --extra mlx pytest tests/test_mlx_backend.py
 
 The project intentionally excludes HTTP transports and custom embedding profiles.
 
+### Adding a structural language
+
+Supporting a new language for structural references and refactoring requires:
+1. One row in `src/code_indexing_mcp/language_rules.py` (`LANGUAGE_RULES`), configuring node-type sets, reserved words, identifier validation, and import candidate resolution.
+2. One handler entry in `_STRUCTURAL_RECORD_HANDLERS` in `src/code_indexing_mcp/extractor.py` pointing to the language's structural record extractor method, paired with its Tree-sitter reference query in `src/code_indexing_mcp/reference_queries/<language>.scm` (and definition query in `src/code_indexing_mcp/queries/<language>.scm` if not already present).
+3. Representative test cases in `tests/test_language_rules.py`, `tests/test_extractor_equivalence.py`, `tests/test_references.py`, and `tests/test_refactors.py`.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
