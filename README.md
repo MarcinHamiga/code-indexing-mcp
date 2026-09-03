@@ -70,8 +70,8 @@ current configuration. Naming what to change applies it directly instead:
 Your MCP clients launch the server by absolute path and never need it on PATH, so the
 installer adds a launcher for you: a symlink at `~/.local/bin/code-indexing-mcp` (a `.cmd`
 shim on Windows) pointing at the executable inside the installation's virtual environment.
-That is what makes `configure`, `index`, `status`, `projects`, `model`, and `daemon` work
-from any shell.
+That is what makes `configure`, `init`, `index`, `status`, `history`, `scan`, `storage`,
+`projects`, `model`, `benchmark`, and `daemon` work from any shell.
 
 If that directory is not already on your `PATH`, the wizard offers — checked by default — to
 add it to your shell profile (`~/.zshrc`, `~/.bashrc` and `~/.bash_profile` on macOS,
@@ -268,7 +268,7 @@ A generic MCP client configuration looks like this:
 }
 ```
 
-The server exposes seventeen tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
+The server exposes eighteen tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
 so hosts may auto-approve them. The other query tools are not: on a root the server has not seen
 before they register it first, which writes a `.ci-mcp/project.toml` marker, and the four code
 queries also build its initial index. `remove_project` is annotated `destructiveHint`;
@@ -281,6 +281,10 @@ overwrite a marker and orphan the previous index.
 | `index_project` | write | Incrementally scan, parse, embed, and commit changed files. |
 | `remove_project` | destructive | Delete a registration and its whole index partition. |
 | `project_status` | read, registers | Index state plus file and chunk counts. |
+| `index_history` | read, registers | One page of a project's durable indexing history (runs, triggers, timings, counts, skip reasons). |
+| `inspect_scan` | read, registers | Stat-only dry-run scan of candidate files and skip reasons without embedding or writing. |
+| `index_storage_status` | read, registers | Storage statistics, retained slot details, and advisory warnings for overlapping roots or worktrees. |
+| `index_storage_maintenance` | read, registers | Compact tables and remove verified old Lance versions (dry-run by default; explicit `dry_run=false` cleans up). |
 | `list_projects` | read only | Every registered project, sorted by name. |
 | `search_code` | read, registers and indexes | Hybrid semantic and keyword search returning ranked snippets. |
 | `search_across_projects` | read, registers and indexes | Globally ranked search across at least two explicitly selected projects. |
@@ -369,6 +373,10 @@ cd /path/to/project
 uv run --project /path/to/code-indexing-mcp code-indexing-mcp init
 uv run --project /path/to/code-indexing-mcp code-indexing-mcp index
 uv run --project /path/to/code-indexing-mcp code-indexing-mcp status
+uv run --project /path/to/code-indexing-mcp code-indexing-mcp history
+uv run --project /path/to/code-indexing-mcp code-indexing-mcp scan --outcome skipped
+uv run --project /path/to/code-indexing-mcp code-indexing-mcp storage status
+uv run --project /path/to/code-indexing-mcp code-indexing-mcp storage vacuum --execute
 ```
 
 `index` reports live progress — the phase, how many files it has walked against the previous run's
@@ -376,6 +384,11 @@ count, and how many chunks it has embedded — on stderr, as a status line on a 
 periodic lines when redirected. The JSON report stays alone on stdout, so piping is unaffected. The
 same numbers reach an MCP client as tool progress notifications, whether the work runs in this
 process or in the shared daemon.
+
+History, scan dry-runs, and storage maintenance are also accessible from the CLI: `history` pages
+through durable indexing run records, `scan` inspects what would be indexed or skipped without
+touching storage, `storage status` reports logical/physical bytes and slot states, and `storage vacuum`
+estimates or (`--execute`) executes table compaction and version pruning.
 
 Benchmark the CPU indexing pipeline with a generated, deterministic corpus:
 
@@ -388,6 +401,17 @@ The command writes one JSON document to stdout with `cold_start`, `warm_index`,
 `incremental_index`, and `forced_reindex` results, including phase timings, peak memory, and
 chunks per second. It reuses the configured model cache but isolates index data in a temporary
 workspace. Pass `--work-dir /fresh/path` to retain the corpus and index for inspection.
+
+Benchmark hybrid search across multiple project scopes:
+
+```bash
+uv run --project /path/to/code-indexing-mcp code-indexing-mcp benchmark search \
+  --projects 50 --iterations 3
+```
+
+The command generates synthetic repositories and measures end-to-end hybrid-search latencies,
+result counts, and deterministic global ordering across 1-, 8-, and 50-project scopes. Pass
+`--work-dir /fresh/path` to retain the corpora for inspection.
 
 Compare vector-storage precisions on a deterministic, judged retrieval corpus:
 
@@ -414,7 +438,10 @@ with settings that keep recall@10 at 0.999.
 Initialization creates `.ci-mcp/project.toml` and a self-ignoring `.ci-mcp/.gitignore`. The
 marker carries the project's shared UUID and scanning configuration. It is not intended to be
 committed. Markers created by earlier releases under `.code-indexing-mcp` remain readable, but all new
-markers use `.ci-mcp`.
+markers use `.ci-mcp`. To prevent indexing the same sources twice under separate project IDs,
+initialization rejects registering a directory whose root equals, contains, or is nested inside
+the root of an already registered project unless `--allow-overlap` (or `allow_overlap=true` in `init_project`)
+is explicitly set.
 
 Git worktrees are first-class. A worktree of an already-registered repository joins that
 repository's registration instead of forming a new project: its marker reuses the shared id,
@@ -505,13 +532,12 @@ TypeScript, and the two Godot data formats are one language.
 | SQL        | `.sql`                         | `sql`             | tables, views, materialized views, indexes, functions, triggers, types |
 | YAML       | `.yaml`, `.yml`                | `yaml`            | collection-valued keys, qualified by their path               |
 | JSON       | `.json`                        | `json`            | collection-valued keys, qualified by their path               |
-
-| Go         | .go                           | go                | types, functions, methods, constants                          |
-| Terraform  | .tf, .tfvars                  | terraform         | variable and resource blocks                                  |
-| Rust       | .rs                           | rust              | structs, enums, functions, constants                          |
-| C          | .c, .h                        | c                 | preprocessor constants, structs, functions                    |
-| C++        | .cc, .cpp, .cxx, .hh, .hpp, .hxx | cpp            | classes, methods, functions                                  |
-| Lua        | .lua                          | lua               | functions                                                     |
+| Go         | `.go`                          | `go`              | types, functions, methods, constants                          |
+| Terraform  | `.tf`, `.tfvars`               | `terraform`       | variable and resource blocks                                  |
+| Rust       | `.rs`                          | `rust`            | structs, enums, functions, constants                          |
+| C          | `.c`, `.h`                     | `c`               | preprocessor constants, structs, functions                    |
+| C++        | `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, `.hxx` | `cpp` | classes, methods, functions                                  |
+| Lua        | `.lua`                         | `lua`             | functions                                                     |
 
 Nested declarations are qualified by their enclosing scope in every language, so a C# method
 indexes as `Outer.Inner.Work` and a Compose service port list as `services.web.ports`.
@@ -541,7 +567,8 @@ Existing project markers whose `scan.include` still holds an older default list 
 current one at runtime, so a project created before a language was supported picks it up without
 being re-initialized. A customized `scan.include` list is never rewritten — add the patterns you
 want (`**/*.cs`, `**/*.gd`, `**/*.gdshader`, `**/*.tscn`, `**/*.tres`, `**/*.sql`, `**/*.yaml`,
-`**/*.yml`, `**/*.json`) explicitly.
+`**/*.yml`, `**/*.json`, `**/*.go`, `**/*.tf`, `**/*.tfvars`, `**/*.rs`, `**/*.c`, `**/*.h`,
+`**/*.cc`, `**/*.cpp`, `**/*.cxx`, `**/*.hh`, `**/*.hpp`, `**/*.hxx`, `**/*.lua`) explicitly.
 
 ## Branch-aware indexing
 
@@ -602,11 +629,12 @@ Retained slots are bounded by least-recently-used eviction:
 export CODE_INDEXING_BRANCH_CACHE_LIMIT=4   # per project, 1–32; counts the active slot
 ```
 
-Eviction runs during storage maintenance (the scheduled daily pass or an explicit
-`index_storage_maintenance`), ordered by last use. It never removes the active slot, a slot being
-indexed, or a slot with pending crash recovery, so the durable slot count can temporarily exceed
-the limit — a failed first build does not destroy a usable cached slot. `remove_project` deletes
-every slot, partition, and pointer of the project while leaving the local marker.
+Eviction runs during storage maintenance (the scheduled daily pass, an explicit
+`index_storage_maintenance`, or `code-indexing-mcp storage vacuum --execute`), ordered by last use.
+It never removes the active slot, a slot being indexed, or a slot with pending crash recovery, so the
+durable slot count can temporarily exceed the limit — a failed first build does not destroy a usable
+cached slot. `remove_project` deletes every slot, partition, and pointer of the project while leaving
+the local marker.
 
 An installation from before branch awareness migrates conservatively: a non-Git registration
 adopts its existing partition as the workspace slot and keeps working without a rebuild, while a
@@ -718,7 +746,10 @@ export CODE_INDEXING_EMBED_MAX_TOKENS=1024
 export CODE_INDEXING_EMBED_OVERLAP_TOKENS=64
 export CODE_INDEXING_EMBED_THREADS=2
 export CODE_INDEXING_EMBED_CPU_ARENA=0
-export CODE_INDEXING_VECTOR_INDEX=exact
+export CODE_INDEXING_VECTOR_INDEX=exact     # exact, or hnsw
+export CODE_INDEXING_VECTOR_STORAGE=float16 # float16, or float32
+export CODE_INDEXING_AUTO_MAINTENANCE=1     # 0 disables scheduled daily compaction and version cleanup
+export CODE_INDEXING_VERSION_RETENTION_HOURS=24 # keep old Lance versions for 24h before verified cleanup (min: 1)
 ```
 
 The ceiling covers indexing memory: the embedding worker plus any growth in the host process while
@@ -1132,8 +1163,7 @@ same graph:
 uv run --extra mlx pytest tests/test_mlx_backend.py
 ```
 
-The project intentionally excludes HTTP transports, dependency/call graphs, cross-reference
-resolution, and custom embedding profiles.
+The project intentionally excludes HTTP transports and custom embedding profiles.
 
 ## License
 
