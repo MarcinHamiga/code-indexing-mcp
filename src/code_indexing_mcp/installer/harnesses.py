@@ -33,6 +33,7 @@ HARNESS_CHOICES = [
     HarnessChoice("opencode", "OpenCode"),
     HarnessChoice("kilocode", "KiloCode"),
     HarnessChoice("antigravity", "Antigravity 2"),
+    HarnessChoice("antigravity-cli", "Antigravity CLI"),
 ]
 
 
@@ -145,6 +146,12 @@ def configuration_path(
             _configured_directory(environment, "ANTIGRAVITY_HOME", home / ".gemini" / "config")
             / "mcp_config.json"
         )
+    if slug == "antigravity-cli":
+        configured = environment.get("ANTIGRAVITY_CLI_HOME") or environment.get("AGY_HOME")
+        directory = (
+            Path(configured).expanduser() if configured else home / ".gemini" / "antigravity-cli"
+        )
+        return directory / "mcp_config.json"
     raise InstallerError(f"Unknown harness {slug!r}")
 
 
@@ -216,7 +223,7 @@ def configure_harness(
         }
         if merged_env:
             entry["env"] = merged_env
-    elif slug in {"kimi-code", "claude-desktop", "antigravity"}:
+    elif slug in {"kimi-code", "claude-desktop", "antigravity", "antigravity-cli"}:
         object_key = "mcpServers"
         entry = {"command": str(command), "args": ["serve"]}
         if merged_env:
@@ -377,6 +384,12 @@ def skill_directory(
             _configured_directory(environment, "ANTIGRAVITY_HOME", home / ".gemini" / "config")
             / "skills"
         )
+    if slug == "antigravity-cli":
+        configured = environment.get("ANTIGRAVITY_CLI_HOME") or environment.get("AGY_HOME")
+        directory = (
+            Path(configured).expanduser() if configured else home / ".gemini" / "antigravity-cli"
+        )
+        return directory / "skills"
     return None
 
 

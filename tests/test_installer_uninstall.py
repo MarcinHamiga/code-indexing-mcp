@@ -34,7 +34,16 @@ def _checkout(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    "slug", ["kimi-code", "claude-code", "opencode", "kilocode", "codex", "antigravity"]
+    "slug",
+    [
+        "kimi-code",
+        "claude-code",
+        "opencode",
+        "kilocode",
+        "codex",
+        "antigravity",
+        "antigravity-cli",
+    ],
 )
 def test_configure_then_deconfigure_restores_the_original_file(tmp_path: Path, slug: str) -> None:
     """The strongest statement available: byte-identical, comments included."""
