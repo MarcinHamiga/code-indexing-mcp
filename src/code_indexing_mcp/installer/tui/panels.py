@@ -648,7 +648,12 @@ def _next_step_lines(result: InstallResult | None) -> list[str]:
     """
 
     reconfigure = "Reconfigure later with: code-indexing-mcp configure"
-    explore = "Explore indexed code interactively with: syndex"
+    tui_cmd = (
+        "syndex"
+        if result and result.tui_launcher and result.tui_launcher.ok
+        else "code-indexing-mcp tui"
+    )
+    explore = f"Explore indexed code interactively with: {tui_cmd}"
     if result is None or result.launcher is None or not result.launcher.ok:
         return [
             "Reconfigure later with:",

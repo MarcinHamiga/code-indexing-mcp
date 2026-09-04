@@ -181,6 +181,16 @@ def install_launcher(
             "failed",
             f"no server executable at {executable}",
         )
+    if (
+        command != LAUNCHER_NAME
+        and (target.exists() or target.is_symlink())
+        and not _removable_launcher(target, install_directory, platform_name, command=command)
+    ):
+        return LauncherResult(
+            target,
+            "skipped",
+            f"an existing executable at {target} is not owned by this installation",
+        )
     try:
         if platform_name.startswith("win"):
             return _install_shim(executable, target)

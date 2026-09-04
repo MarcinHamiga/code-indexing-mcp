@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import sys
 from collections.abc import Sequence
 
@@ -24,13 +23,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Lazily import Textual and TUI components so standard CLI / MCP server
     # never pay for Textual import overhead.
+    from ..errors import CodeIndexingError
     from .app import CodeIndexingApp
     from .service import create_tui_service
 
     service = create_tui_service()
     if args.project:
-        with contextlib.suppress(Exception):
+        try:
             service.select_project(args.project)
+        except CodeIndexingError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
 
     app = CodeIndexingApp(service=service)
     result = app.run()
