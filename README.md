@@ -71,7 +71,7 @@ Your MCP clients launch the server by absolute path and never need it on PATH, s
 installer adds two launchers for you in `~/.local/bin` (or your configured bin directory, with `.cmd`
 shims on Windows):
 - `code-indexing-mcp`: The server and administrative CLI. That is what makes `configure`, `init`, `index`, `status`, `history`, `scan`, `storage`, `projects`, `model`, `benchmark`, `daemon`, and `tui` work from any shell.
-- `syndex`: The dedicated interactive Terminal User Interface (TUI) for navigating and inspecting indexed codebases directly from your terminal.
+- `syndex`: The same CLI under a shorter name, defaulting to the interactive Terminal User Interface (TUI) for navigating and inspecting indexed codebases directly from your terminal. Bare `syndex` (or `syndex <project>`) opens the TUI; `syndex <command>` runs any command `code-indexing-mcp` accepts (`syndex status`, `syndex index`, ...).
 
 If that directory is not already on your `PATH`, the wizard offers — checked by default — to
 add it to your shell profile (`~/.zshrc`, `~/.bashrc` and `~/.bash_profile` on macOS,
@@ -376,6 +376,10 @@ syndex
 # or equivalently:
 code-indexing-mcp tui
 ```
+
+`syndex` is the full CLI, not only the TUI: `syndex status`, `syndex index`, and every
+other `code-indexing-mcp` subcommand work the same under either name — run `syndex --help`
+for the complete list.
 
 `syndex` connects directly to your local index data and honors your configured broker, daemon, and storage settings:
 
