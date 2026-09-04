@@ -268,9 +268,9 @@ A generic MCP client configuration looks like this:
 }
 ```
 
-The server exposes eighteen tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
+The server exposes nineteen tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
 so hosts may auto-approve them. The other query tools are not: on a root the server has not seen
-before they register it first, which writes a `.ci-mcp/project.toml` marker, and the four code
+before they register it first, which writes a `.ci-mcp/project.toml` marker, and the five code
 queries also build its initial index. `remove_project` is annotated `destructiveHint`;
 `init_project` carries the same hint and is non-idempotent because `force_new_id=true` can
 overwrite a marker and orphan the previous index.

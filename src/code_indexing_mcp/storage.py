@@ -1957,7 +1957,9 @@ class LanceStore:
         ]
         best_by_chunk: dict[str, dict[str, Any]] = {}
         for vector in vectors:
-            query = tables.chunks.search(vector, vector_column_name="vector", query_type="vector")
+            query = tables.chunks.search(
+                vector, vector_column_name="vector", query_type="vector"
+            ).distance_type("cosine")
             if condition:
                 query = query.where(condition, prefilter=True)
             query = query.limit(limit).select(select_cols)
@@ -1969,7 +1971,7 @@ class LanceStore:
             for row in query_rows:
                 row["project_id"] = project_id
                 cid = row["chunk_id"]
-                distance = float(row.get("_distance", 0.0))
+                distance = float(row["_distance"])
                 score = 1.0 - distance
                 row["_relevance_score"] = score
                 row["score"] = score

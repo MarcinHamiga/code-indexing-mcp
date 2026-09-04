@@ -1439,6 +1439,15 @@ def create_server(
                 )
             ),
         ] = None,
+        language: Annotated[
+            LanguageName | None,
+            Field(
+                description=(
+                    "Language hint for example parsing. Valid only with example; if omitted, "
+                    "language is detected from the snippet syntax."
+                )
+            ),
+        ] = None,
         languages: Annotated[
             list[LanguageName] | None,
             Field(description="Restrict to these languages across the complete selected scope."),
@@ -1471,6 +1480,11 @@ def create_server(
                 ErrorCode.INVALID_FILTER,
                 "search_across_projects requires exactly one of 'query' or 'example'",
             )
+        if query is not None and language is not None:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                "search_across_projects 'language' is valid only with 'example'",
+            )
         roots = await _startup_roots(ctx, discover=True)
         checkouts = await asyncio.to_thread(app.resolve_scope_checkouts, projects, False, roots)
         project_ids = list(dict.fromkeys(project.id for project in checkouts))
@@ -1500,7 +1514,7 @@ def create_server(
             example,
             checkouts,
             roots,
-            None,
+            language,
             languages,
             paths,
             kinds,

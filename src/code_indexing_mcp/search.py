@@ -76,15 +76,16 @@ _DETECTION_ORDER: tuple[str, ...] = (
 
 def detect_example_language(extractor: TreeSitterExtractor, source: str) -> str | None:
     source_bytes = source.encode("utf-8")
+    candidates: list[str] = []
     for language in _DETECTION_ORDER:
         suffix = _EXAMPLE_SUFFIX.get(language, "")
         try:
             result = extractor.extract(Path(f"example{suffix}"), language, source_bytes)
             if not result.has_errors and any(chunk.kind != "module" for chunk in result.chunks):
-                return language
+                candidates.append(language)
         except Exception:
             continue
-    return None
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _example_passages(
@@ -96,10 +97,11 @@ def _example_passages(
         raise CodeIndexingError(
             ErrorCode.INVALID_FILTER, "Example search requires a non-empty code snippet"
         )
-    if len(example) > MAX_EXAMPLE_LENGTH:
+    example_bytes = example.encode("utf-8")
+    if len(example_bytes) > MAX_EXAMPLE_LENGTH:
         raise CodeIndexingError(
             ErrorCode.INVALID_FILTER,
-            f"Example snippet exceeds maximum length of {MAX_EXAMPLE_LENGTH} characters",
+            f"Example snippet exceeds maximum length of {MAX_EXAMPLE_LENGTH} bytes",
         )
     if language is not None:
         if language not in _EXAMPLE_SUFFIX:
@@ -108,7 +110,7 @@ def _example_passages(
                 f"Unsupported language '{language}'",
             )
         suffix = _EXAMPLE_SUFFIX[language]
-        result = extractor.extract(Path(f"example{suffix}"), language, example.encode("utf-8"))
+        result = extractor.extract(Path(f"example{suffix}"), language, example_bytes)
         passages = [
             compose_passage(chunk.embedding_prefix, chunk.content) for chunk in result.chunks
         ]
@@ -119,7 +121,7 @@ def _example_passages(
     detected = detect_example_language(extractor, example)
     if detected is not None:
         suffix = _EXAMPLE_SUFFIX[detected]
-        result = extractor.extract(Path(f"example{suffix}"), detected, example.encode("utf-8"))
+        result = extractor.extract(Path(f"example{suffix}"), detected, example_bytes)
         passages = [
             compose_passage(chunk.embedding_prefix, chunk.content) for chunk in result.chunks
         ]

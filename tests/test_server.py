@@ -552,13 +552,14 @@ async def test_search_across_projects_example_and_mutual_exclusion(tmp_path: Pat
         cross_res = await client.call_tool(
             "search_across_projects",
             {
-                "example": "def shared_feature():\n    return 'x'\n",
+                "example": "function sharedFeature() { return 'x'; }",
+                "language": "javascript",
                 "projects": [alpha.id, beta.id],
             },
         )
         assert not cross_res.isError
         assert cross_res.structuredContent is not None
-        assert cross_res.structuredContent["language"] == "python"
+        assert cross_res.structuredContent["language"] == "javascript"
         hits = cross_res.structuredContent["hits"]
         assert len(hits) == 2
         assert {hit["project_id"] for hit in hits} == {alpha.id, beta.id}
@@ -576,6 +577,22 @@ async def test_search_across_projects_example_and_mutual_exclusion(tmp_path: Pat
             block.text for block in both_res.content if isinstance(block, types.TextContent)
         )
         assert ErrorCode.INVALID_FILTER.value in both_msg
+
+        query_language_res = await client.call_tool(
+            "search_across_projects",
+            {
+                "query": "shared",
+                "language": "python",
+                "projects": [alpha.id, beta.id],
+            },
+        )
+        assert query_language_res.isError
+        query_language_msg = "".join(
+            block.text
+            for block in query_language_res.content
+            if isinstance(block, types.TextContent)
+        )
+        assert ErrorCode.INVALID_FILTER.value in query_language_msg
 
         neither_res = await client.call_tool(
             "search_across_projects",
@@ -1919,6 +1936,7 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
     assert set(cross_project_schema["properties"]) == {
         "query",
         "example",
+        "language",
         "projects",
         "languages",
         "paths",

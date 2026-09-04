@@ -460,12 +460,15 @@ def test_example_passages_python_snippet() -> None:
 def test_detect_example_language() -> None:
     extractor = TreeSitterExtractor()
     assert detect_example_language(extractor, "def foo():\n    return 1\n") == "python"
+    assert detect_example_language(extractor, "func answer() int { return 42 }") == "go"
     assert (
         detect_example_language(
             extractor, "interface UserProfile {\n    id: string;\n    name: string;\n}\n"
         )
-        == "typescript"
+        is None
     )
+    assert detect_example_language(extractor, "function greet() { return 'hello'; }") is None
+    assert detect_example_language(extractor, "int add(int a, int b) { return a + b; }") is None
     assert (
         detect_example_language(extractor, "This is plain prose explaining how something works.")
         is None
@@ -497,6 +500,11 @@ def test_example_passages_validation_errors() -> None:
         _example_passages(extractor, "x" * (MAX_EXAMPLE_LENGTH + 1))
     assert oversized_err.value.code == ErrorCode.INVALID_FILTER
     assert str(MAX_EXAMPLE_LENGTH) in str(oversized_err.value)
+
+    with pytest.raises(CodeIndexingError) as multibyte_err:
+        _example_passages(extractor, "é" * (MAX_EXAMPLE_LENGTH // 2 + 1))
+    assert multibyte_err.value.code == ErrorCode.INVALID_FILTER
+    assert "bytes" in str(multibyte_err.value)
 
     with pytest.raises(CodeIndexingError) as unsupported_err:
         _example_passages(extractor, "some code", language="unsupported_lang")

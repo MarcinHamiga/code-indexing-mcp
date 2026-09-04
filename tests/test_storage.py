@@ -19,7 +19,7 @@ import pytest
 from conftest import run_git
 from lancedb.expr import Expr
 from lancedb.merge import LanceMergeInsertBuilder
-from lancedb.query import LanceHybridQueryBuilder
+from lancedb.query import LanceHybridQueryBuilder, LanceVectorQueryBuilder
 from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
@@ -863,6 +863,27 @@ def test_example_search_nearer_vector_wins_shared_chunk(tmp_path: Path) -> None:
         assert pytest.approx(hit["_relevance_score"], abs=1e-4) == 1.0
     for hit in hits_near_first:
         assert pytest.approx(hit["_relevance_score"], abs=1e-4) == 1.0
+
+    cosine_hits = store.example_search([[1.0, 0.0, 0.0, 1.0]], [project.id], None, 5)
+    for hit in cosine_hits:
+        assert pytest.approx(hit["_relevance_score"], abs=1e-4) == 2**-0.5
+
+
+def test_example_search_requires_distance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    project = _seed_hybrid_target(store, tmp_path / "repo")
+    original = LanceVectorQueryBuilder.to_list
+
+    def without_distance(builder: LanceVectorQueryBuilder) -> list[dict[str, Any]]:
+        rows = original(builder)
+        for row in rows:
+            row.pop("_distance", None)
+        return rows
+
+    monkeypatch.setattr(LanceVectorQueryBuilder, "to_list", without_distance)
+
+    with pytest.raises(KeyError, match="_distance"):
+        store.example_search([[0.0, 0.0, 0.0, 1.0]], [project.id], None, 5)
 
 
 def test_example_search_per_segment_limits_fan_in_and_merge(tmp_path: Path) -> None:
