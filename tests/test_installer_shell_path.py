@@ -62,13 +62,13 @@ def test_tui_launcher_path_is_a_cmd_shim_on_windows(tmp_path: Path) -> None:
         shell_path.launcher_path(
             tmp_path, command=shell_path.TUI_LAUNCHER_NAME, platform_name="linux"
         ).name
-        == "cidx"
+        == "syndex"
     )
     assert (
         shell_path.launcher_path(
             tmp_path, command=shell_path.TUI_LAUNCHER_NAME, platform_name="win32"
         ).name
-        == "cidx.cmd"
+        == "syndex.cmd"
     )
 
 
@@ -207,14 +207,14 @@ def test_install_and_remove_tui_launcher(tmp_path: Path) -> None:
         checkout, bin_directory, command=shell_path.TUI_LAUNCHER_NAME
     )
     assert result.status == "created"
-    assert result.path.name == "cidx"
+    assert result.path.name == "syndex"
     assert result.path.is_symlink()
 
     removed = shell_path.remove_launcher(
         bin_directory, checkout, command=shell_path.TUI_LAUNCHER_NAME
     )
-    assert removed == bin_directory / "cidx"
-    assert not (bin_directory / "cidx").exists()
+    assert removed == bin_directory / "syndex"
+    assert not (bin_directory / "syndex").exists()
 
 
 # --- PATH detection ----------------------------------------------------------
@@ -456,7 +456,7 @@ def test_inspect_reports_the_full_situation(tmp_path: Path) -> None:
     assert state.profiles_current is False
     assert profile in state.profiles
     assert state.launcher == bin_directory / "code-indexing-mcp"
-    assert state.tui_launcher == bin_directory / "cidx"
+    assert state.tui_launcher == bin_directory / "syndex"
 
     shell_path.update_profile(profile, bin_directory, home=tmp_path)
     refreshed = shell_path.inspect(

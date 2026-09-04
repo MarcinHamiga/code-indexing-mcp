@@ -248,11 +248,11 @@ class PathPanel(Vertical):
         yield Static(
             "Your MCP clients launch the server by absolute path and do not need this. "
             "The launchers are for you: `code-indexing-mcp` makes administration work "
-            "from any shell, and `cidx` opens the interactive terminal UI.",
+            "from any shell, and `syndex` opens the interactive terminal UI.",
             classes="help",
         )
         yield Checkbox(
-            "Create the code-indexing-mcp and cidx launchers",
+            "Create the code-indexing-mcp and syndex launchers",
             value=self.state.install_launcher,
             id="path-launcher",
         )
@@ -648,7 +648,7 @@ def _next_step_lines(result: InstallResult | None) -> list[str]:
     """
 
     reconfigure = "Reconfigure later with: code-indexing-mcp configure"
-    explore = "Explore indexed code interactively with: cidx"
+    explore = "Explore indexed code interactively with: syndex"
     if result is None or result.launcher is None or not result.launcher.ok:
         return [
             "Reconfigure later with:",

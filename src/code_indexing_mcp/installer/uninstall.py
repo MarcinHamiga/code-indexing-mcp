@@ -218,7 +218,7 @@ def _remove_launcher(
                     (
                         f"removed {tui_removed}"
                         if tui_removed
-                        else f"no cidx launcher of ours in {bin_directory}"
+                        else f"no syndex launcher of ours in {bin_directory}"
                     ),
                 )
             )

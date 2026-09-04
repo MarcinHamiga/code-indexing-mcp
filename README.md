@@ -65,13 +65,13 @@ does the same thing. To change settings or harnesses without updating, run
 current configuration. Naming what to change applies it directly instead:
 `code-indexing-mcp configure --set CODE_INDEXING_BROKER=off --unset CODE_INDEXING_INDEX_MODE`.
 
-### The `code-indexing-mcp` and `cidx` commands
+### The `code-indexing-mcp` and `syndex` commands
 
 Your MCP clients launch the server by absolute path and never need it on PATH, so the
 installer adds two launchers for you in `~/.local/bin` (or your configured bin directory, with `.cmd`
 shims on Windows):
 - `code-indexing-mcp`: The server and administrative CLI. That is what makes `configure`, `init`, `index`, `status`, `history`, `scan`, `storage`, `projects`, `model`, `benchmark`, `daemon`, and `tui` work from any shell.
-- `cidx`: The dedicated interactive Terminal User Interface (TUI) for navigating and inspecting indexed codebases directly from your terminal.
+- `syndex`: The dedicated interactive Terminal User Interface (TUI) for navigating and inspecting indexed codebases directly from your terminal.
 
 If that directory is not already on your `PATH`, the wizard offers — checked by default — to
 add it to your shell profile (`~/.zshrc`, `~/.bashrc` and `~/.bash_profile` on macOS,
@@ -187,7 +187,7 @@ accelerator and every setting exactly as they are. It changes no choice; it puts
 went missing.
 
 `code-indexing-mcp uninstall` removes what the installer added: the `code-indexing-mcp` entry
-from each configured client, the bundled skill links, both launchers (`code-indexing-mcp` and `cidx`), and the PATH block. It
+from each configured client, the bundled skill links, both launchers (`code-indexing-mcp` and `syndex`), and the PATH block. It
 prints what it will do and asks before doing any of it (`--yes` skips the prompt).
 
 Removal is evidence-based, not name-based. A launcher that does not point into *this*
@@ -372,12 +372,12 @@ silently wrong.
 Code Indexing MCP includes a terminal-native user interface for searching and inspecting codebases directly from your shell without opening an AI assistant or MCP client:
 
 ```bash
-cidx
+syndex
 # or equivalently:
 code-indexing-mcp tui
 ```
 
-`cidx` connects directly to your local index data and honors your configured broker, daemon, and storage settings:
+`syndex` connects directly to your local index data and honors your configured broker, daemon, and storage settings:
 
 - **Project Discovery & Selection**: Automatically discovers the project corresponding to your current working directory, and provides a dropdown to switch across any registered project.
 - **Search Modes**:

@@ -31,7 +31,7 @@ from .config_files import InstallerError, write_changed_configuration
 from .links import backup_path, is_under, link_destination, replace_link
 
 LAUNCHER_NAME = "code-indexing-mcp"
-TUI_LAUNCHER_NAME = "cidx"
+TUI_LAUNCHER_NAME = "syndex"
 
 # The block written into a shell profile. Both markers are matched literally on
 # rewrite and removal, which is what keeps a second install from appending a

@@ -11,7 +11,7 @@ from collections.abc import Sequence
 def main(argv: Sequence[str] | None = None) -> int:
     """Launch the terminal user interface."""
     parser = argparse.ArgumentParser(
-        prog="cidx",
+        prog="syndex",
         description="Terminal user interface for Code Indexing MCP",
     )
     parser.add_argument(

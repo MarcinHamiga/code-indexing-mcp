@@ -204,7 +204,7 @@ async def test_missing_tui_launcher_suggests_repair(
     app = InstallerApp(state)
     async with app.run_test():
         text = str(app.query_one("#welcome-repair", Static).render())
-        assert "cidx" in text
+        assert "syndex" in text
 
 
 @pytest.mark.asyncio
@@ -419,7 +419,7 @@ async def test_summary_lists_the_launcher_and_the_profile_it_will_edit(
         await advance_to(pilot, app, "summary")
         text = str(app.query_one("#summary-body", Static).render())
         assert "code-indexing-mcp" in text
-        assert "cidx" in text
+        assert "syndex" in text
         assert str(profile) in text
 
 
@@ -586,7 +586,7 @@ async def test_done_panel_tells_the_user_how_to_reach_the_new_command(
     from code_indexing_mcp.installer.shell_path import LauncherResult
 
     launcher = LauncherResult(tmp_path / "bin" / "code-indexing-mcp", "created", "points at it")
-    tui_launcher = LauncherResult(tmp_path / "bin" / "cidx", "created", "points at it")
+    tui_launcher = LauncherResult(tmp_path / "bin" / "syndex", "created", "points at it")
     profile = tmp_path / ".zshrc"
     monkeypatch.setattr(
         panels,
@@ -610,7 +610,7 @@ async def test_done_panel_tells_the_user_how_to_reach_the_new_command(
         assert str(launcher.path) in body
         assert str(tui_launcher.path) in body
         assert str(profile) in body
-        assert "cidx" in body
+        assert "syndex" in body
         # The PATH entry is not live in the shell the installer was started from.
         assert "exec" in body
 
