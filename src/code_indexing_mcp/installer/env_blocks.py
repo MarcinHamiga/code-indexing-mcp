@@ -24,6 +24,7 @@ ENV_KEYS: dict[str, str] = {
     "kilocode": "environment",
     "antigravity": "env",
     "antigravity-cli": "env",
+    "muse-code": "env",
 }
 
 OBJECT_KEYS: dict[str, str] = {
@@ -34,6 +35,7 @@ OBJECT_KEYS: dict[str, str] = {
     "kilocode": "mcp",
     "antigravity": "mcpServers",
     "antigravity-cli": "mcpServers",
+    "muse-code": "mcpServers",
 }
 
 

@@ -151,6 +151,27 @@ def test_configure_harness_antigravity_cli_writes_mcp_config(tmp_path: Path) -> 
     assert env_from_entry("antigravity-cli", reread) == {"CODE_INDEXING_OFFLINE": "1"}
 
 
+def test_configure_harness_muse_code_writes_settings_with_schema_version(
+    tmp_path: Path,
+) -> None:
+    configure_harness(
+        "muse-code",
+        Path(SERVER_COMMAND),
+        env={"CODE_INDEXING_OFFLINE": "1"},
+        environment={"XDG_CONFIG_HOME": str(tmp_path)},
+    )
+    parsed = json.loads((tmp_path / "muse" / "settings.json").read_text())
+    assert parsed["schema_version"] == 1
+    assert parsed["mcpServers"]["code-indexing-mcp"] == {
+        "command": SERVER_COMMAND,
+        "args": ["serve"],
+        "env": {"CODE_INDEXING_OFFLINE": "1"},
+    }
+    reread = read_server_entry("muse-code", environment={"XDG_CONFIG_HOME": str(tmp_path)})
+    assert reread is not None
+    assert env_from_entry("muse-code", reread) == {"CODE_INDEXING_OFFLINE": "1"}
+
+
 def test_configure_harness_codex_writes_toml_env_table(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     configure_harness(

@@ -13,6 +13,7 @@ from .config_files import (
     InstallerError,
     merge_codex_server,
     merge_json_object_entry,
+    merge_muse_code_entry,
     remove_codex_server,
     remove_json_object_entry,
 )
@@ -34,6 +35,7 @@ HARNESS_CHOICES = [
     HarnessChoice("kilocode", "KiloCode"),
     HarnessChoice("antigravity", "Antigravity 2"),
     HarnessChoice("antigravity-cli", "Antigravity CLI"),
+    HarnessChoice("muse-code", "Muse Code"),
 ]
 
 
@@ -152,6 +154,9 @@ def configuration_path(
             Path(configured).expanduser() if configured else home / ".gemini" / "antigravity-cli"
         )
         return directory / "mcp_config.json"
+    if slug == "muse-code":
+        directory = _configured_directory(environment, "XDG_CONFIG_HOME", home / ".config")
+        return directory / "muse" / "settings.json"
     raise InstallerError(f"Unknown harness {slug!r}")
 
 
@@ -223,7 +228,7 @@ def configure_harness(
         }
         if merged_env:
             entry["env"] = merged_env
-    elif slug in {"kimi-code", "claude-desktop", "antigravity", "antigravity-cli"}:
+    elif slug in {"kimi-code", "claude-desktop", "antigravity", "antigravity-cli", "muse-code"}:
         object_key = "mcpServers"
         entry = {"command": str(command), "args": ["serve"]}
         if merged_env:
@@ -240,6 +245,11 @@ def configure_harness(
     else:
         raise InstallerError(f"Unknown harness {slug!r}")
 
+    if slug == "muse-code":
+        # Muse Code rejects a settings document without schema_version; the
+        # merge adds it when the file does not already carry one.
+        merge_muse_code_entry(path, SERVER_NAME, entry)
+        return path
     merge_json_object_entry(path, object_key, SERVER_NAME, entry)
     return path
 
@@ -390,6 +400,9 @@ def skill_directory(
             Path(configured).expanduser() if configured else home / ".gemini" / "antigravity-cli"
         )
         return directory / "skills"
+    if slug == "muse-code":
+        xdg_config = _configured_directory(environment, "XDG_CONFIG_HOME", home / ".config")
+        return xdg_config / "muse" / "skills"
     return None
 
 

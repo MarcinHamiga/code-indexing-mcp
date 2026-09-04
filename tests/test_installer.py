@@ -257,6 +257,7 @@ def test_harness_menu_combines_codex_cli_and_desktop() -> None:
         ("kilocode", "KiloCode"),
         ("antigravity", "Antigravity 2"),
         ("antigravity-cli", "Antigravity CLI"),
+        ("muse-code", "Muse Code"),
     ]
 
 
@@ -270,7 +271,7 @@ def test_harness_selection_accepts_numbers_slugs_duplicates_and_all() -> None:
     assert parse_harness_selection("all") == [choice.slug for choice in HARNESS_CHOICES]
     assert parse_harness_selection("") == []
     with pytest.raises(InstallerError, match="Unknown harness"):
-        parse_harness_selection("9")
+        parse_harness_selection("10")
 
 
 def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None:
@@ -332,6 +333,12 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
             "claude-desktop", home=tmp_path, environment=environment, platform_name="win32"
         )
         == tmp_path / "appdata" / "Claude" / "claude_desktop_config.json"
+    )
+    assert (
+        configuration_path(
+            "muse-code", home=tmp_path, environment=environment, platform_name="darwin"
+        )
+        == tmp_path / "xdg" / "muse" / "settings.json"
     )
 
 
@@ -437,6 +444,12 @@ def test_kilocode_honors_config_directory_override(tmp_path: Path) -> None:
                 "enabled": True,
             },
         ),
+        (
+            "muse-code",
+            "mcpServers",
+            ".config/muse/settings.json",
+            {"command": SERVER_COMMAND, "args": ["serve"]},
+        ),
     ],
 )
 def test_configure_json_harnesses(
@@ -476,6 +489,50 @@ def test_configure_codex_uses_shared_toml(tmp_path: Path) -> None:
         "command": SERVER_COMMAND,
         "args": ["serve"],
     }
+
+
+def test_configure_muse_code_adds_schema_version_to_a_new_file(tmp_path: Path) -> None:
+    """Muse Code rejects a settings document without schema_version."""
+
+    path = configure_harness(
+        "muse-code",
+        SERVER_BINARY,
+        home=tmp_path,
+        environment={},
+        platform_name="darwin",
+    )
+
+    assert path == tmp_path / ".config" / "muse" / "settings.json"
+    parsed = json.loads(path.read_text())
+    assert parsed["schema_version"] == 1
+    assert parsed["mcpServers"]["code-indexing-mcp"] == {
+        "command": SERVER_COMMAND,
+        "args": ["serve"],
+    }
+
+
+def test_configure_muse_code_preserves_comments_and_existing_schema_version(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / ".config" / "muse" / "settings.json"
+    path.parent.mkdir(parents=True)
+    original = (
+        '{\n  // a comment the user wrote\n  "schema_version": 2,\n  "other": {"keep": "this"}\n}\n'
+    )
+    path.write_text(original)
+
+    configure_harness(
+        "muse-code",
+        SERVER_BINARY,
+        home=tmp_path,
+        environment={},
+        platform_name="darwin",
+    )
+
+    text = path.read_text()
+    assert "// a comment the user wrote" in text
+    assert '"other": {"keep": "this"}' in text
+    assert '"schema_version": 2' in text
 
 
 def test_claude_desktop_uses_linux_config_directory(tmp_path: Path) -> None:
@@ -880,6 +937,18 @@ def test_skill_directories_cover_supported_harnesses(tmp_path: Path) -> None:
             "antigravity-cli", home=tmp_path, environment={"AGY_HOME": str(tmp_path / "agy")}
         )
         == tmp_path / "agy" / "skills"
+    )
+    assert (
+        skill_directory("muse-code", home=tmp_path, environment={})
+        == tmp_path / ".config" / "muse" / "skills"
+    )
+    assert (
+        skill_directory(
+            "muse-code",
+            home=tmp_path,
+            environment={"XDG_CONFIG_HOME": str(tmp_path / "xdg")},
+        )
+        == tmp_path / "xdg" / "muse" / "skills"
     )
     assert skill_directory("claude-desktop", home=tmp_path, environment={}) is None
     assert skill_directory("kilocode", home=tmp_path, environment={}) is None

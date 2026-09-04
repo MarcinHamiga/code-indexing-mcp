@@ -46,6 +46,7 @@ def _checkout(tmp_path: Path) -> Path:
         "codex",
         "antigravity",
         "antigravity-cli",
+        "muse-code",
     ],
 )
 def test_configure_then_deconfigure_restores_the_original_file(tmp_path: Path, slug: str) -> None:
@@ -54,11 +55,17 @@ def test_configure_then_deconfigure_restores_the_original_file(tmp_path: Path, s
     checkout = _checkout(tmp_path)
     path = harnesses.configuration_path(slug, home=tmp_path, environment={})
     path.parent.mkdir(parents=True, exist_ok=True)
-    original = (
-        '# a comment the user wrote\n[other]\nkeep = "this"\n'
-        if slug == "codex"
-        else '{\n  // a comment the user wrote\n  "other": {"keep": "this"}\n}\n'
-    )
+    if slug == "codex":
+        original = '# a comment the user wrote\n[other]\nkeep = "this"\n'
+    elif slug == "muse-code":
+        # Muse Code rejects a settings document without schema_version, so a
+        # realistic original already carries one; uninstall must not take it.
+        original = (
+            '{\n  // a comment the user wrote\n  "schema_version": 1,\n'
+            '  "other": {"keep": "this"}\n}\n'
+        )
+    else:
+        original = '{\n  // a comment the user wrote\n  "other": {"keep": "this"}\n}\n'
     path.write_text(original, encoding="utf-8")
 
     harnesses.configure_harness(

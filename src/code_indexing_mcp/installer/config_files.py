@@ -422,6 +422,41 @@ def merge_json_object_entry(
     return write_changed_configuration(path, original, updated)
 
 
+MUSE_CODE_SCHEMA_VERSION = 1
+
+
+def merge_muse_code_entry(path: Path, entry_key: str, entry_value: Any) -> bool:
+    """Merge one entry into a Muse Code settings document.
+
+    Identical to ``merge_json_object_entry`` under the ``"mcpServers"`` key,
+    except a missing ``schema_version`` is added alongside it: Muse Code
+    rejects a settings document without one, so a file this installer creates
+    from scratch must already carry it. A version already present is left
+    exactly as it is.
+    """
+
+    original = _read_configuration(path)
+    source = original if original and original.strip() else "{}\n"
+    try:
+        _validate_jsonc(source)
+        updated = _merge_jsonc_text(source, "mcpServers", entry_key, entry_value)
+        root_start = _skip_jsonc_trivia(updated, 0)
+        members, root_end = _jsonc_object_members(updated, root_start)
+        if not any(member.key == "schema_version" for member in members):
+            updated = _insert_jsonc_member(
+                updated,
+                root_start,
+                root_end,
+                members,
+                "schema_version",
+                MUSE_CODE_SCHEMA_VERSION,
+            )
+        _validate_jsonc(updated)
+    except ValueError as exc:
+        raise InstallerError(f"Invalid JSON/JSONC configuration in {path}: {exc}") from exc
+    return write_changed_configuration(path, original, updated)
+
+
 def remove_json_object_entry(path: Path, object_key: str, entry_key: str) -> bool:
     """Remove one entry from a top-level JSON/JSONC object. False if it was absent."""
 
