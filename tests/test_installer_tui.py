@@ -183,10 +183,28 @@ async def test_a_healthy_install_says_nothing_about_repair(
     launcher = shell_path.launcher_path(state.bin_directory)
     launcher.parent.mkdir(parents=True, exist_ok=True)
     launcher.touch()
+    tui_launcher = shell_path.launcher_path(
+        state.bin_directory, command=shell_path.TUI_LAUNCHER_NAME
+    )
+    tui_launcher.touch()
     app = InstallerApp(state)
     async with app.run_test():
         with pytest.raises(NoMatches):
             app.query_one("#welcome-repair", Static)
+
+
+@pytest.mark.asyncio
+async def test_missing_tui_launcher_suggests_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _reconfigure_state(_prepare_checkout(tmp_path), monkeypatch)
+    launcher = shell_path.launcher_path(state.bin_directory)
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.touch()
+    app = InstallerApp(state)
+    async with app.run_test():
+        text = str(app.query_one("#welcome-repair", Static).render())
+        assert "cidx" in text
 
 
 @pytest.mark.asyncio
@@ -401,6 +419,7 @@ async def test_summary_lists_the_launcher_and_the_profile_it_will_edit(
         await advance_to(pilot, app, "summary")
         text = str(app.query_one("#summary-body", Static).render())
         assert "code-indexing-mcp" in text
+        assert "cidx" in text
         assert str(profile) in text
 
 
@@ -567,12 +586,19 @@ async def test_done_panel_tells_the_user_how_to_reach_the_new_command(
     from code_indexing_mcp.installer.shell_path import LauncherResult
 
     launcher = LauncherResult(tmp_path / "bin" / "code-indexing-mcp", "created", "points at it")
+    tui_launcher = LauncherResult(tmp_path / "bin" / "cidx", "created", "points at it")
     profile = tmp_path / ".zshrc"
     monkeypatch.setattr(
         panels,
         "run_install",
         lambda plan, on_event=None, should_continue=None: InstallResult(
-            None, (), (), (), launcher=launcher, profiles_updated=(profile,)
+            None,
+            (),
+            (),
+            (),
+            launcher=launcher,
+            profiles_updated=(profile,),
+            tui_launcher=tui_launcher,
         ),
     )
     app = InstallerApp(_install_state(tmp_path))
@@ -582,7 +608,9 @@ async def test_done_panel_tells_the_user_how_to_reach_the_new_command(
         await pilot.pause()
         body = str(app.query_one("#done-body", Static).render())
         assert str(launcher.path) in body
+        assert str(tui_launcher.path) in body
         assert str(profile) in body
+        assert "cidx" in body
         # The PATH entry is not live in the shell the installer was started from.
         assert "exec" in body
 

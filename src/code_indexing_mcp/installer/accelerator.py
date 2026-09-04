@@ -106,12 +106,13 @@ def _run_command(
 def server_executable(
     install_directory: Path,
     *,
+    command: str = "code-indexing-mcp",
     platform_name: str | None = None,
 ) -> Path:
     platform_name = platform_name or sys.platform
     if platform_name.startswith("win"):
-        return install_directory / ".venv" / "Scripts" / "code-indexing-mcp.exe"
-    return install_directory / ".venv" / "bin" / "code-indexing-mcp"
+        return install_directory / ".venv" / "Scripts" / f"{command}.exe"
+    return install_directory / ".venv" / "bin" / command
 
 
 def environment_python(directory: Path, *, platform_name: str | None = None) -> Path:

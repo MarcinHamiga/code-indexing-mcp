@@ -58,6 +58,7 @@ class InstallResult:
     # whether a daemon-consumed setting changed without recomputing the
     # accelerator merge itself.
     env_written: Mapping[str, str | None] = field(default_factory=dict)
+    tui_launcher: LauncherResult | None = None
 
     @property
     def warnings(self) -> tuple[verify.Check, ...]:
@@ -103,11 +104,12 @@ def run_install(
         )
 
     launcher: LauncherResult | None = None
+    tui_launcher: LauncherResult | None = None
     profiles_updated: tuple[Path, ...] = ()
     if not plan.install_launcher:
         on_event(StepEvent("path", "skipped", "launcher not requested"))
     elif should_continue():
-        launcher, profiles_updated = _install_launcher(plan, on_event)
+        launcher, tui_launcher, profiles_updated = _install_launcher(plan, on_event)
 
     configured: list[tuple[str, Path]] = []
     failures: list[tuple[str, str]] = []
@@ -167,14 +169,15 @@ def run_install(
         profiles_updated=profiles_updated,
         checks=checks,
         env_written=env_updates,
+        tui_launcher=tui_launcher,
     )
 
 
 def _install_launcher(
     plan: InstallPlan,
     on_event: Callable[[StepEvent], None],
-) -> tuple[LauncherResult, tuple[Path, ...]]:
-    """Create the launcher and, if asked, put its directory on PATH.
+) -> tuple[LauncherResult, LauncherResult, tuple[Path, ...]]:
+    """Create both launchers and, if asked, put their directory on PATH.
 
     Nothing here raises. A missing launcher costs the user a convenience; a
     raise would cost them the harness configuration that comes after it.
@@ -182,7 +185,9 @@ def _install_launcher(
 
     bin_directory = plan.bin_directory or shell_path.default_bin_directory()
     on_event(StepEvent("path", "started", str(bin_directory)))
-    launcher = shell_path.install_launcher(plan.install_directory, bin_directory)
+    launcher = shell_path.install_launcher(
+        plan.install_directory, bin_directory, command=shell_path.LAUNCHER_NAME
+    )
     on_event(
         StepEvent(
             "path",
@@ -190,17 +195,27 @@ def _install_launcher(
             f"{launcher.path}: {launcher.status} ({launcher.detail})",
         )
     )
+    tui_launcher = shell_path.install_launcher(
+        plan.install_directory, bin_directory, command=shell_path.TUI_LAUNCHER_NAME
+    )
+    on_event(
+        StepEvent(
+            "path",
+            "finished" if tui_launcher.ok else "warning",
+            f"{tui_launcher.path}: {tui_launcher.status} ({tui_launcher.detail})",
+        )
+    )
     if not plan.modify_shell_profiles:
-        return launcher, ()
+        return launcher, tui_launcher, ()
     if shell_path.is_on_path(bin_directory):
         on_event(StepEvent("path", "skipped", f"{bin_directory} is already on PATH"))
-        return launcher, ()
+        return launcher, tui_launcher, ()
     profiles = shell_path.shell_profiles()
     if not profiles:
         on_event(
             StepEvent("path", "warning", f"add {bin_directory} to PATH yourself on this platform")
         )
-        return launcher, ()
+        return launcher, tui_launcher, ()
     written, profile_failures = shell_path.update_profiles(bin_directory, profiles)
     for profile in written:
         on_event(StepEvent("path", "finished", f"added {bin_directory} to PATH in {profile}"))
@@ -208,4 +223,4 @@ def _install_launcher(
         on_event(StepEvent("path", "warning", f"{profile}: {message}"))
     if not written and not profile_failures:
         on_event(StepEvent("path", "skipped", "the shell profiles already set PATH"))
-    return launcher, tuple(written)
+    return launcher, tui_launcher, tuple(written)

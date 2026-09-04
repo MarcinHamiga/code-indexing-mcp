@@ -103,6 +103,7 @@ tui = ["textual>=8.2,<9"]
 
 [project.scripts]
 code-indexing-mcp = "code_indexing_mcp.cli:main"
+cidx = "code_indexing_mcp.tui:main"
 
 [tool.hatch.version]
 path = "src/code_indexing_mcp/__init__.py"

@@ -613,3 +613,18 @@ def test_cli_reports_scan_inspection_as_json(  # type: ignore[no-untyped-def]
     assert payload["items"][0]["language"] == "python"
     assert payload["items"][0]["outcome"] == "eligible"
     assert payload["next_cursor"] is None
+
+
+def test_cli_tui_subcommand_dispatches_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
+    import code_indexing_mcp.tui as tui_mod
+
+    called = False
+
+    def fake_tui_main(argv: list[str] | None = None) -> int:
+        nonlocal called
+        called = True
+        return 42
+
+    monkeypatch.setattr(tui_mod, "main", fake_tui_main)
+    assert main(["tui"]) == 42
+    assert called

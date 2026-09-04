@@ -293,6 +293,8 @@ def _checkout(tmp_path: Path) -> Path:
     command = accelerator.server_executable(directory)
     command.parent.mkdir(parents=True, exist_ok=True)
     command.touch(mode=0o755)
+    tui_command = accelerator.server_executable(directory, command=shell_path.TUI_LAUNCHER_NAME)
+    tui_command.touch(mode=0o755)
     return directory
 
 
@@ -318,9 +320,12 @@ def test_run_install_creates_the_launcher_and_adds_it_to_path(
     )
 
     launcher = shell_path.launcher_path(bin_directory)
+    tui_launcher = shell_path.launcher_path(bin_directory, command=shell_path.TUI_LAUNCHER_NAME)
     # A symlink on POSIX, a .cmd shim on Windows; both land at launcher_path.
     assert launcher.is_symlink() or launcher.is_file()
+    assert tui_launcher.is_symlink() or tui_launcher.is_file()
     assert result.launcher is not None and result.launcher.status == "created"
+    assert result.tui_launcher is not None and result.tui_launcher.status == "created"
     assert result.profiles_updated == (profile,)
     text = profile.read_text(encoding="utf-8")
     assert text.startswith("# mine\n")
@@ -328,7 +333,7 @@ def test_run_install_creates_the_launcher_and_adds_it_to_path(
     # ask the module whether the line names it rather than matching raw text.
     assert shell_path.BLOCK_START in text
     assert shell_path.profile_mentions_directory(text, bin_directory, Path.home())
-    assert [event.step for event in events].count("path") == 3
+    assert [event.step for event in events].count("path") == 4
 
 
 def test_run_install_leaves_shell_profiles_alone_when_already_on_path(

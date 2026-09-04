@@ -65,13 +65,13 @@ does the same thing. To change settings or harnesses without updating, run
 current configuration. Naming what to change applies it directly instead:
 `code-indexing-mcp configure --set CODE_INDEXING_BROKER=off --unset CODE_INDEXING_INDEX_MODE`.
 
-### The `code-indexing-mcp` command
+### The `code-indexing-mcp` and `cidx` commands
 
 Your MCP clients launch the server by absolute path and never need it on PATH, so the
-installer adds a launcher for you: a symlink at `~/.local/bin/code-indexing-mcp` (a `.cmd`
-shim on Windows) pointing at the executable inside the installation's virtual environment.
-That is what makes `configure`, `init`, `index`, `status`, `history`, `scan`, `storage`,
-`projects`, `model`, `benchmark`, and `daemon` work from any shell.
+installer adds two launchers for you in `~/.local/bin` (or your configured bin directory, with `.cmd`
+shims on Windows):
+- `code-indexing-mcp`: The server and administrative CLI. That is what makes `configure`, `init`, `index`, `status`, `history`, `scan`, `storage`, `projects`, `model`, `benchmark`, `daemon`, and `tui` work from any shell.
+- `cidx`: The dedicated interactive Terminal User Interface (TUI) for navigating and inspecting indexed codebases directly from your terminal.
 
 If that directory is not already on your `PATH`, the wizard offers — checked by default — to
 add it to your shell profile (`~/.zshrc`, `~/.bashrc` and `~/.bash_profile` on macOS,
@@ -187,7 +187,7 @@ accelerator and every setting exactly as they are. It changes no choice; it puts
 went missing.
 
 `code-indexing-mcp uninstall` removes what the installer added: the `code-indexing-mcp` entry
-from each configured client, the bundled skill links, the launcher, and the PATH block. It
+from each configured client, the bundled skill links, both launchers (`code-indexing-mcp` and `cidx`), and the PATH block. It
 prints what it will do and asks before doing any of it (`--yes` skips the prompt).
 
 Removal is evidence-based, not name-based. A launcher that does not point into *this*
@@ -201,10 +201,10 @@ Indexes and caches are **kept** by default; they cost minutes of CPU to rebuild 
 uninstall that discards them silently is not one you can undo. The checkout is kept too:
 
 ```bash
-code-indexing-mcp uninstall                    # entries, skills, launcher, PATH block
+code-indexing-mcp uninstall                    # entries, skills, launchers, PATH block
 code-indexing-mcp uninstall --purge            # also delete the index and cache directories
 code-indexing-mcp uninstall --remove-checkout  # also delete ~/.local/share/code-indexing-mcp
-code-indexing-mcp uninstall --keep-launcher --keep-path   # leave the command in place
+code-indexing-mcp uninstall --keep-launcher --keep-path   # leave the commands in place
 ```
 
 Both deleting flags check the directory before touching it. `--purge` removes a data or
@@ -366,6 +366,35 @@ enter the patch: they come back in `unapplied` and `conflicted`, and `completene
 partial patch can never read as a finished rename. Signature changes are refused with
 `UNSUPPORTED_OPERATION`, because synthesized argument lists are language-specific and easy to get
 silently wrong.
+
+## Terminal User Interface (TUI)
+
+Code Indexing MCP includes a terminal-native user interface for searching and inspecting codebases directly from your shell without opening an AI assistant or MCP client:
+
+```bash
+cidx
+# or equivalently:
+code-indexing-mcp tui
+```
+
+`cidx` connects directly to your local index data and honors your configured broker, daemon, and storage settings:
+
+- **Project Discovery & Selection**: Automatically discovers the project corresponding to your current working directory, and provides a dropdown to switch across any registered project.
+- **Search Modes**:
+  - **Semantic**: Hybrid semantic and keyword vector search across code chunks.
+  - **Symbol**: Fast declaration lookups (exact, prefix, and substring).
+- **Code Preview**: Syntax-highlighted code chunk previews with 1-based source line numbers.
+- **Structural Analysis Shortcuts**:
+  - `Enter`: Preview the highlighted code chunk.
+  - `o`: View syntax-aware file outline for the selected hit.
+  - `r`: Find structural references to the selected declaration.
+  - `i`: Compute bounded transitive impact radius layers.
+  - `F5`: Trigger incremental reindexing with live progress updates.
+  - `/`: Focus search query input.
+  - `Esc`: Switch focus between search input, results list, and preview panes.
+  - `q`: Exit.
+
+The TUI operates strictly in read-only mode regarding your source code and will never alter files on disk.
 
 ## Project workflow
 

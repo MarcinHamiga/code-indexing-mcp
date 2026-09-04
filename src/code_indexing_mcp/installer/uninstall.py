@@ -43,6 +43,7 @@ class UninstallResult:
     profiles_cleared: tuple[Path, ...] = ()
     directories_removed: tuple[Path, ...] = ()
     failures: list[tuple[str, str]] = field(default_factory=list)
+    tui_launcher_removed: Path | None = None
 
 
 def data_directories(
@@ -186,7 +187,9 @@ def _remove_launcher(
     on_event(StepEvent("path", "started", str(bin_directory)))
     if plan.remove_launcher:
         try:
-            removed = shell_path.remove_launcher(bin_directory, plan.install_directory)
+            removed = shell_path.remove_launcher(
+                bin_directory, plan.install_directory, command=shell_path.LAUNCHER_NAME
+            )
         except OSError as exc:
             result.failures.append(("launcher", str(exc)))
             on_event(StepEvent("path", "failed", str(exc)))
@@ -197,6 +200,26 @@ def _remove_launcher(
                     "path",
                     "finished" if removed else "skipped",
                     f"removed {removed}" if removed else f"no launcher of ours in {bin_directory}",
+                )
+            )
+        try:
+            tui_removed = shell_path.remove_launcher(
+                bin_directory, plan.install_directory, command=shell_path.TUI_LAUNCHER_NAME
+            )
+        except OSError as exc:
+            result.failures.append(("tui_launcher", str(exc)))
+            on_event(StepEvent("path", "failed", str(exc)))
+        else:
+            result.tui_launcher_removed = tui_removed
+            on_event(
+                StepEvent(
+                    "path",
+                    "finished" if tui_removed else "skipped",
+                    (
+                        f"removed {tui_removed}"
+                        if tui_removed
+                        else f"no cidx launcher of ours in {bin_directory}"
+                    ),
                 )
             )
     if not plan.remove_path_block:
@@ -289,7 +312,10 @@ def describe_plan(
         home=home, environment=environment
     )
     if plan.remove_launcher:
-        lines.append(f"Remove the launcher at {shell_path.launcher_path(bin_directory)}.")
+        lines.append(
+            f"Remove the launchers at {shell_path.launcher_path(bin_directory)} and "
+            f"{shell_path.launcher_path(bin_directory, command=shell_path.TUI_LAUNCHER_NAME)}."
+        )
     if plan.remove_path_block:
         lines.append("Remove the PATH block from your shell profiles.")
     if plan.remove_data:

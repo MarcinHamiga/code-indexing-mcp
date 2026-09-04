@@ -1,0 +1,114 @@
+Screen {
+    layout: vertical;
+    background: $surface;
+    color: $text;
+}
+
+#header-bar {
+    height: 3;
+    padding: 0 1;
+    background: $panel;
+    color: $text;
+    border-bottom: solid $primary;
+}
+
+#header-title {
+    text-style: bold;
+}
+
+#header-status {
+    color: $text-muted;
+}
+
+#query-bar {
+    height: 3;
+    layout: horizontal;
+    padding: 0 1;
+    margin-top: 1;
+    margin-bottom: 1;
+}
+
+#project-select {
+    width: 28;
+    margin-right: 1;
+}
+
+#mode-select {
+    width: 16;
+    margin-right: 1;
+}
+
+#query-input {
+    width: 1fr;
+    margin-right: 1;
+}
+
+#index-button {
+    width: 14;
+}
+
+#main-container {
+    layout: horizontal;
+    height: 1fr;
+    padding: 0 1;
+}
+
+#results-pane {
+    width: 48%;
+    height: 100%;
+    border: solid $secondary;
+    padding: 0;
+    margin-right: 1;
+}
+
+#results-title {
+    background: $panel;
+    color: $text;
+    padding: 0 1;
+    text-style: bold;
+    border-bottom: solid $secondary;
+}
+
+#results-list {
+    height: 1fr;
+}
+
+#detail-pane {
+    width: 52%;
+    height: 100%;
+    border: solid $secondary;
+    padding: 0;
+}
+
+#detail-title {
+    background: $panel;
+    color: $text;
+    padding: 0 1;
+    text-style: bold;
+    border-bottom: solid $secondary;
+}
+
+#detail-scroll {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#detail-content {
+    width: 100%;
+}
+
+#status-bar {
+    height: 1;
+    background: $panel;
+    padding: 0 1;
+    color: $text;
+}
+
+#status-bar.error {
+    color: $error;
+    text-style: bold;
+}
+
+Footer {
+    dock: bottom;
+}
