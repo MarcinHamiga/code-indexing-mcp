@@ -18,6 +18,10 @@ def _checkout(tmp_path: Path, *, platform_name: str | None = None) -> Path:
     command = server_executable(directory, platform_name=platform_name)
     command.parent.mkdir(parents=True, exist_ok=True)
     command.touch(mode=0o755)
+    tui_command = server_executable(
+        directory, command=shell_path.TUI_LAUNCHER_NAME, platform_name=platform_name
+    )
+    tui_command.touch(mode=0o755)
     return directory
 
 
@@ -51,6 +55,21 @@ def test_default_bin_directory_falls_back_through_xdg_to_local_bin(tmp_path: Pat
 def test_launcher_path_is_a_cmd_shim_on_windows(tmp_path: Path) -> None:
     assert shell_path.launcher_path(tmp_path, platform_name="linux").name == "code-indexing-mcp"
     assert shell_path.launcher_path(tmp_path, platform_name="win32").name == "code-indexing-mcp.cmd"
+
+
+def test_tui_launcher_path_is_a_cmd_shim_on_windows(tmp_path: Path) -> None:
+    assert (
+        shell_path.launcher_path(
+            tmp_path, command=shell_path.TUI_LAUNCHER_NAME, platform_name="linux"
+        ).name
+        == "syndex"
+    )
+    assert (
+        shell_path.launcher_path(
+            tmp_path, command=shell_path.TUI_LAUNCHER_NAME, platform_name="win32"
+        ).name
+        == "syndex.cmd"
+    )
 
 
 # --- creating the launcher ---------------------------------------------------
@@ -178,6 +197,42 @@ def test_remove_launcher_checks_the_shim_names_this_checkout_on_windows(tmp_path
 
     assert shell_path.remove_launcher(bin_directory, ours, platform_name="win32") is None
     assert shell_path.remove_launcher(bin_directory, theirs, platform_name="win32") is not None
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlink launcher")
+def test_install_and_remove_tui_launcher(tmp_path: Path) -> None:
+    checkout = _checkout(tmp_path)
+    bin_directory = tmp_path / "bin"
+    result = shell_path.install_launcher(
+        checkout, bin_directory, command=shell_path.TUI_LAUNCHER_NAME
+    )
+    assert result.status == "created"
+    assert result.path.name == "syndex"
+    assert result.path.is_symlink()
+
+    removed = shell_path.remove_launcher(
+        bin_directory, checkout, command=shell_path.TUI_LAUNCHER_NAME
+    )
+    assert removed == bin_directory / "syndex"
+    assert not (bin_directory / "syndex").exists()
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlink launcher")
+def test_install_tui_launcher_skips_foreign_executable_without_overwriting(tmp_path: Path) -> None:
+    checkout = _checkout(tmp_path)
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir(parents=True, exist_ok=True)
+    foreign_binary = bin_directory / "syndex"
+    foreign_binary.write_text("#!/bin/sh\necho foreign\n")
+
+    result = shell_path.install_launcher(
+        checkout, bin_directory, command=shell_path.TUI_LAUNCHER_NAME
+    )
+    assert result.status == "skipped"
+    assert not result.ok
+    assert "not owned by this installation" in result.detail
+    assert foreign_binary.read_text() == "#!/bin/sh\necho foreign\n"
+    assert not (bin_directory / "syndex.1.bak").exists()
 
 
 # --- PATH detection ----------------------------------------------------------
@@ -419,6 +474,7 @@ def test_inspect_reports_the_full_situation(tmp_path: Path) -> None:
     assert state.profiles_current is False
     assert profile in state.profiles
     assert state.launcher == bin_directory / "code-indexing-mcp"
+    assert state.tui_launcher == bin_directory / "syndex"
 
     shell_path.update_profile(profile, bin_directory, home=tmp_path)
     refreshed = shell_path.inspect(

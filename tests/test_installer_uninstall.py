@@ -24,6 +24,9 @@ def _checkout(tmp_path: Path) -> Path:
     command.parent.mkdir(parents=True, exist_ok=True)
     command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     command.chmod(0o755)
+    tui_cmd = server_executable(directory, command=shell_path.TUI_LAUNCHER_NAME)
+    tui_cmd.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    tui_cmd.chmod(0o755)
     # The markers --remove-checkout insists on before deleting anything.
     (directory / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
     (directory / "src" / "code_indexing_mcp").mkdir(parents=True, exist_ok=True)
@@ -236,6 +239,7 @@ def test_run_uninstall_takes_back_the_entry_launcher_and_path_block(tmp_path: Pa
     )
     bin_directory = tmp_path / "bin"
     shell_path.install_launcher(checkout, bin_directory)
+    shell_path.install_launcher(checkout, bin_directory, command=shell_path.TUI_LAUNCHER_NAME)
     profile = tmp_path / ".zshrc"
     profile.write_text("alias ll='ls -l'\n", encoding="utf-8")
     shell_path.update_profile(profile, bin_directory, home=tmp_path)
@@ -255,7 +259,9 @@ def test_run_uninstall_takes_back_the_entry_launcher_and_path_block(tmp_path: Pa
     assert result.failures == []
     assert harnesses.read_server_entry("kimi-code", home=tmp_path, environment={}) is None
     assert not (bin_directory / "code-indexing-mcp").exists()
+    assert not (bin_directory / "syndex").exists()
     assert result.launcher_removed == bin_directory / "code-indexing-mcp"
+    assert result.tui_launcher_removed == bin_directory / "syndex"
     assert profile.read_text(encoding="utf-8") == "alias ll='ls -l'\n"
     assert result.profiles_cleared == (profile,)
     assert {event.step for event in events} == {"harnesses", "skills", "path"}
@@ -512,6 +518,7 @@ def test_the_uninstall_subcommand_runs_the_real_pipeline(
     )
     bin_directory = tmp_path / "bin"
     shell_path.install_launcher(checkout, bin_directory)
+    shell_path.install_launcher(checkout, bin_directory, command=shell_path.TUI_LAUNCHER_NAME)
 
     code = main(
         [
@@ -528,6 +535,7 @@ def test_the_uninstall_subcommand_runs_the_real_pipeline(
 
     assert code == 0
     assert not (bin_directory / "code-indexing-mcp").exists()
+    assert not (bin_directory / "syndex").exists()
     assert harnesses.read_server_entry("kimi-code", home=tmp_path, environment={}) is None
     out = capsys.readouterr().out
     assert "Uninstall complete." in out

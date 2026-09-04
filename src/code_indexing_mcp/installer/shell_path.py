@@ -31,6 +31,7 @@ from .config_files import InstallerError, write_changed_configuration
 from .links import backup_path, is_under, link_destination, replace_link
 
 LAUNCHER_NAME = "code-indexing-mcp"
+TUI_LAUNCHER_NAME = "syndex"
 
 # The block written into a shell profile. Both markers are matched literally on
 # rewrite and removal, which is what keeps a second install from appending a
@@ -66,6 +67,7 @@ class PathState:
     profiles: tuple[Path, ...]
     # True when every profile already carries the block or the directory.
     profiles_current: bool
+    tui_launcher: Path | None = None
 
 
 def default_bin_directory(
@@ -84,11 +86,16 @@ def default_bin_directory(
     return home / ".local" / "bin"
 
 
-def launcher_path(bin_directory: Path, *, platform_name: str | None = None) -> Path:
+def launcher_path(
+    bin_directory: Path,
+    *,
+    command: str = LAUNCHER_NAME,
+    platform_name: str | None = None,
+) -> Path:
     platform_name = platform_name or sys.platform
     if platform_name.startswith("win"):
-        return bin_directory / f"{LAUNCHER_NAME}.cmd"
-    return bin_directory / LAUNCHER_NAME
+        return bin_directory / f"{command}.cmd"
+    return bin_directory / command
 
 
 def _path_entries(environment: Mapping[str, str]) -> list[Path]:
@@ -129,21 +136,22 @@ def is_on_path(
 def shadowing_executable(
     bin_directory: Path,
     *,
+    command: str = LAUNCHER_NAME,
     environment: Mapping[str, str] | None = None,
     platform_name: str | None = None,
 ) -> Path | None:
-    """A ``code-indexing-mcp`` an earlier PATH entry would find before ours.
+    """An executable an earlier PATH entry would find before ours.
 
     Reported rather than removed. Something else owns that file, and silently
     winning the name would be a worse surprise than saying which one runs.
     """
 
     environment = os.environ if environment is None else environment
-    ours = launcher_path(bin_directory, platform_name=platform_name)
+    ours = launcher_path(bin_directory, command=command, platform_name=platform_name)
     for entry in _path_entries(environment):
         if _same_directory(entry, bin_directory):
             return None
-        candidate = shutil.which(LAUNCHER_NAME, path=str(entry))
+        candidate = shutil.which(command, path=str(entry))
         if candidate is not None:
             found = Path(candidate)
             if not _same_directory(found.parent, ours.parent):
@@ -155,22 +163,33 @@ def install_launcher(
     install_directory: Path,
     bin_directory: Path,
     *,
+    command: str = LAUNCHER_NAME,
     platform_name: str | None = None,
 ) -> LauncherResult:
-    """Put a ``code-indexing-mcp`` launcher in ``bin_directory``.
+    """Put a launcher in ``bin_directory``.
 
     Never raises: a launcher is a convenience, and a failure to create one must
     not undo harness configuration that already succeeded.
     """
 
     platform_name = platform_name or sys.platform
-    target = launcher_path(bin_directory, platform_name=platform_name)
-    executable = server_executable(install_directory, platform_name=platform_name)
+    target = launcher_path(bin_directory, command=command, platform_name=platform_name)
+    executable = server_executable(install_directory, command=command, platform_name=platform_name)
     if not executable.is_file():
         return LauncherResult(
             target,
             "failed",
             f"no server executable at {executable}",
+        )
+    if (
+        command != LAUNCHER_NAME
+        and (target.exists() or target.is_symlink())
+        and not _removable_launcher(target, install_directory, platform_name, command=command)
+    ):
+        return LauncherResult(
+            target,
+            "skipped",
+            f"an existing executable at {target} is not owned by this installation",
         )
     try:
         if platform_name.startswith("win"):
@@ -227,6 +246,8 @@ def _removable_launcher(
     target: Path,
     install_directory: Path | None,
     platform_name: str,
+    *,
+    command: str = LAUNCHER_NAME,
 ) -> bool:
     """True when ``target`` is evidently a launcher this installation created.
 
@@ -243,7 +264,7 @@ def _removable_launcher(
             content = target.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             return False
-        if ".venv" not in content or LAUNCHER_NAME not in content:
+        if ".venv" not in content or command not in content:
             return False
         if install_directory is None:
             return True
@@ -255,7 +276,7 @@ def _removable_launcher(
     if not target.is_symlink():
         return False
     destination = link_destination(target)
-    if ".venv" not in destination.parts:
+    if ".venv" not in destination.parts or destination.name != command:
         return False
     if install_directory is None:
         return True
@@ -278,6 +299,7 @@ def remove_launcher(
     bin_directory: Path,
     install_directory: Path | None = None,
     *,
+    command: str = LAUNCHER_NAME,
     platform_name: str | None = None,
 ) -> Path | None:
     """Remove a launcher this installer created. Returns the path if one went away.
@@ -289,8 +311,8 @@ def remove_launcher(
     """
 
     platform_name = platform_name or sys.platform
-    target = launcher_path(bin_directory, platform_name=platform_name)
-    if not _removable_launcher(target, install_directory, platform_name):
+    target = launcher_path(bin_directory, command=command, platform_name=platform_name)
+    if not _removable_launcher(target, install_directory, platform_name, command=command):
         return None
     target.unlink()
     return target
@@ -550,6 +572,9 @@ def inspect(
         ),
         profiles=profiles,
         profiles_current=current,
+        tui_launcher=launcher_path(
+            bin_directory, command=TUI_LAUNCHER_NAME, platform_name=platform_name
+        ),
     )
 
 

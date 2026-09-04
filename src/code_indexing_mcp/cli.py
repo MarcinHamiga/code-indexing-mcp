@@ -64,6 +64,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="code-indexing-mcp", description="Local MCP code indexer")
     parser.add_argument("--version", action=_VersionAction, help="show the version and exit")
     commands = parser.add_subparsers(dest="command", required=True)
+    tui = commands.add_parser("tui", help="Launch the terminal user interface")
+    tui.add_argument("project", nargs="?", help="Project to open in the TUI")
     serve = commands.add_parser("serve", help="Run the stdio MCP server")
     serve.add_argument("--direct", action="store_true", help="Bypass the per-user daemon")
     init = commands.add_parser("init", help="Initialize a local project marker")
@@ -439,6 +441,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 assume_yes=args.yes,
                 error_output=lambda line: print(line, file=sys.stderr),
             )
+        if args.command == "tui":
+            from .tui import main as tui_main
+
+            tui_args = [args.project] if getattr(args, "project", None) else []
+            return tui_main(tui_args)
         settings = IndexSettings.from_environment()
         if args.command == "serve":
             use_daemon = not args.direct and settings.broker_mode != "off"

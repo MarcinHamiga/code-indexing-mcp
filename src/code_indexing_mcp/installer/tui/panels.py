@@ -97,6 +97,14 @@ class WelcomePanel(Vertical):
                 f"The {launcher.name} launcher is missing from {launcher.parent}; "
                 "the Command-line access step will put it back."
             )
+        tui_launcher = shell_path.launcher_path(
+            self.state.bin_directory, command=shell_path.TUI_LAUNCHER_NAME
+        )
+        if not tui_launcher.exists():
+            hints.append(
+                f"The {tui_launcher.name} launcher is missing from {tui_launcher.parent}; "
+                "the Command-line access step will put it back."
+            )
         if hints:
             hints.append(
                 "To restore everything without walking the wizard, quit and run: "
@@ -239,12 +247,12 @@ class PathPanel(Vertical):
         yield Label("Command-line access")
         yield Static(
             "Your MCP clients launch the server by absolute path and do not need this. "
-            "The launcher is for you: it makes `code-indexing-mcp configure`, `index`, "
-            "`status`, and `daemon` work from any shell.",
+            "The launchers are for you: `code-indexing-mcp` makes administration work "
+            "from any shell, and `syndex` opens the interactive terminal UI.",
             classes="help",
         )
         yield Checkbox(
-            "Create the code-indexing-mcp launcher",
+            "Create the code-indexing-mcp and syndex launchers",
             value=self.state.install_launcher,
             id="path-launcher",
         )
@@ -277,6 +285,8 @@ class PathPanel(Vertical):
             return
         state = shell_path.inspect(Path(raw).expanduser())
         lines = [f"Launcher: {state.launcher}"]
+        if state.tui_launcher:
+            lines.append(f"TUI Launcher: {state.tui_launcher}")
         profile_checkbox = self.query_one("#path-profile", Checkbox)
         if state.on_path:
             lines.append(f"{state.bin_directory} is already on PATH; nothing to add.")
@@ -410,6 +420,8 @@ class SummaryPanel(Vertical):
             return ["Launcher: not created"]
         state = self._path_state()
         lines = [f"Launcher: {state.launcher}"]
+        if state.tui_launcher:
+            lines.append(f"TUI Launcher: {state.tui_launcher}")
         if state.on_path:
             lines.append("  its directory is already on PATH")
         elif self.state.modify_shell_profiles and state.profiles:
@@ -423,6 +435,8 @@ class SummaryPanel(Vertical):
             return []
         state = self._path_state()
         files = [state.launcher]
+        if state.tui_launcher:
+            files.append(state.tui_launcher)
         if self.state.modify_shell_profiles and not state.on_path:
             files.extend(state.profiles)
         return files
@@ -634,6 +648,12 @@ def _next_step_lines(result: InstallResult | None) -> list[str]:
     """
 
     reconfigure = "Reconfigure later with: code-indexing-mcp configure"
+    tui_cmd = (
+        "syndex"
+        if result and result.tui_launcher and result.tui_launcher.ok
+        else "code-indexing-mcp tui"
+    )
+    explore = f"Explore indexed code interactively with: {tui_cmd}"
     if result is None or result.launcher is None or not result.launcher.ok:
         return [
             "Reconfigure later with:",
@@ -646,8 +666,9 @@ def _next_step_lines(result: InstallResult | None) -> list[str]:
             "Start a new shell, or run:",
             f"  {shell_path.activation_hint(result.profiles_updated)}",
             reconfigure,
+            explore,
         ]
-    return [reconfigure]
+    return [reconfigure, explore]
 
 
 class DonePanel(Vertical):
@@ -683,6 +704,10 @@ class DonePanel(Vertical):
                 launcher = result.launcher
                 verb = "Launcher" if launcher.ok else "Launcher NOT created"
                 lines.append(f"{verb}: {launcher.path}\n  {launcher.detail}")
+            if result.tui_launcher is not None:
+                tui_launcher = result.tui_launcher
+                verb = "TUI Launcher" if tui_launcher.ok else "TUI Launcher NOT created"
+                lines.append(f"{verb}: {tui_launcher.path}\n  {tui_launcher.detail}")
             for profile in result.profiles_updated:
                 lines.append(f"Added to PATH in {profile}")
             for slug, path in result.configured:
