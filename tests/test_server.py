@@ -136,6 +136,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "list_projects",
         "remove_project",
         "search_code",
+        "search_by_example",
         "search_across_projects",
         "find_symbol",
         "find_references",
@@ -145,7 +146,7 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 18
+    assert len(tools) == 19
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -469,6 +470,141 @@ async def test_search_across_projects_returns_filtered_globally_limited_hits(
     assert len(limited.structuredContent["hits"]) == 1
     assert python_only.structuredContent is not None
     assert {hit["project_id"] for hit in python_only.structuredContent["hits"]} == {alpha.id}
+
+
+@pytest.mark.asyncio
+async def test_search_by_example_server_happy_path_and_errors(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "main.py").write_text("def compute_total(items):\n    return sum(items)\n")
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root, "my-service")
+    app.index_project(project.id)
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "search_by_example",
+            {
+                "example": "def compute_total(items):\n    return sum(items)\n",
+                "projects": [project.id],
+            },
+        )
+        assert not result.isError
+        assert result.structuredContent is not None
+        assert result.structuredContent["language"] == "python"
+        assert result.structuredContent["segments"] == 1
+        assert len(result.structuredContent["hits"]) >= 1
+        assert result.structuredContent["hits"][0]["symbol"] == "compute_total"
+
+        empty_res = await client.call_tool(
+            "search_by_example",
+            {"example": "   \n  ", "projects": [project.id]},
+        )
+        assert empty_res.isError
+        empty_msg = "".join(
+            block.text for block in empty_res.content if isinstance(block, types.TextContent)
+        )
+        assert ErrorCode.INVALID_FILTER.value in empty_msg
+
+        oversized_res = await client.call_tool(
+            "search_by_example",
+            {"example": "x" * 20_000, "projects": [project.id]},
+        )
+        assert oversized_res.isError
+        oversized_msg = "".join(
+            block.text for block in oversized_res.content if isinstance(block, types.TextContent)
+        )
+        assert ErrorCode.INVALID_FILTER.value in oversized_msg
+
+
+@pytest.mark.asyncio
+async def test_search_across_projects_example_and_mutual_exclusion(tmp_path: Path) -> None:
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    roots = [tmp_path / "alpha", tmp_path / "beta"]
+    for root in roots:
+        (root / "src").mkdir(parents=True)
+    (roots[0] / "src" / "feature.py").write_text(
+        "def shared_feature_alpha():\n    return 'alpha'\n"
+    )
+    (roots[1] / "src" / "feature.py").write_text("def shared_feature_beta():\n    return 'beta'\n")
+    alpha = app.init_project(roots[0], "alpha-service")
+    beta = app.init_project(roots[1], "beta-service")
+    app.index_project(alpha.id)
+    app.index_project(beta.id)
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        cross_res = await client.call_tool(
+            "search_across_projects",
+            {
+                "example": "function sharedFeature() { return 'x'; }",
+                "language": "javascript",
+                "projects": [alpha.id, beta.id],
+            },
+        )
+        assert not cross_res.isError
+        assert cross_res.structuredContent is not None
+        assert cross_res.structuredContent["language"] == "javascript"
+        hits = cross_res.structuredContent["hits"]
+        assert len(hits) == 2
+        assert {hit["project_id"] for hit in hits} == {alpha.id, beta.id}
+
+        both_res = await client.call_tool(
+            "search_across_projects",
+            {
+                "query": "shared",
+                "example": "def shared_feature(): pass",
+                "projects": [alpha.id, beta.id],
+            },
+        )
+        assert both_res.isError
+        both_msg = "".join(
+            block.text for block in both_res.content if isinstance(block, types.TextContent)
+        )
+        assert ErrorCode.INVALID_FILTER.value in both_msg
+
+        query_language_res = await client.call_tool(
+            "search_across_projects",
+            {
+                "query": "shared",
+                "language": "python",
+                "projects": [alpha.id, beta.id],
+            },
+        )
+        assert query_language_res.isError
+        query_language_msg = "".join(
+            block.text
+            for block in query_language_res.content
+            if isinstance(block, types.TextContent)
+        )
+        assert ErrorCode.INVALID_FILTER.value in query_language_msg
+
+        neither_res = await client.call_tool(
+            "search_across_projects",
+            {
+                "projects": [alpha.id, beta.id],
+            },
+        )
+        assert neither_res.isError
+        neither_msg = "".join(
+            block.text for block in neither_res.content if isinstance(block, types.TextContent)
+        )
+        assert ErrorCode.INVALID_FILTER.value in neither_msg
 
 
 @pytest.mark.asyncio
@@ -1662,6 +1798,7 @@ AUTO_REGISTERING_TOOLS = frozenset(
         "inspect_scan",
         "index_storage_status",
         "search_code",
+        "search_by_example",
         "search_across_projects",
         "find_symbol",
         "find_references",
@@ -1798,16 +1935,34 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
     cross_project_schema = tools["search_across_projects"].inputSchema
     assert set(cross_project_schema["properties"]) == {
         "query",
+        "example",
+        "language",
         "projects",
         "languages",
         "paths",
         "kinds",
         "limit",
     }
-    assert set(cross_project_schema["required"]) == {"query", "projects"}
+    assert set(cross_project_schema["required"]) == {"projects"}
     assert cross_project_schema["properties"]["projects"]["minItems"] == 2
     cross_project_limit = cross_project_schema["properties"]["limit"]
     assert (cross_project_limit["minimum"], cross_project_limit["maximum"]) == (1, 50)
+
+    example_schema = tools["search_by_example"].inputSchema
+    assert set(example_schema["properties"]) == {
+        "example",
+        "language",
+        "projects",
+        "all_projects",
+        "languages",
+        "paths",
+        "kinds",
+        "limit",
+    }
+    assert set(example_schema["required"]) == {"example"}
+    example_limit = example_schema["properties"]["limit"]
+    assert (example_limit["minimum"], example_limit["maximum"]) == (1, 50)
+
     assert set(tools["search_code"].inputSchema["properties"]) == {
         "query",
         "projects",

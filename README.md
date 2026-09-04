@@ -268,9 +268,9 @@ A generic MCP client configuration looks like this:
 }
 ```
 
-The server exposes eighteen tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
+The server exposes nineteen tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
 so hosts may auto-approve them. The other query tools are not: on a root the server has not seen
-before they register it first, which writes a `.ci-mcp/project.toml` marker, and the four code
+before they register it first, which writes a `.ci-mcp/project.toml` marker, and the five code
 queries also build its initial index. `remove_project` is annotated `destructiveHint`;
 `init_project` carries the same hint and is non-idempotent because `force_new_id=true` can
 overwrite a marker and orphan the previous index.
@@ -287,6 +287,7 @@ overwrite a marker and orphan the previous index.
 | `index_storage_maintenance` | read, registers | Compact tables and remove verified old Lance versions (dry-run by default; explicit `dry_run=false` cleans up). |
 | `list_projects` | read only | Every registered project, sorted by name. |
 | `search_code` | read, registers and indexes | Hybrid semantic and keyword search returning ranked snippets. |
+| `search_by_example` | read, registers and indexes | Find indexed chunks most similar to a pasted code snippet. |
 | `search_across_projects` | read, registers and indexes | Globally ranked search across at least two explicitly selected projects. |
 | `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
 | `find_references` | read, registers and indexes | Structural references to one selected C#, Go, Java, JavaScript, Python, Rust, TSX, or TypeScript declaration. |

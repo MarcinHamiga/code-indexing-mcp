@@ -25,6 +25,7 @@ from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.git_state import GitProbeOutcome, GitState, SelectorKind
 from code_indexing_mcp.models import (
     DeclarationSelector,
+    ExampleSearchResponse,
     ParameterShape,
     ProjectInfo,
     ReferenceBackfillReport,
@@ -312,6 +313,59 @@ def test_search_rejects_a_second_repository_transition(tmp_path: Path) -> None:
         app.search_code("answer", projects=[project.id])
 
     assert excinfo.value.code is ErrorCode.REPOSITORY_CHANGED
+
+
+def test_search_by_example_retries_once_when_the_repository_changes(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    first = ExampleSearchResponse(language="python", segments=1, hits=[])
+    second = ExampleSearchResponse(language="python", segments=1, hits=[])
+
+    with (
+        patch.object(
+            app.search, "search_by_example", side_effect=[first, second]
+        ) as search_by_example,
+        patch.object(app, "_target_changed", side_effect=[True, False]),
+    ):
+        response = app.search_by_example("def answer(): pass", projects=[project.id])
+
+    assert response is second
+    assert search_by_example.call_count == 2
+
+
+def test_search_by_example_defaults_to_active_root_and_all_projects_expands(
+    tmp_path: Path,
+) -> None:
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    ids = []
+    for name in ("one", "two"):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "main.py").write_text(f"def {name}_feature():\n    return True\n")
+        project = app.init_project(root)
+        app.index_project(project.id)
+        ids.append(project.id)
+
+    # Defaults to active root
+    one_root = tmp_path / "one"
+    active_search = app.search_by_example("def one_feature(): return True", roots=[one_root])
+    assert len(active_search.hits) >= 1
+    assert active_search.hits[0].project_id == ids[0]
+
+    # all_projects expands to all registered projects
+    all_projects = app.search_by_example("def feature(): return True", all_projects=True)
+    assert {hit.project_id for hit in all_projects.hits} == set(ids)
 
 
 def test_repository_stable_query_retries_when_head_moves_mid_operation(tmp_path: Path) -> None:

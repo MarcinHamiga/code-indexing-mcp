@@ -31,6 +31,7 @@ from .models import (
     ChunkKind,
     CodeChunk,
     DeclarationSelector,
+    ExampleSearchResponse,
     HistoryPage,
     ImpactRadiusResponse,
     IndexReport,
@@ -47,6 +48,7 @@ from .models import (
     ReferenceResponse,
     RemovalReport,
     ScanInspectionPage,
+    SearchAcrossProjectsResponse,
     SearchResponse,
     StorageStatus,
     SymbolResponse,
@@ -60,7 +62,8 @@ logger = logging.getLogger(__name__)
 SERVER_INSTRUCTIONS = (
     "Local Tree-sitter code indexing and hybrid search. "
     "When exploring code, prefer these index tools over grep-style file reading: "
-    "search_code (semantic natural-language queries), find_symbol (definitions), "
+    "search_code (semantic natural-language queries), search_by_example "
+    "(code snippet similarity), find_symbol (definitions), "
     "find_references (structural uses of a selected declaration), impact_radius "
     "(transitive dependents), analyze_refactor (rename or signature impact), file_outline "
     "(file structure before reading), "
@@ -848,6 +851,33 @@ def create_server(
             roots=roots,
         )
 
+    async def example_search_resolved_projects(
+        ctx: ServerContext,
+        example: str,
+        projects: list[ProjectInfo],
+        roots: list[Path],
+        language: LanguageName | None,
+        languages: list[LanguageName] | None,
+        paths: list[str] | None,
+        kinds: list[ChunkKind] | None,
+        limit: int,
+    ) -> ExampleSearchResponse:
+        await _wait_for_startup_projects(ctx, roots, projects)
+        selected_languages: list[str] | None = list(languages) if languages else None
+        selected_kinds: list[str] | None = list(kinds) if kinds else None
+        return await asyncio.to_thread(
+            app.search_by_example,
+            example,
+            projects=list(dict.fromkeys(project.id for project in projects)),
+            all_projects=False,
+            language=language,
+            languages=selected_languages,
+            paths=paths,
+            kinds=selected_kinds,
+            limit=limit,
+            roots=roots,
+        )
+
     @mcp.tool(
         title="Initialize project",
         description=(
@@ -1287,6 +1317,87 @@ def create_server(
         )
 
     @mcp.tool(
+        title="Search by example",
+        description=(
+            "Find indexed code chunks most similar to a pasted code snippet. Extracts declaration "
+            "metadata with the production extractor to weight the match, returning ranked code "
+            "snippets with project and path metadata."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def search_by_example(
+        ctx: ServerContext,
+        example: Annotated[
+            str,
+            Field(description="Code snippet to search for similar implementations of."),
+        ],
+        language: Annotated[
+            LanguageName | None,
+            Field(
+                description=(
+                    "Language hint for snippet parsing. If omitted, language is detected "
+                    "from the snippet syntax."
+                )
+            ),
+        ] = None,
+        projects: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Restrict the search to these project ids, names, or paths. Mutually "
+                    "exclusive with all_projects."
+                )
+            ),
+        ] = None,
+        all_projects: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Search every registered project. Off by default so results from unrelated "
+                    "repositories are never mixed in implicitly."
+                )
+            ),
+        ] = False,
+        languages: Annotated[
+            list[LanguageName] | None,
+            Field(description="Restrict to these languages."),
+        ] = None,
+        paths: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Restrict to paths matching these glob patterns, relative to the project "
+                    "root, for example 'src/*' or '**/*.py'. Patterns match from the right, so "
+                    "'*.py' matches any Python file at any depth."
+                )
+            ),
+        ] = None,
+        kinds: Annotated[
+            list[ChunkKind] | None,
+            Field(description="Restrict to these chunk kinds."),
+        ] = None,
+        limit: Annotated[
+            int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
+        ] = 8,
+    ) -> ExampleSearchResponse:
+        roots = await _startup_roots(ctx, discover=True)
+        checkouts = await asyncio.to_thread(
+            app.resolve_scope_checkouts, projects, all_projects, roots
+        )
+        return await example_search_resolved_projects(
+            ctx,
+            example,
+            checkouts,
+            roots,
+            language,
+            languages,
+            paths,
+            kinds,
+            limit,
+        )
+
+    @mcp.tool(
         title="Search across projects",
         description=(
             "Hybrid semantic and keyword search across an explicit set of related projects for "
@@ -1299,15 +1410,6 @@ def create_server(
     @_with_error_details
     async def search_across_projects(
         ctx: ServerContext,
-        query: Annotated[
-            str,
-            Field(
-                description=(
-                    "What to look for across the selected projects, as natural language or "
-                    "keywords. Matched against chunk text and normalized identifier names."
-                )
-            ),
-        ],
         projects: Annotated[
             list[str],
             Field(
@@ -1318,6 +1420,34 @@ def create_server(
                 ),
             ),
         ],
+        query: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "What to look for across the selected projects, as natural language or "
+                    "keywords. Matched against chunk text and normalized identifier names. "
+                    "Mutually exclusive with example."
+                )
+            ),
+        ] = None,
+        example: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Code snippet to search for similar implementations of across the selected "
+                    "projects. Mutually exclusive with query."
+                )
+            ),
+        ] = None,
+        language: Annotated[
+            LanguageName | None,
+            Field(
+                description=(
+                    "Language hint for example parsing. Valid only with example; if omitted, "
+                    "language is detected from the snippet syntax."
+                )
+            ),
+        ] = None,
         languages: Annotated[
             list[LanguageName] | None,
             Field(description="Restrict to these languages across the complete selected scope."),
@@ -1344,7 +1474,17 @@ def create_server(
                 description="Maximum globally ranked hits to return. Hard cap of 50.",
             ),
         ] = 8,
-    ) -> SearchResponse:
+    ) -> SearchAcrossProjectsResponse:
+        if (query is None and example is None) or (query is not None and example is not None):
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                "search_across_projects requires exactly one of 'query' or 'example'",
+            )
+        if query is not None and language is not None:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                "search_across_projects 'language' is valid only with 'example'",
+            )
         roots = await _startup_roots(ctx, discover=True)
         checkouts = await asyncio.to_thread(app.resolve_scope_checkouts, projects, False, roots)
         project_ids = list(dict.fromkeys(project.id for project in checkouts))
@@ -1353,15 +1493,37 @@ def create_server(
                 ErrorCode.INVALID_FILTER,
                 "search_across_projects requires at least two distinct projects",
             )
-        return await search_resolved_projects(
+        if query is not None:
+            query_res = await search_resolved_projects(
+                ctx,
+                query,
+                checkouts,
+                roots,
+                languages,
+                paths,
+                kinds,
+                limit,
+            )
+            return SearchAcrossProjectsResponse(
+                hits=query_res.hits,
+                query=query_res.query,
+            )
+        assert example is not None
+        example_res = await example_search_resolved_projects(
             ctx,
-            query,
+            example,
             checkouts,
             roots,
+            language,
             languages,
             paths,
             kinds,
             limit,
+        )
+        return SearchAcrossProjectsResponse(
+            hits=example_res.hits,
+            language=example_res.language,
+            segments=example_res.segments,
         )
 
     @mcp.tool(

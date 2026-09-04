@@ -33,6 +33,7 @@ from .indexing import REFERENCE_SCHEMA_VERSION
 from .models import (
     CodeChunk,
     DeclarationSelector,
+    ExampleSearchResponse,
     HistoryPage,
     ImpactRadiusResponse,
     IndexReport,
@@ -663,6 +664,8 @@ class DaemonServer:
             )
         if method == "search_code":
             return app.search_code(roots=roots, **params)
+        if method == "search_by_example":
+            return app.search_by_example(roots=roots, **params)
         if method == "find_symbol":
             return app.find_symbol(roots=roots, **params)
         if method == "file_outline":
@@ -1006,6 +1009,11 @@ class BrokerApplication:
 
     def search_code(self, query: str, **params: Any) -> SearchResponse:
         return SearchResponse.model_validate(self._call("search_code", query=query, **params))
+
+    def search_by_example(self, example: str, **params: Any) -> ExampleSearchResponse:
+        return ExampleSearchResponse.model_validate(
+            self._call("search_by_example", example=example, **params)
+        )
 
     def find_symbol(self, name: str, project: str | None = None, **params: Any) -> SymbolResponse:
         return SymbolResponse.model_validate(

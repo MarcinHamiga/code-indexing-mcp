@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
-from .embedding import Embedder
+from .embedding import Embedder, compose_passage
 from .errors import CodeIndexingError, ErrorCode
+from .extractor import TreeSitterExtractor
 from .models import (
     ChunkPreview,
     CodeChunk,
+    ExampleSearchResponse,
     OutlineItem,
     OutlineResponse,
     SearchHit,
@@ -27,6 +29,107 @@ logger = logging.getLogger(__name__)
 # filter, without materialising a whole project's chunks.
 _FALLBACK_FETCH_ROWS = 500
 
+MAX_EXAMPLE_LENGTH = 16_384
+
+_EXAMPLE_SUFFIX: dict[str, str] = {
+    "python": ".py",
+    "java": ".java",
+    "javascript": ".js",
+    "typescript": ".ts",
+    "tsx": ".tsx",
+    "csharp": ".cs",
+    "sql": ".sql",
+    "gdscript": ".gd",
+    "gdshader": ".gdshader",
+    "godot_resource": ".tres",
+    "yaml": ".yaml",
+    "json": ".json",
+    "go": ".go",
+    "terraform": ".tf",
+    "rust": ".rs",
+    "c": ".c",
+    "cpp": ".cpp",
+    "lua": ".lua",
+}
+
+_DETECTION_ORDER: tuple[str, ...] = (
+    "python",
+    "typescript",
+    "javascript",
+    "go",
+    "rust",
+    "java",
+    "csharp",
+    "cpp",
+    "c",
+    "lua",
+    "sql",
+    "gdscript",
+    "tsx",
+    "yaml",
+    "json",
+    "terraform",
+    "gdshader",
+    "godot_resource",
+)
+
+
+def detect_example_language(extractor: TreeSitterExtractor, source: str) -> str | None:
+    source_bytes = source.encode("utf-8")
+    candidates: list[str] = []
+    for language in _DETECTION_ORDER:
+        suffix = _EXAMPLE_SUFFIX.get(language, "")
+        try:
+            result = extractor.extract(Path(f"example{suffix}"), language, source_bytes)
+            if not result.has_errors and any(chunk.kind != "module" for chunk in result.chunks):
+                candidates.append(language)
+        except Exception:
+            continue
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _example_passages(
+    extractor: TreeSitterExtractor,
+    example: str,
+    language: str | None = None,
+) -> tuple[str | None, list[str]]:
+    if not example or not example.strip():
+        raise CodeIndexingError(
+            ErrorCode.INVALID_FILTER, "Example search requires a non-empty code snippet"
+        )
+    example_bytes = example.encode("utf-8")
+    if len(example_bytes) > MAX_EXAMPLE_LENGTH:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_FILTER,
+            f"Example snippet exceeds maximum length of {MAX_EXAMPLE_LENGTH} bytes",
+        )
+    if language is not None:
+        if language not in _EXAMPLE_SUFFIX:
+            raise CodeIndexingError(
+                ErrorCode.UNSUPPORTED_LANGUAGE,
+                f"Unsupported language '{language}'",
+            )
+        suffix = _EXAMPLE_SUFFIX[language]
+        result = extractor.extract(Path(f"example{suffix}"), language, example_bytes)
+        passages = [
+            compose_passage(chunk.embedding_prefix, chunk.content) for chunk in result.chunks
+        ]
+        if not passages:
+            passages = [compose_passage("", example)]
+        return language, passages
+
+    detected = detect_example_language(extractor, example)
+    if detected is not None:
+        suffix = _EXAMPLE_SUFFIX[detected]
+        result = extractor.extract(Path(f"example{suffix}"), detected, example_bytes)
+        passages = [
+            compose_passage(chunk.embedding_prefix, chunk.content) for chunk in result.chunks
+        ]
+        if not passages:
+            passages = [compose_passage("", example)]
+        return detected, passages
+    return None, [compose_passage("", example)]
+
 
 def _as_partition_refs(value: PartitionRef | Sequence[PartitionRef]) -> list[PartitionRef]:
     """Normalize one pinned partition or a sequence of them into a list."""
@@ -36,9 +139,15 @@ def _as_partition_refs(value: PartitionRef | Sequence[PartitionRef]) -> list[Par
 
 
 class SearchService:
-    def __init__(self, store: LanceStore, embedder: Embedder) -> None:
+    def __init__(
+        self,
+        store: LanceStore,
+        embedder: Embedder,
+        extractor: TreeSitterExtractor | None = None,
+    ) -> None:
         self.store = store
         self.embedder = embedder
+        self.extractor = extractor or TreeSitterExtractor()
 
     def search_code(
         self,
@@ -129,6 +238,92 @@ class SearchService:
                 break
         hits.sort(key=lambda hit: (-hit.score, hit.path, hit.start_line))
         return SearchResponse(query=query, hits=hits)
+
+    def search_by_example(
+        self,
+        example: str,
+        project_ids: list[str],
+        *,
+        language: str | None = None,
+        languages: list[str] | None = None,
+        paths: list[str] | None = None,
+        kinds: list[str] | None = None,
+        limit: int = 8,
+        partitions: Mapping[str, PartitionRef | Sequence[PartitionRef]] | None = None,
+    ) -> ExampleSearchResponse:
+        """Search every given project's pinned partitions by code snippet similarity."""
+        if not project_ids:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER, "Example search requires at least one project"
+            )
+        resolved_language, passages = _example_passages(self.extractor, example, language=language)
+        limit = max(1, min(limit, 50))
+        conditions: list[str] = []
+        if languages:
+            conditions.append(self._in_condition("language", languages))
+        if kinds:
+            conditions.append(self._in_condition("kind", kinds))
+        pushed_paths = path_condition(paths) if paths else None
+        if pushed_paths is not None:
+            conditions.append(pushed_paths)
+        elif paths:
+            logger.debug(
+                "Path patterns %r could not be pushed down; filtering %d fetched rows in "
+                "Python, so low-ranking matches may be missed",
+                paths,
+                _FALLBACK_FETCH_ROWS,
+            )
+        fetch = _FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5)
+        if partitions is None:
+            selected = {
+                project_id: [self.store.active_partition(project_id)] for project_id in project_ids
+            }
+        else:
+            selected = {
+                project_id: _as_partition_refs(refs) for project_id, refs in partitions.items()
+            }
+        if (
+            set(selected) != set(project_ids)
+            or any(
+                ref.project_id != project_id
+                for project_id, refs in selected.items()
+                for ref in refs
+            )
+            or any(not refs for refs in selected.values())
+        ):
+            raise ValueError("search partitions do not match the requested projects")
+        partition_ids = {
+            project_id: [ref.partition_id for ref in refs] for project_id, refs in selected.items()
+        }
+        vectors = self.embedder.embed_passages(passages)
+        with self.store.partitions_access(selected):
+            rows = self.store.example_search(
+                vectors,
+                project_ids,
+                " AND ".join(conditions) if conditions else None,
+                fetch,
+                partition_ids=partition_ids,
+            )
+        names = {project.id: project.name for project in self.store.list_projects()}
+        hits: list[SearchHit] = []
+        seen: set[tuple[str, str, int, int]] = set()
+        for row in rows:
+            chunk = ChunkPreview.model_validate(row)
+            if paths and not any(PurePosixPath(chunk.path).match(pattern) for pattern in paths):
+                continue
+            key = (chunk.project_id, chunk.path, chunk.start_line, chunk.end_line)
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(self._hit(chunk, names, float(row.get("_relevance_score", 0.0))))
+            if len(hits) == limit:
+                break
+        hits.sort(key=lambda hit: (-hit.score, hit.path, hit.start_line))
+        return ExampleSearchResponse(
+            language=resolved_language,
+            segments=len(passages),
+            hits=hits,
+        )
 
     def find_symbol(
         self,

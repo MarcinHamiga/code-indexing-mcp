@@ -5,9 +5,16 @@ import pytest
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import Indexer
+from code_indexing_mcp.models import ExampleSearchResponse
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner
-from code_indexing_mcp.search import SearchService
+from code_indexing_mcp.search import (
+    _EXAMPLE_SUFFIX,
+    MAX_EXAMPLE_LENGTH,
+    SearchService,
+    _example_passages,
+    detect_example_language,
+)
 from code_indexing_mcp.storage import LanceStore, PartitionRef
 
 
@@ -430,3 +437,177 @@ def test_get_chunk_payload_is_dominated_by_content(tmp_path: Path) -> None:
     # Metadata is ~290 chars of ids and offsets; anything beyond a small multiple of
     # the content means a payload field crept back in.
     assert len(encoded) < len(chunk.content) * 2
+
+
+def test_example_search_response_round_trip() -> None:
+    response = ExampleSearchResponse(language=None, segments=0, hits=[])
+    dumped = response.model_dump(mode="json")
+    assert dumped == {"language": None, "segments": 0, "hits": []}
+    loaded = ExampleSearchResponse.model_validate(dumped)
+    assert loaded == response
+
+
+def test_example_passages_python_snippet() -> None:
+    extractor = TreeSitterExtractor()
+    snippet = "def calculate_total(items):\n    return sum(items)\n"
+    lang, passages = _example_passages(extractor, snippet, language="python")
+    assert lang == "python"
+    assert len(passages) >= 1
+    assert passages[0].startswith("language: python")
+    assert "return sum(items)" in passages[0]
+
+
+def test_detect_example_language() -> None:
+    extractor = TreeSitterExtractor()
+    assert detect_example_language(extractor, "def foo():\n    return 1\n") == "python"
+    assert detect_example_language(extractor, "func answer() int { return 42 }") == "go"
+    assert (
+        detect_example_language(
+            extractor, "interface UserProfile {\n    id: string;\n    name: string;\n}\n"
+        )
+        is None
+    )
+    assert detect_example_language(extractor, "function greet() { return 'hello'; }") is None
+    assert detect_example_language(extractor, "int add(int a, int b) { return a + b; }") is None
+    assert (
+        detect_example_language(extractor, "This is plain prose explaining how something works.")
+        is None
+    )
+
+
+def test_example_passages_prose_fallback() -> None:
+    extractor = TreeSitterExtractor()
+    prose = "Just plain text without code declarations."
+    lang, passages = _example_passages(extractor, prose)
+    assert lang is None
+    assert passages == [prose]
+
+
+def test_example_suffix_entries_parse_via_extractor() -> None:
+    extractor = TreeSitterExtractor()
+    for lang, suffix in _EXAMPLE_SUFFIX.items():
+        result = extractor.extract(Path(f"example{suffix}"), lang, b"")
+        assert result.chunks == []
+
+
+def test_example_passages_validation_errors() -> None:
+    extractor = TreeSitterExtractor()
+    with pytest.raises(CodeIndexingError) as empty_err:
+        _example_passages(extractor, "   \n  ")
+    assert empty_err.value.code == ErrorCode.INVALID_FILTER
+
+    with pytest.raises(CodeIndexingError) as oversized_err:
+        _example_passages(extractor, "x" * (MAX_EXAMPLE_LENGTH + 1))
+    assert oversized_err.value.code == ErrorCode.INVALID_FILTER
+    assert str(MAX_EXAMPLE_LENGTH) in str(oversized_err.value)
+
+    with pytest.raises(CodeIndexingError) as multibyte_err:
+        _example_passages(extractor, "é" * (MAX_EXAMPLE_LENGTH // 2 + 1))
+    assert multibyte_err.value.code == ErrorCode.INVALID_FILTER
+    assert "bytes" in str(multibyte_err.value)
+
+    with pytest.raises(CodeIndexingError) as unsupported_err:
+        _example_passages(extractor, "some code", language="unsupported_lang")
+    assert unsupported_err.value.code == ErrorCode.UNSUPPORTED_LANGUAGE
+
+
+def test_search_by_example_exact_chunk_and_renamed_similarity(tmp_path: Path) -> None:
+    _, search, projects = indexed_projects(tmp_path)
+
+    # 1. Pasting a function from an indexed file ranks that chunk first
+    exact_snippet = "def enforce_permissions(user):\n    return user.is_admin\n"
+    res = search.search_by_example(exact_snippet, projects)
+    assert res.language == "python"
+    assert res.segments == 1
+    assert len(res.hits) >= 1
+    assert res.hits[0].symbol == "enforce_permissions"
+    assert res.hits[0].project_id == projects[0]
+    assert pytest.approx(res.hits[0].score, abs=1e-4) == 1.0
+
+    # 2. A structurally similar-but-renamed function outranks unrelated code
+    similar_snippet = "def check_permissions(subject):\n    return subject.is_admin\n"
+    res_similar = search.search_by_example(similar_snippet, projects)
+    assert res_similar.hits[0].symbol == "enforce_permissions"
+    if len(res_similar.hits) > 1:
+        assert res_similar.hits[0].score > res_similar.hits[1].score
+
+
+def test_search_by_example_filters_compose(tmp_path: Path) -> None:
+    _, search, projects = indexed_projects(tmp_path)
+    snippet = "def enforce_permissions(user):\n    return user.is_admin\n"
+
+    # Matching filters
+    matched = search.search_by_example(
+        snippet,
+        projects,
+        languages=["python"],
+        kinds=["function"],
+        paths=["auth.py"],
+    )
+    assert len(matched.hits) == 1
+    assert matched.hits[0].symbol == "enforce_permissions"
+
+    # Conflicting language
+    assert (
+        search.search_by_example(
+            snippet,
+            projects,
+            languages=["rust"],
+        ).hits
+        == []
+    )
+
+    # Conflicting kind
+    assert (
+        search.search_by_example(
+            snippet,
+            projects,
+            kinds=["class"],
+        ).hits
+        == []
+    )
+
+    # Conflicting path
+    assert (
+        search.search_by_example(
+            snippet,
+            projects,
+            paths=["billing/**"],
+        ).hits
+        == []
+    )
+
+
+def test_search_by_example_limit_clamping(tmp_path: Path) -> None:
+    _, search, projects = indexed_projects(tmp_path)
+    snippet = "def enforce_permissions(user):\n    return user.is_admin\n"
+
+    # limit <= 0 clamped to 1
+    res_min = search.search_by_example(snippet, projects, limit=0)
+    assert len(res_min.hits) == 1
+
+    # limit > 50 clamped to 50
+    res_max = search.search_by_example(snippet, projects, limit=100)
+    assert len(res_max.hits) <= 50
+
+
+def test_search_by_example_partitions_validation_errors(tmp_path: Path) -> None:
+    _, search, projects = indexed_projects(tmp_path)
+    snippet = "def enforce_permissions(user):\n    return user.is_admin\n"
+
+    # Empty project_ids
+    with pytest.raises(CodeIndexingError) as err:
+        search.search_by_example(snippet, [])
+    assert err.value.code == ErrorCode.INVALID_FILTER
+
+    # Partitions mapping mismatch
+    with pytest.raises(ValueError, match="search partitions do not match the requested projects"):
+        search.search_by_example(
+            snippet,
+            projects,
+            partitions={
+                projects[0]: PartitionRef(
+                    project_id="other", slot_id="slot", partition_id="part", activation_epoch=1
+                )
+            },
+        )

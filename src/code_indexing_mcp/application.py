@@ -32,6 +32,7 @@ from .models import (
     SCAN_SKIP_REASONS,
     CodeChunk,
     DeclarationSelector,
+    ExampleSearchResponse,
     HistoryPage,
     ImpactRadiusResponse,
     IndexReport,
@@ -232,6 +233,20 @@ class ApplicationLike(Protocol):
         limit: int = 8,
         roots: list[Path] | None = None,
     ) -> SearchResponse: ...
+
+    def search_by_example(
+        self,
+        example: str,
+        *,
+        language: str | None = None,
+        projects: list[str] | None = None,
+        all_projects: bool = False,
+        languages: list[str] | None = None,
+        paths: list[str] | None = None,
+        kinds: list[str] | None = None,
+        limit: int = 8,
+        roots: list[Path] | None = None,
+    ) -> ExampleSearchResponse: ...
 
     def init_project(
         self,
@@ -459,7 +474,7 @@ class Application:
             progress_directory=paths.data / "progress",
             history=self.history,
         )
-        self.search = SearchService(self.store, embedder)
+        self.search = SearchService(self.store, embedder, extractor=self.indexer.extractor)
         self.references = ReferenceService(self.store)
         # Storage maintenance is owned by MaintenanceService (D2). It needs
         # target resolution only Application can provide -- which projects are
@@ -1384,6 +1399,43 @@ class Application:
             return self.search.search_code(
                 query,
                 project_ids,
+                languages=languages,
+                paths=paths,
+                kinds=kinds,
+                limit=limit,
+                partitions={
+                    project_id: [target.partition for target in targets.get(project_id, ())]
+                    for project_id in project_ids
+                },
+            )
+
+        return self._run_repository_stable_query(
+            resolved,
+            search,
+        )
+
+    def search_by_example(
+        self,
+        example: str,
+        *,
+        language: str | None = None,
+        projects: list[str] | None = None,
+        all_projects: bool = False,
+        languages: list[str] | None = None,
+        paths: list[str] | None = None,
+        kinds: list[str] | None = None,
+        limit: int = 8,
+        roots: list[Path] | None = None,
+    ) -> ExampleSearchResponse:
+        resolved = self._scope_checkouts(projects, all_projects, roots)
+        project_ids = list(dict.fromkeys(project.id for project in resolved))
+
+        def search(targets: Mapping[str, Sequence[ActiveIndexTarget]]) -> ExampleSearchResponse:
+            self._ensure_query_generations(targets)
+            return self.search.search_by_example(
+                example,
+                project_ids,
+                language=language,
                 languages=languages,
                 paths=paths,
                 kinds=kinds,

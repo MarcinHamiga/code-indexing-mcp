@@ -19,7 +19,7 @@ import pytest
 from conftest import run_git
 from lancedb.expr import Expr
 from lancedb.merge import LanceMergeInsertBuilder
-from lancedb.query import LanceHybridQueryBuilder
+from lancedb.query import LanceHybridQueryBuilder, LanceVectorQueryBuilder
 from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
@@ -846,6 +846,184 @@ def test_vector_index_gate_reads_vector_index_min_rows(
     exact_tables = exact._existing_tables(project.id)
     assert exact_tables is not None
     assert not any("vector" in index.columns for index in exact_tables.chunks.list_indices())
+
+
+def test_example_search_nearer_vector_wins_shared_chunk(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    project = _seed_hybrid_target(store, tmp_path / "repo")
+    far_vec = [1.0, 0.0, 0.0, 0.0]
+    near_vec = [0.0, 0.0, 0.0, 1.0]
+
+    hits_far_first = store.example_search([far_vec, near_vec], [project.id], None, 5)
+    hits_near_first = store.example_search([near_vec, far_vec], [project.id], None, 5)
+
+    assert len(hits_far_first) == 2
+    assert len(hits_near_first) == 2
+    for hit in hits_far_first:
+        assert pytest.approx(hit["_relevance_score"], abs=1e-4) == 1.0
+    for hit in hits_near_first:
+        assert pytest.approx(hit["_relevance_score"], abs=1e-4) == 1.0
+
+    cosine_hits = store.example_search([[1.0, 0.0, 0.0, 1.0]], [project.id], None, 5)
+    for hit in cosine_hits:
+        assert pytest.approx(hit["_relevance_score"], abs=1e-4) == 2**-0.5
+
+
+def test_example_search_requires_distance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    project = _seed_hybrid_target(store, tmp_path / "repo")
+    original = LanceVectorQueryBuilder.to_list
+
+    def without_distance(builder: LanceVectorQueryBuilder) -> list[dict[str, Any]]:
+        rows = original(builder)
+        for row in rows:
+            row.pop("_distance", None)
+        return rows
+
+    monkeypatch.setattr(LanceVectorQueryBuilder, "to_list", without_distance)
+
+    with pytest.raises(KeyError, match="_distance"):
+        store.example_search([[0.0, 0.0, 0.0, 1.0]], [project.id], None, 5)
+
+
+def test_example_search_per_segment_limits_fan_in_and_merge(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+
+    chunks = [
+        StoredChunk(
+            chunk_id=f"{project.id}:chunk-{i}",
+            file_id="file-1",
+            path="module.py",
+            language="python",
+            kind="function",
+            symbol=f"sym_{i}",
+            qualified_symbol=f"sym_{i}",
+            parent_symbol=None,
+            start_byte=i * 10,
+            end_byte=i * 10 + 9,
+            start_line=i + 1,
+            end_line=i + 1,
+            content=f"pass_{i}",
+            identifier_terms=f"term_{i}",
+            part_index=0,
+            vector=vec,
+        )
+        for i, vec in enumerate(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.8, 0.2, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.8, 0.2],
+            ]
+        )
+    ]
+    store.replace_file(stored_file(project.id, file_id="file-1"), chunks)
+    store.ensure_indexes(project.id)
+
+    seg0 = [1.0, 0.0, 0.0, 0.0]
+    seg1 = [0.0, 0.0, 1.0, 0.0]
+
+    hits = store.example_search([seg0, seg1], [project.id], None, limit=2)
+    assert len(hits) == 2
+    matched_ids = {hit["chunk_id"] for hit in hits}
+    assert matched_ids == {f"{project.id}:chunk-0", f"{project.id}:chunk-2"}
+
+
+def test_example_search_condition_prefilter(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+
+    chunks = [
+        StoredChunk(
+            chunk_id=f"{project.id}:chunk-py",
+            file_id="file-py",
+            path="module.py",
+            language="python",
+            kind="function",
+            symbol="py_fn",
+            qualified_symbol="py_fn",
+            parent_symbol=None,
+            start_byte=0,
+            end_byte=10,
+            start_line=1,
+            end_line=2,
+            content="def f(): pass",
+            identifier_terms="",
+            part_index=0,
+            vector=[1.0, 0.0, 0.0, 0.0],
+        ),
+        StoredChunk(
+            chunk_id=f"{project.id}:chunk-rs",
+            file_id="file-rs",
+            path="module.rs",
+            language="rust",
+            kind="function",
+            symbol="rs_fn",
+            qualified_symbol="rs_fn",
+            parent_symbol=None,
+            start_byte=0,
+            end_byte=10,
+            start_line=1,
+            end_line=2,
+            content="fn f() {}",
+            identifier_terms="",
+            part_index=0,
+            vector=[1.0, 0.0, 0.0, 0.0],
+        ),
+    ]
+    store.replace_file(stored_file(project.id, file_id="file-py"), [chunks[0]])
+    store.replace_file(stored_file(project.id, file_id="file-rs"), [chunks[1]])
+    store.ensure_indexes(project.id)
+
+    py_hits = store.example_search(
+        [[1.0, 0.0, 0.0, 0.0]], [project.id], condition="language = 'python'", limit=5
+    )
+    assert len(py_hits) == 1
+    assert py_hits[0]["chunk_id"] == f"{project.id}:chunk-py"
+
+    both_hits = store.example_search(
+        [[1.0, 0.0, 0.0, 0.0]],
+        [project.id],
+        condition="language IN ('python', 'rust')",
+        limit=5,
+    )
+    assert len(both_hits) == 2
+
+
+def test_example_search_pinned_partitions_and_multi_project(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    proj_a = _seed_hybrid_target(store, tmp_path / "repo-a")
+    proj_b = _seed_hybrid_target(store, tmp_path / "repo-b")
+
+    hits = store.example_search([[0.0, 0.0, 0.0, 1.0]], [proj_a.id, proj_b.id], None, limit=4)
+    assert len(hits) == 4
+    project_ids = {hit["project_id"] for hit in hits}
+    assert project_ids == {proj_a.id, proj_b.id}
+
+    pinned_hits = store.example_search(
+        [[0.0, 0.0, 0.0, 1.0]],
+        [proj_a.id, proj_b.id],
+        None,
+        limit=4,
+        partition_ids={proj_a.id: proj_a.id, proj_b.id: proj_b.id},
+    )
+    assert len(pinned_hits) == 4
+
+    with pytest.raises(ValueError, match="Missing physical partitions"):
+        store.example_search(
+            [[0.0, 0.0, 0.0, 1.0]],
+            [proj_a.id, proj_b.id],
+            None,
+            limit=4,
+            partition_ids={proj_a.id: proj_a.id},
+        )
 
 
 def test_maintenance_keeps_versions_inside_the_retention_window(tmp_path: Path) -> None:

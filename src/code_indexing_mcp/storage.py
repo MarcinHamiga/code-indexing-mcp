@@ -1761,22 +1761,12 @@ class LanceStore:
         )
         return sum(table.chunks.count_rows() for table in tables if table is not None)
 
-    def hybrid_search(
+    def _fan_out_partitions(
         self,
-        query_text: str,
-        vector: list[float],
         project_ids: Iterable[str],
-        condition: str | None,
-        limit: int,
-        *,
-        partition_ids: Mapping[str, str | Sequence[str]] | None = None,
+        partition_ids: Mapping[str, str | Sequence[str]] | None,
+        search_fn: Callable[[str, str | None], list[dict[str, Any]]],
     ) -> list[dict[str, Any]]:
-        """Run the hybrid query across every pinned physical partition.
-
-        A project may pin several partitions -- one per live checkout of a
-        shared registration -- so each project's entry may be one partition id
-        or a sequence of them.
-        """
         ids = list(project_ids)
         if not ids:
             return []
@@ -1796,32 +1786,73 @@ class LanceStore:
         results: dict[int, list[dict[str, Any]]] = {}
         if len(tasks) == 1:
             project_id, partition_id = tasks[0]
-            results[0] = self._hybrid_search_rows(
+            results[0] = search_fn(project_id, partition_id)
+        else:
+            workers = min(len(tasks), _SEARCH_CONCURRENCY)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    index: pool.submit(search_fn, project_id, partition_id)
+                    for index, (project_id, partition_id) in enumerate(tasks)
+                }
+                for index, future in futures.items():
+                    results[index] = future.result()
+        return [row for index in range(len(tasks)) for row in results.get(index, [])]
+
+    def hybrid_search(
+        self,
+        query_text: str,
+        vector: list[float],
+        project_ids: Iterable[str],
+        condition: str | None,
+        limit: int,
+        *,
+        partition_ids: Mapping[str, str | Sequence[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run the hybrid query across every pinned physical partition.
+
+        A project may pin several partitions -- one per live checkout of a
+        shared registration -- so each project's entry may be one partition id
+        or a sequence of them.
+        """
+        rows = self._fan_out_partitions(
+            project_ids,
+            partition_ids,
+            lambda project_id, partition_id: self._hybrid_search_rows(
                 project_id,
                 query_text,
                 vector,
                 condition,
                 limit,
                 partition_id=partition_id,
-            )
-        else:
-            workers = min(len(tasks), _SEARCH_CONCURRENCY)
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    index: pool.submit(
-                        self._hybrid_search_rows,
-                        project_id,
-                        query_text,
-                        vector,
-                        condition,
-                        limit,
-                        partition_id=partition_id,
-                    )
-                    for index, (project_id, partition_id) in enumerate(tasks)
-                }
-                for index, future in futures.items():
-                    results[index] = future.result()
-        rows = [row for index in range(len(tasks)) for row in results.get(index, [])]
+            ),
+        )
+        rows.sort(key=lambda row: float(row.get("_relevance_score", 0.0)), reverse=True)
+        return rows[:limit]
+
+    def example_search(
+        self,
+        vectors: Sequence[list[float]],
+        project_ids: Iterable[str],
+        condition: str | None,
+        limit: int,
+        *,
+        partition_ids: Mapping[str, str | Sequence[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run vector-only searches per snippet vector across partitions and merge."""
+        vec_list = list(vectors)
+        if not vec_list:
+            return []
+        rows = self._fan_out_partitions(
+            project_ids,
+            partition_ids,
+            lambda project_id, partition_id: self._example_search_rows(
+                project_id,
+                vec_list,
+                condition,
+                limit,
+                partition_id=partition_id,
+            ),
+        )
         rows.sort(key=lambda row: float(row.get("_relevance_score", 0.0)), reverse=True)
         return rows[:limit]
 
@@ -1897,6 +1928,59 @@ class LanceStore:
         for row in query_rows:
             row["project_id"] = project_id
         return query_rows
+
+    def _example_search_rows(
+        self,
+        project_id: str,
+        vectors: Sequence[list[float]],
+        condition: str | None,
+        limit: int,
+        *,
+        partition_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run vector-only queries for one partition across vectors, merging by best distance."""
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return []
+        select_cols = [
+            "chunk_id",
+            "path",
+            "language",
+            "kind",
+            "symbol",
+            "qualified_symbol",
+            "parent_symbol",
+            "start_line",
+            "end_line",
+            "content",
+            "_distance",
+        ]
+        best_by_chunk: dict[str, dict[str, Any]] = {}
+        for vector in vectors:
+            query = tables.chunks.search(
+                vector, vector_column_name="vector", query_type="vector"
+            ).distance_type("cosine")
+            if condition:
+                query = query.where(condition, prefilter=True)
+            query = query.limit(limit).select(select_cols)
+            if self.vector_index == "exact":
+                query = query.bypass_vector_index()
+            else:
+                query = query.ef(VECTOR_INDEX_EF).refine_factor(VECTOR_INDEX_REFINE_FACTOR)
+            query_rows = cast(list[dict[str, Any]], query.to_list())
+            for row in query_rows:
+                row["project_id"] = project_id
+                cid = row["chunk_id"]
+                distance = float(row["_distance"])
+                score = 1.0 - distance
+                row["_relevance_score"] = score
+                row["score"] = score
+                existing = best_by_chunk.get(cid)
+                if existing is None or distance < float(existing.get("_distance", float("inf"))):
+                    best_by_chunk[cid] = row
+        rows = list(best_by_chunk.values())
+        rows.sort(key=lambda row: float(row.get("_relevance_score", 0.0)), reverse=True)
+        return rows[:limit]
 
     def find_symbol_chunks(
         self,
