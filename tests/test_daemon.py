@@ -24,7 +24,12 @@ from code_indexing_mcp.daemon import (
 )
 from code_indexing_mcp.embedding import FastEmbedder
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
-from code_indexing_mcp.models import DeclarationSelector, IndexReport, RenameOperation
+from code_indexing_mcp.models import (
+    DeclarationSelector,
+    ExampleSearchResponse,
+    IndexReport,
+    RenameOperation,
+)
 from code_indexing_mcp.settings import IndexSettings
 
 # Gate on the capability the code actually needs rather than on the platform, so
@@ -246,6 +251,53 @@ def test_broker_forwards_refactor_pagination_parameters(tmp_path: Path) -> None:
     # since nothing in it is a coverage gap or an unproven candidate (R4).
     assert analysis.cursor is not None
     assert analysis.completeness.state == "complete"
+
+
+@requires_local_sockets
+def test_search_by_example_round_trip(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=root)
+    project = application.init_project(root)
+    application.index_project(project.id)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=root)
+
+    try:
+        result = broker.search_by_example(
+            "def answer():\n    return 42\n",
+            projects=[project.id],
+            language="python",
+        )
+        assert isinstance(result, ExampleSearchResponse)
+        assert result.language == "python"
+        assert result.segments >= 1
+        assert len(result.hits) >= 1
+        assert result.hits[0].path == "main.py"
+        assert isinstance(result.hits[0].score, float)
+
+        with pytest.raises(CodeIndexingError) as err_lang:
+            broker.search_by_example(
+                "fn main() {}",
+                projects=[project.id],
+                language="fortran",
+            )
+        assert err_lang.value.code is ErrorCode.UNSUPPORTED_LANGUAGE
+
+        with pytest.raises(CodeIndexingError) as err_empty:
+            broker.search_by_example(
+                "   \n  ",
+                projects=[project.id],
+            )
+        assert err_empty.value.code is ErrorCode.INVALID_FILTER
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
 
 
 @requires_local_sockets

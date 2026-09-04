@@ -10,6 +10,8 @@
   see `2026-08-27-structural-references-more-languages-design.md`.
 - **Transitive impact radius** (N-hop closure over the reference graph) —
   see `2026-08-27-transitive-impact-radius-design.md`.
+- **Search by example** (paste a snippet, get structurally similar code) —
+  see `2026-09-04-search-by-example-plan.md`.
 
 ## Backlog
 
@@ -28,14 +30,6 @@ filter parameters. Parsed client-side into the existing `languages`/`paths` filt
 the index scan pushdown (`docs/plans/2026-07-27-search-paths-pushdown.md`) is reused
 unchanged. Quoting rules and conflicts with explicit filter parameters need a decision:
 error on conflict, or let the query string win.
-
-### Search-by-example
-
-Paste a snippet, get structurally similar code. Embeddings already make the similarity
-search itself cheap; the work is chunking the pasted snippet with the extractor so its
-declaration metadata can weight the match, and deciding whether the snippet is embedded
-as-is or normalized first. Pairs well with `search_across_projects` for "where else do
-we do this".
 
 ### Similar-chunk clustering
 

@@ -841,6 +841,19 @@ class SearchResponse(FrozenModel):
     hits: list[SearchHit]
 
 
+class ExampleSearchResponse(FrozenModel):
+    language: str | None
+    segments: int
+    hits: list[SearchHit]
+
+
+class SearchAcrossProjectsResponse(FrozenModel):
+    hits: list[SearchHit]
+    query: str | None = None
+    language: str | None = None
+    segments: int | None = None
+
+
 class SymbolResponse(FrozenModel):
     name: str
     hits: list[SearchHit]

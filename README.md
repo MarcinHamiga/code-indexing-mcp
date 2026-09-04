@@ -287,6 +287,7 @@ overwrite a marker and orphan the previous index.
 | `index_storage_maintenance` | read, registers | Compact tables and remove verified old Lance versions (dry-run by default; explicit `dry_run=false` cleans up). |
 | `list_projects` | read only | Every registered project, sorted by name. |
 | `search_code` | read, registers and indexes | Hybrid semantic and keyword search returning ranked snippets. |
+| `search_by_example` | read, registers and indexes | Find indexed chunks most similar to a pasted code snippet. |
 | `search_across_projects` | read, registers and indexes | Globally ranked search across at least two explicitly selected projects. |
 | `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
 | `find_references` | read, registers and indexes | Structural references to one selected C#, Go, Java, JavaScript, Python, Rust, TSX, or TypeScript declaration. |
