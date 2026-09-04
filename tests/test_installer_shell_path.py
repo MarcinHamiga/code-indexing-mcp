@@ -217,6 +217,24 @@ def test_install_and_remove_tui_launcher(tmp_path: Path) -> None:
     assert not (bin_directory / "syndex").exists()
 
 
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlink launcher")
+def test_install_tui_launcher_skips_foreign_executable_without_overwriting(tmp_path: Path) -> None:
+    checkout = _checkout(tmp_path)
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir(parents=True, exist_ok=True)
+    foreign_binary = bin_directory / "syndex"
+    foreign_binary.write_text("#!/bin/sh\necho foreign\n")
+
+    result = shell_path.install_launcher(
+        checkout, bin_directory, command=shell_path.TUI_LAUNCHER_NAME
+    )
+    assert result.status == "skipped"
+    assert not result.ok
+    assert "not owned by this installation" in result.detail
+    assert foreign_binary.read_text() == "#!/bin/sh\necho foreign\n"
+    assert not (bin_directory / "syndex.1.bak").exists()
+
+
 # --- PATH detection ----------------------------------------------------------
 
 

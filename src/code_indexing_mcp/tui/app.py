@@ -170,6 +170,16 @@ class CodeIndexingApp(App[int]):
             project = self.service.select_project(project_id)
             status = self.service.project_status(project)
             self._update_header(project, status)
+            self._hits = []
+            self._highlighted_index = None
+            option_list = self.query_one("#results-list", OptionList)
+            option_list.clear_options()
+            self.query_one("#results-title", Label).update("Results")
+            self.query_one("#detail-title", Label).update("Code Preview")
+            self.query_one("#detail-content", Static).update(
+                f"Active project changed to {project.name}.\n\n"
+                "Run a query to search, or press F5 to index."
+            )
             self._set_status(f"Selected project: {project.name}")
         except CodeIndexingError as exc:
             self._show_error(str(exc))
@@ -460,9 +470,9 @@ class CodeIndexingApp(App[int]):
         self._is_indexing = False
         self._update_header(project, status)
         files_indexed = getattr(report, "indexed_files", getattr(report, "files_indexed", 0))
-        chunks_created = getattr(report, "chunks_created", 0)
+        chunks_embedded = getattr(report, "embedded_chunks", getattr(report, "chunks_staged", 0))
         self._set_status(
-            f"Indexing complete: {files_indexed} files indexed, {chunks_created} chunks created."
+            f"Indexing complete: {files_indexed} files indexed, {chunks_embedded} chunks embedded."
         )
 
     def _on_index_failed(self, error_message: str) -> None:

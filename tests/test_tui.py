@@ -57,6 +57,14 @@ async def test_tui_app_project_switch() -> None:
         await app.workers.wait_for_complete()
         await pilot.pause()
 
+        # Run a search to populate results in the initial project
+        query_input = app.query_one("#query-input", Input)
+        query_input.value = "main"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert len(app._hits) > 0
+
         proj_select = app.query_one("#project-select", Select)
         proj_select.value = "proj-2"
         await pilot.pause()
@@ -67,6 +75,12 @@ async def test_tui_app_project_switch() -> None:
 
         status_bar = app.query_one("#status-bar", Static).render()
         assert "Selected project: repo-beta" in str(status_bar)
+
+        # Hits and detail pane should be cleared
+        assert len(app._hits) == 0
+        assert app.query_one("#results-list", OptionList).option_count == 0
+        detail_text = str(app.query_one("#detail-content", Static).render())
+        assert "Active project changed to repo-beta" in detail_text
 
 
 @pytest.mark.asyncio
@@ -206,7 +220,7 @@ async def test_tui_app_index_trigger() -> None:
 
         assert not app._is_indexing
         status_bar = app.query_one("#status-bar", Static).render()
-        assert "Indexing complete: 5 files indexed" in str(status_bar)
+        assert "Indexing complete: 5 files indexed, 10 chunks embedded." in str(status_bar)
         assert len(fake_app.index_calls) == 1
 
 
@@ -298,3 +312,12 @@ async def test_tui_app_navigation_and_quit() -> None:
         app.action_quit_app()
         await pilot.pause()
         assert app.return_code == 0
+
+
+def test_tui_main_invalid_project_exits_with_error(capsys: pytest.CaptureFixture[str]) -> None:
+    from code_indexing_mcp.tui import main as tui_main
+
+    exit_code = tui_main(["nonexistent-project-xyz"])
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "Error:" in captured.err

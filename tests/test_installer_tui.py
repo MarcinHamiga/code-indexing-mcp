@@ -616,6 +616,41 @@ async def test_done_panel_tells_the_user_how_to_reach_the_new_command(
 
 
 @pytest.mark.asyncio
+async def test_done_panel_falls_back_to_mcp_tui_when_tui_launcher_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import code_indexing_mcp.installer.tui.panels as panels
+    from code_indexing_mcp.installer.orchestrator import InstallResult
+    from code_indexing_mcp.installer.shell_path import LauncherResult
+
+    launcher = LauncherResult(tmp_path / "bin" / "code-indexing-mcp", "created", "points at it")
+    tui_launcher = LauncherResult(
+        tmp_path / "bin" / "syndex", "skipped", "not owned by this installation"
+    )
+    monkeypatch.setattr(
+        panels,
+        "run_install",
+        lambda plan, on_event=None, should_continue=None: InstallResult(
+            None,
+            (),
+            (),
+            (),
+            launcher=launcher,
+            profiles_updated=(),
+            tui_launcher=tui_launcher,
+        ),
+    )
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "summary")
+        await click(pilot, "#next")
+        await pilot.pause()
+        body = str(app.query_one("#done-body", Static).render())
+        assert "Explore indexed code interactively with: code-indexing-mcp tui" in body
+        assert "TUI Launcher NOT created:" in body
+
+
+@pytest.mark.asyncio
 async def test_progress_shows_a_row_per_step_and_marks_what_ran(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -125,6 +125,7 @@ class FakeApplication:
         return IndexReport(
             project_id=target.id,
             indexed_files=5,
+            embedded_chunks=10,
             chunks_staged=10,
         )
 
