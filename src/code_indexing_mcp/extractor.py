@@ -3519,6 +3519,17 @@ class TreeSitterExtractor:
             parent = node.parent
             if parent is not None and parent.type in {"relation", "field"}:
                 return
+            if parent is not None and parent.type == "from":
+                statement = parent.parent
+                if (
+                    statement is not None
+                    and statement.type == "statement"
+                    and any(child.type == "delete" for child in statement.named_children)
+                ):
+                    # DELETE mutates its target table exactly like UPDATE does.
+                    text = _capture_name(source, node)
+                    add_reference("write", node, target_name=text, written_name=text)
+                    return
             ancestor = parent
             while ancestor is not None:
                 if ancestor.type in TreeSitterExtractor._SQL_DEFINING_STATEMENTS | {

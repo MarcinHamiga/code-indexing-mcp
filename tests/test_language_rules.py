@@ -3,7 +3,11 @@
 from pathlib import PurePosixPath
 
 from code_indexing_mcp.extractor import STRUCTURAL_LANGUAGES
-from code_indexing_mcp.language_rules import _DEFAULT, LANGUAGE_RULES
+from code_indexing_mcp.language_rules import (
+    _DEFAULT,
+    LANGUAGE_RULES,
+    _empty_import_candidates,
+)
 
 
 def test_every_structural_language_has_a_row() -> None:
@@ -141,6 +145,12 @@ def test_import_candidates_for_new_languages() -> None:
 
     cpp = LANGUAGE_RULES["cpp"].import_candidates
     assert cpp(PurePosixPath("app/main.cpp"), "widget.h", known, None) == set()
+    # Positive: C/C++ matches the include basename against known_paths.
+    known_with_header = frozenset({"app/widget.h", "other/widget.h"})
+    assert cpp(PurePosixPath("app/main.cpp"), "widget.h", known_with_header, None) == {
+        PurePosixPath("app/widget.h"),
+        PurePosixPath("other/widget.h"),
+    }
 
     lua = LANGUAGE_RULES["lua"].import_candidates
     assert lua(PurePosixPath("app/main.lua"), "a.b", known, None) == {
@@ -169,12 +179,24 @@ def test_import_candidates_for_new_languages() -> None:
     assert terraform(PurePosixPath("env/main.tf"), "../vpc", known, None) == {
         PurePosixPath("vpc/main.tf")
     }
+    # Remote/registry sources never resolve by design (only local ./ ../ do).
     assert (
         terraform(PurePosixPath("main.tf"), "terraform-aws-modules/vpc/aws", known, None) == set()
     )
+    # "." from a root-level source normalizes to its own dir entrypoint.
+    assert terraform(PurePosixPath("main.tf"), ".", known, None) == {PurePosixPath("main.tf")}
 
     sql = LANGUAGE_RULES["sql"].import_candidates
+    assert sql is _empty_import_candidates
+    # SQL has no module imports by design.
     assert sql(PurePosixPath("schema.sql"), "other", known, None) == set()
+
+    # Absolute Lua module paths collapse: both roots yield the same path.
+    assert lua(PurePosixPath("app/main.lua"), "/abs/mod", known, None) == {
+        PurePosixPath("/abs/mod")
+    }
+    # Empty rest after res:// yields the project root.
+    assert gdscript(PurePosixPath("player.gd"), "res://", known, None) == {PurePosixPath(".")}
 
 
 def test_bound_receivers_per_language() -> None:

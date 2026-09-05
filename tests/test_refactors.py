@@ -850,21 +850,30 @@ def test_an_unanalyzable_language_makes_the_analysis_incomplete(tmp_path: Path) 
     assert any(item.code == "unsupported_language" for item in analysis.limitations)
 
 
-def test_a_declaration_without_reference_extraction_is_refused(tmp_path: Path) -> None:
-    """Answering at all would mean reporting "rename one line" for a YAML key
-    whose uses this index never looked at."""
+@pytest.mark.parametrize(
+    ("path", "source", "qualified_symbol", "new_name"),
+    [
+        ("config.yaml", "service:\n  port: 8080\n", "service", "web"),
+        ("config.json", '{"service": {"port": 8080}}\n', "service", "web"),
+    ],
+)
+def test_a_declaration_without_reference_extraction_is_refused(
+    tmp_path: Path, path: str, source: str, qualified_symbol: str, new_name: str
+) -> None:
+    """Answering at all would mean reporting "rename one line" for a YAML or
+    JSON key whose uses this index never looked at."""
 
     service, project_id = _indexed_service(
         tmp_path,
         {
-            "config.yaml": "service:\n  port: 8080\n",
+            path: source,
         },
     )
 
     with pytest.raises(CodeIndexingError) as raised:
         service.analyze_refactor(
-            DeclarationSelector(project=project_id, path="config.yaml", qualified_symbol="service"),
-            RenameOperation(new_name="web"),
+            DeclarationSelector(project=project_id, path=path, qualified_symbol=qualified_symbol),
+            RenameOperation(new_name=new_name),
         )
 
     assert raised.value.code is ErrorCode.UNSUPPORTED_LANGUAGE

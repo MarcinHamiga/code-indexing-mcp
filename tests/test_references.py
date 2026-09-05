@@ -24,6 +24,11 @@ class TinyEmbedder:
         return [1.0, 0.0, 0.0, float(len(text))]
 
 
+# YAML is the deliberate still-unsupported canary language.
+_COVERAGE_CANARY_PATH = "config.yaml"
+_COVERAGE_CANARY_SOURCE = "service:\n  port: 8080\n"
+
+
 def _indexed_service(
     tmp_path: Path,
     files: dict[str, str],
@@ -35,7 +40,7 @@ def _indexed_service(
     for path, source in files.items():
         destination = root / path
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(source)
+        destination.write_text(source, encoding="utf-8")
     project = initialize_project(root)
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     indexer = Indexer(
@@ -613,7 +618,7 @@ def test_files_without_reference_extraction_are_reported_as_a_coverage_gap(
         tmp_path,
         {
             "lib.py": "def answer():\n    return 42\n",
-            "config.yaml": "service:\n  port: 8080\n",
+            _COVERAGE_CANARY_PATH: _COVERAGE_CANARY_SOURCE,
         },
     )
 
@@ -622,7 +627,7 @@ def test_files_without_reference_extraction_are_reported_as_a_coverage_gap(
     )
 
     limitation = next(item for item in response.limitations if item.code == "unsupported_language")
-    assert "config.yaml" in limitation.explanation
+    assert _COVERAGE_CANARY_PATH in limitation.explanation
     assert "1 yaml file(s)" in limitation.explanation
 
 
@@ -639,7 +644,7 @@ def test_go_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> N
         {
             "lib.py": "def answer():\n    return 42\n",
             "main.go": 'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("hi")\n}\n',
-            "config.yaml": "service:\n  port: 8080\n",
+            _COVERAGE_CANARY_PATH: _COVERAGE_CANARY_SOURCE,
         },
     )
 
@@ -656,7 +661,7 @@ def test_go_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> N
     yaml_gaps = [
         item
         for item in response.limitations
-        if item.code == "unsupported_language" and "config.yaml" in item.explanation
+        if item.code == "unsupported_language" and _COVERAGE_CANARY_PATH in item.explanation
     ]
     assert yaml_gaps
 
@@ -674,7 +679,7 @@ def test_rust_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) ->
         {
             "lib.py": "def answer():\n    return 42\n",
             "main.rs": "pub fn main() {\n    let x = 1;\n}\n",
-            "config.yaml": "service:\n  port: 8080\n",
+            _COVERAGE_CANARY_PATH: _COVERAGE_CANARY_SOURCE,
         },
     )
 
@@ -691,7 +696,7 @@ def test_rust_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) ->
     yaml_gaps = [
         item
         for item in response.limitations
-        if item.code == "unsupported_language" and "config.yaml" in item.explanation
+        if item.code == "unsupported_language" and _COVERAGE_CANARY_PATH in item.explanation
     ]
     assert yaml_gaps
 
@@ -710,7 +715,7 @@ def test_java_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) ->
             "lib.py": "def answer():\n    return 42\n",
             "Main.java": "public class Main {\n    public static void main(String[] args) {\n"
             '        System.out.println("hi");\n    }\n}\n',
-            "config.yaml": "service:\n  port: 8080\n",
+            _COVERAGE_CANARY_PATH: _COVERAGE_CANARY_SOURCE,
         },
     )
 
@@ -727,7 +732,7 @@ def test_java_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) ->
     yaml_gaps = [
         item
         for item in response.limitations
-        if item.code == "unsupported_language" and "config.yaml" in item.explanation
+        if item.code == "unsupported_language" and _COVERAGE_CANARY_PATH in item.explanation
     ]
     assert yaml_gaps
 
@@ -1022,7 +1027,7 @@ def test_csharp_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) 
             "lib.py": "def answer():\n    return 42\n",
             "Program.cs": "public class Program {\n    public static void Main() {\n"
             '        System.Console.WriteLine("hi");\n    }\n}\n',
-            "config.yaml": "service:\n  port: 8080\n",
+            _COVERAGE_CANARY_PATH: _COVERAGE_CANARY_SOURCE,
         },
     )
 
@@ -1039,7 +1044,7 @@ def test_csharp_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) 
     yaml_gaps = [
         item
         for item in response.limitations
-        if item.code == "unsupported_language" and "config.yaml" in item.explanation
+        if item.code == "unsupported_language" and _COVERAGE_CANARY_PATH in item.explanation
     ]
     assert yaml_gaps
 
@@ -1057,7 +1062,7 @@ def test_c_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> No
         {
             "lib.py": "def answer():\n    return 42\n",
             "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
-            "config.yaml": "service:\n  port: 8080\n",
+            _COVERAGE_CANARY_PATH: _COVERAGE_CANARY_SOURCE,
         },
     )
 
@@ -1074,7 +1079,7 @@ def test_c_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> No
     yaml_gaps = [
         item
         for item in response.limitations
-        if item.code == "unsupported_language" and "config.yaml" in item.explanation
+        if item.code == "unsupported_language" and _COVERAGE_CANARY_PATH in item.explanation
     ]
     assert yaml_gaps
 
@@ -1098,7 +1103,8 @@ def test_c_same_file_call_resolves_exactly(tmp_path: Path) -> None:
         DeclarationSelector(project=project_id, path="svc.c", qualified_symbol="Authorize")
     )
 
-    call = next(hit for hit in response.hits if hit.kind == "call")
+    call = next((hit for hit in response.hits if hit.kind == "call"), None)
+    assert call is not None, "expected a call hit for Authorize in svc.c"
     assert call.resolution == "exact"
     assert call.reason_code == "same_file_symbol"
 
@@ -1119,8 +1125,9 @@ def test_c_cross_file_call_without_a_header_edge_stays_likely(tmp_path: Path) ->
         DeclarationSelector(project=project_id, path="svc.c", qualified_symbol="Authorize")
     )
 
-    call = next(hit for hit in response.hits if hit.path == "use.c" and hit.kind == "call")
-    assert call.resolution in {"likely", "unresolved"}
+    call = next((hit for hit in response.hits if hit.path == "use.c" and hit.kind == "call"), None)
+    assert call is not None, "expected a call hit for Authorize in use.c"
+    assert call.resolution == "likely"
 
 
 def test_sql_view_reads_its_source_table(tmp_path: Path) -> None:
@@ -1139,8 +1146,10 @@ def test_sql_view_reads_its_source_table(tmp_path: Path) -> None:
     )
 
     table_read = next(
-        hit for hit in response.hits if hit.kind == "read" and hit.written_name == "users"
+        (hit for hit in response.hits if hit.kind == "read" and hit.written_name == "users"),
+        None,
     )
+    assert table_read is not None, "expected a read hit for users in schema.sql"
     assert table_read.resolution == "exact"
 
 
@@ -1546,7 +1555,7 @@ def test_impact_radius_coverage_gaps_degrade_completeness(tmp_path: Path) -> Non
         tmp_path,
         {
             "graph.py": "def base():\n    return 1\n",
-            "config.yaml": "service:\n  port: 8080\n",
+            _COVERAGE_CANARY_PATH: _COVERAGE_CANARY_SOURCE,
         },
     )
 

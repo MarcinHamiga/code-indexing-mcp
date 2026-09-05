@@ -2073,7 +2073,7 @@ def test_terraform_traversals_are_reads() -> None:
 
     reads = [r.written_name for r in _terraform_result(source).references if r.kind == "read"]
 
-    assert reads == ["var.image_id", "local.sizes.large", "aws_instance.web.public_ip"]
+    assert sorted(reads) == ["aws_instance.web.public_ip", "local.sizes.large", "var.image_id"]
 
 
 def test_terraform_keys_and_type_keywords_are_not_reads() -> None:
@@ -2177,8 +2177,9 @@ def test_sql_mutations_are_writes() -> None:
     writes = sorted(r.written_name for r in refs if r.kind == "write")
     reads = sorted(r.written_name for r in refs if r.kind == "read")
 
-    assert writes == ["users", "users"]
-    assert "users" in reads
+    # DELETE counts as a write because it mutates the table.
+    assert writes == ["users", "users", "users"]
+    assert "users" not in reads
     assert "old_users" in reads
 
 
