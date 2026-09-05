@@ -265,7 +265,15 @@ class CodeIndexingApp(App[int]):
             self._show_pane(True)
             self._set_status("Register a repository to start searching.")
 
+    def _main_screen_has(self, *selectors: str) -> bool:
+        return bool(
+            self.screen_stack
+            and all(self.screen_stack[0].query(selector) for selector in selectors)
+        )
+
     def _update_header(self, project: ProjectInfo, status: ProjectStatus | None) -> None:
+        if not self._main_screen_has("#header-title", "#header-status"):
+            return
         title = self.screen_stack[0].query_one("#header-title", Label)
         status_label = self.screen_stack[0].query_one("#header-status", Label)
 
@@ -284,7 +292,7 @@ class CodeIndexingApp(App[int]):
             status_label.update(f"Root: {project.root}")
 
     def _set_status(self, text: str, *, error: bool = False) -> None:
-        if not self.screen_stack:
+        if not self._main_screen_has("#status-bar"):
             return
         bar = self.screen_stack[0].query_one("#status-bar", Static)
         bar.remove_class("error")
@@ -298,7 +306,9 @@ class CodeIndexingApp(App[int]):
         *,
         retry: Callable[[], None] | None = None,
     ) -> None:
-        if not self.screen_stack:
+        if not self._main_screen_has(
+            "#status-bar", "#error-content", "#error-panel", "#retry-button"
+        ):
             return
         self._set_status(message, error=True)
         self._error_retry = retry

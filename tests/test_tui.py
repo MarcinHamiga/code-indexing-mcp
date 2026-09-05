@@ -671,7 +671,7 @@ async def test_editor_action_uses_selected_location(
         await app.workers.wait_for_complete()
         await pilot.pause()
         await pilot.press("e")
-        assert calls == [["code", "--wait", "--goto", f"{tmp_path}/src/main.py:10"]]
+        assert calls == [["code", "--wait", "--goto", f"{tmp_path / 'src' / 'main.py'}:10"]]
 
 
 @pytest.mark.asyncio

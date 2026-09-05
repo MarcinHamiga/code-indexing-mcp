@@ -54,3 +54,24 @@ async def test_exit_cancels_delayed_callbacks_and_invalidates_requests() -> None
         app._detail_request_id,
         app._project_request_id,
     ) == tuple(request_id + 1 for request_id in request_ids)
+
+
+@pytest.mark.asyncio
+async def test_project_callbacks_are_safe_after_partial_screen_teardown() -> None:
+    app = _make_app()
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        project = app.service.selected_project
+        assert project is not None
+        status = app.service.project_status(project)
+        request_id = app._project_request_id
+
+        await app.query_one("#header-title").remove()
+        await app.query_one("#status-bar").remove()
+        assert app.screen_stack
+
+        app._apply_project_status(request_id, project, status)
+        app._set_status("late status update")
+        app._project_error(request_id, "late project status failure")
