@@ -788,9 +788,7 @@ async def test_error_retry_remains_bound_to_failed_action() -> None:
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
-        app._retry_action = lambda: calls.append("failed action")
-        app._show_error("Could not complete action")
-        app._retry_action = lambda: calls.append("later action")
+        app._show_error("Could not complete action", retry=lambda: calls.append("failed action"))
         await pilot.pause()
         await pilot.click("#retry-button")
         assert calls == ["failed action"]
