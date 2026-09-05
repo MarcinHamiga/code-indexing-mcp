@@ -35,6 +35,27 @@ from .settings import IndexSettings
 # Commands a human runs and reads: the only place an update notice belongs.
 _NOTIFY_COMMANDS = frozenset({"init", "index", "status", "projects", "model", "storage"})
 
+# Every top-level subcommand _parser() defines, in definition order. The syndex
+# entry point reuses this to tell a legacy `syndex <project>` positional apart
+# from a full CLI invocation; a test pins the two in sync.
+COMMAND_NAMES = (
+    "tui",
+    "serve",
+    "init",
+    "index",
+    "status",
+    "history",
+    "scan",
+    "storage",
+    "projects",
+    "model",
+    "benchmark",
+    "daemon",
+    "configure",
+    "uninstall",
+    "update",
+)
+
 
 class _VersionAction(argparse.Action):
     """Print the version, reading the revision only when the flag is used."""
@@ -55,13 +76,13 @@ class _VersionAction(argparse.Action):
         option_string: str | None = None,
     ) -> None:
         head = update_check.checkout_head(Path(__file__).resolve().parents[2])
-        print(f"code-indexing-mcp {__version__} ({head[:7] if head else 'unknown'})")
+        print(f"{parser.prog} {__version__} ({head[:7] if head else 'unknown'})")
         # Exits during parsing, so --version needs no subcommand despite required=True.
         parser.exit()
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="code-indexing-mcp", description="Local MCP code indexer")
+def _parser(prog: str = "code-indexing-mcp") -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=prog, description="Local MCP code indexer")
     parser.add_argument("--version", action=_VersionAction, help="show the version and exit")
     commands = parser.add_subparsers(dest="command", required=True)
     tui = commands.add_parser("tui", help="Launch the terminal user interface")
@@ -331,8 +352,8 @@ def _json(value: BaseModel | Sequence[BaseModel] | dict[str, Any]) -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> int:
+    args = _parser(prog).parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     paths = RuntimePaths.from_environment()
     refresh = (
