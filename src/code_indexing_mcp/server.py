@@ -476,6 +476,9 @@ ServerContext = Context[ServerSession, StartupCoordinator]
 
 
 async def _roots(ctx: ServerContext) -> list[Path]:
+    client_params = ctx.session.client_params
+    if client_params is None or client_params.capabilities.roots is None:
+        return []
     try:
         result = await ctx.session.list_roots()
     except Exception:

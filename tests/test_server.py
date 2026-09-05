@@ -151,6 +151,31 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_roots_are_not_requested_without_client_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requested = False
+
+    async def observe_list_roots(_session) -> types.ListRootsResult:  # type: ignore[no-untyped-def]
+        nonlocal requested
+        requested = True
+        return types.ListRootsResult(roots=[])
+
+    monkeypatch.setattr(server_module.ServerSession, "list_roots", observe_list_roots)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    server = create_server(app, auto_index=True)
+
+    async with create_connected_server_and_client_session(server) as client:
+        assert (await client.list_tools()).tools
+
+    assert not requested
+
+
+@pytest.mark.asyncio
 async def test_default_server_defers_indexing_until_first_code_query(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
