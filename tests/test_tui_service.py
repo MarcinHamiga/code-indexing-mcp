@@ -451,3 +451,21 @@ def test_tui_service_factory_broker_on_raises(
     with pytest.raises(CodeIndexingError) as exc_info:
         create_tui_service(cwd=tmp_path, settings=settings)
     assert exc_info.value.code == ErrorCode.DAEMON_UNAVAILABLE
+
+
+def test_source_preview_reads_bounded_working_tree_context(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("\n".join(f"line {i}" for i in range(1, 501)))
+    app = FakeApplication(projects=[_sample_project(root=root)])
+    service = TuiService(cast(ApplicationLike, app), cwd=root)
+    project = service.discover_current_project()
+    preview = service.source_preview("main.py", 250, project=project)
+    assert preview.start_line == 240
+    assert "line 250" in preview.content
+    assert len(preview.content.splitlines()) <= 41
+    with pytest.raises(CodeIndexingError):
+        service.source_preview("../outside.py", 1, project=project)
+    (root / "link.py").symlink_to(tmp_path / "outside.py")
+    with pytest.raises(CodeIndexingError):
+        service.source_preview("link.py", 1, project=project)

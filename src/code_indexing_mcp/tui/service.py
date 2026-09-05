@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     from ..application import RuntimePaths
     from ..settings import IndexSettings
 
+from .navigation import SourcePreview
+
 logger = logging.getLogger(__name__)
 
 
@@ -189,6 +191,53 @@ class TuiService:
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         """Retrieve chunk content and metadata by chunk_id."""
         return self.application.get_chunk(chunk_id)
+
+    def source_path(self, path: str, project: ProjectInfo | None = None) -> Path:
+        """Resolve a working-tree path without following links outside the project."""
+        root = self._require_project(project).root.resolve()
+        source = (root / path).resolve()
+        if not source.is_relative_to(root):
+            raise CodeIndexingError(
+                ErrorCode.INVALID_CONFIGURATION, "Source is outside the project"
+            )
+        return source
+
+    def source_preview(
+        self,
+        path: str,
+        line: int,
+        *,
+        end_line: int | None = None,
+        project: ProjectInfo | None = None,
+        language: str = "text",
+        symbol: str | None = None,
+    ) -> SourcePreview:
+        """Read bounded current source context for structural navigation."""
+        source = self.source_path(path, project)
+        try:
+            with source.open("rb") as stream:
+                raw = stream.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError("File is too large to preview (2 MiB maximum)")
+            if b"\0" in raw:
+                raise ValueError("Binary files cannot be previewed")
+            lines = raw.decode("utf-8").splitlines()
+            if line < 1 or line > max(1, len(lines)):
+                raise ValueError("Source lines have changed; refresh the index with F5")
+            first = max(1, line - 10)
+            last = min(len(lines), max(line + 30, end_line or line), first + 399)
+            return SourcePreview(
+                path=path,
+                start_line=first,
+                end_line=max(first, last),
+                content="\n".join(lines[first - 1 : last]),
+                language=language,
+                symbol=symbol,
+            )
+        except (OSError, ValueError) as exc:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_CONFIGURATION, f"Cannot preview {path}: {exc}"
+            ) from exc
 
     def file_outline(self, path: str, project: ProjectInfo | None = None) -> OutlineResponse:
         """Retrieve hierarchical symbol outline for a file."""

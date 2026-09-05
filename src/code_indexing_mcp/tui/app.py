@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -14,12 +15,14 @@ from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Footer, Input, Label, OptionList, Select, Static
+from textual.timer import Timer
+from textual.widgets import Button, Footer, Input, Label, OptionList, Select, Static, Tab, Tabs
 from textual.widgets.option_list import Option
 
-from ..errors import CodeIndexingError
+from ..errors import CodeIndexingError, ErrorCode
 from ..models import (
     CodeChunk,
+    DeclarationSelector,
     ImpactRadiusResponse,
     OutlineResponse,
     ProjectInfo,
@@ -27,7 +30,20 @@ from ..models import (
     ReferenceResponse,
     SearchHit,
 )
+from .navigation import SourceLocation, SourcePreview
 from .service import TuiService, create_tui_service
+
+
+@dataclass
+class DetailState:
+    target: SourceLocation | None
+    mode: str
+    title: str
+    content: Any
+    entries: list[tuple[Text, SourceLocation]]
+    highlighted: int | None
+    scroll_y: float
+    list_scroll_y: float
 
 
 class CodeIndexingApp(App[int]):
@@ -64,6 +80,12 @@ class CodeIndexingApp(App[int]):
         self._projects: dict[str, ProjectInfo] = {}
         self._project_request_id = 0
         self._detail_visible = False
+
+        self._active_target: SourceLocation | None = None
+        self._detail_mode = "chunk"
+        self._detail_entries: list[tuple[Text, SourceLocation]] = []
+        self._history: list[DetailState] = []
+        self._preview_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="header-bar"):
@@ -102,6 +124,14 @@ class CodeIndexingApp(App[int]):
 
             with Vertical(id="detail-pane"):
                 yield Label("Code Preview", id="detail-title", markup=False)
+                yield Tabs(
+                    Tab("Code", id="chunk-tab"),
+                    Tab("Outline", id="outline-tab"),
+                    Tab("References", id="references-tab"),
+                    Tab("Impact", id="impact-tab"),
+                    id="detail-tabs",
+                )
+                yield OptionList(id="detail-list")
                 with VerticalScroll(id="detail-scroll"):
                     yield Static(
                         "Run a query, then select a result and press:\n\n"
@@ -118,6 +148,7 @@ class CodeIndexingApp(App[int]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.query_one("#detail-list").display = False
         self._update_search_mode()
         self._update_layout()
         self.run_discovery()
@@ -210,12 +241,20 @@ class CodeIndexingApp(App[int]):
         self._detail_visible = details
         self._update_layout()
         if details:
-            self.query_one("#detail-scroll", VerticalScroll).focus()
+            entries = self.query_one("#detail-list", OptionList)
+            (
+                entries if entries.display else self.query_one("#detail-scroll", VerticalScroll)
+            ).focus()
         else:
             self.query_one("#results-list", OptionList).focus()
 
     def _clear_details(self, message: str) -> None:
         self._detail_request_id += 1
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+        self._active_target = None
+        self._history.clear()
+        self._set_detail_entries([])
         self.query_one("#detail-title", Label).update("Code Preview")
         self.query_one("#detail-content", Static).update(message)
         self.query_one("#detail-scroll", VerticalScroll).scroll_home(animate=False)
@@ -273,6 +312,9 @@ class CodeIndexingApp(App[int]):
         self.query_one("#query-input", Input).focus()
 
     def action_escape_action(self) -> None:
+        if self._history and not isinstance(self.focused, Input):
+            self.action_detail_back()
+            return
         if self._detail_visible:
             self._show_pane(False)
             return
@@ -371,13 +413,101 @@ class CodeIndexingApp(App[int]):
         )
         option_list.focus()
 
+    @staticmethod
+    def _hit_location(hit: SearchHit) -> SourceLocation:
+        return SourceLocation(
+            hit.path,
+            hit.start_line,
+            hit.end_line,
+            hit.qualified_symbol or hit.symbol,
+            hit.language,
+            hit.kind,
+            hit.chunk_id,
+        )
+
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option_list.id != "results-list":
+            return
         self._highlighted_index = event.option_index
+        self._detail_request_id += 1
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+        self._preview_timer = self.set_timer(0.15, self._preview_highlighted)
+
+    def _preview_highlighted(self) -> None:
+        if self._get_selected_hit() is not None:
+            self._load_detail_for_selected("chunk")
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        self._highlighted_index = event.option_index
-        self._load_detail_for_selected("chunk")
-        self._show_pane(True)
+        if event.option_list.id == "detail-list":
+            if event.option_index < len(self._detail_entries):
+                self._remember_detail()
+                self._open_target(self._detail_entries[event.option_index][1], "chunk")
+            return
+        if event.option_list.id == "results-list":
+            self._highlighted_index = event.option_index
+            self._load_detail_for_selected("chunk")
+            self._show_pane(True)
+
+    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        if event.tabs.id != "detail-tabs":
+            return
+        mode = (event.tab.id or "chunk-tab").removesuffix("-tab")
+        if mode != self._detail_mode:
+            self._navigate_mode(mode)
+
+    def _navigate_mode(self, mode: str) -> None:
+        if self._active_target is None:
+            self._load_detail_for_selected(mode)
+        else:
+            self._remember_detail()
+            self._open_target(self._active_target, mode)
+        if self._active_target is not None:
+            self._show_pane(True)
+
+    def _remember_detail(self) -> None:
+        self._history.append(
+            DetailState(
+                self._active_target,
+                self._detail_mode,
+                str(self.query_one("#detail-title", Label).render()),
+                self.query_one("#detail-content", Static).content,
+                list(self._detail_entries),
+                self.query_one("#detail-list", OptionList).highlighted,
+                self.query_one("#detail-scroll", VerticalScroll).scroll_y,
+                self.query_one("#detail-list", OptionList).scroll_y,
+            )
+        )
+        self._history = self._history[-50:]
+
+    def action_detail_back(self) -> None:
+        if not self._history:
+            self._show_pane(False)
+            return
+        self._detail_request_id += 1
+        state = self._history.pop()
+        self._active_target = state.target
+        self._detail_mode = state.mode
+        self.query_one("#detail-tabs", Tabs).active = f"{state.mode}-tab"
+        self.query_one("#detail-title", Label).update(state.title)
+        self.query_one("#detail-content", Static).update(state.content)
+        self._set_detail_entries(state.entries)
+        entries = self.query_one("#detail-list", OptionList)
+        entries.highlighted = state.highlighted
+        self.call_after_refresh(entries.scroll_to, y=state.list_scroll_y, animate=False)
+        scroll = self.query_one("#detail-scroll", VerticalScroll)
+        self.call_after_refresh(scroll.scroll_to, y=state.scroll_y, animate=False)
+        (entries if state.entries else scroll).focus()
+        self._set_status("Returned to previous view.")
+
+    def _set_detail_entries(self, entries: list[tuple[Text, SourceLocation]]) -> None:
+        self._detail_entries = entries
+        widget = self.query_one("#detail-list", OptionList)
+        widget.clear_options()
+        widget.add_options([Option(text) for text, _ in entries])
+        widget.display = bool(entries)
+        widget.highlighted = 0 if entries else None
+        self.query_one("#detail-pane").set_class(bool(entries), "has-entries")
 
     def _get_selected_hit(self) -> SearchHit | None:
         if self._highlighted_index is not None and 0 <= self._highlighted_index < len(self._hits):
@@ -398,17 +528,17 @@ class CodeIndexingApp(App[int]):
     def action_show_outline(self) -> None:
         if isinstance(self.focused, Input):
             return
-        self._load_detail_for_selected("outline")
+        self._navigate_mode("outline")
 
     def action_show_references(self) -> None:
         if isinstance(self.focused, Input):
             return
-        self._load_detail_for_selected("references")
+        self._navigate_mode("references")
 
     def action_show_impact(self) -> None:
         if isinstance(self.focused, Input):
             return
-        self._load_detail_for_selected("impact")
+        self._navigate_mode("impact")
 
     def _load_detail_for_selected(self, action: str) -> None:
         hit = self._get_selected_hit()
@@ -416,18 +546,38 @@ class CodeIndexingApp(App[int]):
             self._set_status("No hit selected. Run a search and select a result first.")
             return
 
+        self._history.clear()
+        self._open_target(self._hit_location(hit), action)
+
+    def _open_target(self, target: SourceLocation, action: str) -> None:
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+        self._active_target = target
+        self._detail_mode = action
+        self.query_one("#detail-tabs", Tabs).active = f"{action}-tab"
         self._detail_request_id += 1
         req_id = self._detail_request_id
-        self._set_status(f"Loading {action} for {hit.path}...")
-        self._run_detail_worker(req_id, action, hit, self.service.selected_project)
+        self._set_status(f"Loading {action} for {target.path}...")
+        self._run_detail_worker(req_id, action, target, self.service.selected_project)
 
     @work(thread=True, exclusive=True, group="detail")
     def _run_detail_worker(
-        self, request_id: int, action: str, hit: SearchHit, project: ProjectInfo | None
+        self, request_id: int, action: str, hit: SourceLocation, project: ProjectInfo | None
     ) -> None:
         try:
             if action == "chunk":
-                chunk = self.service.get_chunk(hit.chunk_id)
+                chunk = (
+                    self.service.get_chunk(hit.chunk_id)
+                    if hit.chunk_id
+                    else self.service.source_preview(
+                        hit.path,
+                        hit.start_line,
+                        end_line=hit.end_line,
+                        project=project,
+                        language=hit.language,
+                        symbol=hit.symbol,
+                    )
+                )
                 if request_id == self._detail_request_id:
                     self.call_from_thread(self._apply_detail, request_id, self._render_chunk, chunk)
             elif action == "outline":
@@ -437,13 +587,17 @@ class CodeIndexingApp(App[int]):
                         self._apply_detail, request_id, self._render_outline, outline
                     )
             elif action == "references":
-                refs = self.service.find_references(hit, project=project)
+                refs = self.service.find_references(
+                    self._target_selector(hit, project), project=project
+                )
                 if request_id == self._detail_request_id:
                     self.call_from_thread(
                         self._apply_detail, request_id, self._render_references, refs
                     )
             elif action == "impact":
-                impact = self.service.impact_radius(hit, project=project)
+                impact = self.service.impact_radius(
+                    self._target_selector(hit, project), project=project
+                )
                 if request_id == self._detail_request_id:
                     self.call_from_thread(
                         self._apply_detail, request_id, self._render_impact, impact
@@ -457,17 +611,34 @@ class CodeIndexingApp(App[int]):
                     self._detail_error, request_id, f"Failed to load {action}: {exc}"
                 )
 
+    def _target_selector(
+        self, target: SourceLocation, project: ProjectInfo | None
+    ) -> DeclarationSelector:
+        if target.chunk_id:
+            return DeclarationSelector(chunk_id=target.chunk_id)
+        if target.symbol and project:
+            return DeclarationSelector(
+                project=project.id, path=target.path, qualified_symbol=target.symbol
+            )
+        raise CodeIndexingError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "Choose a declaration in Outline before finding references or impact.",
+        )
+
     def _apply_detail(self, request_id: int, render: Callable[..., None], value: Any) -> None:
         if request_id == self._detail_request_id:
+            self._set_detail_entries([])
             render(value)
+            self.query_one("#detail-scroll", VerticalScroll).scroll_home(animate=False)
 
     def _detail_error(self, request_id: int, message: str) -> None:
         if request_id == self._detail_request_id:
             self._show_error(message)
 
-    def _render_chunk(self, chunk: CodeChunk) -> None:
+    def _render_chunk(self, chunk: CodeChunk | SourcePreview) -> None:
+        prefix = "Working tree" if isinstance(chunk, SourcePreview) else "Preview"
         self.query_one("#detail-title", Label).update(
-            f"Preview: {chunk.path}:{chunk.start_line}-{chunk.end_line} ({chunk.kind})"
+            f"{prefix}: {chunk.path}:{chunk.start_line}-{chunk.end_line} ({chunk.kind})"
         )
         syntax = Syntax(
             chunk.content,
@@ -490,12 +661,31 @@ class CodeIndexingApp(App[int]):
         text.append(f"File Outline for {outline.path}\n\n", style="bold underline")
         if not outline.items:
             text.append("No outline symbols discovered in this file.", style="dim")
+        entries: list[tuple[Text, SourceLocation]] = []
         for item in outline.items:
             text.append(f"  L{item.start_line:4d}-{item.end_line:4d} ", style="dim")
             text.append(f"{item.kind:<12} ", style="yellow")
             text.append(f"{item.qualified_symbol}\n", style="green bold")
+            entries.append(
+                (
+                    Text(f"{item.qualified_symbol}  · {item.kind}  · L{item.start_line}"),
+                    SourceLocation(
+                        outline.path,
+                        item.start_line,
+                        item.end_line,
+                        item.qualified_symbol,
+                        self._active_target.language if self._active_target else "text",
+                        item.kind,
+                    ),
+                )
+            )
 
         self.query_one("#detail-content", Static).update(text)
+        self._set_detail_entries(entries)
+        if entries:
+            self.query_one("#detail-content", Static).update(
+                "Select a declaration and press Enter to open its source."
+            )
         self._set_status(f"Loaded outline with {len(outline.items)} items.")
 
     def _render_references(self, refs: ReferenceResponse) -> None:
@@ -510,17 +700,27 @@ class CodeIndexingApp(App[int]):
         )
         if not refs.hits:
             text.append("No references found for this declaration.", style="dim")
+        entries: list[tuple[Text, SourceLocation]] = []
         for hit in refs.hits:
             text.append(f"  {hit.path}:{hit.start_line} ", style="cyan bold")
             text.append(f"[{hit.resolution}] ", style="magenta")
             text.append(f"{hit.snippet.strip()}\n", style="white")
+            entries.append(
+                (
+                    Text(f"{hit.path}:{hit.start_line}  [{hit.resolution}]\n{hit.snippet.strip()}"),
+                    SourceLocation(hit.path, hit.start_line, hit.end_line, language=hit.language),
+                )
+            )
 
+        if entries:
+            text = Text("Select a reference and press Enter to open its source.\n")
         if refs.limitations:
             text.append("\nLimitations:\n", style="yellow bold")
             for lim in refs.limitations:
                 text.append(f"  - [{lim.code}] {lim.explanation}\n", style="yellow")
 
         self.query_one("#detail-content", Static).update(text)
+        self._set_detail_entries(entries)
         self._set_status(f"Loaded {len(refs.hits)} reference(s).")
 
     def _render_impact(self, impact: ImpactRadiusResponse) -> None:
@@ -536,14 +736,38 @@ class CodeIndexingApp(App[int]):
         )
         if not impact.layers:
             text.append("No downstream impact detected within search depth.", style="dim")
+        entries: list[tuple[Text, SourceLocation]] = []
         for layer in impact.layers:
             text.append(f"Depth {layer.depth}:\n", style="yellow bold")
             for edge in layer.edges:
                 kinds = ", ".join(edge.kinds)
                 text.append(f"  -> {edge.target.path} ", style="cyan")
                 text.append(f"({kinds})\n", style="dim")
+                target = edge.target
+                entries.append(
+                    (
+                        Text(
+                            f"Depth {layer.depth} · {target.qualified_symbol}\n"
+                            f"{target.path}:{target.start_line} ({kinds})"
+                        ),
+                        SourceLocation(
+                            target.path,
+                            target.start_line,
+                            target.end_line,
+                            target.qualified_symbol,
+                            target.language,
+                            target.kind,
+                            target.chunk_id,
+                        ),
+                    )
+                )
 
         self.query_one("#detail-content", Static).update(text)
+        self._set_detail_entries(entries)
+        if entries:
+            self.query_one("#detail-content", Static).update(
+                "Select a dependent declaration and press Enter to open its source."
+            )
         self._set_status(f"Impact graph loaded: {impact.visited} declaration(s) analyzed.")
 
     def action_trigger_index(self) -> None:

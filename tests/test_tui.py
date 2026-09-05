@@ -449,3 +449,88 @@ async def test_symbol_match_controls_are_explained_and_forwarded() -> None:
         await pilot.pause()
         assert fake.symbol_calls[-1]["match"] == "contains"
         assert "symbol" in app.query_one("#query-input", Input).placeholder.lower()
+
+
+@pytest.mark.asyncio
+async def test_outline_navigation_and_back_restore_selected_entry(tmp_path: Path) -> None:
+    from textual.widgets import Tabs
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/main.py").write_text("def main():\n    pass\n")
+    fake = FakeApplication(projects=[_sample_project(root=tmp_path)])
+    app = _make_app(fake)
+    async with app.run_test(size=(120, 32)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        await pilot.pause(0.3)
+        await app.workers.wait_for_complete()
+        assert "Preview:" in str(app.query_one("#detail-title", Label).render())
+        app.query_one("#detail-tabs", Tabs).active = "outline-tab"
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        entries = app.query_one("#detail-list", OptionList)
+        assert entries.display and entries.option_count == 1
+        entries.focus()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "Working tree:" in str(app.query_one("#detail-title", Label).render())
+        await pilot.press("escape")
+        await pilot.pause()
+        assert "Outline:" in str(app.query_one("#detail-title", Label).render())
+        assert entries.highlighted == 0
+        assert app.focused is entries
+
+
+@pytest.mark.asyncio
+async def test_reference_and_impact_destinations_open_and_return(tmp_path: Path) -> None:
+    from code_indexing_mcp.models import ImpactEdge, ImpactLayer
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/runner.py").write_text("\n" * 4 + "main()\n")
+    fake = FakeApplication(projects=[_sample_project(root=tmp_path)])
+    app = _make_app(fake)
+    async with app.run_test(size=(120, 32)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        await pilot.pause(0.3)
+        await app.workers.wait_for_complete()
+        app.action_show_references()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        entries = app.query_one("#detail-list", OptionList)
+        entries.focus()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "runner.py" in str(app.query_one("#detail-title", Label).render())
+        assert "main()" in app.query_one("#detail-content", Static).content.code
+        await pilot.press("escape")
+        assert "References:" in str(app.query_one("#detail-title", Label).render())
+        assert entries.highlighted == 0
+
+        impact = fake.impact_radius(app.service.to_selector(_sample_hit()))
+        target = impact.selected.model_copy(update={"chunk_id": "chk-1"})
+        impact = impact.model_copy(
+            update={
+                "layers": [
+                    ImpactLayer(
+                        depth=1,
+                        edges=[ImpactEdge(source=impact.selected, target=target, kinds=["call"])],
+                    )
+                ]
+            }
+        )
+        app._render_impact(impact)
+        entries.focus()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "Preview:" in str(app.query_one("#detail-title", Label).render())

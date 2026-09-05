@@ -85,3 +85,7 @@ Footer {
 
 .compact #results-pane, .compact #detail-pane { width: 1fr; margin-right: 0; }
 #results-pane:focus-within, #detail-pane:focus-within { border: solid $accent; }
+
+#detail-tabs { height: 3; }
+#detail-list { height: 1fr; }
+.has-entries #detail-scroll { height: auto; max-height: 5; }
