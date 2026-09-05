@@ -15,12 +15,13 @@ from .models import (
     ExampleSearchResponse,
     OutlineItem,
     OutlineResponse,
+    RankExplanation,
     SearchHit,
     SearchResponse,
     SymbolResponse,
 )
 from .path_filter import path_condition
-from .storage import LanceStore, PartitionRef, _quoted
+from .storage import LanceStore, PartitionRef, RankComponents, _quoted
 
 logger = logging.getLogger(__name__)
 
@@ -213,12 +214,14 @@ class SearchService:
         partition_ids = {
             project_id: [ref.partition_id for ref in refs] for project_id, refs in selected.items()
         }
+        query_vector = self.embedder.embed_query(query)
+        condition = " AND ".join(conditions) if conditions else None
         with self.store.partitions_access(selected):
             rows = self.store.hybrid_search(
                 query,
-                self.embedder.embed_query(query),
+                query_vector,
                 project_ids,
-                " AND ".join(conditions) if conditions else None,
+                condition,
                 fetch,
                 partition_ids=partition_ids,
             )
@@ -237,6 +240,8 @@ class SearchService:
             if len(hits) == limit:
                 break
         hits.sort(key=lambda hit: (-hit.score, hit.path, hit.start_line))
+        if hits:
+            hits = self._explain_hits(query, query_vector, hits, condition, selected)
         return SearchResponse(query=query, hits=hits)
 
     def search_by_example(
@@ -407,6 +412,42 @@ class SearchService:
                 chunk_id=chunk_id,
             )
         return chunk
+
+    def _explain_hits(
+        self,
+        query: str,
+        query_vector: list[float],
+        hits: list[SearchHit],
+        condition: str | None,
+        selected: dict[str, list[PartitionRef]],
+    ) -> list[SearchHit]:
+        """Attach per-signal ranking explanations; never fails the search."""
+        wanted: dict[str, list[str]] = {}
+        for hit in hits:
+            wanted.setdefault(hit.project_id, []).append(hit.chunk_id)
+        partition_ids = {
+            project_id: [ref.partition_id for ref in refs] for project_id, refs in selected.items()
+        }
+        components: dict[str, RankComponents] = {}
+        try:
+            with self.store.partitions_access(selected):
+                components = self.store.explain_hits(
+                    query, query_vector, wanted, condition, partition_ids=partition_ids
+                )
+        except Exception:
+            logger.debug("Ranking explanation probes failed", exc_info=True)
+        if not components:
+            return hits
+        explained: list[SearchHit] = []
+        for hit in hits:
+            component = components.get(hit.chunk_id)
+            if component is None:
+                explained.append(hit)
+            else:
+                explained.append(
+                    hit.model_copy(update={"explanation": RankExplanation(**component)})
+                )
+        return explained
 
     @staticmethod
     def _in_condition(column: str, values: list[str]) -> str:

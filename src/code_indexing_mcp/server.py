@@ -1245,8 +1245,10 @@ def create_server(
             "relevance, each with a code snippet, file path, line range, and a chunk_id that "
             "get_chunk expands to the full text. Searches indexed source only — not commit "
             "history, not comments in unindexed files, and not files excluded by .gitignore or "
-            "the 1 MiB size cap. For a declaration whose name is already known, find_symbol is "
-            "direct; for one file's structure, file_outline is cheaper. A root that is not "
+            "the 1 MiB size cap. Each hit also carries an optional ranking explanation with "
+            "per-signal FTS and vector scores. For a declaration whose name is already "
+            "known, find_symbol is direct; for one file's structure, file_outline is "
+            "cheaper. A root that is not "
             "registered yet is registered and indexed before the first query is answered; later "
             "queries refresh selected projects when source metadata has changed."
         ),
