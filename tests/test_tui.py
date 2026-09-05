@@ -193,7 +193,7 @@ async def test_tui_app_preview_chunk_and_shortcuts() -> None:
         await pilot.pause()
 
         detail_title = app.query_one("#detail-title", Label).render()
-        assert "References: src/main.py (1 hits)" in str(detail_title)
+        assert "References: main · src/main.py (1 hits)" in str(detail_title)
 
         # 4. Impact radius via action_show_impact
         app.action_show_impact()
@@ -201,7 +201,7 @@ async def test_tui_app_preview_chunk_and_shortcuts() -> None:
         await pilot.pause()
 
         detail_title = app.query_one("#detail-title", Label).render()
-        assert "Impact Radius: src/main.py (1 layers, 3 visited)" in str(detail_title)
+        assert "Impact Radius: main · src/main.py (1 layers, 3 visited)" in str(detail_title)
 
 
 @pytest.mark.asyncio
@@ -534,3 +534,160 @@ async def test_reference_and_impact_destinations_open_and_return(tmp_path: Path)
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert "Preview:" in str(app.query_one("#detail-title", Label).render())
+
+
+@pytest.mark.asyncio
+async def test_lazy_index_progress_does_not_overwrite_error() -> None:
+    import threading
+
+    release = threading.Event()
+    started = threading.Event()
+    fake = FakeApplication()
+    fake.statuses["proj-1"] = "stale"
+    original = fake.index_project
+
+    def delayed(*args: object, **kwargs: object):
+        started.set()
+        release.wait(4)
+        return original("proj-1")
+
+    fake.index_project = delayed  # type: ignore[method-assign]
+    app = _make_app(fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await pilot.pause(0.4)
+        assert started.is_set()
+        progress = app.query_one("#progress-bar", Static)
+        assert "Preparing index" in str(progress.render())
+        app._show_error("A recoverable problem")
+        await pilot.pause(0.4)
+        assert "A recoverable problem" in str(app.query_one("#error-content", Static).render())
+        release.set()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.query_one("#error-panel").display
+
+
+@pytest.mark.asyncio
+async def test_help_and_copy_location_are_available(tmp_path: Path) -> None:
+    app = _make_app()
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("ctrl+h")
+        assert "Describe code" in str(app.screen.query_one("#help-content", Static).render())
+        await pilot.press("escape")
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        await pilot.pause(0.3)
+        await app.workers.wait_for_complete()
+        await pilot.press("y")
+        assert app.clipboard == "src/main.py:10"
+
+
+@pytest.mark.asyncio
+async def test_impact_explains_incomplete_results() -> None:
+    from code_indexing_mcp.models import ReferenceLimitation
+
+    fake = FakeApplication()
+    app = _make_app(fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        impact = fake.impact_radius(app.service.to_selector(_sample_hit())).model_copy(
+            update={
+                "budget_exhausted": True,
+                "limitations": [
+                    ReferenceLimitation(code="dynamic", explanation="Dynamic calls omitted")
+                ],
+            }
+        )
+        app._render_impact(impact)
+        text = str(app.query_one("#detail-content", Static).render())
+        assert "Dynamic calls omitted" in text
+        assert "budget" in text.lower()
+        assert "depth" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_help_can_remain_open_during_search_completion() -> None:
+    import threading
+
+    release = threading.Event()
+    fake = FakeApplication()
+    original = fake.search_code
+
+    def delayed(*args: object, **kwargs: object) -> SearchResponse:
+        release.wait(3)
+        return original("main")
+
+    fake.search_code = delayed  # type: ignore[method-assign]
+    app = _make_app(fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await pilot.press("ctrl+h")
+        release.set()
+        await app.workers.wait_for_complete()
+        await pilot.pause(0.3)
+        await app.workers.wait_for_complete()
+        assert app.screen.query_one("#help-content", Static)
+        await pilot.press("escape")
+        assert app.query_one("#results-list", OptionList).option_count == 1
+
+
+@pytest.mark.asyncio
+async def test_editor_action_uses_selected_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from contextlib import nullcontext
+    from subprocess import CompletedProcess
+
+    import code_indexing_mcp.tui.app as app_module
+
+    fake = FakeApplication(projects=[_sample_project(root=tmp_path)])
+    app = _make_app(fake)
+    calls: list[list[str]] = []
+    monkeypatch.setenv("VISUAL", "code --wait")
+    monkeypatch.setattr(app, "suspend", nullcontext)
+
+    def run(command: list[str], *, check: bool) -> CompletedProcess[str]:
+        calls.append(command)
+        return CompletedProcess(command, 0)
+
+    monkeypatch.setattr(app_module.subprocess, "run", run)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("e")
+        assert calls == [["code", "--wait", "--goto", f"{tmp_path}/src/main.py:10"]]
+
+
+@pytest.mark.asyncio
+async def test_long_error_keeps_preview_and_footer_inside_screen() -> None:
+    app = _make_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        app.action_open_selected()
+        await app.workers.wait_for_complete()
+        app._show_error("Cannot connect to daemon. " * 20)
+        await pilot.pause()
+        preview = app.query_one("#detail-scroll")
+        errors = app.query_one("#error-panel")
+        assert preview.region.bottom <= errors.region.y
+        assert preview.region.height >= 2
+        assert app.query_one("#context-help").region.bottom <= 23

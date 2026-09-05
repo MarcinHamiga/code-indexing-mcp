@@ -86,6 +86,19 @@ Footer {
 .compact #results-pane, .compact #detail-pane { width: 1fr; margin-right: 0; }
 #results-pane:focus-within, #detail-pane:focus-within { border: solid $accent; }
 
-#detail-tabs { height: 3; }
+#detail-tabs { height: 2; }
+#detail-tabs Tab { height: 1; padding: 0 1; }
 #detail-list { height: 1fr; }
 .has-entries #detail-scroll { height: auto; max-height: 5; }
+
+#progress-bar { height: 1; padding: 0 1; color: $accent; }
+#error-panel { height: auto; border-left: solid $error; margin: 0 1; }
+#error-scroll { height: auto; max-height: 3; }
+#error-content { height: auto; padding: 0 1; }
+#error-actions { height: 1; }
+#error-actions Button { height: 1; min-width: 10; border: none; }
+#context-help { height: 1; padding: 0 1; color: $text-muted; }
+HelpScreen { align: center middle; background: $background 70%; }
+#help-dialog { width: 76; max-width: 95%; height: auto; max-height: 90%; border: solid $accent; padding: 1 2; background: $surface; }
+
+#detail-title, #results-title { height: 1; }

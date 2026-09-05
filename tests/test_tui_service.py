@@ -469,3 +469,21 @@ def test_source_preview_reads_bounded_working_tree_context(tmp_path: Path) -> No
     (root / "link.py").symlink_to(tmp_path / "outside.py")
     with pytest.raises(CodeIndexingError):
         service.source_preview("link.py", 1, project=project)
+
+
+def test_editor_command_quotes_paths_without_a_shell(tmp_path: Path) -> None:
+    from code_indexing_mcp.tui.navigation import editor_command
+
+    path = tmp_path / "a file; echo surprise.py"
+    assert editor_command('"/Applications/My Editor" --wait', path, 12) == [
+        "/Applications/My Editor",
+        "--wait",
+        str(path),
+    ]
+    assert editor_command("code --reuse-window", path, 12) == [
+        "code",
+        "--reuse-window",
+        "--goto",
+        f"{path}:12",
+    ]
+    assert editor_command("nvim", path, 12) == ["nvim", "+12", str(path)]

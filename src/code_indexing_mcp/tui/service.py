@@ -8,6 +8,7 @@ references, and impact analysis.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -118,7 +119,9 @@ class TuiService:
         target = self._require_project(project)
         return self.application.project_status(target.id, roots=[target.root])
 
-    def ensure_ready(self, project: ProjectInfo | None = None) -> ProjectStatus:
+    def ensure_ready(
+        self, project: ProjectInfo | None = None, on_phase: Callable[[str], None] | None = None
+    ) -> ProjectStatus:
         """Ensure project index is ready before a query.
 
         In lazy or eager mode, refreshes stale or pending indexes with trigger='lazy-query'.
@@ -133,6 +136,8 @@ class TuiService:
             return status
 
         # Trigger lazy indexing
+        if on_phase:
+            on_phase("Preparing index")
         self.application.index_project(target.id, roots=[target.root], trigger="lazy-query")
         return self.project_status(target)
 
@@ -154,16 +159,23 @@ class TuiService:
         return self.application.index_progress(target.id)
 
     def search_code(
-        self, query: str, *, limit: int = 20, project: ProjectInfo | None = None
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        project: ProjectInfo | None = None,
+        on_phase: Callable[[str], None] | None = None,
     ) -> SearchResponse:
         """Execute semantic search within the active project."""
         target = self._require_project(project)
-        status = self.ensure_ready(target)
+        status = self.ensure_ready(target, on_phase)
         if status.state not in {"ready", "partial"} and self.index_mode is IndexMode.MANUAL:
             raise CodeIndexingError(
                 ErrorCode.INDEX_INCOMPATIBLE,
                 f"Project '{target.name}' is {status.state}; index before searching (press F5)",
             )
+        if on_phase:
+            on_phase("Searching")
         return self.application.search_code(
             query, projects=[target.id], limit=limit, roots=[target.root]
         )
@@ -175,15 +187,18 @@ class TuiService:
         match: str = "exact",
         limit: int = 20,
         project: ProjectInfo | None = None,
+        on_phase: Callable[[str], None] | None = None,
     ) -> SymbolResponse:
         """Execute symbol lookup within the active project."""
         target = self._require_project(project)
-        status = self.ensure_ready(target)
+        status = self.ensure_ready(target, on_phase)
         if status.state not in {"ready", "partial"} and self.index_mode is IndexMode.MANUAL:
             raise CodeIndexingError(
                 ErrorCode.INDEX_INCOMPATIBLE,
                 f"Project '{target.name}' is {status.state}; index before searching (press F5)",
             )
+        if on_phase:
+            on_phase("Searching")
         return self.application.find_symbol(
             name, project=target.id, match=match, limit=limit, roots=[target.root]
         )
