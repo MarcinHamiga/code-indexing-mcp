@@ -1,11 +1,11 @@
-# Code Indexing MCP
+# Syndex
 
-Code Indexing MCP is a local-only codebase indexer for MCP clients. It uses Tree-sitter to extract
+Syndex (formerly `code-indexing-mcp`) is a local-only codebase indexer and search engine for MCP clients and developers. It uses Tree-sitter to extract
 syntax-aware chunks, FastEmbed for CPU embeddings, a direct ONNX path for selected passage
 accelerators, and LanceDB for persistent vector and full-text search.
 
 It does not require a hosted database, embedding API, or network service. A private per-user
-daemon is started on demand so all connected MCP clients share one scheduler and model. The only
+daemon is started on demand so all connected MCP clients and CLI sessions share one scheduler and model. The only
 network access is the initial download of the default
 `jinaai/jina-embeddings-v2-base-code` model (approximately 640 MB). Once cached, indexing and
 search work offline.
@@ -58,20 +58,20 @@ writes roll into a `.bak.prev` beside it, so re-running `configure` cannot cost 
 original. For Codex the whole `[mcp_servers.code-indexing-mcp]` table is rewritten, so any
 other key you added inside that one table is replaced rather than merged.
 
-Later, `code-indexing-mcp update` updates an existing clean checkout with a fast-forward-only
+Later, `syndex update` updates an existing clean checkout with a fast-forward-only
 pull and refreshes its environment — see [Update](#update). Re-running the install command above
 does the same thing. To change settings or harnesses without updating, run
-`code-indexing-mcp configure` — it opens the same wizard offline, prefilled from your
+`syndex configure` — it opens the same wizard offline, prefilled from your
 current configuration. Naming what to change applies it directly instead:
-`code-indexing-mcp configure --set CODE_INDEXING_BROKER=off --unset CODE_INDEXING_INDEX_MODE`.
+`syndex configure --set CODE_INDEXING_BROKER=off --unset CODE_INDEXING_INDEX_MODE`.
 
-### The `code-indexing-mcp` and `syndex` commands
+### The `syndex` and `code-indexing-mcp` commands
 
 Your MCP clients launch the server by absolute path and never need it on PATH, so the
 installer adds two launchers for you in `~/.local/bin` (or your configured bin directory, with `.cmd`
 shims on Windows):
-- `code-indexing-mcp`: The server and administrative CLI. That is what makes `configure`, `init`, `index`, `status`, `history`, `scan`, `storage`, `projects`, `model`, `benchmark`, `daemon`, and `tui` work from any shell.
-- `syndex`: The same CLI under a shorter name, defaulting to the interactive Terminal User Interface (TUI) for navigating and inspecting indexed codebases directly from your terminal. Bare `syndex` (or `syndex <project>`) opens the TUI; `syndex <command>` runs any command `code-indexing-mcp` accepts (`syndex status`, `syndex index`, ...).
+- `syndex`: The primary command and CLI. Bare `syndex` (or `syndex <project>`) opens the interactive Terminal User Interface (TUI) for navigating and inspecting indexed codebases directly from your terminal. Running `syndex <command>` executes any subcommand (`syndex status`, `syndex index`, `syndex configure`, ...).
+- `code-indexing-mcp`: An alias that runs the exact same CLI, provided for backwards compatibility and explicit MCP invocations.
 
 If that directory is not already on your `PATH`, the wizard offers — checked by default — to
 add it to your shell profile (`~/.zshrc`, `~/.bashrc` and `~/.bash_profile` on macOS,
@@ -90,7 +90,7 @@ prints the `exec` line that makes it live in the session you are sitting in. Win
 are not edited; add the directory yourself.
 
 An existing file at the launcher's name that the installer did not create is moved aside to
-`code-indexing-mcp.bak` rather than overwritten. If some *other* `code-indexing-mcp` sits
+`syndex.bak` or `code-indexing-mcp.bak` rather than overwritten. If some *other* executable sits
 earlier on your PATH, the wizard says so instead of quietly losing the name.
 
 Three flags control all of this, on both `install.py` and `configure`:
@@ -147,7 +147,7 @@ location. Run `python3 install.py --help` for all installer options.
 
 ### Update
 
-`code-indexing-mcp update` updates an existing installation in place. It checks first — git on
+`syndex update` updates an existing installation in place. It checks first — git on
 PATH, a clean checkout on `main` whose origin is this repository, and `uv` resolvable — and
 refuses with one actionable sentence before touching anything if any of that does not hold. Then
 it fast-forwards to the tip of `main`, refreshes the locked environment, rebuilds the prepared
@@ -157,9 +157,9 @@ harnesses you already have configured. Two updates cannot run at once; the secon
 immediately.
 
 ```bash
-code-indexing-mcp update
-code-indexing-mcp update --check              # report only, change nothing
-code-indexing-mcp update --skip-accelerator   # defer the accelerator rebuild
+syndex update
+syndex update --check              # report only, change nothing
+syndex update --skip-accelerator   # defer the accelerator rebuild
 ```
 
 `--check` prints a JSON report of the local and remote commits and exits `0` when you are up to
@@ -181,13 +181,13 @@ is running from — the sync fails and says so; re-run the installer.
 
 ### Repair and uninstall
 
-`code-indexing-mcp configure --repair` re-applies the cheap steps — the launcher, the client
+`syndex configure --repair` re-applies the cheap steps — the launcher, the client
 entries, and the skill links — for the harnesses already configured, keeping the prepared
 accelerator and every setting exactly as they are. It changes no choice; it puts back what
 went missing.
 
-`code-indexing-mcp uninstall` removes what the installer added: the `code-indexing-mcp` entry
-from each configured client, the bundled skill links, both launchers (`code-indexing-mcp` and `syndex`), and the PATH block. It
+`syndex uninstall` removes what the installer added: the server entry
+from each configured client, the bundled skill links, both launchers (`syndex` and `code-indexing-mcp`), and the PATH block. It
 prints what it will do and asks before doing any of it (`--yes` skips the prompt).
 
 Removal is evidence-based, not name-based. A launcher that does not point into *this*
@@ -201,10 +201,10 @@ Indexes and caches are **kept** by default; they cost minutes of CPU to rebuild 
 uninstall that discards them silently is not one you can undo. The checkout is kept too:
 
 ```bash
-code-indexing-mcp uninstall                    # entries, skills, launchers, PATH block
-code-indexing-mcp uninstall --purge            # also delete the index and cache directories
-code-indexing-mcp uninstall --remove-checkout  # also delete ~/.local/share/code-indexing-mcp
-code-indexing-mcp uninstall --keep-launcher --keep-path   # leave the commands in place
+syndex uninstall                    # entries, skills, launchers, PATH block
+syndex uninstall --purge            # also delete the index and cache directories
+syndex uninstall --remove-checkout  # also delete ~/.local/share/code-indexing-mcp
+syndex uninstall --keep-launcher --keep-path   # leave the commands in place
 ```
 
 Both deleting flags check the directory before touching it. `--purge` removes a data or
@@ -230,13 +230,13 @@ this complete set after pulling so newly bundled skills are installed as well.
 git clone https://github.com/MarcinHamiga/code-indexing-mcp.git
 cd code-indexing-mcp
 uv sync --locked --extra cpu
-uv run code-indexing-mcp model pull
+uv run syndex model pull
 ```
 
 `--extra cpu` is required: the embedding runtime is an extra rather than a plain dependency,
 because the CPU, CUDA, WebGPU, and MIGraphX runtimes conflict and cannot share one environment. See
 [Embedding backends](#embedding-backends). Add `--extra tui` as well if you want the
-`code-indexing-mcp configure` wizard; without it, scripted `configure --set` still works.
+`syndex configure` wizard; without it, scripted `configure --set` still works.
 
 The model preparation step is optional; the first index operation downloads the model when it
 is not already cached.
@@ -246,7 +246,9 @@ is not already cached.
 Run the server over stdio:
 
 ```bash
-uv run code-indexing-mcp serve
+uv run syndex serve
+# or if installed on PATH:
+syndex serve
 ```
 
 A generic MCP client configuration looks like this:
@@ -254,13 +256,13 @@ A generic MCP client configuration looks like this:
 ```json
 {
   "mcpServers": {
-    "code-indexing-mcp": {
+    "syndex": {
       "command": "uv",
       "args": [
         "--directory",
         "/absolute/path/to/code-indexing-mcp",
         "run",
-        "code-indexing-mcp",
+        "syndex",
         "serve"
       ]
     }
@@ -268,9 +270,12 @@ A generic MCP client configuration looks like this:
 }
 ```
 
+> [!NOTE]
+> When installed to your PATH, you can simplify the configuration to `"command": "syndex"`, `"args": ["serve"]`. The server name can be `"syndex"` or `"code-indexing-mcp"`.
+
 The server exposes nineteen tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
 so hosts may auto-approve them. The other query tools are not: on a root the server has not seen
-before they register it first, which writes a `.ci-mcp/project.toml` marker, and the five code
+before they register it first, which writes a `.ci-mcp/project.toml` marker, and code
 queries also build its initial index. `remove_project` is annotated `destructiveHint`;
 `init_project` carries the same hint and is non-idempotent because `force_new_id=true` can
 overwrite a marker and orphan the previous index.
@@ -369,16 +374,16 @@ silently wrong.
 
 ## Terminal User Interface (TUI)
 
-Code Indexing MCP includes a terminal-native user interface for searching and inspecting codebases directly from your shell without opening an AI assistant or MCP client:
+Syndex includes a terminal-native user interface for searching and inspecting codebases directly from your shell without opening an AI assistant or MCP client:
 
 ```bash
 syndex
-# or equivalently:
-code-indexing-mcp tui
+# or explicitly:
+syndex tui
 ```
 
 `syndex` is the full CLI, not only the TUI: `syndex status`, `syndex index`, and every
-other `code-indexing-mcp` subcommand work the same under either name — run `syndex --help`
+other subcommand work the same directly under `syndex` (or under the `code-indexing-mcp` alias) — run `syndex --help`
 for the complete list. If a project name matches a subcommand (`status`, `index`, ...),
 the command wins over the shorthand: open that project with `syndex tui <project>`.
 
@@ -403,16 +408,20 @@ The TUI operates strictly in read-only mode regarding your source code and will 
 
 ## Project workflow
 
+When installed on your PATH:
+
 ```bash
 cd /path/to/project
-uv run --project /path/to/code-indexing-mcp code-indexing-mcp init
-uv run --project /path/to/code-indexing-mcp code-indexing-mcp index
-uv run --project /path/to/code-indexing-mcp code-indexing-mcp status
-uv run --project /path/to/code-indexing-mcp code-indexing-mcp history
-uv run --project /path/to/code-indexing-mcp code-indexing-mcp scan --outcome skipped
-uv run --project /path/to/code-indexing-mcp code-indexing-mcp storage status
-uv run --project /path/to/code-indexing-mcp code-indexing-mcp storage vacuum --execute
+syndex init
+syndex index
+syndex status
+syndex history
+syndex scan --outcome skipped
+syndex storage status
+syndex storage vacuum --execute
 ```
+
+*(From a repository checkout without installing launchers, prefix commands with `uv run syndex ...`)*
 
 `index` reports live progress — the phase, how many files it has walked against the previous run's
 count, and how many chunks it has embedded — on stderr, as a status line on a terminal and as
@@ -428,7 +437,7 @@ estimates or (`--execute`) executes table compaction and version pruning.
 Benchmark the CPU indexing pipeline with a generated, deterministic corpus:
 
 ```bash
-uv run --project /path/to/code-indexing-mcp code-indexing-mcp benchmark index \
+syndex benchmark index \
   --files 128 --functions-per-file 2 --batch-size 8
 ```
 
@@ -440,7 +449,7 @@ workspace. Pass `--work-dir /fresh/path` to retain the corpus and index for insp
 Benchmark hybrid search across multiple project scopes:
 
 ```bash
-uv run --project /path/to/code-indexing-mcp code-indexing-mcp benchmark search \
+syndex benchmark search \
   --projects 50 --iterations 3
 ```
 
@@ -451,7 +460,7 @@ result counts, and deterministic global ordering across 1-, 8-, and 50-project s
 Compare vector-storage precisions on a deterministic, judged retrieval corpus:
 
 ```bash
-uv run --project /path/to/code-indexing-mcp code-indexing-mcp benchmark precision \
+syndex benchmark precision \
   --passages 240 --iterations 5
 ```
 
@@ -665,7 +674,7 @@ export CODE_INDEXING_BRANCH_CACHE_LIMIT=4   # per project, 1–32; counts the ac
 ```
 
 Eviction runs during storage maintenance (the scheduled daily pass, an explicit
-`index_storage_maintenance`, or `code-indexing-mcp storage vacuum --execute`), ordered by last use.
+`index_storage_maintenance`, or `syndex storage vacuum --execute`), ordered by last use.
 It never removes the active slot, a slot being indexed, or a slot with pending crash recovery, so the
 durable slot count can temporarily exceed the limit — a failed first build does not destroy a usable
 cached slot. `remove_project` deletes every slot, partition, and pointer of the project while leaving
@@ -679,7 +688,7 @@ the first query on any selector performs one fresh build into that selector's ow
 `project_status` reports the active selector and slot (abridged):
 
 ```console
-$ code-indexing-mcp status
+$ syndex status
 {
   "active_slot_id": "8cca8ea14be11b16ca366add8d72edb7d2fdf2a78739f2877481d60204d9b7f8",
   "branch_build_pending": false,
@@ -702,7 +711,7 @@ retained slot with its selector, active flag, state, indexed HEAD, last-use time
 bytes, and sums them into the project and installation totals (abridged):
 
 ```console
-$ code-indexing-mcp storage status
+$ syndex storage status
 {
   "schema_version": 2,
   "projects": [
@@ -990,10 +999,10 @@ counted them would describe a failure that never happened. The CPU reference is 
 all, once the accelerator's worker has been retired, so the two models are never resident against
 the same ceiling at the same time.
 
-`code-indexing-mcp model status` reports the whole resolution without loading or probing anything:
+`syndex model status` reports the whole resolution without loading or probing anything:
 
 ```console
-$ code-indexing-mcp model status
+$ syndex model status
 {
   "accelerator_characters_per_second": null,
   "accelerator_environment": null,
@@ -1034,7 +1043,7 @@ batch size a ceiling overrun pinned down. It stays null the rest of the time rat
 advice nothing measured.
 
 If installation reports a fallback, rerun the explicit installer command to see the build/probe
-reason, then use `code-indexing-mcp model status` to distinguish the requested backend, prepared
+reason, then use `syndex model status` to distinguish the requested backend, prepared
 environment, resolved provider, probe state, and fallback reason. Native provider failures never
 trigger a package install or driver change in the server; the installer removes a failed
 environment before CPU is reported.
@@ -1090,7 +1099,7 @@ headroom that the worst-case file shape already needs. Embedding dominates: 141 
 batch size 1. Plan for roughly **45 chunks per second**, and remember that in the default lazy mode
 the first `search_code` call waits for that work. On a large repository prefer
 `CODE_INDEXING_INDEX_MODE=eager` (index during tool listing and monitor later changes) or
-`CODE_INDEXING_INDEX_MODE=manual` with an explicit `code-indexing-mcp index`, so no query blocks on
+`CODE_INDEXING_INDEX_MODE=manual` with an explicit `syndex index`, so no query blocks on
 a cold index.
 
 ### Single-line and generated files
@@ -1121,9 +1130,9 @@ every size measured so far.
 All stdio adapters use the per-user daemon by default. Administrative commands are:
 
 ```bash
-uv run code-indexing-mcp daemon status
-uv run code-indexing-mcp daemon restart
-uv run code-indexing-mcp daemon stop
+syndex daemon status
+syndex daemon restart
+syndex daemon stop
 ```
 
 Set `CODE_INDEXING_BROKER=off` or run `serve --direct` to bypass it. The daemon authenticates over a
@@ -1139,7 +1148,7 @@ The daemon needs Unix domain sockets. Where they are unavailable — currently W
 
 A daemon left running from a previous build is replaced automatically: every `ping` carries a build
 identity derived from the installed code, and a mismatch is retired and restarted exactly like a
-protocol mismatch, with no action needed. `code-indexing-mcp configure` restarts a running daemon
+protocol mismatch, with no action needed. `syndex configure` restarts a running daemon
 itself whenever it changes a setting the daemon reads at startup (indexing or embedding behavior,
 the data or cache directory, offline mode); a change that only touches installer-only concerns, such
 as the launcher's bin directory, leaves it running. `update` continues to restart it on every code
@@ -1152,7 +1161,7 @@ slot. On first upgrade from v1, the old global store is moved to a timestamped
 `lancedb-v1-backup-*` directory and projects are rebuilt lazily from source. Old chunk rows are
 never copied, which repairs duplicate chunk IDs.
 
-With `CODE_INDEXING_OFFLINE=1`, Code Indexing MCP will not download a missing model and returns
+With `CODE_INDEXING_OFFLINE=1`, Syndex will not download a missing model and returns
 `MODEL_UNAVAILABLE` instead. Source code, embeddings, and search queries remain local; there is
 no telemetry.
 
