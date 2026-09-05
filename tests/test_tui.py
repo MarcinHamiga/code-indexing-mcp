@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from rich.text import Text
 from test_tui_service import FakeApplication, _sample_hit, _sample_project
 from textual.widgets import Input, Label, OptionList, Select, Static
 
@@ -701,3 +702,95 @@ async def test_pane_titles_have_visible_text_rows() -> None:
         await pilot.pause()
         assert app.query_one("#results-title", Label).content_region.height >= 1
         assert app.query_one("#detail-title", Label).content_region.height >= 1
+
+
+@pytest.mark.asyncio
+async def test_failed_navigation_preserves_target_and_history() -> None:
+    from code_indexing_mcp.tui.navigation import SourceLocation
+
+    app = _make_app()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        await pilot.pause(0.3)
+        await app.workers.wait_for_complete()
+        app.action_show_outline()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        target = app._active_target
+        history_count = len(app._history)
+        app._set_detail_entries([(Text("Missing source"), SourceLocation("missing.py", 1))])
+        app.query_one("#detail-list", OptionList).focus()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._active_target == target
+        assert app._detail_mode == "outline"
+        assert len(app._history) == history_count
+        assert "Outline:" in str(app.query_one("#detail-title", Label).render())
+
+
+@pytest.mark.asyncio
+async def test_results_shortcuts_use_focused_result_after_drilldown(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/runner.py").write_text("\n" * 4 + "main()\n")
+    fake = FakeApplication(projects=[_sample_project(root=tmp_path)])
+    app = _make_app(fake)
+    async with app.run_test(size=(120, 32)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        await pilot.pause(0.3)
+        await app.workers.wait_for_complete()
+        app.action_show_references()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#detail-list", OptionList).focus()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#results-list", OptionList).focus()
+        await pilot.press("o")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "src/main.py" in str(app.query_one("#detail-title", Label).render())
+        app.query_one("#results-list", OptionList).focus()
+        await pilot.press("r")
+        await app.workers.wait_for_complete()
+        assert fake.references_calls[-1]["selector"].chunk_id == "chk-1"
+
+
+@pytest.mark.asyncio
+async def test_lazy_search_refreshes_header_state() -> None:
+    fake = FakeApplication()
+    fake.statuses["proj-1"] = "stale"
+    app = _make_app(fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        await pilot.pause(0.3)
+        await app.workers.wait_for_complete()
+        assert "State: ready" in str(app.query_one("#header-status", Label).render())
+
+
+@pytest.mark.asyncio
+async def test_error_retry_remains_bound_to_failed_action() -> None:
+    app = _make_app()
+    calls: list[str] = []
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app._retry_action = lambda: calls.append("failed action")
+        app._show_error("Could not complete action")
+        app._retry_action = lambda: calls.append("later action")
+        await pilot.pause()
+        await pilot.click("#retry-button")
+        assert calls == ["failed action"]

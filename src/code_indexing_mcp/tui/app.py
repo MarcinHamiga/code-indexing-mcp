@@ -117,6 +117,7 @@ class CodeIndexingApp(App[int]):
 
         self._active_target: SourceLocation | None = None
         self._detail_mode = "chunk"
+        self._pending_detail: tuple[SourceLocation, str, DetailState | None] | None = None
         self._detail_entries: list[tuple[Text, SourceLocation]] = []
         self._history: list[DetailState] = []
         self._preview_timer: Timer | None = None
@@ -126,6 +127,7 @@ class CodeIndexingApp(App[int]):
         self._index_project: ProjectInfo | None = None
         self._index_started = 0.0
         self._retry_action: Callable[[], None] | None = None
+        self._error_retry: Callable[[], None] | None = None
         self._progress_pending = False
 
     def compose(self) -> ComposeResult:
@@ -269,6 +271,7 @@ class CodeIndexingApp(App[int]):
 
     def _show_error(self, message: str) -> None:
         self._set_status(message, error=True)
+        self._error_retry = self._retry_action
         self.screen_stack[0].query_one("#error-content", Static).update(message)
         self.screen_stack[0].query_one("#error-panel").display = True
         self.screen_stack[0].query_one("#retry-button", Button).disabled = (
@@ -395,6 +398,7 @@ class CodeIndexingApp(App[int]):
         if self._preview_timer is not None:
             self._preview_timer.stop()
         self._active_target = None
+        self._pending_detail = None
         self._detail_mode = "chunk"
         self.screen_stack[0].query_one("#detail-tabs", Tabs).active = "chunk-tab"
         self._history.clear()
@@ -411,6 +415,8 @@ class CodeIndexingApp(App[int]):
         self._update_layout()
         self.service.select_project(project)
         self._search_phase = None
+        self._retry_action = None
+        self._error_retry = None
         self._clear_error()
         self._project_request_id += 1
         self._search_request_id += 1
@@ -452,9 +458,9 @@ class CodeIndexingApp(App[int]):
         if event.button.id == "dismiss-error":
             self._clear_error()
             self._set_status("Ready")
-        elif event.button.id == "retry-button" and self._retry_action:
+        elif event.button.id == "retry-button" and self._error_retry:
             self._clear_error()
-            self._retry_action()
+            self._error_retry()
         if event.button.id in {"results-view", "details-view"}:
             self._show_pane(event.button.id == "details-view")
         if event.button.id == "index-button":
@@ -464,7 +470,7 @@ class CodeIndexingApp(App[int]):
         self.screen_stack[0].query_one("#query-input", Input).focus()
 
     def action_escape_action(self) -> None:
-        if self._history and not isinstance(self.focused, Input):
+        if (self._history or self._pending_detail) and not isinstance(self.focused, Input):
             self.action_detail_back()
             return
         if self._detail_visible:
@@ -553,6 +559,9 @@ class CodeIndexingApp(App[int]):
 
         self._search_phase = None
         self._show_activity()
+        if self._search_project and self._search_project == self.service.selected_project:
+            self._project_request_id += 1
+            self._load_project_status(self._project_request_id, self._search_project)
         self._hits = hits
         self._highlighted_index = 0 if hits else None
         option_list = self.screen_stack[0].query_one("#results-list", OptionList)
@@ -613,8 +622,9 @@ class CodeIndexingApp(App[int]):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "detail-list":
             if event.option_index < len(self._detail_entries):
-                self._remember_detail()
-                self._open_target(self._detail_entries[event.option_index][1], "chunk")
+                self._open_target(
+                    self._detail_entries[event.option_index][1], "chunk", remember=True
+                )
             return
         if event.option_list.id == "results-list":
             self._highlighted_index = event.option_index
@@ -622,37 +632,47 @@ class CodeIndexingApp(App[int]):
             self._show_pane(True)
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
-        if event.tabs.id != "detail-tabs":
+        if event.tabs.id != "detail-tabs" or event.tab.id != event.tabs.active:
             return
         mode = (event.tab.id or "chunk-tab").removesuffix("-tab")
-        if mode != self._detail_mode:
-            self._navigate_mode(mode)
+        expected = self._pending_detail[1] if self._pending_detail else self._detail_mode
+        if mode != expected:
+            self._navigate_mode(mode, from_tab=True)
 
-    def _navigate_mode(self, mode: str) -> None:
-        if self._active_target is None:
+    def _navigate_mode(self, mode: str, *, from_tab: bool = False) -> None:
+        if not from_tab and self.focused and self.focused.id == "results-list":
+            hit = self._get_selected_hit()
+            if hit is None:
+                return
+            self._history.clear()
+            self._open_target(self._hit_location(hit), mode)
+        elif self._active_target is None:
+            if self._get_selected_hit() is None:
+                return
             self._load_detail_for_selected(mode)
         else:
-            self._remember_detail()
-            self._open_target(self._active_target, mode)
-        if self._active_target is not None:
-            self._show_pane(True)
+            self._open_target(self._active_target, mode, remember=True)
+        self._show_pane(True)
 
-    def _remember_detail(self) -> None:
-        self._history.append(
-            DetailState(
-                self._active_target,
-                self._detail_mode,
-                str(self.screen_stack[0].query_one("#detail-title", Label).render()),
-                self.screen_stack[0].query_one("#detail-content", Static).content,
-                list(self._detail_entries),
-                self.screen_stack[0].query_one("#detail-list", OptionList).highlighted,
-                self.screen_stack[0].query_one("#detail-scroll", VerticalScroll).scroll_y,
-                self.screen_stack[0].query_one("#detail-list", OptionList).scroll_y,
-            )
+    def _capture_detail(self) -> DetailState:
+        return DetailState(
+            self._active_target,
+            self._detail_mode,
+            str(self.screen_stack[0].query_one("#detail-title", Label).render()),
+            self.screen_stack[0].query_one("#detail-content", Static).content,
+            list(self._detail_entries),
+            self.screen_stack[0].query_one("#detail-list", OptionList).highlighted,
+            self.screen_stack[0].query_one("#detail-scroll", VerticalScroll).scroll_y,
+            self.screen_stack[0].query_one("#detail-list", OptionList).scroll_y,
         )
-        self._history = self._history[-50:]
 
     def action_detail_back(self) -> None:
+        self._detail_request_id += 1
+        if self._pending_detail:
+            self._pending_detail = None
+            self.screen_stack[0].query_one("#detail-tabs", Tabs).active = f"{self._detail_mode}-tab"
+            self._set_status("Stopped opening the destination.")
+            return
         if not self._history:
             self._show_pane(False)
             return
@@ -723,12 +743,11 @@ class CodeIndexingApp(App[int]):
         self._history.clear()
         self._open_target(self._hit_location(hit), action)
 
-    def _open_target(self, target: SourceLocation, action: str) -> None:
+    def _open_target(self, target: SourceLocation, action: str, *, remember: bool = False) -> None:
         if self._preview_timer is not None:
             self._preview_timer.stop()
-        self._retry_action = lambda: self._open_target(target, action)
-        self._active_target = target
-        self._detail_mode = action
+        self._retry_action = lambda: self._open_target(target, action, remember=remember)
+        self._pending_detail = (target, action, self._capture_detail() if remember else None)
         self.screen_stack[0].query_one("#detail-tabs", Tabs).active = f"{action}-tab"
         self._detail_request_id += 1
         req_id = self._detail_request_id
@@ -801,7 +820,12 @@ class CodeIndexingApp(App[int]):
         )
 
     def _apply_detail(self, request_id: int, render: Callable[..., None], value: Any) -> None:
-        if request_id == self._detail_request_id:
+        if request_id == self._detail_request_id and self._pending_detail:
+            self._active_target, self._detail_mode, previous = self._pending_detail
+            self._pending_detail = None
+            if previous is not None:
+                self._history.append(previous)
+                self._history = self._history[-50:]
             self._set_detail_entries([])
             render(value)
             self.screen_stack[0].query_one("#detail-scroll", VerticalScroll).scroll_home(
@@ -810,6 +834,8 @@ class CodeIndexingApp(App[int]):
 
     def _detail_error(self, request_id: int, message: str) -> None:
         if request_id == self._detail_request_id:
+            self._pending_detail = None
+            self.screen_stack[0].query_one("#detail-tabs", Tabs).active = f"{self._detail_mode}-tab"
             self._show_error(message)
 
     def _render_chunk(self, chunk: CodeChunk | SourcePreview) -> None:
@@ -1033,6 +1059,7 @@ class CodeIndexingApp(App[int]):
         self.screen_stack[0].query_one("#index-button", Button).disabled = False
         self._show_activity()
         if self.service.selected_project == project:
+            self._project_request_id += 1
             self._update_header(project, status)
         files_indexed = getattr(report, "indexed_files", getattr(report, "files_indexed", 0))
         chunks_embedded = getattr(report, "embedded_chunks", getattr(report, "chunks_staged", 0))
