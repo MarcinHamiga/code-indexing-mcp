@@ -190,6 +190,9 @@ async def test_tui_app_search_semantic() -> None:
 
         await _wait_for_workers(app, pilot)
         await pilot.pause()
+        async with asyncio.timeout(5):
+            while app._active_target is None or app._pending_detail is not None:
+                await pilot.pause()
 
         results_title = app.query_one("#results-title", Label).render()
         assert "Results (1)" in str(results_title)
@@ -198,7 +201,8 @@ async def test_tui_app_search_semantic() -> None:
         assert results_list.option_count == 1
 
         status_bar = app.query_one("#status-bar", Static).render()
-        assert "Found 1 hit(s)" in str(status_bar)
+        assert "Showing main · lines 1-10" in str(status_bar)
+        assert "Preview: src/main.py:1-10" in str(app.query_one("#detail-title", Label).render())
 
 
 @pytest.mark.asyncio
