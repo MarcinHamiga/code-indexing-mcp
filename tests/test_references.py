@@ -613,7 +613,7 @@ def test_files_without_reference_extraction_are_reported_as_a_coverage_gap(
         tmp_path,
         {
             "lib.py": "def answer():\n    return 42\n",
-            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
+            "config.yaml": "service:\n  port: 8080\n",
         },
     )
 
@@ -622,23 +622,24 @@ def test_files_without_reference_extraction_are_reported_as_a_coverage_gap(
     )
 
     limitation = next(item for item in response.limitations if item.code == "unsupported_language")
-    assert "svc.c" in limitation.explanation
-    assert "1 c file(s)" in limitation.explanation
+    assert "config.yaml" in limitation.explanation
+    assert "1 yaml file(s)" in limitation.explanation
 
 
 def test_go_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> None:
     """Coverage flips only for the newly supported language.
 
-    Indexing a mixed Python + Go + C project must stop reporting
-    `unsupported_language` for the Go files while the C files stay reported,
-    proving the flip is scoped to the language that gained extraction.
+    Indexing a mixed Python + Go + YAML project must stop reporting
+    `unsupported_language` for the Go files while the YAML files stay
+    reported, proving the flip is scoped to the language that gained
+    extraction.
     """
     service, project_id = _indexed_service(
         tmp_path,
         {
             "lib.py": "def answer():\n    return 42\n",
             "main.go": 'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("hi")\n}\n',
-            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
+            "config.yaml": "service:\n  port: 8080\n",
         },
     )
 
@@ -652,19 +653,19 @@ def test_go_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> N
         if item.code == "unsupported_language" and "main.go" in item.explanation
     ]
     assert not go_gaps
-    c_gaps = [
+    yaml_gaps = [
         item
         for item in response.limitations
-        if item.code == "unsupported_language" and "svc.c" in item.explanation
+        if item.code == "unsupported_language" and "config.yaml" in item.explanation
     ]
-    assert c_gaps
+    assert yaml_gaps
 
 
 def test_rust_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> None:
     """Coverage flips only for the newly supported language.
 
-    Indexing a mixed Python + Rust + C project must stop reporting
-    `unsupported_language` for the Rust files while the C files stay
+    Indexing a mixed Python + Rust + YAML project must stop reporting
+    `unsupported_language` for the Rust files while the YAML files stay
     reported, proving the flip is scoped to the language that gained
     extraction.
     """
@@ -673,7 +674,7 @@ def test_rust_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) ->
         {
             "lib.py": "def answer():\n    return 42\n",
             "main.rs": "pub fn main() {\n    let x = 1;\n}\n",
-            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
+            "config.yaml": "service:\n  port: 8080\n",
         },
     )
 
@@ -687,19 +688,19 @@ def test_rust_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) ->
         if item.code == "unsupported_language" and "main.rs" in item.explanation
     ]
     assert not rust_gaps
-    c_gaps = [
+    yaml_gaps = [
         item
         for item in response.limitations
-        if item.code == "unsupported_language" and "svc.c" in item.explanation
+        if item.code == "unsupported_language" and "config.yaml" in item.explanation
     ]
-    assert c_gaps
+    assert yaml_gaps
 
 
 def test_java_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> None:
     """Coverage flips only for the newly supported language.
 
-    Indexing a mixed Python + Java + C project must stop reporting
-    `unsupported_language` for the Java files while the C files stay
+    Indexing a mixed Python + Java + YAML project must stop reporting
+    `unsupported_language` for the Java files while the YAML files stay
     reported, proving the flip is scoped to the language that gained
     extraction.
     """
@@ -709,7 +710,7 @@ def test_java_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) ->
             "lib.py": "def answer():\n    return 42\n",
             "Main.java": "public class Main {\n    public static void main(String[] args) {\n"
             '        System.out.println("hi");\n    }\n}\n',
-            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
+            "config.yaml": "service:\n  port: 8080\n",
         },
     )
 
@@ -723,12 +724,12 @@ def test_java_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) ->
         if item.code == "unsupported_language" and "Main.java" in item.explanation
     ]
     assert not java_gaps
-    c_gaps = [
+    yaml_gaps = [
         item
         for item in response.limitations
-        if item.code == "unsupported_language" and "svc.c" in item.explanation
+        if item.code == "unsupported_language" and "config.yaml" in item.explanation
     ]
-    assert c_gaps
+    assert yaml_gaps
 
 
 def test_go_method_receiver_name_binds_a_unique_member_exactly(tmp_path: Path) -> None:
@@ -1010,9 +1011,10 @@ def test_references_return_once_a_stale_file_is_reindexed(tmp_path: Path) -> Non
 def test_csharp_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> None:
     """Coverage flips only for the newly supported language.
 
-    Indexing a mixed Python + C# + C project must stop reporting
-    `unsupported_language` for the C# files while the C files stay reported,
-    proving the flip is scoped to the language that gained extraction.
+    Indexing a mixed Python + C# + YAML project must stop reporting
+    `unsupported_language` for the C# files while the YAML files stay
+    reported, proving the flip is scoped to the language that gained
+    extraction.
     """
     service, project_id = _indexed_service(
         tmp_path,
@@ -1020,7 +1022,7 @@ def test_csharp_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) 
             "lib.py": "def answer():\n    return 42\n",
             "Program.cs": "public class Program {\n    public static void Main() {\n"
             '        System.Console.WriteLine("hi");\n    }\n}\n',
-            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
+            "config.yaml": "service:\n  port: 8080\n",
         },
     )
 
@@ -1034,12 +1036,157 @@ def test_csharp_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) 
         if item.code == "unsupported_language" and "Program.cs" in item.explanation
     ]
     assert not csharp_gaps
+    yaml_gaps = [
+        item
+        for item in response.limitations
+        if item.code == "unsupported_language" and "config.yaml" in item.explanation
+    ]
+    assert yaml_gaps
+
+
+def test_c_files_stop_being_a_coverage_gap_once_structural(tmp_path: Path) -> None:
+    """Coverage flips only for the newly supported language.
+
+    Indexing a mixed Python + C + YAML project must stop reporting
+    `unsupported_language` for the C files while the YAML files stay
+    reported, proving the flip is scoped to the language that gained
+    extraction.
+    """
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "svc.c": "int Run(void) {\n\treturn 1;\n}\n",
+            "config.yaml": "service:\n  port: 8080\n",
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    )
+
     c_gaps = [
         item
         for item in response.limitations
         if item.code == "unsupported_language" and "svc.c" in item.explanation
     ]
-    assert c_gaps
+    assert not c_gaps
+    yaml_gaps = [
+        item
+        for item in response.limitations
+        if item.code == "unsupported_language" and "config.yaml" in item.explanation
+    ]
+    assert yaml_gaps
+
+
+def test_c_same_file_call_resolves_exactly(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "svc.c": (
+                "int Authorize(const char *u) {\n"
+                "\treturn 1;\n"
+                "}\n"
+                "int Run(void) {\n"
+                '\treturn Authorize("a");\n'
+                "}\n"
+            ),
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="svc.c", qualified_symbol="Authorize")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "same_file_symbol"
+
+
+def test_c_cross_file_call_without_a_header_edge_stays_likely(tmp_path: Path) -> None:
+    """A bare call in another file with no include edge cannot bind exactly:
+    C has no package rule, so same-named functions elsewhere stay candidates.
+    """
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "svc.c": "int Authorize(const char *u) {\n\treturn 1;\n}\n",
+            "use.c": 'int Run(void) {\n\treturn Authorize("a");\n}\n',
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="svc.c", qualified_symbol="Authorize")
+    )
+
+    call = next(hit for hit in response.hits if hit.path == "use.c" and hit.kind == "call")
+    assert call.resolution in {"likely", "unresolved"}
+
+
+def test_sql_view_reads_its_source_table(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "schema.sql": (
+                "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);\n"
+                "CREATE VIEW active AS SELECT id, name FROM users WHERE active = 1;\n"
+            ),
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="schema.sql", qualified_symbol="users")
+    )
+
+    table_read = next(
+        hit for hit in response.hits if hit.kind == "read" and hit.written_name == "users"
+    )
+    assert table_read.resolution == "exact"
+
+
+def test_lua_require_module_call_is_recorded(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "util.lua": "local M = {}\nfunction M.helper(x)\n    return x\nend\nreturn M\n",
+            "main.lua": 'local util = require("util")\nutil.helper(1)\n',
+        },
+    )
+
+    rows = service.store.list_reference_records(project_id)
+    imports = [
+        row
+        for row in rows
+        if row["record_kind"] == "reference"
+        and row["kind"] == "import"
+        and row["path"] == "main.lua"
+    ]
+
+    assert [(row["target_name"], row["module_path"]) for row in imports] == [("util", "util")]
+
+
+def test_gdscript_self_member_write_is_recorded(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "player.gd": (
+                "extends Node\nvar hp = 100\nfunc heal(amount):\n\tself.hp = hp + amount\n"
+            ),
+        },
+    )
+
+    rows = service.store.list_reference_records(project_id)
+    writes = [
+        row
+        for row in rows
+        if row["record_kind"] == "reference"
+        and row["kind"] == "write"
+        and row["path"] == "player.gd"
+    ]
+
+    assert [(row["target_name"], row["source_qualified_symbol"]) for row in writes] == [
+        ("self.hp", "heal")
+    ]
 
 
 def test_csharp_using_never_binds_an_ambiguous_name_exactly(tmp_path: Path) -> None:
@@ -1399,7 +1546,7 @@ def test_impact_radius_coverage_gaps_degrade_completeness(tmp_path: Path) -> Non
         tmp_path,
         {
             "graph.py": "def base():\n    return 1\n",
-            "native.c": "int caller(void) { return 1; }\n",
+            "config.yaml": "service:\n  port: 8080\n",
         },
     )
 

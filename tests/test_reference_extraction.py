@@ -1793,3 +1793,567 @@ def test_csharp_this_receiver_writes_are_member_rows() -> None:
     reads = [r for r in refs if r.kind == "read"]
     assert [r.target_name for r in reads] == ["this.Count"]
     assert all(r.receiver_text == "this" for r in reads)
+
+
+# ---------------------------------------------------------------------------
+# C structural references
+# ---------------------------------------------------------------------------
+
+
+def _c_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.c"), "c", source.encode())
+
+
+def test_c_extracts_includes_as_module_edges() -> None:
+    source = '#include <stdio.h>\n#include "util.h"\n'
+
+    imports = {r.written_name: r for r in _c_result(source).references if r.kind == "import"}
+
+    assert set(imports) == {"stdio.h", "util.h"}
+    assert all(r.imported_name is None and r.alias is None for r in imports.values())
+    assert imports["util.h"].module_path == "util.h"
+
+
+def test_c_calls_carry_shapes_and_receivers() -> None:
+    source = "int run(void) {\n    build(1, flag);\n    return peer->draw(size);\n}\n"
+
+    refs = _c_result(source).references
+    calls = {r.target_name: r for r in refs if r.kind == "call"}
+
+    assert calls["build"].call_shape is not None
+    assert calls["build"].call_shape.positional_count == 2
+    assert calls["build"].source_qualified_symbol == "run"
+    assert calls["peer->draw"].receiver_text == "peer"
+    assert calls["peer->draw"].call_shape.positional_count == 1
+    assert calls["peer->draw"].source_qualified_symbol == "run"
+
+
+def test_c_member_access_reads_and_writes() -> None:
+    source = "void set(struct Store *s) {\n    s->next = s->head;\n}\n"
+
+    refs = _c_result(source).references
+    rows = [(r.kind, r.target_name) for r in refs if r.kind in {"read", "write"}]
+
+    assert ("write", "s->next") in rows
+    assert ("read", "s->head") in rows
+    assert not any(target in {"next", "head"} for _, target in rows)
+
+
+def test_c_project_types_become_type_use_rows() -> None:
+    source = (
+        "typedef struct { int x; } Point;\n"
+        "int area(Point shape, int scale) {\n"
+        "    return shape.x * scale;\n"
+        "}\n"
+    )
+
+    type_uses = [r for r in _c_result(source).references if r.kind == "type_use"]
+
+    assert [r.written_name for r in type_uses] == ["Point"]
+    assert type_uses[0].source_qualified_symbol == "area"
+    assert not any(r.written_name == "int" for r in type_uses)
+
+
+def test_c_linkage_exports_skip_static() -> None:
+    source = (
+        "int total = 0;\n"
+        "static int hidden = 1;\n"
+        "int add(int a) {\n"
+        "    return a + total;\n"
+        "}\n"
+        "static void helper(void) {}\n"
+    )
+
+    exports = {r.written_name for r in _c_result(source).references if r.kind == "export"}
+
+    assert exports == {"total", "add"}
+
+
+def test_c_bindings_are_not_reads_but_values_are() -> None:
+    source = (
+        "#define LIMIT 10\n"
+        "#define SQUARE(x) ((x) * (x))\n"
+        "int budget = LIMIT;\n"
+        "int scaled(int factor) {\n"
+        "    return SQUARE(factor);\n"
+        "}\n"
+    )
+
+    refs = _c_result(source).references
+    reads = {(r.written_name, r.start_byte) for r in refs if r.kind == "read"}
+
+    assert ("LIMIT", source.index("= LIMIT") + 2) in reads
+    assert ("factor", source.rindex("factor")) in reads
+    assert ("LIMIT", source.index("#define LIMIT") + len("#define ")) not in reads
+    assert ("SQUARE", source.index("#define SQUARE") + len("#define ")) not in reads
+    assert ("budget", source.index("int budget") + len("int ")) not in reads
+    assert ("scaled", source.index("int scaled") + len("int ")) not in reads
+    assert ("x", source.index("SQUARE(x)") + len("SQUARE(")) not in reads
+
+
+def test_c_function_parameters_shape_rows() -> None:
+    source = "int add(int first, const char *name, int items[4]) {\n    return first;\n}\n"
+
+    declarations = {d.qualified_symbol: d for d in _c_result(source).declarations}
+
+    assert [(p.name, p.kind, p.required) for p in declarations["add"].parameters] == [
+        ("first", "positional", True),
+        ("name", "positional", True),
+        ("items", "positional", True),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# C++ structural references
+# ---------------------------------------------------------------------------
+
+
+def _cpp_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.cpp"), "cpp", source.encode())
+
+
+def test_cpp_base_clause_is_an_inheritance_edge() -> None:
+    source = "class Widget : public Base {\n};\n"
+
+    refs = _cpp_result(source).references
+    inheritance = [r for r in refs if r.kind == "inheritance"]
+
+    assert [r.written_name for r in inheritance] == ["Base"]
+    assert all(r.source_qualified_symbol == "Widget" for r in inheritance)
+
+
+def test_cpp_template_base_splits_heritage_from_type_use() -> None:
+    source = "class Cache : public Store<Item> {\n};\n"
+
+    refs = _cpp_result(source).references
+    by_kind = {(r.kind, r.written_name) for r in refs}
+
+    assert ("inheritance", "Store") in by_kind
+    assert ("type_use", "Item") in by_kind
+    assert ("inheritance", "Item") not in by_kind
+
+
+def test_cpp_new_expression_is_a_constructor_call() -> None:
+    source = "Widget *build(int size) {\n    return new Widget(size);\n}\n"
+
+    refs = _cpp_result(source).references
+    call = next(r for r in refs if r.kind == "call")
+
+    assert call.target_name == "Widget"
+    assert call.call_shape is not None
+    assert call.call_shape.positional_count == 1
+    assert call.call_shape.constructor is True
+
+
+def test_cpp_qualified_calls_keep_their_scope() -> None:
+    source = "void run() {\n    Catalog::open(path);\n}\n"
+
+    calls = [r for r in _cpp_result(source).references if r.kind == "call"]
+
+    assert [r.target_name for r in calls] == ["Catalog::open"]
+    assert calls[0].call_shape.positional_count == 1
+
+
+def test_cpp_alias_values_are_type_uses_and_names_are_not() -> None:
+    source = "using myvec = std::vector<int>;\nmyvec all;\n"
+
+    refs = _cpp_result(source).references
+    type_uses = [r.written_name for r in refs if r.kind == "type_use"]
+    reads = [r.written_name for r in refs if r.kind == "read"]
+
+    assert "vector" in type_uses
+    assert "myvec" in type_uses
+    assert "myvec" not in reads
+
+
+def test_cpp_optional_parameters_are_not_required() -> None:
+    source = "int ident(int value, int fallback = value) {\n    return value;\n}\n"
+
+    declarations = {d.qualified_symbol: d for d in _cpp_result(source).declarations}
+    params = [(p.name, p.required) for p in declarations["ident"].parameters]
+
+    assert params == [("value", True), ("fallback", False)]
+    reads = [r.written_name for r in _cpp_result(source).references if r.kind == "read"]
+    assert "value" in reads
+
+
+# ---------------------------------------------------------------------------
+# Lua structural references
+# ---------------------------------------------------------------------------
+
+
+def _lua_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.lua"), "lua", source.encode())
+
+
+def test_lua_require_is_a_call_with_a_module_edge() -> None:
+    source = 'local util = require("util")\nlocal other = require "helpers.format"\n'
+
+    refs = _lua_result(source).references
+    calls = [r for r in refs if r.kind == "call"]
+    imports = {r.written_name: r for r in refs if r.kind == "import"}
+
+    assert [r.target_name for r in calls] == ["require", "require"]
+    assert [r.module_path for r in calls] == ["util", "helpers.format"]
+    assert set(imports) == {"util", "helpers.format"}
+    assert all(r.imported_name is None and r.alias is None for r in imports.values())
+    assert imports["helpers.format"].module_path == "helpers.format"
+
+
+def test_lua_method_calls_carry_the_table_receiver() -> None:
+    source = "local m = {}\nfunction m:add(x)\n    return x\nend\nm:add(2)\nhelper.transform(3)\n"
+
+    calls = [r for r in _lua_result(source).references if r.kind == "call"]
+    by_target = {r.target_name: r for r in calls}
+
+    assert by_target["m:add"].receiver_text == "m"
+    assert by_target["m:add"].call_shape.positional_count == 1
+    assert by_target["helper.transform"].receiver_text == "helper"
+
+
+def test_lua_member_writes_are_writes() -> None:
+    source = "config.retries = config.limit\n"
+
+    refs = _lua_result(source).references
+    rows = [(r.kind, r.target_name) for r in refs]
+
+    assert ("write", "config.retries") in rows
+    assert ("read", "config.limit") in rows
+    assert ("read", "config") in rows
+
+
+def test_lua_bindings_are_not_reads() -> None:
+    source = (
+        "local count = 0\n"
+        "for i = 1, 10 do\n"
+        "    count = count + i\n"
+        "end\n"
+        "local shape = { width = 2, [mode] = name }\n"
+    )
+
+    refs = _lua_result(source).references
+    reads = {(r.written_name, r.start_byte) for r in refs if r.kind == "read"}
+
+    assert ("count", source.index("local count") + len("local ")) not in reads
+    assert ("i", source.index("for i") + len("for ")) not in reads
+    assert ("width", source.index("width =")) not in reads
+    assert ("count", source.index("count + i")) in reads
+    assert ("mode", source.index("[mode]") + 1) in reads
+    assert ("name", source.rindex("name")) in reads
+
+
+def test_lua_vararg_is_a_variadic_slot() -> None:
+    source = "local function each(first, ...)\n    return first\nend\n"
+
+    declarations = {d.qualified_symbol: d for d in _lua_result(source).declarations}
+
+    assert [(p.name, p.kind) for p in declarations["each"].parameters] == [
+        ("first", "positional"),
+        ("...", "variadic"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Terraform structural references
+# ---------------------------------------------------------------------------
+
+
+def _terraform_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.tf"), "terraform", source.encode())
+
+
+def test_terraform_traversals_are_reads() -> None:
+    source = (
+        'resource "aws_instance" "web" {\n'
+        "  ami = var.image_id\n"
+        "  size = local.sizes.large\n"
+        "  ip = aws_instance.web.public_ip\n"
+        "}\n"
+    )
+
+    reads = [r.written_name for r in _terraform_result(source).references if r.kind == "read"]
+
+    assert reads == ["var.image_id", "local.sizes.large", "aws_instance.web.public_ip"]
+
+
+def test_terraform_keys_and_type_keywords_are_not_reads() -> None:
+    source = (
+        'resource "aws_instance" "web" {\n'
+        "  tags = { Name = local.prefix }\n"
+        "}\n"
+        'variable "image_id" {\n'
+        "  type = string\n"
+        "}\n"
+    )
+
+    reads = [r.written_name for r in _terraform_result(source).references if r.kind == "read"]
+
+    assert reads == ["local.prefix"]
+
+
+def test_terraform_interpolations_and_calls_are_reads() -> None:
+    source = (
+        'resource "aws_instance" "web" {\n'
+        '  name = "prefix-${var.env}"\n'
+        "  count = max(1, var.desired)\n"
+        "  shape = list(string)\n"
+        "}\n"
+    )
+
+    refs = _terraform_result(source).references
+    reads = [r.written_name for r in refs if r.kind == "read"]
+    calls = [r.written_name for r in refs if r.kind == "call"]
+
+    assert reads == ["var.env", "var.desired"]
+    assert calls == ["max"]
+
+
+def test_terraform_local_module_source_is_an_import() -> None:
+    source = (
+        'module "vpc" {\n'
+        '  source = "./vpc"\n'
+        "}\n"
+        'module "remote" {\n'
+        '  source = "terraform-aws-modules/vpc/aws"\n'
+        "}\n"
+    )
+
+    imports = [r for r in _terraform_result(source).references if r.kind == "import"]
+
+    assert [(r.written_name, r.module_path) for r in imports] == [("vpc", "./vpc")]
+
+
+# ---------------------------------------------------------------------------
+# SQL relational references
+# ---------------------------------------------------------------------------
+
+
+def _sql_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.sql"), "sql", source.encode())
+
+
+def test_sql_view_body_reads_its_source_tables() -> None:
+    source = (
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);\n"
+        "CREATE VIEW active AS SELECT id, name FROM users WHERE active = 1;\n"
+    )
+
+    refs = _sql_result(source).references
+    by_kind = {(r.kind, r.written_name) for r in refs}
+
+    assert ("read", "users") in by_kind
+    assert ("read", "id") in by_kind
+    assert ("read", "name") in by_kind
+    assert ("read", "active") in by_kind
+    created = [r for r in refs if r.kind == "read" and r.written_name == "users"]
+    assert any(r.source_qualified_symbol == "active" for r in created)
+    assert not any(
+        r.kind == "read" and r.start_byte == source.index("TABLE users") + 6 for r in refs
+    )
+
+
+def test_sql_joins_qualify_columns_by_alias() -> None:
+    source = "SELECT u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id;\n"
+
+    refs = _sql_result(source).references
+    tables = sorted(r.written_name for r in refs if r.kind == "read" and "." not in r.written_name)
+    columns = sorted(r.written_name for r in refs if r.kind == "read" and "." in r.written_name)
+
+    assert tables == ["orders", "users"]
+    assert columns == ["o.total", "o.user_id", "u.id", "u.name"]
+    aliased = next(r for r in refs if r.written_name == "u.name")
+    assert aliased.receiver_text == "u"
+
+
+def test_sql_mutations_are_writes() -> None:
+    source = (
+        "INSERT INTO users (id) VALUES (1);\n"
+        "UPDATE users SET name = 'b' WHERE id = 1;\n"
+        "DELETE FROM users WHERE id = 2;\n"
+        "DROP TABLE old_users;\n"
+    )
+
+    refs = _sql_result(source).references
+    writes = sorted(r.written_name for r in refs if r.kind == "write")
+    reads = sorted(r.written_name for r in refs if r.kind == "read")
+
+    assert writes == ["users", "users"]
+    assert "users" in reads
+    assert "old_users" in reads
+
+
+def test_sql_function_calls_carry_shapes() -> None:
+    source = "SELECT lower(name), COUNT(*) FROM users;\n"
+
+    refs = _sql_result(source).references
+    calls = {r.target_name: r for r in refs if r.kind == "call"}
+
+    assert calls["lower"].call_shape.positional_count == 1
+    assert calls["COUNT"].call_shape.positional_count == 1
+    assert "name" in [r.written_name for r in refs if r.kind == "read"]
+
+
+# ---------------------------------------------------------------------------
+# GDScript structural references
+# ---------------------------------------------------------------------------
+
+
+def _gdscript_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.gd"), "gdscript", source.encode())
+
+
+def test_gdscript_extends_is_an_inheritance_edge() -> None:
+    source = "extends CharacterBody2D\n"
+
+    refs = _gdscript_result(source).references
+    inheritance = [r for r in refs if r.kind == "inheritance"]
+
+    assert [r.written_name for r in inheritance] == ["CharacterBody2D"]
+
+
+def test_gdscript_extends_path_and_preload_are_imports() -> None:
+    source = 'extends "res://base.gd"\nconst Enemy = preload("res://enemy.gd")\n'
+
+    refs = _gdscript_result(source).references
+    imports = {r.written_name: r for r in refs if r.kind == "import"}
+    calls = [r for r in refs if r.kind == "call"]
+
+    assert set(imports) == {"res://base.gd", "res://enemy.gd"}
+    assert [r.target_name for r in calls] == ["preload"]
+    assert calls[0].module_path == "res://enemy.gd"
+
+
+def test_gdscript_member_writes_carry_the_self_receiver() -> None:
+    source = "func heal(amount):\n\tself.hp = hp + amount\n"
+
+    refs = _gdscript_result(source).references
+    writes = [r for r in refs if r.kind == "write"]
+    reads = {(r.written_name) for r in refs if r.kind == "read"}
+
+    assert [(r.target_name, r.receiver_text) for r in writes] == [("self.hp", "self")]
+    assert writes[0].source_qualified_symbol == "heal"
+    assert {"hp", "amount"} <= reads
+
+
+def test_gdscript_bare_assignments_are_writes_not_bindings() -> None:
+    source = "var hp = 100\nfunc reset():\n\thp = 0\n"
+
+    refs = _gdscript_result(source).references
+    writes = [r for r in refs if r.kind == "write"]
+    reads = [r.written_name for r in refs if r.kind == "read"]
+
+    assert [r.written_name for r in writes] == ["hp"]
+    assert "hp" not in reads
+
+
+def test_gdscript_loop_variables_are_not_reads() -> None:
+    source = "func total(items):\n\tfor item in items:\n\t\tprint(item)\n"
+
+    refs = _gdscript_result(source).references
+    reads = {(r.written_name, r.start_byte) for r in refs if r.kind == "read"}
+
+    assert ("item", source.index("for item") + len("for ")) not in reads
+    assert ("items", source.index("in items") + len("in ")) in reads
+    assert ("item", source.rindex("item")) in reads
+
+
+def test_gdscript_method_calls_are_calls_not_member_reads() -> None:
+    source = "func store(items, item):\n\titems.append(item)\n\treturn Player.new()\n"
+
+    refs = _gdscript_result(source).references
+    calls = {r.target_name: r for r in refs if r.kind == "call"}
+    reads = {(r.written_name) for r in refs if r.kind == "read"}
+
+    assert set(calls) == {"items.append", "Player.new"}
+    assert calls["items.append"].receiver_text == "items"
+    assert calls["items.append"].call_shape.positional_count == 1
+    assert calls["Player.new"].receiver_text == "Player"
+    assert "append" not in reads
+    assert "new" not in reads
+    assert "item" in reads
+
+
+def test_gdscript_enum_members_are_not_reads() -> None:
+    source = "enum State { IDLE, RUN }\nvar current = State.IDLE\n"
+
+    reads = {r.written_name for r in _gdscript_result(source).references if r.kind == "read"}
+
+    assert reads == {"State", "State.IDLE"}
+
+
+def test_gdscript_default_parameters_are_not_required() -> None:
+    source = 'func greet(name, greeting = "hi"):\n\tpass\n'
+
+    declarations = {d.qualified_symbol: d for d in _gdscript_result(source).declarations}
+
+    assert [(p.name, p.required) for p in declarations["greet"].parameters] == [
+        ("name", True),
+        ("greeting", False),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Godot shader structural references
+# ---------------------------------------------------------------------------
+
+
+def _gdshader_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.gdshader"), "gdshader", source.encode())
+
+
+def test_gdshader_calls_skip_builtin_constructors() -> None:
+    source = (
+        "float brightness(vec3 c) {\n"
+        "    return dot(c, vec3(0.3));\n"
+        "}\n"
+        "void fragment() {\n"
+        "    COLOR = tint * brightness(COLOR.rgb);\n"
+        "}\n"
+    )
+
+    refs = _gdshader_result(source).references
+    calls = sorted(r.target_name for r in refs if r.kind == "call")
+    reads = sorted(r.written_name for r in refs if r.kind == "read")
+
+    assert calls == ["brightness", "dot"]
+    assert "vec3" not in reads
+    assert "brightness" not in reads
+    assert "fragment" not in reads
+    assert "tint" in reads
+
+
+def test_gdshader_member_access_reads() -> None:
+    source = "void fragment() {\n    COLOR = tint * brightness(COLOR.rgb);\n}\n"
+
+    refs = _gdshader_result(source).references
+    member = next(r for r in refs if r.kind == "read" and "." in r.written_name)
+
+    assert member.written_name == "COLOR.rgb"
+    assert member.receiver_text == "COLOR"
+
+
+def test_gdshader_declarations_are_not_reads() -> None:
+    source = (
+        "uniform vec4 tint : hint_color = vec4(1.0);\n"
+        "const float PI = 3.14;\n"
+        "struct Light { vec3 dir; float energy; };\n"
+        "varying vec3 world_pos;\n"
+    )
+
+    reads = [r.written_name for r in _gdshader_result(source).references if r.kind == "read"]
+
+    assert reads == []
+
+
+def test_gdshader_function_parameters_shape_rows() -> None:
+    source = (
+        "float mix_blend(float amount, in vec3 tint, out vec3 result) {\n    return amount;\n}\n"
+    )
+
+    declarations = {d.qualified_symbol: d for d in _gdshader_result(source).declarations}
+
+    assert [(p.name, p.kind, p.required) for p in declarations["mix_blend"].parameters] == [
+        ("amount", "positional", True),
+        ("tint", "positional", True),
+        ("result", "positional", True),
+    ]

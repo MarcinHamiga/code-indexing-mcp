@@ -38,6 +38,8 @@ SerializablePath = Annotated[Path, _PathAsPlainString()]
 # (Go files already carried version-4 coverage rows with zero occurrences).
 # Version 6 adds Rust; version 7 adds Java, with on-demand-import semantics.
 # Version 8 adds C#, with namespace identity carried on export rows.
+# Version 9 adds C, C++, Lua, Terraform, SQL, GDScript, and GDShader, with
+# relational (table/column) references for SQL and traversal reads for HCL.
 #
 # Lives here rather than in indexing.py (originally its home) because
 # reference_service.py needs it too and importing it from indexing.py made
@@ -45,7 +47,7 @@ SerializablePath = Annotated[Path, _PathAsPlainString()]
 # docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
 # indexing.py re-exports the name for one release so nothing importing it from
 # there breaks.
-REFERENCE_SCHEMA_VERSION = 8
+REFERENCE_SCHEMA_VERSION = 9
 
 
 def content_digest(value: str | bytes) -> str:

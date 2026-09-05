@@ -30,6 +30,7 @@ def test_default_rules_are_empty_and_reject_all() -> None:
     assert _DEFAULT.left_and_type_parents == frozenset()
     assert _DEFAULT.function_and_type_parents == frozenset()
     assert _DEFAULT.pair_parents == frozenset()
+    assert _DEFAULT.declarator_parents == frozenset()
     assert _DEFAULT.handler_owned_type_parents == frozenset()
     assert _DEFAULT.keyword_only_marker is None
     assert _DEFAULT.reserved_words == frozenset()
@@ -82,6 +83,98 @@ def test_identifier_valid_rules() -> None:
     assert java_rules.identifier_valid("validName") is True
     assert java_rules.identifier_valid("assert") is False
     assert java_rules.identifier_valid("package") is False
+
+    # C rejects C keywords
+    c_rules = LANGUAGE_RULES["c"]
+    assert c_rules.identifier_valid("add") is True
+    assert c_rules.identifier_valid("struct") is False
+    assert c_rules.identifier_valid("typedef") is False
+    assert c_rules.identifier_valid("123bad") is False
+
+    # C++ rejects both C and C++-only keywords
+    cpp_rules = LANGUAGE_RULES["cpp"]
+    assert cpp_rules.identifier_valid("render") is True
+    assert cpp_rules.identifier_valid("struct") is False
+    assert cpp_rules.identifier_valid("class") is False
+    assert cpp_rules.identifier_valid("namespace") is False
+
+    # Lua rejects Lua keywords
+    lua_rules = LANGUAGE_RULES["lua"]
+    assert lua_rules.identifier_valid("helper") is True
+    assert lua_rules.identifier_valid("function") is False
+    assert lua_rules.identifier_valid("local") is False
+
+    # SQL rejects keywords case-insensitively
+    sql_rules = LANGUAGE_RULES["sql"]
+    assert sql_rules.identifier_valid("username") is True
+    assert sql_rules.identifier_valid("select") is False
+    assert sql_rules.identifier_valid("SELECT") is False
+    assert sql_rules.identifier_valid("from") is False
+
+    # GDScript rejects Godot keywords
+    gdscript_rules = LANGUAGE_RULES["gdscript"]
+    assert gdscript_rules.identifier_valid("take_damage") is True
+    assert gdscript_rules.identifier_valid("func") is False
+    assert gdscript_rules.identifier_valid("self") is False
+
+    # GDShader rejects shader keywords
+    gdshader_rules = LANGUAGE_RULES["gdshader"]
+    assert gdshader_rules.identifier_valid("brightness") is True
+    assert gdshader_rules.identifier_valid("uniform") is False
+    assert gdshader_rules.identifier_valid("shader_type") is False
+
+    # Terraform rejects only the literal names
+    terraform_rules = LANGUAGE_RULES["terraform"]
+    assert terraform_rules.identifier_valid("image_id") is True
+    assert terraform_rules.identifier_valid("true") is False
+    assert terraform_rules.identifier_valid("null") is False
+
+
+def test_import_candidates_for_new_languages() -> None:
+    c = LANGUAGE_RULES["c"].import_candidates
+    known = frozenset({"src/util.h", "src/main.c", "include/util.h"})
+    assert c(PurePosixPath("src/main.c"), "util.h", known, None) == {
+        PurePosixPath("src/util.h"),
+        PurePosixPath("include/util.h"),
+    }
+    assert c(PurePosixPath("src/main.c"), "stdio.h", known, None) == set()
+
+    cpp = LANGUAGE_RULES["cpp"].import_candidates
+    assert cpp(PurePosixPath("app/main.cpp"), "widget.h", known, None) == set()
+
+    lua = LANGUAGE_RULES["lua"].import_candidates
+    assert lua(PurePosixPath("app/main.lua"), "a.b", known, None) == {
+        PurePosixPath("app/a/b.lua"),
+        PurePosixPath("app/a/b/init.lua"),
+        PurePosixPath("a/b.lua"),
+        PurePosixPath("a/b/init.lua"),
+    }
+    assert lua(PurePosixPath("app/main.lua"), "./side.lua", known, None) == {
+        PurePosixPath("app/side.lua"),
+        PurePosixPath("side.lua"),
+    }
+
+    gdscript = LANGUAGE_RULES["gdscript"].import_candidates
+    assert gdscript(PurePosixPath("player.gd"), "res://ui/hud.gd", known, None) == {
+        PurePosixPath("ui/hud.gd")
+    }
+    assert gdscript(PurePosixPath("actors/player.gd"), "base.gd", known, None) == {
+        PurePosixPath("actors/base.gd")
+    }
+
+    terraform = LANGUAGE_RULES["terraform"].import_candidates
+    assert terraform(PurePosixPath("main.tf"), "./vpc", known, None) == {
+        PurePosixPath("vpc/main.tf")
+    }
+    assert terraform(PurePosixPath("env/main.tf"), "../vpc", known, None) == {
+        PurePosixPath("vpc/main.tf")
+    }
+    assert (
+        terraform(PurePosixPath("main.tf"), "terraform-aws-modules/vpc/aws", known, None) == set()
+    )
+
+    sql = LANGUAGE_RULES["sql"].import_candidates
+    assert sql(PurePosixPath("schema.sql"), "other", known, None) == set()
 
 
 def test_bound_receivers_per_language() -> None:
