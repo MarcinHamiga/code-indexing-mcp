@@ -54,6 +54,20 @@ async def _wait_for_workers(app: CodeIndexingApp, pilot: Pilot[int]) -> None:
             await pilot.pause()
 
 
+async def _wait_for_preview(
+    app: CodeIndexingApp, pilot: Pilot[int], expected_path: str | None = None
+) -> None:
+    """Wait for the debounced automatic preview to render its selected target."""
+    await _wait_for_workers(app, pilot)
+    async with asyncio.timeout(5):
+        while (
+            app._active_target is None
+            or app._pending_detail is not None
+            or (expected_path is not None and app._active_target.path != expected_path)
+        ):
+            await pilot.pause()
+
+
 @pytest.mark.asyncio
 async def test_wait_for_workers_propagates_real_worker_failures() -> None:
     app = _make_app()
@@ -188,11 +202,7 @@ async def test_tui_app_search_semantic() -> None:
         query_input.value = "authentication"
         app.action_submit_query()
 
-        await _wait_for_workers(app, pilot)
-        await pilot.pause()
-        async with asyncio.timeout(5):
-            while app._active_target is None or app._pending_detail is not None:
-                await pilot.pause()
+        await _wait_for_preview(app, pilot, "src/main.py")
 
         results_title = app.query_one("#results-title", Label).render()
         assert "Results (1)" in str(results_title)
@@ -562,9 +572,7 @@ async def test_outline_navigation_and_back_restore_selected_entry(tmp_path: Path
         await pilot.pause()
         app.query_one("#query-input", Input).value = "main"
         app.action_submit_query()
-        await _wait_for_workers(app, pilot)
-        await pilot.pause(0.3)
-        await _wait_for_workers(app, pilot)
+        await _wait_for_preview(app, pilot, "src/main.py")
         assert "Preview:" in str(app.query_one("#detail-title", Label).render())
         app.query_one("#detail-tabs", Tabs).active = "outline-tab"
         await pilot.pause()
@@ -597,9 +605,7 @@ async def test_reference_and_impact_destinations_open_and_return(tmp_path: Path)
         await pilot.pause()
         app.query_one("#query-input", Input).value = "main"
         app.action_submit_query()
-        await _wait_for_workers(app, pilot)
-        await pilot.pause(0.3)
-        await _wait_for_workers(app, pilot)
+        await _wait_for_preview(app, pilot, "src/main.py")
         app.action_show_references()
         await _wait_for_workers(app, pilot)
         await pilot.pause()
@@ -680,9 +686,7 @@ async def test_help_and_copy_location_are_available(tmp_path: Path) -> None:
         await pilot.press("escape")
         app.query_one("#query-input", Input).value = "main"
         app.action_submit_query()
-        await _wait_for_workers(app, pilot)
-        await pilot.pause(0.3)
-        await _wait_for_workers(app, pilot)
+        await _wait_for_preview(app, pilot, "src/main.py")
         await pilot.press("y")
         assert app.clipboard == "src/main.py:10"
 
@@ -732,9 +736,7 @@ async def test_help_can_remain_open_during_search_completion() -> None:
         app.action_submit_query()
         await pilot.press("ctrl+h")
         release.set()
-        await _wait_for_workers(app, pilot)
-        await pilot.pause(0.3)
-        await _wait_for_workers(app, pilot)
+        await _wait_for_preview(app, pilot, "src/main.py")
         assert app.screen.query_one("#help-content", Static)
         await pilot.press("escape")
         assert app.query_one("#results-list", OptionList).option_count == 1
@@ -811,9 +813,7 @@ async def test_failed_navigation_preserves_target_and_history() -> None:
         await pilot.pause()
         app.query_one("#query-input", Input).value = "main"
         app.action_submit_query()
-        await _wait_for_workers(app, pilot)
-        await pilot.pause(0.3)
-        await _wait_for_workers(app, pilot)
+        await _wait_for_preview(app, pilot, "src/main.py")
         app.action_show_outline()
         await _wait_for_workers(app, pilot)
         await pilot.pause()
@@ -841,9 +841,7 @@ async def test_results_shortcuts_use_focused_result_after_drilldown(tmp_path: Pa
         await pilot.pause()
         app.query_one("#query-input", Input).value = "main"
         app.action_submit_query()
-        await _wait_for_workers(app, pilot)
-        await pilot.pause(0.3)
-        await _wait_for_workers(app, pilot)
+        await _wait_for_preview(app, pilot, "src/main.py")
         app.action_show_references()
         await _wait_for_workers(app, pilot)
         await pilot.pause()
@@ -872,9 +870,7 @@ async def test_lazy_search_refreshes_header_state() -> None:
         await pilot.pause()
         app.query_one("#query-input", Input).value = "main"
         app.action_submit_query()
-        await _wait_for_workers(app, pilot)
-        await pilot.pause(0.3)
-        await _wait_for_workers(app, pilot)
+        await _wait_for_preview(app, pilot, "src/main.py")
         assert "State: ready" in str(app.query_one("#header-status", Label).render())
 
 
