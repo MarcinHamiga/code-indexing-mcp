@@ -9,9 +9,9 @@ Screen {
 #header-status { color: $text-muted; }
 #project-bar { height: 3; padding: 0 1; }
 #project-select { width: 1fr; min-width: 18; margin-right: 1; }
-#mode-select { width: 19; margin-right: 1; }
+#mode-select { width: 22; margin-right: 1; }
 #match-select { width: 17; margin-right: 1; }
-#index-button { width: 12; min-width: 12; }
+#index-button { width: 14; min-width: 14; }
 #query-bar { height: 3; padding: 0 1; }
 #query-input { width: 1fr; }
 #pane-switch { height: 1; padding: 0 1; }
@@ -101,4 +101,6 @@ Footer {
 HelpScreen { align: center middle; background: $background 70%; }
 #help-dialog { width: 76; max-width: 95%; height: auto; max-height: 90%; border: solid $accent; padding: 1 2; background: $surface; }
 
-#detail-title, #results-title { height: 1; }
+#detail-title, #results-title { height: 1; width: 100%; border-bottom: none; }
+
+#results-list, #detail-list { border: none; }

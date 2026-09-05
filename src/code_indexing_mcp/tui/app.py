@@ -147,7 +147,7 @@ class CodeIndexingApp(App[int]):
                 id="match-select",
                 allow_blank=False,
             )
-            yield Button("Index [F5]", id="index-button")
+            yield Button("Index F5", id="index-button")
 
         with Horizontal(id="query-bar"):
             yield Input(

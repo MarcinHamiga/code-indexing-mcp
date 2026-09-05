@@ -691,3 +691,13 @@ async def test_long_error_keeps_preview_and_footer_inside_screen() -> None:
         assert preview.region.bottom <= errors.region.y
         assert preview.region.height >= 2
         assert app.query_one("#context-help").region.bottom <= 23
+
+
+@pytest.mark.asyncio
+async def test_pane_titles_have_visible_text_rows() -> None:
+    app = _make_app()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.query_one("#results-title", Label).content_region.height >= 1
+        assert app.query_one("#detail-title", Label).content_region.height >= 1
