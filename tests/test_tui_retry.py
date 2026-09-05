@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
 
 import pytest
 from test_tui import _make_app
@@ -15,6 +16,7 @@ from textual.widgets import Input
 async def test_search_retry_keeps_original_query_when_detail_starts() -> None:
     fake = FakeApplication()
     started = threading.Event()
+    retry_started = threading.Event()
     release = threading.Event()
     attempts = 0
     queries: list[str] = []
@@ -24,6 +26,8 @@ async def test_search_retry_keeps_original_query_when_detail_starts() -> None:
         nonlocal attempts
         attempts += 1
         queries.append(str(args[0]))
+        if attempts == 2:
+            retry_started.set()
         if attempts == 1:
             started.set()
             release.wait(timeout=5)
@@ -44,7 +48,8 @@ async def test_search_retry_keeps_original_query_when_detail_starts() -> None:
         release.set()
         await app.workers.wait_for_complete()
         await pilot.pause()
-        await pilot.click("#retry-button")
+        assert await pilot.click("#retry-button")
+        assert await asyncio.to_thread(retry_started.wait, 2)
         await app.workers.wait_for_complete()
 
         assert attempts == 2
@@ -52,19 +57,32 @@ async def test_search_retry_keeps_original_query_when_detail_starts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_index_retry_stays_bound_when_preview_starts() -> None:
+async def test_index_retry_stays_bound_when_preview_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     started = threading.Event()
+    retry_started = threading.Event()
+    failure_handled = threading.Event()
     release = threading.Event()
     fake = FakeApplication()
 
     def failing_index(*args: object, **kwargs: object) -> object:
         fake.index_calls.append({"project_id": "proj-1"})
+        if len(fake.index_calls) == 2:
+            retry_started.set()
         started.set()
         release.wait(timeout=5)
         raise RuntimeError("index unavailable")
 
     fake.index_project = failing_index  # type: ignore[method-assign]
     app = _make_app(fake)
+    original_on_index_failed = app._on_index_failed
+
+    def on_index_failed(error_message: str, retry: Callable[[], None]) -> None:
+        original_on_index_failed(error_message, retry)
+        failure_handled.set()
+
+    monkeypatch.setattr(app, "_on_index_failed", on_index_failed)
 
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
@@ -75,11 +93,15 @@ async def test_index_retry_stays_bound_when_preview_starts() -> None:
         await pilot.pause()
         app.action_trigger_index()
         assert await asyncio.to_thread(started.wait, 2)
+        index_worker = next(worker for worker in app.workers if worker.name == "_run_index_worker")
         app.action_open_selected()
         release.set()
-        await app.workers.wait_for_complete()
+        await index_worker.wait()
         await pilot.pause()
-        await pilot.click("#retry-button")
-        await app.workers.wait_for_complete()
+        failure_handled.clear()
+        assert await pilot.click("#retry-button")
+        assert await asyncio.to_thread(retry_started.wait, 2)
+        assert await asyncio.to_thread(failure_handled.wait, 2)
+        assert "index unavailable" in app.query_one("#error-content").content
 
         assert len(fake.index_calls) == 2

@@ -496,6 +496,8 @@ class CodeIndexingApp(App[int]):
             self.action_submit_query()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if not self.is_running:
+            return
         if event.button.id == "dismiss-error":
             self._clear_error()
             self._set_status("Ready")

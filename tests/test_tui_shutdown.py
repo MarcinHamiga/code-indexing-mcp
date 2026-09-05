@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_tui import _make_app
-from test_tui_service import _sample_hit
+from test_tui_service import _sample_hit, _sample_project
 
 
 def test_focus_callback_is_safe_after_main_screen_teardown() -> None:
@@ -75,3 +75,13 @@ async def test_project_callbacks_are_safe_after_partial_screen_teardown() -> Non
         app._apply_project_status(request_id, project, status)
         app._set_status("late status update")
         app._project_error(request_id, "late project status failure")
+
+
+def test_retry_button_callback_is_safe_after_main_screen_teardown() -> None:
+    app = _make_app()
+    project = _sample_project()
+    app._error_retry = lambda: app._start_search("main", "semantic", project, "exact")
+    event = SimpleNamespace(button=SimpleNamespace(id="retry-button"))
+
+    assert app.screen_stack == []
+    app.on_button_pressed(event)
