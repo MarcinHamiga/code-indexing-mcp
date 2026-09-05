@@ -32,6 +32,7 @@ from .errors import CodeIndexingError, ErrorCode
 from .indexing import REFERENCE_SCHEMA_VERSION
 from .models import (
     CodeChunk,
+    DeadCodeReport,
     DeclarationSelector,
     ExampleSearchResponse,
     HistoryPage,
@@ -59,12 +60,13 @@ from .storage import SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
-# Bumped whenever the RPC surface changes shape (version 4 added impact_radius;
+# Bumped whenever the RPC surface changes shape (version 5 added dead_code_report;
+# version 4 added impact_radius;
 # version 3 added chunked responses; version 2 added the `trigger`
 # parameter to index_project): a long-lived daemon from a previous release must
 # reject requests it cannot dispatch instead of failing inside them, and the
 # mismatch is what tells ensure_daemon to retire it and start a current one.
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 MAX_FRAME_BYTES = 16 * 1024**2
 MAX_RESPONSE_BYTES = 256 * 1024**2
 MAX_RESPONSE_CHUNK_BYTES = 8 * 1024**2
@@ -668,6 +670,8 @@ class DaemonServer:
             return app.search_by_example(roots=roots, **params)
         if method == "find_symbol":
             return app.find_symbol(roots=roots, **params)
+        if method == "dead_code_report":
+            return app.dead_code_report(roots=roots, **params)
         if method == "file_outline":
             return app.file_outline(roots=roots, **params)
         if method == "get_chunk":
@@ -1031,6 +1035,11 @@ class BrokerApplication:
     def find_references(self, selector: DeclarationSelector, **params: Any) -> ReferenceResponse:
         return ReferenceResponse.model_validate(
             self._call("find_references", selector=selector, **params)
+        )
+
+    def dead_code_report(self, project: str | None = None, **params: Any) -> DeadCodeReport:
+        return DeadCodeReport.model_validate(
+            self._call("dead_code_report", project=project, **params)
         )
 
     def impact_radius(self, selector: DeclarationSelector, **params: Any) -> ImpactRadiusResponse:

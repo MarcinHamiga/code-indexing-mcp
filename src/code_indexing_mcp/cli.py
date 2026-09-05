@@ -46,6 +46,7 @@ COMMAND_NAMES = (
     "status",
     "history",
     "scan",
+    "dead-code-report",
     "storage",
     "projects",
     "model",
@@ -124,6 +125,10 @@ def _parser(prog: str = "code-indexing-mcp") -> argparse.ArgumentParser:
     )
     scan.add_argument("--limit", type=int, default=50)
     scan.add_argument("--cursor", default=None)
+    dead_code = commands.add_parser(
+        "dead-code-report", help="Review exported declarations with no exact uses (JSON report)"
+    )
+    dead_code.add_argument("project", nargs="?", help="Project id, name, or path")
     storage = commands.add_parser(
         "storage", help="Inspect index storage statistics and maintenance"
     )
@@ -507,6 +512,8 @@ def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> 
             result = app.project_status(args.project)
         elif args.command == "history":
             result = app.index_history(args.project, cursor=args.cursor, limit=args.limit)
+        elif args.command == "dead-code-report":
+            result = app.dead_code_report(args.project)
         elif args.command == "scan":
             result = app.inspect_scan(
                 args.project,

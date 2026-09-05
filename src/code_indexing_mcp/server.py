@@ -30,6 +30,7 @@ from .extractor import STRUCTURAL_LANGUAGES
 from .models import (
     ChunkKind,
     CodeChunk,
+    DeadCodeReport,
     DeclarationSelector,
     ExampleSearchResponse,
     HistoryPage,
@@ -65,7 +66,8 @@ SERVER_INSTRUCTIONS = (
     "search_code (semantic natural-language queries), search_by_example "
     "(code snippet similarity), find_symbol (definitions), "
     "find_references (structural uses of a selected declaration), impact_radius "
-    "(transitive dependents), analyze_refactor (rename or signature impact), file_outline "
+    "(transitive dependents), dead_code_report (exports with no exact uses, for review), "
+    "analyze_refactor (rename or signature impact), file_outline "
     "(file structure before reading), "
     "get_chunk (exact code for a "
     "search hit). When correlating code across explicitly related services, use list_projects "
@@ -1592,6 +1594,31 @@ def create_server(
             limit=limit,
             roots=roots,
         )
+
+    @mcp.tool(
+        title="Review possibly dead exports",
+        description=(
+            "Report exported declarations with zero exact references in one project's structural "
+            "snapshot. Returns the full review list, with likely and unresolved reference counts; "
+            "every finding is possibly dead, never proof of dead code. A declaration's own export "
+            "syntax is not a use; imports and re-exports in other files count. Python includes "
+            "public module-level declarations and literal __all__ entries; other supported "
+            "languages use captured export records. May perform parse-only reference backfill. "
+            "Inspect completeness and limitations: external callers, entry points, dynamic uses, "
+            "excluded files and uncaptured exports are outside this syntax-only report."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def dead_code_report(
+        ctx: ServerContext,
+        project: Annotated[
+            str | None,
+            Field(description="Project id, name, or path. Defaults to the active project."),
+        ] = None,
+    ) -> DeadCodeReport:
+        roots = await _startup_roots(ctx, discover=True)
+        return await asyncio.to_thread(app.dead_code_report, project, roots=roots)
 
     @mcp.tool(
         title="Find references",

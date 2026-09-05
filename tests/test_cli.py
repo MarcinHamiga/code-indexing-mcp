@@ -9,6 +9,30 @@ from code_indexing_mcp.application import Application
 from code_indexing_mcp.cli import main
 
 
+def test_cli_dead_code_report(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    from test_references import TinyEmbedder
+
+    from code_indexing_mcp.application import RuntimePaths
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "lib.py").write_text("def answer():\n    return 42\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    monkeypatch.setattr(cli, "Application", lambda *args, **kwargs: app)
+    monkeypatch.setattr(cli, "_update_notice", lambda *args: None)
+
+    assert main(["dead-code-report", project.id]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["review"][0]["declaration"]["symbol"] == "answer"
+    assert report["review"][0]["status"] == "possibly_dead"
+
+
 def test_cli_initializes_and_lists_projects(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
     root = tmp_path / "repo"
     root.mkdir()

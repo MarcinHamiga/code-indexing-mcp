@@ -140,13 +140,14 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "search_across_projects",
         "find_symbol",
         "find_references",
+        "dead_code_report",
         "impact_radius",
         "analyze_refactor",
         "emit_refactor_patch",
         "file_outline",
         "get_chunk",
     }
-    assert len(tools) == 19
+    assert len(tools) == 20
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -1827,6 +1828,7 @@ AUTO_REGISTERING_TOOLS = frozenset(
         "search_across_projects",
         "find_symbol",
         "find_references",
+        "dead_code_report",
         "impact_radius",
         "analyze_refactor",
         "emit_refactor_patch",
@@ -2053,6 +2055,28 @@ async def test_impact_radius_description_states_safety_contract(tmp_path: Path) 
 
     for term in ("layers", "taint", "review", "budget", "completeness"):
         assert term in description
+
+
+@pytest.mark.asyncio
+async def test_dead_code_report_tool(tmp_path: Path) -> None:
+    app = _tiny_application(tmp_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "lib.py").write_text("def answer():\n    return 42\n")
+    project = app.init_project(root)
+    server = create_server(app, auto_index=False)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    assert "dead_code_report" in tools
+    description = (tools["dead_code_report"].description or "").lower()
+    for term in ("export", "review", "exact", "likely", "completeness"):
+        assert term in description
+
+    async with create_connected_server_and_client_session(server) as client:
+        result = await client.call_tool("dead_code_report", {"project": project.id})
+
+    assert not result.isError
+    assert result.structuredContent is not None
+    assert result.structuredContent["review"][0]["declaration"]["symbol"] == "answer"
 
 
 @pytest.mark.asyncio

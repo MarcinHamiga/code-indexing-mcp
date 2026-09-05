@@ -31,6 +31,7 @@ from .maintenance import MaintenanceService
 from .models import (
     SCAN_SKIP_REASONS,
     CodeChunk,
+    DeadCodeReport,
     DeclarationSelector,
     ExampleSearchResponse,
     HistoryPage,
@@ -320,6 +321,10 @@ class ApplicationLike(Protocol):
         limit: int = 20,
         roots: list[Path] | None = None,
     ) -> SymbolResponse: ...
+
+    def dead_code_report(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> DeadCodeReport: ...
 
     def find_references(
         self,
@@ -1522,6 +1527,28 @@ class Application:
     def _get_chunk_for_target(self, chunk_id: str, target: ActiveIndexTarget) -> CodeChunk:
         self._ensure_query_generations({target.project.id: [target]})
         return self.search.get_chunk(chunk_id, partition=target.partition)
+
+    def dead_code_report(
+        self, project: str | None = None, *, roots: list[Path] | None = None
+    ) -> DeadCodeReport:
+        resolved = self.resolve_project(project, roots)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._dead_code_report_for_target(
+                self._primary_target(targets, resolved.id)
+            ),
+        )
+
+    def _dead_code_report_for_target(self, target: ActiveIndexTarget) -> DeadCodeReport:
+        self._ensure_query_generations({target.project.id: [target]})
+        backfill = self.ensure_reference_index(target.project.id, _target=target)
+        with self.store.partition_access(target.project.id, partition_id=target.partition_id):
+            return self.references.dead_code_report(
+                target.project.id,
+                backfill=backfill,
+                partition=target.partition,
+                root=target.project.root,
+            )
 
     def _prepare_reference_query(
         self,
