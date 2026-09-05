@@ -5,7 +5,7 @@ import pytest
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import Indexer
-from code_indexing_mcp.models import ExampleSearchResponse
+from code_indexing_mcp.models import ExampleSearchResponse, SearchResponse
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner
 from code_indexing_mcp.search import (
@@ -107,6 +107,60 @@ def test_hybrid_search_projects_result_columns(tmp_path: Path) -> None:
     assert "vector" not in rows[0]
     assert "embedding_text" not in rows[0]
     assert "search_text" not in rows[0]
+
+
+def test_search_code_hits_carry_ranking_explanation(tmp_path: Path) -> None:
+    _, search, projects = indexed_projects(tmp_path)
+
+    response = search.search_code("permissions", [projects[0]])
+
+    assert response.hits
+    top = response.hits[0]
+    assert top.symbol == "enforce_permissions"
+    assert top.explanation is not None
+    assert top.explanation.fts_score is not None and top.explanation.fts_score > 0
+    assert top.explanation.vector_score is not None
+    assert top.explanation.vector_score == pytest.approx(1.0)
+    assert top.explanation.fts_rank == 1
+    assert top.explanation.vector_rank == 1
+    # The field is additive to the response schema.
+    reloaded = SearchResponse.model_validate(response.model_dump(mode="json"))
+    assert reloaded == response
+
+
+def test_search_code_explanation_distinguishes_signals(tmp_path: Path) -> None:
+    _, search, projects = indexed_projects(tmp_path)
+
+    response = search.search_code("permissions", projects)
+
+    by_symbol = {hit.symbol: hit for hit in response.hits}
+    assert set(by_symbol) == {"enforce_permissions", "create_invoice"}
+    matched = by_symbol["enforce_permissions"].explanation
+    unmatched = by_symbol["create_invoice"].explanation
+    assert matched is not None and unmatched is not None
+    assert matched.fts_score is not None
+    assert unmatched.fts_score is None
+    assert matched.vector_score is not None and unmatched.vector_score is not None
+    assert matched.vector_score > unmatched.vector_score
+    assert matched.vector_rank == 1
+    assert unmatched.vector_rank == 2
+
+
+def test_search_code_explanation_absent_when_probes_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, search, projects = indexed_projects(tmp_path)
+
+    def reject_probes(*_: object, **__: object) -> object:
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(store, "explain_hits", reject_probes)
+
+    response = search.search_code("permissions", [projects[0]])
+
+    assert response.hits
+    assert response.hits[0].symbol == "enforce_permissions"
+    assert all(hit.explanation is None for hit in response.hits)
 
 
 def test_multi_project_search_is_deterministic_across_concurrent_runs(

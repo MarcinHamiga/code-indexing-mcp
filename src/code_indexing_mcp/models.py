@@ -820,6 +820,24 @@ class ModelStatus(FrozenModel):
     recommended_override: str | None = None
 
 
+class RankExplanation(FrozenModel):
+    """Per-hit breakdown of why a hybrid search hit ranked where it did.
+
+    Diagnostic only, and purely additive: the hybrid query fuses per-modality
+    *ranks* (reciprocal rank fusion), so no exact decomposition of the final
+    score into weights exists. ``fts_score`` is the best BM25-style ``_score``
+    across the content and identifier-terms probes; ``vector_score`` is
+    ``1 - cosine distance`` from the vector probe, the same mapping the
+    vector-only path uses. Ranks are 1-based positions within the explained-hit
+    set per modality. A None signal means that probe did not return the chunk.
+    """
+
+    fts_score: float | None = None
+    vector_score: float | None = None
+    fts_rank: int | None = None
+    vector_rank: int | None = None
+
+
 class SearchHit(FrozenModel):
     chunk_id: str
     project_id: str
@@ -834,6 +852,7 @@ class SearchHit(FrozenModel):
     score: float
     snippet: str
     truncated: bool = False
+    explanation: RankExplanation | None = None
 
 
 class SearchResponse(FrozenModel):

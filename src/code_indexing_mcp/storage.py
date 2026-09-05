@@ -523,6 +523,26 @@ class ActiveIndexTarget:
         )
 
 
+# Columns the ranking-explanation FTS probe spans. These are the same two
+# single-column FTS indexes the hybrid query covers; MultiMatchQuery is not
+# implemented on the FTS-only builder, so the probe runs one query per column
+# and the best `_score` wins, mirroring the hybrid OR semantics approximately.
+_FTS_PROBE_COLUMNS = ("content", "identifier_terms")
+
+
+class RankComponents(TypedDict):
+    """Per-signal probe scores for one already-ranked chunk.
+
+    Ranks are filled in by explain_hits after merging across partitions; the
+    per-partition probes report scores only.
+    """
+
+    fts_score: float | None
+    vector_score: float | None
+    fts_rank: int | None
+    vector_rank: int | None
+
+
 class LanceStore:
     def __init__(
         self,
@@ -1981,6 +2001,149 @@ class LanceStore:
         rows = list(best_by_chunk.values())
         rows.sort(key=lambda row: float(row.get("_relevance_score", 0.0)), reverse=True)
         return rows[:limit]
+
+    def explain_hits(
+        self,
+        query_text: str,
+        vector: list[float],
+        chunk_ids_by_project: Mapping[str, Sequence[str]],
+        condition: str | None,
+        *,
+        partition_ids: Mapping[str, str | Sequence[str]] | None = None,
+    ) -> dict[str, RankComponents]:
+        """Probe per-signal scores for already-ranked chunks.
+
+        Runs one FTS probe per indexed text column and one vector probe per
+        pinned partition, each restricted to the given chunk ids so the cost
+        stays bounded by the returned hits rather than the fetch window. Best
+        score per signal wins across partitions; ranks are recomputed over the
+        merged explained set and are diagnostic positions within that set, not
+        global ranks. A probe that fails leaves its signal None instead of
+        failing the search.
+        """
+        wanted = {
+            project_id: list(dict.fromkeys(chunk_ids))
+            for project_id, chunk_ids in chunk_ids_by_project.items()
+            if chunk_ids
+        }
+        if not wanted:
+            return {}
+        per_partition = self._fan_out_partitions(
+            wanted,
+            partition_ids,
+            lambda project_id, partition_id: self._explanation_probe_rows(
+                project_id,
+                query_text,
+                vector,
+                condition,
+                wanted[project_id],
+                partition_id=partition_id,
+            ),
+        )
+        merged_fts: dict[str, float] = {}
+        merged_vector: dict[str, float] = {}
+        for row in per_partition:
+            chunk_id = str(row["chunk_id"])
+            fts_score = row["fts_score"]
+            if fts_score is not None:
+                fts_score = float(fts_score)
+                if fts_score > merged_fts.get(chunk_id, float("-inf")):
+                    merged_fts[chunk_id] = fts_score
+            vector_score = row["vector_score"]
+            if vector_score is not None:
+                vector_score = float(vector_score)
+                if vector_score > merged_vector.get(chunk_id, float("-inf")):
+                    merged_vector[chunk_id] = vector_score
+        explained: dict[str, RankComponents] = {}
+        for chunk_id in set(merged_fts) | set(merged_vector):
+            explained[chunk_id] = {
+                "fts_score": merged_fts.get(chunk_id),
+                "vector_score": merged_vector.get(chunk_id),
+                "fts_rank": None,
+                "vector_rank": None,
+            }
+        for rank, chunk_id in enumerate(
+            sorted(merged_fts, key=lambda cid: (-merged_fts[cid], cid)), start=1
+        ):
+            explained[chunk_id]["fts_rank"] = rank
+        for rank, chunk_id in enumerate(
+            sorted(merged_vector, key=lambda cid: (-merged_vector[cid], cid)), start=1
+        ):
+            explained[chunk_id]["vector_rank"] = rank
+        return explained
+
+    def _explanation_probe_rows(
+        self,
+        project_id: str,
+        query_text: str,
+        vector: list[float],
+        condition: str | None,
+        chunk_ids: Sequence[str],
+        *,
+        partition_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Score known chunks per signal inside one partition; never raises."""
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return []
+        wanted = list(dict.fromkeys(chunk_ids))
+        if not wanted:
+            return []
+        scoped = f"chunk_id IN ({', '.join(_quoted(chunk_id) for chunk_id in wanted)})"
+        combined = f"({condition}) AND {scoped}" if condition else scoped
+        fts_best: dict[str, float] = {}
+        for column in _FTS_PROBE_COLUMNS:
+            try:
+                probe_rows = cast(
+                    list[dict[str, Any]],
+                    tables.chunks.search(query_text, query_type="fts", fts_columns=[column])
+                    .where(combined, prefilter=True)
+                    .limit(len(wanted))
+                    .select(["chunk_id"])
+                    .to_list(),
+                )
+            except Exception:
+                logger.debug(
+                    "FTS explanation probe failed for %s.%s",
+                    project_id,
+                    column,
+                    exc_info=True,
+                )
+                continue
+            for probe_row in probe_rows:
+                chunk_id = str(probe_row["chunk_id"])
+                score = float(probe_row.get("_score", 0.0))
+                if score > fts_best.get(chunk_id, float("-inf")):
+                    fts_best[chunk_id] = score
+        vector_best: dict[str, float] = {}
+        try:
+            query = tables.chunks.search(
+                vector, vector_column_name="vector", query_type="vector"
+            ).distance_type("cosine")
+            query = query.where(combined, prefilter=True)
+            query = query.limit(len(wanted)).select(["chunk_id", "_distance"])
+            if self.vector_index == "exact":
+                query = query.bypass_vector_index()
+            else:
+                query = query.ef(VECTOR_INDEX_EF).refine_factor(VECTOR_INDEX_REFINE_FACTOR)
+            vector_rows = cast(list[dict[str, Any]], query.to_list())
+        except Exception:
+            logger.debug("Vector explanation probe failed for %s", project_id, exc_info=True)
+            vector_rows = []
+        for vector_row in vector_rows:
+            chunk_id = str(vector_row["chunk_id"])
+            score = 1.0 - float(vector_row["_distance"])
+            if score > vector_best.get(chunk_id, float("-inf")):
+                vector_best[chunk_id] = score
+        return [
+            {
+                "chunk_id": chunk_id,
+                "fts_score": fts_best.get(chunk_id),
+                "vector_score": vector_best.get(chunk_id),
+            }
+            for chunk_id in wanted
+            if chunk_id in fts_best or chunk_id in vector_best
+        ]
 
     def find_symbol_chunks(
         self,

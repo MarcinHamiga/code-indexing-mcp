@@ -38,13 +38,6 @@ variants, parallel implementations). Can run offline against stored vectors; the
 question is presentation (a report tool vs enriching `search_code` results with a
 `duplicate_of` field) and threshold tuning.
 
-### Ranking explanations
-
-Per-hit breakdown of why it ranked: term-match contribution vs vector-similarity
-contribution vs boost. Improves trust and debuggability of hybrid search. Requires the
- scorer to return its components alongside the final score; purely additive to the
- response schema.
-
 ### `changed_symbols` tool
 
 Symbols touched since a commit or timestamp: intersect the scanner's changed-path

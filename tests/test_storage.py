@@ -869,6 +869,30 @@ def test_example_search_nearer_vector_wins_shared_chunk(tmp_path: Path) -> None:
         assert pytest.approx(hit["_relevance_score"], abs=1e-4) == 2**-0.5
 
 
+def test_explain_hits_reports_per_signal_scores(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    project = _seed_hybrid_target(store, tmp_path / "repo")
+    chunks = [f"{project.id}:file-1:chunk-0", f"{project.id}:file-1:chunk-1"]
+
+    explained = store.explain_hits("symbol", [0.0, 0.0, 0.0, 1.0], {project.id: chunks}, None)
+
+    assert set(explained) == set(chunks)
+    for component in explained.values():
+        assert component["fts_score"] is not None and component["fts_score"] >= 0
+        assert component["vector_score"] is not None
+        assert component["vector_score"] == pytest.approx(1.0)
+    assert {component["vector_rank"] for component in explained.values()} == {1, 2}
+    assert {component["fts_rank"] for component in explained.values()} == {1, 2}
+
+
+def test_explain_hits_empty_input_returns_empty(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    project = _seed_hybrid_target(store, tmp_path / "repo")
+
+    assert store.explain_hits("symbol", [0.0, 0.0, 0.0, 1.0], {}, None) == {}
+    assert store.explain_hits("symbol", [0.0, 0.0, 0.0, 1.0], {project.id: []}, None) == {}
+
+
 def test_example_search_requires_distance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
     project = _seed_hybrid_target(store, tmp_path / "repo")
