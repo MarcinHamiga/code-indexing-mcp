@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -61,6 +61,8 @@ class CodeIndexingApp(App[int]):
         self._search_request_id: int = 0
         self._detail_request_id: int = 0
         self._is_indexing: bool = False
+        self._projects: dict[str, ProjectInfo] = {}
+        self._project_request_id = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="header-bar"):
@@ -109,7 +111,7 @@ class CodeIndexingApp(App[int]):
     @work(thread=True, exclusive=True)
     def run_discovery(self) -> None:
         try:
-            current = self.service.discover_current_project()
+            current = self.service.selected_project or self.service.discover_current_project()
             projects = self.service.list_projects()
             status = self.service.project_status() if current else None
             self.call_from_thread(self._setup_projects_ui, projects, current, status)
@@ -124,6 +126,7 @@ class CodeIndexingApp(App[int]):
         selected: ProjectInfo | None,
         status: ProjectStatus | None,
     ) -> None:
+        self._projects = {p.id: p for p in projects}
         select = self.query_one("#project-select", Select)
         options = [(f"{p.name} ({p.id})", p.id) for p in projects]
         select.set_options(options)
@@ -165,24 +168,48 @@ class CodeIndexingApp(App[int]):
         if event.select.id == "project-select" and event.value != Select.BLANK:
             self._on_project_selected(str(event.value))
 
+    def _clear_details(self, message: str) -> None:
+        self._detail_request_id += 1
+        self.query_one("#detail-title", Label).update("Code Preview")
+        self.query_one("#detail-content", Static).update(message)
+        self.query_one("#detail-scroll", VerticalScroll).scroll_home(animate=False)
+
     def _on_project_selected(self, project_id: str) -> None:
+        project = self._projects.get(project_id)
+        if project is None:
+            return
+        self.service.select_project(project)
+        self._project_request_id += 1
+        self._search_request_id += 1
+        self._hits = []
+        self._highlighted_index = None
+        self.query_one("#results-list", OptionList).clear_options()
+        self.query_one("#results-title", Label).update("Results")
+        self._clear_details(
+            f"Active project changed to {project.name}.\n\n"
+            "Run a query to search, or press F5 to index."
+        )
+        self._update_header(project, None)
+        self._set_status(f"Selected project: {project.name}")
+        self._load_project_status(self._project_request_id, project)
+
+    @work(thread=True, exclusive=True, group="project-status")
+    def _load_project_status(self, request_id: int, project: ProjectInfo) -> None:
         try:
-            project = self.service.select_project(project_id)
             status = self.service.project_status(project)
+            self.call_from_thread(self._apply_project_status, request_id, project, status)
+        except Exception as exc:
+            self.call_from_thread(self._project_error, request_id, str(exc))
+
+    def _apply_project_status(
+        self, request_id: int, project: ProjectInfo, status: ProjectStatus
+    ) -> None:
+        if request_id == self._project_request_id:
             self._update_header(project, status)
-            self._hits = []
-            self._highlighted_index = None
-            option_list = self.query_one("#results-list", OptionList)
-            option_list.clear_options()
-            self.query_one("#results-title", Label).update("Results")
-            self.query_one("#detail-title", Label).update("Code Preview")
-            self.query_one("#detail-content", Static).update(
-                f"Active project changed to {project.name}.\n\n"
-                "Run a query to search, or press F5 to index."
-            )
-            self._set_status(f"Selected project: {project.name}")
-        except CodeIndexingError as exc:
-            self._show_error(str(exc))
+
+    def _project_error(self, request_id: int, message: str) -> None:
+        if request_id == self._project_request_id:
+            self._show_error(message)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "query-input":
@@ -217,28 +244,35 @@ class CodeIndexingApp(App[int]):
         mode_select = self.query_one("#mode-select", Select)
         mode = str(mode_select.value) if mode_select.value != Select.BLANK else "semantic"
 
+        self._clear_details("Searching… Select a result to preview its source.")
         self._search_request_id += 1
         req_id = self._search_request_id
         self._set_status(f"Searching ({mode})...")
-        self._run_search_worker(req_id, mode, query)
+        self._run_search_worker(req_id, mode, query, self.service.selected_project)
 
-    @work(thread=True, exclusive=True)
-    def _run_search_worker(self, request_id: int, mode: str, query: str) -> None:
+    @work(thread=True, exclusive=True, group="search")
+    def _run_search_worker(
+        self, request_id: int, mode: str, query: str, project: ProjectInfo | None
+    ) -> None:
         try:
             hits = (
-                self.service.find_symbol(query).hits
+                self.service.find_symbol(query, project=project).hits
                 if mode == "symbol"
-                else self.service.search_code(query).hits
+                else self.service.search_code(query, project=project).hits
             )
 
             if request_id == self._search_request_id:
                 self.call_from_thread(self._render_search_results, request_id, hits, query)
         except CodeIndexingError as exc:
             if request_id == self._search_request_id:
-                self.call_from_thread(self._show_error, str(exc))
+                self.call_from_thread(self._search_error, request_id, str(exc))
         except Exception as exc:
             if request_id == self._search_request_id:
-                self.call_from_thread(self._show_error, f"Search failed: {exc}")
+                self.call_from_thread(self._search_error, request_id, f"Search failed: {exc}")
+
+    def _search_error(self, request_id: int, message: str) -> None:
+        if request_id == self._search_request_id:
+            self._show_error(message)
 
     def _render_search_results(self, request_id: int, hits: list[SearchHit], query: str) -> None:
         if request_id != self._search_request_id:
@@ -250,6 +284,7 @@ class CodeIndexingApp(App[int]):
         option_list.clear_options()
 
         if not hits:
+            self._clear_details("No matches. Try a broader query or a different project.")
             self._set_status(f"No results found for '{query}'.")
             self.query_one("#results-title", Label).update("Results (0)")
             return
@@ -315,33 +350,51 @@ class CodeIndexingApp(App[int]):
         self._detail_request_id += 1
         req_id = self._detail_request_id
         self._set_status(f"Loading {action} for {hit.path}...")
-        self._run_detail_worker(req_id, action, hit)
+        self._run_detail_worker(req_id, action, hit, self.service.selected_project)
 
-    @work(thread=True, exclusive=True)
-    def _run_detail_worker(self, request_id: int, action: str, hit: SearchHit) -> None:
+    @work(thread=True, exclusive=True, group="detail")
+    def _run_detail_worker(
+        self, request_id: int, action: str, hit: SearchHit, project: ProjectInfo | None
+    ) -> None:
         try:
             if action == "chunk":
                 chunk = self.service.get_chunk(hit.chunk_id)
                 if request_id == self._detail_request_id:
-                    self.call_from_thread(self._render_chunk, chunk)
+                    self.call_from_thread(self._apply_detail, request_id, self._render_chunk, chunk)
             elif action == "outline":
-                outline = self.service.file_outline(hit.path)
+                outline = self.service.file_outline(hit.path, project)
                 if request_id == self._detail_request_id:
-                    self.call_from_thread(self._render_outline, outline)
+                    self.call_from_thread(
+                        self._apply_detail, request_id, self._render_outline, outline
+                    )
             elif action == "references":
-                refs = self.service.find_references(hit)
+                refs = self.service.find_references(hit, project=project)
                 if request_id == self._detail_request_id:
-                    self.call_from_thread(self._render_references, refs)
+                    self.call_from_thread(
+                        self._apply_detail, request_id, self._render_references, refs
+                    )
             elif action == "impact":
-                impact = self.service.impact_radius(hit)
+                impact = self.service.impact_radius(hit, project=project)
                 if request_id == self._detail_request_id:
-                    self.call_from_thread(self._render_impact, impact)
+                    self.call_from_thread(
+                        self._apply_detail, request_id, self._render_impact, impact
+                    )
         except CodeIndexingError as exc:
             if request_id == self._detail_request_id:
-                self.call_from_thread(self._show_error, str(exc))
+                self.call_from_thread(self._detail_error, request_id, str(exc))
         except Exception as exc:
             if request_id == self._detail_request_id:
-                self.call_from_thread(self._show_error, f"Failed to load {action}: {exc}")
+                self.call_from_thread(
+                    self._detail_error, request_id, f"Failed to load {action}: {exc}"
+                )
+
+    def _apply_detail(self, request_id: int, render: Callable[..., None], value: Any) -> None:
+        if request_id == self._detail_request_id:
+            render(value)
+
+    def _detail_error(self, request_id: int, message: str) -> None:
+        if request_id == self._detail_request_id:
+            self._show_error(message)
 
     def _render_chunk(self, chunk: CodeChunk) -> None:
         self.query_one("#detail-title", Label).update(
@@ -435,7 +488,7 @@ class CodeIndexingApp(App[int]):
         self._set_status(f"Starting index for {proj.name}...")
         self._run_index_worker(proj)
 
-    @work(thread=True, exclusive=True)
+    @work(thread=True, exclusive=True, group="index")
     def _run_index_worker(self, project: ProjectInfo) -> None:
         stop_polling = False
 
@@ -468,7 +521,8 @@ class CodeIndexingApp(App[int]):
 
     def _on_index_complete(self, project: ProjectInfo, status: ProjectStatus, report: Any) -> None:
         self._is_indexing = False
-        self._update_header(project, status)
+        if self.service.selected_project == project:
+            self._update_header(project, status)
         files_indexed = getattr(report, "indexed_files", getattr(report, "files_indexed", 0))
         chunks_embedded = getattr(report, "embedded_chunks", getattr(report, "chunks_staged", 0))
         self._set_status(

@@ -321,3 +321,81 @@ def test_tui_main_invalid_project_exits_with_error(capsys: pytest.CaptureFixture
     assert exit_code == 2
     captured = capsys.readouterr()
     assert "Error:" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_empty_query_results_clear_previous_preview() -> None:
+    app = _make_app()
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "main"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.action_open_selected()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app._render_search_results(app._search_request_id, [], "missing")
+        assert "Preview:" not in str(app.query_one("#detail-title", Label).render())
+        assert "Try" in str(app.query_one("#detail-content", Static).render())
+
+
+@pytest.mark.asyncio
+async def test_project_switch_rejects_old_search_completion() -> None:
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    fake = FakeApplication(projects=[_sample_project(), _sample_project("proj-2", "second")])
+    original = fake.search_code
+
+    def delayed(*args: object, **kwargs: object) -> SearchResponse:
+        started.set()
+        release.wait(3)
+        return original("old")
+
+    fake.search_code = delayed  # type: ignore[method-assign]
+    app = _make_app(fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "old"
+        app.action_submit_query()
+        await pilot.pause()
+        assert started.is_set()
+        app.query_one("#project-select", Select).value = "proj-2"
+        await pilot.pause()
+        release.set()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.query_one("#results-list", OptionList).option_count == 0
+        assert "second" in str(app.query_one("#header-title", Label).render())
+
+
+@pytest.mark.asyncio
+async def test_new_search_rejects_old_detail_completion() -> None:
+    import threading
+
+    release = threading.Event()
+    fake = FakeApplication()
+    original = fake.get_chunk
+
+    def delayed(chunk_id: str):
+        release.wait(3)
+        return original(chunk_id)
+
+    fake.get_chunk = delayed  # type: ignore[method-assign]
+    app = _make_app(fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app._render_search_results(app._search_request_id, [_sample_hit()], "old")
+        app.action_open_selected()
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "new"
+        app.action_submit_query()
+        release.set()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "Preview:" not in str(app.query_one("#detail-title", Label).render())

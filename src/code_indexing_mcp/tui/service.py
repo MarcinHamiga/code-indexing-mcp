@@ -151,9 +151,11 @@ class TuiService:
             return None
         return self.application.index_progress(target.id)
 
-    def search_code(self, query: str, *, limit: int = 20) -> SearchResponse:
+    def search_code(
+        self, query: str, *, limit: int = 20, project: ProjectInfo | None = None
+    ) -> SearchResponse:
         """Execute semantic search within the active project."""
-        target = self._require_project()
+        target = self._require_project(project)
         status = self.ensure_ready(target)
         if status.state not in {"ready", "partial"} and self.index_mode is IndexMode.MANUAL:
             raise CodeIndexingError(
@@ -164,9 +166,16 @@ class TuiService:
             query, projects=[target.id], limit=limit, roots=[target.root]
         )
 
-    def find_symbol(self, name: str, *, match: str = "exact", limit: int = 20) -> SymbolResponse:
+    def find_symbol(
+        self,
+        name: str,
+        *,
+        match: str = "exact",
+        limit: int = 20,
+        project: ProjectInfo | None = None,
+    ) -> SymbolResponse:
         """Execute symbol lookup within the active project."""
-        target = self._require_project()
+        target = self._require_project(project)
         status = self.ensure_ready(target)
         if status.state not in {"ready", "partial"} and self.index_mode is IndexMode.MANUAL:
             raise CodeIndexingError(
@@ -191,7 +200,11 @@ class TuiService:
         return DeclarationSelector(chunk_id=hit.chunk_id)
 
     def find_references(
-        self, hit_or_selector: SearchHit | DeclarationSelector, *, limit: int = 100
+        self,
+        hit_or_selector: SearchHit | DeclarationSelector,
+        *,
+        limit: int = 100,
+        project: ProjectInfo | None = None,
     ) -> ReferenceResponse:
         """Find references to a selected hit or selector."""
         selector = (
@@ -199,13 +212,15 @@ class TuiService:
             if isinstance(hit_or_selector, SearchHit)
             else hit_or_selector
         )
-        roots = [self._selected_project.root] if self._selected_project else self.roots
+        target = self._require_project(project)
+        roots = [target.root]
         return self.application.find_references(selector, limit=limit, roots=roots)
 
     def impact_radius(
         self,
         hit_or_selector: SearchHit | DeclarationSelector,
         *,
+        project: ProjectInfo | None = None,
         max_depth: int = 2,
         limit: int = 100,
     ) -> ImpactRadiusResponse:
@@ -215,7 +230,8 @@ class TuiService:
             if isinstance(hit_or_selector, SearchHit)
             else hit_or_selector
         )
-        roots = [self._selected_project.root] if self._selected_project else self.roots
+        target = self._require_project(project)
+        roots = [target.root]
         return self.application.impact_radius(
             selector, max_depth=max_depth, limit=limit, roots=roots
         )
