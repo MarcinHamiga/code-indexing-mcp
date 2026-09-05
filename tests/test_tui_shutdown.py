@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from concurrent.futures import CancelledError
 from types import SimpleNamespace
 
 import pytest
 from test_tui import _make_app
 from test_tui_service import _sample_hit, _sample_project
+
+from code_indexing_mcp.tui.navigation import SourceLocation
 
 
 def test_focus_callback_is_safe_after_main_screen_teardown() -> None:
@@ -85,3 +89,111 @@ def test_retry_button_callback_is_safe_after_main_screen_teardown() -> None:
 
     assert app.screen_stack == []
     app.on_button_pressed(event)
+
+
+@pytest.mark.asyncio
+async def test_queued_worker_callback_is_dropped_during_screen_teardown() -> None:
+    app = _make_app()
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        queued: list[Callable[[], None]] = []
+
+        def capture(callback: Callable[[], None]) -> None:
+            queued.append(callback)
+
+        app.call_from_thread = capture  # type: ignore[method-assign]
+        app._detail_request_id = 1
+        app._pending_detail = (SourceLocation("src/main.py", 1), "chunk", None)
+        app._call_from_worker(app._apply_detail, 1, lambda value: None, None)
+        assert len(queued) == 1
+
+        await app.query_one("#detail-list").remove()
+        await app.query_one("#detail-tabs").remove()
+        assert app.screen_stack and app.is_running
+        app._running = False
+
+        queued[0]()
+
+        assert app._pending_detail is not None
+        app._running = True
+
+
+def test_worker_callback_submitted_after_shutdown_is_ignored() -> None:
+    app = _make_app()
+    delivered = False
+
+    def callback() -> None:
+        nonlocal delivered
+        delivered = True
+
+    app._running = False
+    app._call_from_worker(callback)
+
+    assert not delivered
+
+
+@pytest.mark.asyncio
+async def test_actions_are_rejected_after_shutdown() -> None:
+    app = _make_app()
+    app._running = False
+
+    assert await app.run_action("submit_query") is False
+
+
+@pytest.mark.asyncio
+async def test_actions_are_allowed_while_running() -> None:
+    app = _make_app()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        assert await app.run_action("focus_query") is True
+
+
+def test_worker_callback_forwards_args_and_kwargs_while_running() -> None:
+    app = _make_app()
+    received: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def callback(*args: object, **kwargs: object) -> None:
+        received.append((args, kwargs))
+
+    def deliver(callback: Callable[[], None]) -> None:
+        callback()
+
+    app.call_from_thread = deliver  # type: ignore[method-assign]
+    app._running = True
+    app._call_from_worker(callback, 1, 2, label="live")
+
+    assert received == [((1, 2), {"label": "live"})]
+
+
+@pytest.mark.parametrize("error", [RuntimeError, CancelledError])
+def test_live_worker_delivery_errors_are_not_swallowed(
+    error: type[Exception],
+) -> None:
+    app = _make_app()
+
+    def fail(callback: Callable[[], None]) -> None:
+        raise error("delivery failed")
+
+    app.call_from_thread = fail  # type: ignore[method-assign]
+    app._running = True
+
+    with pytest.raises(error, match="delivery failed"):
+        app._call_from_worker(lambda: None)
+
+
+@pytest.mark.parametrize("error", [RuntimeError, CancelledError])
+def test_worker_submission_errors_are_ignored_after_shutdown(
+    error: type[Exception],
+) -> None:
+    app = _make_app()
+
+    def fail(callback: Callable[[], None]) -> None:
+        app._running = False
+        raise error("submission failed")
+
+    app.call_from_thread = fail  # type: ignore[method-assign]
+    app._running = True
+    app._call_from_worker(lambda: None)

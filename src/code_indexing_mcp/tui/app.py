@@ -6,6 +6,7 @@ import os
 import subprocess
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import CancelledError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -226,17 +227,32 @@ class CodeIndexingApp(App[int]):
         self._project_request_id += 1
         super().exit(result, return_code, message)
 
+    def _call_from_worker(self, callback: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+        """Deliver worker results only while the app is still accepting UI work."""
+        if not self.is_running:
+            return
+
+        def deliver() -> None:
+            if self.is_running:
+                callback(*args, **kwargs)
+
+        try:
+            self.call_from_thread(deliver)
+        except (CancelledError, RuntimeError):
+            if self.is_running:
+                raise
+
     @work(thread=True, exclusive=True)
     def run_discovery(self) -> None:
         try:
             current = self.service.selected_project or self.service.discover_current_project()
             projects = self.service.list_projects()
             status = self.service.project_status() if current else None
-            self.call_from_thread(self._setup_projects_ui, projects, current, status)
+            self._call_from_worker(self._setup_projects_ui, projects, current, status)
         except CodeIndexingError as exc:
-            self.call_from_thread(self._show_error, str(exc), retry=None)
+            self._call_from_worker(self._show_error, str(exc), retry=None)
         except Exception as exc:
-            self.call_from_thread(self._show_error, f"Discovery failed: {exc}", retry=None)
+            self._call_from_worker(self._show_error, f"Discovery failed: {exc}", retry=None)
 
     def _setup_projects_ui(
         self,
@@ -325,6 +341,8 @@ class CodeIndexingApp(App[int]):
         self.push_screen(HelpScreen())
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if not self.is_running:
+            return False
         if isinstance(self.focused, Input) and action in {
             "show_outline",
             "show_references",
@@ -338,7 +356,8 @@ class CodeIndexingApp(App[int]):
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         if (
-            not self.screen_stack
+            not self.is_running
+            or not self.screen_stack
             or self.screen is not self.screen_stack[0]
             or not self.screen_stack[0].query("#context-help")
         ):
@@ -395,6 +414,8 @@ class CodeIndexingApp(App[int]):
             self._show_error(str(exc), retry=None)
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        if not self.is_running:
+            return
         if event.select.id == "mode-select":
             self._update_search_mode()
         if event.select.id == "project-select" and event.value != Select.BLANK:
@@ -410,7 +431,7 @@ class CodeIndexingApp(App[int]):
         )
 
     def on_resize(self, event: events.Resize) -> None:
-        if self.screen_stack and self.screen_stack[0].query("#pane-switch"):
+        if self.is_running and self.screen_stack and self.screen_stack[0].query("#pane-switch"):
             self._update_layout(event.size.width)
 
     def _update_layout(self, width: int | None = None) -> None:
@@ -477,9 +498,9 @@ class CodeIndexingApp(App[int]):
     def _load_project_status(self, request_id: int, project: ProjectInfo) -> None:
         try:
             status = self.service.project_status(project)
-            self.call_from_thread(self._apply_project_status, request_id, project, status)
+            self._call_from_worker(self._apply_project_status, request_id, project, status)
         except Exception as exc:
-            self.call_from_thread(self._project_error, request_id, str(exc))
+            self._call_from_worker(self._project_error, request_id, str(exc))
 
     def _apply_project_status(
         self, request_id: int, project: ProjectInfo, status: ProjectStatus
@@ -492,6 +513,8 @@ class CodeIndexingApp(App[int]):
             self._show_error(message, retry=None)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if not self.is_running:
+            return
         if event.input.id == "query-input":
             self.action_submit_query()
 
@@ -580,7 +603,7 @@ class CodeIndexingApp(App[int]):
         try:
 
             def on_phase(phase: str) -> None:
-                self.call_from_thread(self._set_search_phase, request_id, phase)
+                self._call_from_worker(self._set_search_phase, request_id, phase)
 
             hits = (
                 self.service.find_symbol(
@@ -591,13 +614,13 @@ class CodeIndexingApp(App[int]):
             )
 
             if request_id == self._search_request_id:
-                self.call_from_thread(self._render_search_results, request_id, hits, query)
+                self._call_from_worker(self._render_search_results, request_id, hits, query)
         except CodeIndexingError as exc:
             if request_id == self._search_request_id:
-                self.call_from_thread(self._search_error, request_id, str(exc), retry)
+                self._call_from_worker(self._search_error, request_id, str(exc), retry)
         except Exception as exc:
             if request_id == self._search_request_id:
-                self.call_from_thread(
+                self._call_from_worker(
                     self._search_error, request_id, f"Search failed: {exc}", retry
                 )
 
@@ -666,6 +689,8 @@ class CodeIndexingApp(App[int]):
         )
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if not self.is_running:
+            return
         if event.option_list.id != "results-list":
             return
         self._highlighted_index = event.option_index
@@ -675,12 +700,14 @@ class CodeIndexingApp(App[int]):
         self._preview_timer = self.set_timer(0.15, self._preview_highlighted)
 
     def _preview_highlighted(self) -> None:
-        if not self.screen_stack:
+        if not self.is_running or not self.screen_stack:
             return
         if self._get_selected_hit() is not None:
             self._load_detail_for_selected("chunk")
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if not self.is_running:
+            return
         if event.option_list.id == "detail-list":
             if event.option_index < len(self._detail_entries):
                 self._open_target(
@@ -693,6 +720,8 @@ class CodeIndexingApp(App[int]):
             self._show_pane(True)
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        if not self.is_running:
+            return
         if event.tabs.id != "detail-tabs" or event.tab.id != event.tabs.active:
             return
         mode = (event.tab.id or "chunk-tab").removesuffix("-tab")
@@ -850,11 +879,13 @@ class CodeIndexingApp(App[int]):
                     )
                 )
                 if request_id == self._detail_request_id:
-                    self.call_from_thread(self._apply_detail, request_id, self._render_chunk, chunk)
+                    self._call_from_worker(
+                        self._apply_detail, request_id, self._render_chunk, chunk
+                    )
             elif action == "outline":
                 outline = self.service.file_outline(hit.path, project)
                 if request_id == self._detail_request_id:
-                    self.call_from_thread(
+                    self._call_from_worker(
                         self._apply_detail, request_id, self._render_outline, outline
                     )
             elif action == "references":
@@ -862,7 +893,7 @@ class CodeIndexingApp(App[int]):
                     self._target_selector(hit, project), project=project
                 )
                 if request_id == self._detail_request_id:
-                    self.call_from_thread(
+                    self._call_from_worker(
                         self._apply_detail, request_id, self._render_references, refs
                     )
             elif action == "impact":
@@ -870,15 +901,15 @@ class CodeIndexingApp(App[int]):
                     self._target_selector(hit, project), project=project
                 )
                 if request_id == self._detail_request_id:
-                    self.call_from_thread(
+                    self._call_from_worker(
                         self._apply_detail, request_id, self._render_impact, impact
                     )
         except CodeIndexingError as exc:
             if request_id == self._detail_request_id:
-                self.call_from_thread(self._detail_error, request_id, str(exc), retry)
+                self._call_from_worker(self._detail_error, request_id, str(exc), retry)
         except Exception as exc:
             if request_id == self._detail_request_id:
-                self.call_from_thread(
+                self._call_from_worker(
                     self._detail_error, request_id, f"Failed to load {action}: {exc}", retry
                 )
 
@@ -1092,9 +1123,9 @@ class CodeIndexingApp(App[int]):
         try:
             report = self.service.index_project(project)
             status = self.service.project_status(project)
-            self.call_from_thread(self._on_index_complete, project, status, report)
+            self._call_from_worker(self._on_index_complete, project, status, report)
         except Exception as exc:
-            self.call_from_thread(self._on_index_failed, f"Indexing failed: {exc}", retry)
+            self._call_from_worker(self._on_index_failed, f"Indexing failed: {exc}", retry)
 
     def _show_activity(self, detail: str = "") -> None:
         if not self.screen_stack:
@@ -1113,7 +1144,11 @@ class CodeIndexingApp(App[int]):
         bar.update(f"{label} · {time.monotonic() - started:.0f}s{detail}")
 
     def _poll_activity(self) -> None:
-        if not self.screen_stack or not self.screen_stack[0].query("#progress-bar"):
+        if (
+            not self.is_running
+            or not self.screen_stack
+            or not self.screen_stack[0].query("#progress-bar")
+        ):
             return
         self._show_activity()
         project = self._index_project if self._is_indexing else self._search_project
@@ -1135,7 +1170,7 @@ class CodeIndexingApp(App[int]):
             # A progress probe must not hide the outcome of the actual operation.
             pass
         finally:
-            self.call_from_thread(self._activity_ready, search_id, detail)
+            self._call_from_worker(self._activity_ready, search_id, detail)
 
     def _activity_ready(self, search_id: int, detail: str) -> None:
         self._progress_pending = False
