@@ -10,7 +10,7 @@ from typing import Any, ClassVar
 
 from rich.syntax import Syntax
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -63,25 +63,37 @@ class CodeIndexingApp(App[int]):
         self._is_indexing: bool = False
         self._projects: dict[str, ProjectInfo] = {}
         self._project_request_id = 0
+        self._detail_visible = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="header-bar"):
             yield Label("Code Indexing MCP", id="header-title", markup=False)
             yield Label("Initializing...", id="header-status", markup=False)
 
-        with Horizontal(id="query-bar"):
+        with Horizontal(id="project-bar"):
             yield Select[str]([], prompt="Select project", id="project-select", allow_blank=True)
             yield Select[str](
-                [("Semantic", "semantic"), ("Symbol", "symbol")],
+                [("Describe code", "semantic"), ("Find symbol", "symbol")],
                 value="semantic",
                 id="mode-select",
                 allow_blank=False,
             )
+            yield Select[str](
+                [("Exact", "exact"), ("Starts with", "prefix"), ("Contains", "contains")],
+                value="exact",
+                id="match-select",
+                allow_blank=False,
+            )
+            yield Button("Index [F5]", id="index-button")
+
+        with Horizontal(id="query-bar"):
             yield Input(
-                placeholder="Search query... (/ to focus, Enter to run)",
+                placeholder="Describe code: where are expired tokens rejected?",
                 id="query-input",
             )
-            yield Button("Index [F5]", id="index-button", variant="primary")
+        with Horizontal(id="pane-switch"):
+            yield Button("Results", id="results-view")
+            yield Button("Details", id="details-view")
 
         with Horizontal(id="main-container"):
             with Vertical(id="results-pane"):
@@ -106,6 +118,8 @@ class CodeIndexingApp(App[int]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._update_search_mode()
+        self._update_layout()
         self.run_discovery()
 
     @work(thread=True, exclusive=True)
@@ -128,12 +142,13 @@ class CodeIndexingApp(App[int]):
     ) -> None:
         self._projects = {p.id: p for p in projects}
         select = self.query_one("#project-select", Select)
-        options = [(f"{p.name} ({p.id})", p.id) for p in projects]
+        options = [(p.name, p.id) for p in projects]
         select.set_options(options)
         if selected is not None:
             select.value = selected.id
             self._update_header(selected, status)
             self._set_status("Ready")
+            self.action_focus_query()
         else:
             self._set_status("No project registered or discovered.")
 
@@ -141,7 +156,8 @@ class CodeIndexingApp(App[int]):
         title = self.query_one("#header-title", Label)
         status_label = self.query_one("#header-status", Label)
 
-        title.update(f"Project: {project.name} [{project.id}]")
+        title.update(f"Syndex · {project.name}")
+        title.tooltip = f"{project.root}\nProject ID: {project.id}"
         if status is not None:
             branch_info = ""
             if status.git_selector_value:
@@ -165,8 +181,38 @@ class CodeIndexingApp(App[int]):
         self._set_status(message, error=True)
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "mode-select":
+            self._update_search_mode()
         if event.select.id == "project-select" and event.value != Select.BLANK:
             self._on_project_selected(str(event.value))
+
+    def _update_search_mode(self) -> None:
+        symbol = self.query_one("#mode-select", Select).value == "symbol"
+        self.query_one("#match-select", Select).display = symbol
+        self.query_one("#query-input", Input).placeholder = (
+            "Find symbol: TokenValidator (choose how the name should match)"
+            if symbol
+            else "Describe code: where are expired tokens rejected?"
+        )
+
+    def on_resize(self, event: events.Resize) -> None:
+        if self.query("#pane-switch"):
+            self._update_layout(event.size.width)
+
+    def _update_layout(self, width: int | None = None) -> None:
+        compact = (self.size.width if width is None else width) < 100
+        self.set_class(compact, "compact")
+        self.query_one("#pane-switch").display = compact
+        self.query_one("#results-pane").display = not compact or not self._detail_visible
+        self.query_one("#detail-pane").display = not compact or self._detail_visible
+
+    def _show_pane(self, details: bool) -> None:
+        self._detail_visible = details
+        self._update_layout()
+        if details:
+            self.query_one("#detail-scroll", VerticalScroll).focus()
+        else:
+            self.query_one("#results-list", OptionList).focus()
 
     def _clear_details(self, message: str) -> None:
         self._detail_request_id += 1
@@ -178,6 +224,8 @@ class CodeIndexingApp(App[int]):
         project = self._projects.get(project_id)
         if project is None:
             return
+        self._detail_visible = False
+        self._update_layout()
         self.service.select_project(project)
         self._project_request_id += 1
         self._search_request_id += 1
@@ -216,6 +264,8 @@ class CodeIndexingApp(App[int]):
             self.action_submit_query()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id in {"results-view", "details-view"}:
+            self._show_pane(event.button.id == "details-view")
         if event.button.id == "index-button":
             self.action_trigger_index()
 
@@ -223,6 +273,9 @@ class CodeIndexingApp(App[int]):
         self.query_one("#query-input", Input).focus()
 
     def action_escape_action(self) -> None:
+        if self._detail_visible:
+            self._show_pane(False)
+            return
         focused = self.focused
         if isinstance(focused, Input) or (focused and focused.id == "detail-scroll"):
             self.query_one("#results-list", OptionList).focus()
@@ -244,19 +297,27 @@ class CodeIndexingApp(App[int]):
         mode_select = self.query_one("#mode-select", Select)
         mode = str(mode_select.value) if mode_select.value != Select.BLANK else "semantic"
 
+        self._detail_visible = False
+        self._update_layout()
         self._clear_details("Searching… Select a result to preview its source.")
         self._search_request_id += 1
         req_id = self._search_request_id
         self._set_status(f"Searching ({mode})...")
-        self._run_search_worker(req_id, mode, query, self.service.selected_project)
+        self._run_search_worker(
+            req_id,
+            mode,
+            query,
+            self.service.selected_project,
+            str(self.query_one("#match-select", Select).value),
+        )
 
     @work(thread=True, exclusive=True, group="search")
     def _run_search_worker(
-        self, request_id: int, mode: str, query: str, project: ProjectInfo | None
+        self, request_id: int, mode: str, query: str, project: ProjectInfo | None, match: str
     ) -> None:
         try:
             hits = (
-                self.service.find_symbol(query, project=project).hits
+                self.service.find_symbol(query, project=project, match=match).hits
                 if mode == "symbol"
                 else self.service.search_code(query, project=project).hits
             )
@@ -284,7 +345,9 @@ class CodeIndexingApp(App[int]):
         option_list.clear_options()
 
         if not hits:
-            self._clear_details("No matches. Try a broader query or a different project.")
+            self._clear_details(
+                "No matches. Try a broader query, Contains symbol matching, or a different project."
+            )
             self._set_status(f"No results found for '{query}'.")
             self.query_one("#results-title", Label).update("Results (0)")
             return
@@ -294,15 +357,18 @@ class CodeIndexingApp(App[int]):
         for i, hit in enumerate(hits):
             text = Text()
             text.append(f"{i + 1:2d}. ", style="dim")
-            text.append(f"{hit.path}:{hit.start_line}", style="bold cyan")
-            if hit.symbol:
-                text.append(f"  {hit.symbol}", style="green")
-            text.append(f" ({hit.kind})", style="yellow")
-            text.append(f" [{hit.score:.2f}]", style="magenta")
+            text.append(hit.qualified_symbol or hit.symbol or Path(hit.path).name, style="bold")
+            text.append(f"  {hit.kind}\n", style="dim")
+            text.append(f"    {hit.path}:{hit.start_line}-{hit.end_line}", style="dim")
             options.append(Option(prompt=text, id=str(i)))
 
         option_list.add_options(options)
-        self._set_status(f"Found {len(hits)} hit(s).")
+        option_list.highlighted = 0
+        self._set_status(
+            f"Found {len(hits)} hit(s)."
+            if len(hits) < 20
+            else "Showing up to 20 matches. Refine the query to narrow results."
+        )
         option_list.focus()
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
@@ -311,6 +377,7 @@ class CodeIndexingApp(App[int]):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         self._highlighted_index = event.option_index
         self._load_detail_for_selected("chunk")
+        self._show_pane(True)
 
     def _get_selected_hit(self) -> SearchHit | None:
         if self._highlighted_index is not None and 0 <= self._highlighted_index < len(self._hits):
@@ -325,6 +392,8 @@ class CodeIndexingApp(App[int]):
             self.action_submit_query()
             return
         self._load_detail_for_selected("chunk")
+        if self._get_selected_hit() is not None:
+            self._show_pane(True)
 
     def action_show_outline(self) -> None:
         if isinstance(self.focused, Input):
@@ -409,7 +478,9 @@ class CodeIndexingApp(App[int]):
             theme="monokai",
         )
         self.query_one("#detail-content", Static).update(syntax)
-        self._set_status(f"Loaded chunk {chunk.chunk_id[:8]} for {chunk.path}")
+        self._set_status(
+            f"Showing {chunk.symbol or chunk.path} · lines {chunk.start_line}-{chunk.end_line}"
+        )
 
     def _render_outline(self, outline: OutlineResponse) -> None:
         self.query_one("#detail-title", Label).update(

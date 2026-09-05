@@ -38,7 +38,7 @@ async def test_tui_app_mount_and_initial_discovery() -> None:
 
         header_title = app.query_one("#header-title", Label).render()
         assert "repo-alpha" in str(header_title)
-        assert "proj-1" in str(header_title)
+        assert "proj-1" in str(app.query_one("#header-title").tooltip)
 
         header_status = app.query_one("#header-status", Label).render()
         assert "State: ready" in str(header_status)
@@ -71,7 +71,7 @@ async def test_tui_app_project_switch() -> None:
 
         header_title = app.query_one("#header-title", Label).render()
         assert "repo-beta" in str(header_title)
-        assert "proj-2" in str(header_title)
+        assert "proj-2" in str(app.query_one("#header-title").tooltip)
 
         status_bar = app.query_one("#status-bar", Static).render()
         assert "Selected project: repo-beta" in str(status_bar)
@@ -399,3 +399,53 @@ async def test_new_search_rejects_old_detail_completion() -> None:
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert "Preview:" not in str(app.query_one("#detail-title", Label).render())
+
+
+@pytest.mark.asyncio
+async def test_compact_layout_preserves_search_space_and_switches_panes() -> None:
+    app = _make_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        query = app.query_one("#query-input", Input)
+        assert query.content_region.width >= 60
+        assert app.focused is query
+        assert app.query_one("#results-pane").display
+        assert not app.query_one("#detail-pane").display
+        await pilot.press("m", "a", "i", "n", "enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.query_one("#detail-pane").display
+        assert not app.query_one("#results-pane").display
+        await pilot.press("escape")
+        assert app.query_one("#results-pane").display
+        await pilot.resize_terminal(120, 32)
+        await pilot.pause()
+        assert app.query_one("#results-pane").display
+        assert app.query_one("#detail-pane").display
+        assert (
+            app.query_one("#detail-pane").region.width > app.query_one("#results-pane").region.width
+        )
+
+
+@pytest.mark.asyncio
+async def test_symbol_match_controls_are_explained_and_forwarded() -> None:
+    fake = FakeApplication()
+    app = _make_app(fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#mode-select", Select).value = "symbol"
+        await pilot.pause()
+        match = app.query_one("#match-select", Select)
+        assert match.display
+        match.value = "contains"
+        app.query_one("#query-input", Input).value = "validate"
+        app.action_submit_query()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.symbol_calls[-1]["match"] == "contains"
+        assert "symbol" in app.query_one("#query-input", Input).placeholder.lower()

@@ -4,48 +4,18 @@ Screen {
     color: $text;
 }
 
-#header-bar {
-    height: 3;
-    padding: 0 1;
-    background: $panel;
-    color: $text;
-    border-bottom: solid $primary;
-}
-
-#header-title {
-    text-style: bold;
-}
-
-#header-status {
-    color: $text-muted;
-}
-
-#query-bar {
-    height: 3;
-    layout: horizontal;
-    padding: 0 1;
-    margin-top: 1;
-    margin-bottom: 1;
-}
-
-#project-select {
-    width: 28;
-    margin-right: 1;
-}
-
-#mode-select {
-    width: 16;
-    margin-right: 1;
-}
-
-#query-input {
-    width: 1fr;
-    margin-right: 1;
-}
-
-#index-button {
-    width: 14;
-}
+#header-bar { height: 2; padding: 0 1; background: $panel; }
+#header-title { text-style: bold; }
+#header-status { color: $text-muted; }
+#project-bar { height: 3; padding: 0 1; }
+#project-select { width: 1fr; min-width: 18; margin-right: 1; }
+#mode-select { width: 19; margin-right: 1; }
+#match-select { width: 17; margin-right: 1; }
+#index-button { width: 12; min-width: 12; }
+#query-bar { height: 3; padding: 0 1; }
+#query-input { width: 1fr; }
+#pane-switch { height: 1; padding: 0 1; }
+#pane-switch Button { height: 1; min-width: 12; border: none; margin-right: 1; }
 
 #main-container {
     layout: horizontal;
@@ -54,7 +24,7 @@ Screen {
 }
 
 #results-pane {
-    width: 48%;
+    width: 40%;
     height: 100%;
     border: solid $secondary;
     padding: 0;
@@ -74,7 +44,7 @@ Screen {
 }
 
 #detail-pane {
-    width: 52%;
+    width: 60%;
     height: 100%;
     border: solid $secondary;
     padding: 0;
@@ -112,3 +82,6 @@ Screen {
 Footer {
     dock: bottom;
 }
+
+.compact #results-pane, .compact #detail-pane { width: 1fr; margin-right: 0; }
+#results-pane:focus-within, #detail-pane:focus-within { border: solid $accent; }
