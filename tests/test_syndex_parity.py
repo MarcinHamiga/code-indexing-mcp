@@ -79,6 +79,47 @@ def test_syndex_tui_subcommand_opens_the_tui(monkeypatch: pytest.MonkeyPatch) ->
     assert received == ["myproj"]
 
 
+def test_syndex_tui_subcommand_without_project_opens_the_tui(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import code_indexing_mcp.tui as tui_package
+
+    received: list[str | None] = []
+    monkeypatch.setattr(tui_package, "_launch_tui", lambda project: received.append(project) or 0)
+    assert syndex_main(["tui"]) == 0
+    assert received == [None]
+
+
+def test_project_named_like_a_command_needs_the_tui_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import code_indexing_mcp.tui as tui_package
+
+    received: list[str | None] = []
+    monkeypatch.setattr(tui_package, "_launch_tui", lambda project: received.append(project) or 0)
+    assert syndex_main(["tui", "status"]) == 0
+    assert received == ["status"]
+
+
+def test_bare_syndex_skips_the_cli_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    import code_indexing_mcp.tui as tui_package
+
+    monkeypatch.delitem(sys.modules, "code_indexing_mcp.cli", raising=False)
+    monkeypatch.setattr(tui_package, "_launch_tui", lambda project: 0)
+    assert syndex_main([]) == 0
+    assert "code_indexing_mcp.cli" not in sys.modules
+
+
+def test_tui_package_exports_are_importable() -> None:
+    pytest.importorskip("textual", reason="tui extra not installed")
+    import code_indexing_mcp.tui as tui_package
+
+    for name in tui_package.__all__:
+        assert getattr(tui_package, name) is not None
+
+
 def test_version_reports_the_invoked_program(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit):
         cli.main(["--version"])

@@ -379,7 +379,8 @@ code-indexing-mcp tui
 
 `syndex` is the full CLI, not only the TUI: `syndex status`, `syndex index`, and every
 other `code-indexing-mcp` subcommand work the same under either name — run `syndex --help`
-for the complete list.
+for the complete list. If a project name matches a subcommand (`status`, `index`, ...),
+the command wins over the shorthand: open that project with `syndex tui <project>`.
 
 `syndex` connects directly to your local index data and honors your configured broker, daemon, and storage settings:
 

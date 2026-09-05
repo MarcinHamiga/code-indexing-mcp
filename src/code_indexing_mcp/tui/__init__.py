@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Sequence
+from typing import Any
 
 
 def _launch_tui(project: str | None) -> int:
@@ -27,6 +28,17 @@ def _launch_tui(project: str | None) -> int:
     return result if isinstance(result, int) else (app.return_code or 0)
 
 
+def _is_command(name: str) -> bool:
+    """Whether *name* is a top-level CLI subcommand.
+
+    Imports the CLI lazily so the TUI fast path never pays for it unless
+    disambiguation actually needs the command list.
+    """
+    from ..cli import COMMAND_NAMES
+
+    return name in COMMAND_NAMES
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the syndex command: the full CLI, defaulting to the TUI.
 
@@ -34,17 +46,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     opens the interactive TUI. Anything starting with a known subcommand name
     or a flag is the full ``code-indexing-mcp`` command surface under the
     syndex program name.
-    """
-    from ..cli import COMMAND_NAMES
-    from ..cli import main as cli_main
 
+    A project whose name collides with a subcommand (``status``, ``index``,
+    ...) cannot use the bare shorthand — ``syndex status`` always runs the
+    command. Open such a project explicitly with ``syndex tui <project>``.
+    """
     raw = list(sys.argv[1:] if argv is None else argv)
     if not raw:
         return _launch_tui(None)
     first = raw[0]
-    if len(raw) == 1 and not first.startswith("-") and first not in COMMAND_NAMES:
+    if first == "tui" and len(raw) <= 2 and all(not arg.startswith("-") for arg in raw[1:]):
+        return _launch_tui(raw[1] if len(raw) == 2 else None)
+    if len(raw) == 1 and not first.startswith("-") and not _is_command(first):
         return _launch_tui(first)
+    from ..cli import main as cli_main
+
     return cli_main(raw, prog="syndex")
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily re-export the TUI components advertised in ``__all__``.
+
+    Keeps ``from code_indexing_mcp.tui import CodeIndexingApp`` working
+    without making every ``import code_indexing_mcp.tui`` pay for Textual.
+    """
+    if name == "CodeIndexingApp":
+        from .app import CodeIndexingApp
+
+        return CodeIndexingApp
+    if name == "create_tui_service":
+        from .service import create_tui_service
+
+        return create_tui_service
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = ["CodeIndexingApp", "create_tui_service", "main"]
