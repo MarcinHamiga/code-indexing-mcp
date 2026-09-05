@@ -375,6 +375,7 @@ def test_broker_round_trips_impact_radius_parameters(tmp_path: Path) -> None:
     assert result.layers[0].edges[0].kinds == ["call"]
 
 
+@requires_local_sockets
 def test_broker_round_trips_dead_code_report(tmp_path: Path) -> None:
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     root = tmp_path / "repo"
