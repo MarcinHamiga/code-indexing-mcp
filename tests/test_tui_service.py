@@ -451,3 +451,39 @@ def test_tui_service_factory_broker_on_raises(
     with pytest.raises(CodeIndexingError) as exc_info:
         create_tui_service(cwd=tmp_path, settings=settings)
     assert exc_info.value.code == ErrorCode.DAEMON_UNAVAILABLE
+
+
+def test_source_preview_reads_bounded_working_tree_context(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("\n".join(f"line {i}" for i in range(1, 501)))
+    app = FakeApplication(projects=[_sample_project(root=root)])
+    service = TuiService(cast(ApplicationLike, app), cwd=root)
+    project = service.discover_current_project()
+    preview = service.source_preview("main.py", 250, project=project)
+    assert preview.start_line == 240
+    assert "line 250" in preview.content
+    assert len(preview.content.splitlines()) <= 41
+    with pytest.raises(CodeIndexingError):
+        service.source_preview("../outside.py", 1, project=project)
+    (root / "link.py").symlink_to(tmp_path / "outside.py")
+    with pytest.raises(CodeIndexingError):
+        service.source_preview("link.py", 1, project=project)
+
+
+def test_editor_command_quotes_paths_without_a_shell(tmp_path: Path) -> None:
+    from code_indexing_mcp.tui.navigation import editor_command
+
+    path = tmp_path / "a file; echo surprise.py"
+    assert editor_command('"/Applications/My Editor" --wait', path, 12) == [
+        "/Applications/My Editor",
+        "--wait",
+        str(path),
+    ]
+    assert editor_command("code --reuse-window", path, 12) == [
+        "code",
+        "--reuse-window",
+        "--goto",
+        f"{path}:12",
+    ]
+    assert editor_command("nvim", path, 12) == ["nvim", "+12", str(path)]

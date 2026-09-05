@@ -410,22 +410,30 @@ the command wins over the shorthand: open that project with `syndex tui <project
 
 `syndex` connects directly to your local index data and honors your configured broker, daemon, and storage settings:
 
-- **Project Discovery & Selection**: Automatically discovers the project corresponding to your current working directory, and provides a dropdown to switch across any registered project.
-- **Search Modes**:
-  - **Semantic**: Hybrid semantic and keyword vector search across code chunks.
-  - **Symbol**: Fast declaration lookups (exact, prefix, and substring).
-- **Code Preview**: Syntax-highlighted code chunk previews with 1-based source line numbers.
-- **Structural Analysis Shortcuts**:
-  - `Enter`: Preview the highlighted code chunk.
-  - `o`: View syntax-aware file outline for the selected hit.
-  - `r`: Find structural references to the selected declaration.
-  - `i`: Compute bounded transitive impact radius layers.
-  - `F5`: Trigger incremental reindexing with live progress updates.
-  - `/`: Focus search query input.
-  - `Esc`: Switch focus between search input, results list, and preview panes.
-  - `q`: Exit.
+- **Project selection**: Select a registered project in the top row. The header shows index state and branch; hover over its title for the repository path and project ID.
+- **Describe code**: Ask a natural-language question such as “where are expired tokens rejected?” and press Enter.
+- **Find symbol**: Search declaration names with **Exact**, **Starts with**, or **Contains** matching. Searches return up to 20 matches; refine the query to narrow them.
+- **Responsive layout**: Search keeps a full-width row. At fewer than 100 columns, Results and Details share one pane; use their buttons or Enter/Escape to switch. Wider terminals show both panes, with more space for source. The supported minimum is 80×24.
+- **Source navigation**: Arrow through search results for automatic previews. Enter opens Details. The Code, Outline, References, and Impact tabs expose structural exploration. Select an outline symbol, reference, or dependent declaration and press Enter to follow it. Escape restores previous views, including selection and scroll position, then returns to Results.
+- **Source freshness**: **Preview** displays indexed source. **Working tree** displays bounded context from the current file, which can differ from the index. Working-tree previews are capped at 400 lines and 2 MiB per file. Use F5 to refresh the index after edits.
+- **Indexing and errors**: Automatic modes prepare stale indexes before searching and show progress separately from action feedback. Manual mode asks you to press F5. Errors remain readable until dismissed and offer Retry for retryable actions. References and impact display returned limitations and incomplete-result notices; impact explores up to two levels.
 
-The TUI operates strictly in read-only mode regarding your source code and will never alter files on disk.
+| Key | Action |
+| --- | --- |
+| `/` | Focus search |
+| `Enter` | Submit query or open selected entry |
+| `Tab` / `Shift+Tab` | Move focus between controls and panes |
+| `o` / `r` / `i` | Outline / References / Impact |
+| `Esc` | Previous detail view, then Results, then search |
+| `y` | Copy the selected relative `path:line` (requires terminal clipboard support) |
+| `e` | Open the selected location using `VISUAL`, falling back to `EDITOR` |
+| `F5` | Incrementally refresh the selected project’s index |
+| `?` / `Ctrl+H` | Help (`Ctrl+H` also works in the search field) |
+| `q` / `Ctrl+Q` | Quit (`Ctrl+Q` also works in the search field) |
+
+Editor commands accept quoted executable paths and arguments and run without a shell. Common editors (VS Code, Cursor, Vim, Neovim, Nano, Emacs) receive the selected line; other editors receive the file path. Set, for example, `EDITOR='nvim'` or `VISUAL='code --wait'` before launching Syndex. The TUI suspends while the editor runs.
+
+The TUI does not edit source files itself. Indexing updates local index data; the editor shortcut hands the selected file to your configured editor.
 
 ## Project workflow
 

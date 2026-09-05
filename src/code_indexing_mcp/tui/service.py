@@ -8,6 +8,7 @@ references, and impact analysis.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,8 @@ from ..settings import IndexMode
 if TYPE_CHECKING:
     from ..application import RuntimePaths
     from ..settings import IndexSettings
+
+from .navigation import SourcePreview
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +119,9 @@ class TuiService:
         target = self._require_project(project)
         return self.application.project_status(target.id, roots=[target.root])
 
-    def ensure_ready(self, project: ProjectInfo | None = None) -> ProjectStatus:
+    def ensure_ready(
+        self, project: ProjectInfo | None = None, on_phase: Callable[[str], None] | None = None
+    ) -> ProjectStatus:
         """Ensure project index is ready before a query.
 
         In lazy or eager mode, refreshes stale or pending indexes with trigger='lazy-query'.
@@ -131,6 +136,8 @@ class TuiService:
             return status
 
         # Trigger lazy indexing
+        if on_phase:
+            on_phase("Preparing index")
         self.application.index_project(target.id, roots=[target.root], trigger="lazy-query")
         return self.project_status(target)
 
@@ -151,28 +158,47 @@ class TuiService:
             return None
         return self.application.index_progress(target.id)
 
-    def search_code(self, query: str, *, limit: int = 20) -> SearchResponse:
+    def search_code(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        project: ProjectInfo | None = None,
+        on_phase: Callable[[str], None] | None = None,
+    ) -> SearchResponse:
         """Execute semantic search within the active project."""
-        target = self._require_project()
-        status = self.ensure_ready(target)
+        target = self._require_project(project)
+        status = self.ensure_ready(target, on_phase)
         if status.state not in {"ready", "partial"} and self.index_mode is IndexMode.MANUAL:
             raise CodeIndexingError(
                 ErrorCode.INDEX_INCOMPATIBLE,
                 f"Project '{target.name}' is {status.state}; index before searching (press F5)",
             )
+        if on_phase:
+            on_phase("Searching")
         return self.application.search_code(
             query, projects=[target.id], limit=limit, roots=[target.root]
         )
 
-    def find_symbol(self, name: str, *, match: str = "exact", limit: int = 20) -> SymbolResponse:
+    def find_symbol(
+        self,
+        name: str,
+        *,
+        match: str = "exact",
+        limit: int = 20,
+        project: ProjectInfo | None = None,
+        on_phase: Callable[[str], None] | None = None,
+    ) -> SymbolResponse:
         """Execute symbol lookup within the active project."""
-        target = self._require_project()
-        status = self.ensure_ready(target)
+        target = self._require_project(project)
+        status = self.ensure_ready(target, on_phase)
         if status.state not in {"ready", "partial"} and self.index_mode is IndexMode.MANUAL:
             raise CodeIndexingError(
                 ErrorCode.INDEX_INCOMPATIBLE,
                 f"Project '{target.name}' is {status.state}; index before searching (press F5)",
             )
+        if on_phase:
+            on_phase("Searching")
         return self.application.find_symbol(
             name, project=target.id, match=match, limit=limit, roots=[target.root]
         )
@@ -180,6 +206,53 @@ class TuiService:
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         """Retrieve chunk content and metadata by chunk_id."""
         return self.application.get_chunk(chunk_id)
+
+    def source_path(self, path: str, project: ProjectInfo | None = None) -> Path:
+        """Resolve a working-tree path without following links outside the project."""
+        root = self._require_project(project).root.resolve()
+        source = (root / path).resolve()
+        if not source.is_relative_to(root):
+            raise CodeIndexingError(
+                ErrorCode.INVALID_CONFIGURATION, "Source is outside the project"
+            )
+        return source
+
+    def source_preview(
+        self,
+        path: str,
+        line: int,
+        *,
+        end_line: int | None = None,
+        project: ProjectInfo | None = None,
+        language: str = "text",
+        symbol: str | None = None,
+    ) -> SourcePreview:
+        """Read bounded current source context for structural navigation."""
+        source = self.source_path(path, project)
+        try:
+            with source.open("rb") as stream:
+                raw = stream.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError("File is too large to preview (2 MiB maximum)")
+            if b"\0" in raw:
+                raise ValueError("Binary files cannot be previewed")
+            lines = raw.decode("utf-8").splitlines()
+            if line < 1 or line > max(1, len(lines)):
+                raise ValueError("Source lines have changed; refresh the index with F5")
+            first = max(1, line - 10)
+            last = min(len(lines), max(line + 30, end_line or line), first + 399)
+            return SourcePreview(
+                path=path,
+                start_line=first,
+                end_line=max(first, last),
+                content="\n".join(lines[first - 1 : last]),
+                language=language,
+                symbol=symbol,
+            )
+        except (OSError, ValueError) as exc:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_CONFIGURATION, f"Cannot preview {path}: {exc}"
+            ) from exc
 
     def file_outline(self, path: str, project: ProjectInfo | None = None) -> OutlineResponse:
         """Retrieve hierarchical symbol outline for a file."""
@@ -191,7 +264,11 @@ class TuiService:
         return DeclarationSelector(chunk_id=hit.chunk_id)
 
     def find_references(
-        self, hit_or_selector: SearchHit | DeclarationSelector, *, limit: int = 100
+        self,
+        hit_or_selector: SearchHit | DeclarationSelector,
+        *,
+        limit: int = 100,
+        project: ProjectInfo | None = None,
     ) -> ReferenceResponse:
         """Find references to a selected hit or selector."""
         selector = (
@@ -199,13 +276,15 @@ class TuiService:
             if isinstance(hit_or_selector, SearchHit)
             else hit_or_selector
         )
-        roots = [self._selected_project.root] if self._selected_project else self.roots
+        target = self._require_project(project)
+        roots = [target.root]
         return self.application.find_references(selector, limit=limit, roots=roots)
 
     def impact_radius(
         self,
         hit_or_selector: SearchHit | DeclarationSelector,
         *,
+        project: ProjectInfo | None = None,
         max_depth: int = 2,
         limit: int = 100,
     ) -> ImpactRadiusResponse:
@@ -215,7 +294,8 @@ class TuiService:
             if isinstance(hit_or_selector, SearchHit)
             else hit_or_selector
         )
-        roots = [self._selected_project.root] if self._selected_project else self.roots
+        target = self._require_project(project)
+        roots = [target.root]
         return self.application.impact_radius(
             selector, max_depth=max_depth, limit=limit, roots=roots
         )

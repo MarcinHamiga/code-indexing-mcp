@@ -93,6 +93,21 @@ async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 15.0) -
         await asyncio.sleep(0.02)
 
 
+async def _wait_for_embedder_start(
+    event: threading.Event, query: asyncio.Task[object], *, timeout: float = 30.0
+) -> None:
+    """Wait for indexing to reach the embedder while surfacing an early query failure."""
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not event.is_set():
+        if query.done():
+            await query
+            raise AssertionError("query completed before indexing reached the embedder")
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("indexing did not reach the embedder before the timeout")
+        await asyncio.sleep(0.02)
+
+
 def _write_with_later_mtime(path: Path, content: str) -> None:
     """Write with a visibly later timestamp for watchfiles' test polling backend."""
 
@@ -203,7 +218,7 @@ async def test_default_server_defers_indexing_until_first_code_query(tmp_path: P
         assert not (root / ".ci-mcp").exists()
 
         query = asyncio.create_task(client.call_tool("search_code", {"query": "answer"}))
-        assert await asyncio.to_thread(embedder.started.wait, 5)
+        await _wait_for_embedder_start(embedder.started, query)
         assert not query.done()
         embedder.release.set()
         result = await query
