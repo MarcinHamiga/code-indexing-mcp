@@ -296,6 +296,7 @@ overwrite a marker and orphan the previous index.
 | `search_across_projects` | read, registers and indexes | Globally ranked search across at least two explicitly selected projects. |
 | `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
 | `find_references` | read, registers and indexes | Structural references to one selected C#, Go, Java, JavaScript, Python, Rust, TSX, or TypeScript declaration. |
+| `dead_code_report` | read, registers and indexes | Review exported declarations with no exact references in one project. |
 | `impact_radius` | read, registers and indexes | Bounded, layered transitive dependents of one selected declaration. |
 | `analyze_refactor` | read, registers and indexes | Read-only rename or signature-change impact analysis for one selected declaration. |
 | `emit_refactor_patch` | read, registers and indexes | Emit a `git apply`-able unified diff from the deterministic subset of a rename analysis; never edits source. |
@@ -317,6 +318,26 @@ the explicit `project`, `path`, and `qualified_symbol` selector). Reference resu
 an opaque cursor that stays bound to the original structural-table snapshot. They distinguish
 `exact` bindings from `likely` and `unresolved` evidence; callers must review the latter and the
 reported limitations rather than treating them as safe edits.
+
+`dead_code_report(project=...)` returns a complete batch `review` list of exported declarations
+with zero exact references, plus `exported_symbols`, `snapshot_version`, `completeness`, and
+`limitations`. Each finding is labelled `possibly_dead`, includes its source location and
+likely/unresolved reference counts, and requires review before removal. The declaration's own
+export syntax is not a use; references in other files, including imports and re-exports, retain
+the resolver's exact/likely/unresolved classification. This is a zero-reference report, not a
+reachability analysis: mutually recursive or otherwise unreachable groups are not detected.
+
+Python candidates include public module-level declarations and literal `__all__` names (a
+restrictive or dynamic `__all__` is not evaluated). For other structural languages, candidates
+follow captured local export records; uncaptured members and exports are outside this report.
+External consumers, entry points, reflection, excluded files and dynamic uses remain unknown.
+Unsupported, unparseable or stale indexed files make the report incomplete, even if `review`
+is empty. No finding is a definitive claim of dead code, and the report never deletes source.
+
+For batch runs, use `syndex dead-code-report [project]` (or `code-indexing-mcp dead-code-report`).
+Omitting the project selects the current project. Output is one JSON report without pagination;
+exit status 0 means the report succeeded, even when it contains review findings. Like reference
+queries, it refreshes stale indexes and backfills structural rows when needed.
 
 `impact_radius` expands those structural references breadth-first and groups dependents by hop
 depth. Exact edges are traversed by default; `include_likely=true` also traverses possible edges
@@ -417,6 +438,7 @@ syndex index
 syndex status
 syndex history
 syndex scan --outcome skipped
+syndex dead-code-report
 syndex storage status
 syndex storage vacuum --execute
 ```

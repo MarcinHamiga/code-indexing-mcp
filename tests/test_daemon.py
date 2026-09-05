@@ -77,8 +77,8 @@ def test_length_prefixed_json_frame_round_trip() -> None:
         right.close()
 
 
-def test_protocol_four_introduces_impact_radius() -> None:
-    assert daemon.PROTOCOL_VERSION == 4
+def test_protocol_five_introduces_dead_code_report() -> None:
+    assert daemon.PROTOCOL_VERSION == 5
 
 
 def test_chunked_response_round_trip_is_transparent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -373,6 +373,31 @@ def test_broker_round_trips_impact_radius_parameters(tmp_path: Path) -> None:
 
     assert result.layers[0].edges[0].target.qualified_symbol == "caller"
     assert result.layers[0].edges[0].kinds == ["call"]
+
+
+@requires_local_sockets
+def test_broker_round_trips_dead_code_report(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=root)
+    project = application.init_project(root)
+    application.index_project(project.id)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=root)
+
+    try:
+        result = broker.dead_code_report(project.id)
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+    assert result.project_id == project.id
+    assert result.review[0].declaration.symbol == "answer"
 
 
 def test_broker_freshness_uses_the_existing_status_rpc(

@@ -22,6 +22,8 @@ from .language_rules import (
 from .models import (
     REFERENCE_SCHEMA_VERSION,
     CompletenessReport,
+    DeadCodeFinding,
+    DeadCodeReport,
     DeclarationSelector,
     ImpactBudgetExhaustion,
     ImpactEdge,
@@ -262,6 +264,207 @@ class ReferenceService:
             OrderedDict()
         )
         self._impact_traversal_cache_lock = threading.Lock()
+
+    def dead_code_report(
+        self,
+        project_id: str,
+        *,
+        backfill: ReferenceBackfillReport | None = None,
+        partition: PartitionRef | None = None,
+        root: Path | None = None,
+    ) -> DeadCodeReport:
+        """Review exported declarations with no exact uses in one structural snapshot.
+
+        Reuse the resolver's full classified hit list, not a page of references:
+        an exact use beyond the first page still rules out a candidate. Export
+        syntax in the declaration's own file establishes visibility, not use;
+        imports and re-exports in other files remain evidence of use.
+        """
+        partition = partition or self.store.active_partition(project_id)
+        if partition.project_id != project_id:
+            raise ValueError("reference partition does not belong to report project")
+        if not self.store.has_reference_table(project_id, partition_id=partition.partition_id):
+            raise CodeIndexingError(
+                ErrorCode.REFERENCE_INDEX_UNAVAILABLE,
+                "The reference index has not been built for this project. "
+                "Reindex before reporting.",
+                project=project_id,
+            )
+        version = self.store.reference_version(project_id, partition_id=partition.partition_id)
+        context = self._load_reference_context(
+            project_id, partition_id=partition.partition_id, version=version
+        )
+        declarations = self.store.list_reference_records(
+            project_id,
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+            record_kinds=("declaration",),
+            partition_id=partition.partition_id,
+        )
+        exports_by_file: dict[str, list[ReferenceRecord]] = {}
+        for row in context.export_rows:
+            # C# export rows carry a namespace rather than a re-export module.
+            if row["module_path"] is None or row["language"] == "csharp":
+                exports_by_file.setdefault(row["file_id"], []).append(row)
+        declarations_by_name = self._declarations_by_file_target(declarations)
+        exported = [
+            row
+            for row in declarations
+            if self._is_report_export(
+                row,
+                exports_by_file.get(row["file_id"], []),
+                declarations_by_name.get((row["file_id"], row["target_name"]), []),
+            )
+        ]
+        exported.sort(
+            key=lambda row: (
+                row["path"],
+                row["start_byte"] or 0,
+                row["source_qualified_symbol"] or "",
+            )
+        )
+        limitations = self._coverage_limitations(context.coverage_rows, backfill)
+        limitations.extend(
+            [
+                ReferenceLimitation(
+                    code="external_consumers",
+                    explanation=(
+                        "Only this project's indexed files are searched. External consumers, "
+                        "entry points, reflection, dynamic dispatch and excluded files can use "
+                        "these declarations. Findings require review and are not proof "
+                        "of dead code."
+                    ),
+                ),
+                ReferenceLimitation(
+                    code="export_scope",
+                    explanation=(
+                        "Exports follow the structural extractor's visibility rules. Python "
+                        "includes public module-level declarations plus literal __all__ names; "
+                        "a restrictive or dynamic __all__ is not evaluated. Other languages "
+                        "include declarations with local export records; members or exports "
+                        "not captured by the extractor are outside this report."
+                    ),
+                ),
+            ]
+        )
+        root = root or self._project_root(project_id)
+        # Check even files with no previous uses: a stale file may have ADDED a
+        # use, which cannot be discovered by validating candidate hits alone.
+        for row in context.coverage_rows:
+            source, bom = self._file_bytes(root, row["path"], {})
+            if not row["content_hash"] or not self._matches_coverage(
+                row["path"], {row["path"]: row["content_hash"]}, source, bom, {}
+            ):
+                limitations.append(
+                    ReferenceLimitation(
+                        code="stale_file",
+                        path=row["path"],
+                        explanation="File contents could not be verified against "
+                        "the structural snapshot.",
+                    )
+                )
+        review: list[DeadCodeFinding] = []
+        for row in exported:
+            selected = SelectedDeclaration(
+                project_id=project_id,
+                file_id=row["file_id"],
+                path=row["path"],
+                language=row["language"],
+                symbol=row["written_name"] or row["target_name"] or "",
+                qualified_symbol=row["source_qualified_symbol"] or "",
+                kind=row["kind"] or "",
+                start_line=row["start_line"] or 0,
+                end_line=row["end_line"] or 0,
+            )
+            query = self._find_references_with_records(
+                DeclarationSelector(
+                    project=project_id,
+                    path=selected.path,
+                    qualified_symbol=selected.qualified_symbol,
+                ),
+                preselected=selected,
+                snapshot_version=version,
+                context=context,
+                partition=partition,
+                root=root,
+                backfill=backfill,
+            )
+            limitations.extend(query.response.limitations)
+            hits = [
+                hit
+                for hit in query.hits
+                if not (hit.kind == "export" and hit.path == selected.path)
+            ]
+            if any(hit.resolution == "exact" for hit in hits):
+                continue
+            likely = sum(hit.resolution == "likely" for hit in hits)
+            unresolved = sum(hit.resolution == "unresolved" for hit in hits)
+            uncertain = bool(likely or unresolved)
+            review.append(
+                DeadCodeFinding(
+                    declaration=selected,
+                    reason_code="only_uncertain_references" if uncertain else "no_exact_references",
+                    explanation=(
+                        "No exact uses were found; uncertain references may be real uses."
+                        if uncertain
+                        else "No exact uses were found in the project. Review before removal."
+                    ),
+                    likely_references=likely,
+                    unresolved_references=unresolved,
+                )
+            )
+        unique = {(item.code, item.path, item.explanation): item for item in limitations}
+        limitations = sorted(
+            unique.values(), key=lambda item: (item.code, item.path or "", item.explanation)
+        )
+        incomplete = any(item.code in _COVERAGE_GAP_CODES for item in limitations)
+        return DeadCodeReport(
+            project_id=project_id,
+            exported_symbols=len(exported),
+            review=review,
+            snapshot_version=version,
+            limitations=limitations,
+            completeness=CompletenessReport(
+                state="incomplete" if incomplete else "complete_with_dynamic_limitations",
+                explanation=(
+                    "Some indexed files could not be analyzed reliably; real uses may be missing."
+                    if incomplete
+                    else "Captured exports were considered; external and dynamic uses are unknown."
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _is_report_export(
+        row: ReferenceRecord,
+        exports: list[ReferenceRecord],
+        same_named: list[ReferenceRecord],
+    ) -> bool:
+        if row["language"] not in STRUCTURAL_LANGUAGES:
+            return False
+        symbol = row["written_name"] or row["target_name"]
+        qualified = row["source_qualified_symbol"]
+        if not symbol or not qualified:
+            return False
+        if row["language"] == "python" and symbol == qualified and not symbol.startswith("_"):
+            return True
+        for export in exports:
+            if export["target_name"] != symbol:
+                continue
+            # Inline exports belong only to the declaration containing the
+            # anchor. Qualified names do not distinguish every scope in every
+            # grammar (e.g. a TS namespace function and a module function).
+            if (row["start_byte"] or 0) <= (export["start_byte"] or 0) < (row["end_byte"] or 0):
+                return True
+            inline = any(
+                (other["start_byte"] or 0) <= (export["start_byte"] or 0) < (other["end_byte"] or 0)
+                for other in same_named
+            )
+            # A detached export such as `export { api }`, `export default api`
+            # or Python's __all__ can name a module-level declaration.
+            if not inline and symbol == qualified:
+                return True
+        return False
 
     def find_references(
         self,

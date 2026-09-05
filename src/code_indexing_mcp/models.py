@@ -532,6 +532,25 @@ class CompletenessReport(FrozenModel):
     explanation: str = "All indexed structural candidates were considered."
 
 
+class DeadCodeFinding(FrozenModel):
+    declaration: SelectedDeclaration
+    status: Literal["possibly_dead"] = "possibly_dead"
+    reason_code: Literal["no_exact_references", "only_uncertain_references"]
+    explanation: str
+    exact_references: Literal[0] = 0
+    likely_references: int = 0
+    unresolved_references: int = 0
+
+
+class DeadCodeReport(FrozenModel):
+    project_id: str
+    exported_symbols: int
+    review: list[DeadCodeFinding] = Field(default_factory=list)
+    completeness: CompletenessReport
+    limitations: list[ReferenceLimitation] = Field(default_factory=list)
+    snapshot_version: int
+
+
 class ImpactEdge(FrozenModel):
     source: SelectedDeclaration
     target: SelectedDeclaration

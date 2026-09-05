@@ -15,14 +15,6 @@
 
 ## Backlog
 
-### Dead-code report
-
-Exported symbols with zero exact references, reported as a conservative `review`-style
-listing rather than a claim. Builds directly on the structural reference table and the
-existing `likely`/`unresolved` classification: a symbol with only `likely` references is
-"possibly dead", never "dead". Natural shape is a new tool or a `find_references` report
-mode, plus a CLI subcommand for batch runs.
-
 ### Field-scoped query syntax
 
 `lang:go path:src/ "exact phrase"` inside `search_code` queries, instead of separate
