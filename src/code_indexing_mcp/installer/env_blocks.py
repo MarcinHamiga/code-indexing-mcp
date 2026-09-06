@@ -25,6 +25,8 @@ ENV_KEYS: dict[str, str] = {
     "antigravity": "env",
     "antigravity-cli": "env",
     "muse-code": "env",
+    "tabnine": "env",
+    "tabnine-cli": "env",
 }
 
 OBJECT_KEYS: dict[str, str] = {
@@ -36,6 +38,8 @@ OBJECT_KEYS: dict[str, str] = {
     "antigravity": "mcpServers",
     "antigravity-cli": "mcpServers",
     "muse-code": "mcpServers",
+    "tabnine": "mcpServers",
+    "tabnine-cli": "mcpServers",
 }
 
 

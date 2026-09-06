@@ -156,6 +156,7 @@ def test_retained_broker_follows_daemon_restart_in_another_runtime(
         assert not second_thread.is_alive()
 
 
+@requires_local_sockets
 def test_startup_timeout_preserves_connection_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

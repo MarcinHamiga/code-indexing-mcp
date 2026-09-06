@@ -305,6 +305,48 @@ async def test_harnesses_panel_commits_checked_slugs(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_harnesses_panel_groups_checkboxes_into_provider_drawers(
+    tmp_path: Path,
+) -> None:
+    from textual.widgets import Checkbox, Collapsible
+
+    from code_indexing_mcp.installer.harnesses import grouped_choices
+    from code_indexing_mcp.installer.tui.panels import HarnessesPanel
+
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "harnesses")
+        drawers = app.query_one(HarnessesPanel).query(Collapsible)
+        assert [drawer.title for drawer in drawers] == [
+            provider for provider, _ in grouped_choices()
+        ]
+        for provider, choices in grouped_choices():
+            drawer = next(drawer for drawer in drawers if drawer.title == provider)
+            assert [checkbox.id for checkbox in drawer.query(Checkbox)] == [
+                f"harness-{choice.slug}" for choice in choices
+            ]
+        # The Tabnine drawer holds both the plugins and the standalone CLI.
+        tabnine = next(drawer for drawer in drawers if drawer.title == "Tabnine")
+        assert [checkbox.id for checkbox in tabnine.query(Checkbox)] == [
+            "harness-tabnine",
+            "harness-tabnine-cli",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_harnesses_panel_focuses_first_checkbox_not_drawer_header(
+    tmp_path: Path,
+) -> None:
+    from textual.widgets import Checkbox
+
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "harnesses")
+        assert isinstance(app.focused, Checkbox)
+        assert app.focused.id == "harness-codex"
+
+
+@pytest.mark.asyncio
 async def test_path_panel_commits_launcher_choices(tmp_path: Path) -> None:
     from textual.widgets import Checkbox, Input
 

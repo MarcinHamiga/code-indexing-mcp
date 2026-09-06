@@ -172,6 +172,46 @@ def test_configure_harness_muse_code_writes_settings_with_schema_version(
     assert env_from_entry("muse-code", reread) == {"CODE_INDEXING_OFFLINE": "1"}
 
 
+def test_configure_harness_tabnine_cli_preserves_unrelated_settings_keys(
+    tmp_path: Path,
+) -> None:
+    """settings.json holds the agent's own settings; only mcpServers is ours."""
+    path = tmp_path / "agent" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"general": {"defaultApprovalMode": "auto_edit"}}), encoding="utf-8")
+    configure_harness(
+        "tabnine-cli",
+        Path(SERVER_COMMAND),
+        env={"CODE_INDEXING_OFFLINE": "1"},
+        environment={"TABNINE_HOME": str(tmp_path)},
+    )
+    parsed = json.loads(path.read_text())
+    assert parsed["general"] == {"defaultApprovalMode": "auto_edit"}
+    assert parsed["mcpServers"]["code-indexing-mcp"] == {
+        "command": SERVER_COMMAND,
+        "args": ["serve"],
+        "env": {"CODE_INDEXING_OFFLINE": "1"},
+    }
+    reread = read_server_entry("tabnine-cli", environment={"TABNINE_HOME": str(tmp_path)})
+    assert reread is not None
+    assert env_from_entry("tabnine-cli", reread) == {"CODE_INDEXING_OFFLINE": "1"}
+
+
+def test_configure_harness_tabnine_writes_plugin_config(tmp_path: Path) -> None:
+    configure_harness(
+        "tabnine",
+        Path(SERVER_COMMAND),
+        env={"CODE_INDEXING_OFFLINE": "1"},
+        environment={"TABNINE_HOME": str(tmp_path)},
+    )
+    parsed = json.loads((tmp_path / "mcp_servers.json").read_text())
+    assert parsed["mcpServers"]["code-indexing-mcp"] == {
+        "command": SERVER_COMMAND,
+        "args": ["serve"],
+        "env": {"CODE_INDEXING_OFFLINE": "1"},
+    }
+
+
 def test_configure_harness_codex_writes_toml_env_table(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     configure_harness(

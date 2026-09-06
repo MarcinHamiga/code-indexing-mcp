@@ -159,9 +159,19 @@ class InstallerApp(App[None]):
         A panel of prose (welcome, summary) has nothing to focus, and leaving
         focus on the Next button there is exactly right. Widgets inside a
         collapsed Collapsible are not focusable, so "Advanced" stays advanced.
+        Drawer headers are section chrome, not controls: the harnesses panel
+        groups its checkboxes under one Collapsible per provider, and focus
+        belongs on the first checkbox rather than the first header.
         """
 
         for widget in panel.query(Widget):
+            # Drawer headers are matched by class name, not import: Textual
+            # does not export CollapsibleTitle from textual.widgets, and
+            # importing its private module would break the whole app the day
+            # that path moves. If the class is ever renamed, the worst case
+            # is focus landing on a header -- the pre-drawer behavior.
+            if type(widget).__name__ == "CollapsibleTitle":
+                continue
             if widget.focusable:
                 widget.focus()
                 return
