@@ -47,6 +47,8 @@ def _checkout(tmp_path: Path) -> Path:
         "antigravity",
         "antigravity-cli",
         "muse-code",
+        "tabnine",
+        "tabnine-cli",
     ],
 )
 def test_configure_then_deconfigure_restores_the_original_file(tmp_path: Path, slug: str) -> None:

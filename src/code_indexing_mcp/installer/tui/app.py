@@ -9,6 +9,7 @@ from textual.binding import Binding, BindingType
 from textual.containers import Horizontal
 from textual.widget import Widget
 from textual.widgets import Button, ContentSwitcher, Footer, Header
+from textual.widgets._collapsible import CollapsibleTitle
 
 from ..orchestrator import InstallResult
 from ..wizard import WizardState
@@ -159,9 +160,14 @@ class InstallerApp(App[None]):
         A panel of prose (welcome, summary) has nothing to focus, and leaving
         focus on the Next button there is exactly right. Widgets inside a
         collapsed Collapsible are not focusable, so "Advanced" stays advanced.
+        Drawer headers are section chrome, not controls: the harnesses panel
+        groups its checkboxes under one Collapsible per provider, and focus
+        belongs on the first checkbox rather than the first header.
         """
 
         for widget in panel.query(Widget):
+            if isinstance(widget, CollapsibleTitle):
+                continue
             if widget.focusable:
                 widget.focus()
                 return

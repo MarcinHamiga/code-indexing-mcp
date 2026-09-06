@@ -248,16 +248,18 @@ def test_codex_merge_rejects_inline_target_without_corrupting_config(tmp_path: P
 
 def test_harness_menu_combines_codex_cli_and_desktop() -> None:
 
-    assert [(choice.slug, choice.label) for choice in HARNESS_CHOICES] == [
-        ("codex", "Codex (CLI + Desktop)"),
-        ("claude-code", "Claude Code"),
-        ("kimi-code", "Kimi Code"),
-        ("claude-desktop", "Claude Desktop"),
-        ("opencode", "OpenCode"),
-        ("kilocode", "KiloCode"),
-        ("antigravity", "Antigravity 2"),
-        ("antigravity-cli", "Antigravity CLI"),
-        ("muse-code", "Muse Code"),
+    assert [(choice.slug, choice.label, choice.provider) for choice in HARNESS_CHOICES] == [
+        ("codex", "Codex (CLI + Desktop)", "OpenAI"),
+        ("claude-code", "Claude Code", "Anthropic"),
+        ("kimi-code", "Kimi Code", "Moonshot"),
+        ("claude-desktop", "Claude Desktop", "Anthropic"),
+        ("opencode", "OpenCode", "OpenCode"),
+        ("kilocode", "KiloCode", "Kilo Code"),
+        ("antigravity", "Antigravity 2", "Google"),
+        ("antigravity-cli", "Antigravity CLI", "Google"),
+        ("muse-code", "Muse Code", "Meta"),
+        ("tabnine", "Tabnine (IDE plugins)", "Tabnine"),
+        ("tabnine-cli", "Tabnine CLI", "Tabnine"),
     ]
 
 
@@ -268,10 +270,26 @@ def test_harness_selection_accepts_numbers_slugs_duplicates_and_all() -> None:
         "kimi-code",
         "opencode",
     ]
+    assert parse_harness_selection("10, tabnine-cli") == ["tabnine", "tabnine-cli"]
     assert parse_harness_selection("all") == [choice.slug for choice in HARNESS_CHOICES]
     assert parse_harness_selection("") == []
     with pytest.raises(InstallerError, match="Unknown harness"):
-        parse_harness_selection("10")
+        parse_harness_selection("12")
+
+
+def test_grouped_choices_collects_each_providers_harnesses() -> None:
+    from code_indexing_mcp.installer.harnesses import grouped_choices
+
+    assert grouped_choices() == [
+        ("OpenAI", [HARNESS_CHOICES[0]]),
+        ("Anthropic", [HARNESS_CHOICES[1], HARNESS_CHOICES[3]]),
+        ("Moonshot", [HARNESS_CHOICES[2]]),
+        ("OpenCode", [HARNESS_CHOICES[4]]),
+        ("Kilo Code", [HARNESS_CHOICES[5]]),
+        ("Google", [HARNESS_CHOICES[6], HARNESS_CHOICES[7]]),
+        ("Meta", [HARNESS_CHOICES[8]]),
+        ("Tabnine", [HARNESS_CHOICES[9], HARNESS_CHOICES[10]]),
+    ]
 
 
 def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None:
@@ -339,6 +357,36 @@ def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None
             "muse-code", home=tmp_path, environment=environment, platform_name="darwin"
         )
         == tmp_path / "xdg" / "muse" / "settings.json"
+    )
+    assert (
+        configuration_path(
+            "tabnine", home=tmp_path, environment=environment, platform_name="darwin"
+        )
+        == tmp_path / ".tabnine" / "mcp_servers.json"
+    )
+    assert (
+        configuration_path(
+            "tabnine-cli", home=tmp_path, environment=environment, platform_name="darwin"
+        )
+        == tmp_path / ".tabnine" / "agent" / "settings.json"
+    )
+    assert (
+        configuration_path(
+            "tabnine",
+            home=tmp_path,
+            environment={"TABNINE_HOME": str(tmp_path / "tabnine-home")},
+            platform_name="darwin",
+        )
+        == tmp_path / "tabnine-home" / "mcp_servers.json"
+    )
+    assert (
+        configuration_path(
+            "tabnine-cli",
+            home=tmp_path,
+            environment={"TABNINE_HOME": str(tmp_path / "tabnine-home")},
+            platform_name="darwin",
+        )
+        == tmp_path / "tabnine-home" / "agent" / "settings.json"
     )
 
 
@@ -448,6 +496,18 @@ def test_kilocode_honors_config_directory_override(tmp_path: Path) -> None:
             "muse-code",
             "mcpServers",
             ".config/muse/settings.json",
+            {"command": SERVER_COMMAND, "args": ["serve"]},
+        ),
+        (
+            "tabnine",
+            "mcpServers",
+            ".tabnine/mcp_servers.json",
+            {"command": SERVER_COMMAND, "args": ["serve"]},
+        ),
+        (
+            "tabnine-cli",
+            "mcpServers",
+            ".tabnine/agent/settings.json",
             {"command": SERVER_COMMAND, "args": ["serve"]},
         ),
     ],
@@ -950,6 +1010,19 @@ def test_skill_directories_cover_supported_harnesses(tmp_path: Path) -> None:
         )
         == tmp_path / "xdg" / "muse" / "skills"
     )
+    assert (
+        skill_directory("tabnine-cli", home=tmp_path, environment={})
+        == tmp_path / ".tabnine" / "agent" / "skills"
+    )
+    assert (
+        skill_directory(
+            "tabnine-cli",
+            home=tmp_path,
+            environment={"TABNINE_HOME": str(tmp_path / "tabnine-home")},
+        )
+        == tmp_path / "tabnine-home" / "agent" / "skills"
+    )
+    assert skill_directory("tabnine", home=tmp_path, environment={}) is None
     assert skill_directory("claude-desktop", home=tmp_path, environment={}) is None
     assert skill_directory("kilocode", home=tmp_path, environment={}) is None
 

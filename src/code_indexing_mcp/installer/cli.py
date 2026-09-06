@@ -142,7 +142,11 @@ def _prompt_harnesses(
     output_fn: Callable[[str], None] = print,
 ) -> list[str]:
     output_fn("Select the harnesses to configure:")
+    last_provider = ""
     for index, choice in enumerate(HARNESS_CHOICES, start=1):
+        if choice.provider != last_provider:
+            output_fn(f"{choice.provider}:")
+            last_provider = choice.provider
         output_fn(f"  {index}. {choice.label}")
     return parse_harness_selection(
         input_fn("Enter comma-separated choices, 'all', or leave blank to skip: ")

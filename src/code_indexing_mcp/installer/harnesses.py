@@ -24,19 +24,31 @@ from .links import is_under, link_destination, replace_link
 class HarnessChoice(NamedTuple):
     slug: str
     label: str
+    provider: str
 
 
 HARNESS_CHOICES = [
-    HarnessChoice("codex", "Codex (CLI + Desktop)"),
-    HarnessChoice("claude-code", "Claude Code"),
-    HarnessChoice("kimi-code", "Kimi Code"),
-    HarnessChoice("claude-desktop", "Claude Desktop"),
-    HarnessChoice("opencode", "OpenCode"),
-    HarnessChoice("kilocode", "KiloCode"),
-    HarnessChoice("antigravity", "Antigravity 2"),
-    HarnessChoice("antigravity-cli", "Antigravity CLI"),
-    HarnessChoice("muse-code", "Muse Code"),
+    HarnessChoice("codex", "Codex (CLI + Desktop)", "OpenAI"),
+    HarnessChoice("claude-code", "Claude Code", "Anthropic"),
+    HarnessChoice("kimi-code", "Kimi Code", "Moonshot"),
+    HarnessChoice("claude-desktop", "Claude Desktop", "Anthropic"),
+    HarnessChoice("opencode", "OpenCode", "OpenCode"),
+    HarnessChoice("kilocode", "KiloCode", "Kilo Code"),
+    HarnessChoice("antigravity", "Antigravity 2", "Google"),
+    HarnessChoice("antigravity-cli", "Antigravity CLI", "Google"),
+    HarnessChoice("muse-code", "Muse Code", "Meta"),
+    HarnessChoice("tabnine", "Tabnine (IDE plugins)", "Tabnine"),
+    HarnessChoice("tabnine-cli", "Tabnine CLI", "Tabnine"),
 ]
+
+
+def grouped_choices() -> list[tuple[str, list[HarnessChoice]]]:
+    """HARNESS_CHOICES grouped by provider, in first-seen provider order."""
+
+    groups: dict[str, list[HarnessChoice]] = {}
+    for choice in HARNESS_CHOICES:
+        groups.setdefault(choice.provider, []).append(choice)
+    return list(groups.items())
 
 
 def parse_harness_selection(selection: str) -> list[str]:
@@ -157,6 +169,21 @@ def configuration_path(
     if slug == "muse-code":
         directory = _configured_directory(environment, "XDG_CONFIG_HOME", home / ".config")
         return directory / "muse" / "settings.json"
+    if slug == "tabnine":
+        # The IDE plugins (VS Code, JetBrains, ...) read user-wide MCP servers
+        # from this file's ``mcpServers`` object.
+        return (
+            _configured_directory(environment, "TABNINE_HOME", home / ".tabnine")
+            / "mcp_servers.json"
+        )
+    if slug == "tabnine-cli":
+        # The standalone agent merges the user tier of its layered settings
+        # from ``mcpServers`` in this file; every other key belongs to Tabnine.
+        return (
+            _configured_directory(environment, "TABNINE_HOME", home / ".tabnine")
+            / "agent"
+            / "settings.json"
+        )
     raise InstallerError(f"Unknown harness {slug!r}")
 
 
@@ -228,7 +255,15 @@ def configure_harness(
         }
         if merged_env:
             entry["env"] = merged_env
-    elif slug in {"kimi-code", "claude-desktop", "antigravity", "antigravity-cli", "muse-code"}:
+    elif slug in {
+        "kimi-code",
+        "claude-desktop",
+        "antigravity",
+        "antigravity-cli",
+        "muse-code",
+        "tabnine",
+        "tabnine-cli",
+    }:
         object_key = "mcpServers"
         entry = {"command": str(command), "args": ["serve"]}
         if merged_env:
@@ -403,6 +438,14 @@ def skill_directory(
     if slug == "muse-code":
         xdg_config = _configured_directory(environment, "XDG_CONFIG_HOME", home / ".config")
         return xdg_config / "muse" / "skills"
+    if slug == "tabnine-cli":
+        # The standalone agent loads ``skills/*/SKILL.md`` from its user
+        # directory; the IDE plugins have no skill directory.
+        return (
+            _configured_directory(environment, "TABNINE_HOME", home / ".tabnine")
+            / "agent"
+            / "skills"
+        )
     return None
 
 

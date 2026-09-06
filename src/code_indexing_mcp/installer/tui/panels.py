@@ -206,20 +206,22 @@ class HarnessesPanel(Vertical):
             "configuration; existing files are backed up with a .bak suffix first.",
             classes="help",
         )
-        for choice in harnesses.HARNESS_CHOICES:
-            path = harnesses.configuration_path(choice.slug)
-            existing = choice.slug in self.state.configured_slugs
-            skills = harnesses.skill_directory(choice.slug) is not None
-            notes = [str(path)]
-            if existing:
-                notes.append("already configured")
-            if skills:
-                notes.append("skills supported")
-            yield Checkbox(
-                f"{choice.label} — {', '.join(notes)}",
-                value=choice.slug in self.state.harness_slugs,
-                id=f"harness-{choice.slug}",
-            )
+        for provider, choices in harnesses.grouped_choices():
+            with Collapsible(title=provider, collapsed=False):
+                for choice in choices:
+                    path = harnesses.configuration_path(choice.slug)
+                    existing = choice.slug in self.state.configured_slugs
+                    skills = harnesses.skill_directory(choice.slug) is not None
+                    notes = [str(path)]
+                    if existing:
+                        notes.append("already configured")
+                    if skills:
+                        notes.append("skills supported")
+                    yield Checkbox(
+                        f"{choice.label} — {', '.join(notes)}",
+                        value=choice.slug in self.state.harness_slugs,
+                        id=f"harness-{choice.slug}",
+                    )
 
     def commit(self) -> bool:
         self.state.harness_slugs = [
