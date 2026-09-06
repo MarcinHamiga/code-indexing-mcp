@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -197,6 +197,52 @@ def daemon_endpoint(paths: RuntimePaths) -> Path:
     directory = _private_directory(root / f"code-indexing-mcp-{identity}")
     digest = sha256(str(paths.data.resolve()).encode()).hexdigest()[:16]
     return directory / f"{digest}.sock"
+
+
+def _published_daemon_endpoint(paths: RuntimePaths) -> Path | None:
+    """Read the listener's location, shared by clients with different environments."""
+    try:
+        value = (paths.data / "daemon.endpoint").read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, UnicodeError):
+        return None
+    endpoint = Path(value)
+    return endpoint if endpoint.is_absolute() and "\0" not in value else None
+
+
+def _publish_daemon_endpoint(paths: RuntimePaths, endpoint: Path) -> None:
+    # Publish only after listen(), atomically, while holding the lifetime lock.
+    descriptor, name = tempfile.mkstemp(prefix=".daemon-endpoint-", dir=paths.data)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(str(endpoint.absolute()))
+        os.replace(temporary, paths.data / "daemon.endpoint")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _daemon_endpoint_candidates(paths: RuntimePaths, previous: Path) -> Iterator[Path]:
+    published = _published_daemon_endpoint(paths)
+    if published is not None:
+        yield published
+    yield previous
+    yield daemon_endpoint(paths)
+    # Upgrade discovery for daemons which predate the endpoint record. In
+    # particular, Codex drops XDG_RUNTIME_DIR while desktop clients retain it.
+    # Only probe existing private directories; never create legacy locations.
+    if hasattr(os, "getuid"):
+        uid = os.getuid()
+        digest = sha256(str(paths.data.resolve()).encode()).hexdigest()[:16]
+        for root in (Path(f"/run/user/{uid}"), Path("/tmp")):
+            directory = root / f"code-indexing-mcp-{uid}"
+            try:
+                info = directory.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(info.st_mode) and info.st_uid == uid and not info.st_mode & 0o077:
+                endpoint = directory / f"{digest}.sock"
+                if endpoint.exists():
+                    yield endpoint
 
 
 def _receive_exact(connection: socket.socket, size: int) -> bytes:
@@ -404,6 +450,7 @@ class DaemonServer:
                 self.endpoint.chmod(0o600)
             listener.listen(32)
             listener.settimeout(0.5)
+            _publish_daemon_endpoint(self.paths, self.endpoint)
             self.ready.set()
             maintenance_thread = threading.Thread(
                 target=self._run_startup_maintenance,
@@ -480,6 +527,7 @@ class DaemonServer:
             self._listener = None
             with contextlib.suppress(FileNotFoundError):
                 self.endpoint.unlink()
+            (self.paths.data / "daemon.endpoint").unlink(missing_ok=True)
             # Buffered slot touches (touch_slot) must not be lost when the
             # daemon exits: the next process's LRU retention decision reads
             # last_used_at from disk.
@@ -724,12 +772,35 @@ class BrokerApplication:
         self.paths = paths
         self.cwd = (cwd or Path.cwd()).resolve()
         self.settings = IndexSettings.from_environment()
-        self.endpoint = daemon_endpoint(paths)
+        self.endpoint = _published_daemon_endpoint(paths) or daemon_endpoint(paths)
         self.token_path = paths.data / "daemon.token"
 
     @classmethod
     def from_environment(cls, *, cwd: Path | None = None) -> BrokerApplication:
         return cls(RuntimePaths.from_environment(), cwd=cwd)
+
+    def _connect(self) -> socket.socket:
+        seen: set[Path] = set()
+        last_error: OSError | None = None
+        for endpoint in _daemon_endpoint_candidates(self.paths, self.endpoint):
+            if endpoint in seen:
+                continue
+            seen.add(endpoint)
+            connection = _local_socket()
+            try:
+                connection.settimeout(5)
+                connection.connect(str(endpoint))
+            except (FileNotFoundError, ConnectionRefusedError) as exc:
+                connection.close()
+                last_error = exc
+                continue
+            except BaseException:
+                connection.close()
+                raise
+            self.endpoint = endpoint
+            return connection
+        assert last_error is not None
+        raise last_error
 
     def _call_once(self, method: str, *, _protocol: int = PROTOCOL_VERSION, **params: Any) -> Any:
         token = self.token_path.read_text().strip()
@@ -740,9 +811,9 @@ class BrokerApplication:
         budget = (
             None if method in _UNBOUNDED_CLIENT_TIMEOUT_METHODS else DAEMON_QUERY_TIMEOUT_SECONDS
         )
-        with _local_socket() as connection:
-            connection.settimeout(5)
-            connection.connect(str(self.endpoint))
+        # Discovery retries only connect failures, before any request is sent.
+        # Refresh the record on every call so retained brokers follow restarts.
+        with self._connect() as connection:
             connection.settimeout(budget)
             try:
                 send_frame(
@@ -1130,6 +1201,7 @@ def ensure_daemon(paths: RuntimePaths, *, timeout_seconds: float = 10) -> Broker
     paths.ensure_private()
     (paths.data / "locks").mkdir(parents=True, exist_ok=True)
     log_path = paths.data / "daemon.log"
+    last_error: Exception | None = None
     with FileLock(paths.data / "locks" / "daemon-start.lock"):
         status = daemon_status(paths)
         if status["running"]:
@@ -1159,11 +1231,14 @@ def ensure_daemon(paths: RuntimePaths, *, timeout_seconds: float = 10) -> Broker
                 # release above and this ping is caught the same way.
                 broker.warn_on_settings_mismatch(ping.get("settings_digest"))
                 return broker
-            except (OSError, CodeIndexingError):
+            except (OSError, EOFError, CodeIndexingError) as exc:
+                last_error = exc
                 time.sleep(0.05)
+    reason = f"; last connection error: {last_error}" if last_error is not None else ""
     raise CodeIndexingError(
         ErrorCode.DAEMON_UNAVAILABLE,
-        f"Timed out starting the local indexing daemon; see {log_path}",
+        f"Timed out starting the local indexing daemon{reason}; see {log_path}",
         log_path=str(log_path),
         timeout_seconds=timeout_seconds,
-    )
+        connection_error=str(last_error) if last_error is not None else None,
+    ) from last_error

@@ -1169,8 +1169,11 @@ Set `CODE_INDEXING_BROKER=off` or run `serve --direct` to bypass it. The daemon 
 current-user-only local socket, starts under leader election, and exits after five idle minutes.
 The socket lives under `XDG_RUNTIME_DIR` when set and the platform temporary directory otherwise;
 the containing directory must be a real directory owned by the current user, or startup fails
-rather than binding somewhere another user controls. Startup output goes to `daemon.log` in the
-data directory.
+rather than binding somewhere another user controls. The daemon publishes its socket location in
+`daemon.endpoint` in the shared data directory, so clients can discover it even when their
+`XDG_RUNTIME_DIR` or temporary-directory settings differ. Clients also check the conventional
+Linux runtime and `/tmp` locations for older daemons that predate this record. Startup output goes
+to `daemon.log` in the data directory; startup timeouts include the last connection error.
 
 The daemon needs Unix domain sockets. Where they are unavailable — currently Windows — the default
 `CODE_INDEXING_BROKER=auto` serves directly and logs a warning; an explicit `CODE_INDEXING_BROKER=on` fails with

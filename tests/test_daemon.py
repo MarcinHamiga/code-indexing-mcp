@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import stat
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -39,6 +40,139 @@ requires_local_sockets = pytest.mark.skipif(
     not daemon_supported(),
     reason="the shared daemon requires Unix domain sockets",
 )
+
+
+@requires_local_sockets
+@pytest.mark.parametrize("client_runtime", [None, "different"])
+def test_broker_discovers_daemon_across_runtime_environments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_runtime: str | None
+) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    with tempfile.TemporaryDirectory(prefix="cim-") as runtime:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", runtime)
+        server = DaemonServer(paths, application=Application(paths, embedder=TinyEmbedder()))
+        thread = threading.Thread(target=server.serve, daemon=True)
+        thread.start()
+        assert server.ready.wait(timeout=2)
+        original_broker = BrokerApplication(paths)
+        try:
+            if client_runtime is None:
+                monkeypatch.delenv("XDG_RUNTIME_DIR")
+            else:
+                monkeypatch.setenv("XDG_RUNTIME_DIR", runtime + "/other")
+            monkeypatch.setattr(daemon.tempfile, "gettempdir", lambda: runtime + "/temp")
+
+            def fail_popen(*args: object, **kwargs: object) -> None:
+                raise AssertionError("the running daemon must be discovered, not respawned")
+
+            monkeypatch.setattr(daemon.subprocess, "Popen", fail_popen)
+            broker = daemon.ensure_daemon(paths)
+            assert broker.ping()["pid"] == os.getpid()
+            assert broker.endpoint == server.endpoint
+        finally:
+            original_broker.stop()
+            thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert not (paths.data / "daemon.endpoint").exists()
+
+
+@requires_local_sockets
+def test_broker_ignores_stale_endpoint_record(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    server = DaemonServer(paths, application=Application(paths, embedder=TinyEmbedder()))
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    try:
+        (paths.data / "daemon.endpoint").write_text("/tmp/missing-code-indexing.sock")
+        assert BrokerApplication(paths)._ping_once()["pid"] == os.getpid()
+    finally:
+        BrokerApplication(paths).stop()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+@requires_local_sockets
+@pytest.mark.parametrize("legacy_location", ["tmp", "linux-runtime"])
+def test_broker_discovers_legacy_daemon_without_endpoint_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_location: str
+) -> None:
+    if not hasattr(os, "getuid"):
+        pytest.skip("legacy POSIX endpoints")
+    runtime = Path("/tmp") if legacy_location == "tmp" else Path(f"/run/user/{os.getuid()}")
+    if not runtime.is_dir():
+        pytest.skip("this system has no per-user Linux runtime directory")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    server = DaemonServer(paths, application=Application(paths, embedder=TinyEmbedder()))
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    original_broker = BrokerApplication(paths)
+    try:
+        (paths.data / "daemon.endpoint").unlink(missing_ok=True)
+        monkeypatch.delenv("XDG_RUNTIME_DIR")
+        with tempfile.TemporaryDirectory(prefix="cim-") as client_temp:
+            monkeypatch.setattr(daemon.tempfile, "gettempdir", lambda: client_temp)
+            broker = BrokerApplication(paths)
+            assert broker._ping_once()["pid"] == os.getpid()
+            assert broker.endpoint == server.endpoint
+    finally:
+        original_broker.stop()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+@requires_local_sockets
+def test_retained_broker_follows_daemon_restart_in_another_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    with tempfile.TemporaryDirectory(prefix="cim-") as runtime:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", runtime)
+        first = DaemonServer(paths, application=Application(paths, embedder=TinyEmbedder()))
+        first_thread = threading.Thread(target=first.serve, daemon=True)
+        first_thread.start()
+        assert first.ready.wait(timeout=2)
+        retained = BrokerApplication(paths)
+        retained.stop()
+        first_thread.join(timeout=2)
+        assert not first_thread.is_alive()
+
+        monkeypatch.setenv("XDG_RUNTIME_DIR", runtime + "/new")
+        second = DaemonServer(paths, application=Application(paths, embedder=TinyEmbedder()))
+        second_thread = threading.Thread(target=second.serve, daemon=True)
+        second_thread.start()
+        assert second.ready.wait(timeout=2)
+        try:
+            # The retained client still has the first daemon's environment.
+            monkeypatch.setenv("XDG_RUNTIME_DIR", runtime)
+            assert retained._ping_once()["pid"] == os.getpid()
+            assert retained.endpoint == second.endpoint != first.endpoint
+            assert stat.S_IMODE((paths.data / "daemon.endpoint").stat().st_mode) == 0o600
+        finally:
+            BrokerApplication(paths).stop()
+            second_thread.join(timeout=2)
+        assert not second_thread.is_alive()
+
+
+def test_startup_timeout_preserves_connection_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    failure = PermissionError(13, "Permission denied", "/private/daemon.sock")
+
+    def fail_ping(self: BrokerApplication) -> dict[str, object]:
+        raise failure
+
+    monkeypatch.setattr(BrokerApplication, "_ping_once", fail_ping)
+    monkeypatch.setattr(daemon.subprocess, "Popen", lambda *args, **kwargs: None)
+    with pytest.raises(CodeIndexingError) as caught:
+        daemon.ensure_daemon(paths, timeout_seconds=0.01)
+    assert caught.value.code is ErrorCode.DAEMON_UNAVAILABLE
+    assert "Permission denied" in str(caught.value)
+    assert caught.value.__cause__ is failure
+    assert caught.value.details["connection_error"] == str(failure)
 
 
 class TinyEmbedder:
