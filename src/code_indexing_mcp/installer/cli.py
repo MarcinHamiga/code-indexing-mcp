@@ -12,7 +12,7 @@ from ..application import RuntimePaths
 from .accelerator import ACCELERATOR_CHOICES
 from .config_files import InstallerError
 from .daemon_control import daemon_relevant_settings_changed, stop_daemon
-from .harnesses import HARNESS_CHOICES, parse_harness_selection
+from .harnesses import HARNESS_CHOICES, grouped_choices, parse_harness_selection
 from .orchestrator import (
     InstallPlan,
     InstallResult,
@@ -142,12 +142,14 @@ def _prompt_harnesses(
     output_fn: Callable[[str], None] = print,
 ) -> list[str]:
     output_fn("Select the harnesses to configure:")
-    last_provider = ""
-    for index, choice in enumerate(HARNESS_CHOICES, start=1):
-        if choice.provider != last_provider:
-            output_fn(f"{choice.provider}:")
-            last_provider = choice.provider
-        output_fn(f"  {index}. {choice.label}")
+    # Numbers stay pinned to the flat HARNESS_CHOICES order so a saved number
+    # keeps meaning the same harness; display groups by provider so each
+    # provider header prints exactly once.
+    numbers = {choice.slug: index for index, choice in enumerate(HARNESS_CHOICES, start=1)}
+    for provider, choices in grouped_choices():
+        output_fn(f"{provider}:")
+        for choice in choices:
+            output_fn(f"  {numbers[choice.slug]}. {choice.label}")
     return parse_harness_selection(
         input_fn("Enter comma-separated choices, 'all', or leave blank to skip: ")
     )

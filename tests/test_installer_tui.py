@@ -334,6 +334,19 @@ async def test_harnesses_panel_groups_checkboxes_into_provider_drawers(
 
 
 @pytest.mark.asyncio
+async def test_harnesses_panel_focuses_first_checkbox_not_drawer_header(
+    tmp_path: Path,
+) -> None:
+    from textual.widgets import Checkbox
+
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "harnesses")
+        assert isinstance(app.focused, Checkbox)
+        assert app.focused.id == "harness-codex"
+
+
+@pytest.mark.asyncio
 async def test_path_panel_commits_launcher_choices(tmp_path: Path) -> None:
     from textual.widgets import Checkbox, Input
 

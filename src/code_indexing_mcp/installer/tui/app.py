@@ -9,7 +9,6 @@ from textual.binding import Binding, BindingType
 from textual.containers import Horizontal
 from textual.widget import Widget
 from textual.widgets import Button, ContentSwitcher, Footer, Header
-from textual.widgets._collapsible import CollapsibleTitle
 
 from ..orchestrator import InstallResult
 from ..wizard import WizardState
@@ -166,7 +165,12 @@ class InstallerApp(App[None]):
         """
 
         for widget in panel.query(Widget):
-            if isinstance(widget, CollapsibleTitle):
+            # Drawer headers are matched by class name, not import: Textual
+            # does not export CollapsibleTitle from textual.widgets, and
+            # importing its private module would break the whole app the day
+            # that path moves. If the class is ever renamed, the worst case
+            # is focus landing on a header -- the pre-drawer behavior.
+            if type(widget).__name__ == "CollapsibleTitle":
                 continue
             if widget.focusable:
                 widget.focus()

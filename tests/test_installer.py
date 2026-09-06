@@ -292,6 +292,23 @@ def test_grouped_choices_collects_each_providers_harnesses() -> None:
     ]
 
 
+def test_prompt_harnesses_prints_each_provider_once_with_stable_numbers() -> None:
+    from code_indexing_mcp.installer.cli import _prompt_harnesses
+    from code_indexing_mcp.installer.harnesses import grouped_choices
+
+    lines: list[str] = []
+    selected = _prompt_harnesses(input_fn=lambda _: "all", output_fn=lines.append)
+    assert selected == [choice.slug for choice in HARNESS_CHOICES]
+
+    numbers = {choice.slug: index for index, choice in enumerate(HARNESS_CHOICES, start=1)}
+    expected = ["Select the harnesses to configure:"]
+    for provider, choices in grouped_choices():
+        expected.append(f"{provider}:")
+        for choice in choices:
+            expected.append(f"  {numbers[choice.slug]}. {choice.label}")
+    assert lines == expected
+
+
 def test_configuration_paths_honor_client_home_overrides(tmp_path: Path) -> None:
     environment = {
         "CODEX_HOME": str(tmp_path / "codex-home"),
