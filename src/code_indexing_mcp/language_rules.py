@@ -326,6 +326,286 @@ _CSHARP_RESERVED_WORDS: Final = frozenset(
 
 _PYTHON_RESERVED_WORDS: Final = frozenset(_keyword_module.kwlist)
 
+_C_RESERVED_WORDS: Final = frozenset(
+    {
+        "auto",
+        "break",
+        "case",
+        "char",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extern",
+        "float",
+        "for",
+        "goto",
+        "if",
+        "inline",
+        "int",
+        "long",
+        "register",
+        "restrict",
+        "return",
+        "short",
+        "signed",
+        "sizeof",
+        "static",
+        "struct",
+        "switch",
+        "typedef",
+        "union",
+        "unsigned",
+        "void",
+        "volatile",
+        "while",
+        "_Alignas",
+        "_Alignof",
+        "_Atomic",
+        "_Bool",
+        "_Complex",
+        "_Generic",
+        "_Imaginary",
+        "_Noreturn",
+        "_Static_assert",
+        "_Thread_local",
+    }
+)
+
+_CPP_RESERVED_WORDS: Final = frozenset(
+    {
+        *_C_RESERVED_WORDS,
+        "alignas",
+        "alignof",
+        "and",
+        "and_eq",
+        "asm",
+        "bitand",
+        "bitor",
+        "bool",
+        "catch",
+        "char16_t",
+        "char32_t",
+        "char8_t",
+        "class",
+        "co_await",
+        "co_return",
+        "co_yield",
+        "compl",
+        "concept",
+        "consteval",
+        "constexpr",
+        "constinit",
+        "const_cast",
+        "decltype",
+        "delete",
+        "dynamic_cast",
+        "explicit",
+        "export",
+        "false",
+        "friend",
+        "mutable",
+        "namespace",
+        "new",
+        "noexcept",
+        "not",
+        "not_eq",
+        "nullptr",
+        "operator",
+        "or",
+        "or_eq",
+        "private",
+        "protected",
+        "public",
+        "reinterpret_cast",
+        "requires",
+        "static_assert",
+        "static_cast",
+        "template",
+        "this",
+        "thread_local",
+        "throw",
+        "true",
+        "try",
+        "typeid",
+        "typename",
+        "using",
+        "virtual",
+        "wchar_t",
+        "xor",
+        "xor_eq",
+    }
+)
+
+_LUA_RESERVED_WORDS: Final = frozenset(
+    {
+        "and",
+        "break",
+        "do",
+        "else",
+        "elseif",
+        "end",
+        "false",
+        "for",
+        "function",
+        "goto",
+        "if",
+        "in",
+        "local",
+        "nil",
+        "not",
+        "or",
+        "repeat",
+        "return",
+        "then",
+        "true",
+        "until",
+        "while",
+    }
+)
+
+_SQL_RESERVED_WORDS: Final = frozenset(
+    {
+        "select",
+        "from",
+        "where",
+        "join",
+        "inner",
+        "outer",
+        "left",
+        "right",
+        "full",
+        "cross",
+        "on",
+        "as",
+        "by",
+        "group",
+        "order",
+        "having",
+        "limit",
+        "offset",
+        "insert",
+        "into",
+        "values",
+        "update",
+        "set",
+        "delete",
+        "create",
+        "drop",
+        "alter",
+        "table",
+        "view",
+        "index",
+        "trigger",
+        "function",
+        "procedure",
+        "column",
+        "with",
+        "union",
+        "all",
+        "distinct",
+        "not",
+        "null",
+        "and",
+        "or",
+        "primary",
+        "key",
+        "foreign",
+        "references",
+        "default",
+        "check",
+        "unique",
+        "constraint",
+        "int",
+        "integer",
+        "text",
+        "varchar",
+        "char",
+        "boolean",
+        "bool",
+        "date",
+        "time",
+        "timestamp",
+        "float",
+        "double",
+        "real",
+    }
+)
+
+_GDSCRIPT_RESERVED_WORDS: Final = frozenset(
+    {
+        "and",
+        "as",
+        "assert",
+        "await",
+        "break",
+        "breakpoint",
+        "class",
+        "class_name",
+        "const",
+        "continue",
+        "elif",
+        "else",
+        "enum",
+        "extends",
+        "for",
+        "func",
+        "if",
+        "in",
+        "is",
+        "match",
+        "namespace",
+        "pass",
+        "return",
+        "self",
+        "signal",
+        "static",
+        "super",
+        "trait",
+        "true",
+        "false",
+        "var",
+        "void",
+        "while",
+        "yield",
+    }
+)
+
+_GDSHADER_RESERVED_WORDS: Final = frozenset(
+    {
+        "shader_type",
+        "render_mode",
+        "uniform",
+        "varying",
+        "const",
+        "struct",
+        "void",
+        "in",
+        "out",
+        "inout",
+        "break",
+        "continue",
+        "discard",
+        "do",
+        "else",
+        "for",
+        "if",
+        "return",
+        "while",
+        "true",
+        "false",
+    }
+)
+
+# HCL has no identifier-reserved keywords: `true`, `false`, and `null` are
+# literals, so they can never name a variable, resource, or module. They are
+# listed only so rename validation rejects them (and so this row satisfies
+# the non-empty reserved-words invariant every structural language carries).
+_TERRAFORM_RESERVED_WORDS: Final = frozenset({"true", "false", "null"})
+
 
 def _csharp_identifier_valid(name: str) -> bool:
     body = name[1:] if name.startswith("@") else name
@@ -488,6 +768,100 @@ def _ecmascript_import_candidates(
     return candidates
 
 
+def _c_include_candidates(
+    source: PurePosixPath,
+    module_path: str,
+    known_paths: frozenset[str],
+    module_index: _ModuleIndex | None,
+) -> set[PurePosixPath]:
+    """Files an `#include` of `module_path` could mean, matched by basename.
+
+    C and C++ have no package map: a quoted include names a header the
+    compiler finds on its search path, and a system include names one the
+    project may vendor. Matching the header basename against indexed files is
+    the honest approximation -- it resolves `#include "util.h"` to the
+    project's own `util.h` wherever it sits, and leaves `<stdio.h>`
+    unresolved when nothing vendored matches.
+    """
+    wanted = PurePosixPath(module_path).name
+    if not wanted:
+        return set()
+    return {PurePosixPath(path) for path in known_paths if PurePosixPath(path).name == wanted}
+
+
+def _lua_require_candidates(
+    source: PurePosixPath,
+    module_path: str,
+    known_paths: frozenset[str],
+    module_index: _ModuleIndex | None,
+) -> set[PurePosixPath]:
+    """Files a `require`/`dofile` of `module_path` could mean.
+
+    Dotted requires (`require "a.b"`) follow `package.path` semantics: each
+    dot is a directory holding either `<name>.lua` or `<name>/init.lua`,
+    resolved against the requiring file's directory first and the project
+    root second. Path-style loads (`dofile "./x.lua"`) resolve the same two
+    roots directly.
+    """
+    if module_path.endswith(".lua") or "/" in module_path:
+        stem = PurePosixPath(module_path)
+        return {source.parent / stem, PurePosixPath(stem)}
+    stem = PurePosixPath(*module_path.split("."))
+    return {
+        source.parent / stem.with_suffix(".lua"),
+        source.parent / stem / "init.lua",
+        stem.with_suffix(".lua"),
+        stem / "init.lua",
+    }
+
+
+def _gdscript_import_candidates(
+    source: PurePosixPath,
+    module_path: str,
+    known_paths: frozenset[str],
+    module_index: _ModuleIndex | None,
+) -> set[PurePosixPath]:
+    """Files a `preload`/`extends` of `module_path` could mean.
+
+    `res://` paths anchor at the project root (the Godot convention the
+    scanner's repo-relative paths already follow); anything else resolves
+    against the importing file's directory.
+    """
+    if module_path.startswith("res://"):
+        return {PurePosixPath(module_path[len("res://") :])}
+    return {source.parent / PurePosixPath(module_path)}
+
+
+def _terraform_module_candidates(
+    source: PurePosixPath,
+    module_path: str,
+    known_paths: frozenset[str],
+    module_index: _ModuleIndex | None,
+) -> set[PurePosixPath]:
+    """Files a `module` block's `source` of `module_path` could mean.
+
+    Only local sources (`./...`, `../...`) resolve to indexed files: a
+    directory source means its `main.tf` entrypoint, and a direct `.tf`
+    source means itself. Registry, Git, and other remote sources never match.
+    """
+    if not module_path.startswith("."):
+        return set()
+    parts = list(source.parent.parts)
+    for part in PurePosixPath(module_path).parts:
+        if part == ".":
+            continue
+        if part == "..":
+            if not parts:
+                return set()
+            parts.pop()
+            continue
+        parts.append(part)
+    normalized = PurePosixPath(*parts)
+    if normalized.suffix == ".tf":
+        return {normalized}
+    return {normalized / "main.tf"}
+
+
 def _empty_import_candidates(
     source: PurePosixPath,
     module_path: str,
@@ -516,6 +890,13 @@ class _LanguageRules:
     left_and_type_parents: frozenset[str] = field(default_factory=frozenset)
     function_and_type_parents: frozenset[str] = field(default_factory=frozenset)
     pair_parents: frozenset[str] = field(default_factory=frozenset)
+    # Parent node types whose `type` and `declarator` fields are bindings the
+    # handler owns, checked before the shared binding-owner set. C-family
+    # grammars name the declared spelling `declarator` rather than `name`
+    # (`int count` hangs the name off `declaration`'s `declarator` field), so
+    # the shared `name`/`type` exclusion cannot cut it; the `type` half keeps
+    # the handler's `type_use` row singly represented.
+    declarator_parents: frozenset[str] = field(default_factory=frozenset)
     handler_owned_type_parents: frozenset[str] = field(default_factory=frozenset)
     keyword_only_marker: str | None = None
     variadic_is_optional: bool = True
@@ -643,6 +1024,96 @@ LANGUAGE_RULES: Final[Mapping[str, _LanguageRules]] = {
         reserved_words=_JAVA_RESERVED_WORDS,
         identifier_valid=lambda name: name.isidentifier() and name not in _JAVA_RESERVED_WORDS,
         import_candidates=_java_import_candidates,
+    ),
+    "c": _LanguageRules(
+        name_only_parents=frozenset(
+            {
+                "preproc_def",
+                "preproc_function_def",
+                "struct_specifier",
+                "enum_specifier",
+                "union_specifier",
+                "enumerator",
+            }
+        ),
+        declarator_parents=frozenset(
+            {
+                "declaration",
+                "init_declarator",
+                "function_declarator",
+                "pointer_declarator",
+                "array_declarator",
+                "parenthesized_declarator",
+                "field_declaration",
+            }
+        ),
+        reserved_words=_C_RESERVED_WORDS,
+        identifier_valid=lambda name: name.isidentifier() and name not in _C_RESERVED_WORDS,
+        import_candidates=_c_include_candidates,
+    ),
+    "cpp": _LanguageRules(
+        name_only_parents=frozenset(
+            {
+                "preproc_def",
+                "preproc_function_def",
+                "class_specifier",
+                "struct_specifier",
+                "enum_specifier",
+                "union_specifier",
+                "enumerator",
+                "alias_declaration",
+            }
+        ),
+        declarator_parents=frozenset(
+            {
+                "declaration",
+                "init_declarator",
+                "function_declarator",
+                "pointer_declarator",
+                "array_declarator",
+                "parenthesized_declarator",
+                "field_declaration",
+            }
+        ),
+        handler_owned_type_parents=frozenset(
+            {
+                "template_type",
+                "template_argument_list",
+                "type_descriptor",
+            }
+        ),
+        reserved_words=_CPP_RESERVED_WORDS,
+        identifier_valid=lambda name: name.isidentifier() and name not in _CPP_RESERVED_WORDS,
+        import_candidates=_c_include_candidates,
+    ),
+    "lua": _LanguageRules(
+        name_only_parents=frozenset({"for_numeric_clause"}),
+        reserved_words=_LUA_RESERVED_WORDS,
+        identifier_valid=lambda name: name.isidentifier() and name not in _LUA_RESERVED_WORDS,
+        import_candidates=_lua_require_candidates,
+    ),
+    "terraform": _LanguageRules(
+        reserved_words=_TERRAFORM_RESERVED_WORDS,
+        identifier_valid=lambda name: name.isidentifier() and name not in _TERRAFORM_RESERVED_WORDS,
+        import_candidates=_terraform_module_candidates,
+    ),
+    "sql": _LanguageRules(
+        reserved_words=_SQL_RESERVED_WORDS,
+        identifier_valid=lambda name: (
+            name.isidentifier() and name.lower() not in _SQL_RESERVED_WORDS
+        ),
+        import_candidates=_empty_import_candidates,
+    ),
+    "gdscript": _LanguageRules(
+        reserved_words=_GDSCRIPT_RESERVED_WORDS,
+        identifier_valid=lambda name: name.isidentifier() and name not in _GDSCRIPT_RESERVED_WORDS,
+        import_candidates=_gdscript_import_candidates,
+    ),
+    "gdshader": _LanguageRules(
+        declarator_parents=frozenset({"init_declarator"}),
+        reserved_words=_GDSHADER_RESERVED_WORDS,
+        identifier_valid=lambda name: name.isidentifier() and name not in _GDSHADER_RESERVED_WORDS,
+        import_candidates=_empty_import_candidates,
     ),
     "csharp": _LanguageRules(
         import_owner_parents=frozenset({"using_directive", "attribute"}),

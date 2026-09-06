@@ -792,6 +792,12 @@ _STRUCTURAL_LANGUAGE_NAMES: dict[str, str] = {
     "java": "Java",
     "csharp": "C#",
     "c": "C",
+    "cpp": "C++",
+    "lua": "Lua",
+    "terraform": "Terraform",
+    "sql": "SQL",
+    "gdscript": "GDScript",
+    "gdshader": "Godot Shader",
 }
 
 

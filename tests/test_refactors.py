@@ -837,7 +837,7 @@ def test_an_unanalyzable_language_makes_the_analysis_incomplete(tmp_path: Path) 
         tmp_path,
         {
             "auth.py": "def authorize(user):\n    return user\n",
-            "client.c": "int Run(void) {\n\treturn 1;\n}\n",
+            "config.yaml": "service:\n  port: 8080\n",
         },
     )
 
@@ -850,25 +850,65 @@ def test_an_unanalyzable_language_makes_the_analysis_incomplete(tmp_path: Path) 
     assert any(item.code == "unsupported_language" for item in analysis.limitations)
 
 
-def test_a_declaration_without_reference_extraction_is_refused(tmp_path: Path) -> None:
-    """Answering at all would mean reporting "rename one line" for a C function
-    whose callers this index never looked at."""
+@pytest.mark.parametrize(
+    ("path", "source", "qualified_symbol", "new_name"),
+    [
+        ("config.yaml", "service:\n  port: 8080\n", "service", "web"),
+        ("config.json", '{"service": {"port": 8080}}\n', "service", "web"),
+    ],
+)
+def test_a_declaration_without_reference_extraction_is_refused(
+    tmp_path: Path, path: str, source: str, qualified_symbol: str, new_name: str
+) -> None:
+    """Answering at all would mean reporting "rename one line" for a YAML or
+    JSON key whose uses this index never looked at."""
 
     service, project_id = _indexed_service(
         tmp_path,
         {
-            "svc.c": "int Authorize(const char *u) {\n\treturn 1;\n}\n",
-            "use.c": 'int Run(void) {\n\treturn Authorize("a");\n}\n',
+            path: source,
         },
     )
 
     with pytest.raises(CodeIndexingError) as raised:
         service.analyze_refactor(
-            DeclarationSelector(project=project_id, path="svc.c", qualified_symbol="Authorize"),
-            RenameOperation(new_name="Permit"),
+            DeclarationSelector(project=project_id, path=path, qualified_symbol=qualified_symbol),
+            RenameOperation(new_name=new_name),
         )
 
     assert raised.value.code is ErrorCode.UNSUPPORTED_LANGUAGE
+
+
+def test_a_c_rename_analysis_covers_its_caller(tmp_path: Path) -> None:
+    """C joined the structural languages, so a rename answers instead of
+    refusing -- and the same-file call site binds exactly."""
+
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "svc.c": (
+                "int Authorize(const char *u) {\n"
+                "\treturn 1;\n"
+                "}\n"
+                "int Run(void) {\n"
+                '\treturn Authorize("a");\n'
+                "}\n"
+            ),
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="svc.c", qualified_symbol="Authorize"),
+        RenameOperation(new_name="Permit"),
+    )
+
+    edited_paths = {
+        (item.path, item.written_name)
+        for item in analysis.must_change
+        if item.edit_required and item.written_name == "Authorize"
+    }
+    assert ("svc.c", "Authorize") in edited_paths
+    assert len([item for item in analysis.must_change if item.path == "svc.c"]) >= 2
 
 
 def test_a_go_rename_analysis_covers_its_same_package_caller(tmp_path: Path) -> None:

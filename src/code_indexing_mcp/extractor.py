@@ -74,6 +74,13 @@ _STRUCTURAL_RECORD_HANDLERS: Final[dict[str, str]] = {
     "rust": "_rust_records",
     "java": "_java_records",
     "csharp": "_csharp_records",
+    "c": "_c_records",
+    "cpp": "_cpp_records",
+    "lua": "_lua_records",
+    "terraform": "_terraform_records",
+    "sql": "_sql_records",
+    "gdscript": "_gdscript_records",
+    "gdshader": "_gdshader_records",
 }
 _PACK_DOWNLOAD_ATTEMPTS: Final = 6
 _PACK_DOWNLOAD_BACKOFF_SECONDS: Final = 1.0
@@ -109,6 +116,47 @@ def _first_named_child(node: Node) -> Node | None:
         if not child.is_extra:
             return child
     return None
+
+
+def _last_named_child(node: Node) -> Node | None:
+    """Return *node*'s last named child that is not "extra" trivia."""
+    for child in reversed(node.named_children):
+        if not child.is_extra:
+            return child
+    return None
+
+
+# Parent node types whose direct identifier children are all bindings owned
+# elsewhere (a handler row, a declaration, or nothing at all). Shared by the
+# `_identifier_record` gate and its inner dispatch so the two can never drift
+# apart again.
+_PURE_BINDING_PARENTS: Final = frozenset(
+    {
+        "variable_list",
+        "preproc_params",
+        "extends_statement",
+        "base_class_clause",
+        "struct_definition",
+        "field_definition",
+        "type_hint",
+        "varying_declaration",
+        "enumerator",
+    }
+)
+
+# Every parent type the positional `_identifier_record` dispatch below handles:
+# the pure bindings above plus the nodes with their own positional logic.
+_POSITIONAL_CLIMB_PARENTS: Final = _PURE_BINDING_PARENTS | frozenset(
+    {
+        "type_definition",
+        "parameter_declaration",
+        "for_statement",
+        "new_expression",
+        "uniform_declaration",
+        "attribute_call",
+        "field",
+    }
+)
 
 
 def normalize_identifier(value: str) -> str:
@@ -480,6 +528,8 @@ class TreeSitterExtractor:
                         parameter.child_by_field_name("right")
                     ):
                         break
+                    if TreeSitterExtractor._is_default_value_read(parameter, node):
+                        break
                 else:
                     return
             excluded_fields: tuple[str, ...] = ()
@@ -498,7 +548,120 @@ class TreeSitterExtractor:
                 # parent -- the climb revisits ancestors for deeper reads,
                 # which must survive.
                 return
-            if parent.type in {
+            if parent.type in rules.declarator_parents:
+                if contains(parent.child_by_field_name("type")):
+                    excluded_fields = ("type",)
+                else:
+                    # The `declarator` span wraps the initializer and the
+                    # parameter list too (`int a = MAX`), so span containment
+                    # on the field would cut the value's reads as well. Only
+                    # the declared name leaf itself is a binding.
+                    name_leaf = TreeSitterExtractor._declarator_identifier(
+                        parent.child_by_field_name("declarator")
+                    )
+                    if name_leaf is not None and contains(name_leaf):
+                        return
+                    excluded_fields = ()
+            elif (
+                parent.type == "function_definition"
+                and language == "gdshader"
+                and node.type == "identifier"
+            ):
+                # Fieldless definition (`float brightness(...)`): the name is
+                # the identifier between the return type and the parameter
+                # list. Other grammars cut definition names through the
+                # `name` field in the shared branch below and never reach
+                # here.
+                siblings = [child for child in parent.named_children if not child.is_extra]
+                if len(siblings) >= 2 and siblings[1] == node:
+                    return
+                excluded_fields = ()
+            elif parent.type in _POSITIONAL_CLIMB_PARENTS:
+                if parent.type == "type_definition":
+                    # C `typedef int myint`: the alias is the trailing name;
+                    # the aliased type stays eligible for the handler.
+                    if not (
+                        node.type in {"type_identifier", "identifier"}
+                        and _last_named_child(parent) == node
+                    ):
+                        excluded_fields = ()
+                    else:
+                        return
+                elif parent.type == "parameter_declaration":
+                    # Fieldless parameters (GDShader `vec3 c`): the trailing
+                    # identifier is the binding. Fieldful grammars (C, C++)
+                    # cut through `declarator` above and never reach here.
+                    if not (node.type == "identifier" and _last_named_child(parent) == node):
+                        excluded_fields = ()
+                    else:
+                        return
+                elif parent.type == "for_statement":
+                    # GDScript `for i in items`: the leading identifier is the
+                    # loop binding; the iterable keeps its reads. Language-
+                    # gated so C/Python loops (whose bindings hang off fields
+                    # or follow different shapes) never reach here.
+                    if (
+                        language != "gdscript"
+                        or node.type != "identifier"
+                        or _first_named_child(parent) != node
+                    ):
+                        excluded_fields = ()
+                    else:
+                        return
+                elif parent.type in _PURE_BINDING_PARENTS:
+                    # Lua assignment targets and loop variables, C macro
+                    # parameters, GDScript superclass spellings (the handler
+                    # owns the inheritance/import row), C++ base lists
+                    # (same), GDShader struct names and member names (the
+                    # handler owns the member types), GDShader uniform hints
+                    # (`: hint_color` names a builtin, never a symbol), and
+                    # GDShader varying names (stage plumbing, not symbols).
+                    # The `enumerator` cut is GDScript-only: C/C++ enumerators
+                    # can carry explicit values (`A = B`) whose reads must
+                    # survive, and they already cut through their `name`
+                    # field instead.
+                    if parent.type == "enumerator" and language != "gdscript":
+                        excluded_fields = ()
+                    else:
+                        return
+                elif parent.type == "attribute_call":
+                    # GDScript `items.append(item)`: the callee is the call
+                    # row's span; the arguments stay eligible reads.
+                    if _first_named_child(parent) == node:
+                        return
+                    excluded_fields = ()
+                elif parent.type == "new_expression":
+                    # Fieldless construction (C++ `new Widget(1)`): the call
+                    # row owns the type. Fieldful `new` (JS) keeps the
+                    # constructor exclusion the call branch used to apply.
+                    if parent.child_by_field_name("constructor") is None:
+                        return
+                    excluded_fields = ("function", "constructor")
+                elif parent.type == "uniform_declaration":
+                    # GDShader `uniform vec4 tint : hint = ...`: identifiers
+                    # before the `=` (the name, the hint) are bindings; a
+                    # default after it (`= PI`) stays a real read.
+                    if node.type != "identifier":
+                        excluded_fields = ()
+                    else:
+                        for child in parent.children:
+                            if child.type == "=":
+                                break
+                            if child == node:
+                                return
+                        excluded_fields = ()
+                elif parent.type == "field":
+                    # Lua `{ x = 1 }`: the key is a binding, the value stays
+                    # eligible. A computed key (`{ [k] = v }`) reads `k`,
+                    # which the brackets betray. (SQL's `field` never reaches
+                    # here: its query captures no bare identifiers.)
+                    if any(not child.is_named and child.type == "[" for child in parent.children):
+                        excluded_fields = ()
+                    else:
+                        excluded_fields = ("name",)
+                else:
+                    excluded_fields = ()
+            elif parent.type in {
                 "function_definition",
                 "function_expression",
                 "generator_function_declaration",
@@ -626,9 +789,46 @@ class TreeSitterExtractor:
                 # `lambda a=LIMIT: a`).
                 excluded_fields = ("parameter",)
             elif parent.type in {"attribute", "member_expression"}:
-                excluded_fields = ("attribute", "property")
-            elif parent.type in {"call", "call_expression", "new_expression"}:
-                excluded_fields = ("function", "constructor")
+                if (
+                    parent.child_by_field_name("attribute") is None
+                    and parent.child_by_field_name("property") is None
+                ):
+                    # Fieldless member access (GDScript `node.hp`): the
+                    # trailing segment is the member name owned by the
+                    # handler's whole-span row; the base stays a read.
+                    if _last_named_child(parent) == node:
+                        return
+                    excluded_fields = ()
+                else:
+                    excluded_fields = ("attribute", "property")
+            elif parent.type == "dot_index_expression":
+                # Lua `M.add`: the field is owned by the call/member row.
+                excluded_fields = ("field",)
+            elif parent.type == "method_index_expression":
+                # Lua `obj:method`: same ownership as `.` access.
+                excluded_fields = ("method",)
+            elif parent.type == "field_expression":
+                # C `s->field` / GDShader `COLOR.rgb`: the field is owned by
+                # the member row; the base stays a read.
+                excluded_fields = ("field",)
+            elif parent.type == "qualified_identifier":
+                # C++ `A::create`: the call row owns the span in calls and
+                # the type descent owns it in types; the qualifier is a
+                # namespace spelling, never a symbol.
+                excluded_fields = ("scope", "name")
+            elif parent.type in {"call", "call_expression", "new_expression", "function_call"}:
+                if (
+                    parent.child_by_field_name("function") is None
+                    and parent.child_by_field_name("constructor") is None
+                ):
+                    # Fieldless call (GDScript, Lua): the callee is the first
+                    # operand and the call row owns it; anything else rides a
+                    # deeper node. Fieldful grammars keep the field cut below.
+                    if _first_named_child(parent) == node:
+                        return
+                    excluded_fields = ()
+                else:
+                    excluded_fields = ("function", "constructor")
             elif parent.type == "keyword_argument":
                 excluded_fields = ("name",)
             elif parent.type in {"as_pattern", "catch_clause"}:
@@ -755,6 +955,7 @@ class TreeSitterExtractor:
                 name_node
                 or child.child_by_field_name("name")
                 or child.child_by_field_name("pattern")
+                or child.child_by_field_name("declarator")
             )
             if name_node is None and child.type == "spread_parameter":
                 # Java varargs (`String... parts`): the element type and the
@@ -765,12 +966,51 @@ class TreeSitterExtractor:
                     None,
                 )
                 name_node = declarator.child_by_field_name("name") if declarator else None
+            if name_node is None and child.type in {
+                "parameter_declaration",
+                "optional_parameter_declaration",
+            }:
+                # Fieldless C-style parameters (GDShader `vec3 c`, C++
+                # `int x = 3`): the declared identifier sits beside the type
+                # with no field to name it. Type leaves are never
+                # `identifier`-typed, so the first direct identifier is the
+                # name; declarator wrappers (`int *p`) are unwrapped below.
+                # A miss here means an unnamed parameter (`void`, `int`),
+                # which takes no shape row at all.
+                name_node = TreeSitterExtractor._c_style_parameter_name(child)
+                if name_node is None:
+                    continue
             if name_node is None:
                 # e.g. a bare `rest_pattern` (`...rest`) -- its identifier is
                 # a plain child, not a named field. A leading comment
                 # (`.../* c */ rest`) must not be mistaken for it (same class
                 # as finding 7/8).
                 name_node = _first_named_child(child)
+            while name_node is not None and name_node.type in {
+                "pointer_declarator",
+                "array_declarator",
+                "parenthesized_declarator",
+                "function_declarator",
+                "init_declarator",
+                "declarator",
+            }:
+                # C `const char *name`: the `declarator` field holds a wrapper
+                # around the declared identifier, not the identifier itself.
+                name_node = name_node.child_by_field_name("declarator") or _first_named_child(
+                    name_node
+                )
+            if child.type == "vararg_expression":
+                # Lua `...`: a genuine variadic slot with no name to bind.
+                rows.append(
+                    ParameterShape(
+                        name="...",
+                        kind="variadic",
+                        required=False,
+                        position=len(rows),
+                        destructured=False,
+                    )
+                )
+                continue
             if name_node is None:
                 continue
             # A destructured slot (`{ a, b }` / `[a, b]`) collapses to ONE
@@ -817,10 +1057,15 @@ class TreeSitterExtractor:
             # wrapper exposes it as a `value` field; bare JS/TS
             # `assignment_pattern` (untyped `a = 1`) exposes it as `right`.
             # A callback type's `=>` in the parameter's raw text is not a
-            # default and must never be mistaken for one.
+            # default and must never be mistaken for one. Fieldless grammars
+            # (C++ `int x = 3`) mark neither field, so a bare `=` child of
+            # the parameter counts too -- an `=` directly under a parameter
+            # node always introduces its default.
             default = (
                 child.child_by_field_name("value") is not None
                 or child.child_by_field_name("right") is not None
+                or child.type == "optional_parameter_declaration"
+                or any(not item.is_named and item.type == "=" for item in child.children)
             )
             required = not default and child.type != "optional_parameter"
             if rules.variadic_is_optional and kind == "variadic":
@@ -842,11 +1087,25 @@ class TreeSitterExtractor:
     # else reachable through the `arguments` field (a tagged template's
     # `template_string`, a `new` with no parens at all) is not a positional arg
     # list and must not have its children miscounted as one (E4).
-    _ARGUMENT_LIST_TYPES: Final = frozenset({"arguments", "argument_list"})
+    _ARGUMENT_LIST_TYPES: Final = frozenset({"arguments", "argument_list", "function_arguments"})
 
     @staticmethod
     def _call_shape(node: Node) -> CallShape:
         arguments = node.child_by_field_name("arguments")
+        if arguments is None:
+            # A call node that names no `arguments` field (Lua
+            # `function_call`) still wraps its arguments in a list node;
+            # taking it positionally keeps the shape real instead of zeroed.
+            # Only list-typed children qualify, so a lone literal argument
+            # (Lua `require "mod"`) still reads as no positional list.
+            arguments = next(
+                (
+                    child
+                    for child in node.named_children
+                    if not child.is_extra and child.type in TreeSitterExtractor._ARGUMENT_LIST_TYPES
+                ),
+                None,
+            )
         positional_count = 0
         keywords: list[str] = []
         positional_spread = False
@@ -1016,6 +1275,139 @@ class TreeSitterExtractor:
                 written_name=_capture_name(source, extra),
             )
 
+    _C_DECLARATOR_WRAPPERS: Final = frozenset(
+        {
+            "pointer_declarator",
+            "array_declarator",
+            "parenthesized_declarator",
+            "function_declarator",
+            "init_declarator",
+            "declarator",
+        }
+    )
+
+    # C type leaves that can never name a project declaration.
+    _C_PREDEFINED_TYPES: Final = frozenset(
+        {
+            "void",
+            "char",
+            "short",
+            "int",
+            "long",
+            "float",
+            "double",
+            "signed",
+            "unsigned",
+            "bool",
+            "_Bool",
+            "_Complex",
+            "_Imaginary",
+            "size_t",
+            "ssize_t",
+            "ptrdiff_t",
+            "int8_t",
+            "int16_t",
+            "int32_t",
+            "int64_t",
+            "uint8_t",
+            "uint16_t",
+            "uint32_t",
+            "uint64_t",
+        }
+    )
+
+    @staticmethod
+    def _is_default_value_read(parameter: Node, node: Node) -> bool:
+        """True if *node* sits after a bare `=` inside parameter *parameter*.
+
+        Fieldless grammars (C++ `int y = x`, GDScript `f(a = 1)`) name no
+        `value`/`right` field for the default, so the parameter-defaults walk
+        would cut the default's reads as bindings. An identifier after the
+        parameter's `=` is the default value -- a real read -- while anything
+        before it is the bound name.
+        """
+        if parameter == node:
+            return False
+        for child in parameter.children:
+            if child == node or (
+                child.start_byte <= node.start_byte and node.end_byte <= child.end_byte
+            ):
+                return False
+            if not child.is_named and child.type == "=":
+                return True
+        return False
+
+    @staticmethod
+    def _c_style_parameter_name(child: Node) -> Node | None:
+        """The declared identifier of a fieldless C-style parameter node."""
+        for candidate in child.named_children:
+            if not candidate.is_extra and candidate.type in {"identifier", "field_identifier"}:
+                return candidate
+        for candidate in child.named_children:
+            if candidate.is_extra or candidate.type not in (
+                TreeSitterExtractor._C_DECLARATOR_WRAPPERS
+            ):
+                continue
+            current: Node | None = candidate
+            while current is not None and current.type in (
+                TreeSitterExtractor._C_DECLARATOR_WRAPPERS
+            ):
+                current = current.child_by_field_name("declarator") or _first_named_child(current)
+            if current is not None and current.type in {"identifier", "field_identifier"}:
+                return current
+        return None
+
+    @staticmethod
+    def _declarator_identifier(node: Node | None) -> Node | None:
+        """Unwrap C declarator wrappers down to the declared identifier."""
+        current = node
+        while current is not None and current.type in (TreeSitterExtractor._C_DECLARATOR_WRAPPERS):
+            current = current.child_by_field_name("declarator") or _first_named_child(current)
+        if current is not None and current.type not in {"identifier", "field_identifier"}:
+            return None
+        return current
+
+    @staticmethod
+    def _c_descend_type_names(node: Node | None) -> list[Node]:
+        """Descend a C/C++ type expression to its naming leaves.
+
+        Yields `type_identifier` leaves; `struct`/`enum`/`union` specifiers
+        contribute their name (never their body -- member declarations are
+        bindings, not uses); `qualified_identifier` contributes its name side
+        (the scope is a namespace spelling); templates contribute their head
+        and arguments. Primitive and qualified-wrapper leaves yield nothing.
+        """
+        if node is None:
+            return []
+        if node.type == "type_identifier":
+            return [node]
+        if node.type in {"struct_specifier", "enum_specifier", "union_specifier"}:
+            name = node.child_by_field_name("name")
+            return TreeSitterExtractor._c_descend_type_names(name)
+        if node.type == "qualified_identifier":
+            return TreeSitterExtractor._c_descend_type_names(node.child_by_field_name("name"))
+        if node.type in {
+            "template_type",
+            "template_argument_list",
+            "type_descriptor",
+            "type_qualifier",
+        }:
+            names: list[Node] = []
+            for child in node.named_children:
+                if not child.is_extra:
+                    names.extend(TreeSitterExtractor._c_descend_type_names(child))
+            return names
+        return []
+
+    @staticmethod
+    def _c_emit_type_uses(node: Node | None, source: bytes, add_reference: _ReferenceAdder) -> None:
+        """Emit one `type_use` per C/C++ type-name leaf reached from *node*."""
+        for name_node in TreeSitterExtractor._c_descend_type_names(node):
+            written = _capture_name(source, name_node)
+            if written in TreeSitterExtractor._C_PREDEFINED_TYPES:
+                continue
+            add_reference("type_use", name_node, target_name=written, written_name=written)
+
     @staticmethod
     def _is_assignment_target(node: Node) -> bool:
         """True if `node` is the LHS of a plain or augmented assignment."""
@@ -1030,7 +1422,14 @@ class TreeSitterExtractor:
             # Rust `count += 1` -- the field operand is the write target.
             "compound_assignment_expr",
         }:
-            return parent.child_by_field_name("left") == node
+            left = parent.child_by_field_name("left")
+            if left is not None:
+                return left == node
+            # A grammar that names no `left` still puts the write target
+            # first, so the first operand is the target. Every grammar in
+            # this set names `left` today; this only fires where none exists.
+            first = _first_named_child(parent)
+            return first is not None and first == node
         # Go wraps each assignment side in an `expression_list` (`s.next =
         # nil`). The list itself is never a symbol; peek one level out without
         # touching the Python/JS shapes, whose LHS identifiers are direct
@@ -1047,7 +1446,17 @@ class TreeSitterExtractor:
                 return grandparent.child_by_field_name("left") == parent
         # Go's `p.x++` / `p.x--`: the statement wraps its single operand
         # without a named field, and the operand is exactly the write target.
-        return parent.type in {"inc_statement", "dec_statement"}
+        # C's `x++` parses as `update_expression` with the same shape.
+        if parent.type in {"inc_statement", "dec_statement", "update_expression"}:
+            return True
+        # Lua `t.field = value`: the targets ride a `variable_list` with no
+        # fields, so a member target inside one is always the write side.
+        # (`for` loop variables ride one too, but only under
+        # `for_generic_clause`, never under an assignment.)
+        if parent.type == "variable_list":
+            grandparent = parent.parent
+            return grandparent is not None and grandparent.type == "assignment_statement"
+        return False
 
     @staticmethod
     def _emit_member_access(node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
@@ -1058,7 +1467,8 @@ class TreeSitterExtractor:
         stay singly represented, not duplicated as a `read`/`write` too:
         a call's `function`/`constructor` (its own `call` row), a Python
         decorator's target (its own `decorator` row), and a class's
-        superclass entry (its own `inheritance` row).
+        superclass entry (its own `inheritance` row). A Lua `function M.add`
+        name and kindred definition spellings are owned by their declaration.
         """
         parent = node.parent
         if parent is not None:
@@ -1068,9 +1478,16 @@ class TreeSitterExtractor:
                     return
                 ancestor = ancestor.parent
             if (
-                parent.type in {"call", "call_expression"}
+                parent.type in {"call", "call_expression", "function_call"}
                 and parent.child_by_field_name("function") == node
             ):
+                return
+            if parent.type in {"call", "function_call"} and _first_named_child(parent) == node:
+                # Fieldless call (GDScript, Lua): the callee is the first
+                # operand, and the call row owns the span. Fieldful grammars
+                # returned through the field check above.
+                return
+            if parent.type == "function_declaration" and parent.child_by_field_name("name") == node:
                 return
             if (
                 parent.type == "new_expression"
@@ -1089,9 +1506,15 @@ class TreeSitterExtractor:
         property_field = node.child_by_field_name("attribute") or node.child_by_field_name(
             "property"
         )
-        if property_field is None:
-            return
         object_field = node.child_by_field_name("object")
+        if property_field is None and object_field is None:
+            # Fieldless member access (GDScript `node.hp`): the base is the
+            # first operand and the member the last. Fieldful grammars always
+            # resolved above, so this only fires where no fields exist.
+            named = [child for child in node.named_children if not child.is_extra]
+            if len(named) < 2:
+                return
+            object_field, property_field = named[0], named[-1]
         text = _capture_name(source, node)
         kind: ReferenceKind = "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
         add_reference(
@@ -2657,6 +3080,636 @@ class TreeSitterExtractor:
                 names.extend(TreeSitterExtractor._csharp_descend_type_names(child))
             return names
         return []
+
+    def _c_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "preproc_include":
+            path_node = node.child_by_field_name("path")
+            if path_node is None:
+                return
+            module_path = _capture_name(source, path_node).strip("'\"<> \t")
+            if not module_path:
+                return
+            # A header include binds the header's declarations, never one
+            # symbol, so `imported_name` stays None -- mirroring Go's package
+            # imports; member uses resolve through the basename candidates.
+            add_reference(
+                "import",
+                path_node,
+                target_name=module_path,
+                written_name=module_path,
+                module_path=module_path,
+                imported_name=None,
+                alias=None,
+            )
+        elif node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is None:
+                return
+            receiver = (
+                function.child_by_field_name("argument")
+                if function.type == "field_expression"
+                else None
+            )
+            add_reference(
+                "call",
+                function,
+                target_name=_capture_name(source, function),
+                written_name=_capture_name(source, function),
+                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+                call_shape=self._call_shape(node),
+            )
+        elif node.type == "field_expression":
+            self._emit_member_access(node, source, add_reference)
+        elif node.type in {"declaration", "field_declaration"}:
+            self._c_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
+            self._c_exports(node, source, add_reference)
+        elif node.type in {"parameter_declaration", "optional_parameter_declaration"}:
+            self._c_emit_type_uses(
+                node.child_by_field_name("type") or _first_named_child(node),
+                source,
+                add_reference,
+            )
+        elif node.type == "type_definition":
+            self._c_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
+        elif node.type == "function_definition":
+            self._c_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
+            self._c_exports(node, source, add_reference)
+
+    def _c_exports(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        """Export rows for top-level C declarations with external linkage.
+
+        A `static` definition is translation-unit-private and gains no row;
+        everything else at file scope (`int count`, `int add(...)`, including
+        prototypes) is visible to every file including the header.
+        """
+        if node.parent is None or node.parent.type != "translation_unit":
+            return
+        if any(
+            child.type == "storage_class_specifier" and "static" in _capture_name(source, child)
+            for child in node.children
+        ):
+            return
+        names: list[Node | None]
+        if node.type == "function_definition":
+            declarator = node.child_by_field_name("declarator")
+            name_node = TreeSitterExtractor._declarator_identifier(declarator)
+            names = [name_node] if name_node is not None else []
+        elif node.type == "declaration":
+            names = [
+                TreeSitterExtractor._declarator_identifier(child)
+                for child in node.named_children
+                if not child.is_extra
+            ]
+        else:
+            return
+        for name_node in names:
+            if name_node is None:
+                continue
+            exported = _capture_name(source, name_node)
+            add_reference("export", name_node, target_name=exported, written_name=exported)
+
+    def _cpp_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "base_class_clause":
+            for child in node.named_children:
+                if child.is_extra or child.type == "access_specifier":
+                    continue
+                head = True
+                for leaf in TreeSitterExtractor._c_descend_type_names(child):
+                    written = _capture_name(source, leaf)
+                    if written in TreeSitterExtractor._C_PREDEFINED_TYPES:
+                        continue
+                    # The head names the base (`inheritance`); template
+                    # arguments inside it (`Base<T>`) are plain type uses.
+                    kind: ReferenceKind = "inheritance" if head else "type_use"
+                    head = False
+                    add_reference(kind, leaf, target_name=written, written_name=written)
+            return
+        if node.type == "alias_declaration":
+            named = [child for child in node.named_children if not child.is_extra]
+            for value in named[1:]:
+                self._c_emit_type_uses(value, source, add_reference)
+            return
+        if node.type == "new_expression":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named:
+                return
+            target = named[0]
+            add_reference(
+                "call",
+                target,
+                target_name=_capture_name(source, target),
+                written_name=_capture_name(source, target),
+                call_shape=self._call_shape(node),
+            )
+            return
+        if node.type in {"class_specifier", "struct_specifier"}:
+            if node.parent is not None and node.parent.type == "translation_unit":
+                name_node = node.child_by_field_name("name")
+                if name_node is not None:
+                    exported = _capture_name(source, name_node)
+                    add_reference("export", name_node, target_name=exported, written_name=exported)
+            return
+        self._c_records(node, source, add_reference)
+
+    # `require`/`dofile` callees that load a whole module. The call row below
+    # keeps signature information; the import row records the module edge.
+    _LUA_MODULE_LOADERS: Final = frozenset({"require", "dofile"})
+
+    def _lua_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "function_call":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named:
+                return
+            prefix = named[0]
+            if (
+                prefix.type == "identifier"
+                and _capture_name(source, prefix) in TreeSitterExtractor._LUA_MODULE_LOADERS
+            ):
+                module_path = TreeSitterExtractor._lua_string_argument(node, prefix, source)
+                add_reference(
+                    "call",
+                    prefix,
+                    target_name=_capture_name(source, prefix),
+                    written_name=_capture_name(source, prefix),
+                    call_shape=self._call_shape(node),
+                    module_path=module_path,
+                )
+                if module_path is not None:
+                    # A loader binds the whole module (a namespace), never a
+                    # single symbol -- mirroring Go package imports.
+                    add_reference(
+                        "import",
+                        prefix,
+                        target_name=module_path,
+                        written_name=module_path,
+                        module_path=module_path,
+                        imported_name=None,
+                        alias=None,
+                    )
+                return
+            receiver = (
+                prefix.child_by_field_name("table")
+                if prefix.type in {"dot_index_expression", "method_index_expression"}
+                else None
+            )
+            add_reference(
+                "call",
+                prefix,
+                target_name=_capture_name(source, prefix),
+                written_name=_capture_name(source, prefix),
+                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+                call_shape=self._call_shape(node),
+            )
+        elif node.type in {"dot_index_expression", "method_index_expression"}:
+            self._emit_member_access(node, source, add_reference)
+
+    @staticmethod
+    def _lua_string_argument(node: Node, prefix: Node, source: bytes) -> str | None:
+        """The quote-stripped module path of a `require`/`dofile` call."""
+        for child in node.named_children:
+            if child.is_extra or child == prefix or child.type == "arguments":
+                continue
+            if child.type == "string":
+                return _capture_name(source, child).strip("'\"")
+        arguments = next(
+            (
+                child
+                for child in node.named_children
+                if not child.is_extra and child.type == "arguments"
+            ),
+            None,
+        )
+        first = _first_named_child(arguments) if arguments is not None else None
+        if first is not None and first.type == "string":
+            return _capture_name(source, first).strip("'\"")
+        return None
+
+    # HCL type constructors name a type, never a project declaration; a call
+    # row for them is an unmatched row forever, so calls skip them instead.
+    _TERRAFORM_TYPE_CONSTRUCTORS: Final = frozenset(
+        {"list", "map", "set", "object", "tuple", "optional"}
+    )
+
+    # HCL primitive type names that parse as single-segment traversals but
+    # name no symbol (`variable "x" { type = string }`).
+    _TERRAFORM_PRIMITIVE_TYPES: Final = frozenset({"string", "number", "bool"})
+
+    def _terraform_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type in {"expression", "template_interpolation"}:
+            self._terraform_emit_traversals(node, source, add_reference)
+        elif node.type == "function_call":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named:
+                return
+            name = _capture_name(source, named[0])
+            if name not in TreeSitterExtractor._TERRAFORM_TYPE_CONSTRUCTORS:
+                add_reference(
+                    "call",
+                    named[0],
+                    target_name=name,
+                    written_name=name,
+                    call_shape=self._call_shape(node),
+                )
+            self._terraform_emit_traversals(node, source, add_reference)
+        elif node.type == "block":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named or named[0].type != "identifier":
+                return
+            if _capture_name(source, named[0]) != "module":
+                return
+            labels = [
+                TreeSitterExtractor._hcl_string_value(child, source)
+                for child in named[1:]
+                if child.type == "string_lit"
+            ]
+            body = next((child for child in named if child.type == "body"), None)
+            if body is None:
+                return
+            for attribute in body.named_children:
+                if attribute.is_extra or attribute.type != "attribute":
+                    continue
+                attribute_named = [
+                    child for child in attribute.named_children if not child.is_extra
+                ]
+                if (
+                    len(attribute_named) < 2
+                    or attribute_named[0].type != "identifier"
+                    or _capture_name(source, attribute_named[0]) != "source"
+                ):
+                    continue
+                value = next(
+                    (
+                        child
+                        for child in attribute_named[1:]
+                        if child.type in {"expression", "string_lit", "template_expr"}
+                    ),
+                    None,
+                )
+                module_path = (
+                    TreeSitterExtractor._hcl_static_string(value, source)
+                    if value is not None
+                    else None
+                )
+                if module_path is None or not module_path.startswith("."):
+                    # Only local sources resolve to indexed files; registry,
+                    # Git, and other remote sources stay out so they never
+                    # become unmatched rows.
+                    continue
+                label = labels[0] if labels else module_path
+                add_reference(
+                    "import",
+                    value,
+                    target_name=label,
+                    written_name=label,
+                    module_path=module_path,
+                    imported_name=None,
+                    alias=None,
+                )
+
+    def _terraform_emit_traversals(
+        self, node: Node, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        """Emit a `read` per HCL traversal (`var.x`, `local.p`, `aws.h.web.ip`)."""
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.type == "expression":
+                named = [child for child in current.named_children if not child.is_extra]
+                if named and named[0].type == "variable_expr":
+                    parent = current.parent
+                    is_key = False
+                    if parent is not None and parent.type == "object_elem":
+                        first = _first_named_child(parent)
+                        is_key = first is not None and (
+                            first == current
+                            or (
+                                first.start_byte <= current.start_byte
+                                and current.end_byte <= first.end_byte
+                            )
+                        )
+                    # An object key (`{ Name = local.prefix }`) names the
+                    # argument, not a symbol.
+                    if not is_key:
+                        text = _capture_name(source, current)
+                        if not (
+                            len(named) == 1
+                            and _capture_name(source, named[0])
+                            in TreeSitterExtractor._TERRAFORM_PRIMITIVE_TYPES
+                        ):
+                            add_reference("read", current, target_name=text, written_name=text)
+            stack.extend(current.named_children)
+
+    @staticmethod
+    def _hcl_string_value(node: Node, source: bytes) -> str | None:
+        """The literal text of an HCL quoted string, or None when dynamic."""
+        for child in node.named_children:
+            if child.is_extra:
+                continue
+            if child.type == "template_literal":
+                return _capture_name(source, child)
+            if child.type == "quoted_template":
+                return TreeSitterExtractor._hcl_string_value(child, source)
+        return None
+
+    @staticmethod
+    def _hcl_static_string(node: Node, source: bytes) -> str | None:
+        """The literal text of an HCL string with no interpolation in it."""
+        texts: list[str] = []
+
+        def visit(current: Node) -> bool:
+            if current.type == "template_interpolation":
+                return False
+            if current.type == "template_literal":
+                texts.append(_capture_name(source, current))
+            for child in current.named_children:
+                if child.is_extra:
+                    continue
+                if not visit(child):
+                    return False
+            return True
+
+        if not visit(node) or not texts:
+            return None
+        return "".join(texts)
+
+    # `create_*` statements whose `object_reference` is the defined name, not
+    # a use. `create_index` is deliberately absent: its object reference is
+    # the indexed table, a genuine use.
+    _SQL_DEFINING_STATEMENTS: Final = frozenset(
+        {
+            "create_table",
+            "create_view",
+            "create_materialized_view",
+            "create_function",
+            "create_trigger",
+            "create_type",
+        }
+    )
+
+    def _sql_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "relation":
+            reference = next(
+                (
+                    child
+                    for child in node.named_children
+                    if not child.is_extra and child.type == "object_reference"
+                ),
+                None,
+            )
+            if reference is None:
+                return
+            text = _capture_name(source, reference)
+            kind: ReferenceKind = (
+                "write" if node.parent is not None and node.parent.type == "update" else "read"
+            )
+            add_reference(kind, reference, target_name=text, written_name=text)
+        elif node.type == "field":
+            named = [child for child in node.named_children if not child.is_extra]
+            if len(named) == 1 and named[0].type == "identifier":
+                text = _capture_name(source, named[0])
+                add_reference("read", named[0], target_name=text, written_name=text)
+            elif (
+                len(named) == 2
+                and named[0].type == "object_reference"
+                and named[1].type == "identifier"
+            ):
+                # Alias-qualified columns (`u.name`): the separator is an
+                # anonymous token, so only the two names are visible here.
+                receiver = _capture_name(source, named[0])
+                text = _capture_name(source, node)
+                add_reference(
+                    "read",
+                    node,
+                    target_name=text,
+                    written_name=text,
+                    receiver_text=receiver,
+                )
+        elif node.type == "invocation":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named:
+                return
+            name = _capture_name(source, named[0])
+            # The grammar wraps no argument list node, so the shape counts
+            # the remaining operands positionally (`lower(name)` takes one).
+            add_reference(
+                "call",
+                named[0],
+                target_name=name,
+                written_name=name,
+                call_shape=CallShape(positional_count=max(0, len(named) - 1)),
+            )
+            for child in node.named_children:
+                if child.is_extra or child == named[0]:
+                    continue
+                self._sql_emit_column_uses(child, source, add_reference)
+        elif node.type == "insert":
+            reference = next(
+                (
+                    child
+                    for child in node.named_children
+                    if not child.is_extra and child.type == "object_reference"
+                ),
+                None,
+            )
+            if reference is None:
+                return
+            text = _capture_name(source, reference)
+            add_reference("write", reference, target_name=text, written_name=text)
+        elif node.type == "object_reference":
+            parent = node.parent
+            if parent is not None and parent.type in {"relation", "field"}:
+                return
+            if parent is not None and parent.type == "from":
+                statement = parent.parent
+                if (
+                    statement is not None
+                    and statement.type == "statement"
+                    and any(child.type == "delete" for child in statement.named_children)
+                ):
+                    # DELETE mutates its target table exactly like UPDATE does.
+                    text = _capture_name(source, node)
+                    add_reference("write", node, target_name=text, written_name=text)
+                    return
+            ancestor = parent
+            while ancestor is not None:
+                if ancestor.type in TreeSitterExtractor._SQL_DEFINING_STATEMENTS | {
+                    "insert",
+                    "invocation",
+                    "column_definition",
+                }:
+                    # Definitions own their name; `insert` owns its table as
+                    # a write; a call owns its callee.
+                    return
+                ancestor = ancestor.parent
+            text = _capture_name(source, node)
+            add_reference("read", node, target_name=text, written_name=text)
+
+    def _sql_emit_column_uses(
+        self, node: Node, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        """Emit `read` rows for bare identifiers inside a call's arguments.
+
+        Function arguments (`lower(name)`) may parse as plain identifiers
+        rather than `field` nodes; the `field` handler owns the latter (and
+        `add_reference` dedupes any overlap), so descending here only fills
+        the gaps.
+        """
+        if node.type == "identifier":
+            text = _capture_name(source, node)
+            add_reference("read", node, target_name=text, written_name=text)
+            return
+        if node.type in {"invocation", "object_reference", "relation", "field"}:
+            # Owned spans: nested calls, schema names, relations, and columns
+            # each have a handler row already; descending would re-emit the
+            # callee as a read beside its call.
+            return
+        for child in node.named_children:
+            if not child.is_extra:
+                self._sql_emit_column_uses(child, source, add_reference)
+
+    def _gdscript_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "call":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named:
+                return
+            callee = named[0]
+            if callee.type == "identifier" and _capture_name(source, callee) == "preload":
+                module_path = TreeSitterExtractor._gdscript_string_argument(node, source)
+                add_reference(
+                    "call",
+                    callee,
+                    target_name="preload",
+                    written_name="preload",
+                    call_shape=self._call_shape(node),
+                    module_path=module_path,
+                )
+                if module_path is not None:
+                    # `preload` binds the loaded script as a namespace, never
+                    # a single symbol -- mirroring Go package imports.
+                    add_reference(
+                        "import",
+                        callee,
+                        target_name=module_path,
+                        written_name=module_path,
+                        module_path=module_path,
+                        imported_name=None,
+                        alias=None,
+                    )
+                return
+            receiver = None
+            if callee.type == "attribute":
+                inner = [child for child in callee.named_children if not child.is_extra]
+                receiver = inner[0] if inner else None
+            add_reference(
+                "call",
+                callee,
+                target_name=_capture_name(source, callee),
+                written_name=_capture_name(source, callee),
+                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+                call_shape=self._call_shape(node),
+            )
+        elif node.type == "attribute_call":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named:
+                return
+            callee = named[0]
+            method = _capture_name(source, callee)
+            owner = node.parent
+            receiver = None
+            prefix = method
+            if owner is not None and owner.type == "attribute":
+                inner = [child for child in owner.named_children if not child.is_extra]
+                receiver = inner[0] if inner else None
+                prefix = (
+                    f"{_capture_name(source, receiver)}.{method}"
+                    if receiver is not None
+                    else method
+                )
+            add_reference(
+                "call",
+                node,
+                target_name=prefix,
+                written_name=prefix,
+                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+                call_shape=self._call_shape(node),
+            )
+        elif node.type == "attribute":
+            for child in node.named_children:
+                if not child.is_extra and child.type == "attribute_call":
+                    # A method call owns the whole span (see above); a bare
+                    # member row here would duplicate it as a read.
+                    return
+            self._emit_member_access(node, source, add_reference)
+        elif node.type == "extends_statement":
+            named = [child for child in node.named_children if not child.is_extra]
+            target = named[-1] if named else None
+            if target is None:
+                return
+            if target.type == "string":
+                module_path = _capture_name(source, target).strip("'\"")
+                if module_path:
+                    add_reference(
+                        "import",
+                        target,
+                        target_name=module_path,
+                        written_name=module_path,
+                        module_path=module_path,
+                        imported_name=None,
+                        alias=None,
+                    )
+            else:
+                base = target
+                resolved: Node | None = _first_named_child(base) if base.type == "type" else base
+                if resolved is not None and resolved.type == "identifier":
+                    text = _capture_name(source, resolved)
+                    add_reference("inheritance", resolved, target_name=text, written_name=text)
+        elif node.type in {"assignment", "augmented_assignment"}:
+            first = _first_named_child(node)
+            if first is not None and first.type == "identifier":
+                # A bare name on the left rebinds an existing local (`var`
+                # owns the declaration); an `attribute` left is owned by the
+                # member-access row on the same span.
+                text = _capture_name(source, first)
+                add_reference("write", first, target_name=text, written_name=text)
+
+    @staticmethod
+    def _gdscript_string_argument(node: Node, source: bytes) -> str | None:
+        """The quote-stripped path of a `preload("...")` call."""
+        arguments = next(
+            (
+                child
+                for child in node.named_children
+                if not child.is_extra and child.type == "arguments"
+            ),
+            None,
+        )
+        first = _first_named_child(arguments) if arguments is not None else None
+        if first is not None and first.type == "string":
+            return _capture_name(source, first).strip("'\"")
+        return None
+
+    def _gdshader_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is None:
+                return
+            if function.type == "primitive_type":
+                # Builtin constructors (`vec4(1.0)`) name a type, never a
+                # project declaration.
+                return
+            add_reference(
+                "call",
+                function,
+                target_name=_capture_name(source, function),
+                written_name=_capture_name(source, function),
+                call_shape=self._call_shape(node),
+            )
+        elif node.type == "field_expression":
+            self._emit_member_access(node, source, add_reference)
+        elif node.type == "field_definition":
+            named = [child for child in node.named_children if not child.is_extra]
+            for type_node in named[:-1]:
+                self._c_emit_type_uses(type_node, source, add_reference)
 
     def _definitions(self, language_name: str, root: Node, source: bytes) -> list[_Definition]:
         matches = QueryCursor(self._query(language_name)).matches(root)

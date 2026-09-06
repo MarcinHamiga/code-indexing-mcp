@@ -296,7 +296,7 @@ overwrite a marker and orphan the previous index.
 | `search_by_example` | read, registers and indexes | Find indexed chunks most similar to a pasted code snippet. |
 | `search_across_projects` | read, registers and indexes | Globally ranked search across at least two explicitly selected projects. |
 | `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
-| `find_references` | read, registers and indexes | Structural references to one selected C#, Go, Java, JavaScript, Python, Rust, TSX, or TypeScript declaration. |
+| `find_references` | read, registers and indexes | Structural references to one selected C, C#, C++, GDScript, Godot Shader, Go, Java, JavaScript, Lua, Python, Rust, SQL, Terraform, TSX, or TypeScript declaration. |
 | `dead_code_report` | read, registers and indexes | Review exported declarations with no exact references in one project. |
 | `impact_radius` | read, registers and indexes | Bounded, layered transitive dependents of one selected declaration. |
 | `analyze_refactor` | read, registers and indexes | Read-only rename or signature-change impact analysis for one selected declaration. |
@@ -351,7 +351,8 @@ depth, budget, structural snapshot, and active slot epoch.
 Structural references are extracted during the normal parse and are backfilled parse-only for an
 older semantic index—no second embedding pass is needed. The first reference query may therefore
 write structural coverage while it refreshes its index, which is why both tools carry the
-registering-read annotation. C#, Go, Java, JavaScript, Python, Rust, TSX, and TypeScript are
+registering-read annotation. C, C#, C++, GDScript, Godot Shader, Go, Java, JavaScript,
+Lua, Python, Rust, SQL, Terraform, TSX, and TypeScript are
 supported; selecting a
 declaration in any other language returns `UNSUPPORTED_LANGUAGE` rather than an empty result that
 would read as "no callers". Runtime imports, wildcard and on-demand imports, inferred receiver
