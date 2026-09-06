@@ -73,7 +73,8 @@ SERVER_INSTRUCTIONS = (
     "search hit). When correlating code across explicitly related services, use list_projects "
     "to discover them and search_across_projects to search the selected repositories together. "
     "Check list_projects/project_status for index freshness first and run index_project if the "
-    "index is missing or stale."
+    "index is missing or stale. If INDEX_BUSY reports background work, poll project_status "
+    "and retry when ready; do not restart the server or force another rebuild."
 )
 
 # Bounds on the retry cadence used while another indexing job holds the global
@@ -87,6 +88,11 @@ MAXIMUM_RETRY_DELAY_SECONDS = 1.0
 # enough that a client's progress bar keeps moving, slow enough that polling a
 # small file costs nothing next to the indexing it is watching.
 PROGRESS_POLL_SECONDS = 0.5
+
+# Hosts impose their own tool deadlines (often 30-300 seconds), regardless of
+# progress notifications. Bound only the response wait, never the index writer.
+INDEX_RESPONSE_TIMEOUT_SECONDS = 10.0
+ROOTS_TIMEOUT_SECONDS = 2.0
 
 # Filesystem events are collapsed before they reach the indexing coordinator.
 # The bounded dirty queue below provides the second layer: one more refresh is
@@ -127,6 +133,14 @@ class _StartupJob:
         return self.discovery_error is not None or self.indexing_error is not None
 
 
+@dataclass
+class _ManualIndexJob:
+    force: bool
+    ready: anyio.Event = field(default_factory=anyio.Event)
+    report: IndexReport | None = None
+    error: Exception | None = None
+
+
 class StartupCoordinator:
     def __init__(
         self,
@@ -154,6 +168,51 @@ class StartupCoordinator:
         self._lock = asyncio.Lock()
         self._limiter = anyio.CapacityLimiter(1)
         self._first_schedule: asyncio.Event = asyncio.Event()
+        self._manual_jobs: dict[tuple[str, Path], _ManualIndexJob] = {}
+
+    async def index_manually(
+        self, project: ProjectInfo, roots: list[Path], *, force: bool
+    ) -> IndexReport:
+        # The lifespan owns the writer, not the tool request. Retries join the
+        # same pending job, including when the original caller was cancelled.
+        key = (project.id, project.root)
+        job = self._manual_jobs.get(key)
+        if job is None:
+            job = _ManualIndexJob(force=force)
+            self._manual_jobs[key] = job
+            self.task_group.start_soon(self._run_manual, key, job, roots, force)
+        elif job.force != force:
+            raise CodeIndexingError(
+                ErrorCode.INDEX_BUSY,
+                "A build with a different force setting is pending. Poll project_status "
+                "before requesting another rebuild.",
+                project=project.id,
+                checkout_root=str(project.root),
+            )
+        await job.ready.wait()
+        if job.error is not None:
+            raise job.error
+        assert job.report is not None
+        return job.report
+
+    async def _run_manual(
+        self,
+        key: tuple[str, Path],
+        job: _ManualIndexJob,
+        roots: list[Path],
+        force: bool,
+    ) -> None:
+        try:
+            job.report = await anyio.to_thread.run_sync(
+                partial(self.application.index_project, key[0], roots=roots, force=force),
+                abandon_on_cancel=False,
+            )
+        except Exception as exc:
+            job.error = exc
+            logger.exception("Manual indexing failed for %s", key[1])
+        finally:
+            job.ready.set()
+            self._manual_jobs.pop(key, None)
 
     async def schedule(
         self, roots: list[Path], *, indexes: bool, trigger: IndexTrigger = "startup"
@@ -482,7 +541,11 @@ async def _roots(ctx: ServerContext) -> list[Path]:
     if client_params is None or client_params.capabilities.roots is None:
         return []
     try:
-        result = await ctx.session.list_roots()
+        async with asyncio.timeout(ROOTS_TIMEOUT_SECONDS):
+            result = await ctx.session.list_roots()
+    except TimeoutError:
+        logger.warning("Client roots/list timed out; using explicit project or working directory")
+        return []
     except Exception:
         return []
     roots: list[Path] = []
@@ -507,9 +570,10 @@ async def _startup_roots(
     coordinator = _coordinator(ctx)
     if coordinator is None:
         return roots
-    await coordinator.schedule(roots, indexes=indexes)
-    if discover or indexes:
-        await coordinator.wait_for_discovery(roots)
+    async with _index_response_budget([], roots=roots):
+        await coordinator.schedule(roots, indexes=indexes)
+        if discover or indexes:
+            await coordinator.wait_for_discovery(roots)
     return roots
 
 
@@ -578,6 +642,31 @@ async def _reporting_index_progress(
             await reporter
 
 
+@asynccontextmanager
+async def _index_response_budget(
+    projects: list[ProjectInfo], *, roots: list[Path] | None = None
+) -> AsyncIterator[None]:
+    budget = asyncio.timeout(INDEX_RESPONSE_TIMEOUT_SECONDS)
+    try:
+        async with budget:
+            yield
+    except TimeoutError as exc:
+        if not budget.expired():
+            raise
+        raise CodeIndexingError(
+            ErrorCode.INDEX_BUSY,
+            "Index preparation is still pending. Check project_status for these projects "
+            "and retry when ready, or after a short delay if no build is running. "
+            "Do not restart the server or force another rebuild. "
+            "An indexing job already started continues in the background. "
+            "If indexing fails, inspect index_history for the failure before retrying.",
+            projects=[project.id for project in projects],
+            checkout_roots=[str(root) for root in roots or [project.root for project in projects]],
+            wait_timeout_seconds=INDEX_RESPONSE_TIMEOUT_SECONDS,
+            retry_after_seconds=2,
+        ) from exc
+
+
 async def _wait_for_startup_projects(
     ctx: ServerContext, roots: list[Path], projects: list[ProjectInfo]
 ) -> None:
@@ -586,6 +675,16 @@ async def _wait_for_startup_projects(
         return
     if coordinator.mode is IndexMode.MANUAL:
         return
+    async with _index_response_budget(projects):
+        await _prepare_startup_projects(ctx, coordinator, roots, projects)
+
+
+async def _prepare_startup_projects(
+    ctx: ServerContext,
+    coordinator: StartupCoordinator,
+    roots: list[Path],
+    projects: list[ProjectInfo],
+) -> None:
     # An explicit project or all_projects query can select registrations that
     # are not among the client's advertised roots. Freshen those too; otherwise
     # lazy mode would silently serve an old index for exactly those scopes.
@@ -654,8 +753,9 @@ search_across_projects with at least two explicit project ids, names, or paths. 
 that deliberate scope and globally ranks the combined results.
 
 In the default lazy mode every project-scoped code query checks freshness and refreshes only when \
-the source tree has changed. The initial refresh can take minutes on a large repository and \
-reports progress while it runs."""
+the source tree has changed. Index waits return INDEX_BUSY after 10 seconds if work is still \
+pending; a started build continues in the background. Poll project_status and retry when ready. \
+Inspect index_history if the build fails; do not restart the server to retry a pending build."""
 
 # openWorldHint is False on every tool: this server touches only the local
 # filesystem and a local index, never the network.
@@ -954,7 +1054,11 @@ def create_server(
             "indexes the newly active slot, returning to a clean cached slot at "
             "the same HEAD costs no scan at all, and a dirty checkout re-checks only its changed "
             "files rather than the whole tree. Returns per-phase counts and durations plus any "
-            "per-file errors. Indexes supported source files in the checked-out working tree, "
+            "per-file errors for a completed build. After 10 seconds of indexing wait, returns "
+            "INDEX_BUSY while the build continues in the background. Poll project_status and "
+            "inspect index_history for completion or failure. Repeated calls join the pending "
+            "manual build when force matches; a different force setting returns INDEX_BUSY. "
+            "Indexes supported source files in the checked-out working tree, "
             "skipping symlinks, binaries, and files over the project's max_file_bytes "
             "(1 MiB by default, and no marker may raise it past 16 MiB)."
         ),
@@ -993,9 +1097,16 @@ def create_server(
         async with _reporting_index_progress(
             ctx, app, [resolved.id], message=f"Indexing {resolved.name}"
         ) as stream:
-            report = await asyncio.to_thread(
-                app.index_project, resolved.id, roots=roots, force=force
-            )
+            coordinator = _coordinator(ctx)
+            if coordinator is None:
+                # Programmatic calls without an MCP lifespan have no owner for
+                # detached work; keep their existing synchronous behavior.
+                report = await asyncio.to_thread(
+                    app.index_project, resolved.id, roots=roots, force=force
+                )
+            else:
+                async with _index_response_budget([resolved]):
+                    report = await coordinator.index_manually(resolved, roots, force=force)
         await stream.finish(
             f"Indexed {report.indexed_files} files, {report.embedded_chunks} chunks embedded"
         )

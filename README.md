@@ -537,9 +537,21 @@ non-ignored source file and contains `.git`, `pyproject.toml`, `setup.py`, `setu
 `package.json`, `tsconfig.json`, or `jsconfig.json`. The server creates the usual local
 `.ci-mcp/project.toml` marker only after that check passes.
 
-Because a query waits for any required refresh, it reports progress while the initial index builds
-so clients can tell a slow index from a stalled tool call. On a large repository the first query
-can still take a while. `CODE_INDEXING_INDEX_MODE=eager` indexes during tool listing, then keeps one
+MCP indexing and query preparation wait for up to 10 seconds per phase, reporting indexing progress
+while waiting. If work is still pending, the tool returns `INDEX_BUSY` with project selectors and
+retry guidance, before typical host timeouts. A started build continues in the background: poll
+`project_status`, then retry the query when ready. `index_history` records completion or failure,
+including run-level error messages. Repeated `index_project` calls in the same session join its
+pending manual build when `force` matches; conflicting requests return `INDEX_BUSY`. Short builds
+still return the usual index report. CLI `syndex index` continues waiting for the full build.
+
+The default daemon owns the build independently of an MCP client connection. In direct mode,
+the server owns the job and orderly shutdown waits for the active writer; killing that process
+can interrupt its build. Do not restart clients or force another rebuild merely to retry
+`INDEX_BUSY`. Clients advertising roots support must answer `roots/list` within two seconds;
+otherwise Syndex falls back to explicit project selection or its working directory.
+
+`CODE_INDEXING_INDEX_MODE=eager` indexes during tool listing, then keeps one
 debounced filesystem monitor per discovered root and refreshes it after later changes. Changes that
 arrive during a refresh are coalesced into one follow-up pass. A stat-only reconciliation every 30
 seconds catches missed notifications and Git exclusion changes outside the watched root, and a
@@ -563,15 +575,15 @@ full walk, and only once, until the next index run.
 
 Two things can make an automatic refresh wait: another root queued ahead of it in the same session,
 and another process holding the global index lock. One budget covers both. The refresh retries with
-exponential backoff for up to five minutes, then fails the waiting query with `INDEX_BUSY` rather
-than blocking indefinitely:
+exponential backoff for up to five minutes before the background attempt fails. The separate
+10-second MCP response budget returns `INDEX_BUSY` while that attempt is still pending:
 
 ```bash
 export CODE_INDEXING_INDEX_WAIT_SECONDS=300
 ```
 
-Set it to `0` to fail immediately whenever anything else is already indexing, or raise it when a
-single cold index legitimately takes longer than the default.
+Set it to `0` to fail immediately whenever anything else is already indexing, or raise it to allow
+longer queue/lock contention. It does not change the MCP response budget or limit embedding time.
 
 Incremental refreshes:
 
@@ -682,7 +694,8 @@ resets reuse the same slot and validate it incrementally:
 Each index mode handles a switch within its existing rules:
 
 - Lazy mode activates an unseen selector as a pending, empty slot, and the first project-scoped
-  query builds it and waits — reporting progress while it does. A pending slot never falls back to
+  query starts its build and waits within the MCP response budget, reporting progress while it does.
+  If still pending, it returns `INDEX_BUSY`. A pending slot never falls back to
   or serves results from the previously active selector.
 - Eager mode treats a selector transition as a change even when filesystem watcher events were
   coalesced or missed, because status compares the slot's indexed HEAD with the checkout's HEAD.
@@ -1127,7 +1140,8 @@ dense-Python corpus at `CODE_INDEXING_EMBED_MEMORY_MB=2048`:
 Batch size 8 buys 17% throughput for 36 MiB more resident memory — not enough to justify spending
 headroom that the worst-case file shape already needs. Embedding dominates: 141 s of the 147 s at
 batch size 1. Plan for roughly **45 chunks per second**, and remember that in the default lazy mode
-the first `search_code` call waits for that work. On a large repository prefer
+the first `search_code` call starts that work and returns `INDEX_BUSY` if its wait exceeds 10 seconds.
+On a large repository prefer
 `CODE_INDEXING_INDEX_MODE=eager` (index during tool listing and monitor later changes) or
 `CODE_INDEXING_INDEX_MODE=manual` with an explicit `syndex index`, so no query blocks on
 a cold index.

@@ -314,8 +314,11 @@ class _RunRecord:
     def complete(self, **counters: object) -> None:
         self._finish(state="completed", **counters)
 
-    def fail(self) -> None:
-        self._finish(state="failed")
+    def fail(self, error: BaseException) -> None:
+        # A host may already have received INDEX_BUSY while this job runs in
+        # the background. Keep its eventual failure available via index_history,
+        # bounded like the per-file issues (empty path denotes a run-level error).
+        self._finish(state="failed", errors=[IndexIssue(path="", message=str(error)[:2000])])
 
     def _finish(self, *, state: str, **counters: object) -> None:
         if not self._started or self._history is None:
@@ -632,8 +635,8 @@ class Indexer:
             record.start()
         try:
             yield record
-        except BaseException:
-            record.fail()
+        except BaseException as exc:
+            record.fail(exc)
             raise
 
     def _run_audit(
