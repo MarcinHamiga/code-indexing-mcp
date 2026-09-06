@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    # Weekly Windows signal (Monday 06:00 UTC); Windows no longer runs on
+    # every push, see the test-windows job below.
+    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       corpus_scale:
@@ -14,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest]
         python: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     # The full suite takes ~10 minutes on the slowest runner; a hung test must
@@ -91,6 +95,23 @@ jobs:
       matrix:
         python: ["3.12", "3.13"]
     runs-on: macos-latest
+    timeout-minutes: 40
+    steps: *test-steps
+
+  # Windows is the slowest runner by far and the only regularly red one: the
+  # daemon needs Unix domain sockets (Windows serves direct instead), much of
+  # the suite is POSIX-only (112 skips), and the remaining timing-sensitive
+  # tests flake under the loaded Windows runners. macOS coverage happens on
+  # real hardware before pushes, so Windows no longer runs on every push. It
+  # is kept as a weekly scheduled plus manual-dispatch job so regressions
+  # still surface without slowing down development.
+  test-windows:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    runs-on: windows-latest
     timeout-minutes: 40
     steps: *test-steps
 

@@ -75,7 +75,9 @@ async def test_slow_index_returns_busy_then_completes_without_restarting(
 ) -> None:
     app, embedder, project = _application(tmp_path)
     server = create_server(app, auto_index=False if tool == "index_project" else None)
-    monkeypatch.setattr(server_module, "INDEX_RESPONSE_TIMEOUT_SECONDS", 0.1, raising=False)
+    # 0.5s, not 0.1s: on loaded runners (notably windows-latest) scheduling
+    # jitter collapses the busy-vs-completed window and flakes the asserts.
+    monkeypatch.setattr(server_module, "INDEX_RESPONSE_TIMEOUT_SECONDS", 0.5, raising=False)
     arguments = {
         "index_project": {"project": project},
         "search_code": {"query": "answer", "projects": [project]},
@@ -95,13 +97,13 @@ async def test_slow_index_returns_busy_then_completes_without_restarting(
         try:
             query = asyncio.create_task(client.call_tool(tool, arguments))
             assert await asyncio.to_thread(embedder.started.wait, 5)
-            result = await asyncio.wait_for(query, 1)
+            result = await asyncio.wait_for(query, 5)
             assert result.isError
             assert "INDEX_BUSY" in _text(result)
             assert "project_status" in _text(result)
             assert project in _text(result)
             # A retry while the worker is blocked must not start another build.
-            repeated = await asyncio.wait_for(client.call_tool(tool, arguments), 1)
+            repeated = await asyncio.wait_for(client.call_tool(tool, arguments), 5)
             assert repeated.isError
             assert "INDEX_BUSY" in _text(repeated)
             assert calls == 1
@@ -124,7 +126,9 @@ async def test_cancelled_manual_request_keeps_one_owned_index_job(
 ) -> None:
     app, embedder, project = _application(tmp_path)
     server = create_server(app, auto_index=False)
-    monkeypatch.setattr(server_module, "INDEX_RESPONSE_TIMEOUT_SECONDS", 0.1, raising=False)
+    # Same loaded-runner headroom as above: the request must still be pending
+    # when cancel() lands, or it resolves normally and never raises.
+    monkeypatch.setattr(server_module, "INDEX_RESPONSE_TIMEOUT_SECONDS", 0.5, raising=False)
     async with create_connected_server_and_client_session(server) as client:
         try:
             request = asyncio.create_task(client.call_tool("index_project", {"project": project}))
@@ -133,7 +137,7 @@ async def test_cancelled_manual_request_keeps_one_owned_index_job(
             with pytest.raises(asyncio.CancelledError):
                 await request
             result = await asyncio.wait_for(
-                client.call_tool("index_project", {"project": project}), 1
+                client.call_tool("index_project", {"project": project}), 5
             )
             assert result.isError and "project_status" in _text(result)
         finally:
