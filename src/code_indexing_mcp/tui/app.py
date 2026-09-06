@@ -36,6 +36,12 @@ from ..models import (
 from .navigation import SourceLocation, SourcePreview, editor_command
 from .service import TuiService, create_tui_service
 
+# Return code CodeIndexingApp exits with when the user asks to reconfigure the
+# installation. tui.main() treats it as "chain into the configure wizard, then
+# come back here" rather than as a real exit status. It must not collide with
+# real statuses (0 ok, 1 failure, 2 usage, 130 cancelled).
+CONFIGURE_EXIT_CODE = 43
+
 
 class HelpScreen(ModalScreen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [("escape", "dismiss", "Close help")]
@@ -53,6 +59,7 @@ class HelpScreen(ModalScreen[None]):
                 "Esc  Previous detail view, then results, then search\n"
                 "y  Copy relative path:line     e  Open in VISUAL / EDITOR\n"
                 "F5  Refresh index     q  Quit outside the search field\n"
+                "c  Configure this installation (setup wizard, then back here)\n"
                 "Ctrl+Q  Quit from anywhere     ? / Ctrl+H  Help\n\n"
                 "At narrow widths, use Results / Details to switch panes.\n"
                 "Preview shows indexed source. Working tree shows current files.\n"
@@ -94,6 +101,7 @@ class CodeIndexingApp(App[int]):
         Binding("r", "show_references", "References", show=False, priority=False),
         Binding("i", "show_impact", "Impact", show=False, priority=False),
         Binding("f5", "trigger_index", "Index", show=True, priority=False),
+        Binding("c", "open_configure", "Configure", show=True, priority=False),
         Binding("escape", "escape_action", "Back", show=False, priority=False),
         Binding("q", "quit_app", "Quit", show=True, priority=False),
     ]
@@ -151,6 +159,7 @@ class CodeIndexingApp(App[int]):
                 allow_blank=False,
             )
             yield Button("Index F5", id="index-button")
+            yield Button("Configure", id="configure-button")
 
         with Horizontal(id="query-bar"):
             yield Input(
@@ -531,6 +540,8 @@ class CodeIndexingApp(App[int]):
             self._show_pane(event.button.id == "details-view")
         if event.button.id == "index-button":
             self.action_trigger_index()
+        if event.button.id == "configure-button":
+            self.action_open_configure()
 
     def action_focus_query(self) -> None:
         self.screen_stack[0].query_one("#query-input", Input).focus()
@@ -1100,6 +1111,13 @@ class CodeIndexingApp(App[int]):
             return
 
         self._start_index(proj)
+
+    def action_open_configure(self) -> None:
+        # A bare "c" belongs to whatever is being typed, same convention as
+        # the other single-letter bindings (quit, outline, ...).
+        if isinstance(self.focused, Input):
+            return
+        self.exit(return_code=CONFIGURE_EXIT_CODE)
 
     def _start_index(self, proj: ProjectInfo) -> None:
         if self._is_indexing:

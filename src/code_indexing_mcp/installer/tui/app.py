@@ -8,7 +8,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal
 from textual.widget import Widget
-from textual.widgets import Button, ContentSwitcher, Footer, Header
+from textual.widgets import Button, ContentSwitcher, Footer, Header, Tab, Tabs
 
 from ..orchestrator import InstallResult
 from ..wizard import WizardState
@@ -32,6 +32,7 @@ PANEL_ORDER = (
     "path",
     "indexing",
     "embedding",
+    "maintenance",
     "summary",
     "progress",
     "done",
@@ -47,6 +48,7 @@ PANEL_TITLES = {
     "path": "Command-line access",
     "indexing": "Indexing settings",
     "embedding": "Embedding settings",
+    "maintenance": "Maintenance",
     "summary": "Summary",
     "progress": "Installing",
     "done": "Done",
@@ -64,9 +66,11 @@ class InstallerApp(App[None]):
     ]
     CSS = """
     #screens { height: 1fr; }
+    #wizard-tabs { margin-bottom: 1; }
     .panel { padding: 1 2; height: 1fr; overflow-y: auto; }
     .help { color: $text-muted; }
-    .field { height: auto; margin-bottom: 1; }
+    .field { height: auto; margin-bottom: 0; }
+    .field-header { text-style: bold; margin-top: 1; }
     .error { color: $error; }
     /* The Footer docks to the same edge, so the row it occupies is reserved
        here; without it the button borders paint over the key hints. */
@@ -91,6 +95,14 @@ class InstallerApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Tabs(
+            *[
+                Tab(PANEL_TITLES[panel], id=f"tab-{panel}")
+                for panel in self._order()
+                if panel not in {"progress", "done"}
+            ],
+            id="wizard-tabs",
+        )
         with ContentSwitcher(id="screens", initial="welcome"):
             yield WelcomePanel(self.state, id="welcome")
             yield LocationPanel(self.state, id="location")
@@ -99,6 +111,7 @@ class InstallerApp(App[None]):
             yield PathPanel(self.state, id="path")
             yield SettingsPanel(self.state, "Indexing", id="indexing")
             yield SettingsPanel(self.state, "Embedding", id="embedding")
+            yield SettingsPanel(self.state, "Maintenance", id="maintenance")
             yield SummaryPanel(self.state, id="summary")
             yield ProgressPanel(self.state, id="progress")
             yield DonePanel(id="done")
@@ -150,7 +163,43 @@ class InstallerApp(App[None]):
         became_visible = getattr(panel, "on_became_visible", None)
         if became_visible is not None:
             became_visible()
+        self._sync_tab(name)
         self._focus_first_control(panel)
+
+    def _sync_tab(self, name: str) -> None:
+        """Snap the tab bar back to the panel actually showing.
+
+        Used both after a successful switch and to undo a click on a tab the
+        current panel refused to be left from (validation failed).
+        """
+
+        tabs = self.query_one("#wizard-tabs", Tabs)
+        wanted = f"tab-{name}"
+        tab_ids = {tab.id for tab in tabs.query(Tab)}
+        if tabs.active != wanted and wanted in tab_ids:
+            tabs.active = wanted
+
+    def jump_to(self, name: str) -> None:
+        """Jump to a tab, committing the panel being left first.
+
+        A panel that fails validation keeps the user where they are, and the
+        tab bar snaps back to match.
+        """
+
+        if self.locked or name == self.current or name not in self._order():
+            self._sync_tab(self.current)
+            return
+        panel = self.query_one(f"#{self.current}")
+        commit = getattr(panel, "commit", None)
+        if commit is not None and not commit():
+            self._sync_tab(self.current)
+            return
+        self.show_panel(name)
+
+    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        tab_id = event.tab.id or ""
+        if tab_id.startswith("tab-"):
+            self.jump_to(tab_id.removeprefix("tab-"))
 
     @staticmethod
     def _focus_first_control(panel: Widget) -> None:

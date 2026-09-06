@@ -116,9 +116,9 @@ async def test_keyboard_navigation_is_locked_while_installing(
 async def test_header_counts_the_steps_the_user_walks(tmp_path: Path) -> None:
     app = InstallerApp(_install_state(tmp_path))
     async with app.run_test() as pilot:
-        assert app.sub_title == "Step 1 of 8 - Welcome"
+        assert app.sub_title == "Step 1 of 9 - Welcome"
         await click(pilot, "#next")
-        assert app.sub_title == "Step 2 of 8 - Install location"
+        assert app.sub_title == "Step 2 of 9 - Install location"
 
 
 @pytest.mark.asyncio
@@ -127,7 +127,7 @@ async def test_reconfigure_drops_the_skipped_panel_from_the_step_count(
 ) -> None:
     app = InstallerApp(_reconfigure_state(tmp_path, monkeypatch))
     async with app.run_test():
-        assert app.sub_title == "Step 1 of 7 - Welcome"
+        assert app.sub_title == "Step 1 of 8 - Welcome"
 
 
 @pytest.mark.asyncio
@@ -845,6 +845,146 @@ async def test_done_panel_gives_the_full_path_when_no_launcher_was_made(
         body = str(app.query_one("#done-body", Static).render())
         assert "no launcher was created" in body
         assert "Launcher NOT created" in body
+
+
+def _tab_ids(app: InstallerApp) -> list[str | None]:
+    from textual.widgets import Tab, Tabs
+
+    return [tab.id for tab in app.query_one("#wizard-tabs", Tabs).query(Tab)]
+
+
+@pytest.mark.asyncio
+async def test_tabs_match_the_walked_panels(tmp_path: Path) -> None:
+    from textual.widgets import Tabs
+
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test():
+        assert _tab_ids(app) == [
+            "tab-welcome",
+            "tab-location",
+            "tab-accelerator",
+            "tab-harnesses",
+            "tab-path",
+            "tab-indexing",
+            "tab-embedding",
+            "tab-maintenance",
+            "tab-summary",
+        ]
+        assert app.query_one("#wizard-tabs", Tabs).active == "tab-welcome"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_tabs_skip_the_location_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = InstallerApp(_reconfigure_state(tmp_path, monkeypatch))
+    async with app.run_test():
+        assert "tab-location" not in _tab_ids(app)
+        assert "tab-maintenance" in _tab_ids(app)
+
+
+@pytest.mark.asyncio
+async def test_clicking_a_tab_jumps_to_that_panel(tmp_path: Path) -> None:
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test(size=(160, 30)) as pilot:
+        await click(pilot, "#tab-summary")
+        assert app.current == "summary"
+        await click(pilot, "#tab-welcome")
+        assert app.current == "welcome"
+
+
+@pytest.mark.asyncio
+async def test_a_tab_jump_is_blocked_by_failed_validation(tmp_path: Path) -> None:
+    from textual.widgets import Input, Tabs
+
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "indexing")
+        app.query_one("#f-CODE_INDEXING_INDEX_WAIT_SECONDS", Input).value = "99999999"
+        app.jump_to("summary")
+        await pilot.pause()
+        assert app.current == "indexing"  # commit failed; the jump did not happen
+        assert app.query_one("#wizard-tabs", Tabs).active == "tab-indexing"
+        app.query_one("#f-CODE_INDEXING_INDEX_WAIT_SECONDS", Input).value = "60"
+        app.jump_to("summary")
+        await pilot.pause()
+        assert app.current == "summary"
+        assert app.state.values["CODE_INDEXING_INDEX_WAIT_SECONDS"] == "60"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_panel_commits_and_validates(tmp_path: Path) -> None:
+    from textual.widgets import Checkbox, Input
+
+    state = _install_state(tmp_path)
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "maintenance")
+        assert app.query_one("#f-CODE_INDEXING_AUTO_MAINTENANCE", Checkbox).value is True
+        field = app.query_one("#f-CODE_INDEXING_BRANCH_CACHE_LIMIT", Input)
+        field.value = "99"
+        await click(pilot, "#next")
+        assert app.current == "maintenance"  # blocked by validation
+        field.value = "8"
+        await click(pilot, "#next")
+        assert app.current == "summary"
+        assert state.values["CODE_INDEXING_BRANCH_CACHE_LIMIT"] == "8"
+
+
+@pytest.mark.asyncio
+async def test_setting_headers_show_labels_defaults_and_modified_markers(
+    tmp_path: Path,
+) -> None:
+    from textual.widgets import Checkbox, Static
+
+    state = _install_state(tmp_path)
+    app = InstallerApp(state)
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "indexing")
+        # Choice fields used to render as a bare dropdown; the header labels them.
+        mode_header = str(app.query_one("#h-CODE_INDEXING_INDEX_MODE", Static).render())
+        assert "Index mode" in mode_header
+        assert "default: lazy" in mode_header
+        offline_header = app.query_one("#h-CODE_INDEXING_OFFLINE", Static)
+        assert "default: 0" in str(offline_header.render())
+        app.query_one("#f-CODE_INDEXING_OFFLINE", Checkbox).value = True
+        await pilot.pause()
+        assert "[modified]" in str(offline_header.render())
+
+
+@pytest.mark.asyncio
+async def test_summary_jumps_include_maintenance(tmp_path: Path) -> None:
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "summary")
+        await click(pilot, "#jump-maintenance")
+        assert app.current == "maintenance"
+
+
+@pytest.mark.asyncio
+async def test_locked_panels_keep_their_tab_highlight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Progress and Done are wizard-driven, so they own no tab of their own."""
+
+    from textual.widgets import Tabs
+
+    import code_indexing_mcp.installer.tui.panels as panels
+
+    monkeypatch.setattr(
+        panels,
+        "run_install",
+        lambda plan, on_event=None, should_continue=None: _fake_result(),
+    )
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "summary")
+        await click(pilot, "#next")
+        await pilot.pause()
+        assert app.current == "done"
+        assert app.query_one("#wizard-tabs", Tabs).active == "tab-summary"
+        app.jump_to("welcome")
+        assert app.current == "done"
 
 
 @pytest.mark.asyncio
