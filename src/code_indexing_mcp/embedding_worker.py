@@ -91,6 +91,7 @@ class SessionTelemetry:
     # report rather than a very large one.
     crossover_characters: int | None = 0
     selection_reason: str | None = None
+    worker_used: bool = False
 
 
 @runtime_checkable
@@ -381,6 +382,7 @@ class EmbeddingWorkerSession:
             fallback_count=self.retry_count,
             termination_reason=self.termination_reason,
             tokenizer_available=self.tokenizer_available,
+            worker_used=self.spawn_count > 0,
         )
 
     def embed_passages(self, texts: list[str]) -> list[list[float]]:

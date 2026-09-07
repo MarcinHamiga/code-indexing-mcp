@@ -69,6 +69,7 @@ from .models import (
     StoredFile,
 )
 from .models import content_digest as _digest
+from .passage_cache import PassageReuseContext
 from .progress import IndexProgress, ProgressPublisher
 from .scanner import SourceScanner
 from .staging import ChunkRow, ReferenceRow, StagingJob
@@ -354,6 +355,10 @@ class Indexer:
         segment_plan: SegmentPlan | None = None,
         passage_session_factory: Callable[[], AbstractContextManager[PassageEmbedder]]
         | None = None,
+        passage_cache_factory: Callable[
+            [ProjectInfo, bool], AbstractContextManager[PassageReuseContext]
+        ]
+        | None = None,
         staging_directory: Path | None = None,
         progress_directory: Path | None = None,
         history: HistoryStore | None = None,
@@ -366,6 +371,7 @@ class Indexer:
         self.batch_size = batch_size
         self.segment_plan = segment_plan or SegmentPlan(max_items=batch_size)
         self.passage_session_factory = passage_session_factory
+        self.passage_cache_factory = passage_cache_factory
         self.staging_directory = staging_directory or lock_directory.parent / "staging"
         self.progress_directory = progress_directory or lock_directory.parent / "progress"
         self.history = history
@@ -476,6 +482,11 @@ class Indexer:
                         embedding_backend=report.embedding_backend,
                         embedding_fallback_reason=report.embedding_fallback_reason,
                         worker_used=report.worker_used,
+                        reused_candidates=report.reused_candidates,
+                        reused_segments=report.reused_segments,
+                        embedding_cache_lookup_ms=report.embedding_cache_lookup_ms,
+                        embedding_cache_write_ms=report.embedding_cache_write_ms,
+                        embedding_cache_status=report.embedding_cache_status,
                     )
         except Timeout as exc:
             raise CodeIndexingError(
@@ -1046,45 +1057,74 @@ class Indexer:
         try:
             self.store.upsert_project(project, model_id=self.embedder.model_id, state="indexing")
             self.store.set_slot_state(partition, "indexing")
-            context = (
-                self.passage_session_factory()
-                if self.passage_session_factory is not None
-                else contextlib.nullcontext(self.embedder)
+            cache_context = (
+                self.passage_cache_factory(project, force)
+                if self.passage_cache_factory is not None
+                else contextlib.nullcontext(None)
             )
-            with context as passage_embedder:
-                report = self._index_scan(
-                    project,
-                    partition=partition,
-                    force=force,
-                    passage_embedder=passage_embedder,
-                    progress=progress,
-                    verify_paths=verify_paths,
-                    verify_all=verify_all,
-                    guard=guard,
+            with cache_context as passage_reuse:
+                context = (
+                    self.passage_session_factory()
+                    if self.passage_session_factory is not None
+                    else contextlib.nullcontext(self.embedder)
                 )
-            if isinstance(context, TelemetrySource):
-                # Read after the context exits, so a session that fell back from
-                # an accelerator to CPU reports the backend it finished on and
-                # the totals from both.
-                measured = context.telemetry()
-                report = report.model_copy(
-                    update={
-                        "embedding_backend": measured.backend,
-                        "memory_budget_bytes": measured.memory_budget_bytes,
-                        "peak_memory_bytes": measured.peak_memory_bytes,
-                        "worker_used": True,
-                        "embedded_segments": measured.segment_count,
-                        "embedded_tokens": measured.token_count,
-                        "embedding_retries": measured.retry_count,
-                        "fallback_count": report.fallback_count + measured.fallback_count,
-                        "worker_termination_reason": measured.termination_reason,
-                        "token_windowing": measured.tokenizer_available,
-                        "embedding_fallback_reason": measured.fallback_reason,
-                        "embedded_characters": measured.character_count,
-                        "embedding_crossover_characters": measured.crossover_characters or None,
-                        "embedding_selection_reason": measured.selection_reason,
-                    }
-                )
+                with context as passage_embedder:
+                    report = self._index_scan(
+                        project,
+                        partition=partition,
+                        force=force,
+                        passage_embedder=passage_embedder,
+                        passage_reuse=passage_reuse,
+                        progress=progress,
+                        verify_paths=verify_paths,
+                        verify_all=verify_all,
+                        guard=guard,
+                    )
+                if isinstance(context, TelemetrySource):
+                    # Read after the context exits, so a session that fell back from
+                    # an accelerator to CPU reports the backend it finished on and
+                    # the totals from both.
+                    measured = context.telemetry()
+                    report = report.model_copy(
+                        update={
+                            "embedding_backend": measured.backend,
+                            "memory_budget_bytes": measured.memory_budget_bytes,
+                            "peak_memory_bytes": measured.peak_memory_bytes,
+                            "worker_used": measured.worker_used,
+                            "embedded_segments": measured.segment_count,
+                            "embedded_tokens": measured.token_count,
+                            "embedding_retries": measured.retry_count,
+                            "fallback_count": report.fallback_count + measured.fallback_count,
+                            "worker_termination_reason": measured.termination_reason,
+                            "token_windowing": measured.tokenizer_available,
+                            "embedding_fallback_reason": measured.fallback_reason,
+                            "embedded_characters": measured.character_count,
+                            "embedding_crossover_characters": measured.crossover_characters or None,
+                            "embedding_selection_reason": measured.selection_reason,
+                        }
+                    )
+                if passage_reuse is not None:
+                    report = report.model_copy(
+                        update={
+                            "reused_candidates": passage_reuse.reused_candidates,
+                            "reused_segments": passage_reuse.reused_segments,
+                            "embedding_cache_lookup_ms": passage_reuse.lookup_duration_ms,
+                            "embedding_cache_write_ms": passage_reuse.write_duration_ms,
+                            "embedding_cache_status": passage_reuse.status,
+                            "embedding_artifact_digest": (
+                                passage_reuse.namespace.artifact_digest
+                                if passage_reuse.namespace is not None
+                                else None
+                            ),
+                            "embedding_tokenizer_digest": (
+                                passage_reuse.namespace.tokenizer_digest
+                                if passage_reuse.namespace is not None
+                                else None
+                            ),
+                        }
+                    )
+                else:
+                    report = report.model_copy(update={"embedding_cache_status": "disabled"})
             return report
         except Exception as exc:
             # Never leave the project stuck in "indexing" after a crash. A
@@ -1154,6 +1194,7 @@ class Indexer:
         timer: _PhaseTimer,
         process: psutil.Process,
         state: _IndexScanState,
+        passage_reuse: PassageReuseContext | None = None,
     ) -> None:
         if not state.pending:
             return
@@ -1176,7 +1217,9 @@ class Indexer:
                 continue
             with timer.measure("embed"):
                 try:
-                    succeeded, failed, retries = self._embed_candidates(passage_embedder, active)
+                    succeeded, failed, retries = self._embed_candidates(
+                        passage_embedder, active, passage_reuse=passage_reuse
+                    )
                 finally:
                     state.sample_memory(process)
             state.fallback_count += retries
@@ -1260,6 +1303,7 @@ class Indexer:
         timer: _PhaseTimer,
         process: psutil.Process,
         state: _IndexScanState,
+        passage_reuse: PassageReuseContext | None = None,
         verify_paths: frozenset[str] = frozenset(),
         verify_all: bool = False,
     ) -> None:
@@ -1382,6 +1426,7 @@ class Indexer:
                     timer,
                     process,
                     state,
+                    passage_reuse,
                 )
             state.add_pending(
                 _PendingFile(
@@ -1400,6 +1445,7 @@ class Indexer:
         partition: PartitionRef,
         force: bool,
         passage_embedder: PassageEmbedder,
+        passage_reuse: PassageReuseContext | None = None,
         progress: ProgressPublisher,
         verify_paths: frozenset[str] = frozenset(),
         verify_all: bool = False,
@@ -1453,6 +1499,7 @@ class Indexer:
                     timer=timer,
                     process=process,
                     state=state,
+                    passage_reuse=passage_reuse,
                     verify_paths=verify_paths,
                     verify_all=verify_all,
                 )
@@ -1465,6 +1512,7 @@ class Indexer:
                 timer,
                 process,
                 state,
+                passage_reuse,
             )
             progress.update(
                 phase="committing",
@@ -1630,12 +1678,44 @@ class Indexer:
         self,
         passage_embedder: PassageEmbedder,
         candidates: list[_PendingCandidate],
+        *,
+        passage_reuse: PassageReuseContext | None = None,
     ) -> tuple[
         list[tuple[_PendingCandidate, list[EmbeddedSegment]]],
         list[tuple[_PendingCandidate, Exception]],
         int,
     ]:
-        """Embed a bounded group, bisecting only content-attributable failures."""
+        """Embed a bounded group, reusing hits and bisecting misses."""
+        if passage_reuse is not None and isinstance(passage_embedder, SegmentingEmbedder):
+            planned_candidates = [
+                PassageCandidate(candidate.chunk.embedding_prefix, candidate.chunk.content)
+                for candidate in candidates
+            ]
+            hits, miss_indices = passage_reuse.lookup(
+                planned_candidates, self.segment_plan, producer=passage_embedder
+            )
+            if not miss_indices:
+                return [(candidates[index], hits[index]) for index in range(len(candidates))], [], 0
+            misses = [candidates[index] for index in miss_indices]
+            embedded, failed, retries = self._embed_candidates(passage_embedder, misses)
+            embedded_by_candidate = {id(candidate): segments for candidate, segments in embedded}
+            new_results = {
+                index: embedded_by_candidate[id(candidate)]
+                for index, candidate in enumerate(candidates)
+                if id(candidate) in embedded_by_candidate
+            }
+            passage_reuse.store(
+                planned_candidates,
+                new_results,
+                self.segment_plan,
+                producer=passage_embedder,
+            )
+            succeeded = [
+                (candidates[index], hits[index] if index in hits else new_results[index])
+                for index in range(len(candidates))
+                if index in hits or index in new_results
+            ]
+            return succeeded, failed, retries
         try:
             segments = self._embed_chunks(
                 passage_embedder, [candidate.chunk for candidate in candidates]

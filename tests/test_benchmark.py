@@ -177,6 +177,11 @@ def test_the_benchmark_derives_the_numbers_it_publishes(tmp_path: Path) -> None:
         # Structural rows are this run's staged rows, not a whole-table count.
         assert scenario["structural_records"] == 12
         assert scenario["reference_extraction_duration_ms"] == 12
+        assert scenario["embedding_backend"] == "cpu"
+        assert scenario["embedding_batch_size"] == 8
+        assert scenario["embedding_cache_status"] is None
+        assert scenario["embedding_cache_lookup_ms"] == 0
+        assert scenario["embedding_cache_write_ms"] == 0
         # Wall time is measured independently of the report's own duration, so
         # a fake that never sleeps must not inherit the reported 100 ms.
         assert 0 <= scenario["wall_ms"] < 100

@@ -545,6 +545,14 @@ class PassageBackendSession:
 
     # -- telemetry ---------------------------------------------------------
 
+    @property
+    def tokenizer_available(self) -> bool | None:
+        """Return the tokenizer result observed by the active or retired worker."""
+        for entry in self._all_telemetry():
+            if entry.tokenizer_available is not None:
+                return entry.tokenizer_available
+        return None
+
     def telemetry(self) -> SessionTelemetry:
         entries = self._all_telemetry()
         termination = next(
@@ -573,6 +581,7 @@ class PassageBackendSession:
             character_count=self.characters_embedded,
             crossover_characters=self.crossover_characters,
             selection_reason=self._selection_reason(),
+            worker_used=any(entry.worker_used for entry in entries),
         )
 
     def _selection_reason(self) -> str | None:

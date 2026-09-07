@@ -15,7 +15,7 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -413,8 +413,10 @@ class PassageEmbeddingCache:
                 placeholders = ",".join("?" for _ in group)
                 rows = connection.execute(
                     "SELECT cache_key, metadata, vectors, checksum, payload_bytes "
-                    f"FROM entries WHERE cache_key IN ({placeholders})",
-                    group,
+                    f"FROM entries WHERE cache_key IN ({placeholders}) "
+                    "AND payload_bytes <= ? "
+                    "AND length(metadata) + length(vectors) <= ?",
+                    [*group, self.max_entry_bytes, self.max_entry_bytes],
                 )
                 for key, metadata, vectors, checksum, payload_bytes in rows:
                     if int(payload_bytes) > self.max_entry_bytes:
@@ -519,3 +521,146 @@ class PassageEmbeddingCache:
             with suppress(sqlite3.Error):
                 connection.execute("ROLLBACK")
             self._disable("could not write passage embedding cache")
+
+
+class PassageReuseContext:
+    """Resolve complete candidate results for one indexing run.
+
+    The context owns the cache connection and all counters for one run. It is
+    intentionally separate from ``PassageEmbeddingCache`` so a caller can
+    bypass reuse without opening the durable file, and so cache failures stay
+    an optimization concern while embedding errors continue through the
+    indexer's normal error handling.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        namespace: PassageCacheNamespace | None,
+        *,
+        force: bool = False,
+        strict: bool = False,
+        producer_matches: Callable[[object], bool] | None = None,
+        max_windows: int = MAX_WINDOWS_PER_CANDIDATE,
+    ) -> None:
+        self.path = path
+        self.namespace = namespace
+        self.force = force
+        self.strict = strict
+        self.producer_matches = producer_matches
+        self.max_windows = max_windows
+        self.status = (
+            "bypassed" if force or strict else "disabled" if namespace is None else "pending"
+        )
+        self.reused_candidates = 0
+        self.reused_segments = 0
+        self.lookup_duration_ns = 0
+        self.write_duration_ns = 0
+        self._cache: PassageEmbeddingCache | None = None
+
+    def __enter__(self) -> PassageReuseContext:
+        if self.status != "pending" or self.namespace is None:
+            return self
+        cache = PassageEmbeddingCache(
+            self.path,
+            dimension=self.namespace.dimension,
+            max_windows=self.max_windows,
+        )
+        cache.__enter__()
+        if cache.disabled:
+            self.status = "error"
+            cache.close()
+        else:
+            self._cache = cache
+            self.status = "active"
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        if self._cache is not None:
+            self._cache.close()
+            self._cache = None
+
+    @property
+    def lookup_duration_ms(self) -> int:
+        return self.lookup_duration_ns // 1_000_000
+
+    @property
+    def write_duration_ms(self) -> int:
+        return self.write_duration_ns // 1_000_000
+
+    def lookup(
+        self,
+        candidates: Sequence[PassageCandidate],
+        plan: SegmentPlan,
+        *,
+        producer: object | None = None,
+    ) -> tuple[dict[int, list[EmbeddedSegment]], list[int]]:
+        """Return validated hits and the original positions of misses."""
+        misses = list(range(len(candidates)))
+        cache = self._cache
+        namespace = self.namespace
+        if self.status != "active" or cache is None or namespace is None or not candidates:
+            return {}, misses
+        if self.producer_matches is not None and not self.producer_matches(producer):
+            return {}, misses
+        if getattr(producer, "tokenizer_available", None) is False:
+            return {}, misses
+        keys = [candidate_key(namespace, candidate, plan) for candidate in candidates]
+        started = time.monotonic_ns()
+        values = cache.get_many(keys)
+        self.lookup_duration_ns += time.monotonic_ns() - started
+        if cache.disabled:
+            self.status = "error"
+            return {}, misses
+        hits: dict[int, list[EmbeddedSegment]] = {}
+        misses = []
+        for index, candidate in enumerate(candidates):
+            segments = values.get(keys[index])
+            if segments is None:
+                misses.append(index)
+                continue
+            try:
+                validate_segments(segments, content_length=len(candidate.content), plan=plan)
+            except ValueError:
+                misses.append(index)
+                continue
+            hits[index] = segments
+        self.reused_candidates += len(hits)
+        self.reused_segments += sum(len(segments) for segments in hits.values())
+        return hits, misses
+
+    def store(
+        self,
+        candidates: Sequence[PassageCandidate],
+        results: Mapping[int, Sequence[EmbeddedSegment]],
+        plan: SegmentPlan,
+        *,
+        producer: object | None = None,
+    ) -> None:
+        """Store complete successful misses when the producer is still known."""
+        cache = self._cache
+        namespace = self.namespace
+        if self.status != "active" or cache is None or namespace is None or not results:
+            return
+        if self.producer_matches is not None and not self.producer_matches(producer):
+            return
+        if getattr(producer, "tokenizer_available", None) is False:
+            return
+        entries: dict[str, Sequence[EmbeddedSegment]] = {}
+        for index, segments in results.items():
+            if index < 0 or index >= len(candidates):
+                continue
+            try:
+                validate_segments(
+                    segments, content_length=len(candidates[index].content), plan=plan
+                )
+            except ValueError:
+                continue
+            entries[candidate_key(namespace, candidates[index], plan)] = segments
+        if not entries:
+            return
+        started = time.monotonic_ns()
+        cache.put_many(entries)
+        self.write_duration_ns += time.monotonic_ns() - started
+        if cache.disabled:
+            self.status = "error"

@@ -756,6 +756,15 @@ class IndexReport(FrozenModel):
     memory_budget_bytes: int | None = None
     peak_memory_bytes: int | None = None
     worker_used: bool = False
+    # Complete candidate results replayed from the durable passage cache.
+    # embedded_chunks and worker counters retain their existing meanings.
+    reused_candidates: int = 0
+    reused_segments: int = 0
+    embedding_cache_lookup_ms: int = 0
+    embedding_cache_write_ms: int = 0
+    embedding_cache_status: str | None = None
+    embedding_artifact_digest: str | None = None
+    embedding_tokenizer_digest: str | None = None
     # Token-window telemetry, populated only on worker runs. embedded_segments
     # counts what the worker embedded, which includes segments from files that
     # later failed and were not committed, so it can exceed embedded_chunks.
@@ -994,6 +1003,11 @@ class RunAudit(FrozenModel):
     embedding_backend: str = "cpu"
     embedding_fallback_reason: str | None = None
     worker_used: bool = False
+    reused_candidates: int = 0
+    reused_segments: int = 0
+    embedding_cache_lookup_ms: int = 0
+    embedding_cache_write_ms: int = 0
+    embedding_cache_status: str | None = None
     # Best-effort storage table versions around the run, not full partition
     # traversals: audit recording must stay inexpensive on any repository.
     storage_before: dict[str, int] = Field(default_factory=dict)
@@ -1014,6 +1028,9 @@ class RunSummary(FrozenModel):
     failed_files: int = 0
     skipped_total: int = 0
     chunks_embedded: int = 0
+    reused_candidates: int = 0
+    reused_segments: int = 0
+    embedding_cache_status: str | None = None
 
 
 class HistoryPage(FrozenModel):

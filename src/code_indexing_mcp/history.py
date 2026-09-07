@@ -70,6 +70,11 @@ CREATE TABLE IF NOT EXISTS runs (
     embedding_backend TEXT NOT NULL DEFAULT 'cpu',
     embedding_fallback_reason TEXT,
     worker_used INTEGER NOT NULL DEFAULT 0,
+    reused_candidates INTEGER NOT NULL DEFAULT 0,
+    reused_segments INTEGER NOT NULL DEFAULT 0,
+    embedding_cache_lookup_ms INTEGER NOT NULL DEFAULT 0,
+    embedding_cache_write_ms INTEGER NOT NULL DEFAULT 0,
+    embedding_cache_status TEXT,
     storage_before TEXT NOT NULL DEFAULT '{}',
     storage_after TEXT NOT NULL DEFAULT '{}'
 );
@@ -101,6 +106,11 @@ _FINISH_COLUMNS = frozenset(
         "embedding_backend",
         "embedding_fallback_reason",
         "worker_used",
+        "reused_candidates",
+        "reused_segments",
+        "embedding_cache_lookup_ms",
+        "embedding_cache_write_ms",
+        "embedding_cache_status",
         "storage_before",
         "storage_after",
     }
@@ -132,6 +142,10 @@ _SCALAR_INT_COLUMNS = frozenset(
         "staged_bytes",
         "bytes_read",
         "worker_used",
+        "reused_candidates",
+        "reused_segments",
+        "embedding_cache_lookup_ms",
+        "embedding_cache_write_ms",
     }
 )
 
@@ -156,6 +170,16 @@ class HistoryStore:
                 connection.execute("ALTER TABLE runs ADD COLUMN pid INTEGER NOT NULL DEFAULT 0")
             if "rebuild_reason" not in columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN rebuild_reason TEXT")
+            migrations = {
+                "reused_candidates": "INTEGER NOT NULL DEFAULT 0",
+                "reused_segments": "INTEGER NOT NULL DEFAULT 0",
+                "embedding_cache_lookup_ms": "INTEGER NOT NULL DEFAULT 0",
+                "embedding_cache_write_ms": "INTEGER NOT NULL DEFAULT 0",
+                "embedding_cache_status": "TEXT",
+            }
+            for column, definition in migrations.items():
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE runs ADD COLUMN {column} {definition}")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_SECONDS)
@@ -366,6 +390,11 @@ def _row_to_audit(row: sqlite3.Row) -> RunAudit:
         embedding_backend=row["embedding_backend"],
         embedding_fallback_reason=row["embedding_fallback_reason"],
         worker_used=bool(row["worker_used"]),
+        reused_candidates=row["reused_candidates"],
+        reused_segments=row["reused_segments"],
+        embedding_cache_lookup_ms=row["embedding_cache_lookup_ms"],
+        embedding_cache_write_ms=row["embedding_cache_write_ms"],
+        embedding_cache_status=row["embedding_cache_status"],
         storage_before=json.loads(row["storage_before"]),
         storage_after=json.loads(row["storage_after"]),
     )
@@ -394,4 +423,7 @@ def _row_to_summary(row: sqlite3.Row) -> RunSummary:
         failed_files=row["failed_files"],
         skipped_total=row["skipped_total"],
         chunks_embedded=row["chunks_embedded"],
+        reused_candidates=row["reused_candidates"],
+        reused_segments=row["reused_segments"],
+        embedding_cache_status=row["embedding_cache_status"],
     )

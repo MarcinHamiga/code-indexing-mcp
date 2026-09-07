@@ -3,7 +3,8 @@ import os
 import sqlite3
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,6 +35,7 @@ from code_indexing_mcp.models import (
     ProjectInfo,
     StoredFile,
 )
+from code_indexing_mcp.passage_cache import PassageCacheNamespace, PassageReuseContext
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner, _GitEnumerationError
 from code_indexing_mcp.storage import LanceStore, _quoted
@@ -229,6 +231,7 @@ def test_index_report_splits_duration_into_phases(tmp_path: Path) -> None:
     assert report.embed_duration_ms >= 45
     assert report.embedding_backend == "cpu"
     assert report.embedding_batch_size == 1
+    assert report.embedding_cache_status == "disabled"
     assert report.scan_ms == report.scan_duration_ms
     assert report.parse_ms == report.parse_duration_ms
     assert report.embed_ms == report.embed_duration_ms
@@ -1393,7 +1396,11 @@ class WindowingEmbedder(RecordingEmbedder):
 
 
 def make_windowing_indexer(
-    tmp_path: Path, embedder: RecordingEmbedder, plan: SegmentPlan
+    tmp_path: Path,
+    embedder: RecordingEmbedder,
+    plan: SegmentPlan,
+    *,
+    passage_cache_factory: Callable[[ProjectInfo, bool], PassageReuseContext] | None = None,
 ) -> tuple[Indexer, LanceStore]:
     store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
     return (
@@ -1404,6 +1411,7 @@ def make_windowing_indexer(
             embedder=embedder,
             lock_directory=tmp_path / "locks",
             segment_plan=plan,
+            passage_cache_factory=passage_cache_factory,
         ),
         store,
     )
@@ -1416,6 +1424,199 @@ DENSE_SOURCE = (
     "        total = total + index\n"
     "    return total\n"
 )
+
+
+def test_reuses_unchanged_windowed_candidates_after_a_partial_edit(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text(DENSE_SOURCE + "\ndef stable():\n    return 7\n")
+    project = initialize_project(root)
+    embedder = WindowingEmbedder()
+    namespace = PassageCacheNamespace(
+        project_id=project.id,
+        artifact_digest="artifact",
+        tokenizer_digest="tokenizer",
+        producer="test-float32",
+        runtime_version="test",
+        dimension=embedder.dimension,
+        precision="float32-le",
+    )
+    cache_path = tmp_path / "passage.sqlite3"
+
+    def cache_factory(current_project: ProjectInfo, force: bool) -> PassageReuseContext:
+        return PassageReuseContext(
+            cache_path,
+            replace(namespace, project_id=current_project.id),
+            force=force,
+        )
+
+    indexer, store = make_windowing_indexer(
+        tmp_path,
+        embedder,
+        SegmentPlan(max_tokens=8, overlap_tokens=2),
+        passage_cache_factory=cache_factory,
+    )
+    first = indexer.index(project)
+    first_call_count = sum(len(batch) for batch in embedder.passage_batches)
+
+    source.write_text(
+        DENSE_SOURCE.replace("return total", "return total + 1") + "\ndef stable():\n    return 7\n"
+    )
+    second = indexer.index(project)
+
+    second_call_count = sum(len(batch) for batch in embedder.passage_batches) - first_call_count
+    assert first.errors == []
+    assert second.errors == []
+    assert second.reused_candidates == 1
+    assert second_call_count > 1
+    assert second_call_count < first_call_count
+    assert {chunk.qualified_symbol for chunk in store.list_chunks([project.id])} == {
+        "answer",
+        "stable",
+    }
+
+
+def test_reuse_rebuilds_current_offsets_after_unicode_insertion_and_reopen(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text(DENSE_SOURCE + "\ndef stable():\n    return 7\n")
+    project = initialize_project(root)
+    namespace = PassageCacheNamespace(
+        project_id=project.id,
+        artifact_digest="artifact",
+        tokenizer_digest="tokenizer",
+        producer="test-float32",
+        runtime_version="test",
+        dimension=4,
+        precision="float32-le",
+    )
+    cache_path = tmp_path / "passage.sqlite3"
+
+    def cache_factory(current_project: ProjectInfo, force: bool) -> PassageReuseContext:
+        return PassageReuseContext(
+            cache_path,
+            replace(namespace, project_id=current_project.id),
+            force=force,
+        )
+
+    first_embedder = WindowingEmbedder()
+    first, store = make_windowing_indexer(
+        tmp_path,
+        first_embedder,
+        SegmentPlan(max_tokens=8, overlap_tokens=2),
+        passage_cache_factory=cache_factory,
+    )
+    first.index(project)
+    source.write_text(
+        DENSE_SOURCE + "\n# π לפני the unchanged function\n\ndef stable():\n    return 7\n"
+    )
+
+    reopened_embedder = WindowingEmbedder()
+    reopened, reopened_store = make_windowing_indexer(
+        tmp_path,
+        reopened_embedder,
+        SegmentPlan(max_tokens=8, overlap_tokens=2),
+        passage_cache_factory=cache_factory,
+    )
+    report = reopened.index(project)
+    current_source = source.read_bytes()
+    stable_chunks = [
+        chunk for chunk in reopened_store.list_chunks([project.id]) if chunk.symbol == "stable"
+    ]
+
+    assert report.reused_candidates == 2
+    assert report.reused_segments > 2
+    assert report.embedding_cache_status == "active"
+    assert not any(
+        "stable" in text for batch in reopened_embedder.passage_batches for text in batch
+    )
+    assert stable_chunks
+    assert all(
+        current_source[chunk.start_byte : chunk.end_byte].decode("utf-8") == chunk.content
+        for chunk in stable_chunks
+    )
+    assert store.list_chunks([project.id]) == reopened_store.list_chunks([project.id])
+
+
+def test_force_bypasses_passage_reuse_reads_and_writes(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text(DENSE_SOURCE + "\ndef stable():\n    return 7\n")
+    project = initialize_project(root)
+    embedder = WindowingEmbedder()
+    namespace = PassageCacheNamespace(
+        project_id=project.id,
+        artifact_digest="artifact",
+        tokenizer_digest="tokenizer",
+        producer="test-float32",
+        runtime_version="test",
+        dimension=embedder.dimension,
+        precision="float32-le",
+    )
+    cache_path = tmp_path / "passage.sqlite3"
+
+    def cache_factory(current_project: ProjectInfo, force: bool) -> PassageReuseContext:
+        return PassageReuseContext(
+            cache_path,
+            replace(namespace, project_id=current_project.id),
+            force=force,
+        )
+
+    indexer, _ = make_windowing_indexer(
+        tmp_path,
+        embedder,
+        SegmentPlan(max_tokens=8, overlap_tokens=2),
+        passage_cache_factory=cache_factory,
+    )
+    indexer.index(project)
+    before = sum(len(batch) for batch in embedder.passage_batches)
+
+    report = indexer.index(project, force=True)
+
+    after = sum(len(batch) for batch in embedder.passage_batches) - before
+    assert report.reused_candidates == 0
+    assert report.embedding_cache_status == "bypassed"
+    assert after == before
+
+
+def test_cache_failure_falls_back_to_normal_embedding(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    project = initialize_project(root)
+    embedder = WindowingEmbedder()
+    namespace = PassageCacheNamespace(
+        project_id=project.id,
+        artifact_digest="artifact",
+        tokenizer_digest="tokenizer",
+        producer="test-float32",
+        runtime_version="test",
+        dimension=embedder.dimension,
+        precision="float32-le",
+    )
+    cache_path = tmp_path / "passage-directory"
+    cache_path.mkdir()
+
+    def cache_factory(current_project: ProjectInfo, force: bool) -> PassageReuseContext:
+        return PassageReuseContext(cache_path, replace(namespace, project_id=current_project.id))
+
+    indexer, _ = make_windowing_indexer(
+        tmp_path,
+        embedder,
+        SegmentPlan(max_tokens=8),
+        passage_cache_factory=cache_factory,
+    )
+
+    report = indexer.index(project)
+
+    assert report.errors == []
+    assert report.embedding_cache_status == "error"
+    assert embedder.passage_batches
 
 
 def test_a_token_dense_chunk_is_split_into_several_stored_chunks(tmp_path: Path) -> None:

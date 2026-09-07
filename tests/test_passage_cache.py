@@ -11,6 +11,7 @@ from code_indexing_mcp.embedding import EmbeddedSegment, PassageCandidate, Segme
 from code_indexing_mcp.passage_cache import (
     PassageCacheNamespace,
     PassageEmbeddingCache,
+    PassageReuseContext,
     artifact_digest,
     candidate_key,
     decode_segments,
@@ -249,3 +250,45 @@ def test_cache_uses_rollback_journaling_and_respects_the_page_ceiling(tmp_path: 
         assert journal_mode == "delete"
         assert page_count <= max_pages
         assert page_count * page_size <= 128 * 1024
+
+
+def test_reuse_context_bulk_resolves_hits_and_writes_misses(tmp_path: Path) -> None:
+    path = tmp_path / "passage.sqlite3"
+    namespace = _namespace()
+    candidates = [_candidate(), _candidate(content="changed text!!")]
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        cache.put_many({candidate_key(namespace, candidates[0], PLAN): _segments()})
+
+    with PassageReuseContext(path, namespace) as reuse:
+        hits, misses = reuse.lookup(candidates, PLAN)
+        assert hits == {0: _segments()}
+        assert misses == [1]
+        reuse.store(candidates, {1: _segments()}, PLAN)
+        assert reuse.status == "active"
+        assert reuse.lookup(candidates, PLAN)[0].keys() == {0, 1}
+        assert reuse.reused_candidates == 3
+        assert reuse.reused_segments == 6
+        assert reuse.lookup_duration_ms >= 0
+        assert reuse.write_duration_ms >= 0
+
+
+def test_reuse_context_skips_hits_when_the_runtime_lacks_a_tokenizer(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "passage.sqlite3"
+    namespace = _namespace()
+    candidate = _candidate()
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        cache.put_many({candidate_key(namespace, candidate, PLAN): _segments()})
+
+    class NoTokenizer:
+        tokenizer_available = False
+
+    with PassageReuseContext(path, namespace) as reuse:
+        assert reuse.lookup([candidate], PLAN, producer=NoTokenizer()) == ({}, [0])
+
+
+def test_reuse_context_bypasses_reads_in_strict_mode(tmp_path: Path) -> None:
+    with PassageReuseContext(tmp_path / "passage.sqlite3", _namespace(), strict=True) as reuse:
+        assert reuse.status == "bypassed"
+        assert reuse.lookup([_candidate()], PLAN) == ({}, [0])
