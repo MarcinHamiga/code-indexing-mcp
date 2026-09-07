@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from textual.widgets import Button, Input
 
-from code_indexing_mcp.tui.app import CONFIGURE_EXIT_CODE, CodeIndexingApp
+from code_indexing_mcp.tui.app import CodeIndexingApp
 
 
 class _StubService:
@@ -29,21 +29,27 @@ async def _click(pilot, selector: str) -> None:  # type: ignore[no-untyped-def]
 
 
 @pytest.mark.asyncio
-async def test_configure_button_exits_with_the_configure_code() -> None:
+async def test_configure_button_opens_the_wizard(monkeypatch: pytest.MonkeyPatch) -> None:
     app = CodeIndexingApp(service=_StubService())  # type: ignore[arg-type]
+    calls: list[bool] = []
+    monkeypatch.setattr(app, "action_open_configure", lambda: calls.append(True))
     async with app.run_test() as pilot:
         await _click(pilot, "#configure-button")
-    assert app.return_code == CONFIGURE_EXIT_CODE
+        assert calls == [True]
+        assert app.return_code is None
 
 
 @pytest.mark.asyncio
-async def test_c_key_opens_configure_outside_inputs() -> None:
+async def test_c_key_opens_configure_outside_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
     app = CodeIndexingApp(service=_StubService())  # type: ignore[arg-type]
+    calls: list[bool] = []
+    monkeypatch.setattr(app, "action_open_configure", lambda: calls.append(True))
     async with app.run_test() as pilot:
         app.query_one("#configure-button", Button).focus()
         await pilot.press("c")
         await pilot.pause()
-    assert app.return_code == CONFIGURE_EXIT_CODE
+        assert calls == [True]
+        assert app.return_code is None
 
 
 @pytest.mark.asyncio
@@ -70,7 +76,7 @@ class _FakeApp:
         return self._codes.pop(0)
 
 
-def test_launch_tui_chains_into_configure_and_back(
+def test_launch_tui_keeps_the_selected_project(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import code_indexing_mcp.installer.cli as installer_cli
@@ -78,11 +84,14 @@ def test_launch_tui_chains_into_configure_and_back(
     import code_indexing_mcp.tui.app as tui_app
     import code_indexing_mcp.tui.service as tui_service
 
-    monkeypatch.setattr(tui_service, "create_tui_service", lambda: object())
-    # One shared instance: _launch_tui constructs the app once per loop
-    # iteration, so a factory handing out a fresh [43, 0] sequence each time
-    # would loop forever and eat all memory.
-    fake = _FakeApp([CONFIGURE_EXIT_CODE, 0])
+    selections: list[str] = []
+
+    class Service:
+        def select_project(self, project: str) -> None:
+            selections.append(project)
+
+    monkeypatch.setattr(tui_service, "create_tui_service", Service)
+    fake = _FakeApp([0])
     monkeypatch.setattr(tui_app, "CodeIndexingApp", lambda service: fake)
     calls: list[dict] = []
     monkeypatch.setattr(
@@ -90,9 +99,9 @@ def test_launch_tui_chains_into_configure_and_back(
         "configure_main",
         lambda **kwargs: calls.append(kwargs) or 0,
     )
-    assert tui_package._launch_tui(None) == 0
-    assert len(calls) == 1
-    assert calls[0]["no_tui"] is False
+    assert tui_package._launch_tui("selected-project") == 0
+    assert selections == ["selected-project"]
+    assert calls == []  # Configure is handled in the mounted app.
 
 
 def test_launch_tui_passes_normal_exits_through(

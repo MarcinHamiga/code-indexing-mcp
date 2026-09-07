@@ -8,49 +8,24 @@ from typing import Any
 
 
 def _launch_tui(project: str | None) -> int:
-    """Open the interactive TUI, optionally preselecting one project.
-
-    When the user picks Configure inside the TUI, the app exits with
-    ``CONFIGURE_EXIT_CODE``; the configure wizard then runs in the freed
-    terminal, and the TUI reopens afterwards so the session continues where
-    it left off.
-    """
+    """Open the interactive TUI, optionally preselecting one project."""
     # Lazily import Textual and TUI components so standard CLI / MCP server
     # never pay for Textual import overhead.
     from ..errors import CodeIndexingError
-    from .app import CONFIGURE_EXIT_CODE, CodeIndexingApp
+    from .app import CodeIndexingApp
     from .service import create_tui_service
 
-    while True:
-        service = create_tui_service()
-        if project:
-            try:
-                service.select_project(project)
-            except CodeIndexingError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                return 2
+    service = create_tui_service()
+    if project:
+        try:
+            service.select_project(project)
+        except CodeIndexingError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
 
-        app = CodeIndexingApp(service=service)
-        result = app.run()
-        code = result if isinstance(result, int) else (app.return_code or 0)
-        if code != CONFIGURE_EXIT_CODE:
-            return code
-        # Lazy like everything else here: the installer is never on the serve
-        # path, and Textual has just released the terminal at this point.
-        from ..installer.cli import configure_main
-
-        configure_main(
-            install_dir=None,
-            accelerator=None,
-            harnesses=None,
-            settings=[],
-            unsets=[],
-            no_tui=False,
-            bin_dir=None,
-            no_launcher=False,
-            no_modify_path=False,
-            repair=False,
-        )
+    app = CodeIndexingApp(service=service)
+    result = app.run()
+    return result if isinstance(result, int) else (app.return_code or 0)
 
 
 def _is_command(name: str) -> bool:

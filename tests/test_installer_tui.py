@@ -854,6 +854,54 @@ def _tab_ids(app: InstallerApp) -> list[str | None]:
 
 
 @pytest.mark.asyncio
+async def test_stale_tab_activation_does_not_reverse_navigation(tmp_path: Path) -> None:
+    from textual.widgets import Tab, Tabs
+
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        app.jump_to("indexing")
+        await pilot.pause()
+        tabs = app.query_one("#wizard-tabs", Tabs)
+        stale = Tabs.TabActivated(tabs, app.query_one("#tab-indexing", Tab))
+        app.jump_to("embedding")
+        app.on_tabs_tab_activated(stale)
+        assert app.current == "embedding"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["60", "99999999"])
+async def test_back_commits_or_validates_before_summary(tmp_path: Path, value: str) -> None:
+    from textual.widgets import Input
+
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test() as pilot:
+        app.jump_to("indexing")
+        await pilot.pause()
+        app.query_one("#f-CODE_INDEXING_INDEX_WAIT_SECONDS", Input).value = value
+        app.action_previous()
+        if value == "60":
+            app.jump_to("summary")
+            assert app.state.values["CODE_INDEXING_INDEX_WAIT_SECONDS"] == "60"
+        else:
+            assert app.current == "indexing"
+
+
+@pytest.mark.asyncio
+async def test_locked_panel_rejects_actual_tab_click(tmp_path: Path) -> None:
+    from textual.widgets import Tabs
+
+    app = InstallerApp(_install_state(tmp_path))
+    async with app.run_test(size=(160, 30)) as pilot:
+        app.jump_to("summary")
+        await pilot.pause()
+        app.show_panel("done")
+        await pilot.click("#tab-welcome")
+        await pilot.pause()
+        assert app.current == "done"
+        assert app.query_one("#wizard-tabs", Tabs).active == "tab-summary"
+
+
+@pytest.mark.asyncio
 async def test_tabs_match_the_walked_panels(tmp_path: Path) -> None:
     from textual.widgets import Tabs
 

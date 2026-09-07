@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError
@@ -35,12 +36,6 @@ from ..models import (
 )
 from .navigation import SourceLocation, SourcePreview, editor_command
 from .service import TuiService, create_tui_service
-
-# Return code CodeIndexingApp exits with when the user asks to reconfigure the
-# installation. tui.main() treats it as "chain into the configure wizard, then
-# come back here" rather than as a real exit status. It must not collide with
-# real statuses (0 ok, 1 failure, 2 usage, 130 cancelled).
-CONFIGURE_EXIT_CODE = 43
 
 
 class HelpScreen(ModalScreen[None]):
@@ -1117,7 +1112,50 @@ class CodeIndexingApp(App[int]):
         # the other single-letter bindings (quit, outline, ...).
         if isinstance(self.focused, Input):
             return
-        self.exit(return_code=CONFIGURE_EXIT_CODE)
+        from ..installer.accelerator import server_executable
+
+        try:
+            # The managed venv identifies this installation even when its console
+            # script is reached through a symlink and the default points elsewhere.
+            prefix = Path(sys.prefix).resolve()
+            directory = prefix.parent
+            if prefix.name != ".venv" or not server_executable(directory).is_file():
+                self._show_error(
+                    "This Syndex is not running from a managed installation. "
+                    "Run syndex from the installation you want to configure.",
+                    retry=None,
+                )
+                return
+            command = [
+                sys.executable,
+                "-m",
+                "code_indexing_mcp",
+                "configure",
+                "--install-dir",
+                str(directory),
+            ]
+            # Keep the mounted app: its selection, query, results, and detail
+            # history survive both confirmation and cancellation of the wizard.
+            with self.suspend():
+                result = subprocess.run(command, check=False)
+            if result.returncode == 130:
+                self._set_status("Configuration cancelled.")
+            elif result.returncode:
+                self._show_error(
+                    f"Configuration exited with status {result.returncode}. "
+                    "Run syndex configure --install-dir " + str(directory) + " to see diagnostics.",
+                    retry=self.action_open_configure,
+                )
+            else:
+                selected = self.service.selected_project
+                service = create_tui_service(cwd=self.service.cwd, roots=self.service.roots)
+                if selected is not None:
+                    service.select_project(selected)
+                self.service = service
+                self._clear_error()
+                self._set_status("Configuration complete. Session resumed.")
+        except (OSError, ValueError, CodeIndexingError) as exc:
+            self._show_error(str(exc), retry=self.action_open_configure)
 
     def _start_index(self, proj: ProjectInfo) -> None:
         if self._is_indexing:

@@ -174,10 +174,11 @@ class InstallerApp(App[None]):
         """
 
         tabs = self.query_one("#wizard-tabs", Tabs)
-        wanted = f"tab-{name}"
+        wanted = "tab-summary" if name in {"progress", "done"} else f"tab-{name}"
         tab_ids = {tab.id for tab in tabs.query(Tab)}
         if tabs.active != wanted and wanted in tab_ids:
-            tabs.active = wanted
+            with tabs.prevent(Tabs.TabActivated):
+                tabs.active = wanted
 
     def jump_to(self, name: str) -> None:
         """Jump to a tab, committing the panel being left first.
@@ -197,6 +198,10 @@ class InstallerApp(App[None]):
         self.show_panel(name)
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        if not self.is_running or event.tabs.id != "wizard-tabs":
+            return
+        if event.tab.id != event.tabs.active:
+            return  # A newer click or programmatic navigation superseded this event.
         tab_id = event.tab.id or ""
         if tab_id.startswith("tab-"):
             self.jump_to(tab_id.removeprefix("tab-"))
@@ -235,7 +240,7 @@ class InstallerApp(App[None]):
         order = self._order()
         index = order.index(self.current)
         if index > 0:
-            self.show_panel(order[index - 1])
+            self.jump_to(order[index - 1])
 
     def action_cancel(self) -> None:
         if not self.locked:
