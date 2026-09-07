@@ -60,7 +60,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_INDEX_WAIT_SECONDS",
         "Indexing",
         "Index wait (seconds)",
-        "How long a startup index waits out a competing job before failing; 0 disables waiting.",
+        "How long a startup index waits out a competing job before failing; 0 disables waiting. "
+        "Default: 300.",
         "int",
         "300",
         minimum=0,
@@ -70,7 +71,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_EMBED_MEMORY_MB",
         "Indexing",
         "Indexing memory (MB)",
-        "Ceiling for the indexing worker. The default is 25% of RAM clamped to 1024-2048.",
+        "Ceiling for the indexing worker; exceeding it restarts the worker rather than failing "
+        "the index. Default: 25% of RAM, clamped to 1024-2048 MB.",
         "int",
         "",
         minimum=1024,
@@ -81,7 +83,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_VECTOR_INDEX",
         "Indexing",
         "Vector index",
-        "exact search, or approximate HNSW indexing.",
+        "exact scans every vector (slower, perfect recall); hnsw builds an approximate index "
+        "(faster on large projects, tiny recall cost). Default: exact.",
         "choice",
         "exact",
         choices=("exact", "hnsw"),
@@ -91,7 +94,7 @@ SETTINGS: tuple[Setting, ...] = (
         "Indexing",
         "Vector storage",
         "float16 halves vector bytes with no measured retrieval loss; float32 restores the "
-        "previous layout (a rebuild follows either change).",
+        "previous layout (a rebuild follows either change). Default: float16.",
         "choice",
         "float16",
         choices=("float16", "float32"),
@@ -100,7 +103,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_INDEX_EXECUTION",
         "Indexing",
         "Index execution",
-        "worker enforces the memory ceiling; in-process is a diagnostic rollback.",
+        "worker runs indexing in a separate process that enforces the memory ceiling above; "
+        "in-process runs it inside the server as a diagnostic rollback. Default: worker.",
         "choice",
         "worker",
         choices=("worker", "in-process"),
@@ -109,7 +113,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_BROKER",
         "Indexing",
         "Broker",
-        "Share one indexing process between clients through the daemon.",
+        "Share one indexing process between clients through the daemon: auto uses it when "
+        "supported, on requires it, off serves directly. Default: auto.",
         "choice",
         "auto",
         choices=("auto", "on", "off"),
@@ -118,7 +123,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_DATA_DIR",
         "Indexing",
         "Data directory",
-        "Where the indexes live.",
+        "Where the indexes live. Moving it abandons the old indexes; they are rebuilt on "
+        "demand. Default: the platform data directory.",
         "path",
         "",
         dynamic_default=lambda: str(user_data_path("code-indexing-mcp")),
@@ -127,7 +133,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_CACHE_DIR",
         "Indexing",
         "Cache directory",
-        "Where the embedding model is cached.",
+        "Where the embedding model is cached. Shared between checkouts; safe to delete when "
+        "offline mode is off (re-downloaded as needed). Default: the platform cache directory.",
         "path",
         "",
         dynamic_default=lambda: str(user_cache_path("code-indexing-mcp")),
@@ -136,7 +143,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_OFFLINE",
         "Indexing",
         "Offline mode",
-        "Never download the model; fail if it is missing.",
+        "Never download the model; indexing fails if it is not already cached. Turn on for "
+        "air-gapped machines. Default: off.",
         "bool",
         "0",
     ),
@@ -144,7 +152,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_EMBED_BATCH_SIZE",
         "Embedding",
         "Batch size",
-        "Embedding microbatch size; auto resolves to 1 unless calibration raised it.",
+        "Embedding microbatch size; higher uses more memory per batch but indexes faster. auto "
+        "resolves to 1 unless calibration measured higher. Default: auto.",
         "auto_int",
         "auto",
         minimum=1,
@@ -154,7 +163,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_EMBED_MAX_TOKENS",
         "Embedding",
         "Max tokens",
-        "Sequence window per chunk; attention memory is quadratic in tokens.",
+        "Sequence window per chunk; larger windows capture more context per chunk while "
+        "attention memory grows quadratically. Default: 1024.",
         "int",
         "1024",
         minimum=64,
@@ -164,7 +174,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_EMBED_OVERLAP_TOKENS",
         "Embedding",
         "Overlap tokens",
-        "Overlap between consecutive windows of a long chunk.",
+        "Overlap between consecutive windows of a long chunk; more overlap preserves context "
+        "across window boundaries at the cost of extra embeddings. Default: 64.",
         "int",
         "64",
         minimum=0,
@@ -174,7 +185,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_EMBED_THREADS",
         "Embedding",
         "Threads",
-        "CPU inference threads.",
+        "CPU inference threads for embedding; more is faster up to the core count, then it "
+        "contends. Default: up to 2, based on CPU count.",
         "int",
         "",
         minimum=1,
@@ -185,7 +197,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_EMBED_CPU_ARENA",
         "Embedding",
         "CPU arena",
-        "Preallocate the CPU inference arena.",
+        "Preallocate the CPU inference arena up front: faster steady-state embedding at the "
+        "cost of higher resident memory. Default: off.",
         "bool",
         "0",
     ),
@@ -193,7 +206,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_EMBED_CROSSOVER",
         "Embedding",
         "Accelerator crossover",
-        "Run size in characters above which starting the accelerator repays its model load.",
+        "Input size in characters above which starting the accelerator repays its model load; "
+        "auto measures it during calibration, off never uses the accelerator. Default: auto.",
         "auto_off_int",
         "auto",
         minimum=0,
@@ -203,7 +217,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_EMBED_CALIBRATE",
         "Embedding",
         "Calibrate",
-        "Measure the backend once to set the batch size and crossover.",
+        "Measure the embedding backend once, then record the batch size and crossover above so "
+        "later runs skip the probe. Default: on.",
         "bool",
         "1",
     ),
@@ -211,7 +226,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_EMBED_STRICT",
         "Embedding",
         "Strict accelerator",
-        "Refuse the CPU fallback when the requested backend is unavailable.",
+        "Refuse the CPU fallback when the requested accelerator backend is unavailable; the "
+        "server fails instead of serving slower. Default: off.",
         "bool",
         "0",
     ),
@@ -219,7 +235,8 @@ SETTINGS: tuple[Setting, ...] = (
         "CODE_INDEXING_EMBED_ACCELERATOR",
         "Embedding",
         "Backend override",
-        "Expert override; auto uses the backend the installer prepared.",
+        "Expert override for the embedding backend; auto uses whatever the installer prepared "
+        "(plain CPU when nothing was prepared). Default: auto.",
         "choice",
         "auto",
         choices=("auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml"),
@@ -229,7 +246,7 @@ SETTINGS: tuple[Setting, ...] = (
         "Maintenance",
         "Automatic maintenance",
         "Compacts tables and removes verified versions older than the retention window on a "
-        "schedule; never uses zero-age cleanup.",
+        "schedule; never uses zero-age cleanup. Default: on.",
         "bool",
         "1",
     ),
@@ -238,7 +255,7 @@ SETTINGS: tuple[Setting, ...] = (
         "Maintenance",
         "Version retention (hours)",
         "How long old Lance versions are kept before verified cleanup; the floor of one hour "
-        "keeps concurrent readers safe.",
+        "keeps concurrent readers safe. Default: 24.",
         "int",
         "24",
         minimum=1,
@@ -250,7 +267,7 @@ SETTINGS: tuple[Setting, ...] = (
         "Branch cache limit",
         "How many branch index slots a project keeps, counting the active ones (one per "
         "live checkout -- the main repository plus any worktrees), before the least recently "
-        "used is evicted; protected slots can exceed it temporarily.",
+        "used is evicted; protected slots can exceed it temporarily. Default: 4.",
         "int",
         "4",
         minimum=1,

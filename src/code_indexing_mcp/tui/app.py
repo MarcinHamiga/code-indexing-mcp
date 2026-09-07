@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError
@@ -53,6 +54,7 @@ class HelpScreen(ModalScreen[None]):
                 "Esc  Previous detail view, then results, then search\n"
                 "y  Copy relative path:line     e  Open in VISUAL / EDITOR\n"
                 "F5  Refresh index     q  Quit outside the search field\n"
+                "c  Configure this installation (setup wizard, then back here)\n"
                 "Ctrl+Q  Quit from anywhere     ? / Ctrl+H  Help\n\n"
                 "At narrow widths, use Results / Details to switch panes.\n"
                 "Preview shows indexed source. Working tree shows current files.\n"
@@ -94,6 +96,7 @@ class CodeIndexingApp(App[int]):
         Binding("r", "show_references", "References", show=False, priority=False),
         Binding("i", "show_impact", "Impact", show=False, priority=False),
         Binding("f5", "trigger_index", "Index", show=True, priority=False),
+        Binding("c", "open_configure", "Configure", show=True, priority=False),
         Binding("escape", "escape_action", "Back", show=False, priority=False),
         Binding("q", "quit_app", "Quit", show=True, priority=False),
     ]
@@ -151,6 +154,7 @@ class CodeIndexingApp(App[int]):
                 allow_blank=False,
             )
             yield Button("Index F5", id="index-button")
+            yield Button("Configure", id="configure-button")
 
         with Horizontal(id="query-bar"):
             yield Input(
@@ -531,6 +535,8 @@ class CodeIndexingApp(App[int]):
             self._show_pane(event.button.id == "details-view")
         if event.button.id == "index-button":
             self.action_trigger_index()
+        if event.button.id == "configure-button":
+            self.action_open_configure()
 
     def action_focus_query(self) -> None:
         self.screen_stack[0].query_one("#query-input", Input).focus()
@@ -1100,6 +1106,56 @@ class CodeIndexingApp(App[int]):
             return
 
         self._start_index(proj)
+
+    def action_open_configure(self) -> None:
+        # A bare "c" belongs to whatever is being typed, same convention as
+        # the other single-letter bindings (quit, outline, ...).
+        if isinstance(self.focused, Input):
+            return
+        from ..installer.accelerator import server_executable
+
+        try:
+            # The managed venv identifies this installation even when its console
+            # script is reached through a symlink and the default points elsewhere.
+            prefix = Path(sys.prefix).resolve()
+            directory = prefix.parent
+            if prefix.name != ".venv" or not server_executable(directory).is_file():
+                self._show_error(
+                    "This Syndex is not running from a managed installation. "
+                    "Run syndex from the installation you want to configure.",
+                    retry=None,
+                )
+                return
+            command = [
+                sys.executable,
+                "-m",
+                "code_indexing_mcp",
+                "configure",
+                "--install-dir",
+                str(directory),
+            ]
+            # Keep the mounted app: its selection, query, results, and detail
+            # history survive both confirmation and cancellation of the wizard.
+            with self.suspend():
+                result = subprocess.run(command, check=False)
+            if result.returncode == 130:
+                self._set_status("Configuration cancelled.")
+            elif result.returncode:
+                self._show_error(
+                    f"Configuration exited with status {result.returncode}. "
+                    "Run syndex configure --install-dir " + str(directory) + " to see diagnostics.",
+                    retry=self.action_open_configure,
+                )
+            else:
+                selected = self.service.selected_project
+                service = create_tui_service(cwd=self.service.cwd, roots=self.service.roots)
+                if selected is not None:
+                    service.select_project(selected)
+                self.service = service
+                self._clear_error()
+                self._set_status("Configuration complete. Session resumed.")
+        except (OSError, ValueError, CodeIndexingError) as exc:
+            self._show_error(str(exc), retry=self.action_open_configure)
 
     def _start_index(self, proj: ProjectInfo) -> None:
         if self._is_indexing:
