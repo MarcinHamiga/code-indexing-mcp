@@ -473,7 +473,13 @@ class PassageEmbeddingCache:
             return
         try:
             connection.execute("BEGIN IMMEDIATE")
-            payload_bytes = self.payload_bytes
+            # Another run can share this cache with a different data directory.
+            # Read its committed total only after acquiring the writer lock.
+            payload_bytes = int(
+                connection.execute(
+                    "SELECT payload_bytes FROM cache_meta WHERE singleton = 1"
+                ).fetchone()[0]
+            )
             for entry, value in encoded:
                 if value.payload_bytes > self.max_payload_bytes:
                     continue
@@ -603,7 +609,7 @@ class PassageReuseContext:
             return {}, misses
         if self.producer_matches is not None and not self.producer_matches(producer):
             return {}, misses
-        if getattr(producer, "tokenizer_available", None) is False:
+        if getattr(producer, "tokenizer_available", None) is not True:
             return {}, misses
         keys = [candidate_key(namespace, candidate, plan) for candidate in candidates]
         started = time.monotonic_ns()
@@ -644,7 +650,7 @@ class PassageReuseContext:
             return
         if self.producer_matches is not None and not self.producer_matches(producer):
             return
-        if getattr(producer, "tokenizer_available", None) is False:
+        if getattr(producer, "tokenizer_available", None) is not True:
             return
         entries: dict[str, Sequence[EmbeddedSegment]] = {}
         for index, segments in results.items():

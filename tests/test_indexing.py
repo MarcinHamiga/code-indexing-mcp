@@ -1380,6 +1380,8 @@ class WindowingEmbedder(RecordingEmbedder):
     path produces, without loading a model.
     """
 
+    tokenizer_available = True
+
     def plan_and_embed(
         self, candidates: Sequence[PassageCandidate], plan: SegmentPlan
     ) -> list[list[EmbeddedSegment]]:

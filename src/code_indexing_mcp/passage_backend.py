@@ -547,11 +547,8 @@ class PassageBackendSession:
 
     @property
     def tokenizer_available(self) -> bool | None:
-        """Return the tokenizer result observed by the active or retired worker."""
-        for entry in self._all_telemetry():
-            if entry.tokenizer_available is not None:
-                return entry.tokenizer_available
-        return None
+        """Return capability established by the current worker, not a retired one."""
+        return self._session.tokenizer_available if self._session is not None else None
 
     def telemetry(self) -> SessionTelemetry:
         entries = self._all_telemetry()

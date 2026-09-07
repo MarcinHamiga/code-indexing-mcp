@@ -474,7 +474,10 @@ verified CPU float32 or MLX float32 model identities, and is disposable: delete 
 run is active to clear the reuse history. A report's `embedding_cache_status` is `active`,
 `disabled`, `bypassed`, or `error`; `reused_candidates` and `reused_segments` count replayed
 results, while `embedded_segments` and `embedded_tokens` count work sent to the embedding worker.
-Forced indexing and strict accelerator mode bypass passage reuse.
+Forced indexing and strict accelerator mode bypass passage reuse. A fresh worker first embeds a
+batch to establish tokenizer availability before later batches can reuse cached results. MLX
+identities include the locally resolved converted weights and conversion version; reuse stays
+disabled until that conversion exists.
 
 Benchmark the CPU indexing pipeline with a generated, deterministic corpus:
 

@@ -259,13 +259,17 @@ def test_reuse_context_bulk_resolves_hits_and_writes_misses(tmp_path: Path) -> N
     with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
         cache.put_many({candidate_key(namespace, candidates[0], PLAN): _segments()})
 
+    class TokenizerAvailable:
+        tokenizer_available = True
+
+    producer = TokenizerAvailable()
     with PassageReuseContext(path, namespace) as reuse:
-        hits, misses = reuse.lookup(candidates, PLAN)
+        hits, misses = reuse.lookup(candidates, PLAN, producer=producer)
         assert hits == {0: _segments()}
         assert misses == [1]
-        reuse.store(candidates, {1: _segments()}, PLAN)
+        reuse.store(candidates, {1: _segments()}, PLAN, producer=producer)
         assert reuse.status == "active"
-        assert reuse.lookup(candidates, PLAN)[0].keys() == {0, 1}
+        assert reuse.lookup(candidates, PLAN, producer=producer)[0].keys() == {0, 1}
         assert reuse.reused_candidates == 3
         assert reuse.reused_segments == 6
         assert reuse.lookup_duration_ms >= 0
@@ -292,3 +296,39 @@ def test_reuse_context_bypasses_reads_in_strict_mode(tmp_path: Path) -> None:
     with PassageReuseContext(tmp_path / "passage.sqlite3", _namespace(), strict=True) as reuse:
         assert reuse.status == "bypassed"
         assert reuse.lookup([_candidate()], PLAN) == ({}, [0])
+
+
+def test_interleaved_writers_share_authoritative_payload_accounting(tmp_path: Path) -> None:
+    path = tmp_path / "passage.sqlite3"
+    size = encode_segments(_segments(), dimension=DIMENSION).payload_bytes
+    with (
+        PassageEmbeddingCache(path, dimension=DIMENSION, max_payload_bytes=size) as first,
+        PassageEmbeddingCache(path, dimension=DIMENSION, max_payload_bytes=size) as second,
+    ):
+        first.put_many({"a": _segments()})
+        second.put_many({"b": _segments()})
+        first.put_many({"c": _segments()})
+        with sqlite3.connect(path) as connection:
+            actual = connection.execute("SELECT SUM(payload_bytes) FROM entries").fetchone()[0]
+            recorded = connection.execute("SELECT payload_bytes FROM cache_meta").fetchone()[0]
+        assert actual == recorded == size
+        assert set(first.get_many(["a", "b", "c"])) == {"c"}
+
+
+@pytest.mark.parametrize(
+    "producer", [None, type("UnknownTokenizer", (), {"tokenizer_available": None})()]
+)
+def test_unknown_tokenizer_bypasses_cache_reads_and_writes(
+    tmp_path: Path, producer: object
+) -> None:
+    path = tmp_path / "passage.sqlite3"
+    namespace = _namespace()
+    candidates = [_candidate(), _candidate(content="changed text!!")]
+    key = candidate_key(namespace, candidates[0], PLAN)
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        cache.put_many({key: _segments()})
+    with PassageReuseContext(path, namespace) as reuse:
+        assert reuse.lookup(candidates, PLAN, producer=producer) == ({}, [0, 1])
+        reuse.store(candidates, {1: _segments()}, PLAN, producer=producer)
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        assert cache.get_many([candidate_key(namespace, candidates[1], PLAN)]) == {}
