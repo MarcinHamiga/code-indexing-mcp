@@ -211,7 +211,36 @@ def test_microbatches_respect_the_padded_token_product() -> None:
 def test_microbatches_bucket_similar_lengths_before_padding() -> None:
     batches = plan_microbatches([10, 1_000, 12, 900], max_items=2, max_token_product=2_000)
 
-    assert batches == [[0, 2], [1, 3]]
+    assert batches == [[0, 2], [3, 1]]
+
+
+def test_microbatches_sort_within_the_old_length_bucket() -> None:
+    counts = [257, 511, 258, 510]
+
+    batches = plan_microbatches(counts, max_items=2, max_token_product=4096)
+
+    assert batches == [[0, 2], [3, 1]]
+    padded = sum(len(batch) * max(counts[i] for i in batch) for batch in batches)
+    assert padded == 1538
+
+
+def test_microbatches_keep_equal_lengths_stable() -> None:
+    assert plan_microbatches([7, 7, 7], max_items=2, max_token_product=100) == [
+        [0, 1],
+        [2],
+    ]
+
+
+def test_microbatches_pack_zero_lengths_before_positive_lengths() -> None:
+    assert plan_microbatches([0, 1, 0], max_items=3, max_token_product=1) == [[0, 2], [1]]
+
+
+def test_multiple_over_budget_segments_are_isolated() -> None:
+    assert plan_microbatches([5_000, 6_000, 10], max_items=4, max_token_product=4_096) == [
+        [0],
+        [1],
+        [2],
+    ]
 
 
 def test_a_segment_wider_than_the_product_still_forms_its_own_batch() -> None:

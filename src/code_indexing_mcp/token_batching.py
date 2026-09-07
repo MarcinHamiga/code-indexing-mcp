@@ -169,20 +169,21 @@ def plan_microbatches(
     max_items: int = 1,
     max_token_product: int = DEFAULT_MAX_TOKEN_PRODUCT,
 ) -> list[list[int]]:
-    """Bucket segment indices by length, then stay within both packing limits.
+    """Order segment indices by length, then stay within both packing limits.
 
     A batch pads to its longest member, so ``item_count * longest`` — not the
     sum — is what the model materializes. A single segment always forms a batch
     even when it exceeds the product on its own; there is nothing smaller to
-    fall back to. Power-of-two buckets keep similarly sized segments together
-    without making exact token counts part of the ordering contract.
+    fall back to. Exact lengths keep similarly sized segments together while
+    preserving the original order for ties.
     """
     if max_items < 1:
         raise ValueError("max_items must be at least 1")
     ordered = sorted(
         enumerate(token_counts),
         key=lambda item: (
-            -1 if item[1] > max_token_product else max(0, item[1]).bit_length(),
+            0 if item[1] > max_token_product else 1,
+            max(0, item[1]),
             item[0],
         ),
     )
