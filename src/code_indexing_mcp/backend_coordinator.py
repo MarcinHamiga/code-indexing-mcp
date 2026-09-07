@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .accelerator_env import EnvironmentStatus, apply_environment, load_environment
 from .backends import (
     CPU_BACKEND,
+    Accelerator,
     BackendDescriptor,
     BackendSelection,
     available_execution_providers,
@@ -40,7 +42,13 @@ from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .embedding_worker import EmbeddingWorkerSession, WorkerConfig, default_launcher
 from .models import ModelStatus
 from .passage_backend import PassageBackendSession
-from .probe_cache import ProbeCache, ProbeKey, ProbeRecord, model_artifact_fingerprint
+from .passage_cache import PassageCacheNamespace, artifact_digest
+from .probe_cache import (
+    ProbeCache,
+    ProbeKey,
+    ProbeRecord,
+    model_artifact_fingerprint,
+)
 from .settings import IndexSettings
 from .worker_launcher import ExternalInterpreterLauncher, WorkerLauncher
 
@@ -212,6 +220,52 @@ class BackendCoordinator:
             return 0
         record = self.probe_cache.load(self._cpu_probe_key())
         return 0 if record is None else record.batch_size
+
+    def passage_cache_namespace(self, project_id: str) -> PassageCacheNamespace | None:
+        """Return a durable identity for a supported, locally known producer."""
+        descriptor = self.effective_backend_selection.descriptor
+        if descriptor.accelerator not in {Accelerator.CPU, Accelerator.MLX}:
+            return None
+        cache_directory = Path(
+            getattr(self.embedder, "cache_directory", self.paths.cache / "models")
+        )
+        model_root = cache_directory / f"models--{self.embedder.model_id.replace('/', '--')}"
+        if not model_root.is_dir() or not any(path.is_file() for path in model_root.rglob("*")):
+            return None
+        digest = artifact_digest(model_root)
+        if digest is None:
+            return None
+        model_digest = digest
+        if descriptor.accelerator is Accelerator.MLX:
+            from .direct_onnx import resolve_model_snapshot
+            from .mlx_backend import WEIGHT_LAYOUT_VERSION, converted_weights_path
+
+            try:
+                # Cache identity must never download or convert a model. Until
+                # the exact conversion exists locally, reuse remains disabled.
+                snapshot = resolve_model_snapshot(
+                    cache_directory, model_id=self.embedder.model_id, offline=True
+                )
+            except (OSError, ValueError):
+                return None
+            weights_digest = artifact_digest(converted_weights_path(cache_directory, snapshot))
+            if weights_digest is None:
+                return None
+            model_digest = sha256(
+                f"{digest}:{weights_digest}:{WEIGHT_LAYOUT_VERSION}".encode()
+            ).hexdigest()
+        producer = "mlx-float32" if descriptor.accelerator is Accelerator.MLX else "cpu-float32"
+        return PassageCacheNamespace(
+            project_id=project_id,
+            artifact_digest=model_digest,
+            # The source snapshot includes tokenizer and configuration files;
+            # MLX additionally depends on its separately stored conversion.
+            tokenizer_digest=digest,
+            producer=producer,
+            runtime_version=descriptor.runtime_version or runtime_version(descriptor.runtime),
+            dimension=self.embedder.dimension,
+            precision=descriptor.precision.value,
+        )
 
     def _measurements(self) -> tuple[ProbeRecord | None, ProbeRecord | None]:
         """Return what calibration recorded for CPU and for the accelerator."""

@@ -70,6 +70,11 @@ def test_a_completed_run_round_trips_all_audit_fields(tmp_path: Path) -> None:
         skipped_samples=["b.txt", "c.bin"],
         embedding_backend="cpu",
         worker_used=True,
+        reused_candidates=2,
+        reused_segments=5,
+        embedding_cache_lookup_ms=3,
+        embedding_cache_write_ms=4,
+        embedding_cache_status="active",
         storage_before={"files": 1, "chunks": 2, "references": 3},
         storage_after={"files": 2, "chunks": 4, "references": 5},
     )
@@ -96,6 +101,11 @@ def test_a_completed_run_round_trips_all_audit_fields(tmp_path: Path) -> None:
     assert run.errors == [IndexIssue(path="a.py", message="boom")]
     assert run.skipped_samples == ["b.txt", "c.bin"]
     assert run.worker_used is True
+    assert run.reused_candidates == 2
+    assert run.reused_segments == 5
+    assert run.embedding_cache_lookup_ms == 3
+    assert run.embedding_cache_write_ms == 4
+    assert run.embedding_cache_status == "active"
     assert run.storage_before == {"files": 1, "chunks": 2, "references": 3}
     assert run.storage_after == {"files": 2, "chunks": 4, "references": 5}
     assert run.project_id == "project-1"
@@ -226,6 +236,9 @@ def test_recent_returns_a_compact_summary_and_nothing_else(tmp_path: Path) -> No
         failed_files=1,
         skipped_total=3,
         chunks_embedded=9,
+        reused_candidates=1,
+        reused_segments=2,
+        embedding_cache_status="active",
     )
 
     summary = store.recent("project-1")
@@ -238,6 +251,9 @@ def test_recent_returns_a_compact_summary_and_nothing_else(tmp_path: Path) -> No
     assert summary.failed_files == 1
     assert summary.skipped_total == 3
     assert summary.chunks_embedded == 9
+    assert summary.reused_candidates == 1
+    assert summary.reused_segments == 2
+    assert summary.embedding_cache_status == "active"
     assert summary.duration_ms >= 0
 
 

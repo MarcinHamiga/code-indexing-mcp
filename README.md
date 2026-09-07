@@ -466,6 +466,19 @@ through durable indexing run records, `scan` inspects what would be indexed or s
 touching storage, `storage status` reports logical/physical bytes and slot states, and `storage vacuum`
 estimates or (`--execute`) executes table compaction and version pruning.
 
+Indexing also keeps a bounded passage embedding cache at
+`<cache-directory>/passage-embeddings.sqlite3`. It reuses complete token-window results for
+unchanged candidates inside changed files, while parsing and staging current source metadata on
+every run. The cache is capped at 256 MiB of logical payload and 64 KiB per entry, uses only
+verified CPU float32 or MLX float32 model identities, and is disposable: delete it while no index
+run is active to clear the reuse history. A report's `embedding_cache_status` is `active`,
+`disabled`, `bypassed`, or `error`; `reused_candidates` and `reused_segments` count replayed
+results, while `embedded_segments` and `embedded_tokens` count work sent to the embedding worker.
+Forced indexing and strict accelerator mode bypass passage reuse. A fresh worker first embeds a
+batch to establish tokenizer availability before later batches can reuse cached results. MLX
+identities include the locally resolved converted weights and conversion version; reuse stays
+disabled until that conversion exists.
+
 Benchmark the CPU indexing pipeline with a generated, deterministic corpus:
 
 ```bash
@@ -475,8 +488,10 @@ syndex benchmark index \
 
 The command writes one JSON document to stdout with `cold_start`, `warm_index`,
 `incremental_index`, and `forced_reindex` results, including phase timings, peak memory, and
-chunks per second. It reuses the configured model cache but isolates index data in a temporary
-workspace. Pass `--work-dir /fresh/path` to retain the corpus and index for inspection.
+chunks per second. Each result includes the resolved backend, batch size, model identity, cache
+state, cache timings, reuse counters, and actual worker counters. It reuses the configured model
+cache but isolates index data in a temporary workspace. Pass `--work-dir /fresh/path` to retain the
+corpus and index for inspection.
 
 Benchmark hybrid search across multiple project scopes:
 

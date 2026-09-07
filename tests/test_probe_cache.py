@@ -112,6 +112,14 @@ def test_every_key_component_invalidates_the_record(tmp_path: Path, field: str) 
     assert cache.load(_key(**{field: "changed"})) is None
 
 
+def test_a_calibration_from_the_old_packing_policy_is_ignored(tmp_path: Path) -> None:
+    cache = ProbeCache(tmp_path / "probes.json")
+    old_policy = replace(_key(), packing_policy_version=1)
+    cache.store(old_policy, batch_size=16, dimension=768)
+
+    assert cache.load(_key()) is None
+
+
 def test_restoring_the_original_configuration_finds_the_record_again(tmp_path: Path) -> None:
     cache = ProbeCache(tmp_path / "probes.json")
     cache.store(_key(), batch_size=8, dimension=768)

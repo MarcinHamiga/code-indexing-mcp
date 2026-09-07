@@ -12,8 +12,10 @@ from code_indexing_mcp.embedding import (
     FastEmbedder,
     PassageCandidate,
     SegmentPlan,
+    TokenWindow,
     compose_passage,
     embed_planned_segments,
+    embed_windows,
     plan_passages,
     resolve_session_providers,
     resolve_tokenizer,
@@ -116,3 +118,34 @@ def test_embedding_without_a_tokenizer_sends_the_whole_candidate() -> None:
 
     assert seen == [["kind: module\nvalue = 1"]]
     assert len(result[0]) == 1
+
+
+def test_embed_windows_restores_candidates_and_sorts_their_windows() -> None:
+    candidates = [
+        PassageCandidate("candidate-a", "ab"),
+        PassageCandidate("candidate-b", "cd"),
+    ]
+    windows = [
+        [TokenWindow(1, 2, 511), TokenWindow(0, 1, 257)],
+        [TokenWindow(1, 2, 510), TokenWindow(0, 1, 258)],
+    ]
+
+    def marker_vectors(texts: list[str]) -> list[str]:
+        return texts
+
+    result = embed_windows(
+        marker_vectors,
+        candidates,
+        windows,
+        SegmentPlan(max_items=2, max_token_product=4_096),
+    )
+
+    assert [[window.start_char for window, _ in group] for group in result] == [[0, 1], [0, 1]]
+    assert [vector for _, vector in result[0]] == [
+        compose_passage("candidate-a", "a"),
+        compose_passage("candidate-a", "b"),
+    ]
+    assert [vector for _, vector in result[1]] == [
+        compose_passage("candidate-b", "c"),
+        compose_passage("candidate-b", "d"),
+    ]
