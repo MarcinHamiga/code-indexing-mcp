@@ -8,16 +8,16 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from ..application import RuntimePaths
 from .accelerator import ACCELERATOR_CHOICES
 from .config_files import InstallerError
-from .daemon_control import daemon_relevant_settings_changed, stop_daemon
+from .daemon_control import stop_daemon
 from .harnesses import HARNESS_CHOICES, grouped_choices, parse_harness_selection
 from .orchestrator import (
     InstallPlan,
     InstallResult,
     StepEvent,
     default_install_directory,
+    finalize_reconfigure,
     run_install,
 )
 from .settings_spec import BY_NAME, as_bool, normalize, validate
@@ -121,20 +121,9 @@ def _print_event(event: StepEvent) -> None:
 
 
 def _restart_daemon_if_settings_changed(result: InstallResult) -> None:
-    """D6: a running daemon serves stale settings once a config write changes one.
+    """Keep the CLI event sink for the shared reconfigure finalization."""
 
-    Only reached for the reconfigure/``configure`` path (see the call site):
-    a fresh install has nothing running yet to be stale, and repair
-    deliberately writes back the settings already in place, so nothing here
-    would find a change to act on. Nothing is printed when no harness was
-    actually configured (the write this guards never happened) or no managed
-    setting changed.
-    """
-
-    if not result.configured or not daemon_relevant_settings_changed(result.env_written):
-        return
-    status, detail = stop_daemon(RuntimePaths.from_environment(), reason="settings")
-    _print_event(StepEvent("daemon", status, detail))
+    finalize_reconfigure(result, on_event=_print_event, stop=stop_daemon)
 
 
 def _prompt_harnesses(
@@ -214,9 +203,9 @@ def _repair(install_directory: Path, args: argparse.Namespace) -> int:
         install_directory=install_directory,
         accelerator=None,
         harness_slugs=tuple(selected),
-        # The values already in the configs, written back as they are: repair
-        # fixes what is broken, it does not change what the user chose.
-        env_updates=dict(prefill.values),
+        # Repair fixes wiring around the existing configuration. It must not
+        # rewrite values merely because they were used to prefill the wizard.
+        env_updates={},
         offline=args.offline,
         bin_directory=Path(args.bin_dir).expanduser() if args.bin_dir else None,
         install_launcher=not args.no_launcher,

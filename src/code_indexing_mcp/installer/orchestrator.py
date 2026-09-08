@@ -7,8 +7,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..application import RuntimePaths
 from . import accelerator, harnesses, shell_path, verify
 from .config_files import InstallerError
+from .daemon_control import daemon_relevant_settings_changed, stop_daemon
 from .shell_path import LauncherResult
 
 EMBED_ACCELERATOR_SETTING = "CODE_INDEXING_EMBED_ACCELERATOR"
@@ -63,6 +65,21 @@ class InstallResult:
     @property
     def warnings(self) -> tuple[verify.Check, ...]:
         return tuple(check for check in self.checks if not check.ok)
+
+
+def finalize_reconfigure(
+    result: InstallResult,
+    *,
+    on_event: Callable[[StepEvent], None] = lambda event: None,
+    stop: Callable[..., tuple[str, str]] | None = None,
+) -> None:
+    """Apply the daemon side effect after a reconfigure actually writes settings."""
+
+    if not result.configured or not daemon_relevant_settings_changed(result.env_written):
+        return
+    stopper = stop or stop_daemon
+    status, detail = stopper(RuntimePaths.from_environment(), reason="settings")
+    on_event(StepEvent("daemon", status, detail))
 
 
 def run_install(

@@ -433,10 +433,10 @@ def test_repair_reapplies_the_current_configuration_without_rebuilding(
 
     assert code == 0
     (plan,) = recorded
-    # The harnesses already configured, their current settings written back, and
-    # explicitly no accelerator work.
+    # The harnesses already configured and explicitly no accelerator work. A
+    # repair does not rewrite the settings it read as prefill.
     assert plan.harness_slugs == ("kimi-code", "codex")
-    assert plan.env_updates == {"CODE_INDEXING_BROKER": "off"}
+    assert plan.env_updates == {}
     assert plan.accelerator is None
     assert plan.install_launcher is True
 

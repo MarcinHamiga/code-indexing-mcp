@@ -23,7 +23,7 @@ from textual.widgets import (
 
 from .. import accelerator as accelerator_module
 from .. import harnesses, shell_path
-from ..orchestrator import InstallResult, StepEvent, run_install
+from ..orchestrator import InstallResult, StepEvent, finalize_reconfigure, run_install
 from ..verify import format_check
 from ..wizard import WizardState
 from .settings_form import SettingsPanel
@@ -636,6 +636,11 @@ class ProgressPanel(Vertical):
                 on_event=lambda event: self.app.call_from_thread(self._on_step_event, event),
                 should_continue=lambda: not self.cancelled,
             )
+            if self.state.mode == "reconfigure":
+                finalize_reconfigure(
+                    result,
+                    on_event=lambda event: self.app.call_from_thread(self._on_step_event, event),
+                )
         except Exception as exc:  # surfaced on the Done screen
             error = exc
         app = cast("InstallerApp", self.app)
