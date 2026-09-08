@@ -24,6 +24,7 @@ from .embedding import (
     PassageCandidate,
     SegmentPlan,
     embed_windows,
+    load_fastembed_model,
     plan_passages,
     resolve_session_providers,
     resolve_tokenizer,
@@ -210,18 +211,14 @@ def _load_model(config: WorkerConfig) -> Any:
             model_id=config.model_id,
             accelerator=config.accelerator,
         )
-    from fastembed import TextEmbedding
-
-    options: dict[str, Any] = {
-        "model_name": config.model_id,
-        "cache_dir": config.cache_directory,
-        "local_files_only": config.offline,
-        "threads": config.threads,
-        "enable_cpu_mem_arena": config.enable_cpu_mem_arena,
-    }
-    if not config.is_cpu:
-        options["providers"] = list(config.providers)
-    return TextEmbedding(**options)
+    return load_fastembed_model(
+        Path(config.cache_directory),
+        model_id=config.model_id,
+        offline=config.offline,
+        threads=config.threads,
+        enable_cpu_mem_arena=config.enable_cpu_mem_arena,
+        providers=() if config.is_cpu else config.providers,
+    )
 
 
 def _worker_main(connection: Connection, config: WorkerConfig) -> None:

@@ -165,6 +165,17 @@ class _Dependencies:
     run_repository_stable_query: _StableQueryRunner
 
 
+@dataclass(frozen=True)
+class _RegistryMaintenanceResult:
+    before: tuple[TableStorageStats, ...]
+    after: tuple[TableStorageStats, ...]
+    status: str
+    skip_reason: str | None
+    error: str | None
+    versions_removed: int
+    bytes_reclaimed: int
+
+
 class MaintenanceService:
     """Compact tables, evict retained versions, and run the scheduled pass."""
 
@@ -211,7 +222,7 @@ class MaintenanceService:
 
         def collect(targets: Mapping[str, Sequence[ActiveIndexTarget]]) -> StorageStatus:
             snapshot_at = datetime.now(UTC).isoformat()
-            registry_before = self.store.registry_stats()
+            registry_before = tuple(self.store.registry_table_stats())
             project_stats = [
                 self.store.storage_stats_for(
                     registered_project,
@@ -219,7 +230,7 @@ class MaintenanceService:
                 )
                 for registered_project in scope
             ]
-            registry_after = self.store.registry_stats()
+            registry_after = tuple(self.store.registry_table_stats())
             partition_bytes: dict[str, int] = {}
             for stats in project_stats:
                 if stats.slots:
@@ -230,16 +241,200 @@ class MaintenanceService:
                     partition_bytes[stats.project.id] = stats.partition_physical_bytes
             return StorageStatus(
                 snapshot_at=snapshot_at,
-                registry=registry_after,
+                registry=registry_after[0],
                 projects=project_stats,
-                physical_bytes_total=registry_after.physical_bytes + sum(partition_bytes.values()),
-                consistent=registry_before.current_version == registry_after.current_version
+                physical_bytes_total=registry_after[0].physical_bytes
+                + sum(partition_bytes.values()),
+                consistent=all(
+                    before.current_version == after.current_version
+                    for before, after in zip(registry_before, registry_after, strict=True)
+                )
                 and all(stats.consistent for stats in project_stats),
                 overlap_warnings=overlap_warnings(registered),
                 worktree_warnings=worktree_warnings(registered),
             )
 
         return self._deps.run_repository_stable_query(scope, collect)
+
+    @staticmethod
+    def _acquire_lock(lock: FileLock, *, wait_for_lock: bool) -> bool:
+        if wait_for_lock:
+            lock.acquire()
+            return True
+        try:
+            lock.acquire(timeout=0)
+        except Timeout:
+            return False
+        return True
+
+    def _dry_run_project(
+        self, project: ProjectInfo, target: ActiveIndexTarget
+    ) -> MaintenanceProjectResult:
+        try:
+            before = self.store.storage_stats_for(project, partition_ref=target.partition)
+            estimate = _estimate_reclaimable(before)
+            if before.partition_open_failed:
+                return MaintenanceProjectResult(
+                    project=project,
+                    before=before,
+                    status="error",
+                    error="Partition exists but its tables could not be opened",
+                    reclaimable_bytes_estimate=estimate,
+                )
+            return MaintenanceProjectResult(
+                project=project,
+                before=before,
+                skip_reason="not-indexed" if not before.tables else "dry-run",
+                reclaimable_bytes_estimate=estimate,
+            )
+        except Exception as exc:
+            return MaintenanceProjectResult(
+                project=project,
+                status="error",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _maintain_project(
+        self,
+        project: ProjectInfo,
+        *,
+        lock_directory: Path,
+        retention: timedelta,
+        branch_cache_limit: int,
+        wait_for_lock: bool,
+    ) -> MaintenanceProjectResult:
+        """Maintain one project while preserving the global-then-project lock order."""
+        global_lock = FileLock(lock_directory / "index-global.lock")
+        project_lock = FileLock(lock_directory / f"{project.id}.lock")
+        global_acquired = False
+        project_acquired = False
+        before: ProjectStorageStats | None = None
+        estimate = 0
+        try:
+            global_acquired = self._acquire_lock(global_lock, wait_for_lock=wait_for_lock)
+            if not global_acquired:
+                return MaintenanceProjectResult(project=project, skip_reason="busy")
+            project_acquired = self._acquire_lock(project_lock, wait_for_lock=wait_for_lock)
+            if not project_acquired:
+                return MaintenanceProjectResult(project=project, skip_reason="busy")
+            target = self._deps.resolve_active_target(project, True)
+            recovery = pending_recovery(self.paths.data / "staging", project.id)
+            if recovery.project_wide:
+                return MaintenanceProjectResult(project=project, skip_reason="recovery-pending")
+            before = self.store.storage_stats_for(project, partition_ref=target.partition)
+            estimate = _estimate_reclaimable(before)
+            if before.partition_open_failed:
+                return MaintenanceProjectResult(
+                    project=project,
+                    before=before,
+                    status="error",
+                    error="Partition exists but its tables could not be opened",
+                    reclaimable_bytes_estimate=estimate,
+                )
+            if not before.tables and not any(slot.physical_bytes > 0 for slot in before.slots):
+                return MaintenanceProjectResult(
+                    project=project,
+                    before=before,
+                    skip_reason="not-indexed",
+                    reclaimable_bytes_estimate=estimate,
+                )
+            self.store.maintain_project(
+                project.id,
+                cleanup_older_than=retention,
+                branch_cache_limit=branch_cache_limit,
+                protected_slot_ids=recovery.slot_ids,
+            )
+            after = self.store.storage_stats_for(project, partition_ref=target.partition)
+            if after.partition_open_failed:
+                raise RuntimeError("Partition became unreadable during maintenance")
+            return MaintenanceProjectResult(
+                project=project,
+                before=before,
+                after=after,
+                status="ok",
+                versions_removed=_versions_removed(before, after),
+                bytes_reclaimed=max(
+                    0, before.partition_physical_bytes - after.partition_physical_bytes
+                ),
+                reclaimable_bytes_estimate=estimate,
+            )
+        except Exception as exc:
+            return MaintenanceProjectResult(
+                project=project,
+                before=before,
+                status="error",
+                error=f"{type(exc).__name__}: {exc}",
+                reclaimable_bytes_estimate=estimate,
+            )
+        finally:
+            if project_acquired:
+                project_lock.release()
+            if global_acquired:
+                global_lock.release()
+
+    def _maintain_registry(
+        self,
+        *,
+        lock_directory: Path,
+        retention: timedelta,
+        wait_for_lock: bool,
+        dry_run: bool,
+    ) -> _RegistryMaintenanceResult:
+        if dry_run:
+            return _RegistryMaintenanceResult(
+                before=tuple(self.store.registry_table_stats()),
+                after=(),
+                status="skipped",
+                skip_reason="dry-run",
+                error=None,
+                versions_removed=0,
+                bytes_reclaimed=0,
+            )
+        lock = FileLock(lock_directory / "index-global.lock")
+        acquired = False
+        try:
+            acquired = self._acquire_lock(lock, wait_for_lock=wait_for_lock)
+            if not acquired:
+                return _RegistryMaintenanceResult(
+                    before=(),
+                    after=(),
+                    status="skipped",
+                    skip_reason="busy",
+                    error=None,
+                    versions_removed=0,
+                    bytes_reclaimed=0,
+                )
+            before = tuple(self.store.registry_table_stats())
+            self.store.maintain_registry(cleanup_older_than=retention)
+            after = tuple(self.store.registry_table_stats())
+            return _RegistryMaintenanceResult(
+                before=before,
+                after=after,
+                status="ok",
+                skip_reason=None,
+                error=None,
+                versions_removed=sum(
+                    max(0, previous.retained_version_count - current.retained_version_count)
+                    for previous, current in zip(before, after, strict=True)
+                ),
+                bytes_reclaimed=sum(
+                    max(0, previous.physical_bytes - current.physical_bytes)
+                    for previous, current in zip(before, after, strict=True)
+                ),
+            )
+        except Exception as exc:
+            return _RegistryMaintenanceResult(
+                before=(),
+                after=(),
+                status="error",
+                skip_reason=None,
+                error=f"{type(exc).__name__}: {exc}",
+                versions_removed=0,
+                bytes_reclaimed=0,
+            )
+        finally:
+            if acquired:
+                lock.release()
 
     def maintain_storage(
         self,
@@ -266,8 +461,10 @@ class MaintenanceService:
         """
         # Retention reads last_used_at for LRU eviction; a buffered touch that
         # never made it to disk must not make a recently used slot look old
-        # enough to evict.
-        self.store.flush_slot_touches()
+        # enough to evict. A dry run reads the in-memory overlay and must not
+        # turn inspection into a registry write.
+        if not dry_run:
+            self.store.flush_slot_touches()
         started = time.monotonic_ns()
         started_at = datetime.now(UTC).isoformat()
         retention = timedelta(hours=self.settings.version_retention_hours)
@@ -281,191 +478,28 @@ class MaintenanceService:
         lock_directory = self.paths.data / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
 
-        def acquire(lock: FileLock) -> bool:
-            if wait_for_lock:
-                lock.acquire()
-                return True
-            try:
-                lock.acquire(timeout=0)
-            except Timeout:
-                return False
-            return True
-
         results: list[MaintenanceProjectResult] = []
         for registered_project in scope:
-            before: ProjectStorageStats | None = None
-            estimate = 0
             if dry_run:
-                try:
-                    before = self.store.storage_stats_for(
+                target = _primary_target(targets, registered_project.id)
+                results.append(self._dry_run_project(registered_project, target))
+            else:
+                results.append(
+                    self._maintain_project(
                         registered_project,
-                        partition_ref=_primary_target(targets, registered_project.id).partition,
+                        lock_directory=lock_directory,
+                        retention=retention,
+                        branch_cache_limit=self.settings.branch_cache_limit,
+                        wait_for_lock=wait_for_lock,
                     )
-                    estimate = _estimate_reclaimable(before)
-                    if before.partition_open_failed:
-                        results.append(
-                            MaintenanceProjectResult(
-                                project=registered_project,
-                                before=before,
-                                status="error",
-                                error="Partition exists but its tables could not be opened",
-                                reclaimable_bytes_estimate=estimate,
-                            )
-                        )
-                    else:
-                        results.append(
-                            MaintenanceProjectResult(
-                                project=registered_project,
-                                before=before,
-                                skip_reason="not-indexed" if not before.tables else "dry-run",
-                                reclaimable_bytes_estimate=estimate,
-                            )
-                        )
-                except Exception as exc:
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            status="error",
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                    )
-                continue
+                )
 
-            global_lock = FileLock(lock_directory / "index-global.lock")
-            project_lock = FileLock(lock_directory / f"{registered_project.id}.lock")
-            global_acquired = False
-            project_acquired = False
-            try:
-                global_acquired = acquire(global_lock)
-                if not global_acquired:
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            skip_reason="busy",
-                        )
-                    )
-                    continue
-                project_acquired = acquire(project_lock)
-                if not project_acquired:
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            skip_reason="busy",
-                        )
-                    )
-                    continue
-                target = self._deps.resolve_active_target(registered_project, True)
-                recovery = pending_recovery(self.paths.data / "staging", registered_project.id)
-                if recovery.project_wide:
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            skip_reason="recovery-pending",
-                        )
-                    )
-                    continue
-                before = self.store.storage_stats_for(
-                    registered_project,
-                    partition_ref=target.partition,
-                )
-                estimate = _estimate_reclaimable(before)
-                if before.partition_open_failed:
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            before=before,
-                            status="error",
-                            error="Partition exists but its tables could not be opened",
-                            reclaimable_bytes_estimate=estimate,
-                        )
-                    )
-                    continue
-                if not before.tables and not any(slot.physical_bytes > 0 for slot in before.slots):
-                    results.append(
-                        MaintenanceProjectResult(
-                            project=registered_project,
-                            before=before,
-                            skip_reason="not-indexed",
-                            reclaimable_bytes_estimate=estimate,
-                        )
-                    )
-                    continue
-                self.store.maintain_project(
-                    registered_project.id,
-                    cleanup_older_than=retention,
-                    branch_cache_limit=self.settings.branch_cache_limit,
-                    protected_slot_ids=recovery.slot_ids,
-                )
-                after = self.store.storage_stats_for(
-                    registered_project,
-                    partition_ref=target.partition,
-                )
-                if after.partition_open_failed:
-                    raise RuntimeError("Partition became unreadable during maintenance")
-                results.append(
-                    MaintenanceProjectResult(
-                        project=registered_project,
-                        before=before,
-                        after=after,
-                        status="ok",
-                        versions_removed=_versions_removed(before, after),
-                        bytes_reclaimed=max(
-                            0, before.partition_physical_bytes - after.partition_physical_bytes
-                        ),
-                        reclaimable_bytes_estimate=estimate,
-                    )
-                )
-            except Exception as exc:  # one project must not abort the pass
-                results.append(
-                    MaintenanceProjectResult(
-                        project=registered_project,
-                        before=before,
-                        status="error",
-                        error=f"{type(exc).__name__}: {exc}",
-                        reclaimable_bytes_estimate=estimate,
-                    )
-                )
-            finally:
-                if project_acquired:
-                    project_lock.release()
-                if global_acquired:
-                    global_lock.release()
-
-        registry_before: TableStorageStats | None = None
-        registry_after: TableStorageStats | None = None
-        registry_status = "skipped"
-        registry_skip_reason: str | None = "dry-run" if dry_run else None
-        registry_error: str | None = None
-        registry_versions_removed = 0
-        registry_bytes_reclaimed = 0
-        if dry_run:
-            registry_before = self.store.registry_stats()
-        else:
-            global_lock = FileLock(lock_directory / "index-global.lock")
-            global_acquired = False
-            try:
-                global_acquired = acquire(global_lock)
-                if not global_acquired:
-                    registry_skip_reason = "busy"
-                else:
-                    registry_before = self.store.registry_stats()
-                    self.store.maintain_registry(cleanup_older_than=retention)
-                    registry_after = self.store.registry_stats()
-                    registry_status = "ok"
-                    registry_versions_removed = max(
-                        0,
-                        registry_before.retained_version_count
-                        - registry_after.retained_version_count,
-                    )
-                    registry_bytes_reclaimed = max(
-                        0, registry_before.physical_bytes - registry_after.physical_bytes
-                    )
-            except Exception as exc:
-                registry_status = "error"
-                registry_error = f"{type(exc).__name__}: {exc}"
-            finally:
-                if global_acquired:
-                    global_lock.release()
+        registry_result = self._maintain_registry(
+            lock_directory=lock_directory,
+            retention=retention,
+            wait_for_lock=wait_for_lock,
+            dry_run=dry_run,
+        )
 
         finished_at = datetime.now(UTC).isoformat()
         duration_ms = (time.monotonic_ns() - started) // 1_000_000
@@ -488,13 +522,15 @@ class MaintenanceService:
             finished_at=finished_at,
             duration_ms=duration_ms,
             projects=results,
-            registry_before=registry_before,
-            registry_after=registry_after,
-            registry_status=registry_status,
-            registry_skip_reason=registry_skip_reason,
-            registry_error=registry_error,
-            registry_versions_removed=registry_versions_removed,
-            registry_bytes_reclaimed=registry_bytes_reclaimed,
+            registry_before=registry_result.before[0] if registry_result.before else None,
+            registry_after=registry_result.after[0] if registry_result.after else None,
+            registry_tables_before=list(registry_result.before),
+            registry_tables_after=list(registry_result.after),
+            registry_status=registry_result.status,
+            registry_skip_reason=registry_result.skip_reason,
+            registry_error=registry_result.error,
+            registry_versions_removed=registry_result.versions_removed,
+            registry_bytes_reclaimed=registry_result.bytes_reclaimed,
             versions_removed_total=sum(result.versions_removed for result in results),
             bytes_reclaimed_total=sum(result.bytes_reclaimed for result in results),
             reclaimable_bytes_estimate_total=sum(

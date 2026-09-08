@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -674,6 +674,7 @@ class DaemonServer:
                 # replaces: SystemExit and KeyboardInterrupt inside a request
                 # thread must still surface as themselves, not be swallowed
                 # into a client-facing error response.
+                logger.exception("Unhandled daemon dispatch failure for method %s", method)
                 with contextlib.suppress(OSError):
                     _send_response(
                         connection,
@@ -1179,6 +1180,32 @@ def daemon_status(paths: RuntimePaths) -> dict[str, Any]:
         # that has no failure answer -- every caller here is only asking whether
         # the daemon is up, and one that closed the connection is not.
         return {"running": False}
+
+
+def stop_daemon_and_wait(
+    paths: RuntimePaths,
+    *,
+    timeout_seconds: float = 5.0,
+    poll_interval: float = 0.05,
+    status: Callable[[RuntimePaths], Mapping[str, Any]] = daemon_status,
+    stop: Callable[[], object] | None = None,
+    initial_running: bool | None = None,
+) -> bool:
+    """Stop the current daemon and report whether it exited before the deadline."""
+    if not daemon_supported():
+        return True
+    if initial_running is None:
+        initial_running = bool(status(paths).get("running"))
+    if not initial_running:
+        return True
+    stopper = stop or (lambda: BrokerApplication(paths).stop())
+    stopper()
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not status(paths)["running"]:
+            return True
+        time.sleep(poll_interval)
+    return not status(paths)["running"]
 
 
 def _retire_stale_daemon(paths: RuntimePaths, protocol: int) -> None:

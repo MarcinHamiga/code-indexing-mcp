@@ -22,7 +22,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from filelock import FileLock, Timeout
 
@@ -42,7 +42,13 @@ from .accelerator import (
 from .config_files import InstallerError
 from .daemon_control import stop_daemon
 from .env_blocks import command_from_entry
-from .harnesses import configuration_path, install_skills, read_server_entry, skill_directory
+from .harnesses import (
+    SkillOutcome,
+    configuration_path,
+    install_skills,
+    read_server_entry,
+    skill_directory,
+)
 from .orchestrator import default_install_directory
 from .verify import format_check, run_update_checks
 from .wizard import load_prefill
@@ -63,6 +69,16 @@ LS_REMOTE_TIMEOUT_SECONDS = 10.0
 # Distinct from 1 (error) and 2 (CodeIndexingError), so a script can tell
 # "an update is available" from "the check itself failed".
 CHECK_UPDATE_AVAILABLE_EXIT = 10
+
+
+def _skill_outcome(value: SkillOutcome | tuple[str, str]) -> SkillOutcome:
+    """Accept legacy tuple results from an older managed checkout during handoff."""
+    if isinstance(value, SkillOutcome):
+        return value
+    slug, detail = value
+    status: Literal["linked", "skipped"] = "skipped" if detail.startswith("skipped:") else "linked"
+    return SkillOutcome(slug, status, detail)
+
 
 RunCommand = Callable[..., "subprocess.CompletedProcess[str]"]
 Spawn = Callable[[list[str], Path], int]
@@ -503,9 +519,10 @@ def _finalize_main(
 
     owned_slugs = [slug for slug in configured_slugs if owned[slug]]
     configured = [(slug, configuration_path(slug)) for slug in owned_slugs]
-    for slug, message in install_skills(install_slugs, directory):
-        status = "warn" if message.startswith("skipped:") else "ok"
-        _print_status("skills", status, f"{slug}: {message}")
+    for raw_outcome in install_skills(install_slugs, directory):
+        outcome = _skill_outcome(raw_outcome)
+        status = "warn" if outcome.status == "skipped" else "ok"
+        _print_status("skills", status, f"{outcome.slug}: {outcome.detail}")
     checks = run_update_checks(
         directory, configured, accelerator_was_prepared=accelerator.prepared is not None
     )
@@ -543,24 +560,9 @@ def _check_main(directory: Path, *, run_command: RunCommand) -> int:
     if _canonical_repository_url(origin) != _canonical_repository_url(expected):
         return _error(f"the checkout at {directory} tracks {origin}, not {expected}")
     try:
-        completed = subprocess.run(
-            ["git", "ls-remote", "origin", REMOTE_BRANCH_REF],
-            cwd=directory,
-            capture_output=True,
-            text=True,
-            timeout=LS_REMOTE_TIMEOUT_SECONDS,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
+        status = update_check.check_remote(directory, timeout=LS_REMOTE_TIMEOUT_SECONDS)
+    except Exception as exc:
         return _error(f"could not reach origin to check for updates: {exc}")
-    lines = [line for line in completed.stdout.splitlines() if line.strip()]
-    if not lines:
-        return _error(f"origin has no {REMOTE_BRANCH_REF} to compare against")
-    status = update_check.UpdateStatus(
-        checked_at=time.time(),
-        local_sha=update_check.checkout_head(directory) or "",
-        remote_sha=lines[0].split()[0],
-    )
     print(
         json.dumps(
             {

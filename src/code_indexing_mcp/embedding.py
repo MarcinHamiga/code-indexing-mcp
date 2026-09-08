@@ -7,12 +7,14 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 import numpy as np
 
 if TYPE_CHECKING:
     from fastembed import TextEmbedding as _TextEmbedding
+else:
+    _TextEmbedding = object
 
 from .errors import CodeIndexingError, ErrorCode
 from .token_batching import (
@@ -176,6 +178,34 @@ def validate_probe_vectors(vectors: Sequence[bytes], *, dimension: int, count: i
         # or normalisation did not run on this provider.
         if not 0.9 <= norm <= 1.1:
             raise ValueError(f"probe vector {index} has norm {norm:.4f}, expected ~1.0")
+
+
+def load_fastembed_model(
+    cache_directory: Path,
+    *,
+    model_id: str = DEFAULT_MODEL,
+    offline: bool = False,
+    threads: int | None = None,
+    enable_cpu_mem_arena: bool = False,
+    providers: Sequence[str] = (),
+) -> _TextEmbedding:
+    """Load the optional FastEmbed model with one lazy, shared construction path."""
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    global TextEmbedding
+    if TextEmbedding is None:
+        from fastembed import TextEmbedding as implementation
+
+        TextEmbedding = implementation
+    options: dict[str, Any] = {
+        "model_name": model_id,
+        "cache_dir": str(cache_directory),
+        "local_files_only": offline,
+        "threads": threads,
+        "enable_cpu_mem_arena": enable_cpu_mem_arena,
+    }
+    if providers:
+        options["providers"] = list(providers)
+    return cast(_TextEmbedding, TextEmbedding(**options))
 
 
 def plan_passages(
@@ -376,17 +406,11 @@ class FastEmbedder:
         with self._model_lock:
             if self._model is not None:
                 return self._model
-            self.cache_directory.mkdir(parents=True, exist_ok=True)
             try:
-                global TextEmbedding
-                if TextEmbedding is None:
-                    from fastembed import TextEmbedding as implementation
-
-                    TextEmbedding = implementation
-                self._model = TextEmbedding(
-                    model_name=self.model_id,
-                    cache_dir=str(self.cache_directory),
-                    local_files_only=self.offline,
+                self._model = load_fastembed_model(
+                    self.cache_directory,
+                    model_id=self.model_id,
+                    offline=self.offline,
                     threads=self.threads,
                     enable_cpu_mem_arena=self.enable_cpu_mem_arena,
                 )

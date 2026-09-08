@@ -115,13 +115,17 @@ class ProbeRecord:
         if not isinstance(value, dict):
             return None
         try:
-            batch_size = _positive_int(value["batch_size"], "batch_size")
+            # An uncalibrated backend persists zero for the batch size, but a
+            # measured record must carry a positive size.
+            batch_size = _nonnegative_int(value["batch_size"], "batch_size")
             dimension = _positive_int(value["dimension"], "dimension")
             recorded_at_ns = _nonnegative_int(value["recorded_at_ns"], "recorded_at_ns")
             characters_per_second = _finite_nonnegative_float(
                 value.get("characters_per_second", 0.0), "characters_per_second"
             )
             load_ns = _nonnegative_int(value.get("load_ns", 0), "load_ns")
+            if batch_size == 0 and (characters_per_second > 0 or load_ns > 0):
+                raise ValueError("measured probe records must have a positive batch_size")
             return cls(
                 fingerprint=str(value["fingerprint"]),
                 batch_size=batch_size,

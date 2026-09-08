@@ -205,4 +205,3 @@
 2. Rename `_rename_analysis` to reflect rename and signature-change analysis, using indexed references to update call sites.
 3. Run `uv run ruff format .`, `uv run ruff format --check .`, `uv run ruff check .`, `uv run mypy src`, and `uv run pytest -n auto`.
 4. Review `git diff --check`, `git status`, and the full diff against the branch base. Confirm every M01–M17 and N01–N33 item has a code change or an explicit test-backed explanation where the current tip already contains the fix.
-

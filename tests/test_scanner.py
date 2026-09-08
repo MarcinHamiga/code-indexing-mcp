@@ -674,6 +674,32 @@ def test_has_supported_source_applies_nested_gitignore_rules(tmp_path: Path) -> 
     assert scanner.has_supported_source(root, ScanConfig()) is False
 
 
+def test_has_supported_source_matches_scan_for_nested_repositories(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    (nested / "nested.py").write_text("nested = True\n")
+    project = initialize_project(root)
+
+    assert SourceScanner().has_supported_source(root, project.scan) is False
+    assert SourceScanner().scan(project).files == []
+
+
+def test_has_supported_source_keeps_force_added_ignored_files_eligible(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / ".gitignore").write_text("ignored.py\n")
+    (root / "ignored.py").write_text("value = 1\n")
+    subprocess.run(["git", "add", "-f", "ignored.py"], cwd=root, check=True)
+    project = initialize_project(root)
+
+    assert SourceScanner().has_supported_source(root, project.scan) is True
+
+
 def test_has_supported_source_batches_git_ignore_queries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

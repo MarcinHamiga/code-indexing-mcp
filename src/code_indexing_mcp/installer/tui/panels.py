@@ -722,8 +722,9 @@ class DonePanel(Vertical):
                 lines.append(f"Configured {slug}: {path}")
             for slug, message in result.failures:
                 lines.append(f"FAILED {slug}: {message}")
-            for slug, message in result.skills:
-                lines.append(f"Skills for {slug}: {message}")
+            for raw_outcome in result.skills:
+                outcome = harnesses.coerce_skill_outcome(raw_outcome)
+                lines.append(f"Skills for {outcome.slug}: [{outcome.status}] {outcome.detail}")
             if result.checks:
                 lines.append("")
                 lines.append("Checks:")

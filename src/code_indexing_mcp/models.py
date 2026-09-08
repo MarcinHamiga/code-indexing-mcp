@@ -1332,6 +1332,10 @@ class MaintenanceReport(FrozenModel):
     projects: list[MaintenanceProjectResult] = Field(default_factory=list)
     registry_before: TableStorageStats | None = None
     registry_after: TableStorageStats | None = None
+    # The registry consists of all three tables; the singular fields above
+    # remain the projects-table compatibility view.
+    registry_tables_before: list[TableStorageStats] = Field(default_factory=list)
+    registry_tables_after: list[TableStorageStats] = Field(default_factory=list)
     registry_status: str = "skipped"
     registry_skip_reason: str | None = None
     registry_error: str | None = None

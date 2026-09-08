@@ -1145,7 +1145,14 @@ def test_maintenance_covers_every_partition_table_and_the_registry(tmp_path: Pat
         store.maintain_project(project.id, cleanup_older_than=timedelta(hours=24))
         store.maintain_registry(cleanup_older_than=timedelta(hours=24))
 
-    assert optimized == ["files", "chunks", "references", "projects"]
+    assert optimized == [
+        "files",
+        "chunks",
+        "references",
+        "projects",
+        "project_slots",
+        "active_slots",
+    ]
 
 
 def test_maintenance_never_passes_delete_unverified(tmp_path: Path) -> None:
