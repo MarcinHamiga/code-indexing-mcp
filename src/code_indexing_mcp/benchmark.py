@@ -219,6 +219,13 @@ def _measure(
         # Reference extraction's own timing (T1), separate from
         # `parse_duration_ms`, which also covers parsing and chunking.
         "reference_extraction_duration_ms": report.reference_extraction_duration_ms or 0,
+        "embedding_backend": report.embedding_backend,
+        "embedding_batch_size": report.embedding_batch_size,
+        "embedding_cache_status": report.embedding_cache_status,
+        "embedding_cache_lookup_ms": report.embedding_cache_lookup_ms,
+        "embedding_cache_write_ms": report.embedding_cache_write_ms,
+        "embedding_artifact_digest": report.embedding_artifact_digest,
+        "embedding_tokenizer_digest": report.embedding_tokenizer_digest,
         "report": report.model_dump(mode="json"),
     }
     if snapshot_after is not None:

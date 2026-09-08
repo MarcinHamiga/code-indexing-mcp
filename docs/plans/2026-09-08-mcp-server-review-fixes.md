@@ -60,3 +60,17 @@ The full suite includes real Git patch application, long-runtime-root daemon
 binding/discovery/reconnect, all fourteen regression groups, and checkout-aware
 search deduplication. Existing optional model/accelerator/platform fixtures remain
 skipped; the default suite does not establish real-device memory or latency limits.
+
+Integration with `main` at `25afbf9`:
+
+- Preserve upstream exact-length batching, passage embedding reuse, cache telemetry,
+  and configure wizard changes alongside the review fixes.
+- Advance the passage cache embedding contract to version 2 so windows generated
+  before separator/special-token accounting are recomputed. A regression test first
+  demonstrated the incompatible cache hit, then passed with the version change.
+- Make the stale-daemon test wait for listening readiness; socket-path existence
+  alone races with `listen()` under parallel test load.
+
+Post-merge verification: formatter and format check passed (147 files), Ruff passed,
+and mypy passed (71 source files). The full parallel suite passed with 2,087 passed
+and 10 skipped in 195.94 seconds. `git diff --check` passed.

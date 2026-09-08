@@ -363,6 +363,7 @@ class SummaryPanel(Vertical):
         ("path", "Command-line access"),
         ("indexing", "Indexing"),
         ("embedding", "Embedding"),
+        ("maintenance", "Maintenance"),
     )
 
     def compose(self) -> ComposeResult:

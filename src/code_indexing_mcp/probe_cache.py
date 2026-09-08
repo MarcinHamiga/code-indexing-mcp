@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 # Bumped whenever a stored record's meaning changes. Records written by another
 # version are treated as absent rather than reinterpreted.
 CACHE_SCHEMA_VERSION = 2
+# Calibration results depend on how passage windows are packed into worker
+# requests. Keep that policy version in the key so changing the packing order
+# does not reuse a measurement from the previous workload shape.
+PACKING_POLICY_VERSION = 2
 # A cache that grows without bound would keep every configuration a machine has
 # ever had. Records are small, but the file is read on every start.
 MAX_RECORDS = 32
@@ -65,6 +69,7 @@ class ProbeKey:
     platform: str
     device: str
     driver_version: str = ""
+    packing_policy_version: int = PACKING_POLICY_VERSION
 
     def fingerprint(self) -> str:
         parts = (
@@ -76,6 +81,7 @@ class ProbeKey:
             self.platform,
             self.device,
             self.driver_version,
+            str(self.packing_policy_version),
         )
         return sha256("\0".join(parts).encode()).hexdigest()
 

@@ -61,6 +61,7 @@ from .models import (
     SymbolResponse,
 )
 from .passage_backend import PassageBackendSession
+from .passage_cache import PassageReuseContext
 from .probe_cache import ProbeCache
 from .progress import IndexProgress, read_progress
 from .projects import (
@@ -448,12 +449,37 @@ class Application:
         self._freshness_lock = threading.Lock()
 
         passage_session_factory: Callable[[], PassageBackendSession] | None = None
+        passage_cache_factory: Callable[[ProjectInfo, bool], PassageReuseContext] | None = None
         if isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker":
             # `segment_plan` is read lazily because `self.indexer` (below)
             # does not exist yet -- see BackendCoordinator._passage_session_factory.
             passage_session_factory = self.backends._passage_session_factory(
                 embedder, segment_plan=lambda: self.indexer.segment_plan
             )
+
+            def passage_cache(current_project: ProjectInfo, force: bool) -> PassageReuseContext:
+                namespace = self.backends.passage_cache_namespace(current_project.id)
+
+                def producer_matches(producer: object) -> bool:
+                    backend = getattr(producer, "backend_used", None)
+                    actual = (
+                        "mlx-float32"
+                        if backend == "mlx"
+                        else "cpu-float32"
+                        if backend == "cpu"
+                        else None
+                    )
+                    return actual == namespace.producer if namespace is not None else False
+
+                return PassageReuseContext(
+                    paths.cache / "passage-embeddings.sqlite3",
+                    namespace,
+                    force=force,
+                    strict=self.settings.embedding_strict,
+                    producer_matches=producer_matches,
+                )
+
+            passage_cache_factory = passage_cache
         self.indexer = Indexer(
             store=self.store,
             scanner=SourceScanner(),
@@ -476,6 +502,7 @@ class Application:
                 ),
             ),
             passage_session_factory=passage_session_factory,
+            passage_cache_factory=passage_cache_factory,
             staging_directory=paths.data / "staging",
             progress_directory=paths.data / "progress",
             history=self.history,

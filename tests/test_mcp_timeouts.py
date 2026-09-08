@@ -311,6 +311,13 @@ async def test_background_manual_failure_is_recorded_and_can_be_retried(
         finally:
             embedder.release.set()
         await _wait_until(lambda: app.project_status(project).state == "error")
+        # The slot enters error before the background job finishes its history
+        # write. Await that write before inspecting the error or retrying the job.
+        await _wait_until(
+            lambda: (
+                (run := app.project_status(project).last_run) is not None and run.state == "failed"
+            )
+        )
         history = await client.call_tool("index_history", {"project": project})
         assert not history.isError and "test backend failed" in _text(history)
         monkeypatch.setattr(embedder, "embed_passages", original)

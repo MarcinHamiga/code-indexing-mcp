@@ -1059,3 +1059,14 @@ def test_a_worker_respawned_by_a_batch_retry_is_verified_before_more_content(
     ]
     assert backend.selection.accelerator is Accelerator.CUDA
     assert backend.fallback_count == 0
+
+
+@pytest.mark.parametrize("available", [True, False, None])
+def test_cache_tokenizer_capability_comes_from_current_worker(available: bool | None) -> None:
+    from dataclasses import replace
+
+    with _backend(_healthy_worker) as backend:
+        backend._retired.append(replace(backend.telemetry(), tokenizer_available=not available))
+        backend._session = backend._cpu_factory()
+        backend._session.tokenizer_available = available
+        assert backend.tokenizer_available is available

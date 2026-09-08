@@ -1373,11 +1373,13 @@ def test_a_stale_daemon_is_reported_running_and_retired(tmp_path: Path) -> None:
     (paths.data / "daemon.token").write_text("shared-token")
     endpoint = daemon_endpoint(paths)
     old_protocol = 2
+    ready = threading.Event()
 
     def old_daemon() -> None:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             server.bind(str(endpoint))
             server.listen()
+            ready.set()
             while True:
                 connection, _ = server.accept()
                 with connection:
@@ -1402,9 +1404,7 @@ def test_a_stale_daemon_is_reported_running_and_retired(tmp_path: Path) -> None:
 
     thread = threading.Thread(target=old_daemon, daemon=True)
     thread.start()
-    deadline = time.monotonic() + 2
-    while not endpoint.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert ready.wait(timeout=2)
 
     assert daemon.daemon_status(paths) == {"running": True, "protocol": old_protocol}
 

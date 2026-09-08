@@ -545,6 +545,11 @@ class PassageBackendSession:
 
     # -- telemetry ---------------------------------------------------------
 
+    @property
+    def tokenizer_available(self) -> bool | None:
+        """Return capability established by the current worker, not a retired one."""
+        return self._session.tokenizer_available if self._session is not None else None
+
     def telemetry(self) -> SessionTelemetry:
         entries = self._all_telemetry()
         termination = next(
@@ -573,6 +578,7 @@ class PassageBackendSession:
             character_count=self.characters_embedded,
             crossover_characters=self.crossover_characters,
             selection_reason=self._selection_reason(),
+            worker_used=any(entry.worker_used for entry in entries),
         )
 
     def _selection_reason(self) -> str | None:
