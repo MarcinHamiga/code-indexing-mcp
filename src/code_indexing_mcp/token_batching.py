@@ -42,11 +42,18 @@ MAX_WINDOWS_PER_CANDIDATE = 16
 
 @dataclass(frozen=True)
 class TokenWindow:
-    """A token-bounded slice of one candidate, in candidate-relative characters."""
+    """A candidate-content slice and the complete model input it produces.
+
+    ``token_count`` remains content-only because it is persisted as chunk
+    telemetry. ``input_token_count`` is the optional count for the composed
+    prefix plus content, including tokenizer special tokens, and is the only
+    count suitable for padded microbatch packing.
+    """
 
     start_char: int
     end_char: int
     token_count: int
+    input_token_count: int | None = None
 
 
 def max_token_product_for(memory_bytes: int, *, max_tokens: int = DEFAULT_MAX_TOKENS) -> int:
@@ -150,18 +157,35 @@ def plan_candidate_windows(
             # Reserve the repeated header, separator, and model-added special
             # tokens. Batch packing re-encodes the final composed input exactly.
             prefix_tokens[prefix] = len(encode(f"{prefix}\n" if prefix else "").offsets)
-        # Keep at least one token of forward progress per window even when a
-        # pathological prefix would otherwise consume the whole budget.
-        budget = max(overlap_tokens + 1, max_tokens - prefix_tokens[prefix])
-        plans.append(
-            plan_token_windows(
-                content_token_offsets(encode(content)),
-                text_length=len(content),
-                max_tokens=budget,
-                overlap_tokens=overlap_tokens,
-                max_windows=max_windows,
-            )
+        budget = max_tokens - prefix_tokens[prefix]
+        if budget < 1:
+            raise ValueError("prefix consumes the complete token window budget")
+        planned = plan_token_windows(
+            content_token_offsets(encode(content)),
+            text_length=len(content),
+            max_tokens=budget,
+            overlap_tokens=overlap_tokens,
+            max_windows=max_windows,
         )
+        measured: list[TokenWindow] = []
+        for window in planned:
+            composed = (
+                f"{prefix}\n{content[window.start_char : window.end_char]}"
+                if prefix
+                else content[window.start_char : window.end_char]
+            )
+            input_tokens = len(encode(composed).offsets)
+            if input_tokens > max_tokens:
+                raise ValueError("composed embedding input exceeds the token window budget")
+            measured.append(
+                TokenWindow(
+                    window.start_char,
+                    window.end_char,
+                    window.token_count,
+                    input_token_count=input_tokens,
+                )
+            )
+        plans.append(measured)
     return plans
 
 

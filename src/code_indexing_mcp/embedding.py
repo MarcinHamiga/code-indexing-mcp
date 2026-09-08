@@ -235,7 +235,12 @@ def embed_windows[Vector](
 
     results: list[list[tuple[TokenWindow, Vector]]] = [[] for _ in candidates]
     for batch in plan_microbatches(
-        [len(encode(text).offsets) for text in texts]
+        [
+            window.input_token_count
+            if window.input_token_count is not None
+            else len(encode(text).offsets)
+            for window, text in zip(windows, texts, strict=True)
+        ]
         if encode is not None
         else [window.token_count for window in windows],
         max_items=plan.max_items,

@@ -145,6 +145,28 @@ def test_microbatches_charge_complete_model_inputs_including_special_tokens() ->
     assert all(window.token_count == 2 for segments in result for window, _ in segments)
 
 
+def test_long_repeated_prefixes_are_charged_in_microbatch_packing() -> None:
+    from test_token_batching import fake_encode
+
+    seen: list[list[str]] = []
+
+    def embed(texts: list[str]) -> list[str]:
+        seen.append(texts)
+        return ["vector" for _ in texts]
+
+    prefix = " ".join(f"header{index}" for index in range(20))
+    candidates = [PassageCandidate(prefix, "body") for _ in range(4)]
+    embed_planned_segments(
+        fake_encode,
+        embed,
+        candidates,
+        SegmentPlan(max_tokens=60, max_items=4, max_token_product=64),
+    )
+
+    assert len(seen) == 2
+    assert all(len(batch) == 2 for batch in seen)
+
+
 def test_embed_windows_restores_candidates_and_sorts_their_windows() -> None:
     candidates = [
         PassageCandidate("candidate-a", "ab"),

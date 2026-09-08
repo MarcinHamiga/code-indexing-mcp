@@ -23,10 +23,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from types import TracebackType
 
-from .backends import CPU_BACKEND, BackendSelection
+from .backends import CPU_BACKEND, BackendSelection, provider_resolution_error
 from .calibration import LIMITED_BY_MEMORY, CalibrationResult, calibrate
 from .embedding import EmbeddedSegment, PassageCandidate, SegmentPlan
 from .embedding_worker import (
@@ -68,44 +68,6 @@ def _recorded_calibration(record: ProbeRecord) -> CalibrationResult | None:
         load_ns=record.load_ns,
         limited_by=record.limited_by,
     )
-
-
-@dataclass(frozen=True)
-class _RunCounters:
-    """The telemetry a worker session accumulates as a run proceeds.
-
-    Snapshotted around calibration so a sweep -- synthetic content, embedded to
-    find a ceiling rather than to index anything -- is not reported as work the
-    run did. ``tokenizer_available`` is deliberately absent: it is a property of
-    the worker rather than of a request, and the sweep establishing it early is
-    the same answer the run would have reached anyway.
-    """
-
-    segment_count: int
-    token_count: int
-    retry_count: int
-    peak_combined_rss: int
-    safe_max_items: int
-    termination_reason: str | None
-
-    @classmethod
-    def of(cls, session: EmbeddingWorkerSession) -> _RunCounters:
-        return cls(
-            segment_count=session.segment_count,
-            token_count=session.token_count,
-            retry_count=session.retry_count,
-            peak_combined_rss=session.peak_combined_rss,
-            safe_max_items=session.safe_max_items,
-            termination_reason=session.termination_reason,
-        )
-
-    def restore(self, session: EmbeddingWorkerSession) -> None:
-        session.segment_count = self.segment_count
-        session.token_count = self.token_count
-        session.retry_count = self.retry_count
-        session.peak_combined_rss = self.peak_combined_rss
-        session.safe_max_items = self.safe_max_items
-        session.termination_reason = self.termination_reason
 
 
 def _reason(exc: BaseException) -> str:
@@ -360,14 +322,10 @@ class PassageBackendSession:
         """
         info = session.initialize()
         descriptor = self.selection.descriptor
-        if info.resolved_providers and descriptor.provider not in info.resolved_providers:
-            # ONNX Runtime drops a provider it cannot initialise and keeps
-            # running on the next one, so a "CUDA" session that quietly became
-            # a CPU session would otherwise look like a successful selection.
+        if (error := provider_resolution_error(descriptor, info.resolved_providers)) is not None:
             raise CodeIndexingError(
                 ErrorCode.BACKEND_UNAVAILABLE,
-                f"{descriptor.provider} was requested but the session runs on "
-                f"{', '.join(info.resolved_providers)}",
+                error,
                 requested=descriptor.provider,
                 resolved=list(info.resolved_providers),
             )
@@ -406,18 +364,15 @@ class PassageBackendSession:
         """
         if self._calibration_plan is None:
             return
-        before = _RunCounters.of(session)
-        try:
+        with session.measurement_scope():
             self.calibration = calibrate(
                 session, self._calibration_plan, load_ns=session.load_duration_ns
             )
-        finally:
-            before.restore(session)
-            # A sweep that overran respawned the worker, and the successor is
-            # the process this verification covers. Without this the first real
-            # request treats it as unproven and loads the model a second time --
-            # the very cost the crossover exists to spend only when it pays.
-            self._verified_spawn = session.spawn_count
+        # A sweep that overran respawned the worker, and the successor is the
+        # process this verification covers. Without this the first real request
+        # treats it as unproven and loads the model a second time -- the very
+        # cost the crossover exists to spend only when it pays.
+        self._verified_spawn = session.spawn_count
         if self.calibration is not None:
             self._calibrated_batch_size = self.calibration.max_items
             self._session_max_items = self.calibration.max_items
@@ -435,7 +390,7 @@ class PassageBackendSession:
         now, which every run reaches, including the CPU-only ones that have no
         accelerator to compare against and nothing to gain from the comparison.
         """
-        if self.probe_state != "verified":
+        if self.probe_state not in {"verified", "cached"}:
             return
         if self._calibration_plan is None or self._probe_cache is None:
             return

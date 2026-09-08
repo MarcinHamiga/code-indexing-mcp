@@ -15,12 +15,37 @@ from code_indexing_mcp.backends import (
     available_execution_providers,
     backend_for,
     parse_accelerator,
+    provider_resolution_error,
     select_backend,
 )
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 
 CUDA_PROVIDER = "CUDAExecutionProvider"
 WEBGPU_PROVIDER = "WebGpuExecutionProvider"
+
+
+@pytest.mark.parametrize(
+    ("runtime", "accelerator", "resolved", "valid"),
+    [
+        (Runtime.ONNX, Accelerator.CUDA, (), True),
+        (Runtime.ONNX, Accelerator.CUDA, (CPU_PROVIDER,), False),
+        (Runtime.ONNX_PLUGIN, Accelerator.WEBGPU, (), False),
+        (Runtime.ONNX_PLUGIN, Accelerator.WEBGPU, (WEBGPU_PROVIDER,), True),
+    ],
+)
+def test_provider_resolution_contract_is_shared_for_direct_and_fastembed_backends(
+    runtime: Runtime, accelerator: Accelerator, resolved: tuple[str, ...], valid: bool
+) -> None:
+    descriptor = BackendDescriptor(
+        accelerator=accelerator,
+        provider=CUDA_PROVIDER if accelerator is Accelerator.CUDA else WEBGPU_PROVIDER,
+        device="gpu",
+        stability=Stability.AUTOMATIC,
+        precision=Precision.FLOAT32,
+        runtime=runtime,
+    )
+
+    assert (provider_resolution_error(descriptor, resolved) is None) is valid
 
 
 def _descriptor(accelerator: Accelerator, provider: str, stability: Stability) -> BackendDescriptor:

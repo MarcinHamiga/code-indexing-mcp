@@ -5,13 +5,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import numpy as np
 import psutil
@@ -41,6 +41,12 @@ HARD_OVERSHOOT_BYTES = 128 * 1024**2
 RETRYABLE_CODES = frozenset({ErrorCode.INDEX_RESOURCE_LIMIT, ErrorCode.EMBEDDING_WORKER_FAILED})
 MAX_BATCH_RETRIES = 2
 WORKER_REQUEST_TIMEOUT_SECONDS = 120.0
+WorkerStatus = Literal[
+    "initialized", "memory", "probed", "packed", "planned", "plan_error", "error", "ok"
+]
+KNOWN_WORKER_STATUSES = frozenset(
+    {"initialized", "memory", "probed", "packed", "planned", "plan_error", "error", "ok"}
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +101,42 @@ class SessionTelemetry:
     crossover_characters: int | None = 0
     selection_reason: str | None = None
     worker_used: bool = False
+
+
+@dataclass(frozen=True)
+class WorkerTelemetrySnapshot:
+    """A typed snapshot of request telemetry owned by one worker session."""
+
+    segment_count: int
+    token_count: int
+    retry_count: int
+    peak_combined_rss: int
+    termination_reason: str | None
+
+
+@dataclass
+class WorkerTelemetry:
+    segment_count: int = 0
+    token_count: int = 0
+    retry_count: int = 0
+    peak_combined_rss: int = 0
+    termination_reason: str | None = None
+
+    def snapshot(self) -> WorkerTelemetrySnapshot:
+        return WorkerTelemetrySnapshot(
+            segment_count=self.segment_count,
+            token_count=self.token_count,
+            retry_count=self.retry_count,
+            peak_combined_rss=self.peak_combined_rss,
+            termination_reason=self.termination_reason,
+        )
+
+    def restore(self, snapshot: WorkerTelemetrySnapshot) -> None:
+        self.segment_count = snapshot.segment_count
+        self.token_count = snapshot.token_count
+        self.retry_count = snapshot.retry_count
+        self.peak_combined_rss = snapshot.peak_combined_rss
+        self.termination_reason = snapshot.termination_reason
 
 
 @runtime_checkable
@@ -268,9 +310,13 @@ class EmbeddingWorkerSession:
         target: WorkerTarget = _worker_main,
         launcher: WorkerLauncher | None = None,
         request_timeout_seconds: float = WORKER_REQUEST_TIMEOUT_SECONDS,
+        model_load_timeout_seconds: float | None = None,
+        inference_timeout_seconds: float | None = None,
     ) -> None:
         self.config = config
         self.request_timeout_seconds = request_timeout_seconds
+        self.model_load_timeout_seconds = model_load_timeout_seconds
+        self.inference_timeout_seconds = inference_timeout_seconds
         self._initialize_before_passages = target is _worker_main
         self._initialized = False
         configured = configured_ceiling_bytes or 2 * 1024**3
@@ -301,25 +347,77 @@ class EmbeddingWorkerSession:
         # caller that verified a backend needs this to notice that the process
         # it verified is not the process now serving it.
         self.spawn_count = 0
-        self.peak_combined_rss = 0
+        self._telemetry = WorkerTelemetry()
         # Telemetry surfaced on IndexReport so a run's shape is diagnosable
         # without re-running it under a profiler.
-        self.retry_count = 0
         # How long spawning the worker and loading its model took, and the
         # microbatch size a retry found to be survivable. Together they are what
         # tells a later run whether starting this backend repays the wait and
         # where to start its batches; 0 means neither has been established.
         self.load_duration_ns = 0
         self.safe_max_items = 0
-        self.segment_count = 0
-        self.token_count = 0
-        self.termination_reason: str | None = None
         self.tokenizer_available: bool | None = None
         # RSS the parent already held before the worker existed. The daemon keeps
         # a query model resident in-process, and charging that to the indexing
         # budget would trip the ceiling before any indexing work happens. Only
         # parent growth during indexing counts against the budget.
         self._parent_baseline_bytes = 0
+
+    @property
+    def peak_combined_rss(self) -> int:
+        return self._telemetry.peak_combined_rss
+
+    @peak_combined_rss.setter
+    def peak_combined_rss(self, value: int) -> None:
+        self._telemetry.peak_combined_rss = value
+
+    @property
+    def retry_count(self) -> int:
+        return self._telemetry.retry_count
+
+    @retry_count.setter
+    def retry_count(self, value: int) -> None:
+        self._telemetry.retry_count = value
+
+    @property
+    def segment_count(self) -> int:
+        return self._telemetry.segment_count
+
+    @segment_count.setter
+    def segment_count(self, value: int) -> None:
+        self._telemetry.segment_count = value
+
+    @property
+    def token_count(self) -> int:
+        return self._telemetry.token_count
+
+    @token_count.setter
+    def token_count(self, value: int) -> None:
+        self._telemetry.token_count = value
+
+    @property
+    def termination_reason(self) -> str | None:
+        return self._telemetry.termination_reason
+
+    @termination_reason.setter
+    def termination_reason(self, value: str | None) -> None:
+        self._telemetry.termination_reason = value
+
+    def telemetry_snapshot(self) -> WorkerTelemetrySnapshot:
+        """Return request telemetry without exposing the mutable accumulator."""
+        return self._telemetry.snapshot()
+
+    def restore_telemetry(self, snapshot: WorkerTelemetrySnapshot) -> None:
+        self._telemetry.restore(snapshot)
+
+    @contextmanager
+    def measurement_scope(self) -> Iterator[None]:
+        """Exclude calibration requests from the run telemetry."""
+        snapshot = self.telemetry_snapshot()
+        try:
+            yield
+        finally:
+            self.restore_telemetry(snapshot)
 
     @property
     def pid(self) -> int | None:
@@ -403,11 +501,10 @@ class EmbeddingWorkerSession:
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
         status, payload = self._request("embed", texts)
         if status == "packed":
-            return [
-                np.frombuffer(vector, dtype="<f4", count=self.config.dimension).tolist()
-                for vector in payload
-            ]
-        return [[float(value) for value in vector] for vector in payload]
+            return self._decode_packed_vectors(payload, count=len(texts))
+        if status == "ok":
+            return self._decode_float_vectors(payload, count=len(texts))
+        raise self._protocol_error(f"worker answered embed with {status!r}")
 
     def plan_and_embed(
         self, candidates: Sequence[PassageCandidate], plan: SegmentPlan
@@ -424,6 +521,8 @@ class EmbeddingWorkerSession:
                 status, payload = self._request("plan_and_embed", (request, attempt))
                 if status == "plan_error":
                     raise ValueError(str(payload))
+                if status != "planned":
+                    raise self._protocol_error(f"worker answered plan_and_embed with {status!r}")
                 if retry:
                     # This size survived what the requested one did not. Kept so
                     # the limit is carried into the cache rather than being
@@ -450,8 +549,10 @@ class EmbeddingWorkerSession:
                 # spawns a fresh process with a fresh ONNX arena.
                 self.close()
 
-        segments_payload, tokenizer_available = payload
-        self.tokenizer_available = bool(tokenizer_available)
+        segments_payload, tokenizer_available = self._decode_planned_payload(
+            payload, candidate_count=len(candidates)
+        )
+        self.tokenizer_available = tokenizer_available
         results: list[list[EmbeddedSegment]] = []
         for segments in segments_payload:
             decoded = [
@@ -501,7 +602,9 @@ class EmbeddingWorkerSession:
                 completed.set()
 
         transfer = threading.Thread(target=exchange, daemon=True, name="embedding-worker-io")
-        deadline = time.monotonic() + self.request_timeout_seconds
+        request_started = time.monotonic()
+        timeout_seconds = self._request_timeout(command)
+        deadline = request_started + timeout_seconds
         self._transfer = transfer
         transfer.start()
         consecutive_over = 0
@@ -545,19 +648,119 @@ class EmbeddingWorkerSession:
                 raise CodeIndexingError(
                     ErrorCode.EMBEDDING_WORKER_FAILED,
                     "Embedding worker exceeded its response deadline",
-                    timeout_seconds=self.request_timeout_seconds,
+                    timeout_seconds=timeout_seconds,
                     command=command,
+                    duration_seconds=time.monotonic() - request_started,
                 )
         transfer.join()
         self._transfer = None
         if failures:
             raise self._channel_failed() from failures[0]
-        status, payload = replies[0]
+        reply = replies[0]
+        if not isinstance(reply, tuple) or len(reply) != 2:
+            raise self._protocol_error("worker returned a malformed reply envelope")
+        status, payload = reply
+        if not isinstance(status, str) or status not in KNOWN_WORKER_STATUSES:
+            raise self._protocol_error(f"worker returned unknown reply status {status!r}")
         if status == "error":
             self.close()
             self.termination_reason = "worker_error"
             raise CodeIndexingError(ErrorCode.EMBEDDING_WORKER_FAILED, str(payload))
         return status, payload
+
+    def _protocol_error(self, detail: str) -> CodeIndexingError:
+        self.close()
+        self.termination_reason = "worker_protocol_error"
+        return CodeIndexingError(ErrorCode.EMBEDDING_WORKER_FAILED, detail)
+
+    def _decode_packed_vectors(self, payload: object, *, count: int) -> list[list[float]]:
+        if not isinstance(payload, (list, tuple)) or len(payload) != count:
+            raise self._protocol_error(f"worker returned the wrong vector count for {count} inputs")
+        decoded: list[list[float]] = []
+        expected_bytes = self.config.dimension * 4
+        for index, vector in enumerate(payload):
+            if not isinstance(vector, (bytes, bytearray, memoryview)):
+                raise self._protocol_error(f"worker vector {index} was not packed bytes")
+            packed = bytes(vector)
+            if len(packed) != expected_bytes:
+                raise self._protocol_error(
+                    f"worker vector {index} was {len(packed) // 4} wide, "
+                    f"expected {self.config.dimension}"
+                )
+            row = np.frombuffer(packed, dtype="<f4", count=self.config.dimension)
+            if not np.all(np.isfinite(row)):
+                raise self._protocol_error(f"worker vector {index} contains non-finite values")
+            decoded.append(row.tolist())
+        return decoded
+
+    def _decode_float_vectors(self, payload: object, *, count: int) -> list[list[float]]:
+        if not isinstance(payload, (list, tuple)) or len(payload) != count:
+            raise self._protocol_error(f"worker returned the wrong vector count for {count} inputs")
+        decoded: list[list[float]] = []
+        for index, vector in enumerate(payload):
+            if not isinstance(vector, (list, tuple)) or len(vector) != self.config.dimension:
+                raise self._protocol_error(
+                    f"worker vector {index} was not {self.config.dimension}-dimensional"
+                )
+            try:
+                row = [float(value) for value in vector]
+            except (TypeError, ValueError) as exc:
+                raise self._protocol_error(f"worker vector {index} was not numeric") from exc
+            if not np.all(np.isfinite(row)):
+                raise self._protocol_error(f"worker vector {index} contains non-finite values")
+            decoded.append(row)
+        return decoded
+
+    def _decode_planned_payload(
+        self, payload: object, *, candidate_count: int
+    ) -> tuple[list[list[tuple[int, int, int, bytes]]], bool]:
+        if not isinstance(payload, tuple | list) or len(payload) != 2:
+            raise self._protocol_error("worker returned a malformed planned payload")
+        raw_segments, tokenizer_available = payload
+        if not isinstance(tokenizer_available, bool):
+            raise self._protocol_error("worker planned payload has a non-boolean tokenizer flag")
+        if not isinstance(raw_segments, (list, tuple)) or len(raw_segments) != candidate_count:
+            raise self._protocol_error(
+                f"worker returned planned results for {candidate_count} candidates"
+            )
+        expected_bytes = self.config.dimension * 4
+        decoded: list[list[tuple[int, int, int, bytes]]] = []
+        for group in raw_segments:
+            if not isinstance(group, (list, tuple)):
+                raise self._protocol_error("worker planned result was not a segment list")
+            decoded_group: list[tuple[int, int, int, bytes]] = []
+            for segment in group:
+                if not isinstance(segment, tuple | list) or len(segment) != 4:
+                    raise self._protocol_error("worker returned a malformed segment")
+                start, end, token_count, vector = segment
+                if (
+                    isinstance(start, bool)
+                    or not isinstance(start, int)
+                    or isinstance(end, bool)
+                    or not isinstance(end, int)
+                    or isinstance(token_count, bool)
+                    or not isinstance(token_count, int)
+                    or start < 0
+                    or end < start
+                    or token_count < 0
+                ):
+                    raise self._protocol_error("worker returned invalid segment offsets")
+                if not isinstance(vector, (bytes, bytearray, memoryview)):
+                    raise self._protocol_error("worker segment vector was not packed bytes")
+                packed = bytes(vector)
+                if len(packed) != expected_bytes:
+                    raise self._protocol_error("worker segment vector has the wrong dimension")
+                decoded_group.append((start, end, token_count, packed))
+            decoded.append(decoded_group)
+        return decoded, tokenizer_available
+
+    def _request_timeout(self, command: str) -> float:
+        configured = (
+            self.model_load_timeout_seconds
+            if command == "initialize"
+            else self.inference_timeout_seconds
+        )
+        return self.request_timeout_seconds if configured is None else configured
 
     def _channel_failed(self) -> CodeIndexingError:
         """Report a broken command channel as this session's own failure.

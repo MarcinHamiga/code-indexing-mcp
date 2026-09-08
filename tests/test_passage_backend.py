@@ -869,6 +869,43 @@ def test_a_cached_calibration_is_not_measured_again(tmp_path: Path) -> None:
     assert backend.calibration.max_items == 4
 
 
+def test_a_cached_accelerator_retries_a_missing_cpu_reference_measurement(
+    tmp_path: Path,
+) -> None:
+    cache = ProbeCache(tmp_path / "probes.json")
+    accelerator_key = _probe_key()
+    cache.store(
+        accelerator_key,
+        batch_size=8,
+        dimension=DIMENSION,
+        characters_per_second=100.0,
+        load_ns=1,
+    )
+    cpu_key = _cpu_probe_key()
+
+    with _backend(
+        _healthy_worker,
+        cpu_target=_dead_on_initialize_worker,
+        probe_cache=cache,
+        probe_key=accelerator_key,
+        cpu_probe_key=cpu_key,
+        calibration_plan=PLAN,
+    ) as first:
+        first.plan_and_embed(_candidates(1), PLAN)
+    assert cache.load(cpu_key) is None
+
+    with _backend(
+        _healthy_worker,
+        probe_cache=cache,
+        probe_key=accelerator_key,
+        cpu_probe_key=cpu_key,
+        calibration_plan=PLAN,
+    ) as second:
+        second.plan_and_embed(_candidates(1), PLAN)
+
+    assert cache.load(cpu_key) is not None
+
+
 def _shrinking_worker(connection: Connection, config: WorkerConfig) -> None:
     """Healthy, except that any microbatch above one item overruns the ceiling."""
     while True:
