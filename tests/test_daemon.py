@@ -128,7 +128,9 @@ def test_retained_broker_follows_daemon_restart_in_another_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
-    with tempfile.TemporaryDirectory(prefix="cim-") as runtime:
+    with tempfile.TemporaryDirectory(
+        prefix="cim-", dir="/tmp" if os.name != "nt" else None
+    ) as runtime:
         monkeypatch.setenv("XDG_RUNTIME_DIR", runtime)
         first = DaemonServer(paths, application=Application(paths, embedder=TinyEmbedder()))
         first_thread = threading.Thread(target=first.serve, daemon=True)
@@ -789,11 +791,13 @@ def test_a_daemon_killed_mid_request_reaches_the_client_as_daemon_unavailable(
     paths.data.mkdir(parents=True)
     (paths.data / "daemon.token").write_text("shared-token")
     endpoint = daemon_endpoint(paths)
+    ready = threading.Event()
 
     def dying_daemon() -> None:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             server.bind(str(endpoint))
             server.listen()
+            ready.set()
             connection, _ = server.accept()
             with connection:
                 receive_frame(connection)
@@ -802,9 +806,8 @@ def test_a_daemon_killed_mid_request_reaches_the_client_as_daemon_unavailable(
 
     thread = threading.Thread(target=dying_daemon, daemon=True)
     thread.start()
-    deadline = time.monotonic() + 2
-    while not endpoint.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
+    # bind creates the pathname before listen accepts connections.
+    assert ready.wait(timeout=2)
 
     broker = BrokerApplication(paths, cwd=tmp_path)
     with pytest.raises(CodeIndexingError) as raised:
@@ -1370,11 +1373,13 @@ def test_a_stale_daemon_is_reported_running_and_retired(tmp_path: Path) -> None:
     (paths.data / "daemon.token").write_text("shared-token")
     endpoint = daemon_endpoint(paths)
     old_protocol = 2
+    ready = threading.Event()
 
     def old_daemon() -> None:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             server.bind(str(endpoint))
             server.listen()
+            ready.set()
             while True:
                 connection, _ = server.accept()
                 with connection:
@@ -1399,9 +1404,7 @@ def test_a_stale_daemon_is_reported_running_and_retired(tmp_path: Path) -> None:
 
     thread = threading.Thread(target=old_daemon, daemon=True)
     thread.start()
-    deadline = time.monotonic() + 2
-    while not endpoint.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert ready.wait(timeout=2)
 
     assert daemon.daemon_status(paths) == {"running": True, "protocol": old_protocol}
 
@@ -1727,3 +1730,41 @@ def test_broker_mirrors_application_surface() -> None:
         assert not missing, (
             f"{name}: BrokerApplication names {sorted(missing)} that Application no longer accepts"
         )
+
+
+@requires_local_sockets
+def test_endpoint_falls_back_when_runtime_path_exceeds_socket_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / ("long-runtime-" * 12)
+    runtime.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    endpoint = daemon_endpoint(paths)
+    assert len(os.fsencode(endpoint)) <= 103
+    assert stat.S_IMODE(endpoint.parent.stat().st_mode) == 0o700
+    with daemon._local_socket() as listener:
+        try:
+            listener.bind(str(endpoint))
+        finally:
+            endpoint.unlink(missing_ok=True)
+
+
+@requires_local_sockets
+def test_discovery_skips_an_overlong_published_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    broker = BrokerApplication(paths)
+    with tempfile.TemporaryDirectory(prefix="cim-", dir="/tmp") as runtime:
+        endpoint = Path(runtime) / "valid.sock"
+        with daemon._local_socket() as listener:
+            listener.bind(str(endpoint))
+            listener.listen()
+            monkeypatch.setattr(
+                daemon,
+                "_daemon_endpoint_candidates",
+                lambda *_args: iter([tmp_path / ("x" * 200), endpoint]),
+            )
+            with broker._connect():
+                assert broker.endpoint == endpoint

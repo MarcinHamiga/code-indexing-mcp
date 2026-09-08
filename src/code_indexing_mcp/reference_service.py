@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
 import re
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal, NamedTuple, cast
 
@@ -20,6 +21,7 @@ from .language_rules import (
     _python_package_root,
 )
 from .models import (
+    MAX_FILE_BYTES_CEILING,
     REFERENCE_SCHEMA_VERSION,
     CompletenessReport,
     DeadCodeFinding,
@@ -53,6 +55,8 @@ from .patching import (
     apply_edits,
     render_unified_diff,
 )
+from .python_bindings import PythonBindings
+from .source_io import SourceReadError, read_source
 from .storage import LanceStore, PartitionRef, ReferenceRecord
 
 # Reason codes that describe something the syntax-only index could not see.
@@ -1419,6 +1423,7 @@ class ReferenceService:
         }
         digests: dict[str, str] = {}
         stale_paths: set[str] = set()
+        python_bindings: dict[str, PythonBindings] = {}
         for row in records:
             if row["record_kind"] != "reference" or not self._may_refer(
                 row, selected, imports, reexport_rows, known_paths, module_index
@@ -1452,6 +1457,25 @@ class ReferenceService:
             if not self._matches_coverage(row["path"], coverage_hashes, source, bom, digests):
                 stale_paths.add(row["path"])
                 continue
+            if row["language"] == "python" and resolution == "exact":
+                bindings = python_bindings.get(row["path"])
+                if bindings is None:
+                    bindings = PythonBindings(source)
+                    python_bindings[row["path"]] = bindings
+                verdict = self._python_binding_verdict(
+                    row, selected, bindings, imports, reexport_rows, known_paths, module_index
+                )
+                if verdict is False:
+                    continue
+                if verdict is None:
+                    resolution, reason, explanation = (
+                        "unresolved",
+                        "unsupported_binding",
+                        "The lexical binding cannot be established safely from this source.",
+                    )
+                    limitations.append(
+                        ReferenceLimitation(code=reason, explanation=explanation, path=row["path"])
+                    )
             start_byte = row["start_byte"] or 0
             end_byte = row["end_byte"] or 0
             hits.append(
@@ -1506,6 +1530,55 @@ class ReferenceService:
             )
         hits.sort(key=lambda hit: (hit.path, hit.start_line, hit.start_byte, hit.reference_id))
         return hits, limitations, declarations
+
+    def _python_binding_verdict(
+        self,
+        row: ReferenceRecord,
+        selected: SelectedDeclaration,
+        bindings: PythonBindings,
+        imports: dict[str, list[ReferenceRecord]],
+        reexports: dict[str, list[ReferenceRecord]],
+        known_paths: frozenset[str],
+        module_index: _ModuleIndex | None,
+    ) -> bool | None:
+        # Import/export edges name the exported object, not the consumer binding.
+        if row["kind"] == "export":
+            return True
+        receiver = row["receiver_text"]
+        owner_receiver = receiver in {"self", "cls"} and self._same_owner(row, selected)
+        name = receiver or row["written_name"] or ""
+        nodes, unsupported = bindings.lookup(row["start_byte"] or 0, name)
+        if row["kind"] == "import":
+            nodes = [
+                node
+                for node in nodes
+                if bindings.start(node) <= (row["start_byte"] or 0) < bindings.end(node)
+            ]
+        if unsupported or len(nodes) != 1:
+            return None
+        node = nodes[0]
+        if owner_receiver and isinstance(node, ast.arg):
+            return True if id(node) in bindings.receiver_parameters else None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return (
+                row["file_id"] == selected.file_id
+                and bindings.qualified.get(id(node)) == selected.qualified_symbol
+                and node.name == selected.symbol
+            )
+        if not isinstance(node, ast.alias):
+            return False
+        source_imports = [
+            item
+            for item in imports.get(row["file_id"], [])
+            if bindings.start(node) <= (item["start_byte"] or 0) < bindings.end(node)
+        ]
+        return any(
+            self._import_targets(item, selected, known_paths, module_index)
+            or self._reexport_targets_symbol(
+                item, selected.symbol, selected.path, reexports, known_paths, module_index
+            )
+            for item in source_imports
+        )
 
     def analyze_refactor(
         self,
@@ -1639,6 +1712,97 @@ class ReferenceService:
         override_findings = _dedupe_edit_spans(override_findings, required_edit_spans)
         full_likely = _dedupe_edit_spans(full_likely, required_edit_spans)
 
+        binding_limitations: list[ReferenceLimitation] = []
+        if isinstance(operation, RenameOperation):
+            candidates = [*full_must]
+            if declaration_finding is not None:
+                candidates.append(declaration_finding)
+            collision_paths: set[str] = set()
+            unsupported_paths: set[str] = {
+                item.path
+                for item in response.limitations
+                if item.code == "unsupported_binding" and item.path is not None
+            }
+            binding_indexes: dict[str, PythonBindings] = {}
+            for finding in candidates:
+                source, bom = self._file_bytes(root, finding.path, sources)
+                if finding.language != "python":
+                    # Structural rows do not model local bindings in these languages.
+                    # Keep declaration/import-only renames when the destination is
+                    # absent; calls, reads and escaped identifiers need a binder.
+                    text = source.decode("utf-8", errors="replace")
+                    if re.search(
+                        r"(?<![\w$])" + re.escape(operation.new_name) + r"(?![\w$])", text
+                    ):
+                        collision_paths.add(finding.path)
+                    if (
+                        finding.kind not in {"import", "export"}
+                        and finding.reason_code != "declaration"
+                    ) or "\\" in text:
+                        unsupported_paths.add(finding.path)
+                    continue
+                bindings = binding_indexes.get(finding.path)
+                if bindings is None:
+                    bindings = PythonBindings(source)
+                    binding_indexes[finding.path] = bindings
+                if bindings.lookup(finding.start_byte - bom, "\0")[1]:
+                    unsupported_paths.add(finding.path)
+                if (
+                    "." in response.selected.qualified_symbol
+                    and operation.new_name in bindings.attribute_writes
+                ):
+                    collision_paths.add(finding.path)
+                row = shapes_by_id.get(finding.reference_id)
+                # An explicit import alias remains unchanged by the rename.
+                if finding.kind == "import" and row is not None and row["alias"]:
+                    continue
+                if row is not None and row["receiver_text"]:
+                    continue
+                if bindings.collision(
+                    finding.start_byte - bom,
+                    operation.new_name,
+                    local_only=finding.reason_code == "declaration",
+                ):
+                    collision_paths.add(finding.path)
+            if unsupported_paths:
+                binding_limitations.extend(
+                    ReferenceLimitation(
+                        code="unsupported_binding",
+                        path=path,
+                        explanation=(
+                            "Binding safety cannot be established for this scope; "
+                            "automatic rename edits are withheld."
+                        ),
+                    )
+                    for path in sorted(unsupported_paths)
+                )
+            if collision_paths or unsupported_paths:
+                reason_code = "rename_collision" if collision_paths else "unsupported_binding"
+                explanation = (
+                    (
+                        "The destination name is already bound in an edited scope: "
+                        + ", ".join(sorted(collision_paths))
+                        + ". All rename edits are withheld to avoid a partial binding change."
+                    )
+                    if collision_paths
+                    else ("Binding safety cannot be established; all rename edits are withheld.")
+                )
+                full_review.extend(
+                    finding.model_copy(
+                        update={
+                            "resolution": "unresolved",
+                            "reason_code": reason_code,
+                            "explanation": explanation,
+                            "edit_required": False,
+                            "edit_start_byte": None,
+                            "edit_end_byte": None,
+                        }
+                    )
+                    for finding in candidates
+                )
+                full_must = []
+                declaration_finding = None
+
         if paginate:
             page_ids = {hit.reference_id for hit in response.hits}
             must_change = [finding for finding in full_must if finding.reference_id in page_ids]
@@ -1655,7 +1819,7 @@ class ReferenceService:
                 must_change = [declaration_finding, *must_change]
             likely_change = [*override_findings, *likely_change]
 
-        limitations = response.limitations
+        limitations = [*response.limitations, *binding_limitations]
         counts = RefactorCounts(
             must_change=len(full_must) + (1 if declaration_finding is not None else 0),
             likely_change=len(full_likely) + len(override_findings),
@@ -2042,6 +2206,7 @@ class ReferenceService:
         likely_change: list[RefactorFinding] = []
         review: list[RefactorFinding] = []
         evidence: list[RefactorFinding] = []
+        binding_indexes: dict[str, PythonBindings] = {}
         for hit in hits:
             finding = RefactorFinding(**hit.model_dump(), edit_required=False)
             if hit.resolution == "unresolved":
@@ -2058,6 +2223,15 @@ class ReferenceService:
                     and row is not None
                     and row["imported_name"] == selected.symbol
                 )
+                if hit.language == "python" and hit.kind not in {"import", "export"}:
+                    source, bom = self._file_bytes(root, hit.path, sources)
+                    bindings = binding_indexes.get(hit.path)
+                    if bindings is None:
+                        bindings = PythonBindings(source)
+                        binding_indexes[hit.path] = bindings
+                    nodes, _ = bindings.lookup(hit.start_byte - bom, written)
+                    if len(nodes) == 1 and isinstance(nodes[0], ast.alias) and nodes[0].asname:
+                        needs_edit = False
                 if not needs_edit:
                     evidence.append(finding)
                     continue
@@ -2069,6 +2243,15 @@ class ReferenceService:
                     selected.symbol,
                     bom,
                 )
+                if hit.language == "python" and hit.kind == "import":
+                    bindings = binding_indexes.get(hit.path)
+                    if bindings is None:
+                        bindings = PythonBindings(source)
+                        binding_indexes[hit.path] = bindings
+                    imported = bindings.nodes.get(hit.start_byte - bom)
+                    if isinstance(imported, ast.alias) and imported.name == selected.symbol:
+                        edit_start = hit.start_byte
+                        edit_end = edit_start + len(selected.symbol.encode("utf-8"))
                 must_change.append(
                     finding.model_copy(
                         update={
@@ -2252,19 +2435,9 @@ class ReferenceService:
         Dynamic dispatch means an override can never be proven `exact` from
         syntax alone, so every finding here is `likely_change`.
 
-        `records` no longer carries `declaration` rows (S4/E3): both
-        `base_decl` and each `override_decl` below are looked up by their own
-        exact `source_qualified_symbol` via `declaration_shapes`, from the
-        same pinned `version` `records` was fetched from.
-
-        `inheritance_rows` (D3) is fetched directly from the store rather
-        than filtered out of `records`: the BFS below walks *every* subclass
-        transitively, so at each hop it needs inheritance rows whose base
-        name matches that hop's own class -- not just rows whose spelling
-        happened to match the originally selected symbol, which is all
-        `records`' candidate condition (D1) guarantees. `kind = 'inheritance'`
-        rows are one per class declaration with a base clause, project-wide,
-        so this stays a narrow query rather than the whole table.
+        Import aliases are resolved once into adjacency edges. Declaration
+        shapes are bulk-fetched from the pinned snapshot before traversal;
+        each reachable subclass is visited once, including diamond graphs.
         """
 
         if "." not in selected.qualified_symbol:
@@ -2304,17 +2477,67 @@ class ReferenceService:
             kinds=("inheritance",),
             partition_id=partition_id,
         )
+        classes: dict[tuple[str, str], tuple[str, str, str]] = {
+            (base_decl["path"], owner_symbol): (selected.file_id, owner_symbol, base_decl["path"])
+        }
+        for row in inheritance_rows:
+            qualified = row["source_qualified_symbol"]
+            if qualified:
+                classes[(row["path"], qualified)] = (row["file_id"], qualified, row["path"])
+        by_path_name: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+        by_path: dict[str, list[tuple[str, str, str]]] = {}
+        for identity in classes.values():
+            by_path_name.setdefault((identity[2], identity[1].rsplit(".", 1)[-1]), []).append(
+                identity
+            )
+            by_path.setdefault(identity[2], []).append(identity)
+        adjacency: dict[tuple[str, str], list[ReferenceRecord]] = {}
+        for row in inheritance_rows:
+            written = row["target_name"] or ""
+            receiver, _, tail = written.rpartition(".")
+            candidates = (
+                set(by_path_name.get((row["path"], written), [])) if not receiver else set()
+            )
+            for item in imports.get(row["file_id"], []):
+                binding = item["alias"] or item["written_name"] or item["imported_name"]
+                if binding != (receiver or tail) or item["module_path"] is None:
+                    continue
+                imported = tail if receiver else item["imported_name"]
+                for module_candidate in self._module_candidates(
+                    item["path"], item["language"], item["module_path"], known_paths, module_index
+                ):
+                    candidates.update(
+                        by_path.get(str(module_candidate), [])
+                        if imported == "default"
+                        else by_path_name.get((str(module_candidate), imported or ""), [])
+                    )
+            for file_id, qualified, path in sorted(candidates):
+                if self._inheritance_targets(
+                    row,
+                    file_id,
+                    qualified.rsplit(".", 1)[-1],
+                    path,
+                    imports,
+                    known_paths,
+                    module_index,
+                ):
+                    adjacency.setdefault((file_id, qualified), []).append(row)
+        override_shapes = self.store.declaration_shapes_many(
+            selected.project_id,
+            [f"{qualified}.{method_name}" for _, qualified in classes],
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+            partition_id=partition_id,
+        )
+        overrides_by_key = {
+            (row["file_id"], row["source_qualified_symbol"]): row for row in override_shapes
+        }
         findings: list[RefactorFinding] = []
         visited: set[tuple[str, str]] = {(selected.file_id, owner_symbol)}
-        queue: list[tuple[str, str, str]] = [(selected.file_id, owner_symbol, base_decl["path"])]
+        queue = deque([(selected.file_id, owner_symbol)])
         while queue:
-            base_file_id, base_qualified, base_path = queue.pop(0)
-            base_tail = base_qualified.rsplit(".", 1)[-1]
-            for row in inheritance_rows:
-                if not self._inheritance_targets(
-                    row, base_file_id, base_tail, base_path, imports, known_paths, module_index
-                ):
-                    continue
+            base_key = queue.popleft()
+            for row in adjacency.get(base_key, []):
                 subclass_qualified = row["source_qualified_symbol"]
                 if not subclass_qualified:
                     continue
@@ -2322,19 +2545,9 @@ class ReferenceService:
                 if key in visited:
                     continue
                 visited.add(key)
-                queue.append((row["file_id"], subclass_qualified, row["path"]))
+                queue.append(key)
                 override_symbol = f"{subclass_qualified}.{method_name}"
-                override_candidates = self.store.declaration_shapes(
-                    selected.project_id,
-                    override_symbol,
-                    version=version,
-                    schema_version=REFERENCE_SCHEMA_VERSION,
-                    partition_id=partition_id,
-                )
-                override_decl = next(
-                    (decl for decl in override_candidates if decl["file_id"] == row["file_id"]),
-                    None,
-                )
+                override_decl = overrides_by_key.get((row["file_id"], override_symbol))
                 if override_decl is None:
                     continue
                 source, bom = self._file_bytes(root, row["path"], sources)
@@ -3363,7 +3576,18 @@ class ReferenceService:
         entry = cache.get(path)
         if entry is None:
             try:
-                raw = (root / path).read_bytes() if root is not None else b""
+                raw = (
+                    read_source(root, Path(path), MAX_FILE_BYTES_CEILING)[0]
+                    if root is not None
+                    else b""
+                )
+            except SourceReadError as exc:
+                raise CodeIndexingError(
+                    ErrorCode.REFERENCE_INDEX_UNAVAILABLE,
+                    "Unsafe live source path; reference analysis cannot proceed",
+                    path=path,
+                    reason=exc.reason,
+                ) from exc
             except OSError:
                 raw = b""
             offset = len(_BOM) if raw.startswith(_BOM) else 0

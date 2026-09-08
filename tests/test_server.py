@@ -412,6 +412,8 @@ async def test_lazy_merged_search_refreshes_every_requested_checkout(tmp_path: P
     ) as client:
         first = await client.call_tool("search_code", {"query": "return"})
         assert not first.isError
+        assert first.structuredContent is not None
+        assert [hit["symbol"] for hit in first.structuredContent["hits"]].count("main_branch") == 1
 
         # A commit changes the canonical checkout's HEAD, which no clean-answer
         # cache may paper over: the fingerprint includes the HEAD OID.
@@ -430,13 +432,11 @@ async def test_lazy_merged_search_refreshes_every_requested_checkout(tmp_path: P
         second = await client.call_tool("search_code", {"query": "after_change"})
         assert not second.isError
 
-    symbols = {hit.symbol for hit in app.search_code("return", roots=[repo, worktree]).hits}
-    # The canonical checkout's slot was refreshed before the merged answer.
-    assert "after_change" in symbols
-    # The untouched worktree slot keeps serving its own checkout, still at the
-    # pre-commit HEAD. (main_branch is deduplicated against the refreshed
-    # main.py chunk: same project, path, and line range across two slots.)
-    assert "worktree_branch" in symbols
+    for roots in ([repo, worktree], [worktree, repo]):
+        symbols = {hit.symbol for hit in app.search_code("return", roots=roots).hits}
+        # The refreshed and untouched checkouts have distinct source at the
+        # same main.py line range. Both must survive exact-content deduplication.
+        assert symbols == {"after_change", "main_branch", "worktree_branch"}
 
 
 @pytest.mark.asyncio

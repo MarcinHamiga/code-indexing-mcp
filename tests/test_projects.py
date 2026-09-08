@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -251,3 +252,41 @@ def test_rooted_under_accepts_a_case_insensitive_parent_spelling(
     alias = case_insensitive_path_alias(parent)
 
     assert rooted_under(alias.resolve(), child.resolve()) is True
+
+
+@pytest.mark.parametrize("component", ["directory", ".gitignore", "project.toml"])
+def test_marker_initialization_rejects_symlinks(tmp_path: Path, component: str) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    valuable = outside / "valuable"
+    valuable.write_text("valuable contents\n")
+    marker = root / ".ci-mcp"
+    if component == "directory":
+        marker.symlink_to(outside, target_is_directory=True)
+    else:
+        marker.mkdir()
+        (marker / component).symlink_to(valuable)
+    with pytest.raises(CodeIndexingError):
+        initialize_project(root, force_new_id=True)
+    assert valuable.read_text() == "valuable contents\n"
+    assert sorted(item.name for item in outside.iterdir()) == ["valuable"]
+
+
+def test_marker_creation_preserves_existing_gitignore(tmp_path: Path) -> None:
+    marker = tmp_path / ".ci-mcp"
+    marker.mkdir()
+    (marker / ".gitignore").write_text("# existing rules\ncustom\n")
+    initialize_project(tmp_path)
+    assert (marker / ".gitignore").read_text() == "# existing rules\ncustom\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises unsupported non-Windows fallback")
+def test_marker_write_fails_closed_without_pinned_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(os, "supports_dir_fd", set())
+    with pytest.raises(CodeIndexingError, match="safely"):
+        initialize_project(tmp_path)
+    assert not (tmp_path / ".ci-mcp" / "project.toml").exists()

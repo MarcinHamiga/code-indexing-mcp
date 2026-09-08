@@ -44,6 +44,7 @@ from .git_state import (
     slot_id as git_slot_id,
 )
 from .history import HistoryStore
+from .memory_budget import check_parent_memory_budget, indexing_memory_budget
 
 # REFERENCE_SCHEMA_VERSION and content_digest (as `_digest`) moved to models.py
 # (D3 in docs/plans/2026-09-02-review-remediation-5-application-split-plan.md):
@@ -72,6 +73,7 @@ from .models import content_digest as _digest
 from .passage_cache import PassageReuseContext
 from .progress import IndexProgress, ProgressPublisher
 from .scanner import SourceScanner
+from .source_io import read_source
 from .staging import ChunkRow, ReferenceRow, StagingJob
 from .storage import SCHEMA_VERSION, ActiveIndexTarget, LanceStore, PartitionRef
 
@@ -128,13 +130,13 @@ def _candidate_groups(
     for candidate in candidates:
         if group and (
             len(group) >= CANDIDATE_GROUP_COUNT
-            or characters + len(candidate.chunk.content) > CANDIDATE_GROUP_CHARS
+            or characters + len(candidate.chunk.embedding_text) > CANDIDATE_GROUP_CHARS
         ):
             yield group
             group = []
             characters = 0
         group.append(candidate)
-        characters += len(candidate.chunk.content)
+        characters += len(candidate.chunk.embedding_text)
     if group:
         yield group
 
@@ -224,7 +226,7 @@ class _IndexScanState:
     def add_pending(self, pending_file: _PendingFile) -> None:
         self.pending.append(pending_file)
         self.pending_chunks += len(pending_file.chunks)
-        self.pending_chars += pending_file.source_chars
+        self.pending_chars += sum(len(chunk.embedding_text) for chunk in pending_file.chunks)
 
     def clear_pending(self) -> None:
         self.pending.clear()
@@ -362,7 +364,9 @@ class Indexer:
         staging_directory: Path | None = None,
         progress_directory: Path | None = None,
         history: HistoryStore | None = None,
+        memory_ceiling_bytes: int = 2 * 1024**3,
     ) -> None:
+        self.memory_ceiling_bytes = memory_ceiling_bytes
         self.store = store
         self.scanner = scanner
         self.extractor = extractor
@@ -860,7 +864,7 @@ class Indexer:
                     incomplete_paths.append(record.path)
                     continue
                 try:
-                    source = item.absolute_path.read_bytes()
+                    source, _ = read_source(project.root, item.path, project.scan.max_file_bytes)
                 except OSError:
                     stale_paths.append(record.path)
                     continue
@@ -868,7 +872,8 @@ class Indexer:
                     stale_paths.append(record.path)
                     continue
                 try:
-                    extraction = self.extractor.extract(item.path, item.language, source)
+                    with indexing_memory_budget(self.memory_ceiling_bytes):
+                        extraction = self.extractor.extract(item.path, item.language, source)
                 except CodeIndexingError:
                     raise
                 except Exception:
@@ -1062,7 +1067,7 @@ class Indexer:
                 if self.passage_cache_factory is not None
                 else contextlib.nullcontext(None)
             )
-            with cache_context as passage_reuse:
+            with indexing_memory_budget(self.memory_ceiling_bytes), cache_context as passage_reuse:
                 context = (
                     self.passage_session_factory()
                     if self.passage_session_factory is not None
@@ -1331,7 +1336,9 @@ class Indexer:
         try:
             with timer.measure("scan"):
                 source = (
-                    item.content if item.content is not None else item.absolute_path.read_bytes()
+                    item.content
+                    if item.content is not None
+                    else read_source(project.root, item.path, project.scan.max_file_bytes)[0]
                 )
                 state.bytes_read += len(source)
                 rejection = _content_rejection(source)
@@ -1378,6 +1385,7 @@ class Indexer:
             )
             with timer.measure("parse"):
                 extraction = self.extractor.extract(item.path, item.language, source)
+                check_parent_memory_budget()
             state.parsed += 1
             state.chunks_extracted += len(extraction.chunks)
             state.reference_extraction_ns += extraction.reference_extraction_ns
@@ -1416,7 +1424,9 @@ class Indexer:
             if state.pending and (
                 len(state.pending) >= CANDIDATE_GROUP_COUNT
                 or state.pending_chunks + len(extraction.chunks) > CANDIDATE_GROUP_COUNT
-                or state.pending_chars + source_chars > CANDIDATE_GROUP_CHARS
+                or state.pending_chars
+                + sum(len(chunk.embedding_text) for chunk in extraction.chunks)
+                > CANDIDATE_GROUP_CHARS
             ):
                 self._flush_pending(
                     project,

@@ -484,6 +484,7 @@ class Application:
             store=self.store,
             scanner=SourceScanner(),
             extractor=TreeSitterExtractor(),
+            memory_ceiling_bytes=self.settings.index_memory_bytes,
             embedder=embedder,
             lock_directory=paths.data / "locks",
             batch_size=self.embedding_batch_size,
@@ -1071,7 +1072,12 @@ class Application:
                 state = "stale"
             else:
                 existing_files = {record.path: record for record in files}
-                candidates = self._subset_stale_candidates(slot, git)
+                # Eligibility changes affect clean tracked files as well as dirty paths.
+                candidates = (
+                    self._subset_stale_candidates(slot, git)
+                    if slot.scan_config_hash == LanceStore._scan_config_hash(resolved)
+                    else None
+                )
                 is_stale = (
                     self._paths_are_stale(
                         resolved,

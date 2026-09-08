@@ -902,13 +902,9 @@ def test_a_c_rename_analysis_covers_its_caller(tmp_path: Path) -> None:
         RenameOperation(new_name="Permit"),
     )
 
-    edited_paths = {
-        (item.path, item.written_name)
-        for item in analysis.must_change
-        if item.edit_required and item.written_name == "Authorize"
-    }
-    assert ("svc.c", "Authorize") in edited_paths
-    assert len([item for item in analysis.must_change if item.path == "svc.c"]) >= 2
+    assert not analysis.must_change
+    assert len([item for item in analysis.review if item.path == "svc.c"]) >= 2
+    assert all(item.reason_code == "unsupported_binding" for item in analysis.review)
 
 
 def test_a_go_rename_analysis_covers_its_same_package_caller(tmp_path: Path) -> None:
@@ -928,14 +924,10 @@ def test_a_go_rename_analysis_covers_its_same_package_caller(tmp_path: Path) -> 
         RenameOperation(new_name="Permit"),
     )
 
-    assert analysis.completeness.state == "complete"
-    edited_paths = {
-        (item.path, item.written_name)
-        for item in analysis.must_change
-        if item.edit_required and item.written_name == "Authorize"
-    }
-    assert ("svc.go", "Authorize") in edited_paths
-    assert ("use.go", "Authorize") in edited_paths
+    assert analysis.completeness.state == "complete_with_dynamic_limitations"
+    assert not analysis.must_change
+    assert {item.path for item in analysis.review} == {"use.go", "svc.go"}
+    assert all(item.reason_code == "unsupported_binding" for item in analysis.review)
 
 
 def test_a_rust_rename_analysis_covers_its_imported_caller(tmp_path: Path) -> None:
@@ -958,14 +950,10 @@ def test_a_rust_rename_analysis_covers_its_imported_caller(tmp_path: Path) -> No
         RenameOperation(new_name="Permit"),
     )
 
-    assert analysis.completeness.state == "complete"
-    edited_paths = {
-        (item.path, item.written_name)
-        for item in analysis.must_change
-        if item.edit_required and item.written_name == "Authorize"
-    }
-    assert ("src/auth.rs", "Authorize") in edited_paths
-    assert ("src/lib.rs", "Authorize") in edited_paths
+    assert analysis.completeness.state == "complete_with_dynamic_limitations"
+    assert not analysis.must_change
+    assert {item.path for item in analysis.review} == {"src/auth.rs", "src/lib.rs"}
+    assert all(item.reason_code == "unsupported_binding" for item in analysis.review)
 
 
 def test_an_unproven_call_keeps_the_analysis_out_of_the_complete_state(
@@ -1023,7 +1011,7 @@ def test_a_ts_scope_no_longer_carries_the_blanket_extraction_gaps_limitation(
     assert not any(item.code == "extraction_gaps" for item in response.limitations)
 
 
-def test_a_ts_scope_reaches_the_complete_state_for_a_function_rename(tmp_path: Path) -> None:
+def test_a_ts_scope_reports_unproven_bindings_for_a_function_rename(tmp_path: Path) -> None:
     service, project_id = _indexed_service(
         tmp_path,
         {
@@ -1038,10 +1026,11 @@ def test_a_ts_scope_reaches_the_complete_state_for_a_function_rename(tmp_path: P
     )
 
     assert not any(item.code == "extraction_gaps" for item in analysis.limitations)
-    assert analysis.completeness.state == "complete"
+    assert analysis.completeness.state == "complete_with_dynamic_limitations"
+    assert any(item.code == "unsupported_binding" for item in analysis.limitations)
 
 
-def test_a_ts_class_rename_finds_the_heritage_reference_and_reaches_complete(
+def test_a_ts_class_rename_reports_the_heritage_binding_for_review(
     tmp_path: Path,
 ) -> None:
     """E1 is fixed: class-heritage extraction now surfaces `extends Base`, so
@@ -1060,11 +1049,11 @@ def test_a_ts_class_rename_finds_the_heritage_reference_and_reaches_complete(
         RenameOperation(new_name="Foundation"),
     )
 
-    findings = analysis.must_change + analysis.likely_change
+    findings = analysis.findings
     inheritance_hit = next(
         item for item in findings if item.path == "child.ts" and item.kind == "inheritance"
     )
-    assert inheritance_hit.resolution in {"exact", "likely"}
+    assert inheritance_hit.reason_code == "unsupported_binding"
     assert not any(item.code == "extraction_gaps" for item in analysis.limitations)
     assert analysis.completeness.state != "incomplete"
 
@@ -1139,6 +1128,14 @@ def test_analyze_refactor_fetches_declarations_narrowly_not_from_the_full_table(
     )
     calls: list[str] = []
     real_declaration_shapes = service.store.declaration_shapes
+    bulk_calls: list[list[str]] = []
+    real_bulk = service.store.declaration_shapes_many
+
+    def spy_bulk(project: str, qualified_symbols: list[str], **kwargs: object) -> list[object]:
+        bulk_calls.append(qualified_symbols)
+        return real_bulk(project, qualified_symbols, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service.store, "declaration_shapes_many", spy_bulk)
 
     def spy_declaration_shapes(
         project: str, qualified_symbol: str, **kwargs: object
@@ -1156,7 +1153,8 @@ def test_analyze_refactor_fetches_declarations_narrowly_not_from_the_full_table(
     # Exactly the qualified symbols this rename actually needed -- the
     # renamed declaration itself, the owner class for the override walk, and
     # the one override found while walking it -- never a project-wide fetch.
-    assert set(calls) == {"Base.handle", "Base", "Mid.handle"}
+    assert set(calls) == {"Base.handle", "Base"}
+    assert bulk_calls == [["Base.handle", "Mid.handle"]]
 
     declaration = next(item for item in analysis.must_change if item.reason_code == "declaration")
     assert declaration.path == "base.py"
@@ -1770,3 +1768,347 @@ def test_emission_returns_every_finding_regardless_of_page_limit(tmp_path: Path)
     assert result.applied == total
     assert result.unapplied == []
     assert result.completeness.state == "complete"
+
+
+@pytest.mark.parametrize(
+    "local",
+    [
+        "def use(answer):\n    return answer()\n",
+        "def use():\n    answer = lambda: 0\n    return answer()\n",
+        "def use():\n    from other import answer\n    return answer()\n",
+        "def use():\n    return answer()\n    answer = lambda: 0\n",
+    ],
+)
+def test_rename_patch_preserves_shadowed_import_calls(tmp_path: Path, local: str) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "other.py": "def answer():\n    return 0\n",
+            "consumer.py": "from lib import answer\n" + local,
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert "+from lib import renamed\n" in result.patch
+    assert "+    return renamed()" not in result.patch
+    assert "+    from other import renamed" not in result.patch
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "def renamed():\n    return 0\n",
+        "renamed = lambda: 0\n",
+        "from other import renamed\n",
+    ],
+)
+def test_rename_patch_rejects_destination_binding(tmp_path: Path, destination: str) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n"
+            + destination
+            + "def use():\n    return answer()\n",
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.patch == ""
+    assert any(
+        item.reason_code == "rename_collision" for item in result.unapplied + result.conflicted
+    )
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        "from lib import answer\nrenamed = lambda: 0\ndef use():\n    return answer()\n",
+        "from lib import answer\ndef use(renamed):\n    return answer()\n",
+        "from lib import answer\ndef use():\n    renamed = lambda: 0\n    return answer()\n",
+    ],
+)
+def test_rename_patch_rejects_consumer_capture(tmp_path: Path, consumer: str) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "consumer.py": consumer,
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.patch == ""
+    assert any(
+        item.reason_code == "rename_collision" for item in result.unapplied + result.conflicted
+    )
+
+
+def test_rename_patch_reports_unsupported_dynamic_binding(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "consumer.py": "from lib import answer\nexec('answer = other')\nanswer()\n",
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert "+renamed()" not in result.patch
+    assert any(item.code == "unsupported_binding" for item in result.limitations)
+
+
+def test_override_traversal_checks_each_inheritance_edge_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    length = 30
+    source = "class Base:\n    def handle(self):\n        pass\n"
+    for number in range(length):
+        base = "Base" if number == 0 else f"Child{number - 1}"
+        source += f"class Child{number}({base}):\n    def handle(self):\n        pass\n"
+    service, project_id = _indexed_service(tmp_path, {"chain.py": source})
+    checks = 0
+    queries = 0
+    original = service._inheritance_targets
+    declarations = service.store.declaration_shapes
+
+    def counted(*args, **kwargs):
+        nonlocal checks
+        checks += 1
+        return original(*args, **kwargs)
+
+    def queried(*args, **kwargs):
+        nonlocal queries
+        queries += 1
+        return declarations(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_inheritance_targets", counted)
+    monkeypatch.setattr(service.store, "declaration_shapes", queried)
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="chain.py", qualified_symbol="Base.handle"),
+        RenameOperation(new_name="process"),
+    )
+    assert (
+        len(
+            [
+                item
+                for item in analysis.likely_change
+                if item.reason_code == "override_of_renamed_method"
+            ]
+        )
+        == length
+    )
+    assert checks <= length
+    assert queries <= 2
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def answer():\n    return 42\ndef use(answer):\n    return answer()\n",
+        "def answer():\n    return 42\ndef use():\n    answer = lambda: 0\n    return answer()\n",
+    ],
+)
+def test_same_file_local_bindings_do_not_enter_rename_patch(tmp_path: Path, source: str) -> None:
+    service, project_id = _indexed_service(tmp_path, {"lib.py": source})
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.applied == 1
+    assert "+    return renamed()" not in result.patch
+
+
+def test_namespace_receiver_shadow_does_not_enter_rename_patch(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "consumer.py": "import lib\ndef use(lib):\n    return lib.answer()\n",
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.applied == 1
+    assert "consumer.py" not in result.patch
+
+
+def test_explicit_import_alias_does_not_collide_with_destination(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "consumer.py": (
+                "from lib import answer as check\nrenamed = 0\ndef use():\n    return check()\n"
+            ),
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.applied == 2
+    assert "+from lib import renamed as check" in result.patch
+    assert result.completeness.state == "complete"
+
+
+def test_non_python_scoped_binding_withholds_automatic_rename(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.js": "export function answer() { return 42; }\n",
+            "consumer.js": (
+                "import { answer } from './lib';\nfunction use(answer) { return answer(); }\n"
+            ),
+        },
+    )
+    result = _emit(service, project_id, "lib.js", "answer", "renamed")
+    assert result.patch == ""
+    assert any(item.reason_code == "unsupported_binding" for item in result.unapplied)
+    assert any(item.code == "unsupported_binding" for item in result.limitations)
+
+
+def test_non_python_destination_binding_withholds_rename(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.js": "function answer() { return 42; }\nconst renamed = 0;\n",
+        },
+    )
+    result = _emit(service, project_id, "lib.js", "answer", "renamed")
+    assert result.patch == ""
+    assert any(item.reason_code == "rename_collision" for item in result.unapplied)
+
+
+def test_non_python_declaration_only_rename_remains_available(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.js": "function answer() { return 42; }\n",
+        },
+    )
+    result = _emit(service, project_id, "lib.js", "answer", "renamed")
+    assert result.applied == 1
+    assert "+function renamed()" in result.patch
+
+
+def test_reassigned_self_is_not_an_exact_rename_receiver(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": (
+                "class Gate:\n    def answer(self):\n"
+                "        self = other\n        return self.answer()\n"
+            ),
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "Gate.answer", "renamed")
+    assert "+        return self.renamed()" not in result.patch
+    assert any(item.reason_code == "unsupported_binding" for item in result.unapplied)
+
+
+def test_dynamic_declaration_scope_withholds_rename(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\nexec('answer = other')\n",
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.patch == ""
+    assert any(item.code == "unsupported_binding" for item in result.limitations)
+
+
+def test_explicit_same_spelling_alias_preserves_consumer_calls(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "consumer.py": "from lib import answer as answer\ndef use():\n    return answer()\n",
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.applied == 2
+    assert "+from lib import renamed as answer" in result.patch
+    assert "+    return renamed()" not in result.patch
+
+
+def test_staticmethod_self_parameter_is_not_known_owner(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": (
+                "class Gate:\n    def answer(self):\n        return 42\n"
+                "    @staticmethod\n    def use(self):\n        return self.answer()\n"
+            ),
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "Gate.answer", "renamed")
+    assert result.patch == ""
+    assert any(item.reason_code == "unsupported_binding" for item in result.unapplied)
+
+
+def test_method_rename_rejects_existing_instance_attribute(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": (
+                "class Gate:\n    def __init__(self):\n        self.renamed = lambda: 0\n"
+                "    def answer(self):\n        return 42\n"
+                "    def use(self):\n        return self.answer()\n"
+            ),
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "Gate.answer", "renamed")
+    assert result.patch == ""
+    assert any(item.reason_code == "rename_collision" for item in result.unapplied)
+
+
+def test_generic_type_parameter_binding_withholds_rename(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "class answer:\n    pass\n",
+            "consumer.py": "from lib import answer\ndef use[answer](x: answer):\n    return x\n",
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.patch == ""
+    assert any(item.code == "unsupported_binding" for item in result.limitations)
+
+
+def test_nested_class_body_skips_outer_class_namespace(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "consumer.py": (
+                "from lib import answer\nclass Outer:\n    answer = lambda: 0\n"
+                "    class Inner:\n        value = answer()\n"
+            ),
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.applied == 3
+    assert "+        value = renamed()" in result.patch
+
+
+def test_generator_argument_does_not_obscure_outer_call_binding(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer(values):\n    return list(values)\n",
+            "consumer.py": (
+                "from lib import answer\ndef use(values):\n    return answer(x for x in values)\n"
+            ),
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.applied == 3
+    assert "+    return renamed(x for x in values)" in result.patch
+    assert result.completeness.state == "complete"
+
+
+def test_comprehension_walrus_withholds_outer_binding_edits(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "consumer.py": (
+                "from lib import answer\ndef use(values):\n"
+                "    [(answer := item) for item in values]\n    return answer()\n"
+            ),
+        },
+    )
+    result = _emit(service, project_id, "lib.py", "answer", "renamed")
+    assert result.patch == ""
+    assert any(item.code == "unsupported_binding" for item in result.limitations)

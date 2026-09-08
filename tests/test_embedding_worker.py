@@ -666,6 +666,7 @@ def _wired_session(
         ),
         effective_ceiling_bytes=2 * 1024**3,
     )
+    session._initialized = True
     session._process = process  # type: ignore[assignment]
     session._connection = connection  # type: ignore[assignment]
     monkeypatch.setattr(session, "_sample_rss", lambda: (rss_bytes, rss_bytes))
@@ -737,3 +738,97 @@ def test_telemetry_names_the_backend_the_worker_ran_on() -> None:
 
     assert session.telemetry().backend == "cpu"
     assert session.telemetry().memory_budget_bytes == 2 * 1024**3
+
+
+@pytest.mark.parametrize("blocked_operation", ["send", "recv"])
+def test_blocked_channel_io_is_supervised_until_its_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_operation: str,
+) -> None:
+    import threading
+
+    release = threading.Event()
+
+    class BlockingConnection(_WiredConnection):
+        def send(self, message: tuple[str, object]) -> None:
+            if blocked_operation == "send":
+                release.wait(0.5)
+            super().send(message)
+
+        def recv(self) -> tuple[str, object]:
+            if blocked_operation == "recv":
+                release.wait(0.5)
+            return super().recv()
+
+    connection = BlockingConnection(ready=True, reply=("ok", "vectors"))
+    process = _WiredProcess(alive=True)
+    session = _wired_session(monkeypatch, connection=connection, process=process, rss_bytes=1024)
+    monkeypatch.setattr(session, "request_timeout_seconds", 0.1, raising=False)
+    started = time.monotonic()
+    try:
+        with pytest.raises(CodeIndexingError) as caught:
+            session._request("embed", ["text"])
+        assert caught.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
+        assert session.termination_reason == "worker_timeout"
+        assert time.monotonic() - started < 0.4
+        assert session.peak_combined_rss == 2048
+        assert not process.is_alive()
+    finally:
+        release.set()
+        session.close()
+
+
+def test_production_protocol_initializes_before_transmitting_passages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InitializingConnection(_WiredConnection):
+        def send(self, message: tuple[str, object]) -> None:
+            super().send(message)
+            self._reply = (
+                ("initialized", ((), 4)) if message[0] == "initialize" else ("ok", "vectors")
+            )
+
+    connection = InitializingConnection(ready=True, reply=("unused", None))
+    process = _WiredProcess(alive=True)
+    session = _wired_session(monkeypatch, connection=connection, process=process, rss_bytes=1024)
+    session._initialized = False
+    try:
+        assert session._request("embed", ["text" * 65_536]) == ("ok", "vectors")
+        assert [command for command, _ in connection.sent] == ["initialize", "embed"]
+    finally:
+        session.close()
+
+
+def test_worker_keeps_the_run_baseline_from_before_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from code_indexing_mcp import memory_budget
+    from code_indexing_mcp.memory_budget import indexing_memory_budget
+
+    rss = [1_000]
+    monkeypatch.setattr(
+        memory_budget.psutil.Process, "memory_info", lambda _: SimpleNamespace(rss=rss[0])
+    )
+    session = _session(_fake_worker, 2 * 1024**3)
+    with indexing_memory_budget(2 * 1024**3), session:
+        rss[0] = 100_000  # Source and derived data allocated before first embedding.
+        session._start()
+        assert session._parent_baseline_bytes == 1_000
+
+
+def test_timed_out_worker_reaps_its_transfer_thread_before_restart() -> None:
+    session = _session(_slow_worker, 2 * 1024**3)
+    session.request_timeout_seconds = 0.05
+    with session:
+        with pytest.raises(CodeIndexingError) as caught:
+            session.embed_passages(["text"])
+        assert caught.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
+        assert session.termination_reason == "worker_timeout"
+        assert session._transfer is None
+        assert session.pid is None
+        session.request_timeout_seconds = 2
+        assert session.embed_passages(["text"]) == [[0.0, 1.0, 2.0, 3.0]]
+        assert session._transfer is None
+        assert session.spawn_count == 2

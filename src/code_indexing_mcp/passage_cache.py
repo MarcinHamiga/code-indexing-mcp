@@ -48,7 +48,9 @@ class PassageCacheNamespace:
     runtime_version: str
     dimension: int
     precision: str
-    embedding_contract_version: int = 1
+    # Version 2 reserves prefix separators and model special tokens when
+    # planning windows; version 1 cached different content boundaries.
+    embedding_contract_version: int = 2
 
 
 @dataclass(frozen=True)

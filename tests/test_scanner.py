@@ -587,13 +587,13 @@ def test_iter_scan_reads_one_file_source_at_a_time(
     (root / "b.py").write_bytes(b"b = 2\n")
     project = initialize_project(root)
     reads: list[Path] = []
-    original = Path.read_bytes
+    from code_indexing_mcp.source_io import read_source
 
-    def tracking_read_bytes(path: Path) -> bytes:
-        reads.append(path)
-        return original(path)
+    def tracking_read_source(root: Path, relative: Path, maximum: int):
+        reads.append(root / relative)
+        return read_source(root, relative, maximum)
 
-    monkeypatch.setattr(Path, "read_bytes", tracking_read_bytes)
+    monkeypatch.setattr("code_indexing_mcp.scanner.read_source", tracking_read_source)
     stream = SourceScanner().iter_scan(project)
 
     first = next(stream)
@@ -718,3 +718,42 @@ def test_language_name_literal_matches_scanner_languages() -> None:
     from code_indexing_mcp.scanner import LANGUAGES
 
     assert set(get_args(LanguageName)) == set(LANGUAGES.values())
+
+
+def test_git_tracked_path_beneath_replaced_directory_is_not_read(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    sub = root / "sub"
+    sub.mkdir()
+    (sub / "target.py").write_text("INSIDE = 1\n")
+    subprocess.run(["git", "add", "sub/target.py"], cwd=root, check=True)
+    (sub / "target.py").unlink()
+    sub.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "target.py").write_text("OUTSIDE_SECRET = 123\n")
+    sub.symlink_to(outside, target_is_directory=True)
+    result = list(SourceScanner().iter_scan(project, read_contents=True))
+    assert not any(isinstance(item, ScannedFile) for item in result)
+
+
+def test_git_enumeration_timeout_excludes_consumer_suspension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    for number in range(1000):
+        (root / f"file{number}.py").write_text("x = 1\n")
+    clock = time.monotonic
+    offset = [0.0]
+    monkeypatch.setattr("code_indexing_mcp.scanner.time.monotonic", lambda: clock() + offset[0])
+    batches = SourceScanner._iter_git_batches(root)
+    count = len(next(batches))
+    offset[0] += 11.0
+    count += sum(len(batch) for batch in batches)
+    assert count == 1000

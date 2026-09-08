@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -29,6 +30,7 @@ from .embedding import (
     validate_probe_vectors,
 )
 from .errors import CodeIndexingError, ErrorCode
+from .memory_budget import parent_memory_baseline
 from .worker_launcher import SpawnLauncher, WorkerLauncher, WorkerProcess
 
 SYSTEM_RESERVE_BYTES = 512 * 1024**2
@@ -38,6 +40,7 @@ HARD_OVERSHOOT_BYTES = 128 * 1024**2
 # validation errors are not retried: they fail identically at any batch size.
 RETRYABLE_CODES = frozenset({ErrorCode.INDEX_RESOURCE_LIMIT, ErrorCode.EMBEDDING_WORKER_FAILED})
 MAX_BATCH_RETRIES = 2
+WORKER_REQUEST_TIMEOUT_SECONDS = 120.0
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +227,13 @@ def _worker_main(connection: Connection, config: WorkerConfig) -> None:
                 # the file instead of aborting every remaining file in the run.
                 connection.send(("plan_error", str(exc)))
                 continue
-            planned = embed_windows(embed_packed, candidates, windows, plan)
+            planned = embed_windows(
+                embed_packed,
+                candidates,
+                windows,
+                plan,
+                encode=None if tokenizer is None else tokenizer.encode,
+            )
             connection.send(
                 (
                     "planned",
@@ -258,8 +267,12 @@ class EmbeddingWorkerSession:
         effective_ceiling_bytes: int | None = None,
         target: WorkerTarget = _worker_main,
         launcher: WorkerLauncher | None = None,
+        request_timeout_seconds: float = WORKER_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         self.config = config
+        self.request_timeout_seconds = request_timeout_seconds
+        self._initialize_before_passages = target is _worker_main
+        self._initialized = False
         configured = configured_ceiling_bytes or 2 * 1024**3
         self.effective_ceiling_bytes = (
             effective_ceiling_bytes
@@ -282,6 +295,7 @@ class EmbeddingWorkerSession:
         self._launcher = launcher if launcher is not None else SpawnLauncher(target)
         self._process: WorkerProcess | None = None
         self._connection: Connection | None = None
+        self._transfer: threading.Thread | None = None
         # How many worker processes this session has started. A batch retry
         # closes the worker and the next request silently spawns another, so a
         # caller that verified a backend needs this to notice that the process
@@ -340,6 +354,7 @@ class EmbeddingWorkerSession:
                 ErrorCode.EMBEDDING_WORKER_FAILED,
                 f"Embedding worker answered initialize with {status!r}",
             )
+        self._initialized = True
         providers, dimension = payload
         return WorkerInfo(
             resolved_providers=tuple(str(name) for name in providers), dimension=int(dimension)
@@ -460,23 +475,38 @@ class EmbeddingWorkerSession:
         self._start()
         assert self._connection is not None
         assert self._process is not None
-        try:
-            self._connection.send((command, payload))
-        except (EOFError, OSError) as exc:
-            raise self._channel_failed() from exc
+        if command != "initialize" and self._initialize_before_passages and not self._initialized:
+            # The production protocol confirms model loading with a small request
+            # before any passages can fill the channel. Injected worker targets
+            # may implement their own protocol; their I/O is still supervised.
+            self.initialize()
+        connection = self._connection
+        process = self._process
+        completed = threading.Event()
+        replies: list[tuple[str, Any]] = []
+        failures: list[BaseException] = []
+
+        def exchange() -> None:
+            try:
+                connection.send((command, payload))
+                while not connection.poll(0.05):
+                    if not process.is_alive():
+                        raise EOFError("worker exited")
+                # poll only guarantees that some bytes arrived, not a whole
+                # frame. The complete read belongs inside supervision too.
+                replies.append(connection.recv())
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                completed.set()
+
+        transfer = threading.Thread(target=exchange, daemon=True, name="embedding-worker-io")
+        deadline = time.monotonic() + self.request_timeout_seconds
+        self._transfer = transfer
+        transfer.start()
         consecutive_over = 0
         while True:
-            try:
-                reply_ready = self._connection.poll(0.1)
-            except (EOFError, OSError) as exc:
-                raise self._channel_failed() from exc
-            if not reply_ready and not self._process.is_alive():
-                self.close()
-                self.termination_reason = "worker_exited"
-                raise CodeIndexingError(
-                    ErrorCode.EMBEDDING_WORKER_FAILED,
-                    "Embedding worker exited without returning a result",
-                )
+            reply_ready = completed.wait(0.05)
             # Sampled and enforced on every pass, including the one that found
             # the reply ready. Lazy worker imports made startup fast enough
             # that a prompt worker can answer inside the first poll every time,
@@ -509,10 +539,20 @@ class EmbeddingWorkerSession:
                 )
             if reply_ready:
                 break
-        try:
-            status, payload = self._connection.recv()
-        except (EOFError, OSError) as exc:
-            raise self._channel_failed() from exc
+            if time.monotonic() >= deadline:
+                self._terminate()
+                self.termination_reason = "worker_timeout"
+                raise CodeIndexingError(
+                    ErrorCode.EMBEDDING_WORKER_FAILED,
+                    "Embedding worker exceeded its response deadline",
+                    timeout_seconds=self.request_timeout_seconds,
+                    command=command,
+                )
+        transfer.join()
+        self._transfer = None
+        if failures:
+            raise self._channel_failed() from failures[0]
+        status, payload = replies[0]
         if status == "error":
             self.close()
             self.termination_reason = "worker_error"
@@ -544,11 +584,10 @@ class EmbeddingWorkerSession:
         process = self._process
         connection = self._connection
         if process is None:
+            self._join_transfer()
             return
-        if process.is_alive() and connection is not None:
-            with suppress(BrokenPipeError, EOFError, OSError):
-                connection.send(("stop", None))
-            process.join(timeout=2)
+        # Even a tiny stop command can block behind an incomplete request.
+        # A disposable worker is terminated directly so cleanup stays bounded.
         if process.is_alive():
             process.terminate()
             process.join(timeout=2)
@@ -562,11 +601,27 @@ class EmbeddingWorkerSession:
             connection.close()
         self._process = None
         self._connection = None
+        self._initialized = False
+        self._join_transfer()
+
+    def _join_transfer(self) -> None:
+        transfer = self._transfer
+        if transfer is not None:
+            transfer.join(timeout=0.2)
+            if not transfer.is_alive():
+                self._transfer = None
 
     def _start(self) -> None:
         if self._process is not None:
             return
-        self._parent_baseline_bytes = psutil.Process().memory_info().rss
+        if self._transfer is not None and self._transfer.is_alive():
+            # Do not spawn retries while a previous channel is still blocked.
+            # Production pipes unblock when their worker exits and closes its end.
+            raise CodeIndexingError(
+                ErrorCode.EMBEDDING_WORKER_FAILED,
+                "Previous embedding worker channel did not close",
+            )
+        self._parent_baseline_bytes = parent_memory_baseline()
         launched = self._launcher.launch(self.config)
         self._process = launched.process
         self.spawn_count += 1

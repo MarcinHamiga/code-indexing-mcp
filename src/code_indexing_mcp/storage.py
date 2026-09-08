@@ -72,8 +72,8 @@ logger = logging.getLogger(__name__)
 # and marks the partition for rebuild instead of mixing generations.
 SCHEMA_VERSION = 5
 
-# Symbol lookups over-fetch because the LIKE pushdown over-matches; these bound
-# how many rows are scanned before the exact filter and the caller's limit apply.
+# Symbol lookups page through the over-matching LIKE prefilter. These bound
+# each page, not the total scan needed to find the caller's literal matches.
 OVERFETCH_FACTOR = 10
 MINIMUM_OVERFETCH = 200
 
@@ -1323,12 +1323,6 @@ class LanceStore:
             else chunk.model_copy(update={"content_hash": record.content_hash})
             for chunk in chunks
         ]
-        chunks = [
-            chunk
-            if chunk.content_hash
-            else chunk.model_copy(update={"content_hash": record.content_hash})
-            for chunk in chunks
-        ]
         if chunks:
             (
                 tables.chunks.merge_insert("chunk_id")
@@ -1619,6 +1613,31 @@ class LanceStore:
     # file. References cannot be narrowed the same way: aliases and renamed
     # re-exports give downstream rows arbitrary local target names, so finding a
     # conservative subset requires an iterative module-graph walk.
+    def declaration_shapes_many(
+        self,
+        project_id: str,
+        qualified_symbols: list[str],
+        *,
+        schema_version: int | None = None,
+        version: int | None = None,
+        partition_id: str | None = None,
+    ) -> list[ReferenceRecord]:
+        """Fetch declaration shapes in bounded batches from one pinned snapshot."""
+        self._validate_schema_version(schema_version)
+        names = sorted(set(qualified_symbols))
+        rows: list[ReferenceRecord] = []
+        for offset in range(0, len(names), 256):
+            values = ", ".join(_quoted(name) for name in names[offset : offset + 256])
+            condition = f"record_kind = 'declaration' AND source_qualified_symbol IN ({values})"
+            if schema_version is not None:
+                condition += f" AND schema_version = {schema_version}"
+            rows.extend(
+                self._reference_rows(
+                    project_id, condition, version=version, partition_id=partition_id
+                )
+            )
+        return rows
+
     def declaration_shapes(
         self,
         project_id: str,
@@ -1793,9 +1812,8 @@ class LanceStore:
         self._validate_partition_mapping(ids, partition_ids)
         # Independent partitions are read concurrently through a small bounded
         # pool, so a multi-project query costs the slowest partition plus the
-        # merge rather than the sum of every partition. Results are reassembled
-        # in request order so relevance-score ties break exactly as the
-        # sequential implementation did.
+        # merge rather than the sum of every partition. Ranking callers impose
+        # their own global ordering after all candidates have been collected.
         tasks: list[tuple[str, str | None]] = []
         for project_id in ids:
             pinned = None if partition_ids is None else partition_ids[project_id]
@@ -1828,11 +1846,16 @@ class LanceStore:
         *,
         partition_ids: Mapping[str, str | Sequence[str]] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run the hybrid query across every pinned physical partition.
+        """Fuse modality candidates across every pinned physical partition.
 
         A project may pin several partitions -- one per live checkout of a
         shared registration -- so each project's entry may be one partition id
-        or a sequence of them.
+        or a sequence of them. Cosine distances share one global scale. BM25
+        statistics are partition-local, so lexical evidence uses the local
+        score's competition rank instead of comparing absolute BM25 scores.
+        Those ordinal values are ranked across the combined candidates before
+        fusion; tied evidence gets equal rank and equal contribution. Candidate
+        retrieval remains bounded to limit rows per modality per partition.
         """
         rows = self._fan_out_partitions(
             project_ids,
@@ -1846,8 +1869,35 @@ class LanceStore:
                 partition_id=partition_id,
             ),
         )
-        rows.sort(key=lambda row: float(row.get("_relevance_score", 0.0)), reverse=True)
-        return rows[:limit]
+        merged: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            chunk_id = str(row["chunk_id"])
+            existing = merged.setdefault(chunk_id, {**row, "_relevance_score": 0.0})
+            for signal in ("_distance", "_fts_local_rank"):
+                if signal in row:
+                    existing[signal] = min(row[signal], existing.get(signal, float("inf")))
+        for signal in ("_distance", "_fts_local_rank"):
+            candidates = sorted(
+                (row for row in merged.values() if signal in row),
+                key=lambda row: (row[signal], row["chunk_id"]),
+            )
+            rank = 0
+            previous: float | None = None
+            for position, row in enumerate(candidates, start=1):
+                if row[signal] != previous:
+                    rank = position
+                    previous = row[signal]
+                row["_relevance_score"] += 1.0 / (60 + rank)
+        return sorted(
+            merged.values(),
+            key=lambda row: (
+                -row["_relevance_score"],
+                row.get("_distance", float("inf")),
+                row["path"],
+                row["start_line"],
+                row["chunk_id"],
+            ),
+        )[:limit]
 
     def example_search(
         self,
@@ -1896,58 +1946,65 @@ class LanceStore:
         *,
         partition_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Run the hybrid query for one partition, injecting its project id."""
+        """Collect independent vector and lexical candidates from one partition."""
         tables = self._project_existing_tables(project_id, partition_id=partition_id)
         if tables is None:
             return []
-        # MultiMatchQuery spans the two single-column FTS indexes (content
-        # and identifier_terms); a plain string would silently search only
-        # one of them whenever both exist.
-        query = (
-            tables.chunks.search(query_type="hybrid", vector_column_name="vector")
-            .vector(vector)
-            .text(
-                MultiMatchQuery(
-                    query_text,
-                    ["content", "identifier_terms"],
-                    boosts=None,
-                    operator=FullTextOperator.OR,
-                )
+        columns = [
+            "chunk_id",
+            "path",
+            "language",
+            "kind",
+            "symbol",
+            "qualified_symbol",
+            "parent_symbol",
+            "start_line",
+            "end_line",
+            "content",
+        ]
+        vector_query = tables.chunks.search(
+            vector, query_type="vector", vector_column_name="vector"
+        ).distance_type("cosine")
+        if condition:
+            vector_query = vector_query.where(condition, prefilter=True)
+        vector_query = vector_query.limit(limit).select([*columns, "_distance"])
+        if self.vector_index == "exact":
+            vector_query = vector_query.bypass_vector_index()
+        else:
+            vector_query = vector_query.ef(VECTOR_INDEX_EF).refine_factor(
+                VECTOR_INDEX_REFINE_FACTOR
             )
+        vector_rows = cast(list[dict[str, Any]], vector_query.to_list())
+        # Search both text indexes explicitly. A plain string silently selects
+        # only one when content and identifier_terms each have an FTS index.
+        lexical_query = tables.chunks.search(
+            MultiMatchQuery(
+                query_text,
+                ["content", "identifier_terms"],
+                boosts=None,
+                operator=FullTextOperator.OR,
+            ),
+            query_type="fts",
         )
         if condition:
-            query = query.where(condition, prefilter=True)
-        query = (
-            query.limit(limit)
-            .select(
-                [
-                    "chunk_id",
-                    "path",
-                    "language",
-                    "kind",
-                    "symbol",
-                    "qualified_symbol",
-                    "parent_symbol",
-                    "start_line",
-                    "end_line",
-                    "content",
-                ]
-            )
-            .rerank()
+            lexical_query = lexical_query.where(condition, prefilter=True)
+        lexical_rows = cast(
+            list[dict[str, Any]],
+            lexical_query.limit(limit).select([*columns, "_score"]).to_list(),
         )
-        if self.vector_index == "exact":
-            query = query.bypass_vector_index()
-        else:
-            # The approximate index is only correct to the extent the query
-            # pays for accuracy: defaults cost 13% of recall@10, and the ef +
-            # refine pair above restores it (see VECTOR_INDEX_EF).
-            query = query.ef(VECTOR_INDEX_EF).refine_factor(VECTOR_INDEX_REFINE_FACTOR)
-        # project_id is not stored on chunk rows; it belongs to the
-        # partition being searched, so it is injected per project.
-        query_rows = cast(list[dict[str, Any]], query.to_list())
-        for row in query_rows:
+        lexical_rows.sort(key=lambda row: (-float(row["_score"]), row["chunk_id"]))
+        rank = 0
+        previous: float | None = None
+        for position, row in enumerate(lexical_rows, start=1):
+            score = float(row["_score"])
+            if score != previous:
+                rank = position
+                previous = score
+            row["_fts_local_rank"] = rank
+        rows = vector_rows + lexical_rows
+        for row in rows:
             row["project_id"] = project_id
-        return query_rows
+        return rows
 
     def _example_search_rows(
         self,
@@ -2018,8 +2075,9 @@ class LanceStore:
         stays bounded by the returned hits rather than the fetch window. Best
         score per signal wins across partitions; ranks are recomputed over the
         merged explained set and are diagnostic positions within that set, not
-        global ranks. A probe that fails leaves its signal None instead of
-        failing the search.
+        global fusion ranks. In particular the diagnostic FTS scores are raw
+        partition-local BM25, whereas fusion compares ordinal lexical evidence.
+        A probe that fails leaves its signal None instead of failing the search.
         """
         wanted = {
             project_id: list(dict.fromkeys(chunk_ids))
@@ -2099,7 +2157,7 @@ class LanceStore:
                     tables.chunks.search(query_text, query_type="fts", fts_columns=[column])
                     .where(combined, prefilter=True)
                     .limit(len(wanted))
-                    .select(["chunk_id"])
+                    .select(["chunk_id", "_score"])
                     .to_list(),
                 )
             except Exception:
@@ -2171,38 +2229,32 @@ class LanceStore:
         tables = self._project_existing_tables(project_id, partition_id=partition_id)
         if tables is None:
             return []
-        # LIKE is only a pushdown pre-filter. The query engine ignores escape
-        # sequences, so `_` and `%` inside an identifier stay wildcards and the
-        # predicate over-matches (`load_user` also matches `loadXuser`). It never
-        # under-matches, so exact semantics are re-applied below. Over-fetch so
-        # the caller's limit is applied to real matches in a stable order.
-        scan_limit = max(limit * OVERFETCH_FACTOR, MINIMUM_OVERFETCH)
-        rows = self._projected_chunks(
-            tables.chunks,
-            " AND ".join(conditions),
-            limit=scan_limit,
-            content=True,
-            order_by=["path", "start_line", "kind"],
-        )
-        for row in rows:
-            row["project_id"] = project_id
-        if len(rows) == scan_limit:
-            # The pre-filter filled the scan window, so real matches sorting
-            # after it were never seen. Silent truncation is otherwise
-            # indistinguishable from "no more matches exist".
-            logger.debug(
-                "Symbol pre-filter for %r in project %s hit the %d-row scan cap; "
-                "later exact matches may be missing",
-                name,
-                project_id,
-                scan_limit,
+        # LIKE over-matches literal underscores and percent signs. Page until
+        # enough literal matches or exhaustion; a fixed candidate cap can hide
+        # every valid match behind earlier wildcard false positives.
+        page_size = max(limit * OVERFETCH_FACTOR, MINIMUM_OVERFETCH)
+        offset = 0
+        matches: list[ChunkPreview] = []
+        while len(matches) < limit:
+            rows = self._projected_chunks(
+                tables.chunks,
+                " AND ".join(conditions),
+                limit=page_size,
+                offset=offset,
+                content=True,
+                order_by=["path", "start_line", "kind", "chunk_id"],
             )
-        matches = [
-            preview
-            for preview in (ChunkPreview.model_validate(row) for row in rows)
-            if _symbol_matches(preview, name, match)
-        ]
-        return matches[:limit]
+            for row in rows:
+                row["project_id"] = project_id
+                preview = ChunkPreview.model_validate(row)
+                if _symbol_matches(preview, name, match):
+                    matches.append(preview)
+                    if len(matches) == limit:
+                        return matches
+            if len(rows) < page_size:
+                break
+            offset += len(rows)
+        return matches
 
     def outline_chunks(
         self, path: str, project_id: str, *, partition_id: str | None = None
@@ -3080,6 +3132,7 @@ class LanceStore:
         limit: int | None,
         content: bool,
         order_by: list[str] | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         # project_id is deliberately absent: it is not stored on chunk rows
         # and belongs to the owning partition, so callers inject it. file_id
@@ -3101,6 +3154,8 @@ class LanceStore:
         if content:
             columns.append("content")
         query = table.search().where(condition).select(columns)
+        if offset:
+            query = query.offset(offset)
         if order_by is not None:
             # A stable scan order makes a truncated result set deterministic
             # rather than dependent on physical row layout.

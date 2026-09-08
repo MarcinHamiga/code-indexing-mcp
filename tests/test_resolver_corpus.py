@@ -102,11 +102,19 @@ def test_e1_ts_class_heritage_finds_the_base_class_reference(tmp_path: Path) -> 
         RenameOperation(new_name="Foundation"),
     )
 
-    findings = analysis.must_change + analysis.likely_change
+    findings = analysis.findings
     inheritance_hit = next(
         item for item in findings if item.path == "child.ts" and item.kind == "inheritance"
     )
-    assert inheritance_hit.resolution in {"exact", "likely"}
+    assert inheritance_hit.resolution == "unresolved"
+    assert inheritance_hit.reason_code == "unsupported_binding"
+    assert not analysis.must_change
+    patch = service.emit_refactor_patch(
+        DeclarationSelector(project=project_id, path="base.ts", qualified_symbol="Base"),
+        RenameOperation(new_name="Foundation"),
+    )
+    assert patch.patch == ""
+    assert any(item.kind == "inheritance" for item in patch.unapplied)
 
 
 # ---------------------------------------------------------------------------

@@ -332,3 +332,20 @@ def test_unknown_tokenizer_bypasses_cache_reads_and_writes(
         reuse.store(candidates, {1: _segments()}, PLAN, producer=producer)
     with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
         assert cache.get_many([candidate_key(namespace, candidates[1], PLAN)]) == {}
+
+
+def test_reuse_rejects_windows_cached_before_special_token_accounting(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    path = tmp_path / "passage.sqlite3"
+    candidate = _candidate()
+    old_key = candidate_key(_namespace(embedding_contract_version=1), candidate, PLAN)
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        cache.put_many({old_key: _segments()})
+
+    with PassageReuseContext(path, _namespace()) as reuse:
+        hits, misses = reuse.lookup(
+            [candidate], PLAN, producer=SimpleNamespace(tokenizer_available=True)
+        )
+        assert hits == {}
+        assert misses == [0]

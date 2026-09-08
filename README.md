@@ -395,6 +395,17 @@ partial patch can never read as a finished rename. Signature changes are refused
 `UNSUPPORTED_OPERATION`, because synthesized argument lists are language-specific and easy to get
 silently wrong.
 
+Rename safety also depends on lexical bindings. Python parameters, assignments, and local imports
+are checked before a reference is eligible for an automatic edit. A destination binding collision
+withholds the whole rename with `rename_collision`. Scopes that cannot be established safely,
+including scoped uses in languages without a lexical binding resolver, return `unsupported_binding`
+and withhold automatic edits. Declaration/import-only cases remain available where safety can be
+established. Review these diagnostics before applying a patch.
+
+Source reads reject symlink components and nonregular files, validate the opened descriptor, and
+bound the number of bytes read. An unsafe live path makes reference analysis fail with a structured
+path/reason diagnostic before patch generation proceeds.
+
 ## Terminal User Interface (TUI)
 
 Syndex includes a terminal-native user interface for searching and inspecting codebases directly from your shell without opening an AI assistant or MCP client:
@@ -980,7 +991,14 @@ a minimum-batch inference, and the parent checks that the vectors are the right 
 normalised. A backend that fails to load, silently falls back to a different execution provider,
 returns unusable vectors, overruns the memory ceiling, or dies mid-run is terminated, and the
 chunks it had not committed are re-embedded on CPU. Chunks are committed per file only after they
-are fully embedded, so a worker crash can neither fail the run nor corrupt an existing index.
+are fully embedded, so a worker failure cannot publish an incomplete file. The run can still fail
+if its fallback backend also fails.
+
+The parent memory baseline is captured before extraction and shared with workers started later.
+Extraction checks that budget as chunks and structural records are produced. Model initialization,
+request transmission, and complete response reads are supervised, with a 120-second worker request
+deadline. Microbatch packing counts the complete tokenized model input, including repeated context
+and special tokens; content-offset telemetry remains separate.
 
 The ceiling is measured as host resident memory, which on unified memory covers the accelerator too.
 A discrete GPU's VRAM is not visible to it, so exhausting a graphics card surfaces as a worker that

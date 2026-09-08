@@ -31,6 +31,7 @@ from tree_sitter import Query as StructuralQuery
 from tree_sitter_language_pack import DownloadError, get_language
 
 from .language_rules import _DEFAULT, LANGUAGE_RULES
+from .memory_budget import check_parent_memory_budget
 from .models import (
     CallShape,
     ExtractedChunk,
@@ -41,6 +42,8 @@ from .models import (
     ParameterShape,
     ReferenceKind,
 )
+
+MAX_CONTEXT_FIELD_CHARS: Final = 512
 
 _CAMEL_BOUNDARY_1: Final = re.compile(r"([a-z0-9])([A-Z])")
 _CAMEL_BOUNDARY_2: Final = re.compile(r"([A-Z]+)([A-Z][a-z])")
@@ -325,10 +328,12 @@ class TreeSitterExtractor:
             return compiled
 
     def extract(self, path: Path, language: str, source: bytes) -> ExtractionResult:
+        check_parent_memory_budget()
         language_impl = self._languages[language]
         normalized_source = source.decode("utf-8-sig").encode("utf-8")
         tree = Parser(language_impl).parse(normalized_source)
         definitions = self._definitions(language, tree.root_node, normalized_source)
+        check_parent_memory_budget()
         index = _DefinitionIndex.build(definitions)
         line_index = _LineIndex(normalized_source)
         references: list[ExtractedReference] = []
@@ -344,6 +349,7 @@ class TreeSitterExtractor:
         covered: list[tuple[int, int]] = []
 
         for definition in definitions:
+            check_parent_memory_budget()
             outer = self._outer_node(definition.node)
             if not self._has_definition_ancestor(definition.node, index):
                 covered.append((outer.start_byte, outer.end_byte))
@@ -365,6 +371,7 @@ class TreeSitterExtractor:
             )
 
         chunks.extend(self._module_chunks(path, language, normalized_source, covered, line_index))
+        check_parent_memory_budget()
         chunks.sort(key=lambda chunk: (chunk.start_byte, chunk.end_byte, chunk.kind))
         return ExtractionResult(
             chunks=chunks,
@@ -384,12 +391,14 @@ class TreeSitterExtractor:
     ) -> tuple[list[ExtractedReference], list[ExtractedDeclarationShape]]:
         """Extract syntax facts using the already parsed tree and definition index."""
         matches = QueryCursor(self._structural_query(language)).matches(root)
+        check_parent_memory_budget()
         # A definition can own several captured parameter lists -- Go's
         # `method_declaration` captures its receiver list AND its parameter
         # list. Slot order follows source order (receiver first), which is
         # exactly slot 0 = Python's `self` convention.
         parameter_nodes: dict[int, list[Node]] = {}
         for _, captures in matches:
+            check_parent_memory_budget()
             for parameter_node in captures.get("declaration.parameters", []):
                 owner = parameter_node.parent
                 while owner is not None and owner.id not in index.by_node_id:
@@ -449,6 +458,7 @@ class TreeSitterExtractor:
         handler = _STRUCTURAL_RECORD_HANDLERS[language]
         method = getattr(self, handler)
         for _, captures in matches:
+            check_parent_memory_budget()
             for capture, nodes in captures.items():
                 if not capture.startswith("reference."):
                     continue
@@ -3715,6 +3725,7 @@ class TreeSitterExtractor:
         matches = QueryCursor(self._query(language_name)).matches(root)
         found: dict[tuple[int, int, str], _Definition] = {}
         for _, captures in matches:
+            check_parent_memory_budget()
             name_nodes = captures.get("name", [])
             if not name_nodes:
                 continue
@@ -4000,13 +4011,19 @@ class TreeSitterExtractor:
         content: str,
         part_index: int,
     ) -> ExtractedChunk:
-        context = [f"language: {language}", f"path: {path.as_posix()}", f"kind: {kind}"]
+        check_parent_memory_budget()
+        # Identity metadata remains exact; repeated embedding/search context has
+        # an independent bound so a long identifier cannot multiply per fragment.
+        context_path = path.as_posix()[:MAX_CONTEXT_FIELD_CHARS]
+        context_qualified = (qualified or "")[:MAX_CONTEXT_FIELD_CHARS]
+        context_symbol = (symbol or "")[:MAX_CONTEXT_FIELD_CHARS]
+        context = [f"language: {language}", f"path: {context_path}", f"kind: {kind}"]
         if qualified:
-            context.append(f"symbol: {qualified}")
+            context.append(f"symbol: {context_qualified}")
         prefix = "\n".join(context)
         embedding_text = f"{prefix}\n{content}"
         normalized = normalize_identifier(
-            " ".join(filter(None, [path.as_posix(), qualified or "", symbol or ""]))
+            " ".join(filter(None, [context_path, context_qualified, context_symbol]))
         )
         return ExtractedChunk(
             kind=kind,

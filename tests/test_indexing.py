@@ -3,7 +3,7 @@ import os
 import sqlite3
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +16,7 @@ from lancedb.table import LanceTable
 from test_token_batching import fake_encode
 
 from code_indexing_mcp import indexing as indexing_module
+from code_indexing_mcp import scanner as scanner_module
 from code_indexing_mcp import staging as staging_module
 from code_indexing_mcp.embedding import (
     EmbeddedSegment,
@@ -33,6 +34,8 @@ from code_indexing_mcp.models import (
     ExtractionResult,
     IndexProgress,
     ProjectInfo,
+    ScannedFile,
+    SkippedFile,
     StoredFile,
 )
 from code_indexing_mcp.passage_cache import PassageCacheNamespace, PassageReuseContext
@@ -100,14 +103,19 @@ def test_indexer_skips_unchanged_and_metadata_only_files(tmp_path: Path) -> None
     indexer, store = make_indexer(tmp_path, embedder)
 
     first = indexer.index(project)
-    original_read_bytes = Path.read_bytes
+    original_read_source = indexing_module.read_source
 
-    def fail_if_source_is_read(path: Path) -> bytes:
-        if path == source:
+    def fail_if_source_is_read(
+        root: Path, relative: Path, max_bytes: int
+    ) -> tuple[bytes, os.stat_result]:
+        if root / relative == source:
             raise AssertionError("unchanged source was read")
-        return original_read_bytes(path)
+        return original_read_source(root, relative, max_bytes)
 
-    with patch.object(Path, "read_bytes", fail_if_source_is_read):
+    with (
+        patch.object(indexing_module, "read_source", fail_if_source_is_read),
+        patch.object(scanner_module, "read_source", fail_if_source_is_read),
+    ):
         second = indexer.index(project)
     stat = source.stat()
     os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
@@ -999,14 +1007,16 @@ def test_reference_backfill_stale_report_includes_files_backfilled(tmp_path: Pat
     indexer.index(project)
     _remove_reference_generation(store, project.id)
 
-    original_read_bytes = Path.read_bytes
+    original_read_source = indexing_module.read_source
 
-    def flaky_read_bytes(path: Path) -> bytes:
-        if path.name == "stale.py":
+    def flaky_read_source(
+        root: Path, relative: Path, max_bytes: int
+    ) -> tuple[bytes, os.stat_result]:
+        if relative.name == "stale.py":
             raise OSError("vanished mid-scan")
-        return original_read_bytes(path)
+        return original_read_source(root, relative, max_bytes)
 
-    with patch.object(Path, "read_bytes", flaky_read_bytes):
+    with patch.object(indexing_module, "read_source", flaky_read_source):
         report = indexer.backfill_references(project)
 
     # The stale-path early return still discards the whole generation (a
@@ -1800,14 +1810,14 @@ def test_each_changed_file_is_read_once(tmp_path: Path, monkeypatch: pytest.Monk
         (root / f"m{index}.py").write_text(f"def f{index}():\n    return {index}\n")
 
     reads: dict[str, int] = {}
-    original = Path.read_bytes
+    original = scanner_module.read_source
 
-    def counting(self: Path) -> bytes:
-        if self.suffix == ".py":
-            reads[str(self)] = reads.get(str(self), 0) + 1
-        return original(self)
+    def counting(root: Path, relative: Path, max_bytes: int) -> tuple[bytes, os.stat_result]:
+        if relative.suffix == ".py":
+            reads[str(relative)] = reads.get(str(relative), 0) + 1
+        return original(root, relative, max_bytes)
 
-    monkeypatch.setattr(Path, "read_bytes", counting)
+    monkeypatch.setattr(scanner_module, "read_source", counting)
     indexer.index(project)
 
     assert len(reads) == 5
@@ -2476,3 +2486,95 @@ def test_progress_publishes_the_slot_identity(tmp_path: Path) -> None:
     assert {item.activation_epoch for item in snapshots} == {partition.activation_epoch}
     assert snapshots[0].selector == "ref:refs/heads/main"
     assert snapshots[0].expected_head == _git_head(root)
+
+
+def test_parent_budget_interrupts_extraction_before_embedding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "many.py").write_text("\n".join(f"def f{i}(): return {i}" for i in range(100)))
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    indexer.memory_ceiling_bytes = 50
+    rss = [0]
+    chunks_created = []
+    make_chunk = TreeSitterExtractor._make_chunk
+
+    def grow(*args: object, **kwargs: object) -> ExtractedChunk:
+        chunk = make_chunk(*args, **kwargs)  # type: ignore[arg-type]
+        chunks_created.append(chunk)
+        rss[0] = 100
+        return chunk
+
+    monkeypatch.setattr(
+        indexing_module.psutil.Process, "memory_info", lambda _: SimpleNamespace(rss=rss[0])
+    )
+    monkeypatch.setattr(TreeSitterExtractor, "_make_chunk", staticmethod(grow))
+    with pytest.raises(CodeIndexingError) as caught:
+        indexer.index(project)
+    assert caught.value.code is ErrorCode.INDEX_RESOURCE_LIMIT
+    assert 0 < len(chunks_created) < 100
+    assert embedder.passage_batches == []
+    assert store.list_files(project.id) == []
+
+
+def test_candidate_groups_charge_repeated_prefixes() -> None:
+    chunks = TreeSitterExtractor().extract(Path("a.py"), "python", b"def f(): return 1").chunks
+    chunk = chunks[0].model_copy(
+        update={
+            "embedding_prefix": "x" * 60_000,
+            "embedding_text": "x" * 60_000 + "\n" + chunks[0].content,
+        }
+    )
+    candidates = [indexing_module._PendingCandidate(0, chunk) for _ in range(10)]
+    groups = list(indexing_module._candidate_groups(candidates))
+    assert len(groups) > 1
+    assert all(
+        sum(len(item.chunk.embedding_text) for item in group)
+        <= indexing_module.CANDIDATE_GROUP_CHARS
+        for group in groups
+    )
+
+
+@pytest.mark.parametrize("backfill", [False, True])
+def test_indexer_rejects_a_live_symlink_substituted_after_scanning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backfill: bool,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("def answer(): return 42\n")
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(source.read_bytes())
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    if backfill:
+        indexer.index(project)
+        _remove_reference_generation(store, project.id)
+    scan = indexer.scanner.iter_scan
+
+    def substitute(
+        project: ProjectInfo, known: dict[str, StoredFile], **_: object
+    ) -> Iterator[ScannedFile | SkippedFile]:
+        for item in scan(project, known, read_contents=False):
+            if item.path == Path("main.py"):
+                source.unlink()
+                source.symlink_to(outside)
+            yield item
+
+    monkeypatch.setattr(indexer.scanner, "iter_scan", substitute)
+    if backfill:
+        report = indexer.backfill_references(project)
+        assert report.files_backfilled == 0
+        assert report.stale_paths == ["main.py"]
+    else:
+        result = indexer.index(project)
+        assert result.indexed_files == 0
+        assert any("symlink" in issue.message for issue in result.errors)

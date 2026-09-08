@@ -2743,3 +2743,20 @@ def test_patch_request_validation_precedes_project_resolution(
     assert raised.value.code is error_code
     assert app.list_projects() == []
     assert not (root / ".ci-mcp").exists()
+
+
+def test_clean_git_status_is_stale_after_scan_configuration_changes(tmp_path: Path) -> None:
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    assert app.project_status(project.id).state == "ready"
+    changed = project.model_copy(
+        update={"scan": project.scan.model_copy(update={"exclude": ["**/*.py"]})}
+    )
+    app.store.upsert_project(changed, model_id="test/tiny", state="ready")
+    assert app.project_status(project.id).state == "stale"

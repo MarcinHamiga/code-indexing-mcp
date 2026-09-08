@@ -132,6 +132,8 @@ BUILD_IDENTITY = _build_identity()
 # so a direct reference fails type checking there even though it never runs.
 # daemon_supported() gates every use.
 _AF_UNIX: int | None = getattr(socket, "AF_UNIX", None)
+# Includes room for the terminating NUL on the shortest supported sockaddr_un.
+UNIX_SOCKET_PATH_BYTES = 103
 
 
 def daemon_supported() -> bool:
@@ -196,7 +198,26 @@ def daemon_endpoint(paths: RuntimePaths) -> Path:
     root = Path(runtime_root) if runtime_root else Path(tempfile.gettempdir())
     directory = _private_directory(root / f"code-indexing-mcp-{identity}")
     digest = sha256(str(paths.data.resolve()).encode()).hexdigest()[:16]
-    return directory / f"{digest}.sock"
+    endpoint = directory / f"{digest}.sock"
+    if len(os.fsencode(endpoint)) <= UNIX_SOCKET_PATH_BYTES:
+        return endpoint
+    # tempfile.gettempdir() is often a long per-user path on macOS. Keep the
+    # same ownership/symlink checks when choosing a short shared-root location.
+    fallback_root = (
+        Path("/tmp")
+        if os.name != "nt"
+        else Path(os.environ.get("SYSTEMROOT", "C:/Windows")) / "Temp"
+    )
+    fallback = (
+        _private_directory(fallback_root / f"code-indexing-mcp-{identity}") / f"{digest}.sock"
+    )
+    if len(os.fsencode(fallback)) > UNIX_SOCKET_PATH_BYTES:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "No usable short daemon socket path",
+            path=str(fallback),
+        )
+    return fallback
 
 
 def _published_daemon_endpoint(paths: RuntimePaths) -> Path | None:
@@ -784,6 +805,9 @@ class BrokerApplication:
         last_error: OSError | None = None
         for endpoint in _daemon_endpoint_candidates(self.paths, self.endpoint):
             if endpoint in seen:
+                continue
+            if len(os.fsencode(endpoint)) > UNIX_SOCKET_PATH_BYTES:
+                last_error = FileNotFoundError("Daemon endpoint exceeds Unix socket path limit")
                 continue
             seen.add(endpoint)
             connection = _local_socket()

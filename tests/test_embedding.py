@@ -120,6 +120,31 @@ def test_embedding_without_a_tokenizer_sends_the_whole_candidate() -> None:
     assert len(result[0]) == 1
 
 
+def test_microbatches_charge_complete_model_inputs_including_special_tokens() -> None:
+    from test_token_batching import fake_encode
+
+    seen: list[list[str]] = []
+
+    def embed(texts: list[str]) -> list[str]:
+        seen.append(texts)
+        return ["vector" for _ in texts]
+
+    prefix = " ".join(f"header{index}" for index in range(40))
+    candidates = [PassageCandidate(prefix, "body value") for _ in range(16)]
+    result = embed_planned_segments(
+        fake_encode,
+        embed,
+        candidates,
+        SegmentPlan(max_tokens=60, max_items=16, max_token_product=64),
+    )
+
+    assert len(result) == 16
+    assert all(
+        len(batch) * max(len(fake_encode(text).offsets) for text in batch) <= 64 for batch in seen
+    )
+    assert all(window.token_count == 2 for segments in result for window, _ in segments)
+
+
 def test_embed_windows_restores_candidates_and_sorts_their_windows() -> None:
     candidates = [
         PassageCandidate("candidate-a", "ab"),
