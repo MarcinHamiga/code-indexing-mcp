@@ -25,6 +25,7 @@ from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner
 from code_indexing_mcp.staging import (
     CHUNKS_NAME,
+    FILES_NAME,
     JOURNAL_FORMAT_VERSION,
     JOURNAL_NAME,
     MAX_RECOVERY_ATTEMPTS,
@@ -38,6 +39,70 @@ from code_indexing_mcp.staging import (
     recover_staged_commits,
 )
 from code_indexing_mcp.storage import LanceStore, PartitionRef, TableVersions
+
+
+def test_recovery_preserves_a_non_object_journal_for_inspection(tmp_path: Path) -> None:
+    journal_path = tmp_path / "staging" / "project-1" / "job-1" / JOURNAL_NAME
+    journal_path.parent.mkdir(parents=True)
+    journal_path.write_text("[]", encoding="utf-8")
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+
+    try:
+        assert recover_staged_commits(tmp_path / "staging", store) == 0
+        assert journal_path.exists()
+    finally:
+        store.close()
+
+
+def test_recovery_preserves_a_journal_with_an_invalid_attempt_count(
+    tmp_path: Path,
+) -> None:
+    journal_path = tmp_path / "staging" / "project-1" / "job-1" / JOURNAL_NAME
+    journal_path.parent.mkdir(parents=True)
+    journal_path.write_text(
+        json.dumps(
+            {
+                "version": JOURNAL_FORMAT_VERSION,
+                "project_id": "project-1",
+                "phase": PHASE_COMMITTING,
+                "recovery_attempts": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+
+    try:
+        assert recover_staged_commits(tmp_path / "staging", store) == 0
+        assert journal_path.exists()
+    finally:
+        store.close()
+
+
+def test_writer_cleanup_closes_all_resources_after_one_writer_fails(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    files_sink, files_writer = job._open_writer(FILES_NAME, job._file_schema)
+    chunks_sink, chunks_writer = job._open_writer(CHUNKS_NAME, job._chunk_schema)
+    references_sink, references_writer = job._open_writer(REFERENCES_NAME, job._reference_schema)
+    job._files_sink, job._files_writer = files_sink, files_writer
+    job._chunks_sink, job._chunks_writer = chunks_sink, chunks_writer
+    job._references_sink, job._references_writer = references_sink, references_writer
+
+    try:
+        with (
+            patch.object(files_writer, "close", side_effect=RuntimeError("close failed")),
+            pytest.raises(RuntimeError, match="close failed"),
+        ):
+            job._close_writers(finalize=False)
+
+        assert chunks_sink.closed
+        assert references_sink.closed
+    finally:
+        for sink in (files_sink, chunks_sink, references_sink):
+            if not sink.closed:
+                sink.close()
+        store.close()
 
 
 class RecordingEmbedder:
