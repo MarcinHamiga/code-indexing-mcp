@@ -227,12 +227,14 @@ class SearchService:
             )
         names = {project.id: project.name for project in self.store.list_projects()}
         hits: list[SearchHit] = []
-        seen: set[tuple[str, str, int, int]] = set()
+        seen: set[tuple[str, str, int, int, str | None]] = set()
         for row in rows:
             chunk = ChunkPreview.model_validate(row)
             if paths and not any(PurePosixPath(chunk.path).match(pattern) for pattern in paths):
                 continue
-            key = (chunk.project_id, chunk.path, chunk.start_line, chunk.end_line)
+            # Requested checkouts may contain different source at one location.
+            # Collapse identical source only, retaining divergent versions.
+            key = (chunk.project_id, chunk.path, chunk.start_line, chunk.end_line, chunk.content)
             if key in seen:
                 continue
             seen.add(key)

@@ -19,7 +19,7 @@ import pytest
 from conftest import run_git
 from lancedb.expr import Expr
 from lancedb.merge import LanceMergeInsertBuilder
-from lancedb.query import LanceHybridQueryBuilder, LanceVectorQueryBuilder
+from lancedb.query import LanceVectorQueryBuilder
 from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
@@ -776,10 +776,10 @@ def test_hybrid_query_vector_knobs_follow_the_index_mode(
     """
     calls: list[tuple[str, tuple[float, ...]]] = []
     for knob in ("bypass_vector_index", "ef", "refine_factor"):
-        original = getattr(LanceHybridQueryBuilder, knob)
+        original = getattr(LanceVectorQueryBuilder, knob)
 
         def spy(
-            builder: LanceHybridQueryBuilder,
+            builder: LanceVectorQueryBuilder,
             *args: float,
             _original: object = original,
             _knob: str = knob,
@@ -788,7 +788,7 @@ def test_hybrid_query_vector_knobs_follow_the_index_mode(
             calls.append((_knob, args))
             return cast(Any, _original)(builder, *args, **kwargs)
 
-        monkeypatch.setattr(LanceHybridQueryBuilder, knob, spy)
+        monkeypatch.setattr(LanceVectorQueryBuilder, knob, spy)
 
     exact = LanceStore(tmp_path / "exact", vector_dimension=4)
     exact_project = _seed_hybrid_target(exact, tmp_path / "repo")

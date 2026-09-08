@@ -32,6 +32,7 @@ from pathlib import Path
 from pathspec import GitIgnoreSpec
 
 from .models import ProjectInfo, ScanConfig, ScannedFile, ScanResult, SkippedFile, StoredFile
+from .source_io import SourceReadError, checked_source_stat, read_source
 
 LANGUAGES = {
     ".py": "python",
@@ -479,9 +480,15 @@ class SourceScanner:
                         batch.append(root / os.fsdecode(raw))
                     if len(batch) >= GIT_IGNORE_DISCOVERY_BATCH_SIZE:
                         batch.sort()
+                        suspended = time.monotonic()
                         yield batch
+                        deadline += time.monotonic() - suspended
                         batch = []
-            if process.wait() != 0:
+            try:
+                returncode = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as exc:
+                raise _GitEnumerationError("git ls-files timed out") from exc
+            if returncode != 0:
                 raise _GitEnumerationError(f"git ls-files exited with status {process.returncode}")
         except OSError as exc:
             raise _GitEnumerationError(str(exc)) from exc
@@ -544,10 +551,13 @@ class SourceScanner:
                     yield SkippedFile(path=relative, reason=skip_reason)
                 continue
             try:
-                stat = absolute.stat()
+                stat = checked_source_stat(root, relative)
                 if stat.st_size > max_file_bytes:
                     yield SkippedFile(path=relative, reason="oversized")
                     continue
+            except SourceReadError as exc:
+                yield SkippedFile(path=relative, reason=exc.reason, detail=str(exc))
+                continue
             except OSError as exc:
                 yield SkippedFile(path=relative, reason="unreadable", detail=str(exc))
                 continue
@@ -559,7 +569,10 @@ class SourceScanner:
                 or previous.mtime_ns != stat.st_mtime_ns
             ):
                 try:
-                    content = absolute.read_bytes()
+                    content, stat = read_source(root, relative, max_file_bytes)
+                except SourceReadError as exc:
+                    yield SkippedFile(path=relative, reason=exc.reason, detail=str(exc))
+                    continue
                 except OSError as exc:
                     yield SkippedFile(path=relative, reason="unreadable", detail=str(exc))
                     continue

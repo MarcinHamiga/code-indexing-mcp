@@ -147,7 +147,9 @@ def plan_candidate_windows(
     prefix_tokens: dict[str, int] = {}
     for prefix, content in candidates:
         if prefix not in prefix_tokens:
-            prefix_tokens[prefix] = len(content_token_offsets(encode(prefix))) if prefix else 0
+            # Reserve the repeated header, separator, and model-added special
+            # tokens. Batch packing re-encodes the final composed input exactly.
+            prefix_tokens[prefix] = len(encode(f"{prefix}\n" if prefix else "").offsets)
         # Keep at least one token of forward progress per window even when a
         # pathological prefix would otherwise consume the whole budget.
         budget = max(overlap_tokens + 1, max_tokens - prefix_tokens[prefix])

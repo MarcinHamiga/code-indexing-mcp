@@ -208,8 +208,14 @@ def embed_windows[Vector](
     candidates: Sequence[PassageCandidate],
     windows_per_candidate: Sequence[Sequence[TokenWindow]],
     plan: SegmentPlan,
+    *,
+    encode: Callable[[str], Any] | None = None,
 ) -> list[list[tuple[TokenWindow, Vector]]]:
-    """Embed planned windows in microbatches packed to the token budget."""
+    """Pack complete model inputs, while retaining content-only offset telemetry.
+
+    The tokenizer includes model special tokens; prefix tokens cannot be inferred
+    from the content windows because each window receives the prefix again.
+    """
     if not candidates:
         return []
     owners: list[int] = []
@@ -229,7 +235,9 @@ def embed_windows[Vector](
 
     results: list[list[tuple[TokenWindow, Vector]]] = [[] for _ in candidates]
     for batch in plan_microbatches(
-        [window.token_count for window in windows],
+        [len(encode(text).offsets) for text in texts]
+        if encode is not None
+        else [window.token_count for window in windows],
         max_items=plan.max_items,
         max_token_product=plan.max_token_product,
     ):
@@ -250,7 +258,9 @@ def embed_planned_segments[Vector](
     """Plan token windows for *candidates* and embed them."""
     if not candidates:
         return []
-    return embed_windows(embed, candidates, plan_passages(encode, candidates, plan), plan)
+    return embed_windows(
+        embed, candidates, plan_passages(encode, candidates, plan), plan, encode=encode
+    )
 
 
 class ModelIdentity(Protocol):

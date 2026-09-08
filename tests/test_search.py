@@ -187,13 +187,35 @@ def test_multi_project_search_is_deterministic_across_concurrent_runs(
     search = SearchService(store, embedder)
 
     baseline = search.search_code("permissions", project_ids)
-    for _ in range(3):
-        repeated = search.search_code("permissions", project_ids)
+    for order in (project_ids, list(reversed(project_ids)), project_ids[2:] + project_ids[:2]):
+        repeated = search.search_code("permissions", order)
         assert [hit.chunk_id for hit in repeated.hits] == [hit.chunk_id for hit in baseline.hits]
         assert [hit.score for hit in repeated.hits] == [hit.score for hit in baseline.hits]
 
     assert len(baseline.hits) == 5
     assert {hit.project_id for hit in baseline.hits} == set(project_ids)
+    assert [hit.score for hit in baseline.hits] == pytest.approx([1 / 61] * 5)
+
+
+def test_multi_project_vector_relevance_is_independent_of_project_order(tmp_path: Path) -> None:
+    store, search, projects = indexed_projects(tmp_path)
+    # "authorization" embeds onto the auth axis but has no lexical match.
+    for order in (projects, list(reversed(projects))):
+        hits = search.search_code("authorization", order, limit=1).hits
+        assert [hit.symbol for hit in hits] == ["enforce_permissions"]
+        rows = store.hybrid_search("authorization", [1.0, 0.0, 0.0, 0.0], order, None, 2)
+        assert [row["symbol"] for row in rows] == ["enforce_permissions", "create_invoice"]
+        assert [row["_relevance_score"] for row in rows] == pytest.approx([1 / 61, 1 / 62])
+
+
+def test_partition_lexical_winners_share_rank_before_global_fusion(tmp_path: Path) -> None:
+    store, _, projects = indexed_projects(tmp_path)
+    # Both singleton partitions match "return" lexically. Their top lexical
+    # evidence contributes equally; their distinct vector relevance does not.
+    for order in (projects, list(reversed(projects))):
+        rows = store.hybrid_search("return", [1.0, 0.0, 0.0, 0.0], order, None, 2)
+        assert [row["symbol"] for row in rows] == ["enforce_permissions", "create_invoice"]
+        assert [row["_relevance_score"] for row in rows] == pytest.approx([2 / 61, 1 / 61 + 1 / 62])
 
 
 def test_symbol_lookup_and_outline_use_indexed_metadata(tmp_path: Path) -> None:
@@ -334,6 +356,19 @@ def test_symbol_results_are_ordered_before_the_limit_applies(tmp_path: Path) -> 
     hits = search.find_symbol("handler_", project_id, match="prefix", limit=3)
 
     assert [hit.symbol for hit in hits.hits] == ["handler_0", "handler_1", "handler_2"]
+
+
+@pytest.mark.parametrize("match", ["prefix", "contains"])
+def test_symbol_lookup_survives_more_than_a_window_of_wildcard_false_positives(
+    tmp_path: Path, match: str
+) -> None:
+    source = "".join(f"def loadXuser{i}():\n    return {i}\n\n" for i in range(205))
+    source += "def load_user():\n    return 1\n"
+    search, project_id = _indexed_source(tmp_path, source)
+
+    hits = search.find_symbol("load_user", project_id, match=match).hits
+
+    assert [hit.symbol for hit in hits] == ["load_user"]
 
 
 def _indexed_tree(tmp_path: Path, sources: dict[str, str]) -> tuple[SearchService, str]:

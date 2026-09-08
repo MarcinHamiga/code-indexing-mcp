@@ -893,3 +893,17 @@ def test_pack_language_gives_up_when_the_download_keeps_failing(
 
     with pytest.raises(DownloadError):
         extractor_module._pack_language("gdscript")
+
+
+def test_large_symbol_identity_does_not_expand_derived_text_quadratically() -> None:
+    sizes = []
+    for length in (32_768, 131_072):
+        name = "a" * length
+        source = f"def {name}():\n    return 1\n".encode()
+        result = TreeSitterExtractor().extract(Path("large.py"), "python", source)
+        assert all(chunk.symbol == name for chunk in result.chunks)
+        sizes.append(
+            sum(len(chunk.embedding_text) + len(chunk.search_text) for chunk in result.chunks)
+        )
+        assert all(len(chunk.embedding_prefix) <= 2048 for chunk in result.chunks)
+    assert sizes[1] < sizes[0] * 5

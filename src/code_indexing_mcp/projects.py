@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import os
+import stat
+import tempfile
 import tomllib
 from collections.abc import Iterable
+from contextlib import suppress
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import tomli_w
 from pydantic import ValidationError
 
+from . import windows_source_io
 from .errors import CodeIndexingError, ErrorCode
 from .models import (
     DEFAULT_INCLUDES,
@@ -73,9 +78,11 @@ def legacy_marker_path(root: Path) -> Path:
 
 def existing_marker_path(root: Path) -> Path | None:
     current = marker_path(root)
+    _validate_marker_path(current)
     if current.is_file():
         return current
     legacy = legacy_marker_path(root)
+    _validate_marker_path(legacy)
     if legacy.is_file():
         return legacy
     return None
@@ -125,16 +132,100 @@ def initialize_checkout(
     return project
 
 
+def _validate_marker_path(path: Path) -> None:
+    for candidate, directory in ((path.parent, True), (path, False)):
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        valid = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+        if not valid or candidate.is_junction():
+            raise CodeIndexingError(
+                ErrorCode.INVALID_CONFIGURATION, "Unsafe project marker path", path=str(candidate)
+            )
+
+
 def _write_marker(path: Path, project: ProjectInfo) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (path.parent / ".gitignore").write_text("*\n", encoding="utf-8")
     data = {
         "version": project.version,
         "id": project.id,
         "name": project.name,
         "scan": project.scan.model_dump(),
     }
-    path.write_text(tomli_w.dumps(data), encoding="utf-8")
+    ignore = path.parent / ".gitignore"
+    _validate_marker_path(path)
+    _validate_marker_path(ignore)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    directory: int | None = None
+    try:
+        if os.open in os.supports_dir_fd:
+            root = os.open(path.parent.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                directory = os.open(
+                    path.parent.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root
+                )
+            finally:
+                os.close(root)
+            # Validate both leaves in the pinned directory before writing either one.
+            for name in (path.name, ignore.name):
+                try:
+                    info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    raise OSError(f"Unsafe marker entry: {name}")
+        if not ignore.exists():
+            _atomic_marker_write(ignore, "*\n", directory, replace=False)
+        _atomic_marker_write(path, tomli_w.dumps(data), directory, replace=True)
+    except OSError as exc:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_CONFIGURATION, "Cannot safely write project marker", path=str(path)
+        ) from exc
+    finally:
+        if directory is not None:
+            os.close(directory)
+
+
+def _atomic_marker_write(path: Path, content: str, directory: int | None, *, replace: bool) -> None:
+    """Replace a marker inode; never truncate an existing inode or follow a leaf link."""
+    if directory is not None:
+        temporary = f".marker-{uuid4().hex}"
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            if replace:
+                os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+            else:
+                # Linking a fresh inode is a no-clobber atomic create.
+                with suppress(FileExistsError):
+                    os.link(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=directory)
+    else:
+        with windows_source_io.pinned_directory(path.parent.parent, Path(path.parent.name)):
+            _windows_marker_write(path, content, replace=replace)
+
+
+def _windows_marker_write(path: Path, content: str, *, replace: bool) -> None:
+    """The caller holds the root and marker directory against rename/replacement."""
+    _validate_marker_path(path)
+    descriptor, name = tempfile.mkstemp(prefix=".marker-", dir=path.parent)
+    temporary_path = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        _validate_marker_path(path)
+        if replace:
+            os.replace(temporary_path, path)
+        else:
+            with suppress(FileExistsError):
+                os.link(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def read_project_marker(root: Path) -> ProjectInfo:
