@@ -4,8 +4,16 @@ import json
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from code_indexing_mcp.installer.env_blocks import entry_from_text, env_from_entry, merge_env
 from code_indexing_mcp.installer.harnesses import configure_harness, read_server_entry
+
+
+@pytest.mark.parametrize("payload", ["[]", "null", "1"])
+def test_entry_from_text_returns_none_for_non_object_json(payload: str) -> None:
+    assert entry_from_text("kimi-code", '{"mcpServers": ' + payload + "}") is None
+
 
 SERVER_COMMAND = str(Path("/opt/ci-mcp"))
 

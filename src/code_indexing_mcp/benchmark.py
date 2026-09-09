@@ -97,6 +97,38 @@ class SearchBenchmarkApplication(Protocol):
     def search_code(self, query: str, *, projects: list[str], limit: int = 8) -> SearchResponse: ...
 
 
+def _benchmark_application(
+    paths: RuntimePaths,
+    workspace: Path,
+    *,
+    batch_size: int | None = None,
+    cwd: Path | None = None,
+) -> Application:
+    """Build every benchmark application from one isolated settings snapshot."""
+    base_settings = IndexSettings.from_environment()
+    settings = replace(
+        base_settings,
+        embedding_batch_size=batch_size
+        if batch_size is not None
+        else base_settings.embedding_batch_size,
+        index_execution="in-process",
+        broker_mode="off",
+    )
+    return Application(
+        RuntimePaths(data=workspace / "data", cache=paths.cache),
+        cwd=cwd or workspace,
+        settings=settings,
+    )
+
+
+def _benchmark_metadata(app: Application) -> dict[str, str | None]:
+    return {
+        "model_id": app.embedder.model_id,
+        "embedding_backend": app.effective_backend_selection.descriptor.accelerator.value,
+        "revision": update_check.checkout_head(Path(__file__).resolve().parents[2]),
+    }
+
+
 def write_benchmark_corpus(root: Path, *, files: int = 128, functions_per_file: int = 2) -> int:
     """Write a fixed Python corpus and return its source byte count."""
     if files < 1 or functions_per_file < 1:
@@ -666,22 +698,11 @@ def _run_in_workspace(
 ) -> dict[str, Any]:
     root = workspace / "corpus"
     source_bytes = write_benchmark_corpus(root, files=files, functions_per_file=functions_per_file)
-    settings = replace(
-        IndexSettings.from_environment(),
-        embedding_batch_size=batch_size,
-        index_execution="in-process",
-        broker_mode="off",
-    )
-    app = Application(
-        RuntimePaths(data=workspace / "data", cache=paths.cache),
-        cwd=root,
-        settings=settings,
-    )
+    app = _benchmark_application(paths, workspace, batch_size=batch_size, cwd=root)
     result = run_index_benchmark(app, root)
     result.update(
         {
-            "model_id": app.embedder.model_id,
-            "embedding_backend": app.effective_backend_selection.descriptor.accelerator.value,
+            **_benchmark_metadata(app),
             "embedding_batch_size": batch_size,
             "corpus": {
                 "files": files,
@@ -758,23 +779,12 @@ def run_search_benchmark_command(
         )
 
     def _run(workspace: Path) -> dict[str, Any]:
-        settings = replace(
-            IndexSettings.from_environment(),
-            index_execution="in-process",
-            broker_mode="off",
-        )
-        app = Application(
-            RuntimePaths(data=workspace / "data", cache=paths.cache),
-            cwd=workspace,
-            settings=settings,
-        )
+        app = _benchmark_application(paths, workspace)
         roots = [workspace / f"project_{index:03d}" for index in range(projects)]
         result = run_search_benchmark(app, roots, iterations=iterations)
         result.update(
             {
-                "model_id": app.embedder.model_id,
-                "embedding_backend": app.effective_backend_selection.descriptor.accelerator.value,
-                "revision": update_check.checkout_head(Path(__file__).resolve().parents[2]),
+                **_benchmark_metadata(app),
             }
         )
         return result
@@ -819,16 +829,7 @@ def run_precision_benchmark_command(
         )
 
     def _run(workspace: Path) -> dict[str, Any]:
-        settings = replace(
-            IndexSettings.from_environment(),
-            index_execution="in-process",
-            broker_mode="off",
-        )
-        app = Application(
-            RuntimePaths(data=workspace / "data", cache=paths.cache),
-            cwd=workspace,
-            settings=settings,
-        )
+        app = _benchmark_application(paths, workspace)
         result = run_precision_benchmark(
             app.embedder,
             workspace / "precision",
@@ -839,9 +840,7 @@ def run_precision_benchmark_command(
         )
         result.update(
             {
-                "model_id": app.embedder.model_id,
-                "embedding_backend": app.effective_backend_selection.descriptor.accelerator.value,
-                "revision": update_check.checkout_head(Path(__file__).resolve().parents[2]),
+                **_benchmark_metadata(app),
             }
         )
         return result

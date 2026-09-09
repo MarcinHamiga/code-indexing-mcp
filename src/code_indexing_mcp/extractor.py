@@ -6,11 +6,11 @@ import re
 import threading
 import time
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol
 
 import tree_sitter_c
 import tree_sitter_c_sharp
@@ -64,30 +64,29 @@ _CONTAINER_KINDS: Final = frozenset(
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 _QUOTE_CHARACTERS: Final = ("'", '"')
 STRUCTURAL_LANGUAGES: Final = frozenset(LANGUAGE_RULES)
-# Per-language handler for the non-`reference.identifier` captures of that
-# language's structural query. Both handlers share one signature
-# `(node, source, add_reference)` and re-dispatch on `node.type`, so a new
-# structured language slots in as one map entry beside its `.scm` file.
-_STRUCTURAL_RECORD_HANDLERS: Final[dict[str, str]] = {
-    "python": "_python_records",
-    "javascript": "_javascript_records",
-    "typescript": "_javascript_records",
-    "tsx": "_javascript_records",
-    "go": "_go_records",
-    "rust": "_rust_records",
-    "java": "_java_records",
-    "csharp": "_csharp_records",
-    "c": "_c_records",
-    "cpp": "_cpp_records",
-    "lua": "_lua_records",
-    "terraform": "_terraform_records",
-    "sql": "_sql_records",
-    "gdscript": "_gdscript_records",
-    "gdshader": "_gdshader_records",
-}
 _PACK_DOWNLOAD_ATTEMPTS: Final = 6
 _PACK_DOWNLOAD_BACKOFF_SECONDS: Final = 1.0
-_ReferenceAdder = Callable[..., None]
+
+
+class _ReferenceAdder(Protocol):
+    def __call__(
+        self,
+        kind: ReferenceKind,
+        node: Node,
+        *,
+        target_name: str,
+        written_name: str | None = None,
+        module_path: str | None = None,
+        imported_name: str | None = None,
+        alias: str | None = None,
+        receiver_text: str | None = None,
+        call_shape: CallShape | None = None,
+        span: tuple[int, int] | None = None,
+    ) -> None: ...
+
+
+class _StructuralRecordHandler(Protocol):
+    def __call__(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None: ...
 
 
 def _capture_name(source: bytes, node: Node) -> str:
@@ -158,6 +157,38 @@ _POSITIONAL_CLIMB_PARENTS: Final = _PURE_BINDING_PARENTS | frozenset(
         "uniform_declaration",
         "attribute_call",
         "field",
+    }
+)
+
+_IDENTIFIER_BINDING_PARENTS: Final = frozenset(
+    {
+        "import_statement",
+        "import_from_statement",
+        "export_clause",
+        "namespace_export",
+        "decorator",
+        "type",
+        "type_annotation",
+        "generic_type",
+        "class_heritage",
+        "extends_type_clause",
+        "use_declaration",
+        "use_as_clause",
+        "scoped_use_list",
+        "use_list",
+        "use_wildcard",
+        "self_parameter",
+    }
+)
+_PARAMETER_PARENTS: Final = frozenset(
+    {
+        "parameters",
+        "formal_parameters",
+        "lambda_parameters",
+        "parameter_list",
+        "closure_parameters",
+        "inferred_parameters",
+        "implicit_parameter",
     }
 )
 
@@ -285,10 +316,49 @@ class TreeSitterExtractor:
         self._languages = _languages()
         self._queries: dict[str, Query] = {}
         self._structural_queries: dict[str, Query] = {}
+        # Keep bound handlers in the instance registry so language dispatch is
+        # checked by the type system instead of going through getattr and
+        # stringly-typed method names.
+        self._structural_handlers: dict[str, _StructuralRecordHandler] = {
+            "python": self._python_records,
+            "javascript": self._javascript_records,
+            "typescript": self._javascript_records,
+            "tsx": self._javascript_records,
+            "go": self._go_records,
+            "rust": self._rust_records,
+            "java": self._java_records,
+            "csharp": self._csharp_records,
+            "c": self._c_records,
+            "cpp": self._cpp_records,
+            "lua": self._lua_records,
+            "terraform": self._terraform_records,
+            "sql": self._sql_records,
+            "gdscript": self._gdscript_records,
+            "gdshader": self._gdshader_records,
+        }
         # Indexer holds one extractor and the daemon serves each client on its own
         # thread, so the lazy compile must not build two queries concurrently. Same
         # double-checked shape as FastEmbedder's model load.
         self._queries_lock = threading.Lock()
+
+    def _compiled_query(
+        self,
+        cache: dict[str, Query],
+        package: str,
+        language_name: str,
+        query_type: type[Query],
+    ) -> Query:
+        cached = cache.get(language_name)
+        if cached is not None:
+            return cached
+        with self._queries_lock:
+            cached = cache.get(language_name)
+            if cached is not None:
+                return cached
+            text = files(package).joinpath(f"{language_name}.scm").read_text()
+            compiled = query_type(self._languages[language_name], text)
+            cache[language_name] = compiled
+            return compiled
 
     def _query(self, language_name: str) -> Query:
         """Return the compiled query for *language_name*, compiling once per process.
@@ -297,35 +367,18 @@ class TreeSitterExtractor:
         code re-read and recompiled one per extracted file, which measured at 44% of
         extraction time across a 35-file pass.
         """
-        cached = self._queries.get(language_name)
-        if cached is not None:
-            return cached
-        with self._queries_lock:
-            cached = self._queries.get(language_name)
-            if cached is not None:
-                return cached
-            text = files("code_indexing_mcp.queries").joinpath(f"{language_name}.scm").read_text()
-            compiled = Query(self._languages[language_name], text)
-            self._queries[language_name] = compiled
-            return compiled
+        return self._compiled_query(
+            self._queries, "code_indexing_mcp.queries", language_name, Query
+        )
 
     def _structural_query(self, language_name: str) -> Query:
         """Return the cached structural query for one supported source grammar."""
-        cached = self._structural_queries.get(language_name)
-        if cached is not None:
-            return cached
-        with self._queries_lock:
-            cached = self._structural_queries.get(language_name)
-            if cached is not None:
-                return cached
-            text = (
-                files("code_indexing_mcp.reference_queries")
-                .joinpath(f"{language_name}.scm")
-                .read_text()
-            )
-            compiled = StructuralQuery(self._languages[language_name], text)
-            self._structural_queries[language_name] = compiled
-            return compiled
+        return self._compiled_query(
+            self._structural_queries,
+            "code_indexing_mcp.reference_queries",
+            language_name,
+            StructuralQuery,
+        )
 
     def extract(self, path: Path, language: str, source: bytes) -> ExtractionResult:
         check_parent_memory_budget()
@@ -455,8 +508,7 @@ class TreeSitterExtractor:
                 )
             )
 
-        handler = _STRUCTURAL_RECORD_HANDLERS[language]
-        method = getattr(self, handler)
+        method = self._structural_handlers[language]
         for _, captures in matches:
             check_parent_memory_budget()
             for capture, nodes in captures.items():
@@ -490,41 +542,11 @@ class TreeSitterExtractor:
         current = node
         while (parent := current.parent) is not None:
             if (
-                parent.type
-                in {
-                    "import_statement",
-                    "import_from_statement",
-                    "export_clause",
-                    "namespace_export",
-                    "decorator",
-                    "type",
-                    "type_annotation",
-                    "generic_type",
-                    "class_heritage",
-                    "extends_type_clause",
-                    # Rust `use` trees bind spellings; the import rows own them.
-                    "use_declaration",
-                    "use_as_clause",
-                    "scoped_use_list",
-                    "use_list",
-                    "use_wildcard",
-                    # `&self`/`&mut self` receivers are not reads of a `self`
-                    # symbol (method-body `self` reads ride field expressions).
-                    "self_parameter",
-                }
+                parent.type in _IDENTIFIER_BINDING_PARENTS
                 or parent.type in rules.import_owner_parents
             ):
                 return
-            if parent.type in {
-                "parameters",
-                "formal_parameters",
-                "lambda_parameters",
-                "parameter_list",
-                "closure_parameters",
-                # Java's `(a, b) -> a` shape and C#'s bare `x => x`.
-                "inferred_parameters",
-                "implicit_parameter",
-            }:
+            if parent.type in _PARAMETER_PARENTS:
                 parameter = node
                 while parameter.parent is not None and parameter.parent != parent:
                     parameter = parameter.parent
@@ -642,8 +664,8 @@ class TreeSitterExtractor:
                     excluded_fields = ()
                 elif parent.type == "new_expression":
                     # Fieldless construction (C++ `new Widget(1)`): the call
-                    # row owns the type. Fieldful `new` (JS) keeps the
-                    # constructor exclusion the call branch used to apply.
+                    # row owns the type. Fieldful `new` (JS) applies the
+                    # constructor exclusion to the function and constructor.
                     if parent.child_by_field_name("constructor") is None:
                         return
                     excluded_fields = ("function", "constructor")
@@ -940,7 +962,6 @@ class TreeSitterExtractor:
             return []
         rules = LANGUAGE_RULES.get(language, _DEFAULT)
         rows: list[ParameterShape] = []
-        positional_only = False
         keyword_only = False
         for child in parameters.named_children:
             if child.type == "positional_separator":
@@ -950,7 +971,6 @@ class TreeSitterExtractor:
                     else row
                     for row in rows
                 ]
-                positional_only = False
                 continue
             if child.type == "keyword_separator":
                 keyword_only = True
@@ -1056,8 +1076,6 @@ class TreeSitterExtractor:
             elif child.type == "dictionary_splat_pattern":
                 kind = "keyword_variadic"
                 name = name.removeprefix("**")
-            elif positional_only:
-                kind = "positional_only"
             elif keyword_only:
                 kind = "keyword_only"
             else:
@@ -3328,9 +3346,11 @@ class TreeSitterExtractor:
             if _capture_name(source, named[0]) != "module":
                 return
             labels = [
-                TreeSitterExtractor._hcl_string_value(child, source)
+                label
                 for child in named[1:]
                 if child.type == "string_lit"
+                for label in [TreeSitterExtractor._hcl_string_value(child, source)]
+                if label is not None
             ]
             body = next((child for child in named if child.type == "body"), None)
             if body is None:
@@ -3360,7 +3380,7 @@ class TreeSitterExtractor:
                     if value is not None
                     else None
                 )
-                if module_path is None or not module_path.startswith("."):
+                if value is None or module_path is None or not module_path.startswith("."):
                     # Only local sources resolve to indexed files; registry,
                     # Git, and other remote sources stay out so they never
                     # become unmatched rows.

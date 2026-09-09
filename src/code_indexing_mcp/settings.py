@@ -37,6 +37,17 @@ class IndexMode(StrEnum):
     MANUAL = "manual"
 
 
+TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+LEGACY_OFFLINE_TRUE_VALUES = frozenset({"1", "true", "yes"})
+
+
+def legacy_offline_value(raw: str | None) -> bool:
+    """Read the historical offline flag without broadening its true values."""
+
+    return raw is not None and raw.strip().lower() in LEGACY_OFFLINE_TRUE_VALUES
+
+
 def _configuration_error(name: str, value: str, expected: str) -> CodeIndexingError:
     return CodeIndexingError(
         ErrorCode.INVALID_CONFIGURATION,
@@ -65,10 +76,10 @@ def _boolean(environment: Mapping[str, str], name: str, default: bool) -> bool:
     raw = environment.get(name)
     if raw is None:
         return default
-    normalized = raw.lower()
-    if normalized in {"1", "true", "yes", "on"}:
+    normalized = raw.strip().lower()
+    if normalized in TRUE_VALUES:
         return True
-    if normalized in {"0", "false", "no", "off"}:
+    if normalized in FALSE_VALUES:
         return False
     raise _configuration_error(name, raw, "a boolean")
 
@@ -272,5 +283,5 @@ class IndexSettings:
             # "1"/"true"/"yes" (including "0", "off", or unset) reads as
             # False rather than raising, matching the check this replaces
             # (`Application.__init__` read `CODE_INDEXING_OFFLINE` directly).
-            offline=environment.get("CODE_INDEXING_OFFLINE", "").lower() in {"1", "true", "yes"},
+            offline=legacy_offline_value(environment.get("CODE_INDEXING_OFFLINE")),
         )

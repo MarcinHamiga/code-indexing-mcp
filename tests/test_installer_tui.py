@@ -572,6 +572,40 @@ async def test_progress_runs_pipeline_and_finishes_on_done(
 
 
 @pytest.mark.asyncio
+async def test_reconfigure_pipeline_runs_shared_daemon_finalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import code_indexing_mcp.installer.tui.panels as panels
+    from code_indexing_mcp.installer.orchestrator import InstallResult
+
+    calls: list[InstallResult] = []
+    monkeypatch.setattr(
+        panels,
+        "finalize_reconfigure",
+        lambda result, **kwargs: calls.append(result),
+    )
+    monkeypatch.setattr(
+        panels,
+        "run_install",
+        lambda plan, on_event=None, should_continue=None: InstallResult(
+            None,
+            (("kimi-code", Path("/tmp/kimi-code.json")),),
+            (),
+            (),
+            env_written={"CODE_INDEXING_EMBED_THREADS": "2"},
+        ),
+    )
+    app = InstallerApp(_reconfigure_state(tmp_path, monkeypatch))
+
+    async with app.run_test() as pilot:
+        await advance_to(pilot, app, "summary")
+        await click(pilot, "#next")
+        await pilot.pause()
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_done_reports_failures_with_exit_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

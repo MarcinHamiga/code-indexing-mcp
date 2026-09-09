@@ -42,6 +42,33 @@ def _stub_pipeline(monkeypatch: pytest.MonkeyPatch, recorded: list) -> None:
     monkeypatch.setattr(cli, "run_install", fake_run_install)
 
 
+@pytest.mark.parametrize(
+    ("tty", "no_prompt", "expected"),
+    [(True, False, ("codex",)), (True, True, ()), (False, False, ())],
+)
+def test_main_prompts_only_for_interactive_terminal_install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tty: bool, no_prompt: bool, expected: tuple
+) -> None:
+    import code_indexing_mcp.installer.cli as cli
+
+    recorded: list = []
+    _stub_pipeline(monkeypatch, recorded)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: tty)
+    prompts: list[bool] = []
+
+    def prompt() -> list[str]:
+        prompts.append(True)
+        return ["codex"]
+
+    monkeypatch.setattr(cli, "_prompt_harnesses", prompt)
+    argv = ["--install-dir", str(tmp_path)]
+    if no_prompt:
+        argv.append("--no-prompt")
+    assert main(argv) == 0
+    assert recorded[0].harness_slugs == expected
+    assert bool(prompts) == bool(expected)
+
+
 def test_main_runs_plan_without_prompting(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -433,10 +460,10 @@ def test_repair_reapplies_the_current_configuration_without_rebuilding(
 
     assert code == 0
     (plan,) = recorded
-    # The harnesses already configured, their current settings written back, and
-    # explicitly no accelerator work.
+    # The harnesses already configured and explicitly no accelerator work. A
+    # repair does not rewrite the settings it read as prefill.
     assert plan.harness_slugs == ("kimi-code", "codex")
-    assert plan.env_updates == {"CODE_INDEXING_BROKER": "off"}
+    assert plan.env_updates == {}
     assert plan.accelerator is None
     assert plan.install_launcher is True
 

@@ -1466,7 +1466,7 @@ def test_reuses_unchanged_windowed_candidates_after_a_partial_edit(tmp_path: Pat
     indexer, store = make_windowing_indexer(
         tmp_path,
         embedder,
-        SegmentPlan(max_tokens=8, overlap_tokens=2),
+        SegmentPlan(max_tokens=32, overlap_tokens=2),
         passage_cache_factory=cache_factory,
     )
     first = indexer.index(project)
@@ -1519,7 +1519,7 @@ def test_reuse_rebuilds_current_offsets_after_unicode_insertion_and_reopen(
     first, store = make_windowing_indexer(
         tmp_path,
         first_embedder,
-        SegmentPlan(max_tokens=8, overlap_tokens=2),
+        SegmentPlan(max_tokens=32, overlap_tokens=2),
         passage_cache_factory=cache_factory,
     )
     first.index(project)
@@ -1531,7 +1531,7 @@ def test_reuse_rebuilds_current_offsets_after_unicode_insertion_and_reopen(
     reopened, reopened_store = make_windowing_indexer(
         tmp_path,
         reopened_embedder,
-        SegmentPlan(max_tokens=8, overlap_tokens=2),
+        SegmentPlan(max_tokens=32, overlap_tokens=2),
         passage_cache_factory=cache_factory,
     )
     report = reopened.index(project)
@@ -1582,7 +1582,7 @@ def test_force_bypasses_passage_reuse_reads_and_writes(tmp_path: Path) -> None:
     indexer, _ = make_windowing_indexer(
         tmp_path,
         embedder,
-        SegmentPlan(max_tokens=8, overlap_tokens=2),
+        SegmentPlan(max_tokens=32, overlap_tokens=2),
         passage_cache_factory=cache_factory,
     )
     indexer.index(project)
@@ -1620,7 +1620,7 @@ def test_cache_failure_falls_back_to_normal_embedding(tmp_path: Path) -> None:
     indexer, _ = make_windowing_indexer(
         tmp_path,
         embedder,
-        SegmentPlan(max_tokens=8),
+        SegmentPlan(max_tokens=32),
         passage_cache_factory=cache_factory,
     )
 
@@ -1639,7 +1639,7 @@ def test_a_token_dense_chunk_is_split_into_several_stored_chunks(tmp_path: Path)
     (root / "main.py").write_bytes(DENSE_SOURCE.encode("utf-8"))
     project = initialize_project(root)
     indexer, store = make_windowing_indexer(
-        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
+        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=32, overlap_tokens=2)
     )
 
     report = indexer.index(project)
@@ -1658,7 +1658,7 @@ def test_windowed_chunk_offsets_still_slice_the_original_source(tmp_path: Path) 
     (root / "main.py").write_bytes(DENSE_SOURCE.encode("utf-8"))
     project = initialize_project(root)
     indexer, store = make_windowing_indexer(
-        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
+        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=32, overlap_tokens=2)
     )
 
     indexer.index(project)
@@ -1678,7 +1678,7 @@ def test_every_window_keeps_the_identifier_tail(tmp_path: Path) -> None:
     (root / "main.py").write_bytes(DENSE_SOURCE.encode("utf-8"))
     project = initialize_project(root)
     indexer, store = make_windowing_indexer(
-        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
+        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=32, overlap_tokens=2)
     )
 
     indexer.index(project)
@@ -1702,7 +1702,7 @@ def test_windows_cover_the_symbol_without_dropping_source(tmp_path: Path) -> Non
     (root / "main.py").write_bytes(DENSE_SOURCE.encode("utf-8"))
     project = initialize_project(root)
     indexer, store = make_windowing_indexer(
-        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
+        tmp_path, WindowingEmbedder(), SegmentPlan(max_tokens=32, overlap_tokens=2)
     )
 
     indexer.index(project)
@@ -1764,7 +1764,7 @@ def test_an_unplannable_file_is_charged_to_the_file_not_the_run(tmp_path: Path) 
     (root / "bad.py").write_text("REJECT = 'x'\n")
     project = initialize_project(root)
     indexer, store = make_windowing_indexer(
-        tmp_path, UnplannableEmbedder(), SegmentPlan(max_tokens=8, overlap_tokens=2)
+        tmp_path, UnplannableEmbedder(), SegmentPlan(max_tokens=32, overlap_tokens=2)
     )
 
     report = indexer.index(project)

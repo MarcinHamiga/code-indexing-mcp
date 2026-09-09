@@ -17,9 +17,9 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import time
-from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -115,14 +115,25 @@ class ProbeRecord:
         if not isinstance(value, dict):
             return None
         try:
+            # An uncalibrated backend persists zero for the batch size, but a
+            # measured record must carry a positive size.
+            batch_size = _nonnegative_int(value["batch_size"], "batch_size")
+            dimension = _positive_int(value["dimension"], "dimension")
+            recorded_at_ns = _nonnegative_int(value["recorded_at_ns"], "recorded_at_ns")
+            characters_per_second = _finite_nonnegative_float(
+                value.get("characters_per_second", 0.0), "characters_per_second"
+            )
+            load_ns = _nonnegative_int(value.get("load_ns", 0), "load_ns")
+            if batch_size == 0 and (characters_per_second > 0 or load_ns > 0):
+                raise ValueError("measured probe records must have a positive batch_size")
             return cls(
                 fingerprint=str(value["fingerprint"]),
-                batch_size=int(value["batch_size"]),
-                dimension=int(value["dimension"]),
-                recorded_at_ns=int(value["recorded_at_ns"]),
+                batch_size=batch_size,
+                dimension=dimension,
+                recorded_at_ns=recorded_at_ns,
                 detail=str(value.get("detail", "")),
-                characters_per_second=float(value.get("characters_per_second", 0.0)),
-                load_ns=int(value.get("load_ns", 0)),
+                characters_per_second=characters_per_second,
+                load_ns=load_ns,
                 limited_by=str(value.get("limited_by", "")),
             )
         except (KeyError, TypeError, ValueError):
@@ -130,6 +141,27 @@ class ProbeRecord:
             # costs one re-probe; honouring a partial one could pick a backend
             # that was never verified.
             return None
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
+def _nonnegative_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return int(value)
+
+
+def _finite_nonnegative_float(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{name} must be a finite non-negative number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return result
 
 
 def model_directory(cache_directory: Path, model_id: str) -> Path:
@@ -217,7 +249,10 @@ class ProbeCache:
             load_ns=load_ns,
             limited_by=limited_by,
         )
-        with self._guard():
+        lock = self._acquire()
+        if lock is None:
+            return
+        try:
             kept = [
                 existing
                 for existing in self._records()
@@ -228,24 +263,19 @@ class ProbeCache:
             # verdict is the one least likely to be needed again.
             kept.sort(key=lambda item: item.recorded_at_ns)
             self._write(kept[-MAX_RECORDS:])
+        finally:
+            lock.release()
 
-    @contextlib.contextmanager
-    def _guard(self) -> Iterator[None]:
-        """Hold the cache lock, or proceed without it rather than fail a run."""
+    def _acquire(self) -> FileLock | None:
+        """Acquire the optional cache lock, returning none when it is unavailable."""
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             lock = FileLock(self.path.with_name(f"{self.path.name}.lock"))
-        except OSError:
-            yield
-            return
-        try:
-            with lock.acquire(timeout=LOCK_TIMEOUT_SECONDS):
-                yield
-        except Timeout:
-            # Another process is mid-write. Losing this record costs one
-            # re-probe; blocking an index run on a diagnostics cache would
-            # cost far more.
+            lock.acquire(timeout=LOCK_TIMEOUT_SECONDS)
+        except (OSError, Timeout):
             logger.debug("Could not lock the probe cache at %s", self.path)
+            return None
+        return lock
 
     def state(self, key: ProbeKey) -> str:
         """Return ``"hit"`` or ``"miss"`` for diagnostics such as model status."""

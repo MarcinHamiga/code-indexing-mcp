@@ -805,17 +805,7 @@ class Indexer:
         def staging_job() -> StagingJob:
             nonlocal job
             if job is None:
-                job = StagingJob(
-                    self.staging_directory,
-                    project.id,
-                    file_schema=LanceStore.file_arrow_schema(),
-                    chunk_schema=LanceStore.chunk_arrow_schema(
-                        self.store.vector_dimension, self.store.vector_dtype
-                    ),
-                    reference_schema=LanceStore.reference_arrow_schema(),
-                    partition=partition,
-                )
-                job.begin()
+                job = self._new_staging_job(project, partition)
             return job
 
         try:
@@ -1150,18 +1140,28 @@ class Indexer:
         if state.job is None:
             if state.partition is None:
                 raise RuntimeError("index scan has no pinned partition")
-            state.job = StagingJob(
-                self.staging_directory,
-                project.id,
-                file_schema=LanceStore.file_arrow_schema(),
-                chunk_schema=LanceStore.chunk_arrow_schema(
-                    self.store.vector_dimension, self.store.vector_dtype
-                ),
-                reference_schema=LanceStore.reference_arrow_schema(),
-                partition=state.partition,
-            )
-            state.job.begin()
+            state.job = self._new_staging_job(project, state.partition)
         return state.job
+
+    def _new_staging_job(self, project: ProjectInfo, partition: PartitionRef) -> StagingJob:
+        """Construct and begin a staging job, cleaning it up if begin fails."""
+        job = StagingJob(
+            self.staging_directory,
+            project.id,
+            file_schema=LanceStore.file_arrow_schema(),
+            chunk_schema=LanceStore.chunk_arrow_schema(
+                self.store.vector_dimension, self.store.vector_dtype
+            ),
+            reference_schema=LanceStore.reference_arrow_schema(),
+            partition=partition,
+        )
+        try:
+            job.begin()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                job.discard()
+            raise
+        return job
 
     def _stage_file_failure(
         self,

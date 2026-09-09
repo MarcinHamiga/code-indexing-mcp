@@ -13,6 +13,7 @@ from filelock import FileLock
 from mcp import types
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
+from support import DeterministicEmbedder
 
 from code_indexing_mcp import server as server_module
 from code_indexing_mcp.application import Application, RuntimePaths
@@ -20,16 +21,7 @@ from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.server import create_server
 from code_indexing_mcp.settings import IndexSettings
 
-
-class TinyEmbedder:
-    model_id = "test/tiny"
-    dimension = 4
-
-    def embed_passages(self, texts: list[str]) -> list[list[float]]:
-        return [[1.0, 0.0, 0.0, float(len(text))] for text in texts]
-
-    def embed_query(self, text: str) -> list[float]:
-        return [1.0, 0.0, 0.0, float(len(text))]
+TinyEmbedder = DeterministicEmbedder
 
 
 class BlockingEmbedder(TinyEmbedder):
@@ -1119,6 +1111,62 @@ async def test_first_automatic_index_materializes_project_tree_once(
 
     assert not result.isError
     assert scans == 1
+
+
+@pytest.mark.asyncio
+async def test_automatic_index_uses_the_discovered_checkout_root(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(repo))
+    (repo / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (repo / "canonical.py").write_text("def canonical_only():\n    return 1\n")
+    run_git("add", "pyproject.toml", "canonical.py", cwd=repo)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "main",
+        cwd=repo,
+    )
+
+    worktree = tmp_path / "worktree"
+    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=repo)
+    (worktree / "worktree_only.py").write_text("def worktree_only():\n    return 2\n")
+    run_git("add", "worktree_only.py", cwd=worktree)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "worktree",
+        cwd=worktree,
+    )
+
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(repo)
+    assert app.init_project(worktree).id == project.id
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=worktree.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool("search_code", {"query": "worktree_only"})
+
+    assert not result.isError
+    assert result.structuredContent is not None
+    assert any(hit["symbol"] == "worktree_only" for hit in result.structuredContent["hits"])
 
 
 @pytest.mark.asyncio

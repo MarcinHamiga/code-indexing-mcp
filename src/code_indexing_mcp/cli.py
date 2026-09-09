@@ -26,6 +26,7 @@ from .daemon import (
     daemon_status,
     ensure_daemon,
     require_daemon_support,
+    stop_daemon_and_wait,
 )
 from .errors import CodeIndexingError
 from .progress import IndexProgress
@@ -385,12 +386,7 @@ def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> 
                 print(_json({"stopped": bool(status["running"])}))
                 return 0
             if args.daemon_command == "restart":
-                if daemon_status(paths)["running"]:
-                    BrokerApplication(paths).stop()
-                    for _ in range(100):
-                        if not daemon_status(paths)["running"]:
-                            break
-                        time.sleep(0.05)
+                stop_daemon_and_wait(paths)
                 broker = ensure_daemon(paths)
                 print(_json({"restarted": True, **broker.ping()}))
                 return 0

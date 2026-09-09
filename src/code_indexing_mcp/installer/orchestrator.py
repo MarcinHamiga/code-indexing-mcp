@@ -6,12 +6,18 @@ import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
+from ..application import RuntimePaths
 from . import accelerator, harnesses, shell_path, verify
 from .config_files import InstallerError
+from .daemon_control import DaemonStopStatus, daemon_relevant_settings_changed, stop_daemon
 from .shell_path import LauncherResult
 
 EMBED_ACCELERATOR_SETTING = "CODE_INDEXING_EMBED_ACCELERATOR"
+
+StepName = Literal["accelerator", "path", "harnesses", "skills", "verify", "daemon", "directories"]
+StepStatus = Literal["started", "finished", "warning", "failed", "skipped", "ok"]
 
 
 def default_install_directory() -> Path:
@@ -39,8 +45,8 @@ class InstallPlan:
 
 @dataclass(frozen=True)
 class StepEvent:
-    step: str  # "accelerator" | "path" | "harnesses" | "skills"
-    status: str  # "started" | "finished" | "warning" | "failed" | "skipped"
+    step: StepName
+    status: StepStatus
     detail: str = ""
 
 
@@ -49,7 +55,7 @@ class InstallResult:
     accelerator_plan: accelerator.AcceleratorPlan | None
     configured: tuple[tuple[str, Path], ...]
     failures: tuple[tuple[str, str], ...]
-    skills: tuple[tuple[str, str], ...]
+    skills: tuple[harnesses.SkillOutcome, ...]
     launcher: LauncherResult | None = None
     profiles_updated: tuple[Path, ...] = ()
     checks: tuple[verify.Check, ...] = ()
@@ -63,6 +69,21 @@ class InstallResult:
     @property
     def warnings(self) -> tuple[verify.Check, ...]:
         return tuple(check for check in self.checks if not check.ok)
+
+
+def finalize_reconfigure(
+    result: InstallResult,
+    *,
+    on_event: Callable[[StepEvent], None] = lambda event: None,
+    stop: Callable[..., tuple[DaemonStopStatus, str]] | None = None,
+) -> None:
+    """Apply the daemon side effect after a reconfigure actually writes settings."""
+
+    if not result.configured or not daemon_relevant_settings_changed(result.env_written):
+        return
+    stopper = stop or stop_daemon
+    status, detail = stopper(RuntimePaths.from_environment(), reason="settings")
+    on_event(StepEvent("daemon", status, detail))
 
 
 def run_install(
@@ -84,7 +105,7 @@ def run_install(
         accelerator_plan = accelerator.configure_accelerator(
             plan.install_directory, plan.accelerator, offline=plan.offline
         )
-        status = "finished" if accelerator_plan.honored else "warning"
+        status: StepStatus = "finished" if accelerator_plan.honored else "warning"
         detail = f"{accelerator_plan.accelerator} ({accelerator_plan.reason})"
         on_event(StepEvent("accelerator", status, detail))
 
@@ -113,7 +134,7 @@ def run_install(
 
     configured: list[tuple[str, Path]] = []
     failures: list[tuple[str, str]] = []
-    skills: list[tuple[str, str]] = []
+    skills: list[harnesses.SkillOutcome] = []
     if should_continue():
         command = accelerator.server_executable(plan.install_directory)
         if plan.harness_slugs and not command.is_file():
@@ -136,9 +157,20 @@ def run_install(
             on_event(StepEvent("harnesses", "failed", f"{slug}: {message}"))
     if should_continue():
         on_event(StepEvent("skills", "started"))
-        skills = harnesses.install_skills(list(plan.harness_slugs), plan.install_directory)
-        for slug, message in skills:
-            on_event(StepEvent("skills", "finished", f"{slug}: {message}"))
+        skills = [
+            harnesses.coerce_skill_outcome(outcome)
+            for outcome in harnesses.install_skills(
+                list(plan.harness_slugs), plan.install_directory
+            )
+        ]
+        for outcome in skills:
+            on_event(
+                StepEvent(
+                    "skills",
+                    "warning" if outcome.status == "skipped" else "finished",
+                    f"{outcome.slug}: {outcome.detail}",
+                )
+            )
 
     checks: tuple[verify.Check, ...] = ()
     if should_continue():

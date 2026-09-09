@@ -184,14 +184,22 @@ def test_a_prefix_wider_than_the_budget_still_makes_forward_progress() -> None:
     prefix = " ".join(f"header{index}" for index in range(200))
     content = " ".join(f"tok{index}" for index in range(50))
 
+    with pytest.raises(ValueError, match="prefix consumes"):
+        plan_candidate_windows(
+            fake_encode, [(prefix, content)], max_tokens=10, overlap_tokens=4, max_windows=64
+        )
+
+
+def test_prefixed_windows_expose_the_full_input_count_for_packing() -> None:
+    prefix = " ".join(f"header{index}" for index in range(20))
+    content = "body"
+
     windows = plan_candidate_windows(
-        fake_encode, [(prefix, content)], max_tokens=10, overlap_tokens=4, max_windows=64
+        fake_encode, [(prefix, content)], max_tokens=60, overlap_tokens=5
     )[0]
 
-    # The budget floor plus the half-budget overlap clamp keep the stride at 3
-    # tokens, so 50 tokens land in 16 windows rather than looping forever.
-    assert len(windows) == 16
-    assert windows[-1].end_char == len(content)
+    assert windows[0].token_count == 1
+    assert windows[0].input_token_count == len(fake_encode(f"{prefix}\n{content}").offsets)
 
 
 def test_microbatches_respect_the_item_limit() -> None:
