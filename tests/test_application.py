@@ -1399,7 +1399,7 @@ def test_storage_status_reports_registry_project_and_totals(tmp_path: Path) -> N
         "slot-alternate",
     }
     assert with_alternate.physical_bytes_total == (
-        with_alternate.registry.physical_bytes
+        sum(table.physical_bytes for table in app.store.registry_table_stats())
         + sum(slot.physical_bytes for slot in with_alternate_stats.slots)
     )
 

@@ -41,10 +41,13 @@ from code_indexing_mcp.staging import (
 from code_indexing_mcp.storage import LanceStore, PartitionRef, TableVersions
 
 
-def test_recovery_preserves_a_non_object_journal_for_inspection(tmp_path: Path) -> None:
+@pytest.mark.parametrize("payload", ["[]", '{"phase": []}', '{"phase": {}}'])
+def test_recovery_preserves_a_malformed_journal_for_inspection(
+    tmp_path: Path, payload: str
+) -> None:
     journal_path = tmp_path / "staging" / "project-1" / "job-1" / JOURNAL_NAME
     journal_path.parent.mkdir(parents=True)
-    journal_path.write_text("[]", encoding="utf-8")
+    journal_path.write_text(payload, encoding="utf-8")
     store = LanceStore(tmp_path / "data", vector_dimension=4)
 
     try:
@@ -79,7 +82,10 @@ def test_recovery_preserves_a_journal_with_an_invalid_attempt_count(
         store.close()
 
 
-def test_writer_cleanup_closes_all_resources_after_one_writer_fails(tmp_path: Path) -> None:
+@pytest.mark.parametrize("failure", ["writer_close", "sink_fileno"])
+def test_writer_cleanup_closes_all_resources_after_one_writer_fails(
+    tmp_path: Path, failure: str
+) -> None:
     store = LanceStore(tmp_path / "data", vector_dimension=4)
     job = make_job(tmp_path, store, "project-1")
     files_sink, files_writer = job._open_writer(FILES_NAME, job._file_schema)
@@ -90,14 +96,21 @@ def test_writer_cleanup_closes_all_resources_after_one_writer_fails(tmp_path: Pa
     job._references_sink, job._references_writer = references_sink, references_writer
 
     try:
+        target, method = (
+            (files_writer, "close") if failure == "writer_close" else (files_sink, "fileno")
+        )
         with (
-            patch.object(files_writer, "close", side_effect=RuntimeError("close failed")),
-            pytest.raises(RuntimeError, match="close failed"),
+            patch.object(target, method, side_effect=RuntimeError("cleanup failed")),
+            pytest.raises(RuntimeError, match="cleanup failed"),
         ):
             job._close_writers(finalize=False)
 
+        assert files_sink.closed
         assert chunks_sink.closed
         assert references_sink.closed
+        for attribute in ("files", "chunks", "references"):
+            assert getattr(job, f"_{attribute}_sink") is None
+            assert getattr(job, f"_{attribute}_writer") is None
     finally:
         for sink in (files_sink, chunks_sink, references_sink):
             if not sink.closed:

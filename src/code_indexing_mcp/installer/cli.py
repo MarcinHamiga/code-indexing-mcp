@@ -126,6 +126,7 @@ class ConfigureRequest:
     settings: tuple[str, ...]
     unsets: tuple[str, ...]
     interactive: bool
+    no_prompt: bool
     offline: bool
     bin_directory: Path | None
     no_launcher: bool
@@ -256,7 +257,7 @@ def _run_request(request: ConfigureRequest) -> int:
             selected = parse_harness_selection(request.harnesses)
         elif request.reconfigure:
             selected = list(load_prefill().configured_slugs)
-        elif not request.interactive or not sys.stdin.isatty():
+        elif request.no_prompt or not sys.stdin.isatty():
             selected = []
         else:
             selected = _prompt_harnesses()
@@ -317,6 +318,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             settings=tuple(args.settings),
             unsets=tuple(args.unsets),
             interactive=args.tui,
+            no_prompt=args.no_prompt,
             offline=args.offline,
             bin_directory=Path(args.bin_dir).expanduser() if args.bin_dir else None,
             no_launcher=args.no_launcher,
@@ -367,6 +369,7 @@ def configure_main(
             settings=tuple(settings),
             unsets=tuple(unsets),
             interactive=interactive,
+            no_prompt=True,
             offline=as_bool(os.environ.get("CODE_INDEXING_OFFLINE", "")),
             bin_directory=Path(bin_dir).expanduser() if bin_dir else None,
             no_launcher=no_launcher,

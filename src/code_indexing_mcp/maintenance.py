@@ -243,7 +243,7 @@ class MaintenanceService:
                 snapshot_at=snapshot_at,
                 registry=registry_after[0],
                 projects=project_stats,
-                physical_bytes_total=registry_after[0].physical_bytes
+                physical_bytes_total=sum(table.physical_bytes for table in registry_after)
                 + sum(partition_bytes.values()),
                 consistent=all(
                     before.current_version == after.current_version

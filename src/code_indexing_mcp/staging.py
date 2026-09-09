@@ -194,7 +194,8 @@ def _read_journal(path: Path) -> dict[str, Any] | None:
         return None
     if not isinstance(payload, dict):
         return None
-    if payload.get("phase") not in _JOURNAL_PHASES:
+    phase = payload.get("phase")
+    if not isinstance(phase, str) or phase not in _JOURNAL_PHASES:
         return None
     version = payload.get("version", LEGACY_JOURNAL_FORMAT_VERSION)
     if (
@@ -657,8 +658,12 @@ class StagingJob:
                 resource_failed = not attempt(writer.close) or resource_failed
                 setattr(self, f"_{attribute}_writer", None)
             if sink is not None:
+
+                def sync_sink(current_sink: Any = sink) -> None:
+                    os.fsync(current_sink.fileno())
+
                 resource_failed = not attempt(sink.flush) or resource_failed
-                resource_failed = not attempt(partial(os.fsync, sink.fileno())) or resource_failed
+                resource_failed = not attempt(sync_sink) or resource_failed
                 resource_failed = not attempt(sink.close) or resource_failed
                 setattr(self, f"_{attribute}_sink", None)
             if finalize and not resource_failed:
