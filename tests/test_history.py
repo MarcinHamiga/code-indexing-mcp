@@ -312,3 +312,22 @@ def test_the_database_uses_wal_mode(tmp_path: Path) -> None:
     journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
     connection.close()
     assert journal_mode == "wal"
+
+
+def test_write_connections_close_after_the_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = HistoryStore(tmp_path / "history")
+    connections: list[sqlite3.Connection] = []
+    original_connect = store._connect
+
+    def connect() -> sqlite3.Connection:
+        connection = original_connect()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", connect)
+    store.begin(_audit("closed-after-write"))
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        connections[0].execute("SELECT 1")

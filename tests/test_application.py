@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 from conftest import run_git
+from support import DeterministicEmbedder
 from test_indexing import _remove_reference_generation, _write_with_pinned_mtime
 
 from code_indexing_mcp.accelerator_env import (
@@ -39,16 +40,7 @@ from code_indexing_mcp.settings import IndexSettings
 from code_indexing_mcp.token_batching import DEFAULT_MAX_TOKEN_PRODUCT, REFERENCE_MEMORY_BYTES
 from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher
 
-
-class TinyEmbedder:
-    model_id = "test/tiny"
-    dimension = 4
-
-    def embed_passages(self, texts: list[str]) -> list[list[float]]:
-        return [[1.0, 0.0, 0.0, float(len(text))] for text in texts]
-
-    def embed_query(self, text: str) -> list[float]:
-        return [1.0, 0.0, 0.0, float(len(text))]
+TinyEmbedder = DeterministicEmbedder
 
 
 class OtherModelTinyEmbedder:
@@ -1407,7 +1399,7 @@ def test_storage_status_reports_registry_project_and_totals(tmp_path: Path) -> N
         "slot-alternate",
     }
     assert with_alternate.physical_bytes_total == (
-        with_alternate.registry.physical_bytes
+        sum(table.physical_bytes for table in app.store.registry_table_stats())
         + sum(slot.physical_bytes for slot in with_alternate_stats.slots)
     )
 

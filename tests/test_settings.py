@@ -152,6 +152,16 @@ def test_strict_mode_is_configurable() -> None:
     )
 
 
+@pytest.mark.parametrize("value", ["1", "true", "yes", "  TRUE  "])
+def test_offline_setting_preserves_runtime_legacy_true_spellings(value: str) -> None:
+    assert IndexSettings.from_environment({"CODE_INDEXING_OFFLINE": value}).offline is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "on", "off", "  yes-no  "])
+def test_offline_setting_preserves_runtime_legacy_false_spellings(value: str) -> None:
+    assert IndexSettings.from_environment({"CODE_INDEXING_OFFLINE": value}).offline is False
+
+
 def test_an_automatic_batch_size_keeps_the_cpu_default() -> None:
     settings = IndexSettings.from_environment({"CODE_INDEXING_EMBED_BATCH_SIZE": "auto"})
 

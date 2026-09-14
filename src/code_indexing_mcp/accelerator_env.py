@@ -104,6 +104,13 @@ class AcceleratorEnvironment:
         providers = value.get("providers")
         if not isinstance(providers, list) or not providers:
             raise ValueError("the record lists no execution providers")
+        recorded_at_ns = value.get("recorded_at_ns", 0)
+        if (
+            isinstance(recorded_at_ns, bool)
+            or not isinstance(recorded_at_ns, int)
+            or recorded_at_ns < 0
+        ):
+            raise ValueError("recorded_at_ns must be a non-negative integer")
         return cls(
             accelerator=accelerator,
             interpreter=Path(interpreter),
@@ -112,7 +119,7 @@ class AcceleratorEnvironment:
             driver_version=str(value.get("driver_version", "")),
             device=str(value.get("device", "")),
             python_version=str(value.get("python_version", "")),
-            recorded_at_ns=int(value.get("recorded_at_ns", 0) or 0),
+            recorded_at_ns=recorded_at_ns,
             detail=str(value.get("detail", "")),
         )
 

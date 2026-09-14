@@ -5,6 +5,8 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from code_indexing_mcp.accelerator_env import (
     RECORD_FILENAME,
     RECORD_PATH_VARIABLE,
@@ -52,6 +54,16 @@ def test_a_record_round_trips_through_the_file_the_installer_writes(tmp_path: Pa
     assert status.environment == record
     assert status.reason is None
     assert status.providers == ("CUDAExecutionProvider", "CPUExecutionProvider")
+
+
+def test_a_malformed_timestamp_is_reported_as_an_unusable_record(tmp_path: Path) -> None:
+    payload = _record(tmp_path).to_json()
+    payload["recorded_at_ns"] = [1]
+    path = tmp_path / "record.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="recorded_at_ns"):
+        AcceleratorEnvironment.from_json(payload)
 
 
 def test_no_record_at_all_is_a_cpu_installation_not_a_problem(tmp_path: Path) -> None:

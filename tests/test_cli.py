@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from support import DeterministicEmbedder
 
 from code_indexing_mcp import cli, daemon
 from code_indexing_mcp.application import Application
@@ -419,15 +420,7 @@ def test_update_notice_is_silent_when_disabled(tmp_path: Path, monkeypatch, caps
     assert "update is available" not in capsys.readouterr().err
 
 
-class _TinyEmbedder:
-    model_id = "test/tiny"
-    dimension = 4
-
-    def embed_passages(self, texts: list[str]) -> list[list[float]]:
-        return [[1.0, 0.0, 0.0, float(len(text))] for text in texts]
-
-    def embed_query(self, text: str) -> list[float]:
-        return [1.0, 0.0, 0.0, float(len(text))]
+_TinyEmbedder = DeterministicEmbedder
 
 
 def test_index_narrates_its_progress_on_stderr_and_keeps_stdout_json(  # type: ignore[no-untyped-def]

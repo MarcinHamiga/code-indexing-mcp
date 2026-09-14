@@ -1424,6 +1424,26 @@ class LanceStore:
         self._merge(self._projects, "id", [row])
         return True
 
+    @staticmethod
+    def _merge_arrow_batch(
+        table: Any,
+        merge_key: str,
+        file_ids: Sequence[str],
+        rows: pa.Table,
+    ) -> None:
+        """Replace all rows for one staged file-id batch in an Arrow table."""
+        condition = _file_ids_condition(file_ids)
+        if rows.num_rows:
+            (
+                table.merge_insert(merge_key)
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .when_not_matched_by_source_delete(condition)
+                .execute(rows)
+            )
+        else:
+            table.delete(condition)
+
     def replace_files_from_arrow(
         self,
         project_id: str,
@@ -1460,22 +1480,15 @@ class LanceStore:
                 "untouched files. Upgrade lancedb and retry.",
             )
         tables = self._project_tables(project_id, partition_id=partition_id)
-        replacement_ids: list[str] = []
+        # A file may occur in both chunk and reference batches. Keep one
+        # insertion-ordered set so the replacement predicate is deterministic
+        # without a second normalization pass.
+        replacement_ids: dict[str, None] = {}
         chunk_iter = iter(chunk_batches)
         try:
             for file_ids, chunks in chunk_iter:
-                replacement_ids.extend(file_ids)
-                condition = _file_ids_condition(file_ids)
-                if chunks.num_rows:
-                    (
-                        tables.chunks.merge_insert("chunk_id")
-                        .when_matched_update_all()
-                        .when_not_matched_insert_all()
-                        .when_not_matched_by_source_delete(condition)
-                        .execute(chunks)
-                    )
-                else:
-                    tables.chunks.delete(condition)
+                replacement_ids.update(dict.fromkeys(file_ids))
+                self._merge_arrow_batch(tables.chunks, "chunk_id", file_ids, chunks)
         finally:
             close = getattr(chunk_iter, "close", None)
             if close is not None:
@@ -1485,18 +1498,8 @@ class LanceStore:
         reference_iter = iter(reference_batches)
         try:
             for file_ids, references in reference_iter:
-                replacement_ids.extend(file_ids)
-                condition = _file_ids_condition(file_ids)
-                if references.num_rows:
-                    (
-                        tables.references.merge_insert("reference_id")
-                        .when_matched_update_all()
-                        .when_not_matched_insert_all()
-                        .when_not_matched_by_source_delete(condition)
-                        .execute(references)
-                    )
-                else:
-                    tables.references.delete(condition)
+                replacement_ids.update(dict.fromkeys(file_ids))
+                self._merge_arrow_batch(tables.references, "reference_id", file_ids, references)
         finally:
             close = getattr(reference_iter, "close", None)
             if close is not None:
@@ -2497,8 +2500,9 @@ class LanceStore:
         return stale
 
     def maintain_registry(self, *, cleanup_older_than: timedelta) -> None:
-        """Compact and clean the project registry table."""
-        self._projects.optimize(cleanup_older_than=cleanup_older_than)
+        """Compact and clean every registry table."""
+        for table in (self._projects, self._project_slots, self._active_slots):
+            table.optimize(cleanup_older_than=cleanup_older_than)
 
     def remove_project(self, project_id: str, *, locks_held: bool = False) -> bool:
         """Remove a registration, every slot row, every owned partition, and its pointer."""
@@ -2895,11 +2899,25 @@ class LanceStore:
         ):
             raise ValueError("schema_version must be a non-boolean integer")
 
-    def registry_stats(self) -> TableStorageStats:
-        """Snapshot the project registry table's storage statistics."""
-        return self._table_storage_stats(
-            self._projects, "projects", physical_directory=self.directory / "registry"
+    def registry_table_stats(self) -> list[TableStorageStats]:
+        """Snapshot projects, project slots, and active-slot registry tables."""
+        tables = (
+            (self._projects, "projects"),
+            (self._project_slots, "project_slots"),
+            (self._active_slots, "active_slots"),
         )
+        return [
+            self._table_storage_stats(
+                table,
+                name,
+                physical_directory=self.directory / "registry" / f"{name}.lance",
+            )
+            for table, name in tables
+        ]
+
+    def registry_stats(self) -> TableStorageStats:
+        """Return the projects-table compatibility view of registry statistics."""
+        return self.registry_table_stats()[0]
 
     def storage_stats(self, project_id: str) -> ProjectStorageStats:
         """Collect read-only storage statistics for one project partition.

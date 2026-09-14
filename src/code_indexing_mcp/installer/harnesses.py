@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from .config_files import (
     SERVER_NAME,
@@ -17,7 +18,7 @@ from .config_files import (
     remove_codex_server,
     remove_json_object_entry,
 )
-from .env_blocks import OBJECT_KEYS, entry_from_text, env_from_entry, merge_env
+from .env_blocks import entry_from_text, env_from_entry, harness_schema, merge_env
 from .links import is_under, link_destination, replace_link
 
 
@@ -25,6 +26,35 @@ class HarnessChoice(NamedTuple):
     slug: str
     label: str
     provider: str
+
+
+@dataclass(frozen=True)
+class SkillOutcome:
+    """Structured result for one harness's bundled-skill operation."""
+
+    slug: str
+    status: Literal["linked", "removed", "skipped"]
+    detail: str
+
+    @property
+    def message(self) -> str:
+        """Compatibility rendering for existing installer event consumers."""
+        return self.detail
+
+    def __iter__(self) -> Iterator[str]:
+        # Existing integrations consumed ``(slug, message)`` pairs. Keep that
+        # small compatibility surface while the result itself carries status.
+        yield self.slug
+        yield self.detail
+
+
+def coerce_skill_outcome(value: SkillOutcome | tuple[str, str]) -> SkillOutcome:
+    """Normalize results from an older installer during an in-place update."""
+    if isinstance(value, SkillOutcome):
+        return value
+    slug, detail = value
+    status: Literal["linked", "skipped"] = "skipped" if detail.startswith("skipped:") else "linked"
+    return SkillOutcome(slug, status, detail)
 
 
 HARNESS_CHOICES = [
@@ -255,31 +285,23 @@ def configure_harness(
         }
         if merged_env:
             entry["env"] = merged_env
-    elif slug in {
-        "kimi-code",
-        "claude-desktop",
-        "antigravity",
-        "antigravity-cli",
-        "muse-code",
-        "tabnine",
-        "tabnine-cli",
-    }:
-        object_key = "mcpServers"
-        entry = {"command": str(command), "args": ["serve"]}
-        if merged_env:
-            entry["env"] = merged_env
-    elif slug in {"opencode", "kilocode"}:
-        object_key = "mcp"
-        entry = {
-            "type": "local",
-            "command": [str(command), "serve"],
-            "enabled": True,
-        }
-        if merged_env:
-            entry["environment"] = merged_env
     else:
-        raise InstallerError(f"Unknown harness {slug!r}")
-
+        schema = harness_schema(slug)
+        if schema is None or schema.object_key is None:
+            raise InstallerError(f"Unknown harness {slug!r}")
+        object_key = schema.object_key
+        if schema.command_style == "argv":
+            entry = {
+                "type": "local",
+                "command": [str(command), "serve"],
+                "enabled": True,
+            }
+            if merged_env:
+                entry["environment"] = merged_env
+        else:
+            entry = {"command": str(command), "args": ["serve"]}
+            if merged_env:
+                entry["env"] = merged_env
     if slug == "muse-code":
         # Muse Code rejects a settings document without schema_version; the
         # merge adds it when the file does not already carry one.
@@ -312,10 +334,10 @@ def deconfigure_harness(
         return path, False
     if slug == "codex":
         return path, remove_codex_server(path)
-    object_key = OBJECT_KEYS.get(slug)
-    if object_key is None:
+    schema = harness_schema(slug)
+    if schema is None or schema.object_key is None:
         raise InstallerError(f"Unknown harness {slug!r}")
-    return path, remove_json_object_entry(path, object_key, SERVER_NAME)
+    return path, remove_json_object_entry(path, schema.object_key, SERVER_NAME)
 
 
 def deconfigure_selected_harnesses(
@@ -350,18 +372,18 @@ def remove_skills(
     *,
     home: Path | None = None,
     environment: Mapping[str, str] | None = None,
-) -> list[tuple[str, str]]:
+) -> list[SkillOutcome]:
     """Unlink bundled skills, leaving anything the user owns exactly where it is.
 
     ``install_directory`` scopes removal to links pointing into the checkout
     being uninstalled, so a second installation elsewhere keeps its own links.
     """
 
-    results: list[tuple[str, str]] = []
+    results: list[SkillOutcome] = []
     for slug in slugs:
         directory = skill_directory(slug, home=home, environment=environment)
         if directory is None or not directory.is_dir():
-            results.append((slug, "skipped: no skill directory"))
+            results.append(SkillOutcome(slug, "skipped", "skipped: no skill directory"))
             continue
         removed = 0
         try:
@@ -371,9 +393,9 @@ def remove_skills(
                     entry.unlink()
                     removed += 1
         except OSError as exc:
-            results.append((slug, f"skipped: {exc}"))
+            results.append(SkillOutcome(slug, "skipped", f"skipped: {exc}"))
             continue
-        results.append((slug, f"{removed} unlinked from {directory}"))
+        results.append(SkillOutcome(slug, "removed", f"{removed} unlinked from {directory}"))
     return results
 
 
@@ -495,32 +517,38 @@ def install_skills(
     *,
     home: Path | None = None,
     environment: Mapping[str, str] | None = None,
-) -> list[tuple[str, str]]:
+) -> list[SkillOutcome]:
     """Symlink bundled skills into each selected harness's skill directory.
 
-    Returns one (slug, status message) pair per harness; per-harness problems
-    become "skipped" messages instead of raising.
+    Returns one structured outcome per harness; per-harness problems become
+    "skipped" outcomes instead of raising.
     """
 
     skills_source = install_directory / "src" / "code_indexing_mcp" / "skills"
     if not skills_source.is_dir():
-        return [(slug, f"skipped: bundled skills not found at {skills_source}") for slug in slugs]
+        return [
+            SkillOutcome(slug, "skipped", f"skipped: bundled skills not found at {skills_source}")
+            for slug in slugs
+        ]
     skills = sorted(entry for entry in skills_source.iterdir() if (entry / "SKILL.md").is_file())
-    results: list[tuple[str, str]] = []
+    results: list[SkillOutcome] = []
     for slug in slugs:
         directory = skill_directory(slug, home=home, environment=environment)
         if directory is None:
-            results.append((slug, "skipped: harness has no skill-directory support"))
+            results.append(
+                SkillOutcome(slug, "skipped", "skipped: harness has no skill-directory support")
+            )
             continue
         try:
             created = [_link_skill(skill, directory / skill.name) for skill in skills]
         except OSError as exc:
-            results.append((slug, f"skipped: {exc}"))
+            results.append(SkillOutcome(slug, "skipped", f"skipped: {exc}"))
             continue
         linked = sum(created)
         results.append(
-            (
+            SkillOutcome(
                 slug,
+                "linked",
                 f"{linked} linked, {len(created) - linked} already installed in {directory}",
             )
         )

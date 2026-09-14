@@ -299,19 +299,23 @@ class BackendCoordinator:
             return 0
         if not self.settings.embedding_crossover_auto:
             return self.settings.embedding_crossover_characters
-        cpu, accelerator = self._measurements()
+        measurements = self._measurements()
+        cpu, accelerator = measurements
         if cpu is None or accelerator is None:
             return 0
-        return self._measured_crossover()
+        return self._measured_crossover(measurements)
 
-    def _measured_crossover(self) -> int | None:
+    def _measured_crossover(
+        self,
+        measurements: tuple[ProbeRecord | None, ProbeRecord | None] | None = None,
+    ) -> int | None:
         """Return the crossover the recorded measurements imply, if both exist.
 
         What the machine measured, with no policy applied. ``model status``
         reports this, so an explicit threshold or strict mode changes which runs
         defer without changing what this machine was found to be.
         """
-        cpu, accelerator = self._measurements()
+        cpu, accelerator = self._measurements() if measurements is None else measurements
         if cpu is None or accelerator is None:
             return None
         return crossover_characters(
@@ -439,7 +443,7 @@ class BackendCoordinator:
         # What was measured, not what policy does with it: an explicit setting
         # or strict mode changes which runs defer, and neither changes what this
         # machine turned out to be.
-        measured_crossover = self._measured_crossover()
+        measured_crossover = self._measured_crossover((cpu, accelerator))
         return ModelStatus(
             embedding_model=self.embedder.model_id,
             dimension=self.embedder.dimension,

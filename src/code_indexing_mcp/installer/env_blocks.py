@@ -11,36 +11,45 @@ from __future__ import annotations
 import json
 import tomllib
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal, NamedTuple
 
-from .config_files import SERVER_NAME, _jsonc_as_json
+from .config_files import SERVER_NAME, InstallerError, _jsonc_as_json
 
-ENV_KEYS: dict[str, str] = {
-    "codex": "env",
-    "claude-code": "env",
-    "kimi-code": "env",
-    "claude-desktop": "env",
-    "opencode": "environment",
-    "kilocode": "environment",
-    "antigravity": "env",
-    "antigravity-cli": "env",
-    "muse-code": "env",
-    "tabnine": "env",
-    "tabnine-cli": "env",
+
+class HarnessSchema(NamedTuple):
+    """The common server-entry shape shared by installer read/write paths."""
+
+    environment_key: str
+    object_key: str | None
+    command_style: Literal["string", "argv"] = "string"
+
+
+HARNESS_SCHEMAS: dict[str, HarnessSchema] = {
+    "codex": HarnessSchema("env", None),
+    "claude-code": HarnessSchema("env", "mcpServers"),
+    "kimi-code": HarnessSchema("env", "mcpServers"),
+    "claude-desktop": HarnessSchema("env", "mcpServers"),
+    "opencode": HarnessSchema("environment", "mcp", "argv"),
+    "kilocode": HarnessSchema("environment", "mcp", "argv"),
+    "antigravity": HarnessSchema("env", "mcpServers"),
+    "antigravity-cli": HarnessSchema("env", "mcpServers"),
+    "muse-code": HarnessSchema("env", "mcpServers"),
+    "tabnine": HarnessSchema("env", "mcpServers"),
+    "tabnine-cli": HarnessSchema("env", "mcpServers"),
 }
 
-OBJECT_KEYS: dict[str, str] = {
-    "claude-code": "mcpServers",
-    "kimi-code": "mcpServers",
-    "claude-desktop": "mcpServers",
-    "opencode": "mcp",
-    "kilocode": "mcp",
-    "antigravity": "mcpServers",
-    "antigravity-cli": "mcpServers",
-    "muse-code": "mcpServers",
-    "tabnine": "mcpServers",
-    "tabnine-cli": "mcpServers",
+# Keep these mappings as compatibility views for callers that only need one
+# field; the registry above is the source of truth for all shared schemas.
+ENV_KEYS = {slug: schema.environment_key for slug, schema in HARNESS_SCHEMAS.items()}
+OBJECT_KEYS = {
+    slug: schema.object_key
+    for slug, schema in HARNESS_SCHEMAS.items()
+    if schema.object_key is not None
 }
+
+
+def harness_schema(slug: str) -> HarnessSchema | None:
+    return HARNESS_SCHEMAS.get(slug)
 
 
 def entry_from_text(slug: str, text: str) -> dict[str, Any] | None:
@@ -50,10 +59,10 @@ def entry_from_text(slug: str, text: str) -> dict[str, Any] | None:
         if slug == "codex":
             servers = tomllib.loads(text).get("mcp_servers")
         else:
-            object_key = OBJECT_KEYS.get(slug)
-            if object_key is None:
+            schema = harness_schema(slug)
+            if schema is None or schema.object_key is None:
                 return None
-            servers = json.loads(_jsonc_as_json(text)).get(object_key)
+            servers = json.loads(_jsonc_as_json(text)).get(schema.object_key)
     except ValueError:
         return None
     if not isinstance(servers, dict):
@@ -64,7 +73,10 @@ def entry_from_text(slug: str, text: str) -> dict[str, Any] | None:
 
 def env_from_entry(slug: str, entry: Mapping[str, Any]) -> dict[str, str]:
     """Return the entry's environment block under this harness's key."""
-    raw = entry.get(ENV_KEYS[slug])
+    schema = harness_schema(slug)
+    if schema is None:
+        raise InstallerError(f"Unknown harness {slug!r}")
+    raw = entry.get(schema.environment_key)
     if not isinstance(raw, dict):
         return {}
     return {str(key): str(value) for key, value in raw.items()}

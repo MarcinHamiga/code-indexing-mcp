@@ -38,7 +38,7 @@ class UninstallPlan:
 @dataclass
 class UninstallResult:
     harnesses_cleared: tuple[tuple[str, Path, bool], ...] = ()
-    skills: tuple[tuple[str, str], ...] = ()
+    skills: tuple[harnesses.SkillOutcome, ...] = ()
     launcher_removed: Path | None = None
     profiles_cleared: tuple[Path, ...] = ()
     directories_removed: tuple[Path, ...] = ()
@@ -165,8 +165,14 @@ def run_uninstall(
             environment=environment,
         )
     )
-    for slug, message in result.skills:
-        on_event(StepEvent("skills", "finished", f"{slug}: {message}"))
+    for outcome in result.skills:
+        on_event(
+            StepEvent(
+                "skills",
+                "warning" if outcome.status == "skipped" else "finished",
+                f"{outcome.slug}: {outcome.detail}",
+            )
+        )
 
     _remove_launcher(plan, result, on_event, home=home, environment=environment)
     _remove_directories(plan, result, on_event, home=home, environment=environment)

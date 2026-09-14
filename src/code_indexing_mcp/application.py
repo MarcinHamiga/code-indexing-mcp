@@ -7,12 +7,13 @@ import os
 import shutil
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Protocol, TypeVar, cast
+from typing import NamedTuple, Protocol, TypeVar, cast
 
 from filelock import FileLock, Timeout
 from platformdirs import user_cache_path, user_data_path
@@ -116,6 +117,13 @@ SCAN_INSPECTION_MAX_LIMIT = 200
 # even when neither directory has been populated with anything else yet
 # (installer/uninstall.py's `_DATA_MARKERS`).
 _PRIVATE_DIRECTORY_SENTINEL = ".code-indexing-mcp"
+
+
+class _PreparedReferenceQuery(NamedTuple):
+    selector: DeclarationSelector
+    backfill: ReferenceBackfillReport
+    partition: PartitionRef
+    root: Path
 
 
 def _tighten_if_owned(directory: Path) -> None:
@@ -940,9 +948,8 @@ class Application:
         remain one coherent generation.
 
         Files that still could not be covered are returned rather than raised.
-        One unparseable file used to disable both reference tools for the whole
-        project on every call, with no way to clear it; the resolver now reports
-        those paths as limitations so the rest of the analysis stays usable.
+        A file-level parser failure is reported as a limitation, so the rest of
+        the project's analysis remains usable.
         """
 
         resolved = self._resolve(project, roots)
@@ -1603,6 +1610,28 @@ class Application:
         report = self.ensure_reference_index(target.project.id, _target=target)
         return selector, report, target.partition
 
+    @contextmanager
+    def _prepared_reference_query(
+        self,
+        selector: DeclarationSelector,
+        target: ActiveIndexTarget,
+    ) -> Iterator[_PreparedReferenceQuery]:
+        """Pin reference inputs and their storage partition for one query.
+
+        The repository-stability retry belongs to the public methods. Once a
+        retry attempt has selected a target, all reference operations share
+        this boundary so preparation and reads cannot accidentally use
+        different partitions.
+        """
+        prepared_selector, backfill, partition = self._prepare_reference_query(selector, target)
+        with self.store.partition_access(backfill.project_id, partition_id=partition.partition_id):
+            yield _PreparedReferenceQuery(
+                selector=prepared_selector,
+                backfill=backfill,
+                partition=partition,
+                root=target.project.root,
+            )
+
     def _ensure_query_generations(self, targets: Mapping[str, Sequence[ActiveIndexTarget]]) -> None:
         """Rebuild incompatible partitions before any query can observe them."""
         for project_id in sorted(targets):
@@ -1652,16 +1681,15 @@ class Application:
         limit: int,
         cursor: str | None,
     ) -> ReferenceResponse:
-        selector, report, partition = self._prepare_reference_query(selector, target)
-        with self.store.partition_access(report.project_id, partition_id=partition.partition_id):
+        with self._prepared_reference_query(selector, target) as prepared:
             return self.references.find_references(
-                selector,
+                prepared.selector,
                 kinds=kinds,
                 limit=limit,
                 cursor=cursor,
-                backfill=report,
-                partition=partition,
-                root=target.project.root,
+                backfill=prepared.backfill,
+                partition=prepared.partition,
+                root=prepared.root,
             )
 
     def impact_radius(
@@ -1703,19 +1731,18 @@ class Application:
         limit: int,
         cursor: str | None,
     ) -> ImpactRadiusResponse:
-        selector, report, partition = self._prepare_reference_query(selector, target)
-        with self.store.partition_access(report.project_id, partition_id=partition.partition_id):
+        with self._prepared_reference_query(selector, target) as prepared:
             return self.references.impact_radius(
-                selector,
+                prepared.selector,
                 max_depth=max_depth,
                 include_likely=include_likely,
                 kinds=kinds,
                 max_nodes=max_nodes,
                 limit=limit,
                 cursor=cursor,
-                backfill=report,
-                partition=partition,
-                root=target.project.root,
+                backfill=prepared.backfill,
+                partition=prepared.partition,
+                root=prepared.root,
             )
 
     def analyze_refactor(
@@ -1748,16 +1775,15 @@ class Application:
         limit: int,
         cursor: str | None,
     ) -> RefactorAnalysis:
-        selector, report, partition = self._prepare_reference_query(selector, target)
-        with self.store.partition_access(report.project_id, partition_id=partition.partition_id):
+        with self._prepared_reference_query(selector, target) as prepared:
             return self.references.analyze_refactor(
-                selector,
+                prepared.selector,
                 operation,
                 limit=limit,
                 cursor=cursor,
-                backfill=report,
-                partition=partition,
-                root=target.project.root,
+                backfill=prepared.backfill,
+                partition=prepared.partition,
+                root=prepared.root,
             )
 
     def emit_refactor_patch(
@@ -1788,15 +1814,14 @@ class Application:
         *,
         context_lines: int,
     ) -> RefactorPatch:
-        selector, report, partition = self._prepare_reference_query(selector, target)
-        with self.store.partition_access(report.project_id, partition_id=partition.partition_id):
+        with self._prepared_reference_query(selector, target) as prepared:
             return self.references.emit_refactor_patch(
-                selector,
+                prepared.selector,
                 operation,
                 context_lines=context_lines,
-                backfill=report,
-                partition=partition,
-                root=target.project.root,
+                backfill=prepared.backfill,
+                partition=prepared.partition,
+                root=prepared.root,
             )
 
     def _resolve_reference_project(

@@ -5,14 +5,57 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from filelock import Timeout
 
 from code_indexing_mcp.probe_cache import (
     CACHE_SCHEMA_VERSION,
     MAX_RECORDS,
     ProbeCache,
     ProbeKey,
+    ProbeRecord,
     model_artifact_fingerprint,
 )
+
+
+@pytest.mark.parametrize("failure", [Timeout, OSError])
+def test_a_cache_lock_failure_skips_the_optional_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: type[Exception]
+) -> None:
+    cache = ProbeCache(tmp_path / "probes.json")
+
+    def acquire(*args: object, **kwargs: object) -> object:
+        raise failure("cache lock unavailable")
+
+    monkeypatch.setattr("code_indexing_mcp.probe_cache.FileLock.acquire", acquire)
+
+    cache.store(_key(), batch_size=8, dimension=768)
+
+    assert not cache.path.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("batch_size", 0),
+        ("batch_size", -1),
+        ("dimension", 0),
+        ("dimension", -1),
+        ("characters_per_second", float("nan")),
+        ("characters_per_second", float("inf")),
+    ],
+)
+def test_invalid_probe_measurements_are_dropped(field: str, value: object) -> None:
+    record = {
+        "fingerprint": "fingerprint",
+        "batch_size": 8,
+        "dimension": 768,
+        "recorded_at_ns": 1,
+        "characters_per_second": 1.0,
+        "load_ns": 1,
+    }
+    record[field] = value
+
+    assert ProbeRecord.from_json(record) is None
 
 
 def _key(**overrides: str) -> ProbeKey:

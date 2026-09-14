@@ -6,18 +6,19 @@ import argparse
 import os
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
-from ..application import RuntimePaths
 from .accelerator import ACCELERATOR_CHOICES
 from .config_files import InstallerError
-from .daemon_control import daemon_relevant_settings_changed, stop_daemon
+from .daemon_control import stop_daemon
 from .harnesses import HARNESS_CHOICES, grouped_choices, parse_harness_selection
 from .orchestrator import (
     InstallPlan,
     InstallResult,
     StepEvent,
     default_install_directory,
+    finalize_reconfigure,
     run_install,
 )
 from .settings_spec import BY_NAME, as_bool, normalize, validate
@@ -115,26 +116,34 @@ def parse_settings(pairs: Sequence[str], unsets: Sequence[str]) -> dict[str, str
     return updates
 
 
+@dataclass(frozen=True)
+class ConfigureRequest:
+    """Typed input shared by the module CLI and ``configure`` entry point."""
+
+    install_directory: Path
+    accelerator: str | None
+    harnesses: str | None
+    settings: tuple[str, ...]
+    unsets: tuple[str, ...]
+    interactive: bool
+    no_prompt: bool
+    offline: bool
+    bin_directory: Path | None
+    no_launcher: bool
+    no_modify_path: bool
+    reconfigure: bool
+    repair: bool
+
+
 def _print_event(event: StepEvent) -> None:
     stream = sys.stderr if event.status in {"warning", "failed"} else sys.stdout
     print(f"[{event.step}] {event.status}: {event.detail}", file=stream)
 
 
 def _restart_daemon_if_settings_changed(result: InstallResult) -> None:
-    """D6: a running daemon serves stale settings once a config write changes one.
+    """Keep the CLI event sink for the shared reconfigure finalization."""
 
-    Only reached for the reconfigure/``configure`` path (see the call site):
-    a fresh install has nothing running yet to be stale, and repair
-    deliberately writes back the settings already in place, so nothing here
-    would find a change to act on. Nothing is printed when no harness was
-    actually configured (the write this guards never happened) or no managed
-    setting changed.
-    """
-
-    if not result.configured or not daemon_relevant_settings_changed(result.env_written):
-        return
-    status, detail = stop_daemon(RuntimePaths.from_environment(), reason="settings")
-    _print_event(StepEvent("daemon", status, detail))
+    finalize_reconfigure(result, on_event=_print_event, stop=stop_daemon)
 
 
 def _prompt_harnesses(
@@ -156,7 +165,7 @@ def _prompt_harnesses(
 
 
 def _run_tui(
-    args: argparse.Namespace,
+    request: ConfigureRequest,
     install_directory: Path,
     env_updates: dict[str, str | None],
 ) -> int:
@@ -173,54 +182,54 @@ def _run_tui(
     from .wizard import WizardState
 
     preset = {name: value for name, value in env_updates.items() if value is not None}
-    if args.reconfigure:
+    if request.reconfigure:
         state = WizardState.for_reconfigure(install_directory)
         state.values.update(preset)
-        if args.accelerator is not None:
-            state.accelerator = args.accelerator
+        if request.accelerator is not None:
+            state.accelerator = request.accelerator
     else:
         state = WizardState.for_install(
             install_directory,
             preset_values=preset,
-            preset_accelerator=args.accelerator,
+            preset_accelerator=request.accelerator,
         )
     # An explicit --unset clears the field, which the wizard then reads as
     # "reset to default" and turns back into a deletion on confirmation.
     for name, value in env_updates.items():
         if value is None:
             state.values.pop(name, None)
-    if args.harnesses is not None:
-        state.harness_slugs = parse_harness_selection(args.harnesses)
-    state.offline = args.offline
-    if args.bin_dir:
-        state.bin_directory = Path(args.bin_dir).expanduser()
-    state.install_launcher = not args.no_launcher
-    state.modify_shell_profiles = not args.no_modify_path
+    if request.harnesses is not None:
+        state.harness_slugs = parse_harness_selection(request.harnesses)
+    state.offline = request.offline
+    if request.bin_directory:
+        state.bin_directory = request.bin_directory
+    state.install_launcher = not request.no_launcher
+    state.modify_shell_profiles = not request.no_modify_path
     app = InstallerApp(state)
     app.run()
     return app.done_code if app.done_code is not None else 130
 
 
-def _repair(install_directory: Path, args: argparse.Namespace) -> int:
+def _repair(request: ConfigureRequest) -> int:
     """Re-apply the launcher, client entries, and skills for an existing install."""
 
     prefill = load_prefill()
     selected = (
-        parse_harness_selection(args.harnesses)
-        if args.harnesses is not None
+        parse_harness_selection(request.harnesses)
+        if request.harnesses is not None
         else list(prefill.configured_slugs)
     )
     plan = InstallPlan(
-        install_directory=install_directory,
+        install_directory=request.install_directory,
         accelerator=None,
         harness_slugs=tuple(selected),
-        # The values already in the configs, written back as they are: repair
-        # fixes what is broken, it does not change what the user chose.
-        env_updates=dict(prefill.values),
-        offline=args.offline,
-        bin_directory=Path(args.bin_dir).expanduser() if args.bin_dir else None,
-        install_launcher=not args.no_launcher,
-        modify_shell_profiles=not args.no_modify_path,
+        # Repair fixes wiring around the existing configuration. It must not
+        # rewrite values merely because they were used to prefill the wizard.
+        env_updates={},
+        offline=request.offline,
+        bin_directory=request.bin_directory,
+        install_launcher=not request.no_launcher,
+        modify_shell_profiles=not request.no_modify_path,
     )
     result = run_install(plan, on_event=_print_event)
     if result.failures:
@@ -233,41 +242,40 @@ def _repair(install_directory: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    install_directory = Path(args.install_dir).expanduser().resolve()
+def _run_request(request: ConfigureRequest) -> int:
+    install_directory = request.install_directory
     try:
-        env_updates = parse_settings(args.settings, args.unsets)
-        if args.tui:
-            return _run_tui(args, install_directory, env_updates)
-        if args.repair:
+        env_updates = parse_settings(request.settings, request.unsets)
+        if request.interactive:
+            return _run_tui(request, install_directory, env_updates)
+        if request.repair:
             # Repair re-runs the cheap steps against what is already configured.
             # Nothing is chosen anew, so it never opens the wizard and never
             # rebuilds an accelerator environment that already works.
-            return _repair(install_directory, args)
-        if args.harnesses is not None:
-            selected = parse_harness_selection(args.harnesses)
-        elif args.reconfigure:
+            return _repair(request)
+        if request.harnesses is not None:
+            selected = parse_harness_selection(request.harnesses)
+        elif request.reconfigure:
             selected = list(load_prefill().configured_slugs)
-        elif args.no_prompt or not sys.stdin.isatty():
+        elif request.no_prompt or not sys.stdin.isatty():
             selected = []
         else:
             selected = _prompt_harnesses()
-        accelerator = args.accelerator
-        if accelerator is None and not args.reconfigure:
+        accelerator = request.accelerator
+        if accelerator is None and not request.reconfigure:
             accelerator = "auto"
         plan = InstallPlan(
             install_directory=install_directory,
             accelerator=accelerator,
             harness_slugs=tuple(selected),
             env_updates=env_updates,
-            offline=args.offline,
-            bin_directory=Path(args.bin_dir).expanduser() if args.bin_dir else None,
-            install_launcher=not args.no_launcher,
-            modify_shell_profiles=not args.no_modify_path,
+            offline=request.offline,
+            bin_directory=request.bin_directory,
+            install_launcher=not request.no_launcher,
+            modify_shell_profiles=not request.no_modify_path,
         )
         result = run_install(plan, on_event=_print_event)
-        if args.reconfigure:
+        if request.reconfigure:
             _restart_daemon_if_settings_changed(result)
     except InstallerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -300,6 +308,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return _run_request(
+        ConfigureRequest(
+            install_directory=Path(args.install_dir).expanduser().resolve(),
+            accelerator=args.accelerator,
+            harnesses=args.harnesses,
+            settings=tuple(args.settings),
+            unsets=tuple(args.unsets),
+            interactive=args.tui,
+            no_prompt=args.no_prompt,
+            offline=args.offline,
+            bin_directory=Path(args.bin_dir).expanduser() if args.bin_dir else None,
+            no_launcher=args.no_launcher,
+            no_modify_path=args.no_modify_path,
+            reconfigure=args.reconfigure,
+            repair=args.repair,
+        )
+    )
+
+
 def configure_main(
     *,
     install_dir: str | None,
@@ -325,30 +354,27 @@ def configure_main(
     if not server_executable(install_directory).is_file():
         print(f"Error: no installation found at {install_directory}", file=sys.stderr)
         return 1
-    argv = ["--install-dir", str(install_directory), "--reconfigure", "--no-prompt"]
-    if accelerator is not None:
-        argv += ["--accelerator", accelerator]
-    if harnesses is not None:
-        argv += ["--harnesses", harnesses]
-    for pair in settings:
-        argv += ["--set", pair]
-    for name in unsets:
-        argv += ["--unset", name]
-    if bin_dir is not None:
-        argv += ["--bin-dir", bin_dir]
-    if no_launcher:
-        argv.append("--no-launcher")
-    if no_modify_path:
-        argv.append("--no-modify-path")
-    if repair:
-        argv.append("--repair")
     # Any flag that already says what to do is an instruction to apply it, not an
     # invitation to open a wizard over the top of it. The launcher flags are not
     # among them: they say where things go, not which steps to skip.
     scripted = bool(
         settings or unsets or harnesses is not None or accelerator is not None or repair
     )
-    if not no_tui and not scripted and sys.stdin.isatty():
-        argv.remove("--no-prompt")
-        argv.append("--tui")
-    return main(argv)
+    interactive = not no_tui and not scripted and sys.stdin.isatty()
+    return _run_request(
+        ConfigureRequest(
+            install_directory=install_directory,
+            accelerator=accelerator,
+            harnesses=harnesses,
+            settings=tuple(settings),
+            unsets=tuple(unsets),
+            interactive=interactive,
+            no_prompt=True,
+            offline=as_bool(os.environ.get("CODE_INDEXING_OFFLINE", "")),
+            bin_directory=Path(bin_dir).expanduser() if bin_dir else None,
+            no_launcher=no_launcher,
+            no_modify_path=no_modify_path,
+            reconfigure=True,
+            repair=repair,
+        )
+    )

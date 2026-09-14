@@ -334,7 +334,7 @@ class StartupCoordinator:
                 logger.info("Skipping automatic indexing for non-project root: %s", root)
                 return
             await self._ensure_monitor(root, project.id)
-            report = await self._index_when_free(project.id, trigger=job.trigger)
+            report = await self._index_when_free(project.id, root=root, trigger=job.trigger)
             logger.info(
                 "Automatic indexing complete for %s: %s files indexed",
                 project.root,
@@ -455,7 +455,7 @@ class StartupCoordinator:
                     dirty.put_nowait(None)
 
     async def _index_when_free(
-        self, project_id: str, *, trigger: IndexTrigger = "startup"
+        self, project_id: str, *, root: Path, trigger: IndexTrigger = "startup"
     ) -> IndexReport:
         """Index *project_id* once the machine is free, within ``wait_seconds``.
 
@@ -469,7 +469,11 @@ class StartupCoordinator:
         await self._acquire_slot(deadline, started=started)
         try:
             return await self._index_with_backoff(
-                project_id, deadline=deadline, started=started, trigger=trigger
+                project_id,
+                root=root,
+                deadline=deadline,
+                started=started,
+                trigger=trigger,
             )
         finally:
             self._limiter.release()
@@ -492,6 +496,7 @@ class StartupCoordinator:
         self,
         project_id: str,
         *,
+        root: Path,
         deadline: float,
         started: float,
         trigger: IndexTrigger = "startup",
@@ -507,7 +512,12 @@ class StartupCoordinator:
         while True:
             try:
                 return await anyio.to_thread.run_sync(
-                    partial(self.application.index_project, project_id, trigger=trigger),
+                    partial(
+                        self.application.index_project,
+                        project_id,
+                        roots=[root],
+                        trigger=trigger,
+                    ),
                     abandon_on_cancel=False,
                 )
             except CodeIndexingError as exc:
