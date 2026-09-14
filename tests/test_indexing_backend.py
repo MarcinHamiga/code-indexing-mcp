@@ -38,7 +38,9 @@ from code_indexing_mcp.embedding_worker import EmbeddingWorkerSession, WorkerCon
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import Indexer
+from code_indexing_mcp.models import ProjectInfo
 from code_indexing_mcp.passage_backend import PassageBackendSession
+from code_indexing_mcp.passage_cache import PassageCacheNamespace, PassageReuseContext
 from code_indexing_mcp.projects import initialize_project
 from code_indexing_mcp.scanner import SourceScanner
 from code_indexing_mcp.storage import LanceStore
@@ -188,8 +190,44 @@ def _session_factory(
     return factory
 
 
+def _counted_cpu_session_factory(
+    sessions: list[PassageBackendSession], worker_starts: list[int]
+) -> Callable[[], PassageBackendSession]:
+    selection = BackendSelection(
+        requested=Accelerator.CPU,
+        descriptor=CPU_BACKEND,
+        available_providers=(CPU_PROVIDER,),
+    )
+
+    def factory() -> PassageBackendSession:
+        def refuse_accelerator() -> EmbeddingWorkerSession:
+            raise AssertionError("a CPU selection must not start an accelerator")
+
+        def cpu_session() -> EmbeddingWorkerSession:
+            worker_starts.append(1)
+            return EmbeddingWorkerSession(
+                _config(Accelerator.CPU.value, CPU_BACKEND.providers),
+                effective_ceiling_bytes=2 * 1024**3,
+                target=_healthy_worker,
+            )
+
+        session = PassageBackendSession(
+            selection,
+            accelerator_factory=refuse_accelerator,
+            cpu_factory=cpu_session,
+            dimension=DIMENSION,
+        )
+        sessions.append(session)
+        return session
+
+    return factory
+
+
 def _indexer(
-    tmp_path: Path, factory: Callable[[], PassageBackendSession] | None
+    tmp_path: Path,
+    factory: Callable[[], PassageBackendSession] | None,
+    *,
+    passage_cache_factory: Callable[[ProjectInfo, bool], PassageReuseContext] | None = None,
 ) -> tuple[Indexer, LanceStore]:
     store = LanceStore(tmp_path / "data", vector_dimension=DIMENSION)
     return (
@@ -201,6 +239,7 @@ def _indexer(
             lock_directory=tmp_path / "locks",
             segment_plan=SegmentPlan(max_tokens=64, max_items=4),
             passage_session_factory=factory,
+            passage_cache_factory=passage_cache_factory,
             staging_directory=tmp_path / "staging",
         ),
         store,
@@ -215,6 +254,64 @@ def _repository(tmp_path: Path, files: int = 3) -> Path:
             f"def function_{index}(value):\n    return value + {index}\n"
         )
     return root
+
+
+def test_fresh_passage_sessions_reuse_before_starting_workers(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "main.py"
+    initial = "def changed():\n    return 1\n\ndef stable():\n    return 7\n"
+    source.write_text(initial)
+    project = initialize_project(root)
+    cache_path = tmp_path / "passage.sqlite3"
+    sessions: list[PassageBackendSession] = []
+    worker_starts: list[int] = []
+
+    def cache_factory(current_project: ProjectInfo, force: bool) -> PassageReuseContext:
+        return PassageReuseContext(
+            cache_path,
+            PassageCacheNamespace(
+                project_id=current_project.id,
+                artifact_digest="artifact",
+                tokenizer_digest="tokenizer",
+                producer="cpu-float32",
+                runtime_version="test",
+                dimension=DIMENSION,
+                precision="float32-le",
+            ),
+            force=force,
+            producer_matches=lambda producer: getattr(producer, "backend_used", None) == "cpu",
+        )
+
+    indexer, store = _indexer(
+        tmp_path,
+        _counted_cpu_session_factory(sessions, worker_starts),
+        passage_cache_factory=cache_factory,
+    )
+
+    cold = indexer.index(project)
+    changed = initial.replace("return 1", "return 2")
+    source.write_text(changed)
+    partial = indexer.index(project)
+    source.write_text("\n" + changed)
+    all_hit = indexer.index(project)
+
+    assert cold.reused_candidates == 0
+    assert partial.reused_candidates == 1
+    assert partial.embedded_segments == 1
+    assert all_hit.reused_candidates == 2
+    assert all_hit.embedded_segments == 0
+    assert all_hit.worker_used is False
+    assert len(sessions) == 3
+    assert len(worker_starts) == 2
+
+    current_source = source.read_bytes()
+    chunks = store.list_chunks([project.id])
+    assert {chunk.qualified_symbol for chunk in chunks} == {"changed", "stable"}
+    assert all(
+        current_source[chunk.start_byte : chunk.end_byte].decode("utf-8") == chunk.content
+        for chunk in chunks
+    )
 
 
 # -- the happy path stays on the accelerator -------------------------------

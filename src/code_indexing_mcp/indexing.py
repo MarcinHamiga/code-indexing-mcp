@@ -1701,9 +1701,7 @@ class Indexer:
                 PassageCandidate(candidate.chunk.embedding_prefix, candidate.chunk.content)
                 for candidate in candidates
             ]
-            hits, miss_indices = passage_reuse.lookup(
-                planned_candidates, self.segment_plan, producer=passage_embedder
-            )
+            hits, miss_indices = passage_reuse.lookup(planned_candidates, self.segment_plan)
             if not miss_indices:
                 return [(candidates[index], hits[index]) for index in range(len(candidates))], [], 0
             misses = [candidates[index] for index in miss_indices]
