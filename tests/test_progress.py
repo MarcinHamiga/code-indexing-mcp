@@ -4,6 +4,7 @@ import json
 import time
 from pathlib import Path
 
+import pytest
 from test_indexing import RecordingEmbedder, make_indexer
 
 from code_indexing_mcp.extractor import TreeSitterExtractor
@@ -113,9 +114,96 @@ def test_skipped_candidates_are_aggregated_by_reason(tmp_path: Path) -> None:
 
 
 def test_reference_extraction_has_a_distinct_progress_description() -> None:
-    progress = IndexProgress(project_id="project", phase="extracting_references")
+    progress = IndexProgress(
+        project_id="project",
+        phase="extracting_references",
+        run_id="abc123def456",
+        trigger="reference-backfill",
+        candidates_seen=2,
+        candidates_total=5,
+        eligible_files=9,
+        changed_files=1,
+        current_path="pkg/mod.py",
+    )
 
-    assert progress.describe() == "Extracting structural references"
+    text = progress.describe()
+    assert text.startswith("Extracting structural references")
+    assert "2/~5 candidates" in text
+    assert "1 changed" in text
+    assert "pkg/mod.py" in text
+    assert "reference-backfill" in text
+
+
+def test_describe_carries_counters_in_every_phase() -> None:
+    base = {
+        "project_id": "project",
+        "run_id": "abc123def456",
+        "trigger": "watcher",
+        "candidates_seen": 10,
+        "candidates_total": 20,
+        "eligible_files": 8,
+        "changed_files": 5,
+        "parsed_files": 5,
+        "chunks_extracted": 12,
+        "chunks_embedded": 9,
+        "chunks_staged": 9,
+        "current_path": "pkg/mod_001.py",
+        "slot_id": "slot-1abcdef",
+        "selector": "ref:refs/heads/main",
+    }
+    for phase in ("scanning", "embedding", "extracting_references", "committing"):
+        text = IndexProgress(**base, phase=phase).describe()  # type: ignore[arg-type]
+        for expected in (
+            "5 changed",
+            "5 parsed",
+            "12 chunks extracted",
+            "9 chunks embedded",
+            "9 chunks staged",
+            "pkg/mod_001.py",
+            "abc123de",
+            "watcher",
+            "slot-1ab",
+            "ref:refs/heads/main",
+        ):
+            assert expected in text, (phase, text)
+    # A run that has not seen anything yet still names the wait.
+    assert IndexProgress(project_id="project").describe() == "Scanning for changed files"
+
+
+def test_embedding_progress_advances_with_every_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("code_indexing_mcp.indexing.CANDIDATE_GROUP_COUNT", 2)
+    project = initialize_project(_repo(tmp_path))
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+    seen: list[IndexProgress] = []
+
+    report = indexer.index(project, on_progress=lambda progress: seen.append(progress.model_copy()))
+
+    embedded = [progress.chunks_embedded for progress in seen if progress.phase == "embedding"]
+    assert embedded, "the longest phase must publish progress"
+    assert embedded[0] < embedded[-1]
+    assert embedded[-1] == report.embedded_chunks
+    assert report.embedded_chunks > 0
+    staged = [progress.chunks_staged for progress in seen if progress.phase == "embedding"]
+    assert staged[0] < staged[-1]
+    assert staged[-1] == report.chunks_staged
+
+
+def test_committing_snapshot_carries_run_totals(tmp_path: Path) -> None:
+    project = initialize_project(_repo(tmp_path))
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+    seen: list[IndexProgress] = []
+
+    report = indexer.index(project, on_progress=lambda progress: seen.append(progress.model_copy()))
+
+    last = seen[-1]
+    assert last.phase == "committing"
+    assert last.changed_files == report.indexed_files == 3
+    assert last.chunks_embedded == report.embedded_chunks
+    assert report.embedded_chunks > 0
+    assert last.chunks_staged == report.chunks_staged
+    assert report.chunks_staged > 0
 
 
 def test_another_process_can_read_the_snapshot_and_it_is_gone_afterwards(tmp_path: Path) -> None:

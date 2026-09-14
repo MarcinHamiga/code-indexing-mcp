@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 import time
 from collections.abc import Sequence
@@ -308,10 +309,12 @@ class _ProgressPrinter:
         self._width = 0
         self._logged_at: float | None = None
         self._logged_phase: str | None = None
+        self._logged_line: str | None = None
 
     def __call__(self, progress: IndexProgress) -> None:
         line = progress.describe()
         if self.interactive:
+            line = self._fit_terminal(line)
             self.stream.write("\r" + line.ljust(self._width))
             self._width = len(line)
             self.stream.flush()
@@ -319,16 +322,29 @@ class _ProgressPrinter:
         now = time.monotonic()
         # A phase change is news whenever it happens: embedding a batch is where
         # a run spends minutes without a word, and the log should say so before
-        # the wait rather than after it.
+        # the wait rather than after it. An advancing counter line is news too:
+        # a run spends those minutes inside one phase, and the periodic cadence
+        # alone cannot tell moving numbers from a frozen worker.
         if (
             progress.phase == self._logged_phase
+            and line == self._logged_line
             and self._logged_at is not None
             and now - self._logged_at < self.LOG_INTERVAL_SECONDS
         ):
             return
         self._logged_at = now
         self._logged_phase = progress.phase
+        self._logged_line = line
         print(line, file=self.stream, flush=True)
+
+    @staticmethod
+    def _fit_terminal(line: str) -> str:
+        """Keep the status line on one row: wrapped output scrolls like a log."""
+
+        columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+        if columns < 40 or len(line) <= columns:
+            return line
+        return line[: columns - 1] + "…"
 
     def clear(self) -> None:
         """Take the status line back down before anything else is printed."""

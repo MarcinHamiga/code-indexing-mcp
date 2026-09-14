@@ -480,6 +480,30 @@ def test_a_terminal_gets_one_status_line_that_is_cleaned_up_afterwards() -> None
     assert written.rstrip("\r").endswith(" " * len("Scanning 2 candidates"))
 
 
+def test_redirected_log_repeats_advancing_counts_without_waiting() -> None:
+    from code_indexing_mcp.progress import IndexProgress
+
+    stream = io.StringIO()
+    printer = cli._ProgressPrinter(stream)
+    assert printer.interactive is False
+
+    def embedding_snapshot(chunks: int) -> IndexProgress:
+        return IndexProgress(
+            project_id="abc",
+            phase="embedding",
+            candidates_seen=5,
+            candidates_total=10,
+            chunks_embedded=chunks,
+        )
+
+    printer(embedding_snapshot(1))
+    printer(embedding_snapshot(2))
+    assert stream.getvalue().count("\n") == 2
+    # An identical line inside the interval is still throttled.
+    printer(embedding_snapshot(2))
+    assert stream.getvalue().count("\n") == 2
+
+
 def test_cli_reports_storage_status_as_json(  # type: ignore[no-untyped-def]
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
