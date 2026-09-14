@@ -4,6 +4,7 @@ import json
 import time
 from pathlib import Path
 
+import pytest
 from test_indexing import RecordingEmbedder, make_indexer
 
 from code_indexing_mcp.extractor import TreeSitterExtractor
@@ -113,9 +114,154 @@ def test_skipped_candidates_are_aggregated_by_reason(tmp_path: Path) -> None:
 
 
 def test_reference_extraction_has_a_distinct_progress_description() -> None:
-    progress = IndexProgress(project_id="project", phase="extracting_references")
+    progress = IndexProgress(
+        project_id="project",
+        phase="extracting_references",
+        run_id="abc123def456",
+        trigger="reference-backfill",
+        candidates_seen=2,
+        candidates_total=5,
+        eligible_files=9,
+        changed_files=1,
+        current_path="pkg/mod.py",
+    )
 
-    assert progress.describe() == "Extracting structural references"
+    text = progress.describe()
+    assert text.startswith("Extracting structural references")
+    assert "2/~5 candidates" in text
+    assert "1 changed" in text
+    assert "pkg/mod.py" in text
+    assert "reference-backfill" in text
+
+
+def test_describe_carries_counters_in_every_phase() -> None:
+    base = {
+        "project_id": "project",
+        "run_id": "abc123def456",
+        "trigger": "watcher",
+        "candidates_seen": 10,
+        "candidates_total": 20,
+        "eligible_files": 8,
+        "changed_files": 5,
+        "parsed_files": 5,
+        "chunks_extracted": 12,
+        "chunks_embedded": 9,
+        "chunks_staged": 9,
+        "current_path": "pkg/mod_001.py",
+        "slot_id": "slot-1abcdef",
+        "selector": "ref:refs/heads/main",
+    }
+    for phase in ("scanning", "embedding", "extracting_references", "committing"):
+        text = IndexProgress(**base, phase=phase).describe()  # type: ignore[arg-type]
+        for expected in (
+            "5 changed",
+            "5 parsed",
+            "12 chunks extracted",
+            "9 chunks embedded",
+            "9 chunks staged",
+            "pkg/mod_001.py",
+            "abc123de",
+            "watcher",
+            "slot-1ab",
+            "ref:refs/heads/main",
+        ):
+            assert expected in text, (phase, text)
+    # A run that has not seen anything yet still names the wait.
+    assert IndexProgress(project_id="project").describe() == "Scanning for changed files"
+
+
+def test_embedding_progress_advances_with_every_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One file with three chunks: small enough to flush once, big enough for
+    # two groups at COUNT=2, so the middle of the phase is one flush's groups
+    # rather than several flushes' bracket updates.
+    monkeypatch.setattr("code_indexing_mcp.indexing.CANDIDATE_GROUP_COUNT", 2)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "module.py").write_text(
+        "def answer_0():\n    return 0\n\n\n"
+        "def answer_1():\n    return 1\n\n\n"
+        "def answer_2():\n    return 2\n"
+    )
+    project = initialize_project(root)
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+    seen: list[IndexProgress] = []
+
+    report = indexer.index(project, on_progress=lambda progress: seen.append(progress.model_copy()))
+
+    assert seen[-1].chunks_extracted >= 3, "the fixture must span at least two groups"
+    embedded = [progress.chunks_embedded for progress in seen if progress.phase == "embedding"]
+    assert embedded, "the longest phase must publish progress"
+    # Initial, per-group, final: a first-to-last comparison alone cannot tell
+    # per-group publishing from a frozen middle, so demand distinct mid-flush
+    # levels too.
+    assert len(embedded) > 2, "each embedding group must publish its running total"
+    assert len(set(embedded)) > 2, "each embedding group must advance the running total"
+    assert embedded == sorted(embedded), "running totals never move backwards"
+    assert embedded[0] < embedded[-1]
+    assert embedded[-1] == report.embedded_chunks
+    assert report.embedded_chunks > 0
+    staged = [progress.chunks_staged for progress in seen if progress.phase == "embedding"]
+    assert len(staged) > 2, "each embedding group must publish its running total"
+    assert len(set(staged)) > 2, "each embedding group must advance the running total"
+    assert staged == sorted(staged), "running totals never move backwards"
+    assert staged[0] < staged[-1]
+    assert staged[-1] == report.chunks_staged
+    # Only the per-group update names the file in flight: the flush brackets
+    # publish with no current path.
+    assert any(
+        progress.current_path is not None for progress in seen if progress.phase == "embedding"
+    ), "each embedding group must publish the file in flight"
+
+
+def test_mid_flush_totals_exclude_files_that_already_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailSecondBatchEmbedder(RecordingEmbedder):
+        """Banks one batch, then fails every later batch like a dying worker."""
+
+        def embed_passages(self, texts: list[str]) -> list[list[float]]:
+            if self.passage_batches:
+                raise RuntimeError("embedding failed")
+            return super().embed_passages(texts)
+
+    # One file, two chunks, one chunk per group: the first group banks a
+    # chunk, the second group fails the file, and the file's banked chunk
+    # must leave the published total the moment the failure lands.
+    monkeypatch.setattr("code_indexing_mcp.indexing.CANDIDATE_GROUP_COUNT", 1)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "module.py").write_text(
+        "def answer_0():\n    return 0\n\n\ndef answer_1():\n    return 1\n"
+    )
+    project = initialize_project(root)
+    indexer, _ = make_indexer(tmp_path, FailSecondBatchEmbedder())
+    seen: list[IndexProgress] = []
+
+    report = indexer.index(project, on_progress=lambda progress: seen.append(progress.model_copy()))
+
+    assert report.embedded_chunks == 0
+    assert report.errors, "the second group must fail the file"
+    embedded = [progress.chunks_embedded for progress in seen if progress.phase == "embedding"]
+    assert max(embedded) > 0, "the first group must bank a chunk before the failure"
+    assert embedded[-2] == 0, "a failed file's banked chunks must leave the published total"
+
+
+def test_committing_snapshot_carries_run_totals(tmp_path: Path) -> None:
+    project = initialize_project(_repo(tmp_path))
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+    seen: list[IndexProgress] = []
+
+    report = indexer.index(project, on_progress=lambda progress: seen.append(progress.model_copy()))
+
+    last = seen[-1]
+    assert last.phase == "committing"
+    assert last.changed_files == report.indexed_files == 3
+    assert last.chunks_embedded == report.embedded_chunks
+    assert report.embedded_chunks > 0
+    assert last.chunks_staged == report.chunks_staged
+    assert report.chunks_staged > 0
 
 
 def test_another_process_can_read_the_snapshot_and_it_is_gone_afterwards(tmp_path: Path) -> None:

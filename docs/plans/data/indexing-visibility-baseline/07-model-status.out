@@ -1,0 +1,29 @@
+{
+  "accelerator_characters_per_second": null,
+  "accelerator_environment": null,
+  "accelerator_load_ms": null,
+  "accelerator_prepared": null,
+  "available_providers": [
+    "CoreMLExecutionProvider",
+    "AzureExecutionProvider",
+    "CPUExecutionProvider"
+  ],
+  "batch_calibration": "default",
+  "batch_size": 1,
+  "cpu_characters_per_second": null,
+  "crossover_characters": null,
+  "device": "cpu",
+  "dimension": 768,
+  "driver_version": "",
+  "embedding_model": "jinaai/jina-embeddings-v2-base-code",
+  "execution_provider": "CPUExecutionProvider",
+  "fallback_reason": "no accelerator is prepared and eligible on this machine; reinstall with --accelerator to prepare one, or set CODE_INDEXING_EMBED_ACCELERATOR to force a backend this installation already offers",
+  "precision": "float32",
+  "probe_cache_state": "not-applicable",
+  "recommended_override": null,
+  "requested_accelerator": "auto",
+  "resolved_accelerator": "cpu",
+  "runtime_version": "1.27.0",
+  "stability": "automatic",
+  "strict": false
+}

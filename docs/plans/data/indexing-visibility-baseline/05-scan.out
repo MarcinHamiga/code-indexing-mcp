@@ -1,0 +1,504 @@
+{
+  "items": [
+    {
+      "detail": null,
+      "language": null,
+      "mtime_ns": null,
+      "outcome": "skipped",
+      "path": "blob.bin",
+      "reason": "unsupported",
+      "size": null
+    },
+    {
+      "detail": null,
+      "language": null,
+      "mtime_ns": null,
+      "outcome": "skipped",
+      "path": "notes.txt",
+      "reason": "unsupported",
+      "size": null
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101268649542,
+      "outcome": "eligible",
+      "path": "pkg/mod_000.py",
+      "reason": null,
+      "size": 64
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101268775585,
+      "outcome": "eligible",
+      "path": "pkg/mod_001.py",
+      "reason": null,
+      "size": 64
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101268862377,
+      "outcome": "eligible",
+      "path": "pkg/mod_002.py",
+      "reason": null,
+      "size": 64
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101268930253,
+      "outcome": "eligible",
+      "path": "pkg/mod_003.py",
+      "reason": null,
+      "size": 64
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101268996587,
+      "outcome": "eligible",
+      "path": "pkg/mod_004.py",
+      "reason": null,
+      "size": 64
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269104713,
+      "outcome": "eligible",
+      "path": "pkg/mod_005.py",
+      "reason": null,
+      "size": 64
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269176297,
+      "outcome": "eligible",
+      "path": "pkg/mod_006.py",
+      "reason": null,
+      "size": 64
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269237048,
+      "outcome": "eligible",
+      "path": "pkg/mod_007.py",
+      "reason": null,
+      "size": 64
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269295423,
+      "outcome": "eligible",
+      "path": "pkg/mod_008.py",
+      "reason": null,
+      "size": 64
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269353299,
+      "outcome": "eligible",
+      "path": "pkg/mod_009.py",
+      "reason": null,
+      "size": 64
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269405758,
+      "outcome": "eligible",
+      "path": "pkg/mod_010.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269462675,
+      "outcome": "eligible",
+      "path": "pkg/mod_011.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269520009,
+      "outcome": "eligible",
+      "path": "pkg/mod_012.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269579260,
+      "outcome": "eligible",
+      "path": "pkg/mod_013.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269634802,
+      "outcome": "eligible",
+      "path": "pkg/mod_014.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269688427,
+      "outcome": "eligible",
+      "path": "pkg/mod_015.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269742470,
+      "outcome": "eligible",
+      "path": "pkg/mod_016.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269798804,
+      "outcome": "eligible",
+      "path": "pkg/mod_017.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269851846,
+      "outcome": "eligible",
+      "path": "pkg/mod_018.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269902013,
+      "outcome": "eligible",
+      "path": "pkg/mod_019.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101269953180,
+      "outcome": "eligible",
+      "path": "pkg/mod_020.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270003639,
+      "outcome": "eligible",
+      "path": "pkg/mod_021.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270052764,
+      "outcome": "eligible",
+      "path": "pkg/mod_022.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270170974,
+      "outcome": "eligible",
+      "path": "pkg/mod_023.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270243100,
+      "outcome": "eligible",
+      "path": "pkg/mod_024.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270305975,
+      "outcome": "eligible",
+      "path": "pkg/mod_025.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270366601,
+      "outcome": "eligible",
+      "path": "pkg/mod_026.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270431352,
+      "outcome": "eligible",
+      "path": "pkg/mod_027.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270484185,
+      "outcome": "eligible",
+      "path": "pkg/mod_028.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270537103,
+      "outcome": "eligible",
+      "path": "pkg/mod_029.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270589978,
+      "outcome": "eligible",
+      "path": "pkg/mod_030.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270640687,
+      "outcome": "eligible",
+      "path": "pkg/mod_031.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270694938,
+      "outcome": "eligible",
+      "path": "pkg/mod_032.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270743980,
+      "outcome": "eligible",
+      "path": "pkg/mod_033.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270795772,
+      "outcome": "eligible",
+      "path": "pkg/mod_034.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270847939,
+      "outcome": "eligible",
+      "path": "pkg/mod_035.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270898856,
+      "outcome": "eligible",
+      "path": "pkg/mod_036.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270947607,
+      "outcome": "eligible",
+      "path": "pkg/mod_037.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101270997149,
+      "outcome": "eligible",
+      "path": "pkg/mod_038.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101271049649,
+      "outcome": "eligible",
+      "path": "pkg/mod_039.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101271119650,
+      "outcome": "eligible",
+      "path": "pkg/mod_040.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101271174276,
+      "outcome": "eligible",
+      "path": "pkg/mod_041.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101271225943,
+      "outcome": "eligible",
+      "path": "pkg/mod_042.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101271274277,
+      "outcome": "eligible",
+      "path": "pkg/mod_043.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101271326611,
+      "outcome": "eligible",
+      "path": "pkg/mod_044.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101271373611,
+      "outcome": "eligible",
+      "path": "pkg/mod_045.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101271422403,
+      "outcome": "eligible",
+      "path": "pkg/mod_046.py",
+      "reason": null,
+      "size": 68
+    },
+    {
+      "detail": null,
+      "language": "python",
+      "mtime_ns": 1789390101271477404,
+      "outcome": "eligible",
+      "path": "pkg/mod_047.py",
+      "reason": null,
+      "size": 68
+    }
+  ],
+  "next_cursor": "50",
+  "project": {
+    "id": "64415005-c5d9-46fc-a125-d4236822eb98",
+    "name": "repo",
+    "root": "/private/tmp/iv/repo",
+    "scan": {
+      "exclude": [],
+      "include": [
+        "**/*.py",
+        "**/*.pyi",
+        "**/*.js",
+        "**/*.jsx",
+        "**/*.mjs",
+        "**/*.cjs",
+        "**/*.ts",
+        "**/*.tsx",
+        "**/*.mts",
+        "**/*.cts",
+        "**/*.java",
+        "**/*.cs",
+        "**/*.csx",
+        "**/*.gd",
+        "**/*.gdshader",
+        "**/*.gdshaderinc",
+        "**/*.tres",
+        "**/*.tscn",
+        "**/*.godot",
+        "**/*.sql",
+        "**/*.yaml",
+        "**/*.yml",
+        "**/*.json",
+        "**/*.go",
+        "**/*.tf",
+        "**/*.tfvars",
+        "**/*.rs",
+        "**/*.c",
+        "**/*.h",
+        "**/*.cc",
+        "**/*.cpp",
+        "**/*.cxx",
+        "**/*.hh",
+        "**/*.hpp",
+        "**/*.hxx",
+        "**/*.lua"
+      ],
+      "max_file_bytes": 1048576
+    },
+    "version": 1
+  },
+  "schema_version": 1
+}
