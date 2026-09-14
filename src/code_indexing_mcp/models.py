@@ -1121,16 +1121,11 @@ class IndexProgress(BaseModel):
         elif self.phase == "extracting_references":
             head = "Extracting structural references"
             if self.candidates_total:
-                head += f" {self.candidates_seen}/~{self.candidates_total} candidates"
+                head += f" {self._candidates_text()}"
         elif not self.candidates_seen:
             head = "Scanning for changed files"
-        elif self.candidates_total:
-            head = (
-                f"{self.phase.capitalize()} "
-                f"{self.candidates_seen}/~{self.candidates_total} candidates"
-            )
         else:
-            head = f"{self.phase.capitalize()} {self.candidates_seen} candidates"
+            head = f"{self.phase.capitalize()} {self._candidates_text()}"
         parts = [head]
         if self.eligible_files:
             parts.append(f"{self.eligible_files} eligible")
@@ -1159,6 +1154,13 @@ class IndexProgress(BaseModel):
         if self.selector:
             parts.append(self.selector)
         return ", ".join(parts)
+
+    def _candidates_text(self) -> str:
+        """Candidate counts; only candidates may imply a total (see fraction)."""
+
+        if self.candidates_total:
+            return f"{self.candidates_seen}/~{self.candidates_total} candidates"
+        return f"{self.candidates_seen} candidates"
 
     @staticmethod
     def _path_tail(path: str) -> str:

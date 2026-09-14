@@ -1257,12 +1257,14 @@ class Indexer:
             # flush ends: embedding is the longest phase, and a counter-less
             # update leaves TTY and log watchers staring at a frozen line.
             # state.embedded only lands at the end of the flush, so add what
-            # this flush has banked so far.
+            # this flush has banked so far. Files that already failed are
+            # excluded, matching the end-of-flush total (a file tripping the
+            # growth check below can still nudge one update above it).
             progress.update(
                 phase="embedding",
                 changed_files=state.indexed,
                 chunks_embedded=state.embedded
-                + sum(target.embedded_chunks for target in state.pending),
+                + sum(target.embedded_chunks for target in state.pending if target.error is None),
                 chunks_staged=state.chunks_staged,
                 staged_bytes=state.staged_bytes,
                 current_path=state.pending[active[0].owner].record.path,

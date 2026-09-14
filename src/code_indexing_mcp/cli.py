@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import sys
 import time
@@ -337,14 +338,29 @@ class _ProgressPrinter:
         self._logged_line = line
         print(line, file=self.stream, flush=True)
 
-    @staticmethod
-    def _fit_terminal(line: str) -> str:
+    def _fit_terminal(self, line: str) -> str:
         """Keep the status line on one row: wrapped output scrolls like a log."""
 
-        columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+        columns = self._terminal_columns()
         if columns < 40 or len(line) <= columns:
             return line
         return line[: columns - 1] + "…"
+
+    def _terminal_columns(self) -> int:
+        """Width of the stream being written, honouring COLUMNS first."""
+
+        try:
+            columns = int(os.environ.get("COLUMNS", ""))
+        except ValueError:
+            columns = 0
+        if columns > 0:
+            return columns
+        try:
+            return os.get_terminal_size(self.stream.fileno()).columns
+        except (AttributeError, ValueError, OSError):
+            # StringIO, closed and duck-typed streams have no usable width;
+            # fall back to stdout's terminal, then the 80-column default.
+            return shutil.get_terminal_size(fallback=(80, 24)).columns
 
     def clear(self) -> None:
         """Take the status line back down before anything else is printed."""

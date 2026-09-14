@@ -480,6 +480,79 @@ def test_a_terminal_gets_one_status_line_that_is_cleaned_up_afterwards() -> None
     assert written.rstrip("\r").endswith(" " * len("Scanning 2 candidates"))
 
 
+def test_status_line_fits_the_stream_terminal_not_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import shutil
+
+    from code_indexing_mcp.progress import IndexProgress
+
+    class FakeTty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return 99
+
+    def long_snapshot() -> IndexProgress:
+        return IndexProgress(
+            project_id="abc",
+            phase="embedding",
+            candidates_seen=5,
+            candidates_total=10,
+            eligible_files=100,
+            changed_files=50,
+            chunks_embedded=30,
+            chunks_staged=30,
+            current_path="pkg/mod.py",
+            run_id="abc123def456",
+            trigger="manual",
+            slot_id="slot-1abcdef",
+            selector="ref:refs/heads/main",
+        )
+
+    assert len(long_snapshot().describe()) > 80
+
+    # The stream's own terminal wins over stdout's: stderr is a TTY while
+    # stdout is piped exactly when the JSON report is being consumed.
+    stream = FakeTty()
+    printer = cli._ProgressPrinter(stream)
+    probed: list[int] = []
+
+    def fake_size(fd: int) -> os.terminal_size:
+        probed.append(fd)
+        return os.terminal_size((50, 24))
+
+    monkeypatch.setattr(os, "get_terminal_size", fake_size)
+    monkeypatch.delenv("COLUMNS", raising=False)
+    printer(long_snapshot())
+    assert probed == [99]
+    assert stream.getvalue().endswith("…")
+    assert len(stream.getvalue()) == 51  # \r + 50 columns
+
+    # COLUMNS still wins when set, without probing any fd.
+    probed.clear()
+    monkeypatch.setenv("COLUMNS", "60")
+    stream = FakeTty()
+    cli._ProgressPrinter(stream)(long_snapshot())
+    assert probed == []
+    assert len(stream.getvalue()) == 61
+
+    # A stream without a usable width falls back to the default.
+    def no_tty(fd: int) -> os.terminal_size:
+        probed.append(fd)
+        raise OSError("not a tty")
+
+    monkeypatch.delenv("COLUMNS")
+    monkeypatch.setattr(os, "get_terminal_size", no_tty)
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size(fallback))
+    stream = FakeTty()
+    cli._ProgressPrinter(stream)(long_snapshot())
+    assert probed == [99]
+    assert len(stream.getvalue()) == 81
+
+
 def test_redirected_log_repeats_advancing_counts_without_waiting() -> None:
     from code_indexing_mcp.progress import IndexProgress
 

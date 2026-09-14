@@ -173,21 +173,79 @@ def test_describe_carries_counters_in_every_phase() -> None:
 def test_embedding_progress_advances_with_every_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # One file with three chunks: small enough to flush once, big enough for
+    # two groups at COUNT=2, so the middle of the phase is one flush's groups
+    # rather than several flushes' bracket updates.
     monkeypatch.setattr("code_indexing_mcp.indexing.CANDIDATE_GROUP_COUNT", 2)
-    project = initialize_project(_repo(tmp_path))
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "module.py").write_text(
+        "def answer_0():\n    return 0\n\n\n"
+        "def answer_1():\n    return 1\n\n\n"
+        "def answer_2():\n    return 2\n"
+    )
+    project = initialize_project(root)
     indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
     seen: list[IndexProgress] = []
 
     report = indexer.index(project, on_progress=lambda progress: seen.append(progress.model_copy()))
 
+    assert seen[-1].chunks_extracted >= 3, "the fixture must span at least two groups"
     embedded = [progress.chunks_embedded for progress in seen if progress.phase == "embedding"]
     assert embedded, "the longest phase must publish progress"
+    # Initial, per-group, final: a first-to-last comparison alone cannot tell
+    # per-group publishing from a frozen middle, so demand distinct mid-flush
+    # levels too.
+    assert len(embedded) > 2, "each embedding group must publish its running total"
+    assert len(set(embedded)) > 2, "each embedding group must advance the running total"
+    assert embedded == sorted(embedded), "running totals never move backwards"
     assert embedded[0] < embedded[-1]
     assert embedded[-1] == report.embedded_chunks
     assert report.embedded_chunks > 0
     staged = [progress.chunks_staged for progress in seen if progress.phase == "embedding"]
+    assert len(staged) > 2, "each embedding group must publish its running total"
+    assert len(set(staged)) > 2, "each embedding group must advance the running total"
+    assert staged == sorted(staged), "running totals never move backwards"
     assert staged[0] < staged[-1]
     assert staged[-1] == report.chunks_staged
+    # Only the per-group update names the file in flight: the flush brackets
+    # publish with no current path.
+    assert any(
+        progress.current_path is not None for progress in seen if progress.phase == "embedding"
+    ), "each embedding group must publish the file in flight"
+
+
+def test_mid_flush_totals_exclude_files_that_already_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailSecondBatchEmbedder(RecordingEmbedder):
+        """Banks one batch, then fails every later batch like a dying worker."""
+
+        def embed_passages(self, texts: list[str]) -> list[list[float]]:
+            if self.passage_batches:
+                raise RuntimeError("embedding failed")
+            return super().embed_passages(texts)
+
+    # One file, two chunks, one chunk per group: the first group banks a
+    # chunk, the second group fails the file, and the file's banked chunk
+    # must leave the published total the moment the failure lands.
+    monkeypatch.setattr("code_indexing_mcp.indexing.CANDIDATE_GROUP_COUNT", 1)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "module.py").write_text(
+        "def answer_0():\n    return 0\n\n\ndef answer_1():\n    return 1\n"
+    )
+    project = initialize_project(root)
+    indexer, _ = make_indexer(tmp_path, FailSecondBatchEmbedder())
+    seen: list[IndexProgress] = []
+
+    report = indexer.index(project, on_progress=lambda progress: seen.append(progress.model_copy()))
+
+    assert report.embedded_chunks == 0
+    assert report.errors, "the second group must fail the file"
+    embedded = [progress.chunks_embedded for progress in seen if progress.phase == "embedding"]
+    assert max(embedded) > 0, "the first group must bank a chunk before the failure"
+    assert embedded[-2] == 0, "a failed file's banked chunks must leave the published total"
 
 
 def test_committing_snapshot_carries_run_totals(tmp_path: Path) -> None:
