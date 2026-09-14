@@ -600,18 +600,12 @@ class PassageReuseContext:
         self,
         candidates: Sequence[PassageCandidate],
         plan: SegmentPlan,
-        *,
-        producer: object | None = None,
     ) -> tuple[dict[int, list[EmbeddedSegment]], list[int]]:
-        """Return validated hits and the original positions of misses."""
+        """Return identity- and payload-validated hits plus miss positions."""
         misses = list(range(len(candidates)))
         cache = self._cache
         namespace = self.namespace
         if self.status != "active" or cache is None or namespace is None or not candidates:
-            return {}, misses
-        if self.producer_matches is not None and not self.producer_matches(producer):
-            return {}, misses
-        if getattr(producer, "tokenizer_available", None) is not True:
             return {}, misses
         keys = [candidate_key(namespace, candidate, plan) for candidate in candidates]
         started = time.monotonic_ns()

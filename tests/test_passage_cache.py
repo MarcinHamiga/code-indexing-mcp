@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -259,37 +260,106 @@ def test_reuse_context_bulk_resolves_hits_and_writes_misses(tmp_path: Path) -> N
     with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
         cache.put_many({candidate_key(namespace, candidates[0], PLAN): _segments()})
 
-    class TokenizerAvailable:
-        tokenizer_available = True
-
-    producer = TokenizerAvailable()
     with PassageReuseContext(path, namespace) as reuse:
-        hits, misses = reuse.lookup(candidates, PLAN, producer=producer)
+        hits, misses = reuse.lookup(candidates, PLAN)
         assert hits == {0: _segments()}
         assert misses == [1]
-        reuse.store(candidates, {1: _segments()}, PLAN, producer=producer)
+        reuse.store(
+            candidates,
+            {1: _segments()},
+            PLAN,
+            producer=SimpleNamespace(tokenizer_available=True),
+        )
         assert reuse.status == "active"
-        assert reuse.lookup(candidates, PLAN, producer=producer)[0].keys() == {0, 1}
+        assert reuse.lookup(candidates, PLAN)[0].keys() == {0, 1}
         assert reuse.reused_candidates == 3
         assert reuse.reused_segments == 6
         assert reuse.lookup_duration_ms >= 0
         assert reuse.write_duration_ms >= 0
 
 
-def test_reuse_context_skips_hits_when_the_runtime_lacks_a_tokenizer(
-    tmp_path: Path,
-) -> None:
+def test_reuse_context_reads_hits_before_a_producer_starts(tmp_path: Path) -> None:
     path = tmp_path / "passage.sqlite3"
     namespace = _namespace()
     candidate = _candidate()
     with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
         cache.put_many({candidate_key(namespace, candidate, PLAN): _segments()})
 
-    class NoTokenizer:
-        tokenizer_available = False
+    with PassageReuseContext(path, namespace) as reuse:
+        assert reuse.lookup([candidate], PLAN) == ({0: _segments()}, [])
+
+
+def test_reuse_context_requires_a_known_tokenizer_only_for_writes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "passage.sqlite3"
+    namespace = _namespace()
+    candidates = [_candidate(), _candidate(content="changed text!!")]
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        cache.put_many({candidate_key(namespace, candidates[0], PLAN): _segments()})
 
     with PassageReuseContext(path, namespace) as reuse:
-        assert reuse.lookup([candidate], PLAN, producer=NoTokenizer()) == ({}, [0])
+        assert reuse.lookup(candidates, PLAN) == ({0: _segments()}, [1])
+        reuse.store(
+            candidates,
+            {1: _segments()},
+            PLAN,
+            producer=None,
+        )
+
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        assert set(
+            cache.get_many([candidate_key(namespace, item, PLAN) for item in candidates])
+        ) == {candidate_key(namespace, candidates[0], PLAN)}
+
+
+@pytest.mark.parametrize(
+    "producer",
+    [
+        SimpleNamespace(tokenizer_available=None),
+        SimpleNamespace(tokenizer_available=False),
+    ],
+)
+def test_reuse_context_requires_unknown_tokenizers_only_for_writes(
+    tmp_path: Path, producer: object
+) -> None:
+    path = tmp_path / "passage.sqlite3"
+    namespace = _namespace()
+    candidates = [_candidate(), _candidate(content="changed text!!")]
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        cache.put_many({candidate_key(namespace, candidates[0], PLAN): _segments()})
+
+    with PassageReuseContext(path, namespace) as reuse:
+        assert reuse.lookup(candidates, PLAN) == ({0: _segments()}, [1])
+        reuse.store(candidates, {1: _segments()}, PLAN, producer=producer)
+
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        assert set(
+            cache.get_many([candidate_key(namespace, item, PLAN) for item in candidates])
+        ) == {candidate_key(namespace, candidates[0], PLAN)}
+
+
+def test_reuse_context_requires_the_matching_producer_only_for_writes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "passage.sqlite3"
+    namespace = _namespace()
+    candidates = [_candidate(), _candidate(content="changed text!!")]
+    expected = SimpleNamespace(tokenizer_available=True)
+    other = SimpleNamespace(tokenizer_available=True)
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        cache.put_many({candidate_key(namespace, candidates[0], PLAN): _segments()})
+
+    with PassageReuseContext(
+        path,
+        namespace,
+        producer_matches=lambda producer: producer is expected,
+    ) as reuse:
+        assert reuse.lookup(candidates, PLAN) == ({0: _segments()}, [1])
+        reuse.store(candidates, {1: _segments()}, PLAN, producer=other)
+
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        assert cache.get_many([candidate_key(namespace, candidates[1], PLAN)]) == {}
 
 
 def test_reuse_context_bypasses_reads_in_strict_mode(tmp_path: Path) -> None:
@@ -315,28 +385,7 @@ def test_interleaved_writers_share_authoritative_payload_accounting(tmp_path: Pa
         assert set(first.get_many(["a", "b", "c"])) == {"c"}
 
 
-@pytest.mark.parametrize(
-    "producer", [None, type("UnknownTokenizer", (), {"tokenizer_available": None})()]
-)
-def test_unknown_tokenizer_bypasses_cache_reads_and_writes(
-    tmp_path: Path, producer: object
-) -> None:
-    path = tmp_path / "passage.sqlite3"
-    namespace = _namespace()
-    candidates = [_candidate(), _candidate(content="changed text!!")]
-    key = candidate_key(namespace, candidates[0], PLAN)
-    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
-        cache.put_many({key: _segments()})
-    with PassageReuseContext(path, namespace) as reuse:
-        assert reuse.lookup(candidates, PLAN, producer=producer) == ({}, [0, 1])
-        reuse.store(candidates, {1: _segments()}, PLAN, producer=producer)
-    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
-        assert cache.get_many([candidate_key(namespace, candidates[1], PLAN)]) == {}
-
-
 def test_reuse_rejects_windows_cached_before_special_token_accounting(tmp_path: Path) -> None:
-    from types import SimpleNamespace
-
     path = tmp_path / "passage.sqlite3"
     candidate = _candidate()
     old_key = candidate_key(_namespace(embedding_contract_version=1), candidate, PLAN)
@@ -344,8 +393,6 @@ def test_reuse_rejects_windows_cached_before_special_token_accounting(tmp_path: 
         cache.put_many({old_key: _segments()})
 
     with PassageReuseContext(path, _namespace()) as reuse:
-        hits, misses = reuse.lookup(
-            [candidate], PLAN, producer=SimpleNamespace(tokenizer_available=True)
-        )
+        hits, misses = reuse.lookup([candidate], PLAN)
         assert hits == {}
         assert misses == [0]
