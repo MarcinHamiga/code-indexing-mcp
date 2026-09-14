@@ -237,7 +237,9 @@ class StartupCoordinator:
                             existing.indexes
                             and existing.project_id is not None
                             and (registered_root or root) not in self._dirty_roots
-                            and not await self._is_stale(existing.project_id)
+                            and not await self._is_stale(
+                                existing.project_id, registered_root or root
+                            )
                         ):
                             continue
                 job = _StartupJob(indexes=indexes, trigger=trigger)
@@ -261,9 +263,9 @@ class StartupCoordinator:
                 return
             await asyncio.sleep(0.25)
 
-    async def _is_stale(self, project_id: str) -> bool:
+    async def _is_stale(self, project_id: str, root: Path) -> bool:
         return await anyio.to_thread.run_sync(
-            partial(self.application.project_is_stale, project_id),
+            partial(self.application.project_is_stale, project_id, roots=[root]),
             abandon_on_cancel=False,
         )
 
@@ -334,7 +336,7 @@ class StartupCoordinator:
                 logger.info("Skipping automatic indexing for non-project root: %s", root)
                 return
             await self._ensure_monitor(root, project.id)
-            report = await self._index_when_free(project.id, trigger=job.trigger)
+            report = await self._index_when_free(project.id, project.root, trigger=job.trigger)
             logger.info(
                 "Automatic indexing complete for %s: %s files indexed",
                 project.root,
@@ -455,9 +457,9 @@ class StartupCoordinator:
                     dirty.put_nowait(None)
 
     async def _index_when_free(
-        self, project_id: str, *, trigger: IndexTrigger = "startup"
+        self, project_id: str, root: Path, *, trigger: IndexTrigger = "startup"
     ) -> IndexReport:
-        """Index *project_id* once the machine is free, within ``wait_seconds``.
+        """Index *project_id* at *root* once free, within ``wait_seconds``.
 
         Two separate things make a job wait: another root queued ahead of it in
         this process, and another process holding the global index lock. Both
@@ -469,7 +471,7 @@ class StartupCoordinator:
         await self._acquire_slot(deadline, started=started)
         try:
             return await self._index_with_backoff(
-                project_id, deadline=deadline, started=started, trigger=trigger
+                project_id, root, deadline=deadline, started=started, trigger=trigger
             )
         finally:
             self._limiter.release()
@@ -491,12 +493,13 @@ class StartupCoordinator:
     async def _index_with_backoff(
         self,
         project_id: str,
+        root: Path,
         *,
         deadline: float,
         started: float,
         trigger: IndexTrigger = "startup",
     ) -> IndexReport:
-        """Index *project_id*, waiting out a competing process up to *deadline*.
+        """Index *project_id* at *root*, waiting for other writers up to *deadline*.
 
         The global index lock is taken non-blockingly so this task stays
         cancellable between attempts; a blocking acquire inside ``run_sync``
@@ -507,7 +510,9 @@ class StartupCoordinator:
         while True:
             try:
                 return await anyio.to_thread.run_sync(
-                    partial(self.application.index_project, project_id, trigger=trigger),
+                    partial(
+                        self.application.index_project, project_id, roots=[root], trigger=trigger
+                    ),
                     abandon_on_cancel=False,
                 )
             except CodeIndexingError as exc:
@@ -959,7 +964,8 @@ def create_server(
             paths=paths,
             kinds=selected_kinds,
             limit=limit,
-            roots=roots,
+            # Preserve the resolved checkout scope through the ID-based API.
+            roots=_unique_project_roots([project.root for project in projects]),
         )
 
     async def example_search_resolved_projects(
@@ -986,7 +992,7 @@ def create_server(
             paths=paths,
             kinds=selected_kinds,
             limit=limit,
-            roots=roots,
+            roots=_unique_project_roots([project.root for project in projects]),
         )
 
     @mcp.tool(
@@ -999,7 +1005,10 @@ def create_server(
             "project rather than forming a new one; pass force_new_id to deliberately split "
             "it away. Returns the project id, name, root, and scan settings. Building the "
             "index is a separate operation (index_project). Re-running on an already-initialized "
-            "directory returns the existing project unless force_new_id is set. A new "
+            "directory preserves its registered project unless force_new_id is set. "
+            "An unregistered marker joins the sole compatible worktree registration, or "
+            "re-registers its existing id when none exists; multiple compatible registrations "
+            "are ambiguous. Initialization never removes another registration. A new "
             "registration whose root equals, contains, or is nested inside an existing "
             "project's root is rejected unless allow_overlap is true."
         ),
@@ -1041,7 +1050,9 @@ def create_server(
             ),
         ] = False,
     ) -> ProjectInfo:
-        roots = await _startup_roots(ctx, discover=True)
+        # Initialization owns registration. Discovering first can recreate a
+        # removed legacy ID or join another project before force_new_id runs.
+        roots = await _roots(ctx)
         return await asyncio.to_thread(
             app.init_project,
             path,
@@ -1108,11 +1119,13 @@ def create_server(
                 # Programmatic calls without an MCP lifespan have no owner for
                 # detached work; keep their existing synchronous behavior.
                 report = await asyncio.to_thread(
-                    app.index_project, resolved.id, roots=roots, force=force
+                    app.index_project, resolved.id, roots=[resolved.root], force=force
                 )
             else:
                 async with _index_response_budget([resolved]):
-                    report = await coordinator.index_manually(resolved, roots, force=force)
+                    report = await coordinator.index_manually(
+                        resolved, [resolved.root], force=force
+                    )
         await stream.finish(
             f"Indexed {report.indexed_files} files, {report.embedded_chunks} chunks embedded"
         )
@@ -1340,9 +1353,11 @@ def create_server(
         title="Remove project",
         description=(
             "Permanently delete a project's registration and its entire on-disk index partition. "
-            "The .ci-mcp/project.toml marker in the working tree is left in place, so a later "
-            "init_project re-registers the same id with an empty index. Irreversible: the only "
-            "way back is a full re-index. Returns whether a registration existed."
+            "The .ci-mcp/project.toml marker in the working tree is left in place. A later "
+            "init_project joins the sole compatible worktree registration if one remains; "
+            "otherwise it re-registers the same id with an empty index. Multiple compatible "
+            "registrations are ambiguous. Irreversible: deleted index data requires a full "
+            "re-index. Returns whether a registration existed."
         ),
         annotations=_DESTRUCTIVE,
     )
@@ -1711,7 +1726,7 @@ def create_server(
             match=match,
             kinds=selected_kinds,
             limit=limit,
-            roots=roots,
+            roots=[resolved.root],
         )
 
     @mcp.tool(
@@ -1958,7 +1973,7 @@ def create_server(
         roots = await _startup_roots(ctx, discover=True)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved])
-        return await asyncio.to_thread(app.file_outline, path, resolved.id, roots=roots)
+        return await asyncio.to_thread(app.file_outline, path, resolved.id, roots=[resolved.root])
 
     @mcp.tool(
         title="Get chunk",

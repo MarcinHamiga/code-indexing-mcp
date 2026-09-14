@@ -611,16 +611,24 @@ class Application:
         with self._root_lock(root), self._registration_lock():
             resolved = root.expanduser().resolve()
             if not allow_overlap and not force_new_id:
-                existing = overlapping_registration(self.store.list_projects(), resolved)
+                registered = self.store.list_projects()
+                existing = overlapping_registration(registered, resolved)
                 if existing is not None:
                     marker = (
                         read_project_marker(resolved)
                         if existing_marker_path(resolved) is not None
                         else None
                     )
-                    # A marker whose id already matches the overlapping project
-                    # is a re-initialization of that project, not a new overlap.
-                    if marker is None or marker.id != existing.id:
+                    # An already registered checkout remains valid even when
+                    # another overlap appears first. A moved marker alone must
+                    # not authorize a new overlap at a different root.
+                    if marker is None or (
+                        marker.id != existing.id
+                        and not any(
+                            project.id == marker.id and same_project_root(project.root, resolved)
+                            for project in registered
+                        )
+                    ):
                         raise CodeIndexingError(
                             ErrorCode.OVERLAPPING_PROJECT,
                             f"Project root {resolved} overlaps the registered root "
@@ -642,32 +650,24 @@ class Application:
 
         A checkout of an already-registered repository -- a linked worktree --
         joins that repository's project instead of minting its own id: its
-        branches occupy slots inside the existing registration. A leftover
-        pre-worktree duplicate registration (its own id on a worktree marker)
-        folds into the surviving registration when explicitly initialized.
-        ``force_new_id`` deliberately splits away and skips both paths.
+        branches occupy slots inside the existing registration. A registered
+        marker always keeps its identity: another registration may be an
+        intentional split, not a legacy duplicate. Migration requires removing
+        the chosen duplicate explicitly before initializing its checkout.
+        ``force_new_id`` deliberately splits away and skips sharing.
         """
         if force_new_id:
             return initialize_project(root, name=name, force_new_id=True)
         marker = read_project_marker(root) if existing_marker_path(root) is not None else None
-        shared = self._shared_registration(root)
-        if marker is not None:
-            if shared is not None and shared.id != marker.id:
-                # The marker still names a separate pre-worktree registration;
-                # unifying drops that registration together with its slots,
-                # which the slot-key upgrade has already invalidated.
-                self.store.remove_project(marker.id)
-                self.invalidate_freshness(marker.id)
-                logger.info(
-                    "Unified legacy worktree registration %s into %s (%s)",
-                    marker.id,
-                    shared.name,
-                    shared.id,
-                )
-                return initialize_checkout(root, shared, name=name)
+        if marker is not None and any(
+            project.id == marker.id for project in self.store.list_projects()
+        ):
             return marker
+        shared = self._shared_registration(root)
         if shared is not None:
             return initialize_checkout(root, shared, name=name)
+        if marker is not None:
+            return marker
         return initialize_project(root, name=name)
 
     def _shared_registration(self, root: Path) -> ProjectInfo | None:
@@ -682,6 +682,7 @@ class Application:
         state = probe_git_state(root)
         if state.probe is not GitProbeOutcome.GIT:
             return None
+        candidates: list[ProjectInfo] = []
         for project in self.store.list_projects():
             registered = Path(project.root)
             if same_project_root(registered, root):
@@ -693,8 +694,17 @@ class Application:
                 and candidate.repository_identity == state.repository_identity
                 and candidate.project_prefix == state.project_prefix
             ):
-                return project
-        return None
+                candidates.append(project)
+        if len(candidates) > 1:
+            raise CodeIndexingError(
+                ErrorCode.AMBIGUOUS_PROJECT,
+                "Multiple registrations share this Git repository and project prefix; "
+                "keep the intended project marker or explicitly choose which registrations "
+                "to remove before initializing this checkout",
+                projects=sorted(project.id for project in candidates),
+                root=str(root),
+            )
+        return candidates[0] if candidates else None
 
     def discover_project(self, root: Path) -> ProjectInfo | None:
         """Find an initialized project or initialize a qualifying client root."""
@@ -1894,10 +1904,10 @@ class Application:
     ) -> list[ProjectInfo]:
         """Resolve every checkout behind a search scope.
 
-        An explicit selector binds its project to the request's own checkout
-        when possible; an unscoped request returns all requested checkouts of
-        the single in-scope registration so their branch slots are searched
-        together. ``all_projects`` keeps each registration's canonical root.
+        Explicit paths keep their checkouts; IDs and names select all matching
+        client roots. An unscoped request returns all requested checkouts of the
+        single in-scope registration so their branch slots are searched together.
+        ``all_projects`` keeps each registration's canonical root.
         """
         resolver = ProjectResolver(self.store.list_projects())
         if projects and all_projects:
@@ -1910,28 +1920,16 @@ class Application:
                 resolver.resolve_scope(explicit=project.id)[0] for project in self.list_projects()
             ]
         elif projects:
-            selected: dict[str, ProjectInfo] = {}
-            for selector in projects:
-                project = resolver.resolve_scope(
-                    explicit=selector, roots=roots or [], cwd=self.cwd
-                )[0]
-                selected.setdefault(project.id, project)
-            # Explicit selection answers with each requested checkout of the
-            # selected registrations, not just one: when the request's roots
-            # carry several markers of a shared registration -- a main
-            # checkout and linked worktrees -- every one of those checkouts
-            # joins the scope behind its primary.
             scope = []
             seen: set[tuple[str, str]] = set()
-            candidates = [*selected.values(), *resolver._marked_checkouts(roots or [])]
-            for project in candidates:
-                if project.id not in selected:
-                    continue
-                key = (project.id, project_root_identity(project.root))
-                if key in seen:
-                    continue
-                seen.add(key)
-                scope.append(project)
+            for selector in projects:
+                for project in resolver.resolve_scope(
+                    explicit=selector, roots=roots or [], cwd=self.cwd, all_checkouts=True
+                ):
+                    key = (project.id, project_root_identity(project.root))
+                    if key not in seen:
+                        seen.add(key)
+                        scope.append(project)
         else:
             scope = resolver.resolve_scope(roots=roots or [], cwd=self.cwd)
         if not scope:

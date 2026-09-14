@@ -13,6 +13,7 @@ from filelock import FileLock
 from mcp import types
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
+from test_application import _git_repo_with_worktree
 
 from code_indexing_mcp import server as server_module
 from code_indexing_mcp.application import Application, RuntimePaths
@@ -758,6 +759,164 @@ async def test_init_project_rejects_overlap_unless_allow_overlap_is_set(tmp_path
     assert not allowed.isError
     assert allowed.structuredContent is not None
     assert allowed.structuredContent["name"] == "src"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("select_worktree", [False, True])
+@pytest.mark.parametrize("build", ["manual", "lazy"])
+@pytest.mark.parametrize(
+    "query_tool", ["search_code", "search_by_example", "find_symbol", "file_outline"]
+)
+async def test_mcp_explicit_checkout_path_wins_over_client_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    select_worktree: bool,
+    build: str,
+    query_tool: str,
+) -> None:
+    # Maintenance has separate lock-contention tests; keep these requests
+    # focused on checkout routing rather than racing the startup compactor.
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    assert app.init_project(worktree).id == project.id
+    selected, ambient = (worktree, root) if select_worktree else (root, worktree)
+    expected = "worktree_branch" if select_worktree else "main_branch"
+    app.index_project(project.id, roots=[ambient])
+    app.cwd = ambient
+    server = create_server(app, auto_index=False) if build == "manual" else create_server(app)
+    arguments = {
+        "search_code": {"query": "return", "projects": [str(selected)]},
+        "search_by_example": {
+            "example": "def branch():\n    return 2\n",
+            "language": "python",
+            "projects": [str(selected)],
+        },
+        "find_symbol": {"name": expected, "project": str(selected)},
+        "file_outline": {"path": "main.py", "project": str(selected)},
+    }[query_tool]
+    result_key = "items" if query_tool == "file_outline" else "hits"
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=ambient.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        status = await client.call_tool("project_status", {"project": str(selected)})
+        assert not status.isError
+        assert status.structuredContent is not None
+        assert status.structuredContent["checkout_root"] == str(selected.resolve())
+        if build == "manual":
+            indexed = await client.call_tool("index_project", {"project": str(selected)})
+            assert not indexed.isError
+        result = await client.call_tool(query_tool, arguments)
+        assert not result.isError
+        assert result.structuredContent is not None
+        assert [hit["symbol"] for hit in result.structuredContent[result_key]] == [expected]
+        references = await client.call_tool(
+            "find_references",
+            {
+                "selector": {
+                    "project": str(selected),
+                    "path": "main.py",
+                    "qualified_symbol": expected,
+                }
+            },
+        )
+        assert not references.isError
+        assert references.structuredContent is not None
+        assert references.structuredContent["selected"]["symbol"] == expected
+        if build == "lazy":
+            # A second refresh must check this checkout even when the client's
+            # other branch remains clean and already indexed.
+            updated = f"{expected}_updated"
+            (selected / "main.py").write_text(f"def {updated}():\n    return 3\n")
+            run_git("add", "main.py", cwd=selected)
+            run_git(
+                "-c",
+                "user.email=test@example.test",
+                "-c",
+                "user.name=Tests",
+                "commit",
+                "-qm",
+                "update selected checkout",
+                cwd=selected,
+            )
+            if query_tool == "find_symbol":
+                arguments["name"] = updated
+            refreshed = await client.call_tool(query_tool, arguments)
+            assert not refreshed.isError
+            assert refreshed.structuredContent is not None
+            assert [hit["symbol"] for hit in refreshed.structuredContent[result_key]] == [updated]
+
+
+@pytest.mark.asyncio
+async def test_mcp_explicit_legacy_migration_preserves_the_survivor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = _tiny_application(tmp_path)
+    survivor = app.init_project(root)
+    duplicate = app.init_project(worktree, force_new_id=True)
+    app.index_project(survivor.id)
+    original_slot = app.project_status(survivor.id).active_slot_id
+    original_chunk = app.find_symbol("main_branch", survivor.id).hits[0].chunk_id
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=worktree.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        removed = await client.call_tool("remove_project", {"project": duplicate.id})
+        assert not removed.isError
+        initialized = await client.call_tool("init_project", {"path": str(worktree)})
+        assert not initialized.isError
+        assert initialized.structuredContent is not None
+        assert initialized.structuredContent["id"] == survivor.id
+        result = await client.call_tool("search_code", {"query": "return"})
+        assert not result.isError
+        assert result.structuredContent is not None
+        assert [hit["symbol"] for hit in result.structuredContent["hits"]] == ["worktree_branch"]
+
+    assert [project.id for project in app.list_projects()] == [survivor.id]
+    assert app.project_status(survivor.id, roots=[root]).active_slot_id == original_slot
+    assert app.get_chunk(original_chunk).content is not None
+
+
+@pytest.mark.asyncio
+async def test_mcp_force_new_id_does_not_first_join_another_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = _tiny_application(tmp_path)
+    projects = [app.init_project(checkout, force_new_id=True) for checkout in [root, worktree]]
+    slot_counts = {project.id: len(app.store.list_slots(project.id)) for project in projects}
+    third = tmp_path / "third"
+    run_git("worktree", "add", "-q", "--detach", str(third), cwd=root)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=third.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        initialized = await client.call_tool(
+            "init_project", {"path": str(third), "force_new_id": True}
+        )
+        assert not initialized.isError
+        assert initialized.structuredContent is not None
+        assert initialized.structuredContent["id"] not in slot_counts
+
+    assert {
+        project.id: len(app.store.list_slots(project.id)) for project in projects
+    } == slot_counts
 
 
 @pytest.mark.asyncio

@@ -400,9 +400,8 @@ def worktree_warnings(
 
     Two roots whose ``--show-toplevel`` differs but whose Git common directory
     is the same are worktrees (or a main checkout and a worktree) of one
-    repository. Since registrations are now shared across a repository's
-    checkouts, such a pair means two pre-worktree-support registrations that
-    were never unified. All failures are swallowed: this is advisory only.
+    repository. Such registrations may predate shared worktree support or be
+    intentionally separate. All failures are swallowed: this is advisory only.
     """
     runner = _run or _run_git_quietly
     repositories: list[tuple[ProjectInfo, Path, Path]] = []
@@ -427,10 +426,13 @@ def worktree_warnings(
         ):
             warnings.append(
                 f"Projects {left.id!r} and {right.id!r} share Git common directory "
-                f"{left_common} from different checkouts. Linked worktrees of one "
-                "repository now share one project registration; remove one of these "
-                f"registrations and re-run init_project on its root ({left_top} or "
-                f"{right_top}) to unify them."
+                f"{left_common} from different checkouts. These registrations may be "
+                "intentionally separate. To unify matching project scopes, choose a "
+                "survivor, explicitly remove the other registration by id (deleting its "
+                "index), then re-run init_project on that registration's root "
+                f"({left.root} or {right.root}), with allow_overlap=true for a nested root. "
+                "Initialization requires one compatible "
+                "surviving registration and never removes another registration automatically."
             )
     return warnings
 

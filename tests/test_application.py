@@ -34,7 +34,7 @@ from code_indexing_mcp.models import (
     SearchResponse,
     SignatureChangeOperation,
 )
-from code_indexing_mcp.projects import existing_marker_path, initialize_project
+from code_indexing_mcp.projects import existing_marker_path, initialize_project, read_project_marker
 from code_indexing_mcp.settings import IndexSettings
 from code_indexing_mcp.token_batching import DEFAULT_MAX_TOKEN_PRODUCT, REFERENCE_MEMORY_BYTES
 from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher
@@ -728,6 +728,32 @@ def test_init_project_allows_a_nested_registration_when_allow_overlap_is_set(
     warnings = app.storage_status().overlap_warnings
     assert len(warnings) == 1
     assert "contains the root" in warnings[0] or "nested inside" in warnings[0]
+
+
+def test_relocating_a_registration_cannot_introduce_a_new_overlap(tmp_path: Path) -> None:
+    original = tmp_path / "original"
+    parent = tmp_path / "parent"
+    original.mkdir()
+    parent.mkdir()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    moved = app.init_project(original)
+    containing = app.init_project(parent)
+    nested = parent / "nested"
+    original.rename(nested)
+
+    with pytest.raises(CodeIndexingError) as exc:
+        app.init_project(nested)
+
+    assert exc.value.code == ErrorCode.OVERLAPPING_PROJECT
+    assert read_project_marker(nested).id == moved.id
+    assert {project.id: project.root for project in app.list_projects()} == {
+        moved.id: original,
+        containing.id: parent,
+    }
 
 
 def test_reinitializing_the_same_root_keeps_one_registration(tmp_path: Path) -> None:
@@ -2410,6 +2436,125 @@ def _git_repo_with_main(tmp_path: Path, name: str = "repo") -> tuple[Path, Proje
     return root, ProjectInfo(id="pending", name=name, root=root)
 
 
+def _git_repo_with_worktree(tmp_path: Path, *, nested: bool = False) -> tuple[Path, Path]:
+    root, _ = _git_repo_with_main(tmp_path)
+    worktree = root / ".worktrees" / "wt" if nested else tmp_path / "wt"
+    if nested:
+        worktree.parent.mkdir()
+        with (root / ".git" / "info" / "exclude").open("a") as exclusions:
+            exclusions.write("\n.worktrees/\n")
+    run_git("worktree", "add", "-q", "-b", "feature", str(worktree), cwd=root)
+    (worktree / "main.py").write_text("def worktree_branch():\n    return 2\n")
+    run_git("add", "main.py", cwd=worktree)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "worktree",
+        cwd=worktree,
+    )
+    return root, worktree
+
+
+@pytest.mark.parametrize("select_worktree", [False, True])
+@pytest.mark.parametrize("operation", ["status", "index", "search"])
+def test_explicit_checkout_path_controls_the_branch_slot(
+    tmp_path: Path, select_worktree: bool, operation: str
+) -> None:
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    assert app.init_project(worktree).id == project.id
+    selected, ambient = (worktree, root) if select_worktree else (root, worktree)
+    expected = "worktree_branch" if select_worktree else "main_branch"
+    expected_slot = app.project_status(project.id, roots=[selected]).active_slot_id
+    if operation == "search":
+        app.index_project(project.id, roots=[root])
+        app.index_project(project.id, roots=[worktree])
+    app.cwd = ambient
+
+    if operation == "status":
+        status = app.project_status(str(selected), roots=[ambient])
+        assert status.checkout_root == str(selected.resolve())
+        assert status.active_slot_id == expected_slot
+    elif operation == "index":
+        app.index_project(str(selected), roots=[ambient])
+        # Inspect independently of the conflicting request context.
+        app.cwd = tmp_path
+        status = app.project_status(project.id, roots=[selected])
+        assert status.active_slot_id == expected_slot
+        assert status.file_count == 1
+        assert app.project_status(project.id, roots=[ambient]).file_count == 0
+    else:
+        hits = app.search_code("return", projects=[str(selected)], roots=[ambient]).hits
+        assert [hit.symbol for hit in hits] == [expected]
+
+
+@pytest.mark.parametrize("worktree_first", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_reinitializing_split_worktrees_preserves_both_registrations(
+    tmp_path: Path, worktree_first: bool, nested: bool
+) -> None:
+    root, worktree = _git_repo_with_worktree(tmp_path, nested=nested)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    checkouts = [worktree, root] if worktree_first else [root, worktree]
+    projects = [app.init_project(checkout, force_new_id=True) for checkout in checkouts]
+    assert projects[0].id != projects[1].id
+    snapshots = {}
+    for project in projects:
+        app.index_project(project.id)
+        snapshots[project.id] = (
+            app.project_status(project.id).active_slot_id,
+            {hit.chunk_id for hit in app.search_code("return", projects=[project.id]).hits},
+        )
+
+    for project in [*projects, *reversed(projects)]:
+        assert app.init_project(project.root).id == project.id
+        assert read_project_marker(project.root).id == project.id
+        assert {item.id for item in app.list_projects()} == {item.id for item in projects}
+        for preserved in projects:
+            slot, chunks = snapshots[preserved.id]
+            assert app.project_status(preserved.id).active_slot_id == slot
+            assert {
+                hit.chunk_id for hit in app.search_code("return", projects=[preserved.id]).hits
+            } == chunks
+            assert all(app.get_chunk(chunk_id).content for chunk_id in chunks)
+
+
+@pytest.mark.parametrize("operation", ["init", "discover"])
+def test_ambiguous_worktree_sharing_does_not_write_a_marker(tmp_path: Path, operation: str) -> None:
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    projects = [app.init_project(checkout, force_new_id=True) for checkout in [root, worktree]]
+    third = tmp_path / "third"
+    run_git("worktree", "add", "-q", "--detach", str(third), cwd=root)
+
+    with pytest.raises(CodeIndexingError) as exc:
+        if operation == "init":
+            app.init_project(third)
+        else:
+            app.discover_project(third)
+
+    assert exc.value.code == ErrorCode.AMBIGUOUS_PROJECT
+    assert existing_marker_path(third) is None
+    assert {project.id for project in app.list_projects()} == {project.id for project in projects}
+
+
 def test_a_worktree_joins_the_registration_and_keeps_its_own_slot(
     tmp_path: Path,
 ) -> None:
@@ -2517,8 +2662,29 @@ def test_search_merges_slots_of_all_requested_checkouts(tmp_path: Path) -> None:
     assert symbols(scoped_wt) == ["main_branch", "worktree_branch"]
 
     # One request across both checkouts merges every slot into one ranking.
-    merged = app.search_code("return", projects=[project.id], roots=[root, worktree])
-    assert symbols(merged) == ["main_branch", "main_only", "worktree_branch"]
+    for selectors in ([project.id], [project.name], None, [str(root), str(worktree)]):
+        merged = app.search_code("return", projects=selectors, roots=[root, worktree])
+        assert symbols(merged) == ["main_branch", "main_only", "worktree_branch"]
+
+    # Multiple explicit paths retain every checkout even with no client roots.
+    for selectors in ([str(root), str(worktree)], [str(worktree), str(root)]):
+        merged = app.search_code("return", projects=selectors)
+        assert symbols(merged) == ["main_branch", "main_only", "worktree_branch"]
+
+    # A path scopes only its checkout; a registration selector still expands
+    # to all advertised checkouts, including when combined with a path.
+    app.cwd = root
+    assert symbols(app.search_code("return", projects=[str(worktree)], roots=[root, worktree])) == [
+        "main_branch",
+        "worktree_branch",
+    ]
+    assert symbols(
+        app.search_code("return", projects=[str(worktree), project.id], roots=[root])
+    ) == [
+        "main_branch",
+        "main_only",
+        "worktree_branch",
+    ]
 
 
 def test_a_branch_slot_survives_relocation_between_worktrees(tmp_path: Path) -> None:
@@ -2569,30 +2735,42 @@ def test_a_branch_slot_survives_relocation_between_worktrees(tmp_path: Path) -> 
     assert app.get_chunk(feature_chunk_id).content is not None
 
 
-def test_init_project_unifies_a_legacy_duplicate_worktree_registration(
+@pytest.mark.parametrize("worktree_first", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_explicit_removal_migrates_a_legacy_worktree_to_the_surviving_registration(
     tmp_path: Path,
+    worktree_first: bool,
+    nested: bool,
 ) -> None:
-    """Pre-worktree registrations surface as warnings until init unifies them."""
-    root, _ = _git_repo_with_main(tmp_path)
+    """Migration requires explicit removal of the selected legacy duplicate."""
+    root, worktree = _git_repo_with_worktree(tmp_path, nested=nested)
     app = Application(
         RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
         embedder=TinyEmbedder(),
         cwd=tmp_path,
     )
-    project = app.init_project(root)
-    app.index_project(project.id)
+    project = initialize_project(root)
 
-    worktree = tmp_path / "wt"
-    run_git("worktree", "add", "-q", "--detach", str(worktree), cwd=root)
     # Simulate the old behavior: the worktree was initialized as its own
     # project before registrations were shared across checkouts.
     legacy_marker = initialize_project(worktree)
-    app.store.upsert_project(legacy_marker, model_id=app.embedder.model_id, state="pending")
+    projects = [legacy_marker, project] if worktree_first else [project, legacy_marker]
+    for registration in projects:
+        app.store.upsert_project(registration, model_id=app.embedder.model_id, state="pending")
+        app.index_project(registration.id)
+    main_status = app.project_status(project.id)
+    main_chunk = app.find_symbol("main_branch", project.id).hits[0].chunk_id
 
     status = app.storage_status()
     assert len(status.worktree_warnings) == 1
 
-    unified = app.init_project(worktree)
+    # Ordinary initialization preserves either registered identity.
+    assert app.init_project(root).id == project.id
+    assert app.init_project(worktree).id == legacy_marker.id
+    assert app.remove_project(legacy_marker.id).removed
+    # Once removed, a nested checkout still requires the explicit overlap
+    # option before joining its surviving parent registration.
+    unified = app.init_project(worktree, allow_overlap=nested)
 
     assert unified.id == project.id
     assert len(app.list_projects()) == 1
@@ -2601,6 +2779,8 @@ def test_init_project_unifies_a_legacy_duplicate_worktree_registration(
     wt_status = app.project_status(project.id, roots=[worktree])
     assert wt_status.state == "ready"
     assert wt_status.file_count == 1
+    assert app.project_status(project.id, roots=[root]).active_slot_id == main_status.active_slot_id
+    assert app.get_chunk(main_chunk).content is not None
 
 
 def test_emit_refactor_patch_returns_the_applyable_subset(tmp_path: Path) -> None:
@@ -2629,7 +2809,10 @@ def test_emit_refactor_patch_returns_the_applyable_subset(tmp_path: Path) -> Non
     assert result.completeness.state == "complete"
 
 
-def test_reference_tools_read_the_selected_worktree_root(tmp_path: Path) -> None:
+@pytest.mark.parametrize("explicit_path", [False, True])
+def test_reference_tools_read_the_selected_worktree_root(
+    tmp_path: Path, explicit_path: bool
+) -> None:
     root, _ = _git_repo_with_main(tmp_path)
     app = Application(
         RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
@@ -2659,19 +2842,17 @@ def test_reference_tools_read_the_selected_worktree_root(tmp_path: Path) -> None
     app.init_project(worktree)
     app.index_project(project.id, roots=[worktree])
     selector = DeclarationSelector(
-        project=project.id,
+        project=str(worktree) if explicit_path else project.id,
         path="auth.py",
         qualified_symbol="authorize",
     )
 
-    references = app.find_references(selector, roots=[worktree])
-    radius = app.impact_radius(selector, roots=[worktree])
-    analysis = app.analyze_refactor(
-        selector, RenameOperation(new_name="validate"), roots=[worktree]
-    )
-    patch = app.emit_refactor_patch(
-        selector, RenameOperation(new_name="validate"), roots=[worktree]
-    )
+    roots = [root] if explicit_path else [worktree]
+    app.cwd = root
+    references = app.find_references(selector, roots=roots)
+    radius = app.impact_radius(selector, roots=roots)
+    analysis = app.analyze_refactor(selector, RenameOperation(new_name="validate"), roots=roots)
+    patch = app.emit_refactor_patch(selector, RenameOperation(new_name="validate"), roots=roots)
 
     assert {item.path for item in references.hits} == {"consumer.py"}
     assert radius.layers[0].edges[0].target.qualified_symbol == "run"

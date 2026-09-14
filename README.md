@@ -552,9 +552,27 @@ keeps its own active-slot pointer. A request answered through a worktree scans, 
 freshens that worktree; when a scope contains several checkouts of one project at once, their
 slots are searched together and merged into one ranking. Register a worktree with `init_project`
 or let root discovery do it; pass `force_new_id` to deliberately keep it separate.
-Registrations that predate this behavior (a repository indexed as several projects) keep working
-and surface an advisory warning in `index_storage_status`; re-running `init_project` on the
-secondary root unifies them under the surviving registration.
+
+An explicit filesystem path selects that checkout even when the client's roots or working
+directory point to another worktree. Searches with multiple explicit paths include each selected
+checkout. Project IDs and names follow the client's roots (then the working directory as a
+fallback); searches by ID/name or implicit scope combine matching client-root checkouts.
+Registered IDs and names take precedence over relative path spellings: use `./name` or an
+absolute path when a directory name also matches a registered project name.
+
+Re-running `init_project` preserves an existing registered marker's ID, including registrations
+deliberately split with `force_new_id`. Multiple registrations for one Git repository surface an
+advisory warning in `index_storage_status`; they may be intentional. A checkout without a
+registered ID joins only a single compatible registration (the same Git repository and project
+prefix). Multiple compatible registrations produce `AMBIGUOUS_PROJECT` without changing the marker.
+
+To migrate a legacy duplicate, choose the registration to keep, explicitly call
+`remove_project` with the duplicate's ID, then call `init_project` on the duplicate's checkout.
+The sole remaining compatible registration is the survivor: its existing slots and indexed data
+are preserved. Explicit removal deletes the duplicate's index; use `index_project` to build that
+checkout's branch slot under the survivor. For a checkout nested inside another registered root,
+set `allow_overlap=true` on this migration's `init_project` call. Initialization never removes a
+registration itself.
 
 CLI index refreshes are explicit and incremental. MCP indexing is lazy by default: listing tools
 does not discover projects, load the model, or start indexing. Every project-scoped code query
