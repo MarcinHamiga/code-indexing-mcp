@@ -1488,7 +1488,7 @@ def test_a_slice_mismatch_conflicts_the_finding(tmp_path: Path) -> None:
     )
     operation = RenameOperation(new_name="validate")
     selector = DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize")
-    analysis, query = service._rename_analysis(
+    analysis, query = service._refactor_analysis(
         selector,
         operation,
         limit=500,
@@ -1550,7 +1550,7 @@ def test_a_path_that_escapes_the_root_is_conflicted_and_never_read(
 
     operation = RenameOperation(new_name="validate")
     selector = DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize")
-    analysis, query = service._rename_analysis(
+    analysis, query = service._refactor_analysis(
         selector,
         operation,
         limit=500,
@@ -1602,7 +1602,7 @@ def test_emission_rereads_files_after_analysis(
         },
     )
     consumer = tmp_path / "repo" / "consumer.py"
-    analyze = service._rename_analysis
+    analyze = service._refactor_analysis
 
     def mutate_after_analysis(*args: object, **kwargs: object) -> object:
         result = analyze(*args, **kwargs)
@@ -1611,7 +1611,7 @@ def test_emission_rereads_files_after_analysis(
         )
         return result
 
-    monkeypatch.setattr(service, "_rename_analysis", mutate_after_analysis)
+    monkeypatch.setattr(service, "_refactor_analysis", mutate_after_analysis)
 
     result = _emit(service, project_id, "auth.py", "authorize", "validate")
 
@@ -1635,7 +1635,7 @@ def test_an_overlapping_edit_is_omitted_not_merged(tmp_path: Path) -> None:
     )
     operation = RenameOperation(new_name="validate")
     selector = DeclarationSelector(project=project_id, path="auth.py", qualified_symbol="authorize")
-    analysis, query = service._rename_analysis(
+    analysis, query = service._refactor_analysis(
         selector,
         operation,
         limit=500,

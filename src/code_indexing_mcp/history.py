@@ -161,7 +161,7 @@ class HistoryStore:
         self.directory = directory
         self.path = directory / "runs.sqlite"
         directory.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.executescript(_SCHEMA)
             # Databases created before pid tracking have no owner column;
             # ALTER is cheap and idempotent because of the guard above.
@@ -191,7 +191,7 @@ class HistoryStore:
     def begin(self, audit: RunAudit) -> None:
         """Insert a run in the ``running`` state before its work starts."""
 
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO runs (
@@ -241,7 +241,7 @@ class HistoryStore:
             assignments.append(f"{column} = ?")
             values.append(value)
         values.append(run_id)
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute(f"UPDATE runs SET {', '.join(assignments)} WHERE run_id = ?", values)
             connection.execute(
                 """
@@ -271,7 +271,7 @@ class HistoryStore:
         cannot be verified, so it is treated as dead.
         """
 
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             rows = connection.execute(
                 "SELECT run_id, pid FROM runs WHERE state = 'running'"
             ).fetchall()

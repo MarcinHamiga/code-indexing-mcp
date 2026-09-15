@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 from conftest import run_git
+from support import DeterministicEmbedder
 
 from code_indexing_mcp import application as application_module
 from code_indexing_mcp.application import Application, RuntimePaths
@@ -22,15 +23,7 @@ from code_indexing_mcp.application import Application, RuntimePaths
 FILE_COUNT = 200
 
 
-class TinyEmbedder:
-    model_id = "test/tiny"
-    dimension = 4
-
-    def embed_passages(self, texts: list[str]) -> list[list[float]]:
-        return [[1.0, 0.0, 0.0, float(len(text))] for text in texts]
-
-    def embed_query(self, text: str) -> list[float]:
-        return [1.0, 0.0, 0.0, float(len(text))]
+TinyEmbedder = DeterministicEmbedder
 
 
 def _large_git_repo(tmp_path: Path) -> Path:

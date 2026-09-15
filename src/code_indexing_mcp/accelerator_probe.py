@@ -25,6 +25,7 @@ from .backends import (
     backend_for,
     parse_accelerator,
     platform_fingerprint,
+    provider_resolution_error,
     runtime_version,
 )
 from .embedding import (
@@ -69,23 +70,8 @@ def probe(
     )
     model = _load_model(config)
     resolved = resolve_session_providers(model)
-    if resolved:
-        if descriptor.provider not in resolved:
-            # ONNX Runtime drops a provider it cannot initialise and carries on
-            # with the next one, so a session that quietly became a CPU session
-            # must not be recorded as a working accelerator.
-            raise RuntimeError(
-                f"{descriptor.provider} was requested but the session runs on {', '.join(resolved)}"
-            )
-    elif descriptor.uses_direct_model:
-        # The direct model reports the target its own session resolved, so
-        # nothing at all means the session is broken. FastEmbed models are
-        # different: resolution walks a private layout there, so an empty tuple
-        # means "unknown" and stays tolerated rather than letting a FastEmbed
-        # refactor fail the probe on a working CUDA environment.
-        raise RuntimeError(
-            f"the direct session reported no providers, so {descriptor.provider} cannot be verified"
-        )
+    if (error := provider_resolution_error(descriptor, resolved)) is not None:
+        raise RuntimeError(error)
     providers = tuple(dict.fromkeys((*providers, *resolved)))
     vectors = [
         np.asarray(vector, dtype="<f4").tobytes()

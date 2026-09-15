@@ -1106,32 +1106,68 @@ class IndexProgress(BaseModel):
         return min(1.0, self.candidates_seen / self.candidates_total)
 
     def describe(self) -> str:
-        """Render a one-line status suitable for a progress bar or a log line."""
+        """Render a one-line status suitable for a progress bar or a log line.
+
+        Every phase carries the live counters, the file currently in flight,
+        and the run's identity: embedding, reference extraction, and
+        committing are the longest stretches of a run, and a line without
+        numbers makes a working run indistinguishable from a hung one on a
+        redirected log. Only candidate counts may imply a total (see
+        :meth:`fraction`); everything else is a running total.
+        """
 
         if self.phase == "committing":
-            return "Committing the index"
-        if self.phase == "extracting_references":
-            return "Extracting structural references"
-        if not self.candidates_seen:
-            return "Scanning for changed files"
-        if self.candidates_total:
-            scanned = f"{self.candidates_seen}/~{self.candidates_total} candidates"
+            head = "Committing the index"
+        elif self.phase == "extracting_references":
+            head = "Extracting structural references"
+            if self.candidates_total:
+                head += f" {self._candidates_text()}"
+        elif not self.candidates_seen:
+            head = "Scanning for changed files"
         else:
-            scanned = f"{self.candidates_seen} candidates"
-        parts = [f"{self.phase.capitalize()} {scanned}"]
+            head = f"{self.phase.capitalize()} {self._candidates_text()}"
+        parts = [head]
         if self.eligible_files:
             parts.append(f"{self.eligible_files} eligible")
         if self.changed_files:
             parts.append(f"{self.changed_files} changed")
         if self.unchanged_files:
             parts.append(f"{self.unchanged_files} unchanged")
+        if self.parsed_files:
+            parts.append(f"{self.parsed_files} parsed")
         if self.failed_files:
             parts.append(f"{self.failed_files} failed")
         if self.skipped_total:
             parts.append(f"{self.skipped_total} skipped")
+        if self.chunks_extracted:
+            parts.append(f"{self.chunks_extracted} chunks extracted")
         if self.chunks_embedded:
             parts.append(f"{self.chunks_embedded} chunks embedded")
+        if self.chunks_staged:
+            parts.append(f"{self.chunks_staged} chunks staged")
+        if self.current_path:
+            parts.append(f"current {self._path_tail(self.current_path)}")
+        if self.run_id:
+            parts.append(f"run {self.run_id[:8]} {self.trigger}")
+        if self.slot_id:
+            parts.append(f"slot {self.slot_id[:8]}")
+        if self.selector:
+            parts.append(self.selector)
         return ", ".join(parts)
+
+    def _candidates_text(self) -> str:
+        """Candidate counts; only candidates may imply a total (see fraction)."""
+
+        if self.candidates_total:
+            return f"{self.candidates_seen}/~{self.candidates_total} candidates"
+        return f"{self.candidates_seen} candidates"
+
+    @staticmethod
+    def _path_tail(path: str) -> str:
+        """The last two segments of *path*: enough to tell files apart."""
+
+        segments = path.split("/")
+        return "/".join(segments[-2:]) if len(segments) > 1 else path
 
 
 class ProjectStatus(FrozenModel):
@@ -1332,6 +1368,10 @@ class MaintenanceReport(FrozenModel):
     projects: list[MaintenanceProjectResult] = Field(default_factory=list)
     registry_before: TableStorageStats | None = None
     registry_after: TableStorageStats | None = None
+    # The registry consists of all three tables; the singular fields above
+    # remain the projects-table compatibility view.
+    registry_tables_before: list[TableStorageStats] = Field(default_factory=list)
+    registry_tables_after: list[TableStorageStats] = Field(default_factory=list)
     registry_status: str = "skipped"
     registry_skip_reason: str | None = None
     registry_error: str | None = None

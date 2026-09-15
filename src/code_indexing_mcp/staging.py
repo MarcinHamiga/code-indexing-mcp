@@ -21,8 +21,9 @@ import logging
 import os
 import shutil
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -54,6 +55,11 @@ JOURNAL_FORMAT_VERSION = 3
 # survives long enough can name a version that no longer exists. Retry a few
 # times to ride out transient I/O, then give up loudly.
 MAX_RECOVERY_ATTEMPTS = 3
+
+_JOURNAL_PHASES = frozenset({PHASE_STAGING, PHASE_COMMITTING, PHASE_COMPLETE, PHASE_ROLLED_BACK})
+_JOURNAL_VERSIONS = frozenset(
+    {LEGACY_JOURNAL_FORMAT_VERSION, THREE_TABLE_JOURNAL_FORMAT_VERSION, JOURNAL_FORMAT_VERSION}
+)
 
 # Bounded commit batches: the commit runs one Lance mutation per batch rather
 # than one per changed file, so an unchanged run creates no mutations and a
@@ -180,6 +186,30 @@ def _journal_paths(staging_root: Path) -> list[Path]:
     )
 
 
+def _read_journal(path: Path) -> dict[str, Any] | None:
+    """Read a supported journal shape, preserving malformed input for inspection."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    phase = payload.get("phase")
+    if not isinstance(phase, str) or phase not in _JOURNAL_PHASES:
+        return None
+    version = payload.get("version", LEGACY_JOURNAL_FORMAT_VERSION)
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in _JOURNAL_VERSIONS
+    ):
+        return None
+    attempts = payload.get("recovery_attempts", 0)
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+        return None
+    return payload
+
+
 def pending_recovery(staging_root: Path, project_id: str) -> PendingRecovery:
     """Return the slots whose retained versions maintenance must preserve."""
     project_root = staging_root / project_id
@@ -191,23 +221,14 @@ def pending_recovery(staging_root: Path, project_id: str) -> PendingRecovery:
         )
     except OSError:
         return PendingRecovery(pending=True, project_wide=True)
-    known_phases = {PHASE_STAGING, PHASE_COMMITTING, PHASE_COMPLETE, PHASE_ROLLED_BACK}
     protected: set[str] = set()
     project_wide = False
     pending = False
     for journal_path in journals:
         relative = journal_path.relative_to(project_root)
         inferred_slot = relative.parts[0] if len(relative.parts) == 3 else None
-        try:
-            payload = json.loads(journal_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            pending = True
-            if inferred_slot is None:
-                project_wide = True
-            else:
-                protected.add(inferred_slot)
-            continue
-        if not isinstance(payload, dict):
+        payload = _read_journal(journal_path)
+        if payload is None:
             pending = True
             if inferred_slot is None:
                 project_wide = True
@@ -215,7 +236,7 @@ def pending_recovery(staging_root: Path, project_id: str) -> PendingRecovery:
                 protected.add(inferred_slot)
             continue
         phase = payload.get("phase")
-        if phase != PHASE_COMMITTING and phase in known_phases:
+        if phase != PHASE_COMMITTING:
             continue
         pending = True
         slot_id = payload.get("slot_id")
@@ -603,29 +624,60 @@ class StagingJob:
     def _open_writer(self, name: str, schema: pa.Schema) -> tuple[Any, pa.RecordBatchWriter]:
         temporary = self.directory / f"{name}.tmp"
         sink = temporary.open("wb")
-        return sink, pa.ipc.new_file(sink, schema)
+        try:
+            return sink, pa.ipc.new_file(sink, schema)
+        except Exception:
+            with contextlib.suppress(Exception):
+                sink.close()
+            raise
 
     def _close_writers(self, *, finalize: bool = True) -> None:
-        for name, sink, writer in (
-            (FILES_NAME, self._files_sink, self._files_writer),
-            (CHUNKS_NAME, self._chunks_sink, self._chunks_writer),
-            (REFERENCES_NAME, self._references_sink, self._references_writer),
+        first_error: Exception | None = None
+
+        def attempt(action: Callable[[], object]) -> bool:
+            nonlocal first_error
+            try:
+                action()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                return False
+            return True
+
+        for attribute, name in (
+            ("files", FILES_NAME),
+            ("chunks", CHUNKS_NAME),
+            ("references", REFERENCES_NAME),
         ):
-            if writer is None:
+            writer = getattr(self, f"_{attribute}_writer")
+            sink = getattr(self, f"_{attribute}_sink")
+            if writer is None and sink is None:
                 continue
-            writer.close()
-            sink.flush()
-            os.fsync(sink.fileno())
-            sink.close()
-            if finalize:
-                os.replace(
-                    self.directory / f"{name}.tmp",
-                    self.directory / name,
+            resource_failed = False
+            if writer is not None:
+                resource_failed = not attempt(writer.close) or resource_failed
+                setattr(self, f"_{attribute}_writer", None)
+            if sink is not None:
+
+                def sync_sink(current_sink: Any = sink) -> None:
+                    os.fsync(current_sink.fileno())
+
+                resource_failed = not attempt(sink.flush) or resource_failed
+                resource_failed = not attempt(sync_sink) or resource_failed
+                resource_failed = not attempt(sink.close) or resource_failed
+                setattr(self, f"_{attribute}_sink", None)
+            if finalize and not resource_failed:
+                attempt(
+                    partial(
+                        os.replace,
+                        self.directory / f"{name}.tmp",
+                        self.directory / name,
+                    )
                 )
-        self._files_sink = self._chunks_sink = self._references_sink = None
-        self._files_writer = self._chunks_writer = self._references_writer = None
         if finalize:
-            _sync_directory(self.directory)
+            attempt(lambda: _sync_directory(self.directory))
+        if first_error is not None:
+            raise first_error
 
     def _write_journal(self) -> None:
         payload = json.dumps(self._journal, indent=2, sort_keys=True).encode()
@@ -652,9 +704,8 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
     recovered = 0
     for journal_path in _journal_paths(staging_root):
         directory = journal_path.parent
-        try:
-            journal = json.loads(journal_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        journal = _read_journal(journal_path)
+        if journal is None:
             logger.warning("Ignoring unreadable staging journal: %s", journal_path)
             continue
         if journal.get("phase") != PHASE_COMMITTING:

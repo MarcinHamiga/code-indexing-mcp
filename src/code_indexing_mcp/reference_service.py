@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import ast
 import base64
+import binascii
 import hashlib
 import json
 import re
 import threading
 from collections import OrderedDict, deque
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Final, Literal, NamedTuple, cast
+from typing import Any, Final, Literal, NamedTuple, TypedDict, cast
 
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import STRUCTURAL_LANGUAGES
@@ -44,6 +47,7 @@ from .models import (
     ReferenceLimitation,
     ReferenceResponse,
     RenameOperation,
+    ResolutionLevel,
     SelectedDeclaration,
     SignatureChangeOperation,
 )
@@ -167,6 +171,9 @@ class _ReferenceContext(NamedTuple):
     export_rows: list[ReferenceRecord]
     known_paths: frozenset[str]
     module_index: _ModuleIndex
+    imports_by_file: dict[str, list[ReferenceRecord]]
+    reexport_rows_by_path: dict[str, list[ReferenceRecord]]
+    coverage_hashes: dict[str, str]
 
 
 class _ReferenceQuery(NamedTuple):
@@ -229,11 +236,60 @@ class _ImpactTraversal(NamedTuple):
     visited_count: int
 
 
+class _ReferenceCursor(TypedDict):
+    version: int
+    project_id: str
+    path: str
+    qualified_symbol: str
+    kinds: list[str]
+    offset: int
+    limit: int
+    operation_digest: str | None
+    slot_id: str
+    activation_epoch: int
+
+
+class _ImpactCursor(TypedDict):
+    version: int
+    project_id: str
+    path: str
+    qualified_symbol: str
+    max_depth: int
+    include_likely: bool
+    kinds: list[str]
+    max_nodes: int
+    offset: int
+    limit: int
+    slot_id: str
+    activation_epoch: int
+
+
 class _ClassifiedFindings(NamedTuple):
     must_change: list[RefactorFinding]
     likely_change: list[RefactorFinding]
     review: list[RefactorFinding]
     evidence: list[RefactorFinding]
+
+
+_ImpactNodeKey = tuple[str, str, str]
+
+
+@dataclass(slots=True)
+class _ImpactEdgeAccumulator:
+    source: SelectedDeclaration
+    target: SelectedDeclaration
+    kinds: set[str]
+    possible: bool
+    tainted: bool
+    cycle_to_depth: int | None
+
+
+_Classification = tuple[ResolutionLevel, str, str]
+
+
+class _PatchVerification(NamedTuple):
+    edit: ByteEdit | None
+    conflict: RefactorFinding | None
 
 
 def _dedupe_edit_spans(
@@ -517,13 +573,9 @@ class ReferenceService:
 
         `analyze_refactor` needs the paginated response, the full
         pinned-snapshot record set, and the full classified hit list (for the
-        declaration/override/signature work below), not just the page. Fetching
-        through the plain `find_references` and then re-fetching
-        `list_reference_records` at the same `response.snapshot_version` --
-        and separately re-running `_hits_and_limitations` over it -- was a
-        second full-table materialization and a second classification pass
-        over data already in hand (S4/E1); this lets `analyze_refactor` reuse
-        the one fetch and one classification pass made here instead.
+        declaration/override/signature work below), not just the page. This
+        method returns those values together so refactor analysis reuses one
+        fetch and one classification pass (S4/E1).
 
         `context` (D2-D4 of the reference-pushdown plan) is the small,
         snapshot-stable row set (coverage/import/export rows) every query
@@ -616,8 +668,8 @@ class ReferenceService:
                 raise CodeIndexingError(
                     ErrorCode.INVALID_CURSOR, "cursor does not match the refactor operation"
                 )
-            offset = cast(int, payload["offset"])
-            version = cast(int, payload["version"])
+            offset = payload["offset"]
+            version = payload["version"]
 
         try:
             # `schema_version` is pushed into the storage layer's `WHERE`
@@ -657,6 +709,7 @@ class ReferenceService:
             ) from error
         root = root or self._project_root(selected.project_id)
         sources: dict[str, tuple[bytes, int]] = {}
+        assert context is not None
         hits, limitations, declarations = self._hits_and_limitations(
             selected,
             kinds,
@@ -666,6 +719,7 @@ class ReferenceService:
             backfill,
             version,
             partition_id=partition.partition_id,
+            context=context,
         )
         page = hits[offset : offset + limit]
         next_cursor = None
@@ -716,12 +770,10 @@ class ReferenceService:
         """Fetch the small, snapshot-stable rows a reference query needs (D2).
 
         Coverage rows (one per indexed file) and import/export rows are
-        orders of magnitude fewer than the full reference table; every
-        `.records` consumer other than the classified candidates themselves
-        reads only these three kinds (the audit in `_candidate_records`), so
-        this is the two narrow queries that replace "the whole table per
-        call" -- the candidate fetch itself happens per selection, in
-        `_candidate_records`.
+        orders of magnitude fewer than the full reference table. Every
+        `.records` consumer other than candidate classification reads only
+        these three kinds, so these two narrow queries provide the shared
+        context while `_candidate_records` fetches candidates per selection.
         """
         coverage_rows = self.store.list_reference_records(
             project_id,
@@ -756,6 +808,11 @@ class ReferenceService:
             export_rows=export_rows,
             known_paths=self._known_paths(coverage_rows),
             module_index=module_index,
+            imports_by_file=self._imports_by_file(import_export_rows),
+            reexport_rows_by_path=self._reexport_rows_by_path(import_export_rows),
+            coverage_hashes={
+                row["path"]: row["content_hash"] for row in coverage_rows if row["content_hash"]
+            },
         )
 
     @staticmethod
@@ -805,11 +862,9 @@ class ReferenceService:
     ) -> list[ReferenceRecord]:
         """Assemble one query's `records` from `context` plus a superset candidate fetch.
 
-        ### `.records` consumer audit (D3, Step 0)
+        The assembled `records` satisfy every reader in this class and the
+        `_ReferenceQuery.records` consumers:
 
-        Every reader of the assembled `records` (the local `records` inside
-        this class, and `_ReferenceQuery.records`/`query.records` outside it)
-        was checked against exactly what this function puts there --
         `context.coverage_rows + context.import_rows + context.export_rows +
         candidate_rows`, deduplicated by `reference_id`:
 
@@ -826,7 +881,7 @@ class ReferenceService:
         - `impact_radius`'s per-hit `rows`/`declarations` lookups: read only
           rows already reachable through `query.hits`, themselves derived
           from these same candidate rows, so nothing wider is needed.
-        - `_rename_analysis`'s `shapes_by_id`: looked up only by a hit's own
+        - `_refactor_analysis`'s `shapes_by_id`: looked up only by a hit's own
           `reference_id`, so never a row outside the candidate set.
         - `_render_patch`'s `coverage_hashes` and `languages_by_path`: read
           `coverage` rows and reference rows respectively, both already
@@ -842,7 +897,7 @@ class ReferenceService:
 
         No consumer needs a fetch this function does not already provide.
         """
-        reexport_rows = self._reexport_rows_by_path(context.import_rows + context.export_rows)
+        reexport_rows = context.reexport_rows_by_path
         spellings: set[str] = set()
         for item in context.import_rows:
             binding = item["alias"] or item["written_name"] or item["imported_name"]
@@ -951,12 +1006,21 @@ class ReferenceService:
                 "max_nodes": max_nodes,
                 "limit": limit,
             }
-            if any(payload[key] != value for key, value in expected.items()):
+            if (
+                payload["project_id"] != expected["project_id"]
+                or payload["path"] != expected["path"]
+                or payload["qualified_symbol"] != expected["qualified_symbol"]
+                or payload["max_depth"] != expected["max_depth"]
+                or payload["include_likely"] != expected["include_likely"]
+                or payload["kinds"] != expected["kinds"]
+                or payload["max_nodes"] != expected["max_nodes"]
+                or payload["limit"] != expected["limit"]
+            ):
                 raise CodeIndexingError(
                     ErrorCode.INVALID_CURSOR, "cursor does not match the impact-radius request"
                 )
-            offset = cast(int, payload["offset"])
-            version = cast(int, payload["version"])
+            offset = payload["offset"]
+            version = payload["version"]
 
         if version is None:
             # A resolved version is needed to build the traversal cache key
@@ -1137,16 +1201,14 @@ class ReferenceService:
     ) -> _ImpactTraversal:
         """Run one full, unpaginated impact-radius traversal (every depth).
 
-        Split out of `impact_radius` so its page cache (D4) can short-circuit
-        a repeat call -- most often a later cursor page, which used to re-run
-        this whole traversal from scratch -- without touching pagination.
+        Split out of `impact_radius` so its page cache (D4) serves later cursor
+        pages without re-running the traversal or touching pagination.
 
         Loads one `_ReferenceContext` up front and passes it to every
         frontier node's `_find_references_with_records` call (D4): the
-        coverage/import/export fetch that used to repeat, unfiltered, once
-        per node now happens once per traversal, and each node's own fetch
-        narrows to `_candidate_records`'s SQL-pushed-down superset (D1/D2)
-        instead of the whole reference table.
+        The coverage/import/export context is loaded once per traversal, and
+        each node's own fetch narrows to `_candidate_records`'s SQL-pushed-down
+        superset (D1/D2) rather than the whole reference table.
         """
         context = self._load_reference_context(
             selected.project_id, partition_id=partition.partition_id, version=version
@@ -1164,22 +1226,19 @@ class ReferenceService:
         )
         root = first_query.root
 
-        def node_key(node: SelectedDeclaration) -> tuple[str, str, str]:
+        def node_key(node: SelectedDeclaration) -> _ImpactNodeKey:
             return (node.project_id, node.path, node.qualified_symbol)
 
-        visited: dict[tuple[str, str, str], int] = {node_key(selected): 0}
+        visited: dict[_ImpactNodeKey, int] = {node_key(selected): 0}
         frontier: list[tuple[SelectedDeclaration, bool]] = [(selected, False)]
         all_layers: list[ImpactLayer] = []
         limitations: list[ReferenceLimitation] = []
         exhaustion: ImpactBudgetExhaustion | None = None
 
         for depth in range(1, max_depth + 1):
-            grouped_edges: dict[
-                tuple[tuple[str, str, str], tuple[str, str, str]],
-                dict[str, object],
-            ] = {}
+            grouped_edges: dict[tuple[_ImpactNodeKey, _ImpactNodeKey], _ImpactEdgeAccumulator] = {}
             review: list[ImpactReview] = []
-            candidates: dict[tuple[str, str, str], tuple[SelectedDeclaration, bool]] = {}
+            candidates: dict[_ImpactNodeKey, tuple[SelectedDeclaration, bool]] = {}
             for source, source_tainted in sorted(frontier, key=lambda item: node_key(item[0])):
                 query = (
                     first_query
@@ -1259,18 +1318,18 @@ class ReferenceService:
                     edge_key = (source_key, target_key)
                     edge = grouped_edges.get(edge_key)
                     if edge is None:
-                        grouped_edges[edge_key] = {
-                            "source": source,
-                            "target": target,
-                            "kinds": {hit.kind},
-                            "possible": possible,
-                            "tainted": tainted,
-                            "cycle_to_depth": cycle_to_depth,
-                        }
+                        grouped_edges[edge_key] = _ImpactEdgeAccumulator(
+                            source=source,
+                            target=target,
+                            kinds={hit.kind},
+                            possible=possible,
+                            tainted=tainted,
+                            cycle_to_depth=cycle_to_depth,
+                        )
                     else:
-                        cast(set[str], edge["kinds"]).add(hit.kind)
-                        edge["possible"] = cast(bool, edge["possible"]) and possible
-                        edge["tainted"] = cast(bool, edge["tainted"]) and tainted
+                        edge.kinds.add(hit.kind)
+                        edge.possible = edge.possible and possible
+                        edge.tainted = edge.tainted and tainted
                     if cycle_to_depth is None:
                         prior = candidates.get(target_key)
                         if prior is None or (prior[1] and not tainted):
@@ -1294,12 +1353,12 @@ class ReferenceService:
 
             edges = [
                 ImpactEdge(
-                    source=cast(SelectedDeclaration, edge["source"]),
-                    target=cast(SelectedDeclaration, edge["target"]),
-                    kinds=cast(list[ReferenceKind], sorted(cast(set[str], edge["kinds"]))),
-                    possible=cast(bool, edge["possible"]),
-                    tainted=cast(bool, edge["tainted"]),
-                    cycle_to_depth=cast(int | None, edge["cycle_to_depth"]),
+                    source=edge.source,
+                    target=edge.target,
+                    kinds=cast(list[ReferenceKind], sorted(edge.kinds)),
+                    possible=edge.possible,
+                    tainted=edge.tainted,
+                    cycle_to_depth=edge.cycle_to_depth,
                 )
                 for _, edge in sorted(grouped_edges.items())
             ]
@@ -1341,6 +1400,7 @@ class ReferenceService:
         version: int,
         *,
         partition_id: str,
+        context: _ReferenceContext,
     ) -> tuple[list[ReferenceHit], list[ReferenceLimitation], list[ReferenceRecord]]:
         """Classify every reference row into a sorted, unsliced hit list.
 
@@ -1396,10 +1456,11 @@ class ReferenceService:
             schema_version=REFERENCE_SCHEMA_VERSION,
             partition_id=partition_id,
         )
-        imports = self._imports_by_file(records)
-        reexport_rows = self._reexport_rows_by_path(records)
-        known_paths = self._known_paths(records)
-        module_index = self._build_module_index(records, declarations)
+        imports = context.imports_by_file
+        reexport_rows = context.reexport_rows_by_path
+        known_paths = context.known_paths
+        receiver_index = self._build_module_index([], declarations)
+        module_index = context.module_index._replace(receiver_names=receiver_index.receiver_names)
         # A declaration nested directly in a class body is reachable only
         # through a receiver, so it must not shadow a bare name the way a
         # nested function does.
@@ -1416,11 +1477,7 @@ class ReferenceService:
         # (e.g. a failed replacement that retained its previous generation)
         # would otherwise have those old offsets served against text they
         # never described -- a wrong-edit hazard for callers that trust them.
-        coverage_hashes = {
-            row["path"]: row["content_hash"]
-            for row in records
-            if row["record_kind"] == "coverage" and row["content_hash"]
-        }
+        coverage_hashes = context.coverage_hashes
         digests: dict[str, str] = {}
         stale_paths: set[str] = set()
         python_bindings: dict[str, PythonBindings] = {}
@@ -1507,7 +1564,7 @@ class ReferenceService:
                     end_byte=end_byte + bom,
                     snippet=source[start_byte:end_byte].decode("utf-8", errors="replace"),
                     written_name=row["written_name"],
-                    resolution=cast(Literal["exact", "likely", "unresolved"], resolution),
+                    resolution=resolution,
                     reason_code=reason,
                     explanation=explanation,
                 )
@@ -1591,7 +1648,7 @@ class ReferenceService:
         partition: PartitionRef | None = None,
         root: Path | None = None,
     ) -> RefactorAnalysis:
-        analysis, _query = self._rename_analysis(
+        analysis, _query = self._refactor_analysis(
             selector,
             operation,
             limit=limit,
@@ -1603,7 +1660,7 @@ class ReferenceService:
         )
         return analysis
 
-    def _rename_analysis(
+    def _refactor_analysis(
         self,
         selector: DeclarationSelector,
         operation: RefactorOperation,
@@ -1653,6 +1710,7 @@ class ReferenceService:
                 sources,
                 response.snapshot_version,
                 partition_id,
+                query.context,
             )
 
         # Signature shapes are fetched once from the same pinned snapshot and reused
@@ -1872,7 +1930,7 @@ class ReferenceService:
         """
         validate_patch_request(operation, context_lines)
         assert isinstance(operation, RenameOperation)
-        analysis, query = self._rename_analysis(
+        analysis, query = self._refactor_analysis(
             selector,
             operation,
             limit=500,
@@ -1949,66 +2007,51 @@ class ReferenceService:
         ):
             if finding.path in escaped_paths:
                 conflicted.append(
-                    finding.model_copy(
-                        update={
-                            "reason_code": "path_escapes_root",
-                            "explanation": (
-                                f"{finding.explanation} The recorded path resolves outside "
-                                "the project root, so no file was read and the edit was "
-                                "left out of the patch."
-                            ),
-                        }
+                    self._patch_conflict(
+                        finding,
+                        "The recorded path resolves outside the project root, so no file was "
+                        "read and the edit was left out of the patch.",
+                        reason_code="path_escapes_root",
                     )
                 )
                 continue
             if finding.path in stale_paths:
                 conflicted.append(
-                    finding.model_copy(
-                        update={
-                            "reason_code": "stale_file",
-                            "explanation": (
-                                f"{finding.explanation} The file changed on disk after its "
-                                "structural rows were extracted, so the recorded offsets "
-                                "are stale and the edit was left out of the patch."
-                            ),
-                        }
+                    self._patch_conflict(
+                        finding,
+                        "The file changed on disk after its structural rows were extracted, "
+                        "so the recorded offsets are stale and the edit was left out of the "
+                        "patch.",
+                        reason_code="stale_file",
                     )
                 )
                 continue
             source, bom = self._file_bytes(query.root, finding.path, render_sources)
-            start = raw_start - bom
-            end = raw_end - bom
-            # Defense against resolver regressions: the span the resolver
-            # classified must still spell the identifier (as `_edit_span`
-            # matched it), or the replacement would corrupt neighboring text.
-            if start < 0 or end > len(source) or source[start:end] != old_bytes:
-                conflicted.append(
-                    finding.model_copy(
-                        update={
-                            "explanation": (
-                                f"{finding.explanation} The bytes at the recorded offsets "
-                                "no longer spell the identifier the analysis resolved, so "
-                                "the edit was left out of the patch."
-                            )
-                        }
-                    )
-                )
+            verification = self._verify_patch_edit(
+                finding,
+                source,
+                bom,
+                raw_start,
+                raw_end,
+                old_bytes,
+                new_bytes,
+            )
+            if verification.conflict is not None:
+                conflicted.append(verification.conflict)
                 continue
+            assert verification.edit is not None
+            start = verification.edit.start - bom
             path_edits = accepted.setdefault(finding.path, [])
             if path_edits and start < path_edits[-1].end - bom:
                 conflicted.append(
-                    finding.model_copy(
-                        update={
-                            "explanation": (
-                                f"{finding.explanation} The edit span overlaps an already "
-                                "accepted edit in the same file, so it was omitted rather "
-                                "than merged."
-                            )
-                        }
+                    self._patch_conflict(
+                        finding,
+                        "The edit span overlaps an already accepted edit in the same file, "
+                        "so it was omitted rather than merged.",
                     )
                 )
                 continue
-            path_edits.append(ByteEdit(raw_start, raw_end, new_bytes))
+            path_edits.append(verification.edit)
 
         # Stale files the gate had already suppressed carry no findings, so
         # the loop above never saw them. Synthesize one conflicted entry per
@@ -2020,25 +2063,14 @@ class ReferenceService:
                 languages_by_path.setdefault(row["path"], row["language"] or "")
         for path in sorted(stale_paths - candidate_paths):
             conflicted.append(
-                RefactorFinding(
-                    reference_id=f"stale:{path}",
-                    project_id=selected.project_id,
-                    path=path,
-                    language=languages_by_path.get(path, ""),
-                    kind="read",
-                    start_line=0,
-                    end_line=0,
-                    start_byte=0,
-                    end_byte=0,
-                    snippet="",
-                    resolution="unresolved",
-                    reason_code="stale_file",
-                    explanation=(
-                        "This file changed on disk after its structural rows were "
-                        "extracted, so its recorded offsets were suppressed as stale "
-                        "and none of its edits could be verified for the patch."
-                    ),
-                    edit_required=True,
+                self._synthetic_patch_conflict(
+                    selected,
+                    path,
+                    languages_by_path.get(path, ""),
+                    "stale_file",
+                    "This file changed on disk after its structural rows were extracted, "
+                    "so its recorded offsets were suppressed as stale and none of its "
+                    "edits could be verified for the patch.",
                 )
             )
         # An escaped path outside the candidate set (e.g. one that only ever
@@ -2047,24 +2079,13 @@ class ReferenceService:
         # silently dropped.
         for path in sorted(escaped_paths - candidate_paths):
             conflicted.append(
-                RefactorFinding(
-                    reference_id=f"escaped:{path}",
-                    project_id=selected.project_id,
-                    path=path,
-                    language=languages_by_path.get(path, ""),
-                    kind="read",
-                    start_line=0,
-                    end_line=0,
-                    start_byte=0,
-                    end_byte=0,
-                    snippet="",
-                    resolution="unresolved",
-                    reason_code="path_escapes_root",
-                    explanation=(
-                        "This path resolves outside the project root, so no file was "
-                        "read and none of its edits could be verified for the patch."
-                    ),
-                    edit_required=True,
+                self._synthetic_patch_conflict(
+                    selected,
+                    path,
+                    languages_by_path.get(path, ""),
+                    "path_escapes_root",
+                    "This path resolves outside the project root, so no file was read "
+                    "and none of its edits could be verified for the patch.",
                 )
             )
 
@@ -2124,6 +2145,73 @@ class ReferenceService:
         )
 
     @staticmethod
+    def _patch_conflict(
+        finding: RefactorFinding,
+        explanation: str,
+        *,
+        reason_code: str | None = None,
+    ) -> RefactorFinding:
+        update: dict[str, object] = {"explanation": f"{finding.explanation} {explanation}"}
+        if reason_code is not None:
+            update["reason_code"] = reason_code
+        return finding.model_copy(update=update)
+
+    @classmethod
+    def _verify_patch_edit(
+        cls,
+        finding: RefactorFinding,
+        source: bytes,
+        bom: int,
+        raw_start: int,
+        raw_end: int,
+        old_bytes: bytes,
+        new_bytes: bytes,
+    ) -> _PatchVerification:
+        start = raw_start - bom
+        end = raw_end - bom
+        # Defense against resolver regressions: the span the resolver
+        # classified must still spell the identifier (as `_edit_span`
+        # matched it), or the replacement would corrupt neighboring text.
+        if start < 0 or end > len(source) or source[start:end] != old_bytes:
+            return _PatchVerification(
+                edit=None,
+                conflict=cls._patch_conflict(
+                    finding,
+                    "The bytes at the recorded offsets no longer spell the identifier "
+                    "the analysis resolved, so the edit was left out of the patch.",
+                ),
+            )
+        return _PatchVerification(
+            edit=ByteEdit(raw_start, raw_end, new_bytes),
+            conflict=None,
+        )
+
+    @staticmethod
+    def _synthetic_patch_conflict(
+        selected: SelectedDeclaration,
+        path: str,
+        language: str,
+        reason_code: str,
+        explanation: str,
+    ) -> RefactorFinding:
+        return RefactorFinding(
+            reference_id=f"{reason_code}:{path}",
+            project_id=selected.project_id,
+            path=path,
+            language=language,
+            kind="read",
+            start_line=0,
+            end_line=0,
+            start_byte=0,
+            end_byte=0,
+            snippet="",
+            resolution="unresolved",
+            reason_code=reason_code,
+            explanation=explanation,
+            edit_required=True,
+        )
+
+    @staticmethod
     def _validate_rename(selected: SelectedDeclaration, operation: RenameOperation) -> None:
         name = operation.new_name
         if name == selected.symbol:
@@ -2143,6 +2231,7 @@ class ReferenceService:
         sources: dict[str, tuple[bytes, int]],
         snapshot_version: int,
         partition_id: str,
+        context: _ReferenceContext,
     ) -> tuple[RefactorFinding, list[RefactorFinding]]:
         declarations = self.store.declaration_shapes(
             selected.project_id,
@@ -2188,7 +2277,7 @@ class ReferenceService:
             edit_end_byte=edit_end,
         )
         overrides = self._override_findings(
-            selected, records, root, sources, snapshot_version, partition_id
+            selected, records, root, sources, snapshot_version, partition_id, context
         )
         return finding, overrides
 
@@ -2425,6 +2514,7 @@ class ReferenceService:
         sources: dict[str, tuple[bytes, int]],
         version: int,
         partition_id: str,
+        context: _ReferenceContext,
     ) -> list[RefactorFinding]:
         """Walk transitive subclasses of a renamed method's owner class.
 
@@ -2460,14 +2550,10 @@ class ReferenceService:
         )
         if base_decl is None:
             return []
-        imports = self._imports_by_file(records)
-        known_paths = self._known_paths(records)
-        module_index = self._build_module_index(records, None)
-        coverage_hashes = {
-            row["path"]: row["content_hash"]
-            for row in records
-            if row["record_kind"] == "coverage" and row["content_hash"]
-        }
+        imports = context.imports_by_file
+        known_paths = context.known_paths
+        module_index = context.module_index
+        coverage_hashes = context.coverage_hashes
         digests: dict[str, str] = {}
         inheritance_rows = self.store.list_reference_records(
             selected.project_id,
@@ -2679,11 +2765,9 @@ class ReferenceService:
             )
         assert selector.project is not None and selector.path is not None
         assert selector.qualified_symbol is not None
-        # `path`/`qualified_symbol` equality is pushed into the query (D5)
-        # instead of scanning and decoding every chunk in the project
-        # (perf-major 5): `list_chunks` had no other production caller left
-        # once this changed, and its own vector-free projection was already
-        # more than this lookup ever needed.
+        # `path`/`qualified_symbol` equality is pushed into the query (D5), so
+        # declaration lookup scans only the matching rows and decodes no
+        # unrelated project chunks.
         chunks = self.store.find_declarations(
             selector.project, selector.path, selector.qualified_symbol, partition_id=partition_id
         )
@@ -2708,12 +2792,9 @@ class ReferenceService:
             # Distinguish a typo from a symbol this project genuinely lacks:
             # "no declaration" and "no references" are different answers.
             #
-            # DEVIATION from the plan's D5 text (recorded here, not silently):
-            # the plan described this suggestion as scoped to `path = ?`, but
-            # the code it replaces searched every chunk in the whole project
-            # for a matching tail, not just this one file's -- so the pushdown
-            # preserves that project-wide search (`declaration_symbols_by_tail`)
-            # rather than narrowing what callers actually see.
+            # Preserve the existing project-wide near-match suggestions while
+            # the exact declaration lookup remains scoped to the requested
+            # path.
             near = self.store.declaration_symbols_by_tail(
                 selector.project,
                 selector.qualified_symbol.rsplit(".", 1)[-1],
@@ -2885,7 +2966,7 @@ class ReferenceService:
         reexport_rows: dict[str, list[ReferenceRecord]],
         known_paths: frozenset[str],
         module_index: _ModuleIndex | None = None,
-    ) -> tuple[str, str, str]:
+    ) -> _Classification:
         source_imports = imports.get(row["file_id"], [])
         # Java's on-demand imports (`import a.b.*`) are wildcard-shaped but
         # resolve under their own, evidence-based rule (D3) -- never through
@@ -3178,7 +3259,7 @@ class ReferenceService:
         target_candidates: list[ReferenceRecord],
         known_paths: frozenset[str],
         module_index: _ModuleIndex | None,
-    ) -> tuple[str, str, str] | None:
+    ) -> _Classification | None:
         """D3: classify a Java row against the file's on-demand imports.
 
         `import a.b.*` (and its `static` form) can bind the selected symbol
@@ -3249,7 +3330,7 @@ class ReferenceService:
         selected: SelectedDeclaration,
         target_candidates: list[ReferenceRecord],
         module_index: _ModuleIndex | None,
-    ) -> tuple[str, str, str] | None:
+    ) -> _Classification | None:
         """D2: classify a C# row against the file's plain/`static` usings.
 
         The row must actually spell the selected symbol (a bare name or a
@@ -3569,8 +3650,8 @@ class ReferenceService:
     ) -> tuple[bytes, int]:
         """Return one file's BOM-stripped bytes and the offset that was removed.
 
-        Reads are cached for the life of one query. Resolving a few hundred
-        references used to re-read the same file once per hit.
+        Reads are cached for the life of one query so multiple references in a
+        file share one source read.
         """
 
         entry = cache.get(path)
@@ -3666,7 +3747,7 @@ class ReferenceService:
         return hashlib.sha256(raw).hexdigest()[:16]
 
     @staticmethod
-    def _encode_cursor(payload: dict[str, object]) -> str:
+    def _encode_cursor(payload: Mapping[str, object]) -> str:
         raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
@@ -3708,18 +3789,36 @@ class ReferenceService:
     )
 
     @staticmethod
-    def _decode_impact_cursor(cursor: str) -> dict[str, object]:
+    def _decode_cursor_payload(
+        cursor: str, *, fields: frozenset[str], description: str
+    ) -> dict[str, object]:
         try:
             padded = cursor + "=" * (-len(cursor) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(padded))
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid impact cursor") from exc
+            raw = base64.b64decode(padded, altchars=b"-_", validate=True)
+            payload = json.loads(raw)
+        except (binascii.Error, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_CURSOR, f"invalid {description} cursor"
+            ) from exc
+
+        def invalid() -> CodeIndexingError:
+            return CodeIndexingError(ErrorCode.INVALID_CURSOR, f"invalid {description} cursor")
+
+        if not isinstance(payload, dict) or set(payload) != fields:
+            raise invalid()
+        return cast(dict[str, object], payload)
+
+    @staticmethod
+    def _decode_impact_cursor(cursor: str) -> _ImpactCursor:
+        payload = ReferenceService._decode_cursor_payload(
+            cursor,
+            fields=ReferenceService._IMPACT_CURSOR_FIELDS,
+            description="impact",
+        )
 
         def invalid() -> CodeIndexingError:
             return CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid impact cursor")
 
-        if not isinstance(payload, dict) or set(payload) != ReferenceService._IMPACT_CURSOR_FIELDS:
-            raise invalid()
         for int_field in (
             "version",
             "max_depth",
@@ -3739,21 +3838,19 @@ class ReferenceService:
         kinds = payload["kinds"]
         if not isinstance(kinds, list) or not all(isinstance(item, str) for item in kinds):
             raise invalid()
-        return payload
+        return cast(_ImpactCursor, payload)
 
     @staticmethod
-    def _decode_cursor(cursor: str) -> dict[str, object]:
-        try:
-            padded = cursor + "=" * (-len(cursor) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(padded))
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid reference cursor") from exc
+    def _decode_cursor(cursor: str) -> _ReferenceCursor:
+        payload = ReferenceService._decode_cursor_payload(
+            cursor,
+            fields=ReferenceService._CURSOR_FIELDS,
+            description="reference",
+        )
 
         def invalid() -> CodeIndexingError:
             return CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid reference cursor")
 
-        if not isinstance(payload, dict) or set(payload) != ReferenceService._CURSOR_FIELDS:
-            raise invalid()
         for int_field in ("version", "offset", "limit", "activation_epoch"):
             value = payload[int_field]
             if isinstance(value, bool) or not isinstance(value, int):
@@ -3767,4 +3864,4 @@ class ReferenceService:
         operation_digest = payload["operation_digest"]
         if operation_digest is not None and not isinstance(operation_digest, str):
             raise invalid()
-        return payload
+        return cast(_ReferenceCursor, payload)

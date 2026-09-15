@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -45,6 +46,7 @@ CACHE_SCHEMA_VERSION = 1
 _DISABLED_VALUES = frozenset({"off", "0", "false", "no"})
 _INSTALL_DIRECTORY_VARIABLE = "CODE_INDEXING_MCP_INSTALL_DIR"
 _REMOTE_BRANCH_REF = "refs/heads/main"
+_REMOTE_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 
 # The subprocess seam, injectable so tests never need a network or a git.
 _Runner = Callable[[list[str], Path, float], "subprocess.CompletedProcess[str]"]
@@ -139,10 +141,17 @@ def check_remote(
     lines = [line for line in completed.stdout.splitlines() if line.strip()]
     if not lines:
         raise RuntimeError(f"no remote branch {_REMOTE_BRANCH_REF} at origin")
+    fields = lines[0].split()
+    if (
+        len(fields) < 2
+        or fields[1] != _REMOTE_BRANCH_REF
+        or _REMOTE_SHA_PATTERN.fullmatch(fields[0]) is None
+    ):
+        raise RuntimeError(f"invalid ls-remote response for {_REMOTE_BRANCH_REF}")
     return UpdateStatus(
         checked_at=time.time(),
         local_sha=checkout_head(install_directory) or "",
-        remote_sha=lines[0].split()[0],
+        remote_sha=fields[0],
     )
 
 

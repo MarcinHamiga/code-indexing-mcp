@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import shutil
 import sys
 import time
 from collections.abc import Sequence
@@ -26,6 +28,7 @@ from .daemon import (
     daemon_status,
     ensure_daemon,
     require_daemon_support,
+    stop_daemon_and_wait,
 )
 from .errors import CodeIndexingError
 from .progress import IndexProgress
@@ -308,10 +311,12 @@ class _ProgressPrinter:
         self._width = 0
         self._logged_at: float | None = None
         self._logged_phase: str | None = None
+        self._logged_line: str | None = None
 
     def __call__(self, progress: IndexProgress) -> None:
         line = progress.describe()
         if self.interactive:
+            line = self._fit_terminal(line)
             self.stream.write("\r" + line.ljust(self._width))
             self._width = len(line)
             self.stream.flush()
@@ -319,16 +324,44 @@ class _ProgressPrinter:
         now = time.monotonic()
         # A phase change is news whenever it happens: embedding a batch is where
         # a run spends minutes without a word, and the log should say so before
-        # the wait rather than after it.
+        # the wait rather than after it. An advancing counter line is news too:
+        # a run spends those minutes inside one phase, and the periodic cadence
+        # alone cannot tell moving numbers from a frozen worker.
         if (
             progress.phase == self._logged_phase
+            and line == self._logged_line
             and self._logged_at is not None
             and now - self._logged_at < self.LOG_INTERVAL_SECONDS
         ):
             return
         self._logged_at = now
         self._logged_phase = progress.phase
+        self._logged_line = line
         print(line, file=self.stream, flush=True)
+
+    def _fit_terminal(self, line: str) -> str:
+        """Keep the status line on one row: wrapped output scrolls like a log."""
+
+        columns = self._terminal_columns()
+        if columns < 40 or len(line) <= columns:
+            return line
+        return line[: columns - 1] + "…"
+
+    def _terminal_columns(self) -> int:
+        """Width of the stream being written, honouring COLUMNS first."""
+
+        try:
+            columns = int(os.environ.get("COLUMNS", ""))
+        except ValueError:
+            columns = 0
+        if columns > 0:
+            return columns
+        try:
+            return os.get_terminal_size(self.stream.fileno()).columns
+        except (AttributeError, ValueError, OSError):
+            # StringIO, closed and duck-typed streams have no usable width;
+            # fall back to stdout's terminal, then the 80-column default.
+            return shutil.get_terminal_size(fallback=(80, 24)).columns
 
     def clear(self) -> None:
         """Take the status line back down before anything else is printed."""
@@ -385,12 +418,7 @@ def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> 
                 print(_json({"stopped": bool(status["running"])}))
                 return 0
             if args.daemon_command == "restart":
-                if daemon_status(paths)["running"]:
-                    BrokerApplication(paths).stop()
-                    for _ in range(100):
-                        if not daemon_status(paths)["running"]:
-                            break
-                        time.sleep(0.05)
+                stop_daemon_and_wait(paths)
                 broker = ensure_daemon(paths)
                 print(_json({"restarted": True, **broker.ping()}))
                 return 0

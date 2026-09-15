@@ -9,24 +9,16 @@ rather than twice.
 
 from __future__ import annotations
 
-import time
 from collections.abc import Mapping
+from typing import Literal
 
 from ..application import RuntimePaths
-from ..daemon import BrokerApplication, daemon_status, daemon_supported
+from ..daemon import BrokerApplication, daemon_status, daemon_supported, stop_daemon_and_wait
+
+DaemonStopStatus = Literal["skipped", "warning", "ok"]
 
 
-def _wait_until_stopped(
-    paths: RuntimePaths, *, attempts: int = 100, interval: float = 0.05
-) -> bool:
-    for _ in range(attempts):
-        if not daemon_status(paths)["running"]:
-            return True
-        time.sleep(interval)
-    return False
-
-
-def stop_daemon(paths: RuntimePaths, *, reason: str) -> tuple[str, str]:
+def stop_daemon(paths: RuntimePaths, *, reason: str) -> tuple[DaemonStopStatus, str]:
     """Stop a running daemon so the next client respawns one on current code and settings.
 
     ``reason`` names what changed (``"code"`` for ``update``, ``"settings"``
@@ -38,10 +30,16 @@ def stop_daemon(paths: RuntimePaths, *, reason: str) -> tuple[str, str]:
     if not daemon_supported():
         return "skipped", "this platform has no shared daemon"
     try:
-        if not daemon_status(paths)["running"]:
+        current = daemon_status(paths)
+        if not current["running"]:
             return "skipped", "no daemon is running"
-        BrokerApplication(paths).stop()
-        if not _wait_until_stopped(paths):
+        stopped = stop_daemon_and_wait(
+            paths,
+            status=daemon_status,
+            stop=lambda: BrokerApplication(paths).stop(),
+            initial_running=True,
+        )
+        if not stopped:
             return "warning", "the daemon did not stop; run `code-indexing-mcp daemon stop`"
     except Exception as exc:
         return "warning", f"the daemon could not be stopped: {exc}"

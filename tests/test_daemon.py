@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from support import DeterministicEmbedder
 
 from code_indexing_mcp import daemon, embedding
 from code_indexing_mcp.application import Application, ApplicationLike, RuntimePaths
@@ -178,15 +179,7 @@ def test_startup_timeout_preserves_connection_failure(
     assert caught.value.details["connection_error"] == str(failure)
 
 
-class TinyEmbedder:
-    model_id = "test/tiny"
-    dimension = 4
-
-    def embed_passages(self, texts: list[str]) -> list[list[float]]:
-        return [[1.0, 0.0, 0.0, float(len(text))] for text in texts]
-
-    def embed_query(self, text: str) -> list[float]:
-        return [1.0, 0.0, 0.0, float(len(text))]
+TinyEmbedder = DeterministicEmbedder
 
 
 def test_jsonable_encodes_sets_as_sorted_lists() -> None:

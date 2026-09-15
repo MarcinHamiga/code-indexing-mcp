@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from .embedding import Embedder, compose_passage
 from .errors import CodeIndexingError, ErrorCode
@@ -13,6 +15,7 @@ from .models import (
     ChunkPreview,
     CodeChunk,
     ExampleSearchResponse,
+    ExtractionResult,
     OutlineItem,
     OutlineResponse,
     RankExplanation,
@@ -75,18 +78,26 @@ _DETECTION_ORDER: tuple[str, ...] = (
 )
 
 
-def detect_example_language(extractor: TreeSitterExtractor, source: str) -> str | None:
+def _detect_example(
+    extractor: TreeSitterExtractor, source: str
+) -> tuple[str | None, ExtractionResult | None]:
     source_bytes = source.encode("utf-8")
-    candidates: list[str] = []
+    candidates: list[tuple[str, ExtractionResult]] = []
     for language in _DETECTION_ORDER:
         suffix = _EXAMPLE_SUFFIX.get(language, "")
         try:
             result = extractor.extract(Path(f"example{suffix}"), language, source_bytes)
             if not result.has_errors and any(chunk.kind != "module" for chunk in result.chunks):
-                candidates.append(language)
-        except Exception:
+                candidates.append((language, result))
+        except (CodeIndexingError, ValueError) as exc:
+            logger.debug("Example language detection could not parse %s: %s", language, exc)
             continue
-    return candidates[0] if len(candidates) == 1 else None
+    return candidates[0] if len(candidates) == 1 else (None, None)
+
+
+def detect_example_language(extractor: TreeSitterExtractor, source: str) -> str | None:
+    language, _ = _detect_example(extractor, source)
+    return language
 
 
 def _example_passages(
@@ -119,12 +130,12 @@ def _example_passages(
             passages = [compose_passage("", example)]
         return language, passages
 
-    detected = detect_example_language(extractor, example)
+    detected, detected_result = _detect_example(extractor, example)
     if detected is not None:
-        suffix = _EXAMPLE_SUFFIX[detected]
-        result = extractor.extract(Path(f"example{suffix}"), detected, example_bytes)
+        assert detected_result is not None
         passages = [
-            compose_passage(chunk.embedding_prefix, chunk.content) for chunk in result.chunks
+            compose_passage(chunk.embedding_prefix, chunk.content)
+            for chunk in detected_result.chunks
         ]
         if not passages:
             passages = [compose_passage("", example)]
@@ -139,6 +150,16 @@ def _as_partition_refs(value: PartitionRef | Sequence[PartitionRef]) -> list[Par
     return list(value)
 
 
+@dataclass(frozen=True)
+class _SearchPreparation:
+    selected: dict[str, list[PartitionRef]]
+    partition_ids: dict[str, list[str]]
+    condition: str | None
+    paths: list[str] | None
+    limit: int
+    fetch: int
+
+
 class SearchService:
     def __init__(
         self,
@@ -149,6 +170,94 @@ class SearchService:
         self.store = store
         self.embedder = embedder
         self.extractor = extractor or TreeSitterExtractor()
+
+    def _prepare_search(
+        self,
+        project_ids: list[str],
+        *,
+        languages: list[str] | None,
+        paths: list[str] | None,
+        kinds: list[str] | None,
+        limit: int,
+        partitions: Mapping[str, PartitionRef | Sequence[PartitionRef]] | None,
+    ) -> _SearchPreparation:
+        limit = max(1, min(limit, 50))
+        conditions: list[str] = []
+        if languages:
+            conditions.append(self._in_condition("language", languages))
+        if kinds:
+            conditions.append(self._in_condition("kind", kinds))
+        pushed_paths = path_condition(paths) if paths else None
+        if pushed_paths is not None:
+            conditions.append(pushed_paths)
+        elif paths:
+            logger.debug(
+                "Path patterns %r could not be pushed down; filtering %d fetched rows in "
+                "Python, so low-ranking matches may be missed",
+                paths,
+                _FALLBACK_FETCH_ROWS,
+            )
+        if partitions is None:
+            selected = {
+                project_id: [self.store.active_partition(project_id)] for project_id in project_ids
+            }
+        else:
+            selected = {
+                project_id: _as_partition_refs(refs) for project_id, refs in partitions.items()
+            }
+        if (
+            set(selected) != set(project_ids)
+            or any(
+                ref.project_id != project_id
+                for project_id, refs in selected.items()
+                for ref in refs
+            )
+            or any(not refs for refs in selected.values())
+        ):
+            raise ValueError("search partitions do not match the requested projects")
+        return _SearchPreparation(
+            selected=selected,
+            partition_ids={
+                project_id: [ref.partition_id for ref in refs]
+                for project_id, refs in selected.items()
+            },
+            condition=" AND ".join(conditions) if conditions else None,
+            paths=paths,
+            limit=limit,
+            fetch=_FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5),
+        )
+
+    def _collect_hits(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        names: Mapping[str, str],
+        preparation: _SearchPreparation,
+        *,
+        include_content_in_key: bool,
+    ) -> list[SearchHit]:
+        hits: list[SearchHit] = []
+        seen: set[tuple[str, str, int, int, str | None]] = set()
+        for row in rows:
+            chunk = ChunkPreview.model_validate(row)
+            if preparation.paths and not any(
+                PurePosixPath(chunk.path).match(pattern) for pattern in preparation.paths
+            ):
+                continue
+            key = (
+                chunk.project_id,
+                chunk.path,
+                chunk.start_line,
+                chunk.end_line,
+                chunk.content if include_content_in_key else None,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(self._hit(chunk, names, float(row.get("_relevance_score", 0.0))))
+            if len(hits) == preparation.limit:
+                break
+        hits.sort(key=lambda hit: (-hit.score, hit.path, hit.start_line))
+        return hits
 
     def search_code(
         self,
@@ -172,78 +281,30 @@ class SearchService:
             raise CodeIndexingError(
                 ErrorCode.INVALID_FILTER, "Search requires a query and at least one project"
             )
-        limit = max(1, min(limit, 50))
-        conditions: list[str] = []
-        if languages:
-            conditions.append(self._in_condition("language", languages))
-        if kinds:
-            conditions.append(self._in_condition("kind", kinds))
-        pushed_paths = path_condition(paths) if paths else None
-        if pushed_paths is not None:
-            conditions.append(pushed_paths)
-        elif paths:
-            # Without a pushdown the Python filter below runs on rows the scan
-            # already truncated, so a low-ranking match can be missed. Widen the
-            # window to make that less likely and say so, rather than reporting a
-            # confident empty result.
-            logger.debug(
-                "Path patterns %r could not be pushed down; filtering %d fetched rows in "
-                "Python, so low-ranking matches may be missed",
-                paths,
-                _FALLBACK_FETCH_ROWS,
-            )
-        fetch = _FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5)
-        if partitions is None:
-            selected = {
-                project_id: [self.store.active_partition(project_id)] for project_id in project_ids
-            }
-        else:
-            selected = {
-                project_id: _as_partition_refs(refs) for project_id, refs in partitions.items()
-            }
-        if (
-            set(selected) != set(project_ids)
-            or any(
-                ref.project_id != project_id
-                for project_id, refs in selected.items()
-                for ref in refs
-            )
-            or any(not refs for refs in selected.values())
-        ):
-            raise ValueError("search partitions do not match the requested projects")
-        partition_ids = {
-            project_id: [ref.partition_id for ref in refs] for project_id, refs in selected.items()
-        }
+        preparation = self._prepare_search(
+            project_ids,
+            languages=languages,
+            paths=paths,
+            kinds=kinds,
+            limit=limit,
+            partitions=partitions,
+        )
         query_vector = self.embedder.embed_query(query)
-        condition = " AND ".join(conditions) if conditions else None
-        with self.store.partitions_access(selected):
+        with self.store.partitions_access(preparation.selected):
             rows = self.store.hybrid_search(
                 query,
                 query_vector,
                 project_ids,
-                condition,
-                fetch,
-                partition_ids=partition_ids,
+                preparation.condition,
+                preparation.fetch,
+                partition_ids=preparation.partition_ids,
             )
         names = {project.id: project.name for project in self.store.list_projects()}
-        hits: list[SearchHit] = []
-        seen: set[tuple[str, str, int, int, str | None]] = set()
-        for row in rows:
-            chunk = ChunkPreview.model_validate(row)
-            if paths and not any(PurePosixPath(chunk.path).match(pattern) for pattern in paths):
-                continue
-            # Requested checkouts may contain different source at one location.
-            # Collapse identical source only, retaining divergent versions.
-            key = (chunk.project_id, chunk.path, chunk.start_line, chunk.end_line, chunk.content)
-            if key in seen:
-                continue
-            seen.add(key)
-            hits.append(self._hit(chunk, names, float(row.get("_relevance_score", 0.0))))
-            if len(hits) == limit:
-                break
-        hits.sort(key=lambda hit: (-hit.score, hit.path, hit.start_line))
+        hits = self._collect_hits(rows, names, preparation, include_content_in_key=True)
         if hits:
-            hits = self._explain_hits(query, query_vector, hits, condition, selected)
+            hits = self._explain_hits(
+                query, query_vector, hits, preparation.condition, preparation.selected
+            )
         return SearchResponse(query=query, hits=hits)
 
     def search_by_example(
@@ -264,68 +325,25 @@ class SearchService:
                 ErrorCode.INVALID_FILTER, "Example search requires at least one project"
             )
         resolved_language, passages = _example_passages(self.extractor, example, language=language)
-        limit = max(1, min(limit, 50))
-        conditions: list[str] = []
-        if languages:
-            conditions.append(self._in_condition("language", languages))
-        if kinds:
-            conditions.append(self._in_condition("kind", kinds))
-        pushed_paths = path_condition(paths) if paths else None
-        if pushed_paths is not None:
-            conditions.append(pushed_paths)
-        elif paths:
-            logger.debug(
-                "Path patterns %r could not be pushed down; filtering %d fetched rows in "
-                "Python, so low-ranking matches may be missed",
-                paths,
-                _FALLBACK_FETCH_ROWS,
-            )
-        fetch = _FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5)
-        if partitions is None:
-            selected = {
-                project_id: [self.store.active_partition(project_id)] for project_id in project_ids
-            }
-        else:
-            selected = {
-                project_id: _as_partition_refs(refs) for project_id, refs in partitions.items()
-            }
-        if (
-            set(selected) != set(project_ids)
-            or any(
-                ref.project_id != project_id
-                for project_id, refs in selected.items()
-                for ref in refs
-            )
-            or any(not refs for refs in selected.values())
-        ):
-            raise ValueError("search partitions do not match the requested projects")
-        partition_ids = {
-            project_id: [ref.partition_id for ref in refs] for project_id, refs in selected.items()
-        }
+        preparation = self._prepare_search(
+            project_ids,
+            languages=languages,
+            paths=paths,
+            kinds=kinds,
+            limit=limit,
+            partitions=partitions,
+        )
         vectors = self.embedder.embed_passages(passages)
-        with self.store.partitions_access(selected):
+        with self.store.partitions_access(preparation.selected):
             rows = self.store.example_search(
                 vectors,
                 project_ids,
-                " AND ".join(conditions) if conditions else None,
-                fetch,
-                partition_ids=partition_ids,
+                preparation.condition,
+                preparation.fetch,
+                partition_ids=preparation.partition_ids,
             )
         names = {project.id: project.name for project in self.store.list_projects()}
-        hits: list[SearchHit] = []
-        seen: set[tuple[str, str, int, int]] = set()
-        for row in rows:
-            chunk = ChunkPreview.model_validate(row)
-            if paths and not any(PurePosixPath(chunk.path).match(pattern) for pattern in paths):
-                continue
-            key = (chunk.project_id, chunk.path, chunk.start_line, chunk.end_line)
-            if key in seen:
-                continue
-            seen.add(key)
-            hits.append(self._hit(chunk, names, float(row.get("_relevance_score", 0.0))))
-            if len(hits) == limit:
-                break
-        hits.sort(key=lambda hit: (-hit.score, hit.path, hit.start_line))
+        hits = self._collect_hits(rows, names, preparation, include_content_in_key=False)
         return ExampleSearchResponse(
             language=resolved_language,
             segments=len(passages),
@@ -456,7 +474,7 @@ class SearchService:
         return f"{column} IN ({', '.join(_quoted(value) for value in values)})"
 
     @staticmethod
-    def _hit(chunk: ChunkPreview, names: dict[str, str], score: float) -> SearchHit:
+    def _hit(chunk: ChunkPreview, names: Mapping[str, str], score: float) -> SearchHit:
         snippet = chunk.content[:4_000]
         return SearchHit(
             chunk_id=chunk.chunk_id,

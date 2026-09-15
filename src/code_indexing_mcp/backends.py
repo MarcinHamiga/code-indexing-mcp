@@ -161,6 +161,19 @@ MLX_PROVIDER = "MlxMetalBackend"
 # for two of them its ONNX Runtime distribution would conflict with theirs.
 DIRECT_MODEL_ACCELERATORS = frozenset({Accelerator.WEBGPU, Accelerator.MIGRAPHX, Accelerator.MLX})
 
+
+def provider_resolution_error(descriptor: BackendDescriptor, resolved: Sequence[str]) -> str | None:
+    """Return the shared validation failure for a loaded backend session."""
+
+    if resolved and descriptor.provider not in resolved:
+        return f"{descriptor.provider} was requested but the session runs on {', '.join(resolved)}"
+    if not resolved and descriptor.uses_direct_model:
+        return (
+            f"the direct session reported no providers, so {descriptor.provider} cannot be verified"
+        )
+    return None
+
+
 CPU_BACKEND = BackendDescriptor(
     accelerator=Accelerator.CPU,
     provider=CPU_PROVIDER,

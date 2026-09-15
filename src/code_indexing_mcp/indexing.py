@@ -805,17 +805,7 @@ class Indexer:
         def staging_job() -> StagingJob:
             nonlocal job
             if job is None:
-                job = StagingJob(
-                    self.staging_directory,
-                    project.id,
-                    file_schema=LanceStore.file_arrow_schema(),
-                    chunk_schema=LanceStore.chunk_arrow_schema(
-                        self.store.vector_dimension, self.store.vector_dtype
-                    ),
-                    reference_schema=LanceStore.reference_arrow_schema(),
-                    partition=partition,
-                )
-                job.begin()
+                job = self._new_staging_job(project, partition)
             return job
 
         try:
@@ -831,6 +821,7 @@ class Indexer:
                     phase="extracting_references",
                     candidates_seen=files_checked,
                     eligible_files=len(existing),
+                    changed_files=files_backfilled,
                     current_path=record.path,
                 )
                 if record.has_errors:
@@ -932,6 +923,7 @@ class Indexer:
                 candidates_seen=files_checked,
                 candidates_total=files_checked,
                 eligible_files=len(existing),
+                changed_files=files_backfilled,
                 current_path=None,
                 force=True,
             )
@@ -1150,18 +1142,28 @@ class Indexer:
         if state.job is None:
             if state.partition is None:
                 raise RuntimeError("index scan has no pinned partition")
-            state.job = StagingJob(
-                self.staging_directory,
-                project.id,
-                file_schema=LanceStore.file_arrow_schema(),
-                chunk_schema=LanceStore.chunk_arrow_schema(
-                    self.store.vector_dimension, self.store.vector_dtype
-                ),
-                reference_schema=LanceStore.reference_arrow_schema(),
-                partition=state.partition,
-            )
-            state.job.begin()
+            state.job = self._new_staging_job(project, state.partition)
         return state.job
+
+    def _new_staging_job(self, project: ProjectInfo, partition: PartitionRef) -> StagingJob:
+        """Construct and begin a staging job, cleaning it up if begin fails."""
+        job = StagingJob(
+            self.staging_directory,
+            project.id,
+            file_schema=LanceStore.file_arrow_schema(),
+            chunk_schema=LanceStore.chunk_arrow_schema(
+                self.store.vector_dimension, self.store.vector_dtype
+            ),
+            reference_schema=LanceStore.reference_arrow_schema(),
+            partition=partition,
+        )
+        try:
+            job.begin()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                job.discard()
+            raise
+        return job
 
     def _stage_file_failure(
         self,
@@ -1228,7 +1230,6 @@ class Indexer:
                 finally:
                     state.sample_memory(process)
             state.fallback_count += retries
-            progress.update(phase="embedding")
             staged_rows: dict[int, list[ChunkRow]] = {}
             for candidate, segments in succeeded:
                 target = state.pending[candidate.owner]
@@ -1252,6 +1253,23 @@ class Indexer:
                     self._staging_job(project, state).stage_chunks(rows)
                     state.chunks_staged += len(rows)
                     state.staged_bytes += sum(len(row.content.encode("utf-8")) for row in rows)
+            # Publish the running totals after every group, not only when the
+            # flush ends: embedding is the longest phase, and a counter-less
+            # update leaves TTY and log watchers staring at a frozen line.
+            # state.embedded only lands at the end of the flush, so add what
+            # this flush has banked so far. Files that already failed are
+            # excluded, matching the end-of-flush total (a file tripping the
+            # growth check below can still nudge one update above it).
+            progress.update(
+                phase="embedding",
+                changed_files=state.indexed,
+                chunks_embedded=state.embedded
+                + sum(target.embedded_chunks for target in state.pending if target.error is None),
+                chunks_staged=state.chunks_staged,
+                staged_bytes=state.staged_bytes,
+                current_path=state.pending[active[0].owner].record.path,
+                force=True,
+            )
 
         with timer.measure("commit"):
             for target in state.pending:
@@ -1530,10 +1548,14 @@ class Indexer:
                 candidates_total=state.candidates_seen,
                 eligible_files=len(state.current_paths),
                 unchanged_files=state.unchanged,
+                changed_files=state.indexed,
                 parsed_files=state.parsed,
                 failed_files=len(state.errors),
                 bytes_read=state.bytes_read,
                 chunks_extracted=state.chunks_extracted,
+                chunks_embedded=state.embedded,
+                chunks_staged=state.chunks_staged,
+                staged_bytes=state.staged_bytes,
                 skipped_total=state.skipped,
                 skipped_by_reason=state.skipped_by_reason,
                 current_path=None,
@@ -1701,9 +1723,7 @@ class Indexer:
                 PassageCandidate(candidate.chunk.embedding_prefix, candidate.chunk.content)
                 for candidate in candidates
             ]
-            hits, miss_indices = passage_reuse.lookup(
-                planned_candidates, self.segment_plan, producer=passage_embedder
-            )
+            hits, miss_indices = passage_reuse.lookup(planned_candidates, self.segment_plan)
             if not miss_indices:
                 return [(candidates[index], hits[index]) for index in range(len(candidates))], [], 0
             misses = [candidates[index] for index in miss_indices]

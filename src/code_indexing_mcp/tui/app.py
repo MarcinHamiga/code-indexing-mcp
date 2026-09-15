@@ -974,15 +974,8 @@ class CodeIndexingApp(App[int]):
         self.screen_stack[0].query_one("#detail-title", Label).update(
             f"Outline: {outline.path} ({len(outline.items)} items)"
         )
-        text = Text()
-        text.append(f"File Outline for {outline.path}\n\n", style="bold underline")
-        if not outline.items:
-            text.append("No outline symbols discovered in this file.", style="dim")
         entries: list[tuple[Text, SourceLocation]] = []
         for item in outline.items:
-            text.append(f"  L{item.start_line:4d}-{item.end_line:4d} ", style="dim")
-            text.append(f"{item.kind:<12} ", style="yellow")
-            text.append(f"{item.qualified_symbol}\n", style="green bold")
             entries.append(
                 (
                     Text(f"{item.qualified_symbol}  · {item.kind}  · L{item.start_line}"),
@@ -996,13 +989,14 @@ class CodeIndexingApp(App[int]):
                     ),
                 )
             )
-
+        if entries:
+            text = Text("Select a declaration and press Enter to open its source.\n")
+        else:
+            text = Text()
+            text.append(f"File Outline for {outline.path}\n\n", style="bold underline")
+            text.append("No outline symbols discovered in this file.", style="dim")
         self.screen_stack[0].query_one("#detail-content", Static).update(text)
         self._set_detail_entries(entries)
-        if entries:
-            self.screen_stack[0].query_one("#detail-content", Static).update(
-                "Select a declaration and press Enter to open its source."
-            )
         self._set_status(f"Loaded outline with {len(outline.items)} items.")
 
     def _render_references(self, refs: ReferenceResponse) -> None:
@@ -1010,27 +1004,23 @@ class CodeIndexingApp(App[int]):
         self.screen_stack[0].query_one("#detail-title", Label).update(
             f"References: {target_name} ({len(refs.hits)} hits)"
         )
-        text = Text()
-        text.append(
-            f"References to declaration in {refs.selected.path}\n\n",
-            style="bold underline",
-        )
-        if not refs.hits:
-            text.append("No references found for this declaration.", style="dim")
         entries: list[tuple[Text, SourceLocation]] = []
         for hit in refs.hits:
-            text.append(f"  {hit.path}:{hit.start_line} ", style="cyan bold")
-            text.append(f"[{hit.resolution}] ", style="magenta")
-            text.append(f"{hit.snippet.strip()}\n", style="white")
             entries.append(
                 (
                     Text(f"{hit.path}:{hit.start_line}  [{hit.resolution}]\n{hit.snippet.strip()}"),
                     SourceLocation(hit.path, hit.start_line, hit.end_line, language=hit.language),
                 )
             )
-
         if entries:
             text = Text("Select a reference and press Enter to open its source.\n")
+        else:
+            text = Text()
+            text.append(
+                f"References to declaration in {refs.selected.path}\n\n",
+                style="bold underline",
+            )
+            text.append("No references found for this declaration.", style="dim")
         if refs.cursor:
             text.append("More references exist beyond the displayed limit.\n", style="yellow")
         if refs.limitations:
@@ -1048,20 +1038,10 @@ class CodeIndexingApp(App[int]):
             f"({len(impact.layers)} layers, {impact.visited} visited)"
         )
         self.screen_stack[0].query_one("#detail-title", Label).update(title_text)
-        text = Text()
-        text.append(
-            f"Impact Radius for {impact.selected.path} (visited: {impact.visited})\n\n",
-            style="bold underline",
-        )
-        if not impact.layers:
-            text.append("No downstream impact detected within search depth.", style="dim")
         entries: list[tuple[Text, SourceLocation]] = []
         for layer in impact.layers:
-            text.append(f"Depth {layer.depth}:\n", style="yellow bold")
             for edge in layer.edges:
                 kinds = ", ".join(edge.kinds)
-                text.append(f"  -> {edge.target.path} ", style="cyan")
-                text.append(f"({kinds})\n", style="dim")
                 target = edge.target
                 entries.append(
                     (
@@ -1083,6 +1063,19 @@ class CodeIndexingApp(App[int]):
 
         if entries:
             text = Text("Select a dependent declaration and press Enter to open its source.\n")
+        else:
+            text = Text()
+            text.append(
+                f"Impact Radius for {impact.selected.path} (visited: {impact.visited})\n\n",
+                style="bold underline",
+            )
+            if not impact.layers:
+                text.append("No downstream impact detected within search depth.\n", style="dim")
+            for layer in impact.layers:
+                text.append(f"Depth {layer.depth}:\n", style="yellow bold")
+                for edge in layer.edges:
+                    text.append(f"  -> {edge.target.path} ", style="cyan")
+                    text.append(f"({', '.join(edge.kinds)})\n", style="dim")
         text.append("What depends on this declaration? Search depth: 2.\n")
         if impact.budget_exhausted:
             text.append("Analysis budget reached; results are incomplete.\n", style="yellow")

@@ -40,6 +40,12 @@ def _fake_worker(connection: Connection, _: WorkerConfig) -> None:
         connection.send(("ok", vectors))
 
 
+def _unexpected_status_worker(connection: Connection, _: WorkerConfig) -> None:
+    command, _payload = connection.recv()
+    if command != "stop":
+        connection.send(("unexpected_status", []))
+
+
 class _ToListOnlyVector:
     """A model row exposing only ``tolist()``, which the contract permits."""
 
@@ -97,6 +103,15 @@ def test_embedding_worker_round_trips_vectors_and_stops() -> None:
     assert vectors == [[1.0, 1.0, 2.0, 3.0], [4.0, 1.0, 2.0, 3.0]]
     assert pid is not None
     assert session.pid is None
+
+
+def test_unknown_worker_reply_status_is_a_protocol_failure() -> None:
+    session = _session(_unexpected_status_worker, 2 * 1024**3)
+    with session, pytest.raises(CodeIndexingError, match="unknown reply status") as caught:
+        session.embed_passages(["text"])
+
+    assert caught.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
+    assert session.termination_reason == "worker_protocol_error"
 
 
 def test_embedding_worker_refuses_unsafe_effective_budget() -> None:
@@ -832,3 +847,24 @@ def test_timed_out_worker_reaps_its_transfer_thread_before_restart() -> None:
         assert session.embed_passages(["text"]) == [[0.0, 1.0, 2.0, 3.0]]
         assert session._transfer is None
         assert session.spawn_count == 2
+
+
+def test_model_load_and_inference_deadlines_can_be_configured_separately() -> None:
+    session = EmbeddingWorkerSession(
+        WorkerConfig(
+            cache_directory="unused",
+            offline=True,
+            threads=1,
+            enable_cpu_mem_arena=False,
+            dimension=4,
+        ),
+        effective_ceiling_bytes=2 * 1024**3,
+        target=_slow_worker,
+        model_load_timeout_seconds=0.05,
+        inference_timeout_seconds=1.0,
+    )
+
+    with session, pytest.raises(CodeIndexingError, match="response deadline") as caught:
+        session.initialize()
+
+    assert caught.value.details["command"] == "initialize"

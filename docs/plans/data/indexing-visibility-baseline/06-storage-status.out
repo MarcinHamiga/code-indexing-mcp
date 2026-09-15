@@ -1,0 +1,328 @@
+{
+  "consistent": true,
+  "overlap_warnings": [],
+  "physical_bytes_total": 984350,
+  "projects": [
+    {
+      "consistent": true,
+      "partition_open_failed": false,
+      "partition_physical_bytes": 938775,
+      "project": {
+        "id": "64415005-c5d9-46fc-a125-d4236822eb98",
+        "name": "repo",
+        "root": "/private/tmp/iv/repo",
+        "scan": {
+          "exclude": [],
+          "include": [
+            "**/*.py",
+            "**/*.pyi",
+            "**/*.js",
+            "**/*.jsx",
+            "**/*.mjs",
+            "**/*.cjs",
+            "**/*.ts",
+            "**/*.tsx",
+            "**/*.mts",
+            "**/*.cts",
+            "**/*.java",
+            "**/*.cs",
+            "**/*.csx",
+            "**/*.gd",
+            "**/*.gdshader",
+            "**/*.gdshaderinc",
+            "**/*.tres",
+            "**/*.tscn",
+            "**/*.godot",
+            "**/*.sql",
+            "**/*.yaml",
+            "**/*.yml",
+            "**/*.json",
+            "**/*.go",
+            "**/*.tf",
+            "**/*.tfvars",
+            "**/*.rs",
+            "**/*.c",
+            "**/*.h",
+            "**/*.cc",
+            "**/*.cpp",
+            "**/*.cxx",
+            "**/*.hh",
+            "**/*.hpp",
+            "**/*.hxx",
+            "**/*.lua"
+          ],
+          "max_file_bytes": 1048576
+        },
+        "version": 1
+      },
+      "slots": [
+        {
+          "active": true,
+          "indexed_clean": null,
+          "indexed_head": null,
+          "last_used_at": 1789390203484985000,
+          "partition_id": "64415005-c5d9-46fc-a125-d4236822eb98",
+          "physical_bytes": 938775,
+          "selector_kind": "workspace",
+          "selector_value": "/private/tmp/iv/repo",
+          "slot_id": "00f2bb599e31e4bbaabe0bf4bc90a94b3fd2866141be14b3c7a7b4144a8bd22d",
+          "state": "ready"
+        }
+      ],
+      "snapshot_at": "2026-09-14T12:50:03.505622+00:00",
+      "tables": [
+        {
+          "current_version": 2,
+          "fragment_stats": {
+            "lengths": {
+              "max": 150,
+              "mean": 150.0,
+              "min": 150,
+              "p25": 150,
+              "p50": 150,
+              "p75": 150,
+              "p99": 150
+            },
+            "num_fragments": 1,
+            "num_small_fragments": 1
+          },
+          "indexes": [],
+          "logical_bytes": 26088,
+          "name": "files",
+          "newest_version_at": "2026-09-14T14:49:59.319371",
+          "oldest_version_at": "2026-09-14T14:49:59.202838",
+          "physical_bytes": 30937,
+          "retained_version_count": 2,
+          "row_count": 150
+        },
+        {
+          "current_version": 10,
+          "fragment_stats": {
+            "lengths": {
+              "max": 128,
+              "mean": 100.0,
+              "min": 44,
+              "p25": 44,
+              "p50": 128,
+              "p75": 128,
+              "p99": 128
+            },
+            "num_fragments": 3,
+            "num_small_fragments": 3
+          },
+          "indexes": [
+            {
+              "columns": [
+                "content"
+              ],
+              "index_type": "FTS",
+              "indexed_rows": 300,
+              "name": "content_idx",
+              "size_bytes": 13113,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "file_id"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 300,
+              "name": "file_id_idx",
+              "size_bytes": 15374,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "identifier_terms"
+              ],
+              "index_type": "FTS",
+              "indexed_rows": 300,
+              "name": "identifier_terms_idx",
+              "size_bytes": 17155,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "language"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 300,
+              "name": "language_idx",
+              "size_bytes": 4353,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "path"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 300,
+              "name": "path_idx",
+              "size_bytes": 7758,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "symbol"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 300,
+              "name": "symbol_idx",
+              "size_bytes": 8247,
+              "unindexed_rows": 0
+            }
+          ],
+          "logical_bytes": 559540,
+          "name": "chunks",
+          "newest_version_at": "2026-09-14T14:49:59.343920",
+          "oldest_version_at": "2026-09-14T14:49:59.204133",
+          "physical_bytes": 659248,
+          "retained_version_count": 10,
+          "row_count": 300
+        },
+        {
+          "current_version": 13,
+          "fragment_stats": {
+            "lengths": {
+              "max": 256,
+              "mean": 200.0,
+              "min": 88,
+              "p25": 88,
+              "p50": 256,
+              "p75": 256,
+              "p99": 256
+            },
+            "num_fragments": 3,
+            "num_small_fragments": 3
+          },
+          "indexes": [
+            {
+              "columns": [
+                "file_id"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 600,
+              "name": "file_id_idx",
+              "size_bytes": 17358,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "kind"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 600,
+              "name": "kind_idx",
+              "size_bytes": 6330,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "module_path"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 600,
+              "name": "module_path_idx",
+              "size_bytes": 5805,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "receiver_text"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 600,
+              "name": "receiver_text_idx",
+              "size_bytes": 5805,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "record_kind"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 600,
+              "name": "record_kind_idx",
+              "size_bytes": 6347,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "schema_version"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 600,
+              "name": "schema_version_idx",
+              "size_bytes": 6257,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "source_qualified_symbol"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 600,
+              "name": "source_qualified_symbol_idx",
+              "size_bytes": 12837,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "target_name"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 600,
+              "name": "target_name_idx",
+              "size_bytes": 11557,
+              "unindexed_rows": 0
+            },
+            {
+              "columns": [
+                "written_name"
+              ],
+              "index_type": "BTree",
+              "indexed_rows": 600,
+              "name": "written_name_idx",
+              "size_bytes": 11557,
+              "unindexed_rows": 0
+            }
+          ],
+          "logical_bytes": 117304,
+          "name": "references",
+          "newest_version_at": "2026-09-14T14:49:59.363080",
+          "oldest_version_at": "2026-09-14T14:49:59.205265",
+          "physical_bytes": 247576,
+          "retained_version_count": 13,
+          "row_count": 600
+        }
+      ]
+    }
+  ],
+  "registry": {
+    "current_version": 4,
+    "fragment_stats": {
+      "lengths": {
+        "max": 1,
+        "mean": 1.0,
+        "min": 1,
+        "p25": 1,
+        "p50": 1,
+        "p75": 1,
+        "p99": 1
+      },
+      "num_fragments": 1,
+      "num_small_fragments": 1
+    },
+    "indexes": [],
+    "logical_bytes": 837,
+    "name": "projects",
+    "newest_version_at": "2026-09-14T14:49:59.373591",
+    "oldest_version_at": "2026-09-14T14:49:51.302403",
+    "physical_bytes": 45575,
+    "retained_version_count": 4,
+    "row_count": 1
+  },
+  "schema_version": 2,
+  "snapshot_at": "2026-09-14T12:50:03.485008+00:00",
+  "worktree_warnings": []
+}

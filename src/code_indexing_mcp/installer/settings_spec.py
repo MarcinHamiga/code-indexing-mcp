@@ -16,10 +16,9 @@ from typing import Literal
 import psutil
 from platformdirs import user_cache_path, user_data_path
 
-SettingType = Literal["bool", "int", "choice", "path", "auto_int", "auto_off_int"]
+from ..settings import FALSE_VALUES, LEGACY_OFFLINE_TRUE_VALUES, TRUE_VALUES
 
-_TRUE = {"1", "true", "yes", "on"}
-_FALSE = {"0", "false", "no", "off"}
+SettingType = Literal["bool", "int", "choice", "path", "auto_int", "auto_off_int"]
 
 
 @dataclass(frozen=True)
@@ -291,14 +290,14 @@ def as_bool(raw: str) -> bool:
     every spelling the server accepts has to render as the same checkbox state.
     """
 
-    return raw.strip().lower() in _TRUE
+    return raw.strip().lower() in TRUE_VALUES
 
 
 def validate(setting: Setting, raw: str) -> str | None:
     """Return an error message, or None when ``raw`` is acceptable."""
     value = raw.strip()
     if setting.type == "bool":
-        if value.lower() in _TRUE | _FALSE:
+        if value.lower() in TRUE_VALUES | FALSE_VALUES:
             return None
         return f"{setting.name} expects a boolean (1/0, true/false, yes/no, on/off)"
     if setting.type == "path":
@@ -331,7 +330,9 @@ def normalize(setting: Setting, raw: str) -> str:
     """Canonical string form for storage in a harness env block."""
     value = raw.strip()
     if setting.type == "bool":
-        return "1" if value.lower() in _TRUE else "0"
+        if setting.name == "CODE_INDEXING_OFFLINE":
+            return "1" if value.lower() in LEGACY_OFFLINE_TRUE_VALUES else "0"
+        return "1" if value.lower() in TRUE_VALUES else "0"
     if setting.type == "path":
         # A leading tilde is the one thing worth rewriting: no shell is left to
         # expand it. Everything else is stored exactly as typed, separators
