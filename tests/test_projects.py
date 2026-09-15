@@ -16,6 +16,7 @@ from code_indexing_mcp.models import (
 from code_indexing_mcp.projects import (
     ProjectResolver,
     find_project_root,
+    initialize_checkout,
     initialize_project,
     project_root_identity,
     read_project_marker,
@@ -168,6 +169,73 @@ def test_resolver_prefers_explicit_project(tmp_path: Path) -> None:
 
     assert resolver.resolve(explicit=two.id, roots=[one_root], cwd=one_root) == two
     assert resolver.resolve(explicit=str(two_root), roots=[one_root], cwd=one_root) == two
+
+
+@pytest.mark.parametrize("select_worktree", [False, True])
+@pytest.mark.parametrize("context", ["roots", "cwd"])
+@pytest.mark.parametrize("path_form", ["absolute", "relative", "nested"])
+def test_explicit_checkout_path_wins_over_ambient_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    select_worktree: bool,
+    context: str,
+    path_form: str,
+) -> None:
+    main = tmp_path / "main"
+    worktree = tmp_path / "worktree"
+    main.mkdir()
+    worktree.mkdir()
+    project = initialize_project(main)
+    initialize_checkout(worktree, project)
+    selected, ambient = (worktree, main) if select_worktree else (main, worktree)
+    candidate = selected
+    if path_form == "nested":
+        candidate = selected / "src"
+        candidate.mkdir()
+    monkeypatch.chdir(tmp_path)
+    explicit = f"./{candidate.relative_to(tmp_path)}" if path_form == "relative" else str(candidate)
+
+    resolved = ProjectResolver([project]).resolve(
+        explicit=explicit, roots=[ambient] if context == "roots" else [], cwd=ambient
+    )
+
+    assert resolved.id == project.id
+    assert resolved.root == selected.resolve()
+
+
+@pytest.mark.parametrize("select_worktree", [False, True])
+@pytest.mark.parametrize("selector_kind", ["id", "name", "implicit"])
+def test_registration_selection_follows_client_root_before_cwd(
+    tmp_path: Path, select_worktree: bool, selector_kind: str
+) -> None:
+    main = tmp_path / "main"
+    worktree = tmp_path / "worktree"
+    main.mkdir()
+    worktree.mkdir()
+    project = initialize_project(main)
+    initialize_checkout(worktree, project)
+    selected, ambient = (worktree, main) if select_worktree else (main, worktree)
+    explicit = {"id": project.id, "name": project.name, "implicit": None}[selector_kind]
+    resolver = ProjectResolver([project])
+
+    assert resolver.resolve(explicit=explicit, roots=[selected], cwd=ambient).root == selected
+    assert resolver.resolve(explicit=explicit, cwd=selected).root == selected
+
+
+def test_implicit_scope_keeps_both_checkouts_of_one_registration(tmp_path: Path) -> None:
+    main = tmp_path / "main"
+    worktree = tmp_path / "worktree"
+    main.mkdir()
+    worktree.mkdir()
+    project = initialize_project(main)
+    initialize_checkout(worktree, project)
+
+    scope = ProjectResolver([project]).resolve_scope(roots=[main, worktree, main])
+
+    assert [(item.id, item.root) for item in scope] == [
+        (project.id, main),
+        (project.id, worktree),
+    ]
 
 
 def test_resolver_uses_single_marked_root_then_cwd(tmp_path: Path) -> None:

@@ -310,6 +310,7 @@ class ProjectResolver:
         explicit: str | None = None,
         roots: Iterable[Path] = (),
         cwd: Path | None = None,
+        all_checkouts: bool = False,
     ) -> list[ProjectInfo]:
         """Resolve the checkouts a request is scoped to.
 
@@ -318,9 +319,23 @@ class ProjectResolver:
         when one exists (the marker under an MCP root or *cwd*), and they may
         repeat a project id once per live checkout so callers can search
         every requested branch slot together.
+
+        An explicit path selects only its checkout. IDs and names follow the
+        requesting checkout; with *all_checkouts*, they select every matching
+        client root. ID/name matches take precedence over relative paths.
         """
         if explicit:
-            project = self._resolve_explicit(explicit)
+            project, is_path = self._resolve_explicit(explicit)
+            if is_path:
+                return [project]
+            if all_checkouts:
+                marked = [
+                    checkout
+                    for checkout in self._marked_checkouts(roots)
+                    if checkout.id == project.id
+                ]
+                if marked:
+                    return marked
             return [self._bind_checkout(project, roots=roots, cwd=cwd)]
 
         marked = self._marked_checkouts(roots)
@@ -342,14 +357,15 @@ class ProjectResolver:
             searched_roots=[str(root) for root in roots],
         )
 
-    def _resolve_explicit(self, explicit: str) -> ProjectInfo:
+    def _resolve_explicit(self, explicit: str) -> tuple[ProjectInfo, bool]:
+        """Return the project and whether the selector explicitly names a path."""
         direct = [
             project
             for project in self._projects
             if project.id == explicit or project.name == explicit
         ]
         if len(direct) == 1:
-            return direct[0]
+            return direct[0], False
         if len(direct) > 1:
             raise CodeIndexingError(
                 ErrorCode.AMBIGUOUS_PROJECT,
@@ -360,7 +376,7 @@ class ProjectResolver:
         if candidate.exists():
             root = find_project_root(candidate)
             if root is not None:
-                return self._by_root_or_marker(root)
+                return self._by_root_or_marker(root), True
         raise CodeIndexingError(ErrorCode.PROJECT_NOT_FOUND, f"Unknown project: {explicit}")
 
     def _bind_checkout(
@@ -397,8 +413,10 @@ class ProjectResolver:
                 marker = read_project_marker(marker_root)
             except CodeIndexingError:
                 continue
-            if marker.id == project.id and not same_project_root(marker.root, project.root):
-                return marker
+            if marker.id == project.id:
+                # A matching canonical root wins over cwd too, but keeps the
+                # registered payload (including updated scan configuration).
+                return project if same_project_root(marker.root, project.root) else marker
         return project
 
     @staticmethod
