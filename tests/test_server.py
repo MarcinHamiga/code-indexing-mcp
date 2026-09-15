@@ -853,6 +853,245 @@ async def test_mcp_explicit_checkout_path_wins_over_client_root(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selector_kind", ["path", "id"])
+@pytest.mark.parametrize(
+    "query_tool",
+    [
+        "search_code",
+        "all_projects",
+        "search_by_example",
+        "search_across_projects",
+        "find_symbol",
+        "file_outline",
+        "find_references",
+        "impact_radius",
+        "analyze_refactor",
+        "emit_refactor_patch",
+        "dead_code_report",
+        "project_status",
+        "index_history",
+        "inspect_scan",
+        "index_project",
+    ],
+)
+async def test_explicit_query_ignores_ambiguous_client_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, query_tool: str, selector_kind: str
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root, force_new_id=True)
+    split = app.init_project(worktree, force_new_id=True)
+    app.index_project(project.id)
+    chunk_id = app.find_symbol("main_branch", project.id).hits[0].chunk_id
+    third = tmp_path / "third"
+    run_git("worktree", "add", "-q", "--detach", str(third), cwd=root)
+    selected = str(root) if selector_kind == "path" else project.id
+    declaration = (
+        {"project": selected, "path": "main.py", "qualified_symbol": "main_branch"}
+        if selector_kind == "path"
+        else {"chunk_id": chunk_id}
+    )
+    arguments = {
+        "search_code": {"query": "return", "projects": [selected]},
+        "all_projects": {"query": "return", "all_projects": True},
+        "search_by_example": {
+            "example": "def branch():\n    return 1\n",
+            "language": "python",
+            "projects": [selected],
+        },
+        "search_across_projects": {"query": "return", "projects": [selected, split.id]},
+        "find_symbol": {"name": "main_branch", "project": selected},
+        "file_outline": {"path": "main.py", "project": selected},
+        "find_references": {"selector": declaration},
+        "impact_radius": {"selector": declaration},
+        "analyze_refactor": {
+            "selector": declaration,
+            "operation": {"kind": "rename", "new_name": "renamed_branch"},
+        },
+        "emit_refactor_patch": {
+            "selector": declaration,
+            "operation": {"kind": "rename", "new_name": "renamed_branch"},
+        },
+        "dead_code_report": {"project": selected},
+        "project_status": {"project": selected},
+        "index_history": {"project": selected},
+        "inspect_scan": {"project": selected},
+        "index_project": {"project": selected},
+    }[query_tool]
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=third.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        create_server(app), list_roots_callback=list_roots
+    ) as client:
+        tool = "search_code" if query_tool == "all_projects" else query_tool
+        result = await client.call_tool(tool, arguments)
+
+    assert not result.isError, result.content
+    assert result.structuredContent is not None
+    if query_tool in {"search_code", "search_by_example", "find_symbol"}:
+        assert [hit["symbol"] for hit in result.structuredContent["hits"]] == ["main_branch"]
+    assert not (third / ".ci-mcp" / "project.toml").exists()
+    assert {item.id for item in app.list_projects()} == {project.id, split.id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested_root", [False, True])
+async def test_explicit_query_propagates_selected_discovery_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nested_root: bool
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, _ = _git_repo_with_worktree(tmp_path)
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    app.index_project(project.id)
+    advertised = root / "src" if nested_root else root
+    advertised.mkdir(exist_ok=True)
+
+    def fail_discovery(root: Path) -> None:
+        raise CodeIndexingError(ErrorCode.PROJECT_ID_CONFLICT, "Selected checkout failed discovery")
+
+    monkeypatch.setattr(app, "discover_project", fail_discovery)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=advertised.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        create_server(app), list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "find_symbol", {"name": "main_branch", "project": project.id}
+        )
+
+    assert result.isError
+    assert "Selected checkout failed discovery" in str(result.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_root_first", [False, True])
+async def test_worktree_chunk_query_ignores_ambiguous_client_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_root_first: bool
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    assert app.init_project(worktree).id == project.id
+    split = tmp_path / "split"
+    third = tmp_path / "third"
+    for checkout in [split, third]:
+        run_git("worktree", "add", "-q", "--detach", str(checkout), cwd=root)
+    app.init_project(split, force_new_id=True)
+    for checkout in [root, worktree]:
+        app.index_project(str(checkout))
+    chunk_id = app.find_symbol("worktree_branch", str(worktree)).hits[0].chunk_id
+    app.cwd = root
+    roots = [third, worktree] if failed_root_first else [worktree, third]
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(
+            roots=[types.Root(uri=checkout.as_uri()) for checkout in roots]
+        )
+
+    async with create_connected_server_and_client_session(
+        create_server(app), list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool("find_references", {"selector": {"chunk_id": chunk_id}})
+
+    assert not result.isError, result.content
+    assert result.structuredContent is not None
+    assert result.structuredContent["selected"]["symbol"] == "worktree_branch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scope",
+    ["implicit", "path", "nested_path", "missing", "conflicting", "bad_chunk", "unknown_chunk"],
+)
+async def test_query_errors_with_ambiguous_client_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = _tiny_application(tmp_path)
+    for checkout in [root, worktree]:
+        app.init_project(checkout, force_new_id=True)
+    third = tmp_path / "third"
+    run_git("worktree", "add", "-q", "--detach", str(third), cwd=root)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=third.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        create_server(app), list_roots_callback=list_roots
+    ) as client:
+        tool, arguments, expected = {
+            "implicit": ("find_symbol", {"name": "main_branch"}, "AMBIGUOUS_PROJECT"),
+            "path": (
+                "find_symbol",
+                {"name": "main_branch", "project": str(third)},
+                "AMBIGUOUS_PROJECT",
+            ),
+            "nested_path": (
+                "find_symbol",
+                {"name": "main_branch", "project": str(third / "main.py")},
+                "AMBIGUOUS_PROJECT",
+            ),
+            "missing": (
+                "find_symbol",
+                {"name": "main_branch", "project": "missing-project"},
+                "PROJECT_NOT_FOUND",
+            ),
+            "conflicting": (
+                "search_code",
+                {"query": "return", "projects": [str(root)], "all_projects": True},
+                "INVALID_FILTER",
+            ),
+            "bad_chunk": (
+                "find_references",
+                {"selector": {"chunk_id": app.list_projects()[0].id + ":"}},
+                "CHUNK_NOT_FOUND",
+            ),
+            "unknown_chunk": (
+                "find_references",
+                {"selector": {"chunk_id": "missing-project:deadbeef"}},
+                "CHUNK_NOT_FOUND",
+            ),
+        }[scope]
+        result = await client.call_tool(tool, arguments)
+
+    assert result.isError
+    assert expected in str(result.content)
+    assert not (third / ".ci-mcp" / "project.toml").exists()
+
+
+@pytest.mark.asyncio
+async def test_explicit_id_discovers_matching_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=worktree.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        create_server(app), list_roots_callback=list_roots
+    ) as client:
+        result = await client.call_tool(
+            "search_code", {"query": "return", "projects": [project.id]}
+        )
+
+    assert not result.isError, result.content
+    assert result.structuredContent is not None
+    assert [hit["symbol"] for hit in result.structuredContent["hits"]] == ["worktree_branch"]
+
+
+@pytest.mark.asyncio
 async def test_mcp_explicit_legacy_migration_preserves_the_survivor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

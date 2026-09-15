@@ -54,7 +54,7 @@ from .models import (
     StorageStatus,
     SymbolResponse,
 )
-from .projects import same_project_root
+from .projects import find_project_root, rooted_under, same_project_root
 from .reference_service import validate_patch_request
 from .settings import IndexMode, IndexSettings
 
@@ -116,6 +116,16 @@ def _unique_project_roots(roots: Iterable[Path]) -> list[Path]:
         if not any(same_project_root(resolved, existing) for existing in unique):
             unique.append(resolved)
     return unique
+
+
+def _selected_project_roots(roots: list[Path], projects: list[ProjectInfo]) -> list[Path]:
+    """Include advertised subdirectories only when their checkout is selected."""
+    selected = [project.root for project in projects]
+    for root in roots:
+        checkout = find_project_root(root) or root
+        if any(same_project_root(checkout, candidate) for candidate in selected):
+            selected.append(root)
+    return _unique_project_roots(selected)
 
 
 @dataclass
@@ -697,7 +707,7 @@ async def _prepare_startup_projects(
     # every requested slot, so every one of them is freshness-checked here,
     # each against its own checkout root rather than the registration's
     # canonical one.
-    selected_roots = _unique_project_roots([*roots, *(project.root for project in projects)])
+    selected_roots = _selected_project_roots(roots, projects)
     statuses = await asyncio.gather(
         *(
             asyncio.to_thread(
@@ -940,6 +950,72 @@ def create_server(
     )
     mcp = AutoIndexingMCP(app, mode=mode, wait_seconds=settings.index_wait_seconds)
 
+    async def scoped_roots(
+        ctx: ServerContext,
+        *,
+        project: str | None = None,
+        projects: list[str] | None = None,
+        all_projects: bool = False,
+        selector: DeclarationSelector | None = None,
+    ) -> list[Path]:
+        if not (project or projects or all_projects or selector):
+            return await _startup_roots(ctx, discover=True)
+        roots = await _roots(ctx)
+        coordinator = _coordinator(ctx)
+        if coordinator is None:
+            return roots
+        failures: list[tuple[Path, Exception]] = []
+        async with _index_response_budget([], roots=roots):
+            await coordinator.schedule(roots, indexes=False)
+            # Finish discovery for every root so ID/name selection still sees
+            # newly joined worktrees, even if another root cannot be registered.
+            for root in roots:
+                try:
+                    await coordinator.wait_for_discovery([root])
+                except Exception as exc:
+                    failures.append((root, exc))
+            if failures:
+                try:
+                    if selector is not None:
+                        project = selector.project
+                        if project is None:
+                            # Chunk IDs carry the logical project prefix. Loading
+                            # the chunk here would validate it in the canonical
+                            # checkout before the reference tool binds MCP roots.
+                            project, _, remainder = (selector.chunk_id or "").partition(":")
+                            if not project or not remainder:
+                                # Let the reference operation validate malformed
+                                # chunk selectors without consulting another root.
+                                return roots
+                    if project:
+                        checkouts = [await asyncio.to_thread(app.resolve_project, project, roots)]
+                    else:
+                        checkouts = await asyncio.to_thread(
+                            app.resolve_scope_checkouts, projects, all_projects, roots
+                        )
+                except CodeIndexingError as exc:
+                    if exc.code is ErrorCode.PROJECT_NOT_FOUND:
+                        if selector is not None and selector.chunk_id is not None:
+                            # An unknown routing prefix is a chunk validation
+                            # error, handled by the reference operation below.
+                            return roots
+                        # Preserve discovery's explanation when an explicitly
+                        # selected path could not get its initial marker.
+                        explicit = projects or ([project] if project else [])
+                        for root, error in failures:
+                            if any(
+                                (path := Path(value).expanduser().resolve()).exists()
+                                and (same_project_root(path, root) or rooted_under(root, path))
+                                for value in explicit
+                            ):
+                                raise error from None
+                    raise
+                selected_roots = _selected_project_roots(roots, checkouts)
+                for root, error in failures:
+                    if any(same_project_root(root, selected) for selected in selected_roots):
+                        raise error
+        return roots
+
     async def search_resolved_projects(
         ctx: ServerContext,
         query: str,
@@ -1107,7 +1183,7 @@ def create_server(
         # meant to let callers manually recover from. If startup indexing is still
         # running, app.index_project's 0-timeout file lock raises INDEX_BUSY, which is
         # acceptable, pre-existing behavior.
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, project=project)
         # Resolved up front because progress is published per project id, and the
         # process doing the work may be the daemon rather than this one.
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
@@ -1159,7 +1235,7 @@ def create_server(
             ),
         ] = None,
     ) -> ProjectStatus:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, project=project)
         return await asyncio.to_thread(app.project_status, project, roots=roots)
 
     @mcp.tool(
@@ -1195,7 +1271,7 @@ def create_server(
             Field(description="Maximum runs per page, up to 100.", ge=1, le=100),
         ] = 20,
     ) -> HistoryPage:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, project=project)
         return await asyncio.to_thread(
             app.index_history, project, roots=roots, cursor=cursor, limit=limit
         )
@@ -1247,7 +1323,7 @@ def create_server(
             Field(description="Maximum items per page, up to 200.", ge=1, le=200),
         ] = 50,
     ) -> ScanInspectionPage:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, project=project)
         return await asyncio.to_thread(
             app.inspect_scan,
             project,
@@ -1440,7 +1516,7 @@ def create_server(
             int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
         ] = 8,
     ) -> SearchResponse:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, projects=projects, all_projects=all_projects)
         checkouts = await asyncio.to_thread(
             app.resolve_scope_checkouts, projects, all_projects, roots
         )
@@ -1520,7 +1596,7 @@ def create_server(
             int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
         ] = 8,
     ) -> ExampleSearchResponse:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, projects=projects, all_projects=all_projects)
         checkouts = await asyncio.to_thread(
             app.resolve_scope_checkouts, projects, all_projects, roots
         )
@@ -1624,7 +1700,7 @@ def create_server(
                 ErrorCode.INVALID_FILTER,
                 "search_across_projects 'language' is valid only with 'example'",
             )
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, projects=projects)
         checkouts = await asyncio.to_thread(app.resolve_scope_checkouts, projects, False, roots)
         project_ids = list(dict.fromkeys(project.id for project in checkouts))
         if len(project_ids) < 2:
@@ -1715,7 +1791,7 @@ def create_server(
             int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
         ] = 20,
     ) -> SymbolResponse:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, project=project)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved])
         selected_kinds: list[str] | None = list(kinds) if kinds else None
@@ -1751,7 +1827,7 @@ def create_server(
             Field(description="Project id, name, or path. Defaults to the active project."),
         ] = None,
     ) -> DeadCodeReport:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, project=project)
         return await asyncio.to_thread(app.dead_code_report, project, roots=roots)
 
     @mcp.tool(
@@ -1786,7 +1862,7 @@ def create_server(
         limit: Annotated[int, Field(ge=1, le=500, description="Maximum results per page.")] = 100,
         cursor: Annotated[str | None, Field(description="Opaque page cursor.")] = None,
     ) -> ReferenceResponse:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, selector=selector)
         return await asyncio.to_thread(
             app.find_references,
             selector,
@@ -1843,7 +1919,7 @@ def create_server(
             str | None, Field(description="Opaque impact-radius page cursor.")
         ] = None,
     ) -> ImpactRadiusResponse:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, selector=selector)
         return await asyncio.to_thread(
             app.impact_radius,
             selector,
@@ -1884,7 +1960,7 @@ def create_server(
         limit: Annotated[int, Field(ge=1, le=500, description="Maximum findings per page.")] = 500,
         cursor: Annotated[str | None, Field(description="Opaque analysis page cursor.")] = None,
     ) -> RefactorAnalysis:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, selector=selector)
         return await asyncio.to_thread(
             app.analyze_refactor,
             selector,
@@ -1928,7 +2004,7 @@ def create_server(
         ] = 3,
     ) -> RefactorPatch:
         validate_patch_request(operation, context_lines)
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, selector=selector)
         return await asyncio.to_thread(
             app.emit_refactor_patch,
             selector,
@@ -1970,7 +2046,7 @@ def create_server(
             ),
         ] = None,
     ) -> OutlineResponse:
-        roots = await _startup_roots(ctx, discover=True)
+        roots = await scoped_roots(ctx, project=project)
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved])
         return await asyncio.to_thread(app.file_outline, path, resolved.id, roots=[resolved.root])
