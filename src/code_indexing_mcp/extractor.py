@@ -1149,6 +1149,11 @@ class TreeSitterExtractor:
                 # (`.../* c */ rest`) must not be mistaken for it (same class
                 # as finding 7/8).
                 name_node = _first_named_child(child)
+            call_name = None
+            if language == "swift" and child.type == "parameter":
+                external_name = child.child_by_field_name("external_name")
+                if external_name is not None:
+                    call_name = (external_name.text or b"").decode("utf-8")
             while name_node is not None and name_node.type in {
                 "pointer_declarator",
                 "array_declarator",
@@ -1235,6 +1240,7 @@ class TreeSitterExtractor:
             rows.append(
                 ParameterShape(
                     name=name,
+                    call_name=call_name,
                     kind=kind,
                     required=required,
                     position=len(rows),
@@ -1349,6 +1355,11 @@ class TreeSitterExtractor:
             # `review` instead of fabricating a match (E4).
             positional_count = 1
             positional_spread = True
+        positional_count += sum(
+            child.type in {"annotated_lambda", "lambda_literal"}
+            for child in node.named_children
+            if child != arguments and not child.is_extra
+        )
         # else: e.g. a tagged template's `template_string` -- no positional
         # args at all; its `string_fragment`/`template_substitution` children
         # are not call arguments and must not be counted (E4).
@@ -1626,7 +1637,13 @@ class TreeSitterExtractor:
     @staticmethod
     def _is_assignment_target(node: Node) -> bool:
         """True if `node` is the LHS of a plain or augmented assignment."""
-        parent = node.parent
+        current = node
+        while current.parent is not None and current.parent.type in {
+            "directly_assignable_expression",
+            "ErrorUnionExpr",
+        }:
+            current = current.parent
+        parent = current.parent
         if parent is None:
             return False
         if parent.type in {
@@ -1634,17 +1651,19 @@ class TreeSitterExtractor:
             "augmented_assignment",
             "assignment_expression",
             "augmented_assignment_expression",
+            # Zig wraps both operands in `ErrorUnionExpr` under `AssignExpr`.
+            "AssignExpr",
             # Rust `count += 1` -- the field operand is the write target.
             "compound_assignment_expr",
         }:
             left = parent.child_by_field_name("left")
             if left is not None:
-                return left == node
+                return left == current
             # A grammar that names no `left` still puts the write target
-            # first, so the first operand is the target. Every grammar in
-            # this set names `left` today; this only fires where none exists.
+            # first, so the first operand is the target (notably Zig's
+            # `AssignExpr`).
             first = _first_named_child(parent)
-            return first is not None and first == node
+            return first is not None and first == current
         # Go wraps each assignment side in an `expression_list` (`s.next =
         # nil`). The list itself is never a symbol; peek one level out without
         # touching the Python/JS shapes, whose LHS identifiers are direct
@@ -3985,14 +4004,24 @@ class TreeSitterExtractor:
                 )
                 return
             imported = module_path.rsplit(".", 1)[-1]
+            alias_node = next(
+                (
+                    child
+                    for child in node.named_children
+                    if not child.is_extra and child.type == "import_alias"
+                ),
+                None,
+            )
+            alias_name = _last_named_child(alias_node) if alias_node is not None else None
+            alias = _capture_name(source, alias_name) if alias_name is not None else None
             add_reference(
                 "import",
                 node,
                 target_name=imported,
-                written_name=imported,
+                written_name=alias or imported,
                 module_path=module_path,
                 imported_name=imported,
-                alias=None,
+                alias=alias,
             )
         elif node.type == "call_expression":
             named = [child for child in node.named_children if not child.is_extra]
@@ -4011,7 +4040,7 @@ class TreeSitterExtractor:
                 receiver_text=qualifier,
                 call_shape=self._call_shape(suffix),
             )
-        elif node.type == "navigation_expression":
+        elif node.type in {"navigation_expression", "directly_assignable_expression"}:
             parent = node.parent
             if parent is not None and parent.type == "call_expression":
                 siblings = [child for child in parent.named_children if not child.is_extra]
@@ -4019,6 +4048,52 @@ class TreeSitterExtractor:
                     # The call row above already owns this span.
                     return
             self._emit_member_access(node, source, add_reference)
+        elif node.type in {
+            "class_declaration",
+            "object_declaration",
+            "function_declaration",
+            "property_declaration",
+            "type_alias",
+        }:
+            self._kotlin_export(node, source, add_reference)
+
+    @staticmethod
+    def _kotlin_export(node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        modifiers = next(
+            (child for child in node.named_children if child.type == "modifiers"), None
+        )
+        visibility = (
+            next(
+                (
+                    child
+                    for child in modifiers.named_children
+                    if child.type == "visibility_modifier"
+                ),
+                None,
+            )
+            if modifiers is not None
+            else None
+        )
+        if visibility is not None and _capture_name(source, visibility) != "public":
+            return
+        owner = node
+        if node.type == "property_declaration":
+            owner = next(
+                (child for child in node.named_children if child.type == "variable_declaration"),
+                node,
+            )
+        name = next(
+            (
+                child
+                for child in owner.named_children
+                if child.type in {"simple_identifier", "type_identifier"}
+            ),
+            None,
+        )
+        if name is None:
+            return
+        exported = _capture_name(source, name)
+        add_reference("export", name, target_name=exported, written_name=exported)
 
     def _swift_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
         if node.type == "import_declaration":
@@ -4069,9 +4144,57 @@ class TreeSitterExtractor:
                     # The call row above already owns this span.
                     return
             self._emit_member_access(node, source, add_reference)
+        elif node.type in {
+            "class_declaration",
+            "protocol_declaration",
+            "function_declaration",
+            "property_declaration",
+        }:
+            self._swift_export(node, source, add_reference)
+
+    @staticmethod
+    def _swift_export(node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        modifiers = next(
+            (child for child in node.named_children if child.type == "modifiers"), None
+        )
+        visibility = (
+            next(
+                (
+                    child
+                    for child in modifiers.named_children
+                    if child.type == "visibility_modifier"
+                ),
+                None,
+            )
+            if modifiers is not None
+            else None
+        )
+        if visibility is None or _capture_name(source, visibility) not in {"open", "public"}:
+            return
+        name = node.child_by_field_name("name")
+        if name is not None and name.type == "pattern":
+            name = _first_named_child(name)
+        if name is None:
+            return
+        exported = _capture_name(source, name)
+        add_reference("export", name, target_name=exported, written_name=exported)
 
     def _zig_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "BUILTINIDENTIFIER":
+        if node.type == "Decl":
+            previous = node.prev_sibling
+            if previous is None or previous.type != "pub":
+                return
+            declaration = _first_named_child(node)
+            name = None
+            if declaration is not None:
+                name = declaration.child_by_field_name(
+                    "function"
+                ) or declaration.child_by_field_name("variable_type_function")
+            if name is None:
+                return
+            exported = _capture_name(source, name)
+            add_reference("export", name, target_name=exported, written_name=exported)
+        elif node.type == "BUILTINIDENTIFIER":
             if _capture_name(source, node) != "@import":
                 return
             parent = node.parent
@@ -4095,14 +4218,28 @@ class TreeSitterExtractor:
             if module_path is not None:
                 # An import binds the file's namespace to the `const` on its
                 # left, never a single symbol -- mirroring Go package imports.
+                owner: Node | None = parent
+                while owner is not None and owner.type != "VarDecl":
+                    owner = owner.parent
+                binding_node = (
+                    owner.child_by_field_name("variable_type_function")
+                    if owner is not None
+                    else None
+                )
+                binding_node = binding_node or (
+                    _first_named_child(owner) if owner is not None else None
+                )
+                binding = (
+                    _capture_name(source, binding_node) if binding_node is not None else module_path
+                )
                 add_reference(
                     "import",
                     node,
-                    target_name=module_path,
-                    written_name=module_path,
+                    target_name=binding,
+                    written_name=binding,
                     module_path=module_path,
                     imported_name=None,
-                    alias=None,
+                    alias=binding if binding_node is not None else None,
                 )
         elif node.type == "FieldOrFnCall":
             arguments = next(

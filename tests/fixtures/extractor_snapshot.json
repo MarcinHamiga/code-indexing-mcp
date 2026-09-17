@@ -358,6 +358,7 @@
         [
           [
             "x",
+            null,
             "positional",
             true,
             0
@@ -1119,12 +1120,14 @@
         [
           [
             "x",
+            null,
             "positional",
             true,
             0
           ],
           [
             "y",
+            null,
             "positional",
             true,
             1
@@ -1152,6 +1155,7 @@
         [
           [
             "handler",
+            null,
             "positional",
             true,
             0
@@ -1169,6 +1173,7 @@
         [
           [
             "input",
+            null,
             "positional",
             true,
             0
@@ -2120,6 +2125,7 @@
         [
           [
             "options",
+            null,
             "positional",
             true,
             0
@@ -2132,6 +2138,7 @@
         [
           [
             "value",
+            null,
             "positional",
             true,
             0
@@ -2149,6 +2156,7 @@
         [
           [
             "options",
+            null,
             "positional",
             true,
             0
@@ -2161,6 +2169,7 @@
         [
           [
             "payload",
+            null,
             "positional",
             true,
             0
@@ -2607,6 +2616,7 @@
         [
           [
             "items",
+            null,
             "variadic",
             false,
             0
@@ -2619,6 +2629,7 @@
         [
           [
             "target",
+            null,
             "positional",
             true,
             0
@@ -2631,6 +2642,7 @@
         [
           [
             "onSave",
+            null,
             "positional",
             true,
             0
@@ -2643,6 +2655,7 @@
         [
           [
             "items",
+            null,
             "positional",
             true,
             0
@@ -3051,6 +3064,7 @@
         [
           [
             "value",
+            null,
             "positional",
             true,
             0
@@ -3063,6 +3077,7 @@
         [
           [
             "value",
+            null,
             "positional",
             true,
             0
@@ -3080,6 +3095,7 @@
         [
           [
             "seed",
+            null,
             "positional",
             true,
             0
@@ -3527,6 +3543,7 @@
         [
           [
             "value",
+            null,
             "positional",
             true,
             0
@@ -3539,6 +3556,7 @@
         [
           [
             "other",
+            null,
             "positional",
             true,
             0
@@ -3556,12 +3574,14 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
           ],
           [
             "value",
+            null,
             "positional",
             true,
             1
@@ -3584,6 +3604,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -4258,6 +4279,7 @@
         [
           [
             "item",
+            null,
             "positional",
             true,
             0
@@ -4546,6 +4568,7 @@
         [
           [
             "items",
+            null,
             "positional",
             true,
             0
@@ -4558,6 +4581,7 @@
         [
           [
             "items",
+            null,
             "positional",
             true,
             0
@@ -4590,12 +4614,14 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
           ],
           [
             "config",
+            null,
             "positional",
             true,
             1
@@ -4901,12 +4927,14 @@
         [
           [
             "left",
+            null,
             "positional",
             true,
             0
           ],
           [
             "right",
+            null,
             "positional",
             true,
             1
@@ -5337,12 +5365,14 @@
         [
           [
             "u",
+            null,
             "positional",
             true,
             0
           ],
           [
             "name",
+            null,
             "positional",
             true,
             1
@@ -5355,6 +5385,7 @@
         [
           [
             "p",
+            null,
             "positional",
             true,
             0
@@ -5367,6 +5398,7 @@
         [
           [
             "r",
+            null,
             "positional",
             true,
             0
@@ -5394,6 +5426,7 @@
         [
           [
             "item",
+            null,
             "positional",
             true,
             0
@@ -6321,12 +6354,14 @@
         [
           [
             "first",
+            null,
             "positional",
             true,
             0
           ],
           [
             "second",
+            null,
             "positional",
             false,
             1
@@ -6391,6 +6426,18 @@
         null
       ],
       [
+        "export",
+        "Greeter",
+        "Greeter",
+        null,
+        null,
+        null,
+        68,
+        75,
+        "Greeter",
+        null
+      ],
+      [
         "read",
         "String",
         "String",
@@ -6424,6 +6471,18 @@
         145,
         149,
         "Greeter.greet",
+        null
+      ],
+      [
+        "export",
+        "topLevel",
+        "topLevel",
+        null,
+        null,
+        null,
+        163,
+        171,
+        "topLevel",
         null
       ],
       [
@@ -6482,6 +6541,42 @@
         null
       ],
       [
+        "export",
+        "Singletons",
+        "Singletons",
+        null,
+        null,
+        null,
+        235,
+        245,
+        "Singletons",
+        null
+      ],
+      [
+        "export",
+        "Direction",
+        "Direction",
+        null,
+        null,
+        null,
+        288,
+        297,
+        "Direction",
+        null
+      ],
+      [
+        "export",
+        "Name",
+        "Name",
+        null,
+        null,
+        null,
+        334,
+        338,
+        "Name",
+        null
+      ],
+      [
         "read",
         "String",
         "String",
@@ -6521,6 +6616,7 @@
         [
           [
             "name",
+            null,
             "positional",
             true,
             0
@@ -6926,12 +7022,14 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
           ],
           [
             "self",
+            null,
             "positional",
             true,
             1
@@ -6944,6 +7042,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -6956,6 +7055,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -6968,6 +7068,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -6980,6 +7081,7 @@
         [
           [
             "label",
+            null,
             "positional",
             true,
             0
@@ -6992,6 +7094,7 @@
         [
           [
             "other",
+            null,
             "positional",
             true,
             0
@@ -7004,6 +7107,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -7021,6 +7125,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -7038,6 +7143,7 @@
         [
           [
             "path",
+            null,
             "positional",
             true,
             0
@@ -8362,6 +8468,7 @@
         [
           [
             "name",
+            null,
             "positional",
             true,
             0
@@ -8379,12 +8486,14 @@
         [
           [
             "first",
+            null,
             "positional",
             true,
             0
           ],
           [
             "second",
+            null,
             "positional",
             true,
             1
@@ -8444,7 +8553,7 @@
         null
       ],
       [
-        "read",
+        "write",
         "self.name",
         "self.name",
         null,
@@ -8834,12 +8943,14 @@
         [
           [
             "a",
+            null,
             "positional",
             true,
             0
           ],
           [
             "b",
+            null,
             "positional",
             true,
             1
@@ -8872,7 +8983,7 @@
         "std",
         "std",
         null,
-        null,
+        "std",
         12,
         19,
         "std",
@@ -8892,14 +9003,26 @@
       ],
       [
         "import",
-        "store.zig",
-        "store.zig",
+        "store",
+        "store",
         "store.zig",
         null,
-        null,
+        "store",
         42,
         49,
         "store",
+        null
+      ],
+      [
+        "export",
+        "add",
+        "add",
+        null,
+        null,
+        null,
+        148,
+        151,
+        "add",
         null
       ],
       [
@@ -9591,6 +9714,7 @@
         [
           [
             "other",
+            null,
             "positional",
             true,
             0
@@ -9613,12 +9737,14 @@
         [
           [
             "a",
+            null,
             "positional",
             true,
             0
           ],
           [
             "b",
+            null,
             "positional",
             true,
             1
@@ -9636,6 +9762,7 @@
         [
           [
             "label",
+            null,
             "positional",
             true,
             0
@@ -9648,6 +9775,7 @@
         [
           [
             "title,subtitle,onSave",
+            null,
             "positional",
             true,
             0
@@ -10369,6 +10497,7 @@
         [
           [
             "other",
+            null,
             "positional",
             true,
             0
@@ -10391,6 +10520,7 @@
         [
           [
             "value",
+            null,
             "positional",
             true,
             0
@@ -10413,12 +10543,14 @@
         [
           [
             "a",
+            null,
             "positional",
             true,
             0
           ],
           [
             "b",
+            null,
             "positional",
             true,
             1
@@ -10431,6 +10563,7 @@
         [
           [
             "title,subtitle,footnote",
+            null,
             "positional",
             true,
             0
@@ -10443,12 +10576,14 @@
         [
           [
             "handler",
+            null,
             "positional",
             true,
             0
           ],
           [
             "retries",
+            null,
             "positional",
             true,
             1
@@ -11090,12 +11225,14 @@
         [
           [
             "x",
+            null,
             "positional",
             true,
             0
           ],
           [
             "freq",
+            null,
             "positional",
             true,
             1
@@ -11330,6 +11467,7 @@
         [
           [
             "label,children",
+            null,
             "positional",
             true,
             0

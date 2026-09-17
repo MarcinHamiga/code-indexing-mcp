@@ -27,6 +27,10 @@
 (FnProto
   (ParamDeclList) @declaration.parameters)
 
+; --- exports: `pub` top-level declarations ---------------------------------
+
+(source_file (Decl) @reference.export)
+
 ; --- identifier fallback (bindings excluded in _identifier_record) ------------
 
 (IDENTIFIER) @reference.identifier

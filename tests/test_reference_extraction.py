@@ -2381,6 +2381,24 @@ def test_kotlin_extracts_import_shapes() -> None:
     assert (wildcard.module_path, wildcard.imported_name) == ("sample.store", "*")
 
 
+def test_kotlin_import_alias_preserves_imported_and_local_names() -> None:
+    refs = [
+        reference
+        for reference in _kotlin_result("import other.Widget as Alias\n").references
+        if reference.kind == "import"
+    ]
+
+    assert len(refs) == 1
+    imported = refs[0]
+    assert (
+        imported.target_name,
+        imported.written_name,
+        imported.module_path,
+        imported.imported_name,
+        imported.alias,
+    ) == ("Widget", "Alias", "other.Widget", "Widget", "Alias")
+
+
 def test_kotlin_calls_member_access_and_shapes() -> None:
     source = (
         "fun run() {\n"
@@ -2412,6 +2430,16 @@ def test_kotlin_calls_member_access_and_shapes() -> None:
     # is owned by its call row, asserted above).
     assert "run" not in reads
     assert "Greeter" not in reads
+
+
+def test_kotlin_member_assignment_is_a_write() -> None:
+    result = _kotlin_result("fun update(value: Int) { this.count = value }\n")
+
+    writes = [reference for reference in result.references if reference.kind == "write"]
+
+    assert [(reference.written_name, reference.receiver_text) for reference in writes] == [
+        ("this.count", "this")
+    ]
 
 
 def test_kotlin_declaration_names_and_parameters_are_not_reads() -> None:
@@ -2474,6 +2502,23 @@ def test_swift_extracts_imports_calls_and_labels() -> None:
     assert "name" not in reads  # the argument label is not a value read
 
 
+@pytest.mark.parametrize(
+    ("language", "suffix", "source"),
+    [
+        ("kotlin", "kt", 'fun run() { accept { println("x") } }\n'),
+        ("swift", "swift", 'func run() { accept { print("x") } }\n'),
+    ],
+)
+def test_trailing_closure_counts_as_a_positional_argument(
+    language: str, suffix: str, source: str
+) -> None:
+    result = TreeSitterExtractor().extract(Path(f"sample.{suffix}"), language, source.encode())
+    call = next(reference for reference in result.references if reference.target_name == "accept")
+
+    assert call.call_shape is not None
+    assert call.call_shape.positional_count == 1
+
+
 def test_swift_declaration_names_are_not_reads() -> None:
     source = (
         "class Greeter {\n"
@@ -2502,6 +2547,21 @@ def test_swift_declaration_names_are_not_reads() -> None:
     assert init == [("label", "positional", True)]
 
 
+def test_swift_parameter_shapes_preserve_external_labels() -> None:
+    source = "func greet(to person: String, _ count: Int, name: String) {}\n"
+
+    declaration = _swift_result(source).declarations[0]
+
+    assert [
+        (parameter.name, parameter.model_dump().get("call_name"))
+        for parameter in declaration.parameters
+    ] == [
+        ("person", "to"),
+        ("count", "_"),
+        ("name", None),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Zig structural references
 # ---------------------------------------------------------------------------
@@ -2519,8 +2579,13 @@ def test_zig_extracts_imports_with_module_paths() -> None:
     refs = [r for r in _zig_result(source).references if r.kind == "import"]
     by_module = {r.module_path: r for r in refs}
 
-    assert by_module["std"].written_name == "std"
-    assert by_module["helper.zig"].written_name == "helper.zig"
+    assert (by_module["std"].target_name, by_module["std"].written_name) == ("std", "std")
+    helper = by_module["helper.zig"]
+    assert (helper.target_name, helper.written_name, helper.alias) == (
+        "helper",
+        "helper",
+        "helper",
+    )
 
 
 def test_zig_calls_carry_receivers_and_shapes() -> None:
@@ -2542,6 +2607,37 @@ def test_zig_calls_carry_receivers_and_shapes() -> None:
     member = next(r for r in result.references if r.kind == "read" and "." in r.target_name)
     assert member.target_name == "s.limit"
     assert member.receiver_text == "s"
+
+
+@pytest.mark.parametrize(
+    ("language", "suffix", "source", "written_name", "receiver"),
+    [
+        (
+            "swift",
+            "swift",
+            "func update(_ value: Int) { self.count = value }\n",
+            "self.count",
+            "self",
+        ),
+        (
+            "zig",
+            "zig",
+            "pub fn update(value: u32) void { state.count = value; }\n",
+            "state.count",
+            "state",
+        ),
+    ],
+)
+def test_wrapped_member_assignments_are_writes(
+    language: str, suffix: str, source: str, written_name: str, receiver: str
+) -> None:
+    result = TreeSitterExtractor().extract(Path(f"sample.{suffix}"), language, source.encode())
+
+    writes = [reference for reference in result.references if reference.kind == "write"]
+
+    assert [(reference.written_name, reference.receiver_text) for reference in writes] == [
+        (written_name, receiver)
+    ]
 
 
 def test_zig_declaration_names_and_field_keys_are_not_reads() -> None:

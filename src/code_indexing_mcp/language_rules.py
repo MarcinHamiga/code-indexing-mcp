@@ -978,6 +978,35 @@ def _zig_import_candidates(
     return {source.parent / stem, PurePosixPath(stem)}
 
 
+def _kotlin_import_candidates(
+    source: PurePosixPath,
+    module_path: str,
+    known_paths: frozenset[str],
+    module_index: _ModuleIndex | None,
+) -> set[PurePosixPath]:
+    """Conservative file candidates for an imported Kotlin declaration.
+
+    Kotlin permits top-level declarations in arbitrarily named files, so a
+    dotted import is exact by path only when its final symbol matches an
+    indexed `.kt`/`.kts` file under the imported package suffix. Other cases
+    stay unresolved instead of guessing across every file in the package.
+    """
+    parts = tuple(part for part in module_path.split(".") if part)
+    if len(parts) < 2:
+        return set()
+    package, symbol = parts[:-1], parts[-1]
+    suffixes = {(*package, f"{symbol}.kt"), (*package, f"{symbol}.kts")}
+    candidates: set[PurePosixPath] = set()
+    for raw_path in known_paths:
+        path = PurePosixPath(raw_path)
+        if any(
+            len(path.parts) >= len(suffix) and path.parts[-len(suffix) :] == suffix
+            for suffix in suffixes
+        ):
+            candidates.add(path)
+    return candidates
+
+
 def _gdscript_import_candidates(
     source: PurePosixPath,
     module_path: str,
@@ -1282,7 +1311,7 @@ LANGUAGE_RULES: Final[Mapping[str, _LanguageRules]] = {
         import_owner_parents=frozenset({"import_header", "package_header"}),
         reserved_words=_KOTLIN_RESERVED_WORDS,
         identifier_valid=lambda name: name.isidentifier() and name not in _KOTLIN_RESERVED_WORDS,
-        import_candidates=_empty_import_candidates,
+        import_candidates=_kotlin_import_candidates,
     ),
     "swift": _LanguageRules(
         import_owner_parents=frozenset({"import_declaration"}),

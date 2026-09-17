@@ -42,6 +42,7 @@ SerializablePath = Annotated[Path, _PathAsPlainString()]
 # relational (table/column) references for SQL and traversal reads for HCL.
 # Version 10 adds Kotlin, Swift, and Zig, with XML indexed definitions-only
 # (no structural references, like YAML and JSON).
+# Version 11 preserves Swift's external call-site labels in declaration shapes.
 #
 # Lives here rather than in indexing.py (originally its home) because
 # reference_service.py needs it too and importing it from indexing.py made
@@ -49,7 +50,7 @@ SerializablePath = Annotated[Path, _PathAsPlainString()]
 # docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
 # indexing.py re-exports the name for one release so nothing importing it from
 # there breaks.
-REFERENCE_SCHEMA_VERSION = 10
+REFERENCE_SCHEMA_VERSION = 11
 
 
 def content_digest(value: str | bytes) -> str:
@@ -333,6 +334,13 @@ class CallShape(FrozenModel):
 
 class ParameterShape(FrozenModel):
     name: str = Field(description="Parameter name.")
+    call_name: str | None = Field(
+        default=None,
+        description=(
+            "Call-site label when it differs from the local parameter name; Swift uses `_` "
+            "for an explicitly unlabeled parameter."
+        ),
+    )
     kind: ParameterKind = Field(
         description=(
             "One of positional_only, positional, keyword_only, variadic (*args-style), "

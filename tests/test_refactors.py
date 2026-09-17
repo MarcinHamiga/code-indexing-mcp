@@ -107,6 +107,53 @@ def test_signature_renamed_keyword_marks_the_exact_call_with_a_stable_reason(
     assert call.reason_code == "invalid_keyword"
 
 
+def test_swift_external_label_satisfies_its_local_parameter(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {"service.swift": ('func greet(to person: String) {}\nfunc run() { greet(to: "Ada") }\n')},
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="service.swift", qualified_symbol="greet"),
+        SignatureChangeOperation(
+            parameters=[ParameterShape(name="person", kind="positional", required=True, position=0)]
+        ),
+    )
+
+    assert not any(item.kind == "call" for item in analysis.must_change)
+    call = next(item for item in analysis.evidence if item.kind == "call")
+    assert call.reason_code == "same_file_symbol"
+
+
+@pytest.mark.parametrize(
+    ("path", "source"),
+    [
+        (
+            "service.kt",
+            'fun accept(block: () -> Unit) {}\nfun run() { accept { println("x") } }\n',
+        ),
+        (
+            "service.swift",
+            'func accept(_ block: () -> Void) {}\nfunc run() { accept { print("x") } }\n',
+        ),
+    ],
+)
+def test_trailing_closure_satisfies_required_parameter(
+    tmp_path: Path, path: str, source: str
+) -> None:
+    service, project_id = _indexed_service(tmp_path, {path: source})
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path=path, qualified_symbol="accept"),
+        SignatureChangeOperation(
+            parameters=[ParameterShape(name="block", kind="positional", required=True, position=0)]
+        ),
+    )
+
+    assert not any(item.kind == "call" for item in analysis.must_change)
+    assert any(item.kind == "call" for item in analysis.evidence)
+
+
 def test_signature_spread_calls_are_reviewed_not_silently_ignored(tmp_path: Path) -> None:
     service, project_id = _indexed_service(
         tmp_path,

@@ -35,6 +35,7 @@ from .models import (
     ImpactLayer,
     ImpactRadiusResponse,
     ImpactReview,
+    ParameterShape,
     PatchEdit,
     RefactorAnalysis,
     RefactorCounts,
@@ -2440,6 +2441,32 @@ class ReferenceService:
         positional_count = int(shape.get("positional_count", 0))
         keywords = set(shape.get("keywords", []))
         new_by_name = {parameter.name: parameter for parameter in operation.parameters}
+        old_by_name = {
+            parameter.get("name"): parameter
+            for parameter in old_records
+            if isinstance(parameter.get("name"), str)
+        }
+        old_by_position = {
+            parameter.get("position"): parameter
+            for parameter in old_records
+            if isinstance(parameter.get("position"), int)
+        }
+        call_names: dict[str, str | None] = {}
+        new_by_call_name: dict[str, ParameterShape] = {}
+        for parameter in operation.parameters:
+            call_name = parameter.call_name
+            if call_name is None:
+                previous = old_by_name.get(parameter.name) or old_by_position.get(
+                    parameter.position
+                )
+                previous_call_name = previous.get("call_name") if previous is not None else None
+                call_name = (
+                    previous_call_name if isinstance(previous_call_name, str) else parameter.name
+                )
+            effective = None if call_name == "_" else call_name
+            call_names[parameter.name] = effective
+            if effective is not None:
+                new_by_call_name[effective] = parameter
         rules = LANGUAGE_RULES.get(selected.language, _DEFAULT)
         bound_receiver = bool(
             selected.kind == "method" and row["receiver_text"] in rules.bound_receivers
@@ -2449,18 +2476,20 @@ class ReferenceService:
         if any(
             parameter.required
             and parameter.kind == "keyword_only"
-            and parameter.name not in keywords
+            and call_names.get(parameter.name) not in keywords
             for parameter in operation.parameters
         ):
             return "missing_required_parameter"
         for keyword in keywords:
-            parameter = new_by_name.get(keyword)
-            if parameter is None:
+            matched = new_by_call_name.get(keyword)
+            if matched is None:
                 return "invalid_keyword"
-            if parameter.kind == "positional_only":
+            if matched.kind == "positional_only":
                 return "parameter_mode_change"
         if any(
-            parameter.required and position >= positional_count and parameter.name not in keywords
+            parameter.required
+            and position >= positional_count
+            and call_names.get(parameter.name) not in keywords
             for position, parameter in enumerate(new_positional)
         ):
             return "missing_required_parameter"

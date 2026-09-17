@@ -99,7 +99,13 @@ def declaration_fingerprint(result: ExtractionResult) -> list[list[object]]:
             declaration.qualified_symbol,
             declaration.kind,
             [
-                [parameter.name, parameter.kind, parameter.required, parameter.position]
+                [
+                    parameter.name,
+                    parameter.call_name,
+                    parameter.kind,
+                    parameter.required,
+                    parameter.position,
+                ]
                 for parameter in declaration.parameters
             ],
         ]

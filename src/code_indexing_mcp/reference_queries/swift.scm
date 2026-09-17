@@ -24,6 +24,13 @@
 (init_declaration
   (parameter) @declaration.parameters)
 
+; --- exports: explicitly public/open top-level declarations ----------------
+
+(source_file (class_declaration) @reference.export)
+(source_file (protocol_declaration) @reference.export)
+(source_file (function_declaration) @reference.export)
+(source_file (property_declaration) @reference.export)
+
 ; --- identifier fallback (bindings excluded in _identifier_record) -----------
 
 (simple_identifier) @reference.identifier
