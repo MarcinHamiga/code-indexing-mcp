@@ -133,6 +133,25 @@ def test_identifier_valid_rules() -> None:
     assert terraform_rules.identifier_valid("true") is False
     assert terraform_rules.identifier_valid("null") is False
 
+    # Kotlin rejects hard keywords (soft keywords stay valid identifiers)
+    kotlin_rules = LANGUAGE_RULES["kotlin"]
+    assert kotlin_rules.identifier_valid("greet") is True
+    assert kotlin_rules.identifier_valid("data") is True
+    assert kotlin_rules.identifier_valid("fun") is False
+    assert kotlin_rules.identifier_valid("val") is False
+
+    # Swift rejects keywords including contextual self/super spellings
+    swift_rules = LANGUAGE_RULES["swift"]
+    assert swift_rules.identifier_valid("greet") is True
+    assert swift_rules.identifier_valid("func") is False
+    assert swift_rules.identifier_valid("self") is False
+
+    # Zig rejects Zig keywords
+    zig_rules = LANGUAGE_RULES["zig"]
+    assert zig_rules.identifier_valid("add") is True
+    assert zig_rules.identifier_valid("fn") is False
+    assert zig_rules.identifier_valid("comptime") is False
+
 
 def test_import_candidates_for_new_languages() -> None:
     c = LANGUAGE_RULES["c"].import_candidates

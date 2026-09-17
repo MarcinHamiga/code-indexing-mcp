@@ -133,6 +133,21 @@ def test_dead_code_rejects_missing_reference_index(tmp_path: Path) -> None:
         ("default.js", "function api() {}\nexport default api;\n", {"api"}),
         ("named.js", "export default function api() {}\n", {"api"}),
         ("lib.tsx", "export function View() { return <div />; }\n", {"View"}),
+        (
+            "lib.kt",
+            "fun implicit() {}\npublic class Open\nprivate fun hidden() {}\n",
+            {"implicit", "Open"},
+        ),
+        (
+            "lib.swift",
+            "public func api() {}\nopen class Open {}\nprivate func hidden() {}\n",
+            {"api", "Open"},
+        ),
+        (
+            "lib.zig",
+            "pub fn api() void {}\nfn hidden() void {}\npub const value = 1;\nconst local = 2;\n",
+            {"api", "value"},
+        ),
     ],
 )
 def test_dead_code_uses_structural_export_rules(

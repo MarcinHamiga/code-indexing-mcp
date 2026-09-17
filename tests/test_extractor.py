@@ -178,6 +178,109 @@ end
 """,
             {("function", "greet")},
         ),
+        (
+            "kotlin",
+            "pkg/user.kt",
+            b"""package sample
+
+class Greeter(val name: String) {
+    fun greet(): String = "hi " + name
+}
+
+fun build_greeter(name: String): Greeter = Greeter(name)
+
+object Singletons {
+    const val VERSION = 1
+}
+
+enum class Direction {
+    NORTH,
+    SOUTH
+}
+
+typealias Name = String
+""",
+            {
+                ("class", "Greeter"),
+                ("method", "Greeter.greet"),
+                ("function", "build_greeter"),
+                ("object", "Singletons"),
+                ("constant", "Singletons.VERSION"),
+                ("class", "Direction"),
+                ("constant", "Direction.NORTH"),
+                ("type", "Name"),
+            },
+        ),
+        (
+            "swift",
+            "pkg/user.swift",
+            b"""import Foundation
+
+class Greeter {
+    let name: String
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func greet() -> String {
+        return "hi " + name
+    }
+}
+
+protocol Runnable {
+    func run()
+}
+""",
+            {
+                ("class", "Greeter"),
+                ("property", "Greeter.name"),
+                ("constructor", "Greeter.init"),
+                ("method", "Greeter.greet"),
+                ("interface", "Runnable"),
+                ("method", "Runnable.run"),
+            },
+        ),
+        (
+            "zig",
+            "src/user.zig",
+            b"""const std = @import("std");
+
+const Point = struct {
+    x: i32,
+    y: i32,
+};
+
+const VERSION: u32 = 1;
+
+pub fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+""",
+            {
+                ("constant", "std"),
+                ("constant", "Point"),
+                ("property", "Point.x"),
+                ("property", "Point.y"),
+                ("constant", "VERSION"),
+                ("function", "add"),
+            },
+        ),
+        (
+            "xml",
+            "res/layout.xml",
+            b"""<?xml version="1.0"?>
+<catalog>
+    <book id="1">
+        <title>Example</title>
+    </book>
+</catalog>
+""",
+            {
+                ("object", "catalog"),
+                ("object", "catalog.book"),
+            },
+        ),
     ],
 )
 def test_extracts_next_language_symbols(

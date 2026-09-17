@@ -358,6 +358,7 @@
         [
           [
             "x",
+            null,
             "positional",
             true,
             0
@@ -1119,12 +1120,14 @@
         [
           [
             "x",
+            null,
             "positional",
             true,
             0
           ],
           [
             "y",
+            null,
             "positional",
             true,
             1
@@ -1152,6 +1155,7 @@
         [
           [
             "handler",
+            null,
             "positional",
             true,
             0
@@ -1169,6 +1173,7 @@
         [
           [
             "input",
+            null,
             "positional",
             true,
             0
@@ -2120,6 +2125,7 @@
         [
           [
             "options",
+            null,
             "positional",
             true,
             0
@@ -2132,6 +2138,7 @@
         [
           [
             "value",
+            null,
             "positional",
             true,
             0
@@ -2149,6 +2156,7 @@
         [
           [
             "options",
+            null,
             "positional",
             true,
             0
@@ -2161,6 +2169,7 @@
         [
           [
             "payload",
+            null,
             "positional",
             true,
             0
@@ -2607,6 +2616,7 @@
         [
           [
             "items",
+            null,
             "variadic",
             false,
             0
@@ -2619,6 +2629,7 @@
         [
           [
             "target",
+            null,
             "positional",
             true,
             0
@@ -2631,6 +2642,7 @@
         [
           [
             "onSave",
+            null,
             "positional",
             true,
             0
@@ -2643,6 +2655,7 @@
         [
           [
             "items",
+            null,
             "positional",
             true,
             0
@@ -3051,6 +3064,7 @@
         [
           [
             "value",
+            null,
             "positional",
             true,
             0
@@ -3063,6 +3077,7 @@
         [
           [
             "value",
+            null,
             "positional",
             true,
             0
@@ -3080,6 +3095,7 @@
         [
           [
             "seed",
+            null,
             "positional",
             true,
             0
@@ -3527,6 +3543,7 @@
         [
           [
             "value",
+            null,
             "positional",
             true,
             0
@@ -3539,6 +3556,7 @@
         [
           [
             "other",
+            null,
             "positional",
             true,
             0
@@ -3556,12 +3574,14 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
           ],
           [
             "value",
+            null,
             "positional",
             true,
             1
@@ -3584,6 +3604,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -4258,6 +4279,7 @@
         [
           [
             "item",
+            null,
             "positional",
             true,
             0
@@ -4546,6 +4568,7 @@
         [
           [
             "items",
+            null,
             "positional",
             true,
             0
@@ -4558,6 +4581,7 @@
         [
           [
             "items",
+            null,
             "positional",
             true,
             0
@@ -4590,12 +4614,14 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
           ],
           [
             "config",
+            null,
             "positional",
             true,
             1
@@ -4901,12 +4927,14 @@
         [
           [
             "left",
+            null,
             "positional",
             true,
             0
           ],
           [
             "right",
+            null,
             "positional",
             true,
             1
@@ -5337,12 +5365,14 @@
         [
           [
             "u",
+            null,
             "positional",
             true,
             0
           ],
           [
             "name",
+            null,
             "positional",
             true,
             1
@@ -5355,6 +5385,7 @@
         [
           [
             "p",
+            null,
             "positional",
             true,
             0
@@ -5367,6 +5398,7 @@
         [
           [
             "r",
+            null,
             "positional",
             true,
             0
@@ -5394,6 +5426,7 @@
         [
           [
             "item",
+            null,
             "positional",
             true,
             0
@@ -6141,6 +6174,422 @@
       ]
     ]
   },
+  "sample.kt": {
+    "chunks": [
+      [
+        "module",
+        null,
+        null,
+        null,
+        0,
+        62,
+        1,
+        4,
+        0,
+        "9cae12c163bb651f",
+        "b80537389fc8a933",
+        "869f5ec1985648fe",
+        "08792ba25ed8be31",
+        "bd0a750692fe3362"
+      ],
+      [
+        "class",
+        "Greeter",
+        "Greeter",
+        null,
+        62,
+        100,
+        6,
+        6,
+        0,
+        "bd7a1a6205ab4e43",
+        "e07d25acc7379e4d",
+        "49ba2aa83e8b4a6d",
+        "65e79a25d860d975",
+        "943104d0fba5b320"
+      ],
+      [
+        "method",
+        "greet",
+        "Greeter.greet",
+        "Greeter",
+        100,
+        155,
+        7,
+        9,
+        0,
+        "c0cbeafec5e76e9a",
+        "4445844a0d017753",
+        "fc76948b6f25dfa1",
+        "a92078bd944bf101",
+        "1bebcbc070a5f6a5"
+      ],
+      [
+        "function",
+        "topLevel",
+        "topLevel",
+        null,
+        159,
+        226,
+        12,
+        12,
+        0,
+        "604aea09f51c3c2e",
+        "9543e230d13d6619",
+        "078908cf7b88c782",
+        "a8bad530878081aa",
+        "a894030d262c6cc2"
+      ],
+      [
+        "object",
+        "Singletons",
+        "Singletons",
+        null,
+        228,
+        252,
+        14,
+        14,
+        0,
+        "8ec7d9c7cd59e004",
+        "45430e5a2b167b51",
+        "6a66ab1fc09c0f41",
+        "66ece7731529d985",
+        "5db6fe247d06a19a"
+      ],
+      [
+        "constant",
+        "VERSION",
+        "Singletons.VERSION",
+        "Singletons",
+        252,
+        273,
+        15,
+        15,
+        0,
+        "0ce3f626f58a06a9",
+        "4acb300946533aa3",
+        "12f980554a37a24d",
+        "48e48dd71fab4f87",
+        "aa4665c846216574"
+      ],
+      [
+        "class",
+        "Direction",
+        "Direction",
+        null,
+        277,
+        304,
+        18,
+        18,
+        0,
+        "b0b8b05cbeb1e728",
+        "b46dd56a8ba7519d",
+        "772812474d7844b2",
+        "190e9d178da1fe62",
+        "a9c3dde7e8340c53"
+      ],
+      [
+        "constant",
+        "NORTH",
+        "Direction.NORTH",
+        "Direction",
+        304,
+        309,
+        19,
+        19,
+        0,
+        "34a489fb589a0a73",
+        "2a91480043b96334",
+        "088b65860160d583",
+        "87c963ea0e976b4b",
+        "bd12d3573ecee704"
+      ],
+      [
+        "constant",
+        "SOUTH",
+        "Direction.SOUTH",
+        "Direction",
+        315,
+        320,
+        20,
+        20,
+        0,
+        "881dac23c6a82829",
+        "279180f285ac5f8f",
+        "cdb6756214828538",
+        "636ca841e06aaf43",
+        "c35955e0a22556a6"
+      ],
+      [
+        "type",
+        "Name",
+        "Name",
+        null,
+        324,
+        347,
+        23,
+        23,
+        0,
+        "8f4c2b27467e05b1",
+        "cd5af6ea1f919a62",
+        "dd6d9ddccef02fd6",
+        "619d9616b99bfb94",
+        "5749249f87bf17a4"
+      ]
+    ],
+    "declarations": [
+      [
+        "Greeter",
+        "class",
+        []
+      ],
+      [
+        "Greeter.greet",
+        "method",
+        []
+      ],
+      [
+        "topLevel",
+        "function",
+        [
+          [
+            "first",
+            null,
+            "positional",
+            true,
+            0
+          ],
+          [
+            "second",
+            null,
+            "positional",
+            false,
+            1
+          ]
+        ]
+      ],
+      [
+        "Singletons",
+        "object",
+        []
+      ],
+      [
+        "Singletons.VERSION",
+        "constant",
+        []
+      ],
+      [
+        "Direction",
+        "class",
+        []
+      ],
+      [
+        "Direction.NORTH",
+        "constant",
+        []
+      ],
+      [
+        "Direction.SOUTH",
+        "constant",
+        []
+      ],
+      [
+        "Name",
+        "type",
+        []
+      ]
+    ],
+    "has_errors": false,
+    "references": [
+      [
+        "import",
+        "max",
+        "max",
+        "kotlin.math.max",
+        "max",
+        null,
+        16,
+        38,
+        null,
+        null
+      ],
+      [
+        "import",
+        "*",
+        "*",
+        "sample.store",
+        "*",
+        null,
+        39,
+        60,
+        null,
+        null
+      ],
+      [
+        "export",
+        "Greeter",
+        "Greeter",
+        null,
+        null,
+        null,
+        68,
+        75,
+        "Greeter",
+        null
+      ],
+      [
+        "read",
+        "String",
+        "String",
+        null,
+        null,
+        null,
+        86,
+        92,
+        "Greeter",
+        null
+      ],
+      [
+        "read",
+        "String",
+        "String",
+        null,
+        null,
+        null,
+        113,
+        119,
+        "Greeter.greet",
+        null
+      ],
+      [
+        "read",
+        "name",
+        "name",
+        null,
+        null,
+        null,
+        145,
+        149,
+        "Greeter.greet",
+        null
+      ],
+      [
+        "export",
+        "topLevel",
+        "topLevel",
+        null,
+        null,
+        null,
+        163,
+        171,
+        "topLevel",
+        null
+      ],
+      [
+        "read",
+        "Int",
+        "Int",
+        null,
+        null,
+        null,
+        202,
+        205,
+        "topLevel",
+        null
+      ],
+      [
+        "call",
+        "max",
+        "max",
+        null,
+        null,
+        null,
+        208,
+        211,
+        "topLevel",
+        [
+          2,
+          [],
+          false,
+          false,
+          null,
+          false
+        ]
+      ],
+      [
+        "read",
+        "first",
+        "first",
+        null,
+        null,
+        null,
+        212,
+        217,
+        "topLevel",
+        null
+      ],
+      [
+        "read",
+        "second",
+        "second",
+        null,
+        null,
+        null,
+        219,
+        225,
+        "topLevel",
+        null
+      ],
+      [
+        "export",
+        "Singletons",
+        "Singletons",
+        null,
+        null,
+        null,
+        235,
+        245,
+        "Singletons",
+        null
+      ],
+      [
+        "export",
+        "Direction",
+        "Direction",
+        null,
+        null,
+        null,
+        288,
+        297,
+        "Direction",
+        null
+      ],
+      [
+        "export",
+        "Name",
+        "Name",
+        null,
+        null,
+        null,
+        334,
+        338,
+        "Name",
+        null
+      ],
+      [
+        "read",
+        "String",
+        "String",
+        null,
+        null,
+        null,
+        341,
+        347,
+        "Name",
+        null
+      ]
+    ]
+  },
   "sample.lua": {
     "chunks": [
       [
@@ -6167,6 +6616,7 @@
         [
           [
             "name",
+            null,
             "positional",
             true,
             0
@@ -6572,12 +7022,14 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
           ],
           [
             "self",
+            null,
             "positional",
             true,
             1
@@ -6590,6 +7042,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -6602,6 +7055,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -6614,6 +7068,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -6626,6 +7081,7 @@
         [
           [
             "label",
+            null,
             "positional",
             true,
             0
@@ -6638,6 +7094,7 @@
         [
           [
             "other",
+            null,
             "positional",
             true,
             0
@@ -6650,6 +7107,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -6667,6 +7125,7 @@
         [
           [
             "self",
+            null,
             "positional",
             true,
             0
@@ -6684,6 +7143,7 @@
         [
           [
             "path",
+            null,
             "positional",
             true,
             0
@@ -7812,6 +8272,372 @@
       ]
     ]
   },
+  "sample.swift": {
+    "chunks": [
+      [
+        "module",
+        null,
+        null,
+        null,
+        0,
+        19,
+        1,
+        1,
+        0,
+        "55aac2c2aa641984",
+        "c73205f94b11191b",
+        "eaa685f77a08d27c",
+        "45ef1289ec01db79",
+        "60fcc1f4fee755af"
+      ],
+      [
+        "class",
+        "Greeter",
+        "Greeter",
+        null,
+        19,
+        39,
+        3,
+        3,
+        0,
+        "930433ae03fa46c3",
+        "7de47bb6d33fadc9",
+        "93635e7347ee4757",
+        "2c80e9540dfdc1be",
+        "df885570fbdee35b"
+      ],
+      [
+        "property",
+        "name",
+        "Greeter.name",
+        "Greeter",
+        39,
+        55,
+        4,
+        4,
+        0,
+        "133f01d51e7a6c47",
+        "a7335da9ed22e82f",
+        "acd1be404eaa25c5",
+        "7864627a6a4d9593",
+        "c2f52d9c701dc642"
+      ],
+      [
+        "constructor",
+        "init",
+        "Greeter.init",
+        "Greeter",
+        61,
+        112,
+        6,
+        8,
+        0,
+        "901886c8183731bd",
+        "a79a24bdce3b8d74",
+        "f3595b554d11d95c",
+        "4359252e11149e2a",
+        "158839fc3aaa5167"
+      ],
+      [
+        "method",
+        "greet",
+        "Greeter.greet",
+        "Greeter",
+        118,
+        176,
+        10,
+        12,
+        0,
+        "18a0f42e19bd0399",
+        "f3bcfaec3f5dcd2a",
+        "f8834e983fa75975",
+        "3b7c49a8a741114d",
+        "08c63a57fa9dc3db"
+      ],
+      [
+        "function",
+        "topLevel",
+        "topLevel",
+        null,
+        180,
+        255,
+        15,
+        17,
+        0,
+        "265dcd3e6fda796e",
+        "4115dc691b3c8eaa",
+        "49fc2e6a7a8fc5ed",
+        "87de49c8b5b6253a",
+        "8e2c291a35ef5590"
+      ],
+      [
+        "class",
+        "Point",
+        "Point",
+        null,
+        257,
+        276,
+        19,
+        19,
+        0,
+        "0264d45a412562f0",
+        "6e3ae64a5483dc2b",
+        "658901b843c9c52b",
+        "294252e9a3854675",
+        "98bc46b59c478eca"
+      ],
+      [
+        "property",
+        "x",
+        "Point.x",
+        "Point",
+        276,
+        286,
+        20,
+        20,
+        0,
+        "a6cbbf5d56a7061c",
+        "8fe50a25d603058e",
+        "0a42d015bf0ed131",
+        "b0b5dc949cba8eb9",
+        "c0d7ee5a0eae2903"
+      ],
+      [
+        "property",
+        "y",
+        "Point.y",
+        "Point",
+        291,
+        301,
+        21,
+        21,
+        0,
+        "c8267f6dbd52ad0f",
+        "e6710c733e2251ed",
+        "5c9ccf516a89ce05",
+        "63a6b23300da52ff",
+        "e210f7f52ba48751"
+      ],
+      [
+        "interface",
+        "Runnable",
+        "Runnable",
+        null,
+        305,
+        329,
+        24,
+        24,
+        0,
+        "63fba1421ef3ba5c",
+        "a881849fd67a10b3",
+        "0598f4eadc16e923",
+        "a5855b520e709348",
+        "6c8699eccb56fed2"
+      ],
+      [
+        "method",
+        "run",
+        "Runnable.run",
+        "Runnable",
+        329,
+        339,
+        25,
+        25,
+        0,
+        "695ccf3782bdf83a",
+        "ab5e0462a274b615",
+        "069a8fa9750e844c",
+        "db82136715e3f79c",
+        "f3bedfe3382febd7"
+      ]
+    ],
+    "declarations": [
+      [
+        "Greeter",
+        "class",
+        []
+      ],
+      [
+        "Greeter.name",
+        "property",
+        []
+      ],
+      [
+        "Greeter.init",
+        "constructor",
+        [
+          [
+            "name",
+            null,
+            "positional",
+            true,
+            0
+          ]
+        ]
+      ],
+      [
+        "Greeter.greet",
+        "method",
+        []
+      ],
+      [
+        "topLevel",
+        "function",
+        [
+          [
+            "first",
+            null,
+            "positional",
+            true,
+            0
+          ],
+          [
+            "second",
+            null,
+            "positional",
+            true,
+            1
+          ]
+        ]
+      ],
+      [
+        "Point",
+        "class",
+        []
+      ],
+      [
+        "Point.x",
+        "property",
+        []
+      ],
+      [
+        "Point.y",
+        "property",
+        []
+      ],
+      [
+        "Runnable",
+        "interface",
+        []
+      ],
+      [
+        "Runnable.run",
+        "method",
+        []
+      ]
+    ],
+    "has_errors": false,
+    "references": [
+      [
+        "import",
+        "Foundation",
+        "Foundation",
+        "Foundation",
+        null,
+        null,
+        0,
+        17,
+        null,
+        null
+      ],
+      [
+        "read",
+        "String",
+        "String",
+        null,
+        null,
+        null,
+        72,
+        78,
+        "Greeter.init",
+        null
+      ],
+      [
+        "write",
+        "self.name",
+        "self.name",
+        null,
+        null,
+        null,
+        90,
+        99,
+        "Greeter.init",
+        null
+      ],
+      [
+        "read",
+        "name",
+        "name",
+        null,
+        null,
+        null,
+        102,
+        106,
+        "Greeter.init",
+        null
+      ],
+      [
+        "read",
+        "name",
+        "name",
+        null,
+        null,
+        null,
+        166,
+        170,
+        "Greeter.greet",
+        null
+      ],
+      [
+        "read",
+        "Int",
+        "Int",
+        null,
+        null,
+        null,
+        201,
+        204,
+        "topLevel",
+        null
+      ],
+      [
+        "read",
+        "Int",
+        "Int",
+        null,
+        null,
+        null,
+        214,
+        217,
+        "topLevel",
+        null
+      ],
+      [
+        "read",
+        "first",
+        "first",
+        null,
+        null,
+        null,
+        239,
+        244,
+        "topLevel",
+        null
+      ],
+      [
+        "read",
+        "second",
+        "second",
+        null,
+        null,
+        null,
+        247,
+        253,
+        "topLevel",
+        null
+      ]
+    ]
+  },
   "sample.tf": {
     "chunks": [
       [
@@ -7861,6 +8687,419 @@
     ],
     "has_errors": false,
     "references": []
+  },
+  "sample.xml": {
+    "chunks": [
+      [
+        "module",
+        null,
+        null,
+        null,
+        0,
+        39,
+        1,
+        1,
+        0,
+        "12c29731e40adc0c",
+        "a4718f49d3b54bbe",
+        "04ff5cb26b3150f5",
+        "29032f76f5f205d5",
+        "97c4bec8289cba67"
+      ],
+      [
+        "object",
+        "catalog",
+        "catalog",
+        null,
+        39,
+        53,
+        2,
+        2,
+        0,
+        "9d44e7edcf1cfad3",
+        "4cc2c0a82ae495b4",
+        "605f7101d5b9f911",
+        "0ca99022eda9be9b",
+        "15f19a53da2f0c43"
+      ],
+      [
+        "object",
+        "book",
+        "catalog.book",
+        "catalog",
+        53,
+        141,
+        3,
+        6,
+        0,
+        "277365a942af0a3c",
+        "2ed8de560dba4d0a",
+        "973bedf16981718c",
+        "35a2acb81a21babe",
+        "9f37624b20d8b11c"
+      ],
+      [
+        "object",
+        "book",
+        "catalog.book",
+        "catalog",
+        146,
+        202,
+        7,
+        9,
+        0,
+        "e09906a5bcaa9a84",
+        "fad6e9be5d2732ee",
+        "6181dc2265f16ecd",
+        "35a2acb81a21babe",
+        "9f37624b20d8b11c"
+      ]
+    ],
+    "declarations": [],
+    "has_errors": false,
+    "references": []
+  },
+  "sample.zig": {
+    "chunks": [
+      [
+        "constant",
+        "std",
+        "std",
+        null,
+        0,
+        27,
+        1,
+        1,
+        0,
+        "1d44e83b6beb87a8",
+        "49724865777abe87",
+        "7faf68bccf6e01a0",
+        "66efe889fef4abcb",
+        "21e8699625946561"
+      ],
+      [
+        "constant",
+        "store",
+        "store",
+        null,
+        28,
+        63,
+        2,
+        2,
+        0,
+        "49240f53129c2d8b",
+        "be0ef5ab1b5fc931",
+        "72929930d8450208",
+        "acc05ad052a06110",
+        "c25d3f9587b207e8"
+      ],
+      [
+        "constant",
+        "Point",
+        "Point",
+        null,
+        65,
+        92,
+        4,
+        4,
+        0,
+        "37de2b6e3379704c",
+        "5e3716fb76594add",
+        "ce5f9832db219520",
+        "54a1cb5c7d581cef",
+        "e9e80b625c611828"
+      ],
+      [
+        "property",
+        "x",
+        "Point.x",
+        "Point",
+        92,
+        98,
+        5,
+        5,
+        0,
+        "1ded94992e4ced53",
+        "4e5a38ebf7e870ec",
+        "d330a49651e0b33d",
+        "682ea349b41cbe89",
+        "5e964a390d2a5c60"
+      ],
+      [
+        "property",
+        "y",
+        "Point.y",
+        "Point",
+        104,
+        110,
+        6,
+        6,
+        0,
+        "a4cbcc4a0f2f5796",
+        "f8bc82d4c0d2af55",
+        "2ee0c1cc5580fc12",
+        "bd66c72a9cf8b698",
+        "b547dd3bd4e03e05"
+      ],
+      [
+        "constant",
+        "VERSION",
+        "VERSION",
+        null,
+        116,
+        139,
+        9,
+        9,
+        0,
+        "e9f9424b3269a988",
+        "11173a8ba8d70726",
+        "e364dc809cf5fb4a",
+        "058db8f86179e3a8",
+        "7aa7ecf36df1c9d1"
+      ],
+      [
+        "module",
+        null,
+        null,
+        null,
+        139,
+        145,
+        9,
+        11,
+        0,
+        "ff299bc23679753b",
+        "e58c1d9cd063d9a5",
+        "ca08b649831b3723",
+        "788ec2c2a91de6ea",
+        "bef31c993ff8be1a"
+      ],
+      [
+        "function",
+        "add",
+        "add",
+        null,
+        145,
+        193,
+        11,
+        13,
+        0,
+        "21f3c9b45e55c7d2",
+        "03412e5345502d89",
+        "8798d4169a4fd353",
+        "f545f42445370054",
+        "008c4567337a8e54"
+      ],
+      [
+        "function",
+        "basic",
+        "basic",
+        null,
+        195,
+        255,
+        15,
+        17,
+        0,
+        "b0aab3d410bd01ce",
+        "4bc2590ac9c4f516",
+        "2d45a07febfe47bc",
+        "12fd31d3111e6b6d",
+        "27d1ee08487ab163"
+      ]
+    ],
+    "declarations": [
+      [
+        "std",
+        "constant",
+        []
+      ],
+      [
+        "store",
+        "constant",
+        []
+      ],
+      [
+        "Point",
+        "constant",
+        []
+      ],
+      [
+        "Point.x",
+        "property",
+        []
+      ],
+      [
+        "Point.y",
+        "property",
+        []
+      ],
+      [
+        "VERSION",
+        "constant",
+        []
+      ],
+      [
+        "add",
+        "function",
+        [
+          [
+            "a",
+            null,
+            "positional",
+            true,
+            0
+          ],
+          [
+            "b",
+            null,
+            "positional",
+            true,
+            1
+          ]
+        ]
+      ],
+      [
+        "basic",
+        "function",
+        []
+      ]
+    ],
+    "has_errors": false,
+    "references": [
+      [
+        "call",
+        "@import",
+        "@import",
+        null,
+        null,
+        null,
+        12,
+        19,
+        "std",
+        null
+      ],
+      [
+        "import",
+        "std",
+        "std",
+        "std",
+        null,
+        "std",
+        12,
+        19,
+        "std",
+        null
+      ],
+      [
+        "call",
+        "@import",
+        "@import",
+        null,
+        null,
+        null,
+        42,
+        49,
+        "store",
+        null
+      ],
+      [
+        "import",
+        "store",
+        "store",
+        "store.zig",
+        null,
+        "store",
+        42,
+        49,
+        "store",
+        null
+      ],
+      [
+        "export",
+        "add",
+        "add",
+        null,
+        null,
+        null,
+        148,
+        151,
+        "add",
+        null
+      ],
+      [
+        "read",
+        "a",
+        "a",
+        null,
+        null,
+        null,
+        185,
+        186,
+        "add",
+        null
+      ],
+      [
+        "read",
+        "b",
+        "b",
+        null,
+        null,
+        null,
+        189,
+        190,
+        "add",
+        null
+      ],
+      [
+        "read",
+        "std",
+        "std",
+        null,
+        null,
+        null,
+        218,
+        221,
+        "basic",
+        null
+      ],
+      [
+        "call",
+        "expect",
+        "expect",
+        null,
+        null,
+        null,
+        230,
+        236,
+        "basic",
+        [
+          1,
+          [],
+          false,
+          false,
+          null,
+          false
+        ]
+      ],
+      [
+        "call",
+        "add",
+        "add",
+        null,
+        null,
+        null,
+        237,
+        240,
+        "basic",
+        [
+          2,
+          [],
+          false,
+          false,
+          null,
+          false
+        ]
+      ]
+    ]
   },
   "schema.sql": {
     "chunks": [
@@ -8475,6 +9714,7 @@
         [
           [
             "other",
+            null,
             "positional",
             true,
             0
@@ -8497,12 +9737,14 @@
         [
           [
             "a",
+            null,
             "positional",
             true,
             0
           ],
           [
             "b",
+            null,
             "positional",
             true,
             1
@@ -8520,6 +9762,7 @@
         [
           [
             "label",
+            null,
             "positional",
             true,
             0
@@ -8532,6 +9775,7 @@
         [
           [
             "title,subtitle,onSave",
+            null,
             "positional",
             true,
             0
@@ -9253,6 +10497,7 @@
         [
           [
             "other",
+            null,
             "positional",
             true,
             0
@@ -9275,6 +10520,7 @@
         [
           [
             "value",
+            null,
             "positional",
             true,
             0
@@ -9297,12 +10543,14 @@
         [
           [
             "a",
+            null,
             "positional",
             true,
             0
           ],
           [
             "b",
+            null,
             "positional",
             true,
             1
@@ -9315,6 +10563,7 @@
         [
           [
             "title,subtitle,footnote",
+            null,
             "positional",
             true,
             0
@@ -9327,12 +10576,14 @@
         [
           [
             "handler",
+            null,
             "positional",
             true,
             0
           ],
           [
             "retries",
+            null,
             "positional",
             true,
             1
@@ -9974,12 +11225,14 @@
         [
           [
             "x",
+            null,
             "positional",
             true,
             0
           ],
           [
             "freq",
+            null,
             "positional",
             true,
             1
@@ -10214,6 +11467,7 @@
         [
           [
             "label,children",
+            null,
             "positional",
             true,
             0

@@ -73,6 +73,45 @@ def test_direct_python_import_alias_resolves_exactly(tmp_path: Path) -> None:
     assert call.snippet == "local"
 
 
+def test_kotlin_import_alias_resolves_exactly(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "other/Widget.kt": "package other\nclass Widget\n",
+            "main.kt": "import other.Widget as Alias\nfun build() { Alias() }\n",
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="other/Widget.kt", qualified_symbol="Widget")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "direct_import_alias"
+    assert call.snippet == "Alias"
+
+
+def test_zig_import_binding_resolves_namespace_call_exactly(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "helper.zig": "pub fn work() void {}\n",
+            "main.zig": (
+                'const helper = @import("helper.zig");\npub fn run() void { helper.work(); }\n'
+            ),
+        },
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="helper.zig", qualified_symbol="work")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.snippet == "work"
+
+
 def test_absolute_import_within_a_package_resolves_exactly(tmp_path: Path) -> None:
     """A same-package absolute import (`from mypkg.lib import answer`) written
     inside `mypkg/main.py` must anchor at the project root, not at `mypkg/`

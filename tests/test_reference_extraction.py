@@ -2358,3 +2358,311 @@ def test_gdshader_function_parameters_shape_rows() -> None:
         ("tint", "positional", True),
         ("result", "positional", True),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Kotlin structural references
+# ---------------------------------------------------------------------------
+
+
+def _kotlin_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.kt"), "kotlin", source.encode())
+
+
+def test_kotlin_extracts_import_shapes() -> None:
+    """Plain and wildcard imports produce one row each: the bound name (or
+    `*`) with the dotted module path."""
+    source = "package sample\n\nimport kotlin.math.max\nimport sample.store.*\n"
+
+    refs = {r.written_name: r for r in _kotlin_result(source).references if r.kind == "import"}
+
+    assert (refs["max"].module_path, refs["max"].imported_name) == ("kotlin.math.max", "max")
+    wildcard = refs["*"]
+    assert (wildcard.module_path, wildcard.imported_name) == ("sample.store", "*")
+
+
+def test_kotlin_import_alias_preserves_imported_and_local_names() -> None:
+    refs = [
+        reference
+        for reference in _kotlin_result("import other.Widget as Alias\n").references
+        if reference.kind == "import"
+    ]
+
+    assert len(refs) == 1
+    imported = refs[0]
+    assert (
+        imported.target_name,
+        imported.written_name,
+        imported.module_path,
+        imported.imported_name,
+        imported.alias,
+    ) == ("Widget", "Alias", "other.Widget", "Widget", "Alias")
+
+
+def test_kotlin_calls_member_access_and_shapes() -> None:
+    source = (
+        "fun run() {\n"
+        '    val g = Greeter("x")\n'
+        "    println(g.greet())\n"
+        "    val m = max(1, 2)\n"
+        "    connect(name = ping())\n"
+        "}\n"
+    )
+
+    result = _kotlin_result(source)
+    calls = {r.target_name: r for r in result.references if r.kind == "call"}
+
+    assert calls["Greeter"].receiver_text is None
+    assert calls["Greeter"].source_qualified_symbol == "run.g"
+    assert calls["Greeter"].call_shape is not None
+    assert calls["Greeter"].call_shape.positional_count == 1
+    assert calls["greet"].receiver_text == "g"
+    assert calls["greet"].source_qualified_symbol == "run"
+    assert calls["max"].call_shape is not None
+    assert calls["max"].call_shape.positional_count == 2
+    assert calls["connect"].call_shape is not None
+    assert calls["connect"].call_shape.keywords == ["name"]
+    assert calls["ping"].receiver_text is None
+
+    reads = {r.written_name for r in result.references if r.kind == "read"}
+    assert "g" in reads
+    # Declaration names are bindings, not reads (the `Greeter(...)` callee
+    # is owned by its call row, asserted above).
+    assert "run" not in reads
+    assert "Greeter" not in reads
+
+
+def test_kotlin_member_assignment_is_a_write() -> None:
+    result = _kotlin_result("fun update(value: Int) { this.count = value }\n")
+
+    writes = [reference for reference in result.references if reference.kind == "write"]
+
+    assert [(reference.written_name, reference.receiver_text) for reference in writes] == [
+        ("this.count", "this")
+    ]
+
+
+def test_kotlin_declaration_names_and_parameters_are_not_reads() -> None:
+    source = (
+        "class Greeter(val name: String) {\n"
+        "    fun greet(): String {\n"
+        '        return "hi " + name\n'
+        "    }\n"
+        "}\n"
+        "\n"
+        "fun topLevel(first: Int, second: Int = 1): Int = first\n"
+    )
+
+    result = _kotlin_result(source)
+    reads = [r.written_name for r in result.references if r.kind == "read"]
+
+    assert "Greeter" not in reads
+    assert "greet" not in reads
+    assert "topLevel" not in reads
+    assert "first" in reads
+    assert "name" in reads
+
+    declarations = {d.qualified_symbol: d for d in result.declarations}
+    top = [(p.name, p.kind, p.required) for p in declarations["topLevel"].parameters]
+    assert top == [("first", "positional", True), ("second", "positional", False)]
+
+
+# ---------------------------------------------------------------------------
+# Swift structural references
+# ---------------------------------------------------------------------------
+
+
+def _swift_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.swift"), "swift", source.encode())
+
+
+def test_swift_extracts_imports_calls_and_labels() -> None:
+    """Module imports bind the module name; argument labels land in the call
+    shape keywords instead of leaking as reads."""
+    source = (
+        "import Foundation\n"
+        "\n"
+        "func run() {\n"
+        '    let g = Greeter(name: "x")\n'
+        "    print(g.greet())\n"
+        "}\n"
+    )
+
+    result = _swift_result(source)
+    imports = [r for r in result.references if r.kind == "import"]
+    assert [(r.written_name, r.module_path) for r in imports] == [("Foundation", "Foundation")]
+
+    calls = {r.target_name: r for r in result.references if r.kind == "call"}
+    assert calls["Greeter"].call_shape is not None
+    assert calls["Greeter"].call_shape.keywords == ["name"]
+    assert calls["greet"].receiver_text == "g"
+
+    reads = [r.written_name for r in result.references if r.kind == "read"]
+    assert "g" in reads
+    assert "name" not in reads  # the argument label is not a value read
+
+
+@pytest.mark.parametrize(
+    ("language", "suffix", "source"),
+    [
+        ("kotlin", "kt", 'fun run() { accept { println("x") } }\n'),
+        ("swift", "swift", 'func run() { accept { print("x") } }\n'),
+    ],
+)
+def test_trailing_closure_counts_as_a_positional_argument(
+    language: str, suffix: str, source: str
+) -> None:
+    result = TreeSitterExtractor().extract(Path(f"sample.{suffix}"), language, source.encode())
+    call = next(reference for reference in result.references if reference.target_name == "accept")
+
+    assert call.call_shape is not None
+    assert call.call_shape.positional_count == 1
+
+
+def test_swift_declaration_names_are_not_reads() -> None:
+    source = (
+        "class Greeter {\n"
+        "    let label: String\n"
+        "\n"
+        "    init(label: String) {\n"
+        "        self.label = label\n"
+        "    }\n"
+        "\n"
+        "    func greet() -> String {\n"
+        '        return "hi"\n'
+        "    }\n"
+        "}\n"
+    )
+
+    result = _swift_result(source)
+    reads = [r.written_name for r in result.references if r.kind == "read"]
+
+    assert "Greeter" not in reads
+    assert "greet" not in reads
+    assert "init" not in reads
+    assert "label" in reads  # the init body's use of the parameter
+
+    declarations = {d.qualified_symbol: d for d in result.declarations}
+    init = [(p.name, p.kind, p.required) for p in declarations["Greeter.init"].parameters]
+    assert init == [("label", "positional", True)]
+
+
+def test_swift_parameter_shapes_preserve_external_labels() -> None:
+    source = "func greet(to person: String, _ count: Int, name: String) {}\n"
+
+    declaration = _swift_result(source).declarations[0]
+
+    assert [
+        (parameter.name, parameter.model_dump().get("call_name"))
+        for parameter in declaration.parameters
+    ] == [
+        ("person", "to"),
+        ("count", "_"),
+        ("name", None),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Zig structural references
+# ---------------------------------------------------------------------------
+
+
+def _zig_result(source: str):
+    return TreeSitterExtractor().extract(Path("sample.zig"), "zig", source.encode())
+
+
+def test_zig_extracts_imports_with_module_paths() -> None:
+    """`@import("...")` produces a call row plus an import row carrying the
+    path; bare module names like `"std"` resolve to nothing local."""
+    source = 'const std = @import("std");\nconst helper = @import("helper.zig");\n'
+
+    refs = [r for r in _zig_result(source).references if r.kind == "import"]
+    by_module = {r.module_path: r for r in refs}
+
+    assert (by_module["std"].target_name, by_module["std"].written_name) == ("std", "std")
+    helper = by_module["helper.zig"]
+    assert (helper.target_name, helper.written_name, helper.alias) == (
+        "helper",
+        "helper",
+        "helper",
+    )
+
+
+def test_zig_calls_carry_receivers_and_shapes() -> None:
+    source = (
+        "pub fn run() void {\n"
+        "    const s = load(3);\n"
+        "    try std.testing.expect(s.limit == 3);\n"
+        "}\n"
+    )
+
+    result = _zig_result(source)
+    calls = {r.target_name: r for r in result.references if r.kind == "call"}
+
+    assert calls["load"].receiver_text is None
+    assert calls["load"].call_shape is not None
+    assert calls["load"].call_shape.positional_count == 1
+    assert calls["expect"].receiver_text == "std.testing"
+
+    member = next(r for r in result.references if r.kind == "read" and "." in r.target_name)
+    assert member.target_name == "s.limit"
+    assert member.receiver_text == "s"
+
+
+@pytest.mark.parametrize(
+    ("language", "suffix", "source", "written_name", "receiver"),
+    [
+        (
+            "swift",
+            "swift",
+            "func update(_ value: Int) { self.count = value }\n",
+            "self.count",
+            "self",
+        ),
+        (
+            "zig",
+            "zig",
+            "pub fn update(value: u32) void { state.count = value; }\n",
+            "state.count",
+            "state",
+        ),
+    ],
+)
+def test_wrapped_member_assignments_are_writes(
+    language: str, suffix: str, source: str, written_name: str, receiver: str
+) -> None:
+    result = TreeSitterExtractor().extract(Path(f"sample.{suffix}"), language, source.encode())
+
+    writes = [reference for reference in result.references if reference.kind == "write"]
+
+    assert [(reference.written_name, reference.receiver_text) for reference in writes] == [
+        (written_name, receiver)
+    ]
+
+
+def test_zig_declaration_names_and_field_keys_are_not_reads() -> None:
+    source = (
+        "const Store = struct {\n"
+        "    limit: u32,\n"
+        "};\n"
+        "\n"
+        "pub fn load(limit: u32) Store {\n"
+        "    return Store{ .limit = limit };\n"
+        "}\n"
+    )
+
+    result = _zig_result(source)
+    reads = [(r.written_name, r.start_byte) for r in result.references if r.kind == "read"]
+
+    assert "Store" in [name for name, _ in reads]  # the body's `Store{...}` use
+    assert "load" not in [name for name, _ in reads]
+    # The `.limit` field key is a binding; only the value reads.
+    assert [name for name, _ in reads].count("limit") == 1
+
+    type_uses = {r.target_name for r in result.references if r.kind == "type_use"}
+    assert "Store" in type_uses  # the `load` return type
+    assert "limit" not in type_uses
+
+    declarations = {d.qualified_symbol: d for d in result.declarations}
+    params = [(p.name, p.kind, p.required) for p in declarations["load"].parameters]
+    assert params == [("limit", "positional", True)]

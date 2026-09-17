@@ -388,6 +388,11 @@ def test_next_language_extensions_have_stable_language_names() -> None:
         ".hpp": "cpp",
         ".hxx": "cpp",
         ".lua": "lua",
+        ".kt": "kotlin",
+        ".kts": "kotlin",
+        ".zig": "zig",
+        ".swift": "swift",
+        ".xml": "xml",
     }
     assert all(LANGUAGES.get(extension) == language for extension, language in expected.items())
 
