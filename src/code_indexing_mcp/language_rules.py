@@ -606,6 +606,150 @@ _GDSHADER_RESERVED_WORDS: Final = frozenset(
 # the non-empty reserved-words invariant every structural language carries).
 _TERRAFORM_RESERVED_WORDS: Final = frozenset({"true", "false", "null"})
 
+# Kotlin hard keywords (soft keywords like `data` and `sealed` are valid
+# identifiers and stay renameable).
+_KOTLIN_RESERVED_WORDS: Final = frozenset(
+    {
+        "as",
+        "break",
+        "class",
+        "continue",
+        "do",
+        "else",
+        "false",
+        "for",
+        "fun",
+        "if",
+        "in",
+        "interface",
+        "is",
+        "null",
+        "object",
+        "package",
+        "return",
+        "super",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typealias",
+        "typeof",
+        "val",
+        "var",
+        "when",
+        "while",
+    }
+)
+
+# Swift keywords, including the contextual `self`/`Self`/`super` spellings
+# that never name a declaration.
+_SWIFT_RESERVED_WORDS: Final = frozenset(
+    {
+        "associatedtype",
+        "class",
+        "deinit",
+        "enum",
+        "extension",
+        "fileprivate",
+        "func",
+        "import",
+        "init",
+        "inout",
+        "internal",
+        "let",
+        "open",
+        "operator",
+        "private",
+        "precedencegroup",
+        "protocol",
+        "public",
+        "rethrows",
+        "self",
+        "Self",
+        "static",
+        "struct",
+        "subscript",
+        "super",
+        "throw",
+        "throws",
+        "try",
+        "typealias",
+        "var",
+        "break",
+        "case",
+        "catch",
+        "continue",
+        "default",
+        "defer",
+        "do",
+        "else",
+        "fallthrough",
+        "for",
+        "guard",
+        "if",
+        "in",
+        "repeat",
+        "return",
+        "switch",
+        "where",
+        "while",
+        "as",
+        "false",
+        "is",
+        "nil",
+        "true",
+    }
+)
+
+_ZIG_RESERVED_WORDS: Final = frozenset(
+    {
+        "addrspace",
+        "align",
+        "allowzero",
+        "and",
+        "anyframe",
+        "anytype",
+        "asm",
+        "async",
+        "await",
+        "break",
+        "callconv",
+        "catch",
+        "comptime",
+        "const",
+        "continue",
+        "defer",
+        "else",
+        "enum",
+        "errdefer",
+        "error",
+        "export",
+        "extern",
+        "fn",
+        "for",
+        "if",
+        "inline",
+        "linksection",
+        "or",
+        "orelse",
+        "packed",
+        "pub",
+        "resume",
+        "return",
+        "struct",
+        "suspend",
+        "switch",
+        "test",
+        "threadlocal",
+        "try",
+        "union",
+        "unreachable",
+        "usingnamespace",
+        "var",
+        "while",
+    }
+)
+
 
 def _csharp_identifier_valid(name: str) -> bool:
     body = name[1:] if name.startswith("@") else name
@@ -813,6 +957,25 @@ def _lua_require_candidates(
         stem.with_suffix(".lua"),
         stem / "init.lua",
     }
+
+
+def _zig_import_candidates(
+    source: PurePosixPath,
+    module_path: str,
+    known_paths: frozenset[str],
+    module_index: _ModuleIndex | None,
+) -> set[PurePosixPath]:
+    """Files a Zig `@import` of `module_path` could mean.
+
+    `@import` takes a path, not a symbol: relative imports (`"foo.zig"`,
+    `"./bar.zig"`) resolve against the importing file's directory first and
+    the project root second, mirroring the path-style branch of Lua's
+    `require`. Bare module names (`"std"`) never match an indexed file.
+    """
+    if "/" not in module_path and not module_path.endswith(".zig"):
+        return set()
+    stem = PurePosixPath(module_path)
+    return {source.parent / stem, PurePosixPath(stem)}
 
 
 def _gdscript_import_candidates(
@@ -1114,6 +1277,24 @@ LANGUAGE_RULES: Final[Mapping[str, _LanguageRules]] = {
         reserved_words=_GDSHADER_RESERVED_WORDS,
         identifier_valid=lambda name: name.isidentifier() and name not in _GDSHADER_RESERVED_WORDS,
         import_candidates=_empty_import_candidates,
+    ),
+    "kotlin": _LanguageRules(
+        import_owner_parents=frozenset({"import_header", "package_header"}),
+        reserved_words=_KOTLIN_RESERVED_WORDS,
+        identifier_valid=lambda name: name.isidentifier() and name not in _KOTLIN_RESERVED_WORDS,
+        import_candidates=_empty_import_candidates,
+    ),
+    "swift": _LanguageRules(
+        import_owner_parents=frozenset({"import_declaration"}),
+        reserved_words=_SWIFT_RESERVED_WORDS,
+        identifier_valid=lambda name: name.isidentifier() and name not in _SWIFT_RESERVED_WORDS,
+        import_candidates=_empty_import_candidates,
+    ),
+    "zig": _LanguageRules(
+        function_and_type_parents=frozenset({"FnProto"}),
+        reserved_words=_ZIG_RESERVED_WORDS,
+        identifier_valid=lambda name: name.isidentifier() and name not in _ZIG_RESERVED_WORDS,
+        import_candidates=_zig_import_candidates,
     ),
     "csharp": _LanguageRules(
         import_owner_parents=frozenset({"using_directive", "attribute"}),

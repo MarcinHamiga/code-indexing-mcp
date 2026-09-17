@@ -40,6 +40,8 @@ SerializablePath = Annotated[Path, _PathAsPlainString()]
 # Version 8 adds C#, with namespace identity carried on export rows.
 # Version 9 adds C, C++, Lua, Terraform, SQL, GDScript, and GDShader, with
 # relational (table/column) references for SQL and traversal reads for HCL.
+# Version 10 adds Kotlin, Swift, and Zig, with XML indexed definitions-only
+# (no structural references, like YAML and JSON).
 #
 # Lives here rather than in indexing.py (originally its home) because
 # reference_service.py needs it too and importing it from indexing.py made
@@ -47,7 +49,7 @@ SerializablePath = Annotated[Path, _PathAsPlainString()]
 # docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
 # indexing.py re-exports the name for one release so nothing importing it from
 # there breaks.
-REFERENCE_SCHEMA_VERSION = 9
+REFERENCE_SCHEMA_VERSION = 10
 
 
 def content_digest(value: str | bytes) -> str:
@@ -108,6 +110,11 @@ DEFAULT_INCLUDES = [
     "**/*.hpp",
     "**/*.hxx",
     "**/*.lua",
+    "**/*.kt",
+    "**/*.kts",
+    "**/*.zig",
+    "**/*.swift",
+    "**/*.xml",
 ]
 
 # A repository-shipped marker is trusted input up to this point: a project.toml
@@ -203,6 +210,10 @@ LanguageName = Literal[
     "c",
     "cpp",
     "lua",
+    "kotlin",
+    "zig",
+    "swift",
+    "xml",
 ]
 
 

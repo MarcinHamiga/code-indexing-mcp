@@ -189,6 +189,8 @@ _PARAMETER_PARENTS: Final = frozenset(
         "closure_parameters",
         "inferred_parameters",
         "implicit_parameter",
+        "function_value_parameters",
+        "ParamDeclList",
     }
 )
 
@@ -238,10 +240,17 @@ def _languages() -> dict[str, Language]:
         # No standalone GDScript grammar is published to PyPI; the language pack
         # is the only packaged source. It already returns a Language, not a
         # PyCapsule, so it is not wrapped like the others. The two sibling Godot
-        # formats come from the same pack for the same reason.
+        # formats come from the same pack for the same reason. Kotlin, Zig,
+        # Swift, and XML have dedicated PyPI grammars but all four also ship
+        # in the pack, so they follow the same download-on-first-use path and
+        # add no new dependency.
         "gdscript": _pack_language("gdscript"),
         "gdshader": _pack_language("gdshader"),
         "godot_resource": _pack_language("godot_resource"),
+        "kotlin": _pack_language("kotlin"),
+        "zig": _pack_language("zig"),
+        "swift": _pack_language("swift"),
+        "xml": _pack_language("xml"),
         "yaml": Language(tree_sitter_yaml.language()),
         "json": Language(tree_sitter_json.language()),
     }
@@ -335,6 +344,9 @@ class TreeSitterExtractor:
             "sql": self._sql_records,
             "gdscript": self._gdscript_records,
             "gdshader": self._gdshader_records,
+            "kotlin": self._kotlin_records,
+            "swift": self._swift_records,
+            "zig": self._zig_records,
         }
         # Indexer holds one extractor and the daemon serves each client on its own
         # thread, so the lazy compile must not build two queries concurrently. Same
@@ -608,6 +620,123 @@ class TreeSitterExtractor:
                 if len(siblings) >= 2 and siblings[1] == node:
                     return
                 excluded_fields = ()
+            elif (
+                language in {"kotlin", "swift"}
+                and current is node
+                and parent.type
+                in {
+                    "function_declaration",
+                    "protocol_function_declaration",
+                    "class_declaration",
+                    "protocol_declaration",
+                    "object_declaration",
+                    "type_alias",
+                    "variable_declaration",
+                    "enum_entry",
+                    "parameter",
+                }
+            ):
+                # Declaration names the shared field-based branches cannot
+                # cut: Kotlin names no `name` field at all. The declared
+                # name is the only DIRECT identifier child -- receiver
+                # types, type parameters, value parameters, and return
+                # types all nest a level deeper -- so any direct
+                # `simple_identifier`/`type_identifier` is the name, even
+                # with a receiver (`fun String.greet`) or type parameters
+                # (`fun <T> identity`) in front of it. `current is node`
+                # keeps this to the identifier's immediate parent: the
+                # climb revisits ancestors for deeper reads, which must
+                # survive (the method_name_field_excluded branch above
+                # needs the same guard for the same reason).
+                if node.type in {"simple_identifier", "type_identifier"}:
+                    return
+                excluded_fields = ()
+            elif language == "swift" and current is node and parent.type == "pattern":
+                # `let name: String`: the bound name is the first name in
+                # the pattern. (Later names in a tuple pattern stay reads;
+                # destructuring is not modeled for Swift.)
+                if _first_named_child(parent) == node:
+                    return
+                excluded_fields = ()
+            elif (
+                language in {"kotlin", "swift"}
+                and current is node
+                and parent.type == "class_parameter"
+            ):
+                # `class Greeter(val name: String)`: the property name is
+                # the `simple_identifier` beside the type, with the
+                # `val`/`var` marker first so the gate above cannot see it.
+                if node.type == "simple_identifier":
+                    return
+                excluded_fields = ()
+            elif (
+                language in {"kotlin", "swift"}
+                and current is node
+                and parent.type == "navigation_suffix"
+            ):
+                # `foo.bar`: the member is owned by the handler's
+                # whole-span member row; the base keeps its read.
+                if _last_named_child(parent) == node:
+                    return
+                excluded_fields = ()
+            elif (
+                language in {"kotlin", "swift"}
+                and current is node
+                and parent.type == "value_argument_label"
+            ):
+                # A call-site argument label (`name:` in `Greeter(name:)`)
+                # is owned by the call shape's keyword row, never a read.
+                return
+            elif (
+                language == "zig"
+                and current is node
+                and parent.type in {"VarDecl", "ContainerField"}
+            ):
+                # `const Point = ...` / `x: i32`: the declared name is the
+                # first named child. (FnProto names cut through the
+                # `function` field in function_and_type_parents; parameter
+                # names through ParamDeclList.)
+                if _first_named_child(parent) == node:
+                    return
+                excluded_fields = ()
+            elif (
+                language == "zig"
+                and current is node
+                and parent.type == "FieldOrFnCall"
+                and node.type == "IDENTIFIER"
+            ):
+                # `.debug` in `std.debug`: the member is owned by the
+                # handler's whole-span member row (or the call row); the
+                # base keeps its read.
+                return
+            elif (
+                language == "zig"
+                and current is node
+                and parent.type == "FieldInit"
+                and node.type == "IDENTIFIER"
+            ):
+                # `Store{ .limit = value }`: the field key is a binding,
+                # not a read -- the `field_initializer` branch's rule for
+                # other grammars. The value keeps its read.
+                if _first_named_child(parent) == node:
+                    return
+                excluded_fields = ()
+            elif (
+                language == "zig"
+                and current is node
+                and parent.type == "SuffixExpr"
+                and node.type == "IDENTIFIER"
+                and _first_named_child(parent) == node
+                and any(
+                    child.type == "FnCallArguments"
+                    for child in parent.named_children
+                    if not child.is_extra
+                )
+            ):
+                # A bare call's callee (`add` in `add(1, 2)`) is owned by
+                # the handler's call row, mirroring the fieldless-call cut
+                # in the shared `call_expression` branch below.
+                return
             elif parent.type in _POSITIONAL_CLIMB_PARENTS:
                 if parent.type == "type_definition":
                     # C `typedef int myint`: the alias is the trailing name;
@@ -963,7 +1092,11 @@ class TreeSitterExtractor:
         rules = LANGUAGE_RULES.get(language, _DEFAULT)
         rows: list[ParameterShape] = []
         keyword_only = False
-        for child in parameters.named_children:
+        # Swift names no parameter-list wrapper, so its reference query
+        # captures each bare `parameter` and one is a single slot -- the
+        # per-child logic below already resolves such a node to one shape.
+        slots = [parameters] if parameters.type == "parameter" else list(parameters.named_children)
+        for child in slots:
             if child.type == "positional_separator":
                 rows = [
                     row.model_copy(update={"kind": "positional_only"})
@@ -1094,6 +1227,7 @@ class TreeSitterExtractor:
                 or child.child_by_field_name("right") is not None
                 or child.type == "optional_parameter_declaration"
                 or any(not item.is_named and item.type == "=" for item in child.children)
+                or TreeSitterExtractor._has_list_level_default(child)
             )
             required = not default and child.type != "optional_parameter"
             if rules.variadic_is_optional and kind == "variadic":
@@ -1111,11 +1245,42 @@ class TreeSitterExtractor:
                 keyword_only = True
         return rows
 
+    @staticmethod
+    def _has_list_level_default(slot: Node) -> bool:
+        """Whether a bare `=` follows *slot* before the next named sibling.
+
+        Some grammars hang a default's `=` beside the parameter instead of
+        under it (Kotlin `second: Int = 1` leaves the `=` as a direct child
+        of `function_value_parameters`), so the under-node checks above
+        cannot see it. A bare `=` at parameter-list level always introduces
+        the preceding slot's default; any other sibling (`,`, `)`, the next
+        slot, or the default value itself) ends the search first.
+        """
+        parent = slot.parent
+        if parent is None:
+            return False
+        siblings = parent.children
+        for index, sibling in enumerate(siblings):
+            if sibling.id != slot.id:
+                continue
+            for rest in siblings[index + 1 :]:
+                if rest.is_extra:
+                    continue
+                if not rest.is_named:
+                    if rest.type == "=":
+                        return True
+                else:
+                    return False
+            return False
+        return False
+
     # Node types that hold a genuine positional/keyword argument list. Anything
     # else reachable through the `arguments` field (a tagged template's
     # `template_string`, a `new` with no parens at all) is not a positional arg
     # list and must not have its children miscounted as one (E4).
-    _ARGUMENT_LIST_TYPES: Final = frozenset({"arguments", "argument_list", "function_arguments"})
+    _ARGUMENT_LIST_TYPES: Final = frozenset(
+        {"arguments", "argument_list", "function_arguments", "value_arguments", "FnCallArguments"}
+    )
 
     @staticmethod
     def _call_shape(node: Node) -> CallShape:
@@ -1153,6 +1318,28 @@ class TreeSitterExtractor:
                     name = argument.child_by_field_name("name")
                     if name is not None:
                         keywords.append((name.text or b"").decode("utf-8"))
+                elif argument.type == "value_argument":
+                    # Kotlin/Swift named argument (`name = "y"`, or Swift's
+                    # `label: value` spelling where the label wraps in a
+                    # `value_argument_label`): the name is the leading
+                    # identifier before a bare `=`/`:` -- mirroring the E8
+                    # rule in _one_parameter_list that a bare `=` under the
+                    # node marks the default. Unnamed arguments stay
+                    # positional.
+                    first = _first_named_child(argument)
+                    if first is not None and first.type == "value_argument_label":
+                        first = _first_named_child(first)
+                    if (
+                        first is not None
+                        and first.type == "simple_identifier"
+                        and any(
+                            not item.is_named and item.type in {"=", ":"}
+                            for item in argument.children
+                        )
+                    ):
+                        keywords.append((first.text or b"").decode("utf-8"))
+                    else:
+                        positional_count += 1
                 else:
                     positional_count += 1
         elif arguments is not None and arguments.type == "generator_expression":
@@ -3740,6 +3927,324 @@ class TreeSitterExtractor:
             named = [child for child in node.named_children if not child.is_extra]
             for type_node in named[:-1]:
                 self._c_emit_type_uses(type_node, source, add_reference)
+
+    @staticmethod
+    def _navigation_callee(node: Node, source: bytes) -> tuple[Node, str | None]:
+        """Split a `foo.bar.baz` chain into its callee leaf and qualifier.
+
+        Returns the deepest member leaf and the dotted qualifier (`foo.bar`),
+        or the node itself with no qualifier when it is already a leaf.
+        Shared by the Kotlin and Swift handlers, whose grammars spell member
+        access identically (`navigation_expression`/`navigation_suffix`).
+        """
+        current = node
+        while current.type == "navigation_expression":
+            named = [child for child in current.named_children if not child.is_extra]
+            if not named:
+                break
+            last = named[-1]
+            if last.type != "navigation_suffix":
+                current = last
+                continue
+            inner = [child for child in last.named_children if not child.is_extra]
+            if not inner:
+                break
+            current = inner[-1]
+            break
+        if current == node:
+            return node, None
+        full = _capture_name(source, node)
+        name = _capture_name(source, current)
+        qualifier = full[: len(full) - len(name)].rstrip(".")
+        return current, qualifier or None
+
+    def _kotlin_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "import_header":
+            identifier = next(
+                (
+                    child
+                    for child in node.named_children
+                    if not child.is_extra and child.type == "identifier"
+                ),
+                None,
+            )
+            if identifier is None:
+                return
+            module_path = _capture_name(source, identifier)
+            if any(child.type == "wildcard_import" for child in node.children):
+                # On-demand imports bind every name in the package without a
+                # local spelling -- wildcard semantics, mirroring Java.
+                add_reference(
+                    "import",
+                    node,
+                    target_name="*",
+                    written_name="*",
+                    module_path=module_path,
+                    imported_name="*",
+                    alias=None,
+                )
+                return
+            imported = module_path.rsplit(".", 1)[-1]
+            add_reference(
+                "import",
+                node,
+                target_name=imported,
+                written_name=imported,
+                module_path=module_path,
+                imported_name=imported,
+                alias=None,
+            )
+        elif node.type == "call_expression":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named:
+                return
+            callee, qualifier = TreeSitterExtractor._navigation_callee(named[0], source)
+            suffix = next(
+                (child for child in named if child.type in {"call_suffix", "call_suffix_no_args"}),
+                node,
+            )
+            add_reference(
+                "call",
+                callee,
+                target_name=_capture_name(source, callee),
+                written_name=_capture_name(source, callee),
+                receiver_text=qualifier,
+                call_shape=self._call_shape(suffix),
+            )
+        elif node.type == "navigation_expression":
+            parent = node.parent
+            if parent is not None and parent.type == "call_expression":
+                siblings = [child for child in parent.named_children if not child.is_extra]
+                if siblings and siblings[0] == node:
+                    # The call row above already owns this span.
+                    return
+            self._emit_member_access(node, source, add_reference)
+
+    def _swift_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "import_declaration":
+            identifier = next(
+                (
+                    child
+                    for child in node.named_children
+                    if not child.is_extra and child.type == "identifier"
+                ),
+                None,
+            )
+            if identifier is None:
+                return
+            module_path = _capture_name(source, identifier)
+            # A Swift import binds the whole module (a namespace), never a
+            # single symbol -- mirroring Go package imports.
+            add_reference(
+                "import",
+                node,
+                target_name=module_path,
+                written_name=module_path,
+                module_path=module_path,
+                imported_name=None,
+                alias=None,
+            )
+        elif node.type == "call_expression":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named:
+                return
+            callee, qualifier = TreeSitterExtractor._navigation_callee(named[0], source)
+            suffix = next(
+                (child for child in named if child.type in {"call_suffix", "call_suffix_no_args"}),
+                node,
+            )
+            add_reference(
+                "call",
+                callee,
+                target_name=_capture_name(source, callee),
+                written_name=_capture_name(source, callee),
+                receiver_text=qualifier,
+                call_shape=self._call_shape(suffix),
+            )
+        elif node.type == "navigation_expression":
+            parent = node.parent
+            if parent is not None and parent.type == "call_expression":
+                siblings = [child for child in parent.named_children if not child.is_extra]
+                if siblings and siblings[0] == node:
+                    # The call row above already owns this span.
+                    return
+            self._emit_member_access(node, source, add_reference)
+
+    def _zig_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        if node.type == "BUILTINIDENTIFIER":
+            if _capture_name(source, node) != "@import":
+                return
+            parent = node.parent
+            if parent is None:
+                return
+            arguments = next(
+                (
+                    child
+                    for child in parent.named_children
+                    if not child.is_extra and child.type == "FnCallArguments"
+                ),
+                None,
+            )
+            module_path = TreeSitterExtractor._zig_string_argument(arguments, source)
+            add_reference(
+                "call",
+                node,
+                target_name="@import",
+                written_name="@import",
+            )
+            if module_path is not None:
+                # An import binds the file's namespace to the `const` on its
+                # left, never a single symbol -- mirroring Go package imports.
+                add_reference(
+                    "import",
+                    node,
+                    target_name=module_path,
+                    written_name=module_path,
+                    module_path=module_path,
+                    imported_name=None,
+                    alias=None,
+                )
+        elif node.type == "FieldOrFnCall":
+            arguments = next(
+                (
+                    child
+                    for child in node.named_children
+                    if not child.is_extra and child.type == "FnCallArguments"
+                ),
+                None,
+            )
+            if arguments is None:
+                return
+            member = next(
+                (
+                    child
+                    for child in node.named_children
+                    if not child.is_extra and child.type == "IDENTIFIER"
+                ),
+                None,
+            )
+            if member is None:
+                return
+            parent = node.parent
+            receiver = None
+            if parent is not None and parent.type == "SuffixExpr":
+                prefix = _capture_name(source, parent)[
+                    : node.start_byte - parent.start_byte
+                ].rstrip(".")
+                receiver = prefix or None
+            add_reference(
+                "call",
+                member,
+                target_name=_capture_name(source, member),
+                written_name=_capture_name(source, member),
+                receiver_text=receiver,
+                call_shape=self._call_shape(node),
+            )
+        elif node.type == "SuffixExpr":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named or named[0].type == "BUILTINIDENTIFIER":
+                # `@import("...")` is owned by the import row; a bare
+                # builtin takes no member row.
+                return
+            direct_arguments = next(
+                (child for child in named if child.type == "FnCallArguments"),
+                None,
+            )
+            if direct_arguments is not None and named[0].type == "IDENTIFIER":
+                # A bare call (`add(1, 2)`): the callee is the head
+                # identifier with no receiver.
+                add_reference(
+                    "call",
+                    named[0],
+                    target_name=_capture_name(source, named[0]),
+                    written_name=_capture_name(source, named[0]),
+                    call_shape=self._call_shape(node),
+                )
+                return
+            if any(
+                child.type == "FieldOrFnCall"
+                and any(
+                    grandchild.type == "FnCallArguments"
+                    for grandchild in child.named_children
+                    if not grandchild.is_extra
+                )
+                for child in named
+            ):
+                # A member call in the chain owns its span through the
+                # FieldOrFnCall call row.
+                return
+            self._emit_member_access(node, source, add_reference)
+        elif node.type in {"VarDecl", "FnProto", "ParamDecl", "ContainerField"}:
+            self._zig_emit_type_uses(node, source, add_reference)
+
+    @staticmethod
+    def _zig_string_argument(node: Node | None, source: bytes) -> str | None:
+        """The quote-stripped path of an `@import("...")` call."""
+        if node is None:
+            return None
+        stack = list(node.named_children)
+        while stack:
+            current = stack.pop()
+            if current.is_extra:
+                continue
+            if current.type == "STRINGLITERALSINGLE":
+                return _capture_name(source, current).strip("'\"")
+            stack.extend(current.named_children)
+        return None
+
+    @staticmethod
+    def _zig_emit_type_uses(node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+        """Emit `type_use` rows for a declaration's type annotations only.
+
+        Only the annotation subtrees are descended: the declared name, the
+        initializer value, and (for FnProto) the body sibling are never
+        entered, so a value like `@import("std")` or a call in a default
+        cannot leak in as a type. Zig builtin types (`i32`, `void`) parse
+        as BuildinTypeExpr rather than IDENTIFIER, so descending to
+        IDENTIFIER leaves naturally skips them the way Go's keyword-typed
+        basics never reach its own descent.
+        """
+        roots: list[Node] = []
+        if node.type == "VarDecl":
+            # `const NAME (":" TYPE)? ("=" VALUE)?`: the type is the
+            # ErrorUnionExpr between `:` and `=`. Without a colon the
+            # declaration is unannotated and owns no type row.
+            seen_colon = False
+            for child in node.children:
+                if not child.is_named:
+                    if child.type == ":":
+                        seen_colon = True
+                    elif child.type == "=":
+                        break
+                elif seen_colon and child.type == "ErrorUnionExpr":
+                    roots.append(child)
+                    break
+        elif node.type == "FnProto":
+            # The parameter list is owned by the ParamDecl captures; only
+            # the return type (everything after the ParamDeclList) is
+            # descended here, never the declared name.
+            named = [child for child in node.named_children if not child.is_extra]
+            seen_params = False
+            for child in named:
+                if child.type == "ParamDeclList":
+                    seen_params = True
+                elif seen_params:
+                    roots.append(child)
+        else:
+            # ParamDecl and ContainerField: the name is the first named
+            # child; everything after it is type (and default) position.
+            named = [child for child in node.named_children if not child.is_extra]
+            roots.extend(named[1:])
+        stack = list(roots)
+        while stack:
+            current = stack.pop()
+            if current.is_extra:
+                continue
+            if current.type == "IDENTIFIER":
+                name = _capture_name(source, current)
+                add_reference("type_use", current, target_name=name, written_name=name)
+            else:
+                stack.extend(current.children)
 
     def _definitions(self, language_name: str, root: Node, source: bytes) -> list[_Definition]:
         matches = QueryCursor(self._query(language_name)).matches(root)

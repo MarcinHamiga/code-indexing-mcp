@@ -212,6 +212,9 @@ def test_rename_validation_uses_the_selected_language(tmp_path: Path) -> None:
         ("rust", "match"),
         ("java", "class"),
         ("csharp", "namespace"),
+        ("kotlin", "fun"),
+        ("swift", "func"),
+        ("zig", "comptime"),
     ],
 )
 def test_rename_rejects_reserved_words_for_the_selected_language(

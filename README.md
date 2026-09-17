@@ -296,7 +296,7 @@ overwrite a marker and orphan the previous index.
 | `search_by_example` | read, registers and indexes | Find indexed chunks most similar to a pasted code snippet. |
 | `search_across_projects` | read, registers and indexes | Globally ranked search across at least two explicitly selected projects. |
 | `find_symbol` | read, registers and indexes | Exact, prefix, or substring lookup of declaration names. |
-| `find_references` | read, registers and indexes | Structural references to one selected C, C#, C++, GDScript, Godot Shader, Go, Java, JavaScript, Lua, Python, Rust, SQL, Terraform, TSX, or TypeScript declaration. |
+| `find_references` | read, registers and indexes | Structural references to one selected C, C#, C++, GDScript, Godot Shader, Go, Java, JavaScript, Kotlin, Lua, Python, Rust, SQL, Swift, Terraform, TSX, TypeScript, or Zig declaration. |
 | `dead_code_report` | read, registers and indexes | Review exported declarations with no exact references in one project. |
 | `impact_radius` | read, registers and indexes | Bounded, layered transitive dependents of one selected declaration. |
 | `analyze_refactor` | read, registers and indexes | Read-only rename or signature-change impact analysis for one selected declaration. |
@@ -352,7 +352,7 @@ Structural references are extracted during the normal parse and are backfilled p
 older semantic index—no second embedding pass is needed. The first reference query may therefore
 write structural coverage while it refreshes its index, which is why both tools carry the
 registering-read annotation. C, C#, C++, GDScript, Godot Shader, Go, Java, JavaScript,
-Lua, Python, Rust, SQL, Terraform, TSX, and TypeScript are
+Kotlin, Lua, Python, Rust, SQL, Swift, Terraform, TSX, TypeScript, and Zig are
 supported; selecting a
 declaration in any other language returns `UNSUPPORTED_LANGUAGE` rather than an empty result that
 would read as "no callers". Runtime imports, wildcard and on-demand imports, inferred receiver
@@ -670,6 +670,10 @@ TypeScript, and the two Godot data formats are one language.
 | C          | `.c`, `.h`                     | `c`               | preprocessor constants, structs, functions                    |
 | C++        | `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, `.hxx` | `cpp` | classes, methods, functions                                  |
 | Lua        | `.lua`                         | `lua`             | functions                                                     |
+| Kotlin     | `.kt`, `.kts`                  | `kotlin`          | classes (including interfaces and enum classes), objects, functions, methods, type aliases, constants |
+| Swift      | `.swift`                       | `swift`           | classes (including structs and enums), interfaces (protocols), functions, methods, constructors, properties, enum cases |
+| Zig        | `.zig`                         | `zig`             | functions, constants, struct fields (as properties)           |
+| XML        | `.xml`                         | `xml`             | elements with nested elements, qualified by their path        |
 
 Nested declarations are qualified by their enclosing scope in every language, so a C# method
 indexes as `Outer.Inner.Work` and a Compose service port list as `services.web.ports`.

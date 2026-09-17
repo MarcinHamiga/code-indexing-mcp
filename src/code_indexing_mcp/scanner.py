@@ -71,6 +71,11 @@ LANGUAGES = {
     ".hpp": "cpp",
     ".hxx": "cpp",
     ".lua": "lua",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".zig": "zig",
+    ".swift": "swift",
+    ".xml": "xml",
 }
 
 HARD_EXCLUDED_DIRECTORIES = {
