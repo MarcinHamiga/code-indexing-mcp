@@ -2467,6 +2467,50 @@ def test_kotlin_declaration_names_and_parameters_are_not_reads() -> None:
     assert top == [("first", "positional", True), ("second", "positional", False)]
 
 
+def test_kotlin_delegation_specifiers_are_inheritance_edges() -> None:
+    """`class A : B(), C` yields one inheritance row per supertype -- the
+    constructor-invocation and the bare interface form alike -- and no plain
+    read for either name."""
+    source = "class A : B(), C\n"
+
+    refs = _kotlin_result(source).references
+    inheritance = [
+        (r.written_name, r.source_qualified_symbol) for r in refs if r.kind == "inheritance"
+    ]
+
+    assert inheritance == [("B", "A"), ("C", "A")]
+    assert not any(r.kind == "read" for r in refs)
+
+
+def test_kotlin_generic_delegation_argument_is_a_type_use() -> None:
+    """`class A : B<Int>()`: the head type is the inheritance edge and the
+    type argument a `type_use`, never a plain read."""
+    source = "class A : B<Int>()\n"
+
+    refs = _kotlin_result(source).references
+
+    assert [(r.kind, r.written_name) for r in refs if r.kind != "export"] == [
+        ("inheritance", "B"),
+        ("type_use", "Int"),
+    ]
+
+
+def test_kotlin_types_become_type_use_rows_and_not_reads() -> None:
+    """Class-parameter, parameter, return, property, and generic-argument
+    types emit `type_use`; none of them leaks a parallel plain read."""
+    source = (
+        "class A(val stored: Foo) {\n    fun f(x: List<Foo>): Bar = x\n    val v: Foo? = null\n}\n"
+    )
+
+    refs = _kotlin_result(source).references
+    type_uses = [r.written_name for r in refs if r.kind == "type_use"]
+
+    assert type_uses.count("Foo") >= 3
+    assert "List" in type_uses
+    assert "Bar" in type_uses
+    assert not any(r.kind == "read" and r.written_name in {"Foo", "List", "Bar"} for r in refs)
+
+
 # ---------------------------------------------------------------------------
 # Swift structural references
 # ---------------------------------------------------------------------------
@@ -2560,6 +2604,55 @@ def test_swift_parameter_shapes_preserve_external_labels() -> None:
         ("count", "_"),
         ("name", None),
     ]
+
+
+def test_swift_inheritance_specifiers_are_inheritance_edges() -> None:
+    """Class conformance and protocol inheritance each yield one inheritance
+    row per listed supertype, with no parallel plain read."""
+    source = "class C: D, E {}\nprotocol P: Q {}\n"
+
+    refs = _swift_result(source).references
+    inheritance = [
+        (r.written_name, r.source_qualified_symbol) for r in refs if r.kind == "inheritance"
+    ]
+
+    assert inheritance == [("D", "C"), ("E", "C"), ("Q", "P")]
+    assert not any(r.kind == "read" for r in refs)
+
+
+def test_swift_types_become_type_use_rows_and_not_reads() -> None:
+    """Parameter, array-return, property, optional, and generic-inheritance
+    argument types emit `type_use`; none of them leaks a parallel plain read."""
+    source = (
+        "func f(x: Foo?) -> [Bar] { return [] }\nclass A: Box<Item> {\n    var v: Foo = Foo()\n}\n"
+    )
+
+    refs = _swift_result(source).references
+    type_uses = [r.written_name for r in refs if r.kind == "type_use"]
+
+    assert "Foo" in type_uses
+    assert "Bar" in type_uses
+    assert "Item" in type_uses
+    assert [r.written_name for r in refs if r.kind == "inheritance"] == ["Box"]
+    assert not any(r.kind == "read" for r in refs)
+
+
+def test_swift_extension_members_qualify_under_the_extended_type() -> None:
+    """`extension Greeter { ... }` is a naming scope: member references carry
+    the extended type as their enclosing symbol."""
+    source = (
+        "class Greeter {}\n"
+        "extension Greeter {\n"
+        "    func greet() {}\n"
+        "    func run() { greet() }\n"
+        "}\n"
+    )
+
+    result = _swift_result(source)
+
+    assert "Greeter.greet" in {d.qualified_symbol for d in result.declarations}
+    call = next(reference for reference in result.references if reference.target_name == "greet")
+    assert call.source_qualified_symbol == "Greeter.run"
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,20 @@
 
 (navigation_expression) @reference.member_access
 
+; --- heritage: inheritance clauses are inheritance edges -------------------
+; `class C: D, E` / `protocol P: Q` -- one capture per listed supertype; the
+; handler takes the head type as `inheritance` and any type arguments as
+; `type_use`.
+
+(inheritance_specifier) @reference.heritage
+
+; --- type expressions (handler descends to the naming leaves) --------------
+; `x: Foo`, `-> Bar`, `var v: Foo` -- user_type owns every named type
+; spelling, so the handler emits the `type_use` rows and the identifier
+; fallback cuts the parallel plain reads (`handler_owned_type_parents`).
+
+(user_type) @reference.type_use
+
 ; --- declaration parameters (Swift names no parameter-list wrapper, so each
 ; bare `parameter` is captured and _one_parameter_list treats one as a
 ; single slot; positions renumber over the merged lists) --------------------
