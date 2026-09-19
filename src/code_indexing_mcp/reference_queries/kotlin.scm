@@ -15,6 +15,19 @@
 (navigation_expression) @reference.member_access
 (directly_assignable_expression) @reference.member_access
 
+; --- heritage: delegation specifiers are inheritance edges ------------------
+; `class A : B(), C` -- one capture per supertype; the handler takes the head
+; type as `inheritance` and any type arguments as `type_use`.
+
+(delegation_specifier) @reference.heritage
+
+; --- type expressions (handler descends to the naming leaves) --------------
+; `x: Foo`, `: Bar`, `val v: Foo` -- user_type owns every named type spelling,
+; so the handler emits the `type_use` rows and the identifier fallback cuts
+; the parallel plain reads (`handler_owned_type_parents`).
+
+(user_type) @reference.type_use
+
 ; --- declaration parameters -------------------------------------------------
 
 (function_declaration

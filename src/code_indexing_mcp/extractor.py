@@ -1483,7 +1483,15 @@ class TreeSitterExtractor:
         `extends Base<T>` yields an `inheritance` row for `Base` and a `type_use`
         row for `T`; `extends Base` (no type arguments) yields just the former.
         """
-        names = TreeSitterExtractor._descend_type_names(node)
+        TreeSitterExtractor._emit_heritage_leaves(
+            TreeSitterExtractor._descend_type_names(node), source, add_reference
+        )
+
+    @staticmethod
+    def _emit_heritage_leaves(
+        names: list[Node], source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        """Emit a descended heritage type list as one inheritance edge plus type uses."""
         if not names:
             return
         head, *rest = names
@@ -1500,6 +1508,70 @@ class TreeSitterExtractor:
                 target_name=_capture_name(source, extra),
                 written_name=_capture_name(source, extra),
             )
+
+    # Kotlin/Swift type wrappers `_kotlin_swift_type_names` unwraps. `user_type`
+    # is the annotation node the reference query captures; type arguments nest
+    # one `type_projection` (or `nullable_type`, for `Foo?`) deep inside it, and
+    # Swift wraps the same shapes in `optional_type`/`array_type`.
+    _KOTLIN_SWIFT_TYPE_WRAPPERS: Final = frozenset(
+        {
+            "user_type",
+            "type_arguments",
+            "type_projection",
+            "nullable_type",
+            "optional_type",
+            "array_type",
+            "function_type",
+            "tuple_type",
+            "dictionary_type",
+            "metatype",
+        }
+    )
+
+    @staticmethod
+    def _kotlin_swift_type_names(node: Node | None) -> list[Node]:
+        """Descend a Kotlin/Swift type expression to its naming leaves.
+
+        `List<Foo>` yields `List` then `Foo`: the head `type_identifier` plus
+        one leaf per type argument, in source order. Only `type_identifier`
+        leaves are collected, so value arguments of a delegation
+        (`class A : Base(limit)`) can never leak in as types. Builtin
+        spellings (`String`, `Int`) are ordinary `type_identifier` leaves in
+        these grammars and stay rows, mirroring Java's boxed names.
+        """
+        if node is None:
+            return []
+        names: list[Node] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.is_extra:
+                continue
+            if current.type == "type_identifier":
+                names.append(current)
+                continue
+            if current.type in TreeSitterExtractor._KOTLIN_SWIFT_TYPE_WRAPPERS:
+                stack.extend(reversed(current.named_children))
+        return names
+
+    @staticmethod
+    def _emit_kotlin_swift_type_uses(
+        node: Node, source: bytes, add_reference: _ReferenceAdder
+    ) -> None:
+        """Emit one `type_use` per naming leaf under a Kotlin/Swift type node."""
+        for leaf in TreeSitterExtractor._kotlin_swift_type_names(node):
+            written = _capture_name(source, leaf)
+            add_reference("type_use", leaf, target_name=written, written_name=written)
+
+    @staticmethod
+    def _within_ancestor(node: Node, ancestor_type: str) -> bool:
+        """Whether any strict ancestor of `node` carries `ancestor_type`."""
+        parent = node.parent
+        while parent is not None:
+            if parent.type == ancestor_type:
+                return True
+            parent = parent.parent
+        return False
 
     _C_DECLARATOR_WRAPPERS: Final = frozenset(
         {
@@ -4048,6 +4120,25 @@ class TreeSitterExtractor:
                     # The call row above already owns this span.
                     return
             self._emit_member_access(node, source, add_reference)
+        elif node.type == "delegation_specifier":
+            # `class A : B(), C` -- each specifier is one supertype. The type
+            # sits under a `constructor_invocation` when the delegation is
+            # explicit (`B()`) and directly on the specifier otherwise (`C`).
+            specifier = next((child for child in node.named_children if not child.is_extra), None)
+            if specifier is not None and specifier.type == "constructor_invocation":
+                specifier = next(
+                    (child for child in specifier.named_children if not child.is_extra), None
+                )
+            TreeSitterExtractor._emit_heritage_leaves(
+                TreeSitterExtractor._kotlin_swift_type_names(specifier), source, add_reference
+            )
+        elif node.type == "user_type":
+            # Delegation specifiers own their type rows; every other
+            # user_type (`x: Foo`, `: Bar`, `val v: Foo`, call type
+            # arguments) is a type use. Nested user_types under a shared
+            # capture re-emit the same span and are deduplicated by `add`.
+            if not TreeSitterExtractor._within_ancestor(node, "delegation_specifier"):
+                self._emit_kotlin_swift_type_uses(node, source, add_reference)
         elif node.type in {
             "class_declaration",
             "object_declaration",
@@ -4144,6 +4235,23 @@ class TreeSitterExtractor:
                     # The call row above already owns this span.
                     return
             self._emit_member_access(node, source, add_reference)
+        elif node.type == "inheritance_specifier":
+            # `class C: D, E` / `protocol P: Q` -- one specifier per listed
+            # supertype, reached through the `inherits_from` field.
+            TreeSitterExtractor._emit_heritage_leaves(
+                TreeSitterExtractor._kotlin_swift_type_names(
+                    node.child_by_field_name("inherits_from")
+                ),
+                source,
+                add_reference,
+            )
+        elif node.type == "user_type":
+            # Inheritance specifiers own their type rows. Every other
+            # user_type is a type use: parameter and return types, stored
+            # properties, array/optional wrappers, and the extended type of
+            # an `extension`, mirroring Rust's impl self type.
+            if not TreeSitterExtractor._within_ancestor(node, "inheritance_specifier"):
+                self._emit_kotlin_swift_type_uses(node, source, add_reference)
         elif node.type in {
             "class_declaration",
             "protocol_declaration",
@@ -4443,6 +4551,17 @@ class TreeSitterExtractor:
                 name = TreeSitterExtractor._impl_self_type_name(parent)
                 if name is not None:
                     chain.append(_Definition(parent, "struct", name))
+            elif parent.type == "class_declaration":
+                # Swift extensions are naming scopes but deliberately not
+                # chunked definitions: the definition query matches a
+                # `type_identifier` name, while an extension's `name` field
+                # holds a `user_type`, so the extension node never enters the
+                # index. Synthesizing a container named by the extended type
+                # qualifies `func hi` inside `extension Greeter` as
+                # `Greeter.hi`, mirroring the Rust `impl_item` precedent.
+                name = TreeSitterExtractor._swift_extension_type_name(parent)
+                if name is not None:
+                    chain.append(_Definition(parent, "class", name))
             parent = parent.parent
         chain.reverse()
         if any(item.kind in _CALLABLE_KINDS for item in chain):
@@ -4465,6 +4584,29 @@ class TreeSitterExtractor:
             return (type_node.text or b"").decode("utf-8", errors="replace")
         # A generic self type (`impl<T> Pool<T>`) names its head type.
         current: Node | None = type_node
+        while current is not None:
+            if current.type == "type_identifier":
+                return (current.text or b"").decode("utf-8", errors="replace")
+            current = current.named_children[0] if current.named_children else None
+        return None
+
+    @staticmethod
+    def _swift_extension_type_name(declaration: Node) -> str | None:
+        """The extended type of a Swift `extension` declaration, if it is one.
+
+        The grammar records every Swift type declaration (class, struct, enum,
+        protocol, extension) as a `class_declaration`; `declaration_kind` tells
+        them apart. Only `extension` carries its target in a `user_type` name
+        field, so a plain type declaration returns None and keeps its own
+        indexed `_Definition`.
+        """
+        kind = declaration.child_by_field_name("declaration_kind")
+        if kind is None or kind.type != "extension":
+            return None
+        name = declaration.child_by_field_name("name")
+        if name is None:
+            return None
+        current: Node | None = name
         while current is not None:
             if current.type == "type_identifier":
                 return (current.text or b"").decode("utf-8", errors="replace")

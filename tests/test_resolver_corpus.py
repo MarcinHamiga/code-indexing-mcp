@@ -870,3 +870,93 @@ def test_csharp_partial_class_this_receiver_resolves_exactly(tmp_path: Path) -> 
     write = next(hit for hit in response.hits if hit.kind == "write")
     assert write.resolution == "exact"
     assert write.reason_code == "known_owner_member"
+
+
+# ---------------------------------------------------------------------------
+# Kotlin, Swift, Zig: direct imports, heritage, and extension scopes.
+# ---------------------------------------------------------------------------
+
+
+def test_kotlin_direct_import_resolves_a_call_and_a_type_use_exactly(
+    tmp_path: Path,
+) -> None:
+    """`import other.Widget` binds the constructor call and the return type
+    use exactly: the dotted path resolves to the symbol-named `.kt` file, so
+    both rows ride `direct_import_alias`."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "kotlin" / "direct_import_exact")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="other/Widget.kt", qualified_symbol="Widget")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "direct_import_alias"
+    type_use = next(hit for hit in response.hits if hit.kind == "type_use")
+    assert type_use.resolution == "exact"
+    assert type_use.reason_code == "direct_import_alias"
+
+
+def test_kotlin_delegation_is_an_inheritance_edge(tmp_path: Path) -> None:
+    """`class Child : Base()` records the supertype as an inheritance edge and
+    binds it exactly through the direct import -- the hierarchy edge
+    `impact_radius` traverses -- with no parallel plain read."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "kotlin" / "heritage_inheritance"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="other/Base.kt", qualified_symbol="Base")
+    )
+
+    inheritance = next(hit for hit in response.hits if hit.kind == "inheritance")
+    assert inheritance.resolution == "exact"
+    assert inheritance.reason_code == "direct_import_alias"
+    assert not any(hit.kind == "read" for hit in response.hits)
+
+
+def test_zig_relative_import_resolves_namespace_call_exactly(tmp_path: Path) -> None:
+    """`const helper = @import("helper.zig")` binds the file namespace, so
+    `helper.work()` resolves exactly through `known_namespace_member`."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "zig" / "relative_import_exact")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="helper.zig", qualified_symbol="work")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "known_namespace_member"
+
+
+def test_swift_cross_file_use_stays_likely_without_a_module_map(tmp_path: Path) -> None:
+    """Swift imports bind whole modules, so a cross-file `Greeter()` has no
+    provable symbol edge: it stays `likely/name_only_candidate`."""
+    service, project_id = _indexed_service(tmp_path, CORPUS_ROOT / "swift" / "same_module_likely")
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="greeter.swift", qualified_symbol="Greeter")
+    )
+
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "likely"
+    assert call.reason_code == "name_only_candidate"
+
+
+def test_swift_extension_member_is_selectable_and_binds_exactly(tmp_path: Path) -> None:
+    """Extension members qualify under the extended type, so `Greeter.greet`
+    is selectable and the same-file bare call binds exactly."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "swift" / "extension_member_exact"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(
+            project=project_id, path="service.swift", qualified_symbol="Greeter.greet"
+        )
+    )
+
+    assert response.selected.kind == "method"
+    call = next(hit for hit in response.hits if hit.kind == "call")
+    assert call.resolution == "exact"
+    assert call.reason_code == "same_file_symbol"

@@ -1309,12 +1309,19 @@ LANGUAGE_RULES: Final[Mapping[str, _LanguageRules]] = {
     ),
     "kotlin": _LanguageRules(
         import_owner_parents=frozenset({"import_header", "package_header"}),
+        # A `user_type` is the annotation node the reference handler descends;
+        # its identifiers are the handler's `type_use` rows, never plain reads.
+        handler_owned_type_parents=frozenset({"user_type"}),
         reserved_words=_KOTLIN_RESERVED_WORDS,
         identifier_valid=lambda name: name.isidentifier() and name not in _KOTLIN_RESERVED_WORDS,
         import_candidates=_kotlin_import_candidates,
     ),
     "swift": _LanguageRules(
         import_owner_parents=frozenset({"import_declaration"}),
+        # Mirrors Kotlin: `user_type` covers parameters, returns, stored
+        # properties, array/optional wrappers, and the extended type of an
+        # `extension`, all owned by the handler's `type_use` rows.
+        handler_owned_type_parents=frozenset({"user_type"}),
         reserved_words=_SWIFT_RESERVED_WORDS,
         identifier_valid=lambda name: name.isidentifier() and name not in _SWIFT_RESERVED_WORDS,
         import_candidates=_empty_import_candidates,

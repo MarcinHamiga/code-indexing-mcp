@@ -296,6 +296,35 @@ def test_extracts_next_language_symbols(
     assert expected <= symbols
 
 
+def test_swift_extension_members_qualify_under_the_extended_type() -> None:
+    """`extension Greeter { ... }` is a naming scope: members index as
+    `Greeter.shout` and their enclosing symbol rides the synthesized container,
+    mirroring Rust's `impl Widget` qualification."""
+    source = b"""class Greeter {
+    func greet() -> String { return "hi" }
+}
+
+extension Greeter {
+    func shout() -> String { return greet() }
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("pkg/user.swift"), "swift", source)
+
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert {
+        ("class", "Greeter"),
+        ("method", "Greeter.greet"),
+        ("method", "Greeter.shout"),
+    } <= symbols
+    call = next(
+        reference
+        for reference in result.references
+        if reference.kind == "call" and reference.target_name == "greet"
+    )
+    assert call.source_qualified_symbol == "Greeter.shout"
+
+
 def test_extracts_java_symbols_with_precise_kinds_and_nested_qualification() -> None:
     source = b"""package demo;
 

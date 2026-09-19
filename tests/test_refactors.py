@@ -208,6 +208,65 @@ def test_rename_marks_identifier_reads_for_edit(tmp_path: Path) -> None:
     assert read.written_name == "answer"
 
 
+def test_kotlin_rename_surfaces_heritage_and_type_uses_for_review(tmp_path: Path) -> None:
+    """A Kotlin class rename must surface the delegation specifier and every
+    type use; structural bindings are not modeled, so the edits are withheld
+    as `unsupported_binding` review findings rather than silently applied."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "models.kt": (
+                "open class Base\nclass Child : Base()\nfun load(value: Base): Base = value\n"
+            )
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(project=project_id, path="models.kt", qualified_symbol="Base"),
+        RenameOperation(new_name="Entity"),
+    )
+
+    findings = analysis.findings
+    kinds = {item.kind for item in findings}
+    assert {"inheritance", "type_use"} <= kinds
+    for finding in findings:
+        if finding.kind in {"inheritance", "type_use"}:
+            assert finding.reason_code == "unsupported_binding"
+    assert not analysis.must_change
+
+
+def test_swift_extension_member_rename_surfaces_the_bare_call_for_review(
+    tmp_path: Path,
+) -> None:
+    """A member declared in an extension resolves through the synthesized
+    `Greeter` owner, so renaming it surfaces the bare call inside `run` (as an
+    `unsupported_binding` review finding) instead of missing it silently."""
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "service.swift": (
+                "class Greeter {}\n"
+                "extension Greeter {\n"
+                "    func greet() {}\n"
+                "    func run() { greet() }\n"
+                "}\n"
+            )
+        },
+    )
+
+    analysis = service.analyze_refactor(
+        DeclarationSelector(
+            project=project_id, path="service.swift", qualified_symbol="Greeter.greet"
+        ),
+        RenameOperation(new_name="welcome"),
+    )
+
+    call = next(item for item in analysis.findings if item.kind == "call")
+    assert call.written_name == "greet"
+    assert call.reason_code == "unsupported_binding"
+    assert not analysis.must_change
+
+
 @pytest.mark.parametrize("new_name", ["$answer", "class"])
 def test_python_rename_rejects_invalid_identifiers(tmp_path: Path, new_name: str) -> None:
     service, project_id = _indexed_service(

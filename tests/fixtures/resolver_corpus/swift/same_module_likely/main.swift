@@ -1,0 +1,3 @@
+func build() {
+    _ = Greeter()
+}
