@@ -2495,9 +2495,68 @@ def test_kotlin_generic_delegation_argument_is_a_type_use() -> None:
     ]
 
 
+def test_kotlin_by_delegation_keeps_the_delegated_interface() -> None:
+    """`class A : B by b` and `object O : I by impl` record the delegated
+    interface as the inheritance edge; the delegate expression stays a read."""
+    source = "class A : B by b\nobject O : I by impl\n"
+
+    refs = _kotlin_result(source).references
+    inheritance = [
+        (r.written_name, r.source_qualified_symbol) for r in refs if r.kind == "inheritance"
+    ]
+    reads = [r.written_name for r in refs if r.kind == "read"]
+
+    assert inheritance == [("B", "A"), ("I", "O")]
+    assert reads == ["b", "impl"]
+
+
+def test_kotlin_generic_by_delegation_splits_head_and_argument() -> None:
+    """`class A : B<C> by b`: the head is the inheritance edge, the type
+    argument a `type_use`, and only the delegate expression stays a read."""
+    source = "class A : B<C> by b\n"
+
+    refs = _kotlin_result(source).references
+
+    assert [(r.kind, r.written_name) for r in refs if r.kind != "export"] == [
+        ("inheritance", "B"),
+        ("type_use", "C"),
+        ("read", "b"),
+    ]
+
+
+def test_kotlin_supertype_call_type_arguments_are_type_uses() -> None:
+    """`class A : B(listOf<Foo>())`: the nested `Foo` is an ordinary type use,
+    not the heritage edge, so the heritage capture must not suppress it."""
+    source = "class A : B(listOf<Foo>())\n"
+
+    refs = _kotlin_result(source).references
+
+    assert [(r.kind, r.written_name) for r in refs if r.kind != "export"] == [
+        ("inheritance", "B"),
+        ("call", "listOf"),
+        ("type_use", "Foo"),
+    ]
+
+
+def test_kotlin_qualified_supertype_stays_one_inheritance_edge() -> None:
+    """`class A : Outer.Inner` names a nested type: the whole qualification is
+    one inheritance edge spanning just `Outer.Inner`, never a type argument."""
+    source = "class A : Outer.Inner\n"
+
+    refs = _kotlin_result(source).references
+    inheritance = [r for r in refs if r.kind == "inheritance"]
+
+    assert [(r.written_name, r.target_name) for r in inheritance] == [
+        ("Outer.Inner", "Outer.Inner")
+    ]
+    assert source.encode()[inheritance[0].start_byte : inheritance[0].end_byte] == b"Outer.Inner"
+    assert not any(r.kind == "type_use" for r in refs)
+
+
 def test_kotlin_types_become_type_use_rows_and_not_reads() -> None:
     """Class-parameter, parameter, return, property, and generic-argument
-    types emit `type_use`; none of them leaks a parallel plain read."""
+    types emit `type_use`; none of them leaks a parallel plain read, and the
+    nested captures deduplicate to exactly one row per occurrence."""
     source = (
         "class A(val stored: Foo) {\n    fun f(x: List<Foo>): Bar = x\n    val v: Foo? = null\n}\n"
     )
@@ -2505,9 +2564,7 @@ def test_kotlin_types_become_type_use_rows_and_not_reads() -> None:
     refs = _kotlin_result(source).references
     type_uses = [r.written_name for r in refs if r.kind == "type_use"]
 
-    assert type_uses.count("Foo") >= 3
-    assert "List" in type_uses
-    assert "Bar" in type_uses
+    assert sorted(type_uses) == ["Bar", "Foo", "Foo", "Foo", "List"]
     assert not any(r.kind == "read" and r.written_name in {"Foo", "List", "Bar"} for r in refs)
 
 
@@ -2635,6 +2692,33 @@ def test_swift_types_become_type_use_rows_and_not_reads() -> None:
     assert "Item" in type_uses
     assert [r.written_name for r in refs if r.kind == "inheritance"] == ["Box"]
     assert not any(r.kind == "read" for r in refs)
+
+
+def test_swift_qualified_supertype_and_metatype_spellings() -> None:
+    """`Outer.Inner<Item>` names a nested supertype -- one inheritance edge
+    spanning the qualification plus a `type_use` for the argument -- and
+    `Foo.Type`/`Bar.Protocol` are metatypes, not symbols of their own."""
+    source = "class C: Outer.Inner<Item> {}\nfunc f(x: Foo.Type) {}\nfunc g(y: Bar.Protocol) {}\n"
+
+    refs = _swift_result(source).references
+
+    inheritance = [r for r in refs if r.kind == "inheritance"]
+    assert [(r.written_name, r.target_name) for r in inheritance] == [
+        ("Outer.Inner", "Outer.Inner")
+    ]
+    assert source.encode()[inheritance[0].start_byte : inheritance[0].end_byte] == b"Outer.Inner"
+    assert sorted(r.written_name for r in refs if r.kind == "type_use") == ["Bar", "Foo", "Item"]
+    assert not any(r.written_name in {"Type", "Protocol"} for r in refs)
+
+
+def test_swift_nested_extension_qualifies_under_the_full_type() -> None:
+    """`extension Outer.Inner` qualifies its members by the whole nested type,
+    not by the outer namespace alone."""
+    source = "extension Outer.Inner { func f() {} }\n"
+
+    result = _swift_result(source)
+
+    assert "Outer.Inner.f" in {d.qualified_symbol for d in result.declarations}
 
 
 def test_swift_extension_members_qualify_under_the_extended_type() -> None:

@@ -10,7 +10,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Final, NamedTuple, Protocol
 
 import tree_sitter_c
 import tree_sitter_c_sharp
@@ -87,6 +87,25 @@ class _ReferenceAdder(Protocol):
 
 class _StructuralRecordHandler(Protocol):
     def __call__(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None: ...
+
+
+class _TypeLeaf(NamedTuple):
+    """One naming leaf of a type expression: its span node, spelling, and range.
+
+    `span` is set only when the spelling is not one grammar node: a
+    Kotlin/Swift dotted type (`Outer.Inner`) flattens into one
+    `type_identifier` per component, so `name` joins the run while `span`
+    still covers exactly that run, excluding any type arguments.
+    """
+
+    node: Node
+    name: str
+    span: tuple[int, int] | None = None
+
+
+def _node_text(node: Node) -> str:
+    """Decode a node's own bytes, tolerating invalid UTF-8 in type spellings."""
+    return (node.text or b"").decode("utf-8", errors="replace")
 
 
 def _capture_name(source: bytes, node: Node) -> str:
@@ -1484,29 +1503,33 @@ class TreeSitterExtractor:
         row for `T`; `extends Base` (no type arguments) yields just the former.
         """
         TreeSitterExtractor._emit_heritage_leaves(
-            TreeSitterExtractor._descend_type_names(node), source, add_reference
+            [
+                _TypeLeaf(leaf, _capture_name(source, leaf))
+                for leaf in TreeSitterExtractor._descend_type_names(node)
+            ],
+            add_reference,
         )
 
     @staticmethod
-    def _emit_heritage_leaves(
-        names: list[Node], source: bytes, add_reference: _ReferenceAdder
-    ) -> None:
+    def _emit_heritage_leaves(leaves: list[_TypeLeaf], add_reference: _ReferenceAdder) -> None:
         """Emit a descended heritage type list as one inheritance edge plus type uses."""
-        if not names:
+        if not leaves:
             return
-        head, *rest = names
+        head, *rest = leaves
         add_reference(
             "inheritance",
-            head,
-            target_name=_capture_name(source, head),
-            written_name=_capture_name(source, head),
+            head.node,
+            target_name=head.name,
+            written_name=head.name,
+            span=head.span,
         )
         for extra in rest:
             add_reference(
                 "type_use",
-                extra,
-                target_name=_capture_name(source, extra),
-                written_name=_capture_name(source, extra),
+                extra.node,
+                target_name=extra.name,
+                written_name=extra.name,
+                span=extra.span,
             )
 
     # Kotlin/Swift type wrappers `_kotlin_swift_type_names` unwraps. `user_type`
@@ -1528,50 +1551,112 @@ class TreeSitterExtractor:
         }
     )
 
+    # Kotlin heritage wrappers whose own first type child is the supertype:
+    # `constructor_invocation` (`class A : B()`) and `explicit_delegation`
+    # (`class A : B by b`, `object O : I by impl`). The delegation handler owns
+    # that child; every other user_type under the specifier is an ordinary use.
+    _KOTLIN_HERITAGE_WRAPPERS: Final = frozenset({"constructor_invocation", "explicit_delegation"})
+
+    # Swift metatype spellings: `Foo.Type` / `Foo.Protocol` parse as a flat
+    # `user_type` with two `type_identifier` children, structurally identical to
+    # the nested type `Outer.Inner`; only the spelling tells them apart.
+    _SWIFT_METATYPE_SUFFIXES: Final = frozenset({"Type", "Protocol"})
+
     @staticmethod
-    def _kotlin_swift_type_names(node: Node | None) -> list[Node]:
+    def _kotlin_swift_type_names(
+        node: Node | None, *, metatype_suffix: bool = False
+    ) -> list[_TypeLeaf]:
         """Descend a Kotlin/Swift type expression to its naming leaves.
 
-        `List<Foo>` yields `List` then `Foo`: the head `type_identifier` plus
-        one leaf per type argument, in source order. Only `type_identifier`
-        leaves are collected, so value arguments of a delegation
-        (`class A : Base(limit)`) can never leak in as types. Builtin
-        spellings (`String`, `Int`) are ordinary `type_identifier` leaves in
-        these grammars and stay rows, mirroring Java's boxed names.
+        `List<Foo>` yields `List` then `Foo`: the head name plus one leaf per
+        type argument, in source order. A dotted run (`Outer.Inner`) is one
+        leaf spelling the whole qualification, mirroring `_descend_type_names`
+        for Java/TS, with a span covering exactly the run. Only
+        `type_identifier` leaves are collected, so value arguments of a
+        delegation (`class A : Base(limit)`) can never leak in as types.
+        Builtin spellings (`String`, `Int`) are ordinary `type_identifier`
+        leaves in these grammars and stay rows, mirroring Java's boxed names.
+
+        `metatype_suffix` drops Swift's trailing `.Type`/`.Protocol` keyword
+        from the last component (`func f(x: Foo.Type)` refers to `Foo`).
         """
         if node is None:
             return []
-        names: list[Node] = []
+        leaves: list[_TypeLeaf] = []
         stack = [node]
         while stack:
             current = stack.pop()
             if current.is_extra:
                 continue
             if current.type == "type_identifier":
-                names.append(current)
+                leaves.append(_TypeLeaf(current, _node_text(current)))
+                continue
+            if current.type == "user_type":
+                named = [child for child in current.named_children if not child.is_extra]
+                run: list[Node] = []
+                for child in named:
+                    if child.type != "type_identifier":
+                        break
+                    run.append(child)
+                consumed = len(run)
+                if (
+                    metatype_suffix
+                    and len(run) >= 2
+                    and _node_text(run[-1]) in TreeSitterExtractor._SWIFT_METATYPE_SUFFIXES
+                ):
+                    run.pop()
+                if run:
+                    leaves.append(
+                        _TypeLeaf(
+                            current,
+                            ".".join(_node_text(item) for item in run),
+                            (run[0].start_byte, run[-1].end_byte),
+                        )
+                    )
+                stack.extend(reversed(named[consumed:]))
                 continue
             if current.type in TreeSitterExtractor._KOTLIN_SWIFT_TYPE_WRAPPERS:
                 stack.extend(reversed(current.named_children))
-        return names
+        return leaves
 
     @staticmethod
     def _emit_kotlin_swift_type_uses(
-        node: Node, source: bytes, add_reference: _ReferenceAdder
+        node: Node, add_reference: _ReferenceAdder, *, metatype_suffix: bool = False
     ) -> None:
         """Emit one `type_use` per naming leaf under a Kotlin/Swift type node."""
-        for leaf in TreeSitterExtractor._kotlin_swift_type_names(node):
-            written = _capture_name(source, leaf)
-            add_reference("type_use", leaf, target_name=written, written_name=written)
+        for leaf in TreeSitterExtractor._kotlin_swift_type_names(
+            node, metatype_suffix=metatype_suffix
+        ):
+            add_reference(
+                "type_use",
+                leaf.node,
+                target_name=leaf.name,
+                written_name=leaf.name,
+                span=leaf.span,
+            )
 
     @staticmethod
-    def _within_ancestor(node: Node, ancestor_type: str) -> bool:
-        """Whether any strict ancestor of `node` carries `ancestor_type`."""
+    def _is_heritage_type_node(node: Node) -> bool:
+        """Whether *node* is the supertype a Kotlin/Swift heritage clause owns.
+
+        A `user_type` directly under a `delegation_specifier` (`class A : C`)
+        or `inheritance_specifier` (`class C: D`) is the heritage edge, and so
+        is one under the Kotlin wrapper the clause owns (`class A : B()`,
+        `class A : B by b`). A type nested deeper -- a constructor argument's
+        type argument (`class A : B(listOf<Foo>())`) -- is an ordinary use, so
+        it must stay eligible for the handler's `type_use` row instead of
+        being suppressed as owned by the heritage capture.
+        """
         parent = node.parent
-        while parent is not None:
-            if parent.type == ancestor_type:
-                return True
-            parent = parent.parent
-        return False
+        if parent is None:
+            return False
+        if parent.type in {"delegation_specifier", "inheritance_specifier"}:
+            return True
+        return (
+            parent.type in TreeSitterExtractor._KOTLIN_HERITAGE_WRAPPERS
+            and parent.parent is not None
+            and parent.parent.type == "delegation_specifier"
+        )
 
     _C_DECLARATOR_WRAPPERS: Final = frozenset(
         {
@@ -4121,24 +4206,29 @@ class TreeSitterExtractor:
                     return
             self._emit_member_access(node, source, add_reference)
         elif node.type == "delegation_specifier":
-            # `class A : B(), C` -- each specifier is one supertype. The type
-            # sits under a `constructor_invocation` when the delegation is
-            # explicit (`B()`) and directly on the specifier otherwise (`C`).
+            # `class A : B(), C` / `class A : B by b` -- each specifier is one
+            # supertype. The type sits under a `constructor_invocation` when
+            # the delegation is explicit (`B()`), under an
+            # `explicit_delegation` when it is proxied (`B by b`), and
+            # directly on the specifier otherwise (`C`).
             specifier = next((child for child in node.named_children if not child.is_extra), None)
-            if specifier is not None and specifier.type == "constructor_invocation":
+            if (
+                specifier is not None
+                and specifier.type in TreeSitterExtractor._KOTLIN_HERITAGE_WRAPPERS
+            ):
                 specifier = next(
                     (child for child in specifier.named_children if not child.is_extra), None
                 )
             TreeSitterExtractor._emit_heritage_leaves(
-                TreeSitterExtractor._kotlin_swift_type_names(specifier), source, add_reference
+                TreeSitterExtractor._kotlin_swift_type_names(specifier), add_reference
             )
         elif node.type == "user_type":
-            # Delegation specifiers own their type rows; every other
-            # user_type (`x: Foo`, `: Bar`, `val v: Foo`, call type
-            # arguments) is a type use. Nested user_types under a shared
-            # capture re-emit the same span and are deduplicated by `add`.
-            if not TreeSitterExtractor._within_ancestor(node, "delegation_specifier"):
-                self._emit_kotlin_swift_type_uses(node, source, add_reference)
+            # Heritage clauses own their supertype; every other user_type
+            # (`x: Foo`, `: Bar`, `val v: Foo`, call type arguments) is a type
+            # use. Nested user_types under a shared capture re-emit the same
+            # span and are deduplicated by `add`.
+            if not TreeSitterExtractor._is_heritage_type_node(node):
+                self._emit_kotlin_swift_type_uses(node, add_reference)
         elif node.type in {
             "class_declaration",
             "object_declaration",
@@ -4240,18 +4330,17 @@ class TreeSitterExtractor:
             # supertype, reached through the `inherits_from` field.
             TreeSitterExtractor._emit_heritage_leaves(
                 TreeSitterExtractor._kotlin_swift_type_names(
-                    node.child_by_field_name("inherits_from")
+                    node.child_by_field_name("inherits_from"), metatype_suffix=True
                 ),
-                source,
                 add_reference,
             )
         elif node.type == "user_type":
-            # Inheritance specifiers own their type rows. Every other
+            # Inheritance specifiers own their supertype. Every other
             # user_type is a type use: parameter and return types, stored
             # properties, array/optional wrappers, and the extended type of
             # an `extension`, mirroring Rust's impl self type.
-            if not TreeSitterExtractor._within_ancestor(node, "inheritance_specifier"):
-                self._emit_kotlin_swift_type_uses(node, source, add_reference)
+            if not TreeSitterExtractor._is_heritage_type_node(node):
+                self._emit_kotlin_swift_type_uses(node, add_reference, metatype_suffix=True)
         elif node.type in {
             "class_declaration",
             "protocol_declaration",
@@ -4598,7 +4687,9 @@ class TreeSitterExtractor:
         protocol, extension) as a `class_declaration`; `declaration_kind` tells
         them apart. Only `extension` carries its target in a `user_type` name
         field, so a plain type declaration returns None and keeps its own
-        indexed `_Definition`.
+        indexed `_Definition`. The head naming leaf spells the whole
+        qualification, so `extension Outer.Inner` qualifies its members as
+        `Outer.Inner.member`, never `Outer.member`.
         """
         kind = declaration.child_by_field_name("declaration_kind")
         if kind is None or kind.type != "extension":
@@ -4606,12 +4697,8 @@ class TreeSitterExtractor:
         name = declaration.child_by_field_name("name")
         if name is None:
             return None
-        current: Node | None = name
-        while current is not None:
-            if current.type == "type_identifier":
-                return (current.text or b"").decode("utf-8", errors="replace")
-            current = current.named_children[0] if current.named_children else None
-        return None
+        leaves = TreeSitterExtractor._kotlin_swift_type_names(name, metatype_suffix=True)
+        return leaves[0].name if leaves else None
 
     @staticmethod
     def _content_range(
