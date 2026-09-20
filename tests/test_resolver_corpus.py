@@ -915,6 +915,45 @@ def test_kotlin_delegation_is_an_inheritance_edge(tmp_path: Path) -> None:
     assert not any(hit.kind == "read" for hit in response.hits)
 
 
+def test_kotlin_by_delegation_resolves_the_delegated_interface_exactly(
+    tmp_path: Path,
+) -> None:
+    """`class Child : Base by base` records the delegated interface as an
+    inheritance edge, bound exactly through the direct import instead of
+    silently dropping the name -- the hierarchy edge `impact_radius` walks."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "kotlin" / "delegation_by_inheritance"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="other/Base.kt", qualified_symbol="Base")
+    )
+
+    inheritance = next(hit for hit in response.hits if hit.kind == "inheritance")
+    assert inheritance.resolution == "exact"
+    assert inheritance.reason_code == "direct_import_alias"
+    assert not any(hit.kind == "read" for hit in response.hits)
+
+
+def test_kotlin_qualified_nested_supertype_is_one_exact_edge(tmp_path: Path) -> None:
+    """`class Child : Outer.Inner()` names a nested supertype: the inheritance
+    edge spells the whole qualification, binds exactly in-file, and never
+    splits the qualifier off as a type argument."""
+    service, project_id = _indexed_service(
+        tmp_path, CORPUS_ROOT / "kotlin" / "nested_type_heritage"
+    )
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="Main.kt", qualified_symbol="Outer.Inner")
+    )
+
+    inheritance = next(hit for hit in response.hits if hit.kind == "inheritance")
+    assert inheritance.written_name == "Outer.Inner"
+    assert inheritance.resolution == "exact"
+    assert inheritance.reason_code == "same_file_symbol"
+    assert not any(hit.kind == "type_use" for hit in response.hits)
+
+
 def test_zig_relative_import_resolves_namespace_call_exactly(tmp_path: Path) -> None:
     """`const helper = @import("helper.zig")` binds the file namespace, so
     `helper.work()` resolves exactly through `known_namespace_member`."""
