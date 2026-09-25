@@ -153,9 +153,10 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "analyze_refactor",
         "emit_refactor_patch",
         "file_outline",
+        "changed_symbols",
         "get_chunk",
     }
-    assert len(tools) == 20
+    assert len(tools) == 21
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -860,6 +861,7 @@ async def test_mcp_explicit_checkout_path_wins_over_client_root(
         "analyze_refactor",
         "emit_refactor_patch",
         "dead_code_report",
+        "changed_symbols",
         "project_status",
         "index_history",
         "inspect_scan",
@@ -906,6 +908,7 @@ async def test_explicit_query_ignores_ambiguous_client_root(
             "operation": {"kind": "rename", "new_name": "renamed_branch"},
         },
         "dead_code_report": {"project": selected},
+        "changed_symbols": {"project": selected},
         "project_status": {"project": selected},
         "index_history": {"project": selected},
         "inspect_scan": {"project": selected},
@@ -2294,6 +2297,7 @@ AUTO_REGISTERING_TOOLS = frozenset(
         "analyze_refactor",
         "emit_refactor_patch",
         "file_outline",
+        "changed_symbols",
     }
 )
 WRITE_TOOLS = frozenset({"init_project", "index_project", "remove_project"})

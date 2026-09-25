@@ -942,6 +942,45 @@ class OutlineResponse(FrozenModel):
     items: list[OutlineItem]
 
 
+FileChangeKind = Literal["added", "modified", "deleted", "untracked"]
+
+
+class LineRange(FrozenModel):
+    start_line: int
+    end_line: int
+
+
+class ChangedFile(FrozenModel):
+    """One file that differs from the base revision, and the symbols it touches.
+
+    ``changed_lines`` are current-file lines that were added or rewritten; a
+    pure deletion has no current lines but still marks the declaration it fell
+    inside. Added and untracked files -- and files whose diff has no line
+    ranges, such as binary ones -- touch every symbol they declare.
+    ``index_current`` is false when the index holds different content than the
+    file on disk, so its symbol line ranges may not match; refresh the index
+    and ask again.
+    """
+
+    path: str
+    change: FileChangeKind
+    indexed: bool
+    index_current: bool | None = None
+    changed_lines: list[LineRange] = Field(default_factory=list)
+    symbols: list[OutlineItem] = Field(default_factory=list)
+
+
+class ChangedSymbolsResponse(FrozenModel):
+    project_id: str
+    base: str
+    head: str | None = None
+    since: str | None = None
+    since_time: str | None = None
+    files: list[ChangedFile]
+    total_files: int
+    truncated: bool = False
+
+
 class CodeChunk(FrozenModel):
     """One indexed chunk as returned to a caller.
 

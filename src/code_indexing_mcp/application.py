@@ -21,6 +21,7 @@ from platformdirs import user_cache_path, user_data_path
 from .accelerator_env import EnvironmentStatus
 from .backend_coordinator import BackendCoordinator
 from .backends import BackendSelection
+from .changes import collect_changes, resolve_base
 from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
@@ -31,6 +32,8 @@ from .indexing import Indexer
 from .maintenance import MaintenanceService
 from .models import (
     SCAN_SKIP_REASONS,
+    ChangedFile,
+    ChangedSymbolsResponse,
     CodeChunk,
     DeadCodeReport,
     DeclarationSelector,
@@ -60,6 +63,7 @@ from .models import (
     StorageStatus,
     StoredFile,
     SymbolResponse,
+    content_digest,
 )
 from .passage_backend import PassageBackendSession
 from .passage_cache import PassageReuseContext
@@ -79,6 +83,7 @@ from .reference_service import ReferenceService, validate_patch_request
 from .scanner import SourceScanner
 from .search import SearchService
 from .settings import IndexSettings
+from .source_io import SourceReadError, read_source
 from .staging import recover_staged_commits
 from .storage import (
     ActiveIndexTarget,
@@ -110,7 +115,18 @@ RESOLVE_TARGET_MAX_WORKERS = 8
 # watcher events, indexing, and registration invalidate it immediately.
 FRESHNESS_CACHE_SECONDS = 5.0
 
+# A lazy tool call probes Git in `project_status` and then again when the query
+# resolves its target a few milliseconds later. The query reuses the status
+# probe's identity and selector for this long, but only after re-reading HEAD
+# off disk (no spawn) and finding it unchanged -- the same check that already
+# detects a mid-request move after the operation runs.
+GIT_PROBE_REUSE_SECONDS = 5.0
+
 SCAN_INSPECTION_MAX_LIMIT = 200
+
+# changed_symbols lists at most this many files per call; each one is read
+# from disk once to check that its indexed content is current.
+CHANGED_SYMBOLS_MAX_LIMIT = 500
 
 # Written into `data` and `cache` by `RuntimePaths.ensure_private()`. Its
 # presence is what tells the uninstaller "this directory is ours to delete"
@@ -381,6 +397,17 @@ class ApplicationLike(Protocol):
         self, path: str, project: str | None = None, *, roots: list[Path] | None = None
     ) -> OutlineResponse: ...
 
+    def changed_symbols(
+        self,
+        project: str | None = None,
+        *,
+        since: str | None = None,
+        since_time: str | None = None,
+        include_untracked: bool = True,
+        limit: int = 100,
+        roots: list[Path] | None = None,
+    ) -> ChangedSymbolsResponse: ...
+
     def get_chunk(self, chunk_id: str) -> CodeChunk: ...
 
 
@@ -455,6 +482,10 @@ class Application:
         # threads, so every access goes through _freshness_lock.
         self._clean_freshness_until: dict[tuple[str, str], tuple[float, str]] = {}
         self._freshness_lock = threading.Lock()
+        # Recent successful Git probes keyed by checkout root identity: the
+        # monotonic reuse deadline and the probe. Guarded like the freshness map.
+        self._recent_git_probes: dict[str, tuple[float, GitState]] = {}
+        self._git_probe_lock = threading.Lock()
 
         passage_session_factory: Callable[[], PassageBackendSession] | None = None
         passage_cache_factory: Callable[[ProjectInfo, bool], PassageReuseContext] | None = None
@@ -736,6 +767,47 @@ class Application:
             self.invalidate_freshness(project.id)
             return project
 
+    def _probe_git(self, root: Path, *, include_status: bool) -> GitState:
+        """Probe *root*'s Git state, reusing a recent probe when HEAD has not moved.
+
+        A status probe always runs fresh: its cleanliness answer is what the
+        freshness check exists to compute. A plain probe may reuse any recent
+        successful probe of the same checkout -- including the status probe
+        ``project_status`` ran moments earlier in the same tool call -- when
+        :func:`head_snapshot` still reads the same selector and HEAD. The reused
+        state drops the status fields, so the caller gets exactly what a fresh
+        plain probe would have returned.
+        """
+        key = project_root_identity(root)
+        if not include_status:
+            with self._git_probe_lock:
+                entry = self._recent_git_probes.get(key)
+            if entry is not None and entry[0] > time.monotonic():
+                cached = entry[1]
+                if head_snapshot(cached) == (
+                    cached.selector_kind,
+                    cached.selector_value,
+                    cached.head_oid,
+                ):
+                    return cached.model_copy(
+                        update={
+                            "worktree": WorktreeStatus.UNKNOWN,
+                            "dirty_paths": (),
+                            "untracked_paths": (),
+                            "status_fingerprint": None,
+                        }
+                    )
+        state = probe_git_state(root, include_status=include_status)
+        with self._git_probe_lock:
+            if state.probe is GitProbeOutcome.GIT:
+                self._recent_git_probes[key] = (
+                    time.monotonic() + GIT_PROBE_REUSE_SECONDS,
+                    state,
+                )
+            else:
+                self._recent_git_probes.pop(key, None)
+        return state
+
     def _resolve_active_target(
         self,
         project: ProjectInfo,
@@ -744,7 +816,7 @@ class Application:
         lock_held: bool = False,
     ) -> ActiveIndexTarget:
         """Resolve one immutable Git and physical-partition operation target."""
-        git = probe_git_state(project.root, include_status=include_status)
+        git = self._probe_git(project.root, include_status=include_status)
         lock_directory = self.paths.data / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
 
@@ -1561,6 +1633,104 @@ class Application:
     def _file_outline_for_target(self, path: str, target: ActiveIndexTarget) -> OutlineResponse:
         self._ensure_query_generations({target.project.id: [target]})
         return self.search.file_outline(path, target.project.id, partition=target.partition)
+
+    def changed_symbols(
+        self,
+        project: str | None = None,
+        *,
+        since: str | None = None,
+        since_time: str | None = None,
+        include_untracked: bool = True,
+        limit: int = 100,
+        roots: list[Path] | None = None,
+    ) -> ChangedSymbolsResponse:
+        if not 1 <= limit <= CHANGED_SYMBOLS_MAX_LIMIT:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                f"limit must be between 1 and {CHANGED_SYMBOLS_MAX_LIMIT}",
+                limit=limit,
+            )
+        resolved = self.resolve_project(project, roots)
+        return self._run_repository_stable_query(
+            [resolved],
+            lambda targets: self._changed_symbols_for_target(
+                self._primary_target(targets, resolved.id),
+                since=since,
+                since_time=since_time,
+                include_untracked=include_untracked,
+                limit=limit,
+            ),
+        )
+
+    def _changed_symbols_for_target(
+        self,
+        target: ActiveIndexTarget,
+        *,
+        since: str | None,
+        since_time: str | None,
+        include_untracked: bool,
+        limit: int,
+    ) -> ChangedSymbolsResponse:
+        project = target.project
+        if target.git_state.probe is not GitProbeOutcome.GIT:
+            raise CodeIndexingError(
+                ErrorCode.UNSUPPORTED_OPERATION,
+                "changed_symbols needs a Git checkout; this project root is not one "
+                f"(git probe: {target.git_state.probe.value})",
+                project=project.id,
+            )
+        base = resolve_base(project.root, since=since, since_time=since_time)
+        changes = collect_changes(
+            project.root, base, include_untracked=include_untracked, limit=limit
+        )
+        self._ensure_query_generations({project.id: [target]})
+        paths = [change.path for change in changes.files]
+        with self.store.partition_access(project.id, partition_id=target.partition_id):
+            stored = {
+                record.path: record
+                for record in self.store.files_for_paths(
+                    paths, project.id, partition_id=target.partition_id
+                )
+            }
+        outlines = self.search.file_outlines(paths, project.id, partition=target.partition)
+        files: list[ChangedFile] = []
+        for change in changes.files:
+            record = stored.get(change.path)
+            files.append(
+                ChangedFile(
+                    path=change.path,
+                    change=change.change,
+                    indexed=record is not None,
+                    index_current=(
+                        None
+                        if record is None
+                        else self._index_matches_disk(project.root, change.path, record)
+                    ),
+                    changed_lines=change.line_ranges(),
+                    symbols=change.touched(outlines.get(change.path, [])),
+                )
+            )
+        return ChangedSymbolsResponse(
+            project_id=project.id,
+            base=changes.base,
+            head=target.git_state.head_oid,
+            since=since,
+            since_time=since_time,
+            files=files,
+            total_files=changes.total_files,
+            truncated=changes.total_files > len(files),
+        )
+
+    @staticmethod
+    def _index_matches_disk(root: Path, path: str, record: StoredFile) -> bool:
+        """Whether the indexed content of *path* is what is on disk now."""
+        # Identical content has the indexed size, so a larger file fails fast
+        # as oversized instead of being read in full.
+        try:
+            source, _ = read_source(root, Path(path), record.size)
+        except (OSError, SourceReadError):
+            return False
+        return content_digest(source) == record.content_hash
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         project_id = self.store.chunk_project_id(chunk_id)

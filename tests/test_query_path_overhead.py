@@ -92,9 +92,10 @@ def test_a_dirty_worktree_query_costs_no_full_scan_extra_probes_or_writes(
     probe_calls.clear()
 
     # The query itself, run against the (still stale) index -- this track
-    # does not reindex on query, only avoids re-walking and re-probing.
+    # does not reindex on query, only avoids re-walking and re-probing. HEAD
+    # has not moved since the status check, so the query reuses its probe.
     app.search_code("def f_1", projects=[project.id])
 
     assert iter_scan_calls == []
-    assert len(probe_calls) <= 1
+    assert probe_calls == []
     assert app.store._project_slots.version == version_before

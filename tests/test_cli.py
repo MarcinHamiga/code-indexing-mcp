@@ -34,6 +34,34 @@ def test_cli_dead_code_report(tmp_path: Path, monkeypatch, capsys) -> None:  # t
     assert report["review"][0]["status"] == "possibly_dead"
 
 
+def test_cli_changed_symbols(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    from conftest import run_git
+
+    from code_indexing_mcp.application import RuntimePaths
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(root))
+    (root / "lib.py").write_text("def answer():\n    return 42\n")
+    run_git("add", "lib.py", cwd=root)
+    run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init", cwd=root)
+    (root / "lib.py").write_text("def answer():\n    return 43\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=DeterministicEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    monkeypatch.setattr(cli, "Application", lambda *args, **kwargs: app)
+    monkeypatch.setattr(cli, "_update_notice", lambda *args: None)
+
+    assert main(["changed-symbols", project.id, "--since", "HEAD", "--no-untracked"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert [file["path"] for file in report["files"]] == ["lib.py"]
+    assert report["files"][0]["symbols"][0]["symbol"] == "answer"
+
+
 def test_cli_initializes_and_lists_projects(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
     root = tmp_path / "repo"
     root.mkdir()

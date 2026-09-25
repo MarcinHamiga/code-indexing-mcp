@@ -274,7 +274,7 @@ A generic MCP client configuration looks like this:
 > [!NOTE]
 > When installed to your PATH, you can simplify the configuration to `"command": "syndex"`, `"args": ["serve"]`. The server name can be `"syndex"` or `"code-indexing-mcp"`.
 
-The server exposes nineteen tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
+The server exposes twenty-one tools. Only `list_projects` and `get_chunk` are annotated `readOnlyHint`,
 so hosts may auto-approve them. The other query tools are not: on a root the server has not seen
 before they register it first, which writes a `.ci-mcp/project.toml` marker, and code
 queries also build its initial index. `remove_project` is annotated `destructiveHint`;
@@ -302,6 +302,7 @@ overwrite a marker and orphan the previous index.
 | `analyze_refactor` | read, registers and indexes | Read-only rename or signature-change impact analysis for one selected declaration. |
 | `emit_refactor_patch` | read, registers and indexes | Emit a `git apply`-able unified diff from the deterministic subset of a rename analysis; never edits source. |
 | `file_outline` | read, registers and indexes | One file's declared symbols, metadata only. |
+| `changed_symbols` | read, registers and indexes | Files that differ from a base commit and the declarations each change touches, metadata only. |
 | `get_chunk` | read only | Full stored text for one `chunk_id`. |
 
 Search `limit` values are capped at 50 and `match` accepts only `exact`, `prefix`, or `contains`;
@@ -339,6 +340,28 @@ For batch runs, use `syndex dead-code-report [project]` (or `code-indexing-mcp d
 Omitting the project selects the current project. Output is one JSON report without pagination;
 exit status 0 means the report succeeded, even when it contains review findings. Like reference
 queries, it refreshes stale indexes and backfills structural rows when needed.
+
+### Reviewing changes
+
+`changed_symbols(project=..., since=..., since_time=..., include_untracked=true, limit=100)`
+compares the working tree with a base commit and names the indexed declarations each change
+touches. The base defaults to `HEAD`, so the default answer covers staged, unstaged, and untracked
+work in progress; `since` accepts any commit-ish (`main`, a tag, `HEAD~3`) to review a branch, and
+`since_time` (`2026-09-01`, `2 days ago`) picks the last commit on `HEAD` before that time. Only
+Git checkouts are supported, and a project registered in a subdirectory sees only its own subtree.
+
+Each returned file carries its `change` kind (`added`, `modified`, `deleted`, or `untracked`), the
+current-file `changed_lines`, and the touched `symbols` as outline entries; `get_chunk` or
+`find_symbol` expand them to code. A declaration counts as touched when a changed line falls in its
+span or lines were removed from inside it, and split declarations are matched across all of their
+parts. Added and untracked files touch every declaration they contain; deleted files are listed
+with no symbols. Files are returned in path order up to `limit` (at most 500), with `total_files`
+and `truncated` reporting the rest.
+
+Line ranges come from the index, so `index_current` says whether the indexed content still matches
+the file on disk: the MCP tool refreshes a stale index first in lazy mode, while
+`syndex changed-symbols [project] [--since REV | --since-time TIME] [--no-untracked]` reads the
+index as it is, so run `syndex index` first when it reports `index_current: false`.
 
 `impact_radius` expands those structural references breadth-first and groups dependents by hop
 depth. Exact edges are traversed by default; `include_likely=true` also traverses possible edges
@@ -460,6 +483,7 @@ syndex status
 syndex history
 syndex scan --outcome skipped
 syndex dead-code-report
+syndex changed-symbols --since main
 syndex storage status
 syndex storage vacuum --execute
 ```

@@ -23,7 +23,7 @@ from code_indexing_mcp.application import Application, RuntimePaths
 from code_indexing_mcp.backends import CPU_BACKEND, Accelerator
 from code_indexing_mcp.embedding_worker import default_launcher
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
-from code_indexing_mcp.git_state import GitProbeOutcome, GitState, SelectorKind
+from code_indexing_mcp.git_state import GitProbeOutcome, GitState, SelectorKind, probe_git_state
 from code_indexing_mcp.models import (
     DeclarationSelector,
     ExampleSearchResponse,
@@ -425,10 +425,122 @@ def test_probe_git_state_runs_once_per_project_when_nothing_moves(tmp_path: Path
         calls.append(1)
         return original_probe(*args, **kwargs)
 
+    # Start without a reusable probe so the query's own probe is counted.
+    app._recent_git_probes.clear()
     with patch("code_indexing_mcp.application.probe_git_state", side_effect=counting_probe):
         app.search_code("main_branch", projects=[project.id])
 
     assert len(calls) == 1
+
+
+def _counting_probes(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Record the ``include_status`` flag of every Git probe the application runs."""
+    from code_indexing_mcp import application as application_module
+
+    original_probe = application_module.probe_git_state
+    calls: list[bool] = []
+
+    def counting_probe(*args, **kwargs):
+        calls.append(bool(kwargs.get("include_status", False)))
+        return original_probe(*args, **kwargs)
+
+    monkeypatch.setattr("code_indexing_mcp.application.probe_git_state", counting_probe)
+    return calls
+
+
+def test_query_reuses_the_status_probe_of_the_same_tool_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lazy path runs ``project_status`` and then the query; the query must
+    not re-probe a checkout whose HEAD the status probe just read."""
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    (root / "main.py").write_text("def main_branch():\n    return 2\n")
+    calls = _counting_probes(monkeypatch)
+
+    status = app.project_status(project.id)
+    response = app.search_code("main_branch", projects=[project.id])
+
+    assert status.state == "stale"
+    assert calls == [True]
+    assert [hit.symbol for hit in response.hits] == ["main_branch"]
+
+
+def test_reused_probe_carries_no_status_fields(tmp_path: Path) -> None:
+    """A reused status probe must look exactly like a fresh plain probe."""
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    (root / "untracked.py").write_text("value = 1\n")
+
+    with_status = app._probe_git(root, include_status=True)
+    reused = app._probe_git(root, include_status=False)
+
+    assert with_status.untracked_paths == ("untracked.py",)
+    assert reused == probe_git_state(root)
+
+
+def test_query_reprobes_when_head_moved_after_the_status_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    status = app.project_status(project.id)
+    run_git(
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "moved",
+        cwd=root,
+    )
+    calls = _counting_probes(monkeypatch)
+
+    target = app._resolve_active_target(project)
+
+    assert calls == [False]
+    assert status.git_head is not None
+    assert target.git_state.head_oid != status.git_head
+    assert target.git_state.head_oid == probe_git_state(root).head_oid
+
+
+def test_query_reprobes_once_the_reuse_window_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.project_status(project.id)
+    monkeypatch.setattr("code_indexing_mcp.application.GIT_PROBE_REUSE_SECONDS", 0.0)
+    app.project_status(project.id)
+    calls = _counting_probes(monkeypatch)
+
+    app._resolve_active_target(project)
+
+    assert calls == [False]
 
 
 def test_application_can_ensure_the_structural_index_without_a_semantic_search(
@@ -918,6 +1030,9 @@ def test_resolve_active_targets_probes_multiple_projects_in_parallel(
         return real_probe(*args, **kwargs)
 
     monkeypatch.setattr("code_indexing_mcp.application.probe_git_state", slow_probe)
+    # Indexing left a reusable probe per project; drop them so every project
+    # really probes and the concurrency is what gets measured.
+    app._recent_git_probes.clear()
 
     started = time.monotonic()
     grouped = app._resolve_active_targets(infos)

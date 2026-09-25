@@ -143,6 +143,35 @@ def _example_passages(
     return None, [compose_passage("", example)]
 
 
+def _outline_items(
+    chunks: Sequence[ChunkPreview], path: str, *, span_parts: bool = False
+) -> list[OutlineItem]:
+    """One outline entry per declaration, merging a split declaration's parts.
+
+    The entry keeps the first part's line range unless *span_parts* asks for
+    the whole declaration's, from its first part's start to its last's end.
+    """
+    items: dict[tuple[str, str], OutlineItem] = {}
+    for chunk in sorted(chunks, key=lambda item: (item.path, item.start_line)):
+        if chunk.path != path or not chunk.symbol or not chunk.qualified_symbol:
+            continue
+        key = (chunk.kind.removesuffix("_part"), chunk.qualified_symbol)
+        existing = items.get(key)
+        if existing is not None:
+            if span_parts and chunk.end_line > existing.end_line:
+                items[key] = existing.model_copy(update={"end_line": chunk.end_line})
+            continue
+        items[key] = OutlineItem(
+            kind=key[0],
+            symbol=chunk.symbol,
+            qualified_symbol=chunk.qualified_symbol,
+            parent_symbol=chunk.parent_symbol,
+            start_line=chunk.start_line,
+            end_line=chunk.end_line,
+        )
+    return list(items.values())
+
+
 def _as_partition_refs(value: PartitionRef | Sequence[PartitionRef]) -> list[PartitionRef]:
     """Normalize one pinned partition or a sequence of them into a list."""
     if isinstance(value, PartitionRef):
@@ -386,8 +415,6 @@ class SearchService:
     def file_outline(
         self, path: str, project_id: str, *, partition: PartitionRef | None = None
     ) -> OutlineResponse:
-        items: list[OutlineItem] = []
-        seen: set[tuple[str, str]] = set()
         partition = partition or self.store.active_partition(project_id)
         if partition.project_id != project_id:
             raise ValueError("outline partition does not belong to project")
@@ -395,24 +422,28 @@ class SearchService:
             chunks = self.store.outline_chunks(
                 path, project_id, partition_id=partition.partition_id
             )
-        for chunk in sorted(chunks, key=lambda item: (item.path, item.start_line)):
-            if chunk.path != path or not chunk.symbol or not chunk.qualified_symbol:
-                continue
-            key = (chunk.kind.removesuffix("_part"), chunk.qualified_symbol)
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append(
-                OutlineItem(
-                    kind=key[0],
-                    symbol=chunk.symbol,
-                    qualified_symbol=chunk.qualified_symbol,
-                    parent_symbol=chunk.parent_symbol,
-                    start_line=chunk.start_line,
-                    end_line=chunk.end_line,
-                )
+        return OutlineResponse(project_id=project_id, path=path, items=_outline_items(chunks, path))
+
+    def file_outlines(
+        self, paths: Sequence[str], project_id: str, *, partition: PartitionRef
+    ) -> dict[str, list[OutlineItem]]:
+        """Outline several files in one batched read, keyed by path.
+
+        Each entry spans its whole declaration, including every split part,
+        so a caller can intersect it with changed line ranges.
+        """
+        if partition.project_id != project_id:
+            raise ValueError("outline partition does not belong to project")
+        with self.store.partition_access(project_id, partition_id=partition.partition_id):
+            chunks = self.store.outline_chunks_for_paths(
+                paths, project_id, partition_id=partition.partition_id
             )
-        return OutlineResponse(project_id=project_id, path=path, items=items)
+        by_path: dict[str, list[ChunkPreview]] = {}
+        for chunk in chunks:
+            by_path.setdefault(chunk.path, []).append(chunk)
+        return {
+            path: _outline_items(by_path.get(path, []), path, span_parts=True) for path in paths
+        }
 
     def get_chunk(self, chunk_id: str, *, partition: PartitionRef | None = None) -> CodeChunk:
         project_id = self.store.chunk_project_id(chunk_id)

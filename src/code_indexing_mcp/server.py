@@ -28,6 +28,7 @@ from .daemon import BrokerApplication
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import STRUCTURAL_LANGUAGES
 from .models import (
+    ChangedSymbolsResponse,
     ChunkKind,
     CodeChunk,
     DeadCodeReport,
@@ -68,7 +69,7 @@ SERVER_INSTRUCTIONS = (
     "find_references (structural uses of a selected declaration), impact_radius "
     "(transitive dependents), dead_code_report (exports with no exact uses, for review), "
     "analyze_refactor (rename or signature impact), file_outline "
-    "(file structure before reading), "
+    "(file structure before reading), changed_symbols (declarations touched since a commit), "
     "get_chunk (exact code for a "
     "search hit). When correlating code across explicitly related services, use list_projects "
     "to discover them and search_across_projects to search the selected repositories together. "
@@ -2060,6 +2061,81 @@ def create_server(
         resolved = await asyncio.to_thread(app.resolve_project, project, roots)
         await _wait_for_startup_projects(ctx, roots, [resolved])
         return await asyncio.to_thread(app.file_outline, path, resolved.id, roots=[resolved.root])
+
+    @mcp.tool(
+        title="Changed symbols",
+        description=(
+            "List the files that differ from a base commit in the working tree -- committed, "
+            "staged, and unstaged changes, plus untracked files -- and the indexed declarations "
+            "each change touches, matched by line range. The base defaults to HEAD, so the "
+            "default answer is the uncommitted work in progress; pass since (a branch, tag, or "
+            "commit, e.g. main) to review a branch, or since_time to cover recent history. "
+            "Returns structure metadata only, never code text; get_chunk or file_outline expand "
+            "it. Git checkouts only. A file whose index_current is false was indexed with "
+            "different content, so its symbol ranges may be off until the index refreshes."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def changed_symbols(
+        ctx: ServerContext,
+        project: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Project id, name, or path. Defaults to the active MCP root or the nearest "
+                    ".ci-mcp/project.toml."
+                )
+            ),
+        ] = None,
+        since: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Base commit-ish to compare the working tree against: a branch, tag, commit, "
+                    "or expression such as HEAD~3. Defaults to HEAD. Mutually exclusive with "
+                    "since_time."
+                )
+            ),
+        ] = None,
+        since_time: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Use the last commit on HEAD made before this time as the base, in any "
+                    "format git accepts, such as 2026-09-01, '2 days ago', or an ISO 8601 "
+                    "timestamp. Mutually exclusive with since."
+                )
+            ),
+        ] = None,
+        include_untracked: Annotated[
+            bool,
+            Field(description="Include untracked, non-ignored files as new files."),
+        ] = True,
+        limit: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=500,
+                description=(
+                    "Maximum files to return, in path order; total_files and truncated report "
+                    "the rest."
+                ),
+            ),
+        ] = 100,
+    ) -> ChangedSymbolsResponse:
+        roots = await scoped_roots(ctx, project=project)
+        resolved = await asyncio.to_thread(app.resolve_project, project, roots)
+        await _wait_for_startup_projects(ctx, roots, [resolved])
+        return await asyncio.to_thread(
+            app.changed_symbols,
+            resolved.id,
+            since=since,
+            since_time=since_time,
+            include_untracked=include_untracked,
+            limit=limit,
+            roots=[resolved.root],
+        )
 
     @mcp.tool(
         title="Get chunk",
