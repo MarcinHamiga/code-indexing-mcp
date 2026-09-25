@@ -263,7 +263,7 @@ async def test_stdio_peer_that_never_answers_roots_does_not_block_discovery(
             )
             assert "result" in response
             await send({"method": "notifications/initialized"})
-            assert len((await request("tools", "tools/list", {}))["result"]["tools"]) == 20
+            assert len((await request("tools", "tools/list", {}))["result"]["tools"]) == 21
             # Explicitly unknown project should return its real error after
             # roots fallback, not hang behind the peer's absent response.
             status = await request(

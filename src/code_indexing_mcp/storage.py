@@ -2280,6 +2280,45 @@ class LanceStore:
             row["project_id"] = project_id
         return [ChunkPreview.model_validate(row) for row in rows]
 
+    def outline_chunks_for_paths(
+        self, paths: Iterable[str], project_id: str, *, partition_id: str | None = None
+    ) -> list[ChunkPreview]:
+        """``outline_chunks`` for several files, in bounded ``IN`` batches."""
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return []
+        names = sorted(set(paths))
+        previews: list[ChunkPreview] = []
+        for offset in range(0, len(names), 256):
+            values = ", ".join(_quoted(name) for name in names[offset : offset + 256])
+            rows = self._projected_chunks(
+                tables.chunks,
+                f"path IN ({values}) AND symbol IS NOT NULL AND qualified_symbol IS NOT NULL",
+                limit=None,
+                content=False,
+            )
+            for row in rows:
+                row["project_id"] = project_id
+            previews.extend(ChunkPreview.model_validate(row) for row in rows)
+        return previews
+
+    def files_for_paths(
+        self, paths: Iterable[str], project_id: str, *, partition_id: str | None = None
+    ) -> list[StoredFile]:
+        """Return the stored file rows for exactly these project-relative paths."""
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return []
+        names = sorted(set(paths))
+        records: list[StoredFile] = []
+        for offset in range(0, len(names), 256):
+            values = ", ".join(_quoted(name) for name in names[offset : offset + 256])
+            records.extend(
+                StoredFile.model_validate(row)
+                for row in self._rows(tables.files, f"path IN ({values})")
+            )
+        return records
+
     def find_declarations(
         self,
         project_id: str,
