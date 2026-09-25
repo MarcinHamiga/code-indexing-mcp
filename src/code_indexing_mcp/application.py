@@ -110,6 +110,13 @@ RESOLVE_TARGET_MAX_WORKERS = 8
 # watcher events, indexing, and registration invalidate it immediately.
 FRESHNESS_CACHE_SECONDS = 5.0
 
+# A lazy tool call probes Git in `project_status` and then again when the query
+# resolves its target a few milliseconds later. The query reuses the status
+# probe's identity and selector for this long, but only after re-reading HEAD
+# off disk (no spawn) and finding it unchanged -- the same check that already
+# detects a mid-request move after the operation runs.
+GIT_PROBE_REUSE_SECONDS = 5.0
+
 SCAN_INSPECTION_MAX_LIMIT = 200
 
 # Written into `data` and `cache` by `RuntimePaths.ensure_private()`. Its
@@ -455,6 +462,10 @@ class Application:
         # threads, so every access goes through _freshness_lock.
         self._clean_freshness_until: dict[tuple[str, str], tuple[float, str]] = {}
         self._freshness_lock = threading.Lock()
+        # Recent successful Git probes keyed by checkout root identity: the
+        # monotonic reuse deadline and the probe. Guarded like the freshness map.
+        self._recent_git_probes: dict[str, tuple[float, GitState]] = {}
+        self._git_probe_lock = threading.Lock()
 
         passage_session_factory: Callable[[], PassageBackendSession] | None = None
         passage_cache_factory: Callable[[ProjectInfo, bool], PassageReuseContext] | None = None
@@ -736,6 +747,47 @@ class Application:
             self.invalidate_freshness(project.id)
             return project
 
+    def _probe_git(self, root: Path, *, include_status: bool) -> GitState:
+        """Probe *root*'s Git state, reusing a recent probe when HEAD has not moved.
+
+        A status probe always runs fresh: its cleanliness answer is what the
+        freshness check exists to compute. A plain probe may reuse any recent
+        successful probe of the same checkout -- including the status probe
+        ``project_status`` ran moments earlier in the same tool call -- when
+        :func:`head_snapshot` still reads the same selector and HEAD. The reused
+        state drops the status fields, so the caller gets exactly what a fresh
+        plain probe would have returned.
+        """
+        key = project_root_identity(root)
+        if not include_status:
+            with self._git_probe_lock:
+                entry = self._recent_git_probes.get(key)
+            if entry is not None and entry[0] > time.monotonic():
+                cached = entry[1]
+                if head_snapshot(cached) == (
+                    cached.selector_kind,
+                    cached.selector_value,
+                    cached.head_oid,
+                ):
+                    return cached.model_copy(
+                        update={
+                            "worktree": WorktreeStatus.UNKNOWN,
+                            "dirty_paths": (),
+                            "untracked_paths": (),
+                            "status_fingerprint": None,
+                        }
+                    )
+        state = probe_git_state(root, include_status=include_status)
+        with self._git_probe_lock:
+            if state.probe is GitProbeOutcome.GIT:
+                self._recent_git_probes[key] = (
+                    time.monotonic() + GIT_PROBE_REUSE_SECONDS,
+                    state,
+                )
+            else:
+                self._recent_git_probes.pop(key, None)
+        return state
+
     def _resolve_active_target(
         self,
         project: ProjectInfo,
@@ -744,7 +796,7 @@ class Application:
         lock_held: bool = False,
     ) -> ActiveIndexTarget:
         """Resolve one immutable Git and physical-partition operation target."""
-        git = probe_git_state(project.root, include_status=include_status)
+        git = self._probe_git(project.root, include_status=include_status)
         lock_directory = self.paths.data / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
 
