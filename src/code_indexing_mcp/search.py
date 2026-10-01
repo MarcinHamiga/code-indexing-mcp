@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -25,6 +25,7 @@ from .models import (
 )
 from .path_filter import path_condition
 from .storage import LanceStore, PartitionRef, RankComponents, _quoted
+from .token_batching import MAX_WINDOWS_PER_CANDIDATE
 
 logger = logging.getLogger(__name__)
 
@@ -236,20 +237,31 @@ class SearchService:
         include_content_in_key: bool,
     ) -> list[SearchHit]:
         hits: list[SearchHit] = []
-        seen: set[tuple[str, str, int, int, str | None]] = set()
+        seen: set[tuple[object, ...]] = set()
         for row in rows:
             chunk = ChunkPreview.model_validate(row)
             if preparation.paths and not any(
                 PurePosixPath(chunk.path).match(pattern) for pattern in preparation.paths
             ):
                 continue
-            key = (
+            key: tuple[object, ...] = (
                 chunk.project_id,
                 chunk.path,
                 chunk.start_line,
                 chunk.end_line,
                 chunk.content if include_content_in_key else None,
             )
+            if chunk.source_start_byte is not None:
+                key = (
+                    chunk.project_id,
+                    chunk.file_id,
+                    chunk.kind,
+                    chunk.qualified_symbol,
+                    chunk.part_index,
+                    chunk.source_start_byte,
+                    chunk.source_end_byte,
+                    chunk.content_hash,
+                )
             if key in seen:
                 continue
             seen.add(key)
@@ -258,6 +270,34 @@ class SearchService:
                 break
         hits.sort(key=lambda hit: (-hit.score, hit.path, hit.start_line))
         return hits
+
+    def _window_aware_hits(
+        self,
+        fetch_rows: Callable[[int], list[dict[str, Any]]],
+        names: Mapping[str, str],
+        preparation: _SearchPreparation,
+        *,
+        include_content_in_key: bool,
+    ) -> list[SearchHit]:
+        """Refill a result page when embedding windows occupied its candidate slots."""
+        fetch = preparation.fetch
+        # Equal source in pinned checkouts shares a logical result identity,
+        # but every physical partition contributes its own window vectors.
+        copies = max((len(refs) for refs in preparation.selected.values()), default=1)
+        maximum = max(fetch, preparation.limit * MAX_WINDOWS_PER_CANDIDATE * copies)
+        while True:
+            rows = fetch_rows(fetch)
+            hits = self._collect_hits(
+                rows, names, preparation, include_content_in_key=include_content_in_key
+            )
+            if (
+                len(hits) >= preparation.limit
+                or len(rows) < fetch
+                or fetch >= maximum
+                or not any(row.get("source_start_byte") is not None for row in rows)
+            ):
+                return hits
+            fetch = min(maximum, fetch * 2)
 
     def search_code(
         self,
@@ -290,17 +330,21 @@ class SearchService:
             partitions=partitions,
         )
         query_vector = self.embedder.embed_query(query)
-        with self.store.partitions_access(preparation.selected):
-            rows = self.store.hybrid_search(
-                query,
-                query_vector,
-                project_ids,
-                preparation.condition,
-                preparation.fetch,
-                partition_ids=preparation.partition_ids,
-            )
         names = {project.id: project.name for project in self.store.list_projects()}
-        hits = self._collect_hits(rows, names, preparation, include_content_in_key=True)
+        with self.store.partitions_access(preparation.selected):
+            hits = self._window_aware_hits(
+                lambda fetch: self.store.hybrid_search(
+                    query,
+                    query_vector,
+                    project_ids,
+                    preparation.condition,
+                    fetch,
+                    partition_ids=preparation.partition_ids,
+                ),
+                names,
+                preparation,
+                include_content_in_key=True,
+            )
         if hits:
             hits = self._explain_hits(
                 query, query_vector, hits, preparation.condition, preparation.selected
@@ -334,16 +378,20 @@ class SearchService:
             partitions=partitions,
         )
         vectors = self.embedder.embed_passages(passages)
-        with self.store.partitions_access(preparation.selected):
-            rows = self.store.example_search(
-                vectors,
-                project_ids,
-                preparation.condition,
-                preparation.fetch,
-                partition_ids=preparation.partition_ids,
-            )
         names = {project.id: project.name for project in self.store.list_projects()}
-        hits = self._collect_hits(rows, names, preparation, include_content_in_key=False)
+        with self.store.partitions_access(preparation.selected):
+            hits = self._window_aware_hits(
+                lambda fetch: self.store.example_search(
+                    vectors,
+                    project_ids,
+                    preparation.condition,
+                    fetch,
+                    partition_ids=preparation.partition_ids,
+                ),
+                names,
+                preparation,
+                include_content_in_key=False,
+            )
         return ExampleSearchResponse(
             language=resolved_language,
             segments=len(passages),

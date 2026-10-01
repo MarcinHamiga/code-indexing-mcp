@@ -13,6 +13,7 @@ from code_indexing_mcp.token_batching import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_OVERLAP_TOKENS,
     REFERENCE_MEMORY_BYTES,
+    TokenWindow,
     content_token_offsets,
     max_token_product_for,
     plan_candidate_windows,
@@ -200,6 +201,133 @@ def test_prefixed_windows_expose_the_full_input_count_for_packing() -> None:
 
     assert windows[0].token_count == 1
     assert windows[0].input_token_count == len(fake_encode(f"{prefix}\n{content}").offsets)
+
+
+def composition_encode(text: str) -> FakeEncoding:
+    """Model a tokenizer whose prefix/body boundary adds two tokens."""
+    encoding = fake_encode(text)
+    if "\n" in text and text.partition("\n")[2]:
+        return FakeEncoding(
+            offsets=[*encoding.offsets, (0, 0), (0, 0)],
+            special_tokens_mask=[*encoding.special_tokens_mask, 1, 1],
+        )
+    return encoding
+
+
+def assert_complete_windows(content: str, windows: list[TokenWindow]) -> None:
+    assert windows[0].start_char == 0
+    assert windows[-1].end_char == len(content)
+    rebuilt = content[: windows[0].end_char]
+    for previous, window in itertools.pairwise(windows):
+        assert previous.start_char < window.start_char <= previous.end_char
+        assert previous.end_char < window.end_char
+        rebuilt += content[previous.end_char : window.end_char]
+    assert rebuilt == content
+
+
+def test_composed_input_overflow_replans_without_losing_source() -> None:
+    content = "\n".join(f"value_{index} = {index}" for index in range(20))
+    candidates = [("header", content)]
+
+    windows = plan_candidate_windows(
+        composition_encode, candidates, max_tokens=16, overlap_tokens=4
+    )[0]
+
+    assert_complete_windows(content, windows)
+    for window in windows:
+        measured = len(
+            composition_encode(f"header\n{content[window.start_char : window.end_char]}").offsets
+        )
+        assert window.input_token_count == measured <= 16
+    assert (
+        plan_candidate_windows(composition_encode, candidates, max_tokens=16, overlap_tokens=4)[0]
+        == windows
+    )
+
+
+def test_replanning_checks_new_boundaries_until_every_input_fits() -> None:
+    attempts: list[int] = []
+
+    def encode(text: str) -> FakeEncoding:
+        encoding = fake_encode(text)
+        if "\n" not in text or not text.partition("\n")[2]:
+            return encoding
+        body_tokens = len(offsets_for(text.partition("\n")[2]))
+        attempts.append(body_tokens)
+        extra = 1 if body_tokens % 2 else 2
+        return FakeEncoding(
+            offsets=[*encoding.offsets, *([(0, 0)] * extra)],
+            special_tokens_mask=[*encoding.special_tokens_mask, *([1] * extra)],
+        )
+
+    content = "a b c d e f g h i"
+    windows = plan_candidate_windows(encode, [("header", content)], max_tokens=8, overlap_tokens=0)[
+        0
+    ]
+
+    assert 5 in attempts and 4 in attempts and 3 in attempts
+    assert all(window.input_token_count <= 8 for window in windows)
+    assert_complete_windows(content, windows)
+
+
+def test_a_fitting_candidate_keeps_its_original_boundaries() -> None:
+    content = " ".join(f"tok{index}" for index in range(30))
+    expected = plan_token_windows(
+        offsets_for(content), text_length=len(content), max_tokens=7, overlap_tokens=2
+    )
+
+    measured = plan_candidate_windows(
+        fake_encode, [("header", content)], max_tokens=10, overlap_tokens=2
+    )[0]
+
+    assert [(w.start_char, w.end_char, w.token_count) for w in measured] == [
+        (w.start_char, w.end_char, w.token_count) for w in expected
+    ]
+
+
+def test_a_composed_input_that_cannot_fit_terminates_with_a_clear_error() -> None:
+    with pytest.raises(ValueError, match="even with a one-token content window"):
+        plan_candidate_windows(composition_encode, [("header", "body")], max_tokens=4)
+
+
+@pytest.mark.parametrize("prefix", ["", "head"])
+def test_subword_boundary_inflation_replans_with_a_real_tokenizer(prefix: str) -> None:
+    tokenizers = pytest.importorskip("tokenizers")
+    vocab = ["[UNK]", "[CLS]", "[SEP]", "head", "a", "##a", "##bc", "b", "##c"]
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.WordPiece(
+            {word: index for index, word in enumerate(vocab)}, unk_token="[UNK]"
+        )
+    )
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer.post_processor = tokenizers.processors.TemplateProcessing(
+        single="[CLS] $A [SEP]", special_tokens=[("[CLS]", 1), ("[SEP]", 2)]
+    )
+    content = "abc" * 10
+    max_tokens = 7 if prefix else 6
+
+    windows = plan_candidate_windows(
+        tokenizer.encode, [(prefix, content)], max_tokens=max_tokens, overlap_tokens=1
+    )[0]
+
+    assert_complete_windows(content, windows)
+    for window in windows:
+        body = content[window.start_char : window.end_char]
+        composed = f"{prefix}\n{body}" if prefix else body
+        assert window.input_token_count == len(tokenizer.encode(composed).offsets) <= max_tokens
+
+
+def test_composition_replanning_retains_the_window_count_cap() -> None:
+    content = " ".join(f"tok{index}" for index in range(14))
+
+    with pytest.raises(ValueError, match="exceeded 2 windows"):
+        plan_candidate_windows(
+            composition_encode,
+            [("header", content)],
+            max_tokens=11,
+            overlap_tokens=0,
+            max_windows=2,
+        )
 
 
 def test_microbatches_respect_the_item_limit() -> None:

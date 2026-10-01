@@ -70,7 +70,9 @@ logger = logging.getLogger(__name__)
 # available through CODE_INDEXING_VECTOR_STORAGE. The bump keeps a pre-float16
 # binary from serving a float16 partition: it sees version 5 against its own 4
 # and marks the partition for rebuild instead of mixing generations.
-SCHEMA_VERSION = 5
+# Version 6 records original chunk bounds on embedding windows so retrieval can
+# reconstruct their source chunk without reading a changed checkout.
+SCHEMA_VERSION = 6
 
 # Symbol lookups page through the over-matching LIKE prefilter. These bound
 # each page, not the total scan needed to find the caller's literal matches.
@@ -135,6 +137,8 @@ CHUNK_PAYLOAD_COLUMNS = [
     "content",
     "content_hash",
     "part_index",
+    "source_start_byte",
+    "source_end_byte",
 ]
 
 # Every chunk column except the vector. list_chunks has no production caller and its
@@ -156,6 +160,8 @@ INDEXED_CHUNK_COLUMNS = [
     "identifier_terms",
     "content_hash",
     "part_index",
+    "source_start_byte",
+    "source_end_byte",
 ]
 
 
@@ -1743,7 +1749,8 @@ class LanceStore:
         project_id = self.chunk_project_id(chunk_id)
         if project_id is None:
             return None
-        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        physical = self._partition_id_for(project_id) if partition_id is None else partition_id
+        tables = self._existing_tables(physical)
         if tables is None:
             return None
         rows = cast(
@@ -1756,8 +1763,100 @@ class LanceStore:
         if not rows:
             return None
         row = dict(rows[0])
+        if row.get("source_start_byte") is not None:
+            # Pin both reads to one table version: an incremental replacement
+            # must not swap out the sibling windows between these lookups.
+            version = tables.chunks.version
+            database = lancedb.connect(
+                self.directory / "projects" / physical,
+                read_consistency_interval=timedelta(0),
+            )
+            snapshot = cast(LanceTable, database.open_table("chunks", version=version))
+            rows = cast(
+                list[dict[str, Any]],
+                snapshot.search()
+                .where(f"chunk_id = {_quoted(chunk_id)}")
+                .select(CHUNK_PAYLOAD_COLUMNS)
+                .to_list(),
+            )
+            if not rows:
+                return None
+            row = dict(rows[0])
+            siblings = cast(
+                list[dict[str, Any]],
+                snapshot.search()
+                .where(self._source_chunk_condition(row))
+                .select(CHUNK_PAYLOAD_COLUMNS)
+                .to_list(),
+            )
+            row = self._reconstruct_source_chunk(row, siblings)
         row["project_id"] = project_id
         return CodeChunk.model_validate(row)
+
+    @staticmethod
+    def _source_chunk_condition(row: Mapping[str, Any]) -> str:
+        """A source chunk is scoped by file, byte range, and extractor identity."""
+        qualified = row.get("qualified_symbol")
+        symbol_condition = (
+            "qualified_symbol IS NULL"
+            if qualified is None
+            else f"qualified_symbol = {_quoted(str(qualified))}"
+        )
+        return (
+            f"file_id = {_quoted(str(row['file_id']))} "
+            f"AND source_start_byte = {int(row['source_start_byte'])} "
+            f"AND source_end_byte = {int(row['source_end_byte'])} "
+            f"AND kind = {_quoted(str(row['kind']))} "
+            f"AND part_index = {int(row.get('part_index', 0))} AND {symbol_condition} "
+            f"AND content_hash = {_quoted(str(row['content_hash']))}"
+        )
+
+    @staticmethod
+    def _reconstruct_source_chunk(
+        row: dict[str, Any], siblings: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any]:
+        """Join overlapping UTF-8 slices, refusing gaps or inconsistent source."""
+        start = int(row["source_start_byte"])
+        end = int(row["source_end_byte"])
+        cursor = start
+        content = bytearray()
+        ordered = sorted(
+            siblings, key=lambda item: (int(item["start_byte"]), int(item["end_byte"]))
+        )
+        for window in ordered:
+            window_start = int(window["start_byte"])
+            window_end = int(window["end_byte"])
+            text = str(window["content"]).encode("utf-8")
+            overlap = min(cursor, window_end) - window_start
+            if (
+                window_start < start
+                or window_start > cursor
+                or window_end > end
+                or window_end - window_start != len(text)
+                or content[window_start - start : window_start - start + overlap] != text[:overlap]
+            ):
+                raise CodeIndexingError(
+                    ErrorCode.INDEX_INCOMPATIBLE,
+                    "Stored embedding windows do not cover a consistent source chunk; reindex",
+                    chunk_id=row["chunk_id"],
+                )
+            if window_end > cursor:
+                content.extend(text[cursor - window_start :])
+                cursor = window_end
+        if cursor != end or not ordered:
+            raise CodeIndexingError(
+                ErrorCode.INDEX_INCOMPATIBLE,
+                "Stored embedding windows leave a gap in the source chunk; reindex",
+                chunk_id=row["chunk_id"],
+            )
+        return {
+            **row,
+            "content": content.decode("utf-8"),
+            "start_byte": start,
+            "end_byte": end,
+            "start_line": ordered[0]["start_line"],
+            "end_line": ordered[-1]["end_line"],
+        }
 
     @staticmethod
     def _chunk_id_prefix(chunk_id: str) -> str | None:
@@ -1957,6 +2056,7 @@ class LanceStore:
             return []
         columns = [
             "chunk_id",
+            "file_id",
             "path",
             "language",
             "kind",
@@ -1966,6 +2066,10 @@ class LanceStore:
             "start_line",
             "end_line",
             "content",
+            "part_index",
+            "source_start_byte",
+            "source_end_byte",
+            "content_hash",
         ]
         vector_query = tables.chunks.search(
             vector, query_type="vector", vector_column_name="vector"
@@ -2026,6 +2130,7 @@ class LanceStore:
             return []
         select_cols = [
             "chunk_id",
+            "file_id",
             "path",
             "language",
             "kind",
@@ -2036,6 +2141,10 @@ class LanceStore:
             "end_line",
             "content",
             "_distance",
+            "part_index",
+            "source_start_byte",
+            "source_end_byte",
+            "content_hash",
         ]
         best_by_chunk: dict[str, dict[str, Any]] = {}
         for vector in vectors:
@@ -2240,7 +2349,7 @@ class LanceStore:
         page_size = max(limit * OVERFETCH_FACTOR, MINIMUM_OVERFETCH)
         offset = 0
         matches: list[ChunkPreview] = []
-        while len(matches) < limit:
+        while len(self._coalesce_source_previews(matches)) < limit:
             rows = self._projected_chunks(
                 tables.chunks,
                 " AND ".join(conditions),
@@ -2254,12 +2363,59 @@ class LanceStore:
                 preview = ChunkPreview.model_validate(row)
                 if _symbol_matches(preview, name, match):
                     matches.append(preview)
-                    if len(matches) == limit:
-                        return matches
             if len(rows) < page_size:
                 break
             offset += len(rows)
-        return matches
+        selected = self._coalesce_source_previews(matches)[:limit]
+        # A page/limit may end in the middle of one source chunk's windows.
+        # Complete just the selected groups with one metadata-only query.
+        groups = [
+            self._source_chunk_condition(item.model_dump())
+            for item in selected
+            if item.source_start_byte is not None
+        ]
+        if groups:
+            siblings = self._projected_chunks(
+                tables.chunks,
+                " OR ".join(f"({condition})" for condition in groups),
+                limit=None,
+                content=False,
+            )
+            for row in siblings:
+                row["project_id"] = project_id
+            selected = self._coalesce_source_previews(
+                [*selected, *(ChunkPreview.model_validate(row) for row in siblings)]
+            )
+        return selected
+
+    @staticmethod
+    def _coalesce_source_previews(chunks: Sequence[ChunkPreview]) -> list[ChunkPreview]:
+        """Collapse embedding windows, preserving distinct extractor chunks."""
+        grouped: dict[tuple[object, ...], ChunkPreview] = {}
+        for chunk in chunks:
+            key: tuple[object, ...] = (chunk.chunk_id,)
+            if chunk.source_start_byte is not None:
+                key = (
+                    chunk.file_id,
+                    chunk.kind,
+                    chunk.qualified_symbol,
+                    chunk.part_index,
+                    chunk.source_start_byte,
+                    chunk.source_end_byte,
+                    chunk.content_hash,
+                )
+            previous = grouped.get(key)
+            grouped[key] = (
+                chunk
+                if previous is None
+                else previous.model_copy(
+                    update={
+                        "start_line": min(previous.start_line, chunk.start_line),
+                        "end_line": max(previous.end_line, chunk.end_line),
+                    }
+                )
+            )
+        return list(grouped.values())
 
     def outline_chunks(
         self, path: str, project_id: str, *, partition_id: str | None = None
@@ -2278,7 +2434,7 @@ class LanceStore:
         )
         for row in rows:
             row["project_id"] = project_id
-        return [ChunkPreview.model_validate(row) for row in rows]
+        return self._coalesce_source_previews([ChunkPreview.model_validate(row) for row in rows])
 
     def find_declarations(
         self,
@@ -2304,7 +2460,7 @@ class LanceStore:
         rows = self._projected_chunks(tables.chunks, condition, limit=None, content=False)
         for row in rows:
             row["project_id"] = project_id
-        return [ChunkPreview.model_validate(row) for row in rows]
+        return self._coalesce_source_previews([ChunkPreview.model_validate(row) for row in rows])
 
     def declaration_symbols_by_tail(
         self, project_id: str, tail: str, *, partition_id: str | None = None
@@ -2641,6 +2797,8 @@ class LanceStore:
                 ("identifier_terms", pa.string()),
                 ("content_hash", pa.string()),
                 ("part_index", pa.int32()),
+                ("source_start_byte", pa.int64()),
+                ("source_end_byte", pa.int64()),
                 (
                     "vector",
                     pa.list_(vector_dtype, vector_dimension),
@@ -3170,6 +3328,10 @@ class LanceStore:
             "parent_symbol",
             "start_line",
             "end_line",
+            "part_index",
+            "source_start_byte",
+            "source_end_byte",
+            "content_hash",
         ]
         if content:
             columns.append("content")
