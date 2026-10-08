@@ -24,8 +24,13 @@ class _StubService:
 
 
 async def _click(pilot, selector: str) -> None:  # type: ignore[no-untyped-def]
+    # Disabling the active effect keeps Textual from ignoring a click that
+    # lands while the button is still -active, so no fixed sleep is needed.
+    widget = pilot.app.query_one(selector)
+    if isinstance(widget, Button):
+        widget.active_effect_duration = 0
     await pilot.click(selector)
-    await pilot.pause(0.4)
+    await pilot.pause()
 
 
 @pytest.mark.asyncio
