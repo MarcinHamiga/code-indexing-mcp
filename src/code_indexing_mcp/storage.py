@@ -2370,7 +2370,10 @@ class LanceStore:
                 limit=page_size,
                 offset=offset,
                 content=True,
-                order_by=["path", "start_line", "kind", "chunk_id"],
+                # start_byte puts a chunk's first window ahead of its siblings
+                # even when dense code gives them all one start line, so the
+                # coalesced preview shows the opening of the declaration.
+                order_by=["path", "start_line", "kind", "start_byte", "chunk_id"],
             )
             for row in rows:
                 row["project_id"] = project_id
@@ -2404,7 +2407,11 @@ class LanceStore:
 
     @staticmethod
     def _coalesce_source_previews(chunks: Sequence[ChunkPreview]) -> list[ChunkPreview]:
-        """Collapse embedding windows, preserving distinct extractor chunks."""
+        """Collapse embedding windows, preserving distinct extractor chunks.
+
+        The first window seen represents its source chunk, so callers that
+        expose its chunk_id or content order their scan by ``start_byte``.
+        """
         grouped: dict[tuple[object, ...], ChunkPreview] = {}
         for chunk in chunks:
             key: tuple[object, ...] = (chunk.chunk_id,)
@@ -2471,7 +2478,15 @@ class LanceStore:
         if tables is None:
             return []
         condition = f"path = {_quoted(path)} AND qualified_symbol = {_quoted(qualified_symbol)}"
-        rows = self._projected_chunks(tables.chunks, condition, limit=None, content=False)
+        # Source order makes a windowed declaration's selected chunk_id its
+        # first window rather than whichever window the physical scan yields.
+        rows = self._projected_chunks(
+            tables.chunks,
+            condition,
+            limit=None,
+            content=False,
+            order_by=["start_byte", "chunk_id"],
+        )
         for row in rows:
             row["project_id"] = project_id
         return self._coalesce_source_previews([ChunkPreview.model_validate(row) for row in rows])

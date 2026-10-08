@@ -524,6 +524,13 @@ class SearchService:
     @staticmethod
     def _hit(chunk: ChunkPreview, names: Mapping[str, str], score: float) -> SearchHit:
         snippet = chunk.content[:4_000]
+        truncated = len(chunk.content) > len(snippet)
+        if chunk.source_start_byte is not None and chunk.source_end_byte is not None:
+            # An embedding window carries only part of its source chunk, even
+            # when symbol lookup reports the whole chunk's line range; get_chunk
+            # returns the rest.
+            source_bytes = chunk.source_end_byte - chunk.source_start_byte
+            truncated = truncated or len(snippet.encode("utf-8")) < source_bytes
         return SearchHit(
             chunk_id=chunk.chunk_id,
             project_id=chunk.project_id,
@@ -537,5 +544,5 @@ class SearchService:
             end_line=chunk.end_line,
             score=score,
             snippet=snippet,
-            truncated=len(chunk.content) > len(snippet),
+            truncated=truncated,
         )

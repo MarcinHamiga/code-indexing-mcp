@@ -171,6 +171,7 @@ def test_search_matches_retrieve_complete_context(tmp_path: Path, query: str) ->
     hits = [hit for hit in response.hits if hit.symbol == "process_data"]
 
     assert len(hits) == 1
+    assert hits[0].truncated
     assert search.get_chunk(hits[0].chunk_id).content == expected.content
 
 
@@ -180,13 +181,47 @@ def test_symbol_lookup_and_outline_span_the_original_chunk(tmp_path: Path) -> No
 
     found = search.find_symbol("process_data", project.id)
     assert len(found.hits) == 1
-    assert search.get_chunk(found.hits[0].chunk_id).content == expected.content
+    hit = found.hits[0]
+    assert (hit.start_line, hit.end_line) == (expected.start_line, expected.end_line)
+    # The hit spans the whole chunk but shows one window, so it must say so.
+    assert hit.truncated
+    assert expected.content.startswith(hit.snippet)
+    assert search.get_chunk(hit.chunk_id).content == expected.content
     item = next(
         item
         for item in search.file_outline("main.py", project.id).items
         if item.symbol == expected.symbol
     )
     assert (item.start_line, item.end_line) == (expected.start_line, expected.end_line)
+
+
+def test_dense_line_symbol_hits_represent_their_first_window(tmp_path: Path) -> None:
+    # Every window of a one-line declaration shares its start line, so only
+    # source byte order can pick the window that opens the declaration.
+    source = "".join(
+        f"def dense{i}(user): return " + " + ".join(f"user.v{j}" for j in range(60)) + "\n"
+        for i in range(8)
+    )
+    _, store, search, project, original = indexed_windows(tmp_path, source)
+    references = ReferenceService(store)
+
+    for index in range(8):
+        name = f"dense{index}"
+        expected = next(chunk for chunk in original if chunk.symbol == name)
+        windows = [chunk for chunk in store.list_chunks([project.id]) if chunk.symbol == name]
+        assert len(windows) > 1
+        assert len({window.start_line for window in windows}) == 1
+        first = min(windows, key=lambda window: window.start_byte)
+
+        hit = search.find_symbol(name, project.id).hits[0]
+        assert hit.chunk_id == first.chunk_id
+        assert hit.truncated
+        assert hit.snippet == first.content
+        assert expected.content.startswith(hit.snippet)
+        selected = references.find_references(
+            DeclarationSelector(project=project.id, path="main.py", qualified_symbol=name)
+        ).selected
+        assert selected.chunk_id == first.chunk_id
 
 
 def test_windowing_does_not_make_a_declaration_selector_ambiguous(tmp_path: Path) -> None:
