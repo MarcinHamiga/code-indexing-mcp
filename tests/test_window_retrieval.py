@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
+import lancedb
 import pytest
 from test_search import SemanticEmbedder
 from test_token_batching import FakeEncoding, fake_encode
@@ -358,16 +359,8 @@ def test_window_duplicates_do_not_exhaust_the_search_result_limit(
     assert len({hit.qualified_symbol for hit in response.hits}) == 20
 
 
-@pytest.mark.parametrize("example", [False, True])
-def test_identical_windows_in_pinned_checkouts_do_not_exhaust_search_results(
-    tmp_path: Path, example: bool
-) -> None:
-    source = "\n".join(
-        f"def function{i}(user):\n"
-        + "".join(f"    step_{j} = user.value + {j}\n" for j in range(43))
-        for i in range(10)
-    )
-    _, store, search, project, _ = indexed_windows(tmp_path, source, embedder=OrderedEmbedder())
+def _second_checkout(store: LanceStore, project: ProjectInfo) -> PartitionRef:
+    """Register a second branch slot of *project* without building its partition."""
     first = store.active_partition(project.id)
     first_slot = store.get_slot(first.slot_id)
     assert first_slot is not None
@@ -381,9 +374,51 @@ def test_identical_windows_in_pinned_checkouts_do_not_exhaust_search_results(
         }
     )
     store.upsert_slot(second_slot)
-    second = PartitionRef(
+    return PartitionRef(
         project.id, second_slot.slot_id, second_slot.partition_id, first.activation_epoch
     )
+
+
+def test_sibling_slot_without_window_columns_is_rebuilt_before_queries(tmp_path: Path) -> None:
+    indexer, store, search, project, _ = indexed_windows(tmp_path)
+    second = _second_checkout(store, project)
+    # A sibling slot built before the window columns existed. Rebuilding the
+    # first slot already stamped the shared registry row with this schema.
+    source = store._project_tables(project.id)
+    database = lancedb.connect(store.directory / "projects" / second.partition_id)
+    database.create_table("files", source.files.to_arrow())
+    database.create_table(
+        "chunks", source.chunks.to_arrow().drop_columns(["source_start_byte", "source_end_byte"])
+    )
+    database.create_table("references", source.references.to_arrow())
+
+    reason = store.incompatibility_reason(
+        project.id, indexer.embedder.model_id, partition_id=second.partition_id
+    )
+    assert "chunk columns missing: source_start_byte, source_end_byte" in (reason or "")
+
+    assert indexer.index(project, partition=second).errors == []
+    assert (
+        store.incompatibility_reason(
+            project.id, indexer.embedder.model_id, partition_id=second.partition_id
+        )
+        is None
+    )
+    assert len(search.find_symbol("process_data", project.id, partition=second).hits) == 1
+
+
+@pytest.mark.parametrize("example", [False, True])
+def test_identical_windows_in_pinned_checkouts_do_not_exhaust_search_results(
+    tmp_path: Path, example: bool
+) -> None:
+    source = "\n".join(
+        f"def function{i}(user):\n"
+        + "".join(f"    step_{j} = user.value + {j}\n" for j in range(43))
+        for i in range(10)
+    )
+    _, store, search, project, _ = indexed_windows(tmp_path, source, embedder=OrderedEmbedder())
+    first = store.active_partition(project.id)
+    second = _second_checkout(store, project)
     # Equal source in separate slots has equal logical source metadata but
     # distinct chunk IDs, since physical slot identity participates in the ID.
     rows = store._project_tables(project.id).chunks.to_arrow().to_pylist()

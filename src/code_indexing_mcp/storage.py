@@ -1193,8 +1193,9 @@ class LanceStore:
         has no live rows to describe, so it is never incompatible.
 
         The model, dimension, and schema-version comparisons are registry-only;
-        the dtype comparison is authoritative only on the partition's own
-        chunk-table schema, so it opens the partition on disk when one exists.
+        the dtype and chunk-column comparisons are authoritative only on the
+        partition's own chunk-table schema, so they open the partition on disk
+        when one exists.
         """
         rows = self._rows(self._projects, f"id = {_quoted(project_id)}")
         if not rows:
@@ -1217,9 +1218,22 @@ class LanceStore:
         # store (or the reverse) must rebuild rather than mix generations.
         tables = self._project_existing_tables(project_id, partition_id=partition_id)
         if tables is not None:
-            stored_dtype = tables.chunks.schema.field("vector").type.value_type
+            stored_schema = tables.chunks.schema
+            stored_dtype = stored_schema.field("vector").type.value_type
             if stored_dtype != self.vector_dtype:
                 differences.append(f"vector storage {stored_dtype} -> {self.vector_dtype}")
+            # The registry row is project-wide, but each branch or worktree slot
+            # owns its own partition. Rebuilding one slot re-stamps the shared
+            # schema version while sibling slots still hold the previous chunk
+            # columns, so every read would fail selecting a column they lack.
+            stored_columns = set(stored_schema.names)
+            missing = [
+                name
+                for name in self._chunk_schema(self.vector_dimension, self.vector_dtype).names
+                if name not in stored_columns
+            ]
+            if missing:
+                differences.append(f"chunk columns missing: {', '.join(missing)}")
         return "; ".join(differences) if differences else None
 
     def mark_rebuild_required(self, project_id: str) -> None:
