@@ -1,7 +1,11 @@
 name: CI
 
 on:
+  # Pull requests run through pull_request; also running on every branch push
+  # started a second, identical run for each PR push. Main keeps its push run
+  # for post-merge signal, and workflow_dispatch covers a branch with no PR.
   push:
+    branches: [main]
   pull_request:
   schedule:
     # Weekly Windows signal (Monday 06:00 UTC); Windows no longer runs on
@@ -12,6 +16,13 @@ on:
       corpus_scale:
         description: Corpus scale for the real-model memory gate
         default: "1"
+
+# A newer push to a pull request cancels the run it supersedes. Every other
+# event gets its own group (the run id), so pushes to main, the weekly
+# schedule, and manual dispatches never cancel or queue behind one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -81,8 +92,11 @@ jobs:
       - name: Test
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         # pytest-xdist shortens the suite ~2.6x on multi-core runners (locally
-        # 225s -> 86s); the suite is worker-safe (tmp_path isolation).
-        run: uv run pytest -n auto
+        # 225s -> 86s); the suite is worker-safe (tmp_path isolation). Test
+        # durations range from milliseconds to several seconds, and worksteal
+        # lets idle workers take queued tests from busy ones instead of
+        # waiting out their preassigned share: 188-197s -> 158s on 4 workers.
+        run: uv run pytest -n auto --dist worksteal
 
   # macOS is the most expensive runner by far, and a developer with a Mac can
   # run these exact checks locally, so it no longer runs on every push. It is

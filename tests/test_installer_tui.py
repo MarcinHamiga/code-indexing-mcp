@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from textual.pilot import Pilot
-from textual.widgets import Label, Static
+from textual.widgets import Button, Label, Static
 
 from code_indexing_mcp.installer import shell_path
 from code_indexing_mcp.installer.tui.app import InstallerApp
@@ -13,26 +13,35 @@ from code_indexing_mcp.installer.wizard import WizardState
 
 
 async def click(pilot: Pilot, selector: str) -> None:
-    """Click and wait out the button's active-effect timer (0.2s by default).
+    """Click like a user, without pacing for the button's active effect.
 
-    Textual ignores a click landing while the button still has its -active
-    class from the previous one, so pilot clicks must be paced.
+    Textual ignores a click landing while a button still has the -active class
+    from its previous press (0.2s by default), which used to force a fixed 0.4s
+    sleep after every click. With the effect disabled that guard never arms, so
+    waiting for the app to go idle is enough.
     """
 
+    widget = pilot.app.query_one(selector)
+    if isinstance(widget, Button):
+        widget.active_effect_duration = 0
     await pilot.click(selector)
-    await pilot.pause(0.4)
+    await pilot.pause()
 
 
 async def advance_to(pilot: Pilot, app: InstallerApp, panel: str) -> None:
-    """Click Next until ``panel`` is showing.
+    """Press Next until ``panel`` is showing.
 
     Counting clicks would make every test in this file wrong the moment a step is
     added between two existing ones; naming the destination keeps them honest.
+    Navigation presses the button directly: the tests that click cover the mouse
+    path, and three simulated mouse events per step doubled the cost of reaching
+    a later panel.
     """
 
     while app.current != panel:
         previous = app.current
-        await click(pilot, "#next")
+        app.query_one("#next", Button).press()
+        await pilot.pause()
         if app.current == previous:
             raise AssertionError(f"navigation stopped on {previous!r} before reaching {panel!r}")
 

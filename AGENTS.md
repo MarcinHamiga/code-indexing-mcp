@@ -13,4 +13,4 @@ uv run mypy src
 
 Prefer formatting after every batch of edits, not only at the end. The full
 gate that CI enforces is `ruff format --check .`, `ruff check .`, `mypy src`,
-and `uv run pytest -n auto`.
+and `uv run pytest -n auto --dist worksteal`.

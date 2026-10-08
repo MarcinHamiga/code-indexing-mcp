@@ -1713,10 +1713,10 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
     async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
         return types.ListRootsResult(roots=[types.Root(uri=startup_root.as_uri())])
 
-    try:
-        async with create_connected_server_and_client_session(
-            server, list_roots_callback=list_roots
-        ) as client:
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        try:
             await client.list_tools()
             await _wait_until(embedder.started.is_set, timeout=30)
 
@@ -1731,8 +1731,11 @@ async def test_explicit_code_query_ignores_unrelated_startup_index(tmp_path: Pat
             )
 
             assert not result.isError
-    finally:
-        embedder.release.set()
+        finally:
+            # Release before the session closes: server shutdown waits for the
+            # startup job, which would otherwise sit in the blocked embedder
+            # until its 30s timeout and then fail unseen on its own thread.
+            embedder.release.set()
 
 
 @pytest.mark.asyncio
