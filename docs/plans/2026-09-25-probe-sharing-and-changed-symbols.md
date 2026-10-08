@@ -50,24 +50,37 @@ each change touches. MCP tool, `syndex changed-symbols` CLI command, daemon prot
 
 - **Base.** `since` is any commit-ish (default `HEAD`: uncommitted work only), verified
   with `rev-parse --verify <rev>^{commit}`; a leading `-` is rejected. `since_time` uses
-  `rev-list -1 --before=<time> HEAD`. Both together, or an unresolvable base, is
-  `INVALID_FILTER`; a non-Git project is `UNSUPPORTED_OPERATION`.
+  `rev-list -1 --before=<time> HEAD`, after `git config --type=expiry-date` has checked it
+  with Git's strict date parser: `--before` alone reads unparseable text (`garbage`,
+  `yesterdy`) as now, which would silently narrow the answer to uncommitted work. Both
+  together, or an unresolvable base, is `INVALID_FILTER`; a non-Git project is
+  `UNSUPPORTED_OPERATION`.
 - **Files.** `git diff --name-status -z --no-renames --relative <base>` plus
   `ls-files --others --exclude-standard`, so a subdirectory project sees only its subtree
-  with project-relative paths. Sorted by path and cut at `limit` (≤ 500) before any patch
-  is read, so a distant base costs one listing plus a bounded patch.
-- **Lines.** One `git diff --unified=0` over the selected files (`:(literal)` pathspecs,
-  with prefixes, quoting, colour, external drivers and textconv pinned). New-side hunk
-  ranges become `changed_lines`; pure deletions become deletion points that touch only
-  a declaration spanning both neighbouring lines. `---`/`+++` are only read in section
-  headers, since a removed `-- comment` line reads `--- comment` inside a hunk.
+  with project-relative paths. A path the diff calls deleted but ls-files lists (a
+  `git rm --cached` file still on disk) is untracked. Sorted by path and cut at `limit`
+  (≤ 500) before any patch is read, so a distant base costs one listing plus a bounded
+  patch.
+- **Lines.** One `git diff --unified=0` over the selected modified files (`:(literal)`
+  pathspecs, with prefixes, quoting, colour, external drivers and textconv pinned; added
+  files touch all of themselves and are not patched). Output is decoded with replacement,
+  since the patch carries content in whatever encoding the file uses. New-side hunk ranges
+  become `changed_lines`; pure deletions touch a declaration spanning both neighbouring
+  lines, or one ending right where they were removed when the removed lines are indented
+  deeper than its first line -- the tail of a Python body, which has no closing line.
+  `---`/`+++` are only read in section headers, since a removed `-- comment` line reads
+  `--- comment` inside a hunk.
 - **Symbols.** One batched outline read (`outline_chunks_for_paths`) whose entries span
-  every part of a split declaration (`_outline_items(span_parts=True)`); `file_outline`
-  output is unchanged. Added and untracked files, and files with no line ranges (binary),
-  touch every declaration; deleted files list none; mode-only changes touch none.
+  every part of a split declaration (`_outline_items(span_parts=True)`). Only abutting or
+  overlapping `_part` chunks merge, so overloads and other same-named declarations stay
+  separate entries; `file_outline` output is unchanged. Added and untracked files, and
+  files with no line ranges (binary), touch every declaration; deleted files list none;
+  mode-only changes touch none.
 - **Honesty.** `index_current` compares the stored content hash with the file on disk,
   so a stale index is flagged per file rather than silently mismatched. The MCP tool
   refreshes first in lazy mode; the CLI reads the index as it is.
 
 Not in this version: symbols removed by the change (they are gone from the index of the
-current tree), rename tracking, and multi-project scope.
+current tree) -- nor their container, whose chunk span ends at its first nested
+declaration, so removing a whole method touches nothing -- rename tracking, and
+multi-project scope.

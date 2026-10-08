@@ -347,15 +347,17 @@ queries, it refreshes stale indexes and backfills structural rows when needed.
 compares the working tree with a base commit and names the indexed declarations each change
 touches. The base defaults to `HEAD`, so the default answer covers staged, unstaged, and untracked
 work in progress; `since` accepts any commit-ish (`main`, a tag, `HEAD~3`) to review a branch, and
-`since_time` (`2026-09-01`, `2 days ago`) picks the last commit on `HEAD` before that time. Only
-Git checkouts are supported, and a project registered in a subdirectory sees only its own subtree.
+`since_time` (`2026-09-01`, `2 days ago`) picks the last commit on `HEAD` before that time; text
+Git cannot read as a time is rejected rather than taken as now. Only Git checkouts are supported,
+and a project registered in a subdirectory sees only its own subtree.
 
 Each returned file carries its `change` kind (`added`, `modified`, `deleted`, or `untracked`), the
 current-file `changed_lines`, and the touched `symbols` as outline entries; `get_chunk` or
 `find_symbol` expand them to code. A declaration counts as touched when a changed line falls in its
-span or lines were removed from inside it, and split declarations are matched across all of their
-parts. Added and untracked files touch every declaration they contain; deleted files are listed
-with no symbols. Files are returned in path order up to `limit` (at most 500), with `total_files`
+span or lines were removed from inside it, including the tail of an indentation-scoped body such as
+a Python function's. Split declarations are matched across all of their parts, while overloads and
+other same-named declarations are matched one by one. Added and untracked files touch every
+declaration they contain; deleted files are listed with no symbols. Files are returned in path order up to `limit` (at most 500), with `total_files`
 and `truncated` reporting the rest.
 
 Line ranges come from the index, so `index_current` says whether the indexed content still matches

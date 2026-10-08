@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import cast
 
 from .errors import CodeIndexingError, ErrorCode
-from .git_state import GitRunner, GitRunnerError, run_git
+from .git_state import GitCommandResult, GitRunner, GitRunnerError, run_git
 from .models import FileChangeKind, LineRange, OutlineItem
 
 # Pinned so user configuration cannot change what the parsers below read:
@@ -32,6 +32,9 @@ _DIFF_OPTIONS = (
     "--dst-prefix=b/",
 )
 _GIT = ("git", "-c", "core.quotePath=false")
+# A throwaway command-line config key that carries since_time into
+# `git config --type=expiry-date`; it is never written anywhere.
+_SINCE_TIME_KEY = "codeindexing.sincetime"
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _STATUS_KINDS: dict[str, FileChangeKind] = {
     "A": "added",
@@ -42,25 +45,42 @@ _STATUS_KINDS: dict[str, FileChangeKind] = {
 
 
 @dataclass(frozen=True)
+class Deletion:
+    """Lines removed between current lines ``after`` and ``after + 1``.
+
+    ``indent`` is the first non-blank removed line's indentation, or ``None``
+    when only blank lines were removed.
+    """
+
+    after: int
+    indent: int | None = None
+
+
+@dataclass(frozen=True)
 class FileChange:
     """One changed file: its kind and, for a textual diff, the touched lines.
 
     ``ranges`` are inclusive current-file line ranges that were added or
-    rewritten. ``deletion_points`` are current-file lines after which lines
-    were removed. ``whole_file`` means every declaration counts as touched.
+    rewritten. ``deletions`` are the places lines were removed. ``whole_file``
+    means every declaration counts as touched.
     """
 
     path: str
     change: FileChangeKind
     ranges: tuple[tuple[int, int], ...] = ()
-    deletion_points: tuple[int, ...] = ()
+    deletions: tuple[Deletion, ...] = ()
     whole_file: bool = False
 
     def line_ranges(self) -> list[LineRange]:
         return [LineRange(start_line=start, end_line=end) for start, end in self.ranges]
 
-    def touched(self, items: Sequence[OutlineItem]) -> list[OutlineItem]:
-        """The declarations whose line span meets a change."""
+    def touched(self, items: Sequence[OutlineItem], lines: Sequence[str] = ()) -> list[OutlineItem]:
+        """The declarations whose line span meets a change.
+
+        *lines* is the current file's text, one entry per line, matching the
+        indexed line numbers. Without it a removal at the very end of an
+        indentation-scoped body goes unmatched (see :func:`_removed_inside`).
+        """
         if self.change == "deleted":
             return []
         if self.whole_file:
@@ -69,16 +89,41 @@ class FileChange:
             item
             for item in items
             if any(start <= item.end_line and item.start_line <= end for start, end in self.ranges)
-            # Removed lines sit between current lines `point` and `point + 1`;
-            # only a declaration spanning both contained them.
-            or any(item.start_line <= point < item.end_line for point in self.deletion_points)
+            or any(_removed_inside(item, deletion, lines) for deletion in self.deletions)
         ]
+
+
+def _removed_inside(item: OutlineItem, deletion: Deletion, lines: Sequence[str]) -> bool:
+    """Whether the lines *deletion* removed sat inside *item*."""
+    # A declaration spanning both neighbouring lines contained them.
+    if item.start_line <= deletion.after < item.end_line:
+        return True
+    # An indentation-scoped body (Python, GDScript) has no closing line, so
+    # removing its tail leaves the declaration ending exactly at `after`. The
+    # removed lines were its own when indented deeper than its first line; a
+    # removed sibling or the next top-level declaration is not.
+    if deletion.after != item.end_line or deletion.indent is None:
+        return False
+    if not 1 <= item.start_line <= len(lines):
+        return False
+    return deletion.indent > _indentation(lines[item.start_line - 1])
+
+
+def _indentation(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def source_lines(source: bytes) -> list[str]:
+    """Split file content into lines numbered as the extractor numbers them."""
+    # Only "\n" ends a line there; str.splitlines would also split on
+    # form feeds and Unicode separators and shift every later line.
+    return source.decode("utf-8-sig", errors="replace").split("\n")
 
 
 @dataclass
 class _Hunks:
     ranges: list[tuple[int, int]] = field(default_factory=list)
-    deletion_points: list[int] = field(default_factory=list)
+    deletions: list[Deletion] = field(default_factory=list)
     binary: bool = False
 
 
@@ -101,7 +146,7 @@ def resolve_base(
     ``since`` names any commit-ish (default ``HEAD``: only uncommitted work);
     ``since_time`` picks the last commit on ``HEAD`` made before that time.
     """
-    run = run_git if runner is None else runner
+    run = _run_git_lenient if runner is None else runner
     if since is not None and since_time is not None:
         raise CodeIndexingError(
             ErrorCode.INVALID_FILTER, "Pass either since or since_time, not both"
@@ -109,6 +154,28 @@ def resolve_base(
     if since_time is not None:
         if not since_time.strip():
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, "since_time must not be empty")
+        # `--before` reads text it cannot parse as the current time, which
+        # would silently narrow the answer to uncommitted work. The expiry-date
+        # config type runs Git's own date parser in its strict mode instead.
+        parsed = _run(
+            run,
+            [
+                "-c",
+                f"{_SINCE_TIME_KEY}={since_time}",
+                "config",
+                "--type=expiry-date",
+                "--get",
+                _SINCE_TIME_KEY,
+            ],
+            root,
+        )
+        if parsed is None or not parsed.strip():
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                f"Git cannot read since_time {since_time!r} as a time; pass a date such as "
+                "2026-09-01 or a relative time such as '2 days ago'",
+                since_time=since_time,
+            )
         result = _run(run, ["rev-list", "-1", f"--before={since_time}", "HEAD"], root)
         oid = result.strip() if result is not None else ""
         if not oid:
@@ -144,10 +211,10 @@ def collect_changes(
 ) -> ChangeSet:
     """List files that differ from *base* in the working tree, first *limit* by path.
 
-    Only the returned files are diffed line by line, so a base far in the past
-    costs one name listing plus a bounded patch.
+    Only the returned modified files are diffed line by line, so a base far in
+    the past costs one name listing plus a bounded patch.
     """
-    run = run_git if runner is None else runner
+    run = _run_git_lenient if runner is None else runner
     listing = _run(run, ["diff", *_DIFF_OPTIONS, "--name-status", "-z", base, "--"], root)
     if listing is None:
         raise CodeIndexingError(
@@ -157,11 +224,14 @@ def collect_changes(
     if include_untracked:
         others = _run(run, ["ls-files", "--others", "--exclude-standard", "-z"], root)
         for path in (others or "").split("\0"):
-            if path and path not in kinds:
+            # A file dropped from the index but kept on disk (`git rm --cached`)
+            # is deleted to the diff and untracked to ls-files; it is still here.
+            if path and kinds.get(path, "deleted") == "deleted":
                 kinds[path] = "untracked"
     ordered = sorted(kinds)
     selected = ordered[:limit]
-    diffed = [path for path in selected if kinds[path] in {"modified", "added"}]
+    # An added file touches all of itself, so only modified files need a patch.
+    diffed = [path for path in selected if kinds[path] == "modified"]
     hunks: dict[str, _Hunks] = {}
     if diffed:
         patch = _run(
@@ -192,7 +262,7 @@ def collect_changes(
                 path=path,
                 change=kind,
                 ranges=tuple(found.ranges),
-                deletion_points=tuple(found.deletion_points),
+                deletions=tuple(found.deletions),
             )
         )
     return ChangeSet(base=base, files=files, total_files=len(ordered))
@@ -218,11 +288,14 @@ def parse_unified_zero(patch: str) -> dict[str, _Hunks]:
     current: _Hunks | None = None
     old_path: str | None = None
     in_header = False
+    # Set after a pure-deletion hunk header until its first non-blank removed
+    # line gives the deletion's indentation.
+    awaiting_indent = False
     for line in patch.splitlines():
         if line.startswith("diff --git "):
             # A section whose header names its file is recorded even without
             # hunks: a mode-only change touches no lines.
-            in_header, old_path = True, None
+            in_header, old_path, awaiting_indent = True, None, False
             path = _header_path(line[len("diff --git ") :])
             current = files.setdefault(path, _Hunks()) if path else None
             continue
@@ -243,13 +316,21 @@ def parse_unified_zero(patch: str) -> dict[str, _Hunks]:
                     current.binary = True
             elif line.startswith("@@ "):
                 in_header = False
-        if not in_header and current is not None and (match := _HUNK.match(line)):
+        if in_header or current is None:
+            continue
+        if match := _HUNK.match(line):
             start = int(match.group(1))
             count = int(match.group(2)) if match.group(2) is not None else 1
             if count:
                 current.ranges.append((start, start + count - 1))
             else:
-                current.deletion_points.append(start)
+                current.deletions.append(Deletion(after=start))
+            awaiting_indent = not count
+        elif awaiting_indent and line.startswith("-") and line[1:].strip():
+            current.deletions[-1] = Deletion(
+                after=current.deletions[-1].after, indent=_indentation(line[1:])
+            )
+            awaiting_indent = False
     return files
 
 
@@ -293,6 +374,12 @@ def _unquote(value: str) -> str:
     # typeshed types escape_decode's result as str; it is bytes for bytes input.
     raw = cast(bytes, codecs.escape_decode(value[1:-1].encode("utf-8"))[0])
     return raw.decode("utf-8", errors="replace")
+
+
+def _run_git_lenient(command: Sequence[str], cwd: Path) -> GitCommandResult:
+    # A patch carries file content, and a text file need not be UTF-8; only
+    # header lines are parsed, so undecodable bytes are replaced, not fatal.
+    return run_git(command, cwd, errors="replace")
 
 
 def _run(run: GitRunner, arguments: list[str], root: Path) -> str | None:

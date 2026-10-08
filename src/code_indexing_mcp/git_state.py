@@ -71,11 +71,13 @@ class GitCommandResult(FrozenModel):
 GitRunner = Callable[[Sequence[str], Path], GitCommandResult]
 
 
-def run_git(command: Sequence[str], cwd: Path) -> GitCommandResult:
+def run_git(command: Sequence[str], cwd: Path, *, errors: str = "strict") -> GitCommandResult:
     """Run one Git command without a shell and with bounded patience.
 
     ``GIT_OPTIONAL_LOCKS=0`` keeps even ``git status`` from taking the
     repository's index lock: a probe must never disturb the working checkout.
+    *errors* is the output decoding's error handler; a caller reading file
+    content, which need not be UTF-8, passes ``"replace"``.
     """
     environment = os.environ.copy()
     environment["GIT_OPTIONAL_LOCKS"] = "0"
@@ -85,6 +87,7 @@ def run_git(command: Sequence[str], cwd: Path) -> GitCommandResult:
             cwd=cwd,
             capture_output=True,
             text=True,
+            errors=errors,
             timeout=GIT_TIMEOUT_SECONDS,
             check=False,
             env=environment,

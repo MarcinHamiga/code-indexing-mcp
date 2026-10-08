@@ -9,7 +9,7 @@ from conftest import run_git
 from support import DeterministicEmbedder
 
 from code_indexing_mcp.application import Application, RuntimePaths
-from code_indexing_mcp.changes import FileChange, parse_name_status, parse_unified_zero
+from code_indexing_mcp.changes import Deletion, FileChange, parse_name_status, parse_unified_zero
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.models import ChunkPreview, OutlineItem
 from code_indexing_mcp.search import _outline_items
@@ -27,6 +27,22 @@ def second():
 class Holder:
     def method(self):
         return 3
+"""
+
+SHAPES = """\
+class Shapes {
+    int area(int side) {
+        return side * side;
+    }
+
+    int perimeter(int side) {
+        return 4 * side;
+    }
+
+    int area(int width, int height) {
+        return width * height;
+    }
+}
 """
 
 
@@ -68,10 +84,28 @@ def _item(name: str, start: int, end: int) -> OutlineItem:
     )
 
 
+def _chunk(kind: str, name: str, start: int, end: int) -> ChunkPreview:
+    return ChunkPreview(
+        chunk_id=f"{name}:{start}",
+        project_id="p",
+        path="big.py",
+        language="python",
+        kind=kind,
+        symbol=name.rsplit(".", 1)[-1],
+        qualified_symbol=name,
+        start_line=start,
+        end_line=end,
+    )
+
+
+def _spans(items: list[OutlineItem]) -> list[tuple[str | None, int, int]]:
+    return [(item.qualified_symbol, item.start_line, item.end_line) for item in items]
+
+
 # -- parsing ---------------------------------------------------------------
 
 
-def test_unified_zero_patch_yields_new_side_ranges_and_deletion_points() -> None:
+def test_unified_zero_patch_yields_new_side_ranges_and_deletions() -> None:
     patch = (
         "diff --git a/src/a.py b/src/a.py\n"
         "index 1..2 100644\n"
@@ -85,13 +119,23 @@ def test_unified_zero_patch_yields_new_side_ranges_and_deletion_points() -> None
         "-+++ and one that looks like a header\n"
         "@@ -20,0 +21,3 @@\n"
         "+a\n+b\n+c\n"
+        "@@ -30,2 +30,0 @@\n"
+        "-\n"
+        "-        tail()\n"
+        "@@ -40 +37,0 @@\n"
+        "-\n"
     )
 
     hunks = parse_unified_zero(patch)
 
     assert list(hunks) == ["src/a.py"]
     assert hunks["src/a.py"].ranges == [(3, 3), (21, 23)]
-    assert hunks["src/a.py"].deletion_points == [9]
+    # Each deletion carries its first non-blank removed line's indentation.
+    assert hunks["src/a.py"].deletions == [
+        Deletion(after=9, indent=0),
+        Deletion(after=30, indent=8),
+        Deletion(after=37),
+    ]
 
 
 def test_patch_paths_with_spaces_quotes_binary_and_mode_changes() -> None:
@@ -137,29 +181,68 @@ def test_touched_matches_overlapping_ranges_and_enclosed_deletions() -> None:
     assert FileChange("x.py", "modified", ranges=((3, 5),)).touched(items) == items[:2]
     # Lines removed between current lines 6 and 7 fell inside b; lines
     # removed between 9 and 10 fell between declarations and touch neither.
-    assert FileChange("x.py", "modified", deletion_points=(6, 9)).touched(items) == [items[1]]
+    deletions = (Deletion(after=6), Deletion(after=9))
+    assert FileChange("x.py", "modified", deletions=deletions).touched(items) == [items[1]]
     assert FileChange("x.py", "added", whole_file=True).touched(items) == items
     assert FileChange("x.py", "deleted").touched(items) == []
 
 
-def test_changed_outline_spans_every_part_of_a_split_declaration() -> None:
-    def part(start: int, end: int) -> ChunkPreview:
-        return ChunkPreview(
-            chunk_id=f"c{start}",
-            project_id="p",
-            path="big.py",
-            language="python",
-            kind="function_part",
-            symbol="big",
-            qualified_symbol="big",
-            start_line=start,
-            end_line=end,
-        )
+def test_removing_the_tail_of_an_indentation_scoped_body_touches_it() -> None:
+    lines = ["def a():", "    x = 1", "", "", "def b():", "    return 2", ""]
+    items = [_item("a", 1, 2), _item("b", 5, 6)]
 
-    chunks = [part(1, 40), part(41, 80)]
+    # a's last statement went: the removal ends a and is indented deeper
+    # than a's first line, so it was a's own.
+    tail = FileChange("x.py", "modified", deletions=(Deletion(after=2, indent=4),))
+    assert tail.touched(items, lines) == [items[0]]
+    # A removed top-level sibling, or only blank lines, belonged to neither.
+    sibling = FileChange(
+        "x.py", "modified", deletions=(Deletion(after=2, indent=0), Deletion(after=2))
+    )
+    assert sibling.touched(items, lines) == []
+    # Without the file text only a removal both neighbours enclose matches.
+    assert tail.touched(items) == []
+
+
+def test_changed_outline_spans_every_part_of_a_split_declaration() -> None:
+    chunks = [_chunk("function_part", "big", 1, 40), _chunk("function_part", "big", 41, 80)]
 
     assert _outline_items(chunks, "big.py")[0].end_line == 40
     assert _outline_items(chunks, "big.py", span_parts=True)[0].end_line == 80
+
+
+def test_changed_outline_keeps_same_named_declarations_apart() -> None:
+    overloads = [
+        _chunk("method", "Shapes.area", 2, 4),
+        _chunk("method", "Shapes.perimeter", 6, 8),
+        _chunk("method", "Shapes.area", 10, 12),
+    ]
+
+    assert _spans(_outline_items(overloads, "big.py", span_parts=True)) == [
+        ("Shapes.area", 2, 4),
+        ("Shapes.perimeter", 6, 8),
+        ("Shapes.area", 10, 12),
+    ]
+    # file_outline keeps its one entry per name.
+    assert _spans(_outline_items(overloads, "big.py")) == [
+        ("Shapes.area", 2, 4),
+        ("Shapes.perimeter", 6, 8),
+    ]
+
+    # Overlapping parts merge; two split overloads do not merge across the
+    # declaration between them.
+    split = [
+        _chunk("method_part", "Shapes.area", 2, 30),
+        _chunk("method_part", "Shapes.area", 21, 50),
+        _chunk("method", "Shapes.perimeter", 52, 54),
+        _chunk("method_part", "Shapes.area", 56, 90),
+        _chunk("method_part", "Shapes.area", 81, 120),
+    ]
+    assert _spans(_outline_items(split, "big.py", span_parts=True)) == [
+        ("Shapes.area", 2, 50),
+        ("Shapes.perimeter", 52, 54),
+        ("Shapes.area", 56, 120),
+    ]
 
 
 # -- application -----------------------------------------------------------
@@ -200,6 +283,65 @@ def test_untracked_and_deleted_files(tmp_path: Path) -> None:
 
     tracked_only = app.changed_symbols(project_id, include_untracked=False)
     assert [file.path for file in tracked_only.files] == ["other.py"]
+
+
+def test_removing_a_python_body_tail_touches_only_that_function(tmp_path: Path) -> None:
+    root, app, project_id = _indexed(tmp_path)
+    (root / "main.py").write_text(SOURCE.replace("    return value\n", ""))
+    app.index_project(project_id)
+
+    changed = app.changed_symbols(project_id).files[0]
+
+    assert changed.changed_lines == []
+    assert [symbol.qualified_symbol for symbol in changed.symbols] == ["second"]
+
+    # Removing a whole function touches neither neighbour.
+    (root / "main.py").write_text(
+        SOURCE.replace("def second():\n    value = 2\n    return value\n\n\n", "")
+    )
+    app.index_project(project_id)
+    assert app.changed_symbols(project_id).files[0].symbols == []
+
+
+def test_overloads_are_matched_one_by_one(tmp_path: Path) -> None:
+    root, app, project_id = _indexed(tmp_path)
+    (root / "Shapes.java").write_text(SHAPES)
+    _commit(root, "shapes")
+    (root / "Shapes.java").write_text(SHAPES.replace("return 4 * side;", "return side * 4;"))
+    app.index_project(project_id)
+
+    changed = app.changed_symbols(project_id).files[0]
+
+    assert [symbol.qualified_symbol for symbol in changed.symbols] == ["Shapes.perimeter"]
+
+
+def test_files_that_are_not_utf8_are_still_diffed(tmp_path: Path) -> None:
+    root, app, project_id = _indexed(tmp_path)
+    (root / "legacy.properties").write_bytes("greeting=caf\xe9\n".encode("latin-1"))
+    _commit(root, "legacy")
+    (root / "legacy.properties").write_bytes("greeting=d\xe9j\xe0 vu\n".encode("latin-1"))
+    (root / "staged.properties").write_bytes("name=Jos\xe9\n".encode("latin-1"))
+    run_git("add", "staged.properties", cwd=root)
+
+    files = {file.path: file for file in app.changed_symbols(project_id).files}
+
+    assert files["staged.properties"].change == "added"
+    assert files["legacy.properties"].change == "modified"
+    assert [
+        (line.start_line, line.end_line) for line in files["legacy.properties"].changed_lines
+    ] == [(1, 1)]
+
+
+def test_a_file_dropped_from_the_index_but_kept_on_disk_is_untracked(tmp_path: Path) -> None:
+    root, app, project_id = _indexed(tmp_path)
+    run_git("rm", "-q", "--cached", "other.py", cwd=root)
+
+    files = {file.path: file for file in app.changed_symbols(project_id).files}
+
+    assert files["other.py"].change == "untracked"
+    assert [symbol.symbol for symbol in files["other.py"].symbols] == ["other"]
+    tracked_only = app.changed_symbols(project_id, include_untracked=False)
+    assert [(file.path, file.change) for file in tracked_only.files] == [("other.py", "deleted")]
 
 
 def test_since_a_commit_includes_committed_changes(tmp_path: Path) -> None:
@@ -245,6 +387,9 @@ def test_stale_index_is_flagged_per_file(tmp_path: Path) -> None:
         ({"since": "no-such-branch"}, ErrorCode.INVALID_FILTER),
         ({"since": "--output=/tmp/x"}, ErrorCode.INVALID_FILTER),
         ({"since": "HEAD", "since_time": "yesterday"}, ErrorCode.INVALID_FILTER),
+        # `--before` alone would read these as now and answer with HEAD.
+        ({"since_time": "garbage"}, ErrorCode.INVALID_FILTER),
+        ({"since_time": "yesterdy"}, ErrorCode.INVALID_FILTER),
         ({"limit": 0}, ErrorCode.INVALID_FILTER),
     ],
 )

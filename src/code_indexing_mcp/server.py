@@ -2104,7 +2104,8 @@ def create_server(
                 description=(
                     "Use the last commit on HEAD made before this time as the base, in any "
                     "format git accepts, such as 2026-09-01, '2 days ago', or an ISO 8601 "
-                    "timestamp. Mutually exclusive with since."
+                    "timestamp; text git cannot read as a time is rejected. Mutually "
+                    "exclusive with since."
                 )
             ),
         ] = None,

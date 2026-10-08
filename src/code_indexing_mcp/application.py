@@ -21,7 +21,7 @@ from platformdirs import user_cache_path, user_data_path
 from .accelerator_env import EnvironmentStatus
 from .backend_coordinator import BackendCoordinator
 from .backends import BackendSelection
-from .changes import collect_changes, resolve_base
+from .changes import collect_changes, resolve_base, source_lines
 from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
@@ -1696,18 +1696,22 @@ class Application:
         files: list[ChangedFile] = []
         for change in changes.files:
             record = stored.get(change.path)
+            source = (
+                None if record is None else self._indexed_source(project.root, change.path, record)
+            )
             files.append(
                 ChangedFile(
                     path=change.path,
                     change=change.change,
                     indexed=record is not None,
-                    index_current=(
-                        None
-                        if record is None
-                        else self._index_matches_disk(project.root, change.path, record)
-                    ),
+                    index_current=None if record is None else source is not None,
                     changed_lines=change.line_ranges(),
-                    symbols=change.touched(outlines.get(change.path, [])),
+                    # The text is only trusted to line up with the outline
+                    # when it is exactly what was indexed.
+                    symbols=change.touched(
+                        outlines.get(change.path, []),
+                        source_lines(source) if source is not None else (),
+                    ),
                 )
             )
         return ChangedSymbolsResponse(
@@ -1722,15 +1726,15 @@ class Application:
         )
 
     @staticmethod
-    def _index_matches_disk(root: Path, path: str, record: StoredFile) -> bool:
-        """Whether the indexed content of *path* is what is on disk now."""
+    def _indexed_source(root: Path, path: str, record: StoredFile) -> bytes | None:
+        """*path*'s content on disk when it is exactly what was indexed, else None."""
         # Identical content has the indexed size, so a larger file fails fast
         # as oversized instead of being read in full.
         try:
             source, _ = read_source(root, Path(path), record.size)
         except (OSError, SourceReadError):
-            return False
-        return content_digest(source) == record.content_hash
+            return None
+        return source if content_digest(source) == record.content_hash else None
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
         project_id = self.store.chunk_project_id(chunk_id)

@@ -150,26 +150,42 @@ def _outline_items(
 
     The entry keeps the first part's line range unless *span_parts* asks for
     the whole declaration's, from its first part's start to its last's end.
+    Without *span_parts* same-named declarations share the first one's entry,
+    as the outline always has. With it they stay separate entries -- overloads
+    or a property's getter and setter are not parts of one declaration -- so
+    no merged span reaches over the declarations between them.
     """
-    items: dict[tuple[str, str], OutlineItem] = {}
+    items: list[OutlineItem] = []
+    # Each key's latest entry, and whether it was built from split parts.
+    latest: dict[tuple[str, str], tuple[int, bool]] = {}
     for chunk in sorted(chunks, key=lambda item: (item.path, item.start_line)):
         if chunk.path != path or not chunk.symbol or not chunk.qualified_symbol:
             continue
         key = (chunk.kind.removesuffix("_part"), chunk.qualified_symbol)
-        existing = items.get(key)
-        if existing is not None:
-            if span_parts and chunk.end_line > existing.end_line:
-                items[key] = existing.model_copy(update={"end_line": chunk.end_line})
-            continue
-        items[key] = OutlineItem(
-            kind=key[0],
-            symbol=chunk.symbol,
-            qualified_symbol=chunk.qualified_symbol,
-            parent_symbol=chunk.parent_symbol,
-            start_line=chunk.start_line,
-            end_line=chunk.end_line,
+        is_part = chunk.kind.endswith("_part")
+        if key in latest:
+            if not span_parts:
+                continue
+            index, from_parts = latest[key]
+            existing = items[index]
+            # A split declaration's parts overlap or abut; a gap or a whole
+            # declaration means another declaration with the same name.
+            if is_part and from_parts and chunk.start_line <= existing.end_line + 1:
+                if chunk.end_line > existing.end_line:
+                    items[index] = existing.model_copy(update={"end_line": chunk.end_line})
+                continue
+        latest[key] = (len(items), is_part)
+        items.append(
+            OutlineItem(
+                kind=key[0],
+                symbol=chunk.symbol,
+                qualified_symbol=chunk.qualified_symbol,
+                parent_symbol=chunk.parent_symbol,
+                start_line=chunk.start_line,
+                end_line=chunk.end_line,
+            )
         )
-    return list(items.values())
+    return items
 
 
 def _as_partition_refs(value: PartitionRef | Sequence[PartitionRef]) -> list[PartitionRef]:
