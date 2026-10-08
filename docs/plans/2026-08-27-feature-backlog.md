@@ -30,14 +30,6 @@ variants, parallel implementations). Can run offline against stored vectors; the
 question is presentation (a report tool vs enriching `search_code` results with a
 `duplicate_of` field) and threshold tuning.
 
-### `changed_symbols` tool
-
-Symbols touched since a commit or timestamp: intersect the scanner's changed-path
-validation with the chunk table and report the declarations in those files. Natural
-pairing with review workflows and the index-freshness monitoring work. Cheap first
-version: files → outlines of changed files. Richer version maps byte ranges to specific
-symbols via the structural table.
-
 ### Blame/staleness enrichment
 
 Last-touched date per chunk from `git blame`, enabling "only code older than N months"

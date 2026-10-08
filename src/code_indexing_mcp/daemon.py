@@ -31,6 +31,7 @@ from .application import Application, RuntimePaths
 from .errors import CodeIndexingError, ErrorCode
 from .indexing import REFERENCE_SCHEMA_VERSION
 from .models import (
+    ChangedSymbolsResponse,
     CodeChunk,
     DeadCodeReport,
     DeclarationSelector,
@@ -60,13 +61,14 @@ from .storage import SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
-# Bumped whenever the RPC surface changes shape (version 5 added dead_code_report;
+# Bumped whenever the RPC surface changes shape (version 6 added changed_symbols;
+# version 5 added dead_code_report;
 # version 4 added impact_radius;
 # version 3 added chunked responses; version 2 added the `trigger`
 # parameter to index_project): a long-lived daemon from a previous release must
 # reject requests it cannot dispatch instead of failing inside them, and the
 # mismatch is what tells ensure_daemon to retire it and start a current one.
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 MAX_FRAME_BYTES = 16 * 1024**2
 MAX_RESPONSE_BYTES = 256 * 1024**2
 MAX_RESPONSE_CHUNK_BYTES = 8 * 1024**2
@@ -744,6 +746,8 @@ class DaemonServer:
             return app.dead_code_report(roots=roots, **params)
         if method == "file_outline":
             return app.file_outline(roots=roots, **params)
+        if method == "changed_symbols":
+            return app.changed_symbols(roots=roots, **params)
         if method == "get_chunk":
             return app.get_chunk(**params)
         if method == "find_references":
@@ -1123,6 +1127,11 @@ class BrokerApplication:
     def file_outline(self, path: str, project: str | None = None, **params: Any) -> OutlineResponse:
         return OutlineResponse.model_validate(
             self._call("file_outline", path=path, project=project, **params)
+        )
+
+    def changed_symbols(self, project: str | None = None, **params: Any) -> ChangedSymbolsResponse:
+        return ChangedSymbolsResponse.model_validate(
+            self._call("changed_symbols", project=project, **params)
         )
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:

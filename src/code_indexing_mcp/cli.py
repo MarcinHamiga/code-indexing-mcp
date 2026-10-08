@@ -50,6 +50,7 @@ COMMAND_NAMES = (
     "history",
     "scan",
     "dead-code-report",
+    "changed-symbols",
     "storage",
     "projects",
     "model",
@@ -132,6 +133,25 @@ def _parser(prog: str = "code-indexing-mcp") -> argparse.ArgumentParser:
         "dead-code-report", help="Review exported declarations with no exact uses (JSON report)"
     )
     dead_code.add_argument("project", nargs="?", help="Project id, name, or path")
+    changed = commands.add_parser(
+        "changed-symbols",
+        help="List declarations touched since a commit or time (JSON report)",
+    )
+    changed.add_argument("project", nargs="?", help="Project id, name, or path")
+    changed_base = changed.add_mutually_exclusive_group()
+    changed_base.add_argument(
+        "--since", default=None, help="Base branch, tag, or commit (default: HEAD)"
+    )
+    changed_base.add_argument(
+        "--since-time", default=None, help="Use the last commit on HEAD before this time"
+    )
+    changed.add_argument(
+        "--no-untracked",
+        dest="include_untracked",
+        action="store_false",
+        help="Leave untracked files out",
+    )
+    changed.add_argument("--limit", type=int, default=100)
     storage = commands.add_parser(
         "storage", help="Inspect index storage statistics and maintenance"
     )
@@ -542,6 +562,14 @@ def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> 
             result = app.index_history(args.project, cursor=args.cursor, limit=args.limit)
         elif args.command == "dead-code-report":
             result = app.dead_code_report(args.project)
+        elif args.command == "changed-symbols":
+            result = app.changed_symbols(
+                args.project,
+                since=args.since,
+                since_time=args.since_time,
+                include_untracked=args.include_untracked,
+                limit=args.limit,
+            )
         elif args.command == "scan":
             result = app.inspect_scan(
                 args.project,
