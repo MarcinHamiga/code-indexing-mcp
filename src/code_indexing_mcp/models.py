@@ -321,6 +321,12 @@ class ExtractedChunk(FrozenModel):
     # windowed away from every part after the first.
     embedding_prefix: str = ""
     search_suffix: str = ""
+    # Embedding windows retain their original extracted chunk's byte bounds
+    # and content digest. Internal only: extraction output and MCP payloads
+    # keep their existing shape.
+    source_start_byte: int | None = Field(default=None, exclude=True)
+    source_end_byte: int | None = Field(default=None, exclude=True)
+    source_content_hash: str | None = Field(default=None, exclude=True)
 
 
 class CallShape(FrozenModel):
@@ -709,6 +715,9 @@ class IndexedChunk(FrozenModel):
     identifier_terms: str
     part_index: int = 0
     content_hash: str = ""
+    source_start_byte: int | None = None
+    source_end_byte: int | None = None
+    source_content_hash: str | None = None
 
 
 class StoredChunk(IndexedChunk):
@@ -735,6 +744,11 @@ class ChunkPreview(FrozenModel):
     start_line: int
     end_line: int
     content: str = ""
+    part_index: int = 0
+    source_start_byte: int | None = None
+    source_end_byte: int | None = None
+    source_content_hash: str | None = None
+    content_hash: str = ""
 
 
 class IndexIssue(FrozenModel):

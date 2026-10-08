@@ -2065,7 +2065,9 @@ def create_server(
         title="Get chunk",
         description=(
             "Fetch one indexed chunk's full stored text by the chunk_id returned from search_code "
-            "or find_symbol, with its path, symbol, and line range. Resolved against the active "
+            "or find_symbol, with its path, symbol, and line range. Matches inside smaller "
+            "embedding windows return the entire original extracted chunk from the stored "
+            "index snapshot. Resolved against the active "
             "index slot: chunk ids are content-derived and change when the file is re-indexed, "
             "and a selector switch makes the previous slot's chunks unavailable through this "
             "lookup, so a stale id returns CHUNK_NOT_FOUND rather than the wrong code."

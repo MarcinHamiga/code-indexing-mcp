@@ -101,6 +101,9 @@ class ChunkRow:
     part_index: int
     vector: bytes
     content_hash: str = ""
+    source_start_byte: int | None = None
+    source_end_byte: int | None = None
+    source_content_hash: str | None = None
 
 
 @dataclass(frozen=True)

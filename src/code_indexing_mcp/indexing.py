@@ -1817,6 +1817,15 @@ class Indexer:
                 "end_line": start_line + content.count("\n"),
                 "content": content,
                 "embedding_text": embedding_text,
+                "source_start_byte": chunk.start_byte,
+                # Extractor parts may trim trailing whitespace from content
+                # while keeping a wider syntax span. Retrieval bounds describe
+                # the actual stored text so coverage can be checked exactly.
+                "source_end_byte": chunk.start_byte + len(chunk.content.encode("utf-8")),
+                # The file hash scopes sibling windows to one generation; this
+                # identifies the source chunk itself, so equal code in pinned
+                # checkouts that differ elsewhere in the file stays one result.
+                "source_content_hash": _digest(chunk.content),
             }
         )
 
@@ -1998,4 +2007,7 @@ class Indexer:
             part_index=chunk.part_index,
             vector=vector,
             content_hash=file.content_hash,
+            source_start_byte=chunk.source_start_byte,
+            source_end_byte=chunk.source_end_byte,
+            source_content_hash=chunk.source_content_hash,
         )

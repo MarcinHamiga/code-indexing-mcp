@@ -148,7 +148,8 @@ def plan_candidate_windows(
 
     The prefix is the context header repeated on every window of a candidate, so
     it is charged against the budget once and the content windows are sized with
-    what is left.
+    what is left. Slicing can change tokenization at either boundary, so this is
+    only an initial budget: shrink it and replan when a complete input overflows.
     """
     plans: list[list[TokenWindow]] = []
     prefix_tokens: dict[str, int] = {}
@@ -160,31 +161,46 @@ def plan_candidate_windows(
         budget = max_tokens - prefix_tokens[prefix]
         if budget < 1:
             raise ValueError("prefix consumes the complete token window budget")
-        planned = plan_token_windows(
-            content_token_offsets(encode(content)),
-            text_length=len(content),
-            max_tokens=budget,
-            overlap_tokens=overlap_tokens,
-            max_windows=max_windows,
-        )
-        measured: list[TokenWindow] = []
-        for window in planned:
-            composed = (
-                f"{prefix}\n{content[window.start_char : window.end_char]}"
-                if prefix
-                else content[window.start_char : window.end_char]
+        offsets = content_token_offsets(encode(content))
+        while True:
+            planned = plan_token_windows(
+                offsets,
+                text_length=len(content),
+                max_tokens=budget,
+                overlap_tokens=overlap_tokens,
+                max_windows=max_windows,
             )
-            input_tokens = len(encode(composed).offsets)
-            if input_tokens > max_tokens:
-                raise ValueError("composed embedding input exceeds the token window budget")
-            measured.append(
-                TokenWindow(
-                    window.start_char,
-                    window.end_char,
-                    window.token_count,
-                    input_token_count=input_tokens,
+            measured: list[TokenWindow] = []
+            overflow = 0
+            for window in planned:
+                composed = (
+                    f"{prefix}\n{content[window.start_char : window.end_char]}"
+                    if prefix
+                    else content[window.start_char : window.end_char]
                 )
-            )
+                input_tokens = len(encode(composed).offsets)
+                overflow = max(overflow, input_tokens - max_tokens)
+                measured.append(
+                    TokenWindow(
+                        window.start_char,
+                        window.end_char,
+                        window.token_count,
+                        input_token_count=input_tokens,
+                    )
+                )
+            if overflow == 0:
+                break
+            # Token counts are not additive: a continuation at a slice boundary
+            # can become several tokens when encoded as a fresh model input.
+            # Replan all windows so the smaller slices still cover every source
+            # character, with overlap clamped to the new budget. The budget
+            # strictly decreases, independent of memory and batch scheduling.
+            if budget == 1:
+                raise ValueError(
+                    "composed embedding input cannot fit the token window budget "
+                    "even with a one-token content window"
+                )
+            budget = max(1, budget - overflow)
         plans.append(measured)
     return plans
 

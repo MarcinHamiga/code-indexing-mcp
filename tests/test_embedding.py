@@ -167,6 +167,35 @@ def test_long_repeated_prefixes_are_charged_in_microbatch_packing() -> None:
     assert all(len(batch) == 2 for batch in seen)
 
 
+def test_embedding_replanned_windows_respects_sequence_and_batch_limits() -> None:
+    from test_token_batching import assert_complete_windows, composition_encode
+
+    candidates = [
+        PassageCandidate("header", " ".join(f"value{index}" for index in range(30))),
+        PassageCandidate("another header", "small body"),
+    ]
+    plan = SegmentPlan(max_tokens=12, overlap_tokens=2, max_items=4, max_token_product=24)
+    batches: list[list[str]] = []
+
+    def embed(texts: list[str]) -> list[str]:
+        counts = [len(composition_encode(text).offsets) for text in texts]
+        assert max(counts) <= plan.max_tokens
+        assert len(texts) * max(counts) <= plan.max_token_product
+        batches.append(texts)
+        return texts
+
+    result = embed_planned_segments(composition_encode, embed, candidates, plan)
+
+    assert batches
+    assert len(result[0]) > 1
+    for candidate, segments in zip(candidates, result, strict=True):
+        assert_complete_windows(candidate.content, [window for window, _ in segments])
+        for window, vector in segments:
+            assert vector == compose_passage(
+                candidate.prefix, candidate.content[window.start_char : window.end_char]
+            )
+
+
 def test_embed_windows_restores_candidates_and_sorts_their_windows() -> None:
     candidates = [
         PassageCandidate("candidate-a", "ab"),
