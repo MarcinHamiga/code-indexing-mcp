@@ -252,6 +252,10 @@ class SearchService:
                 chunk.content if include_content_in_key else None,
             )
             if chunk.source_start_byte is not None:
+                # A window's logical result is its source chunk. Pinned
+                # checkouts can differ elsewhere in the file, so the chunk's
+                # own digest, not the file hash, decides whether equal source
+                # collapses -- matching the content rule for unwindowed rows.
                 key = (
                     chunk.project_id,
                     chunk.file_id,
@@ -260,7 +264,7 @@ class SearchService:
                     chunk.part_index,
                     chunk.source_start_byte,
                     chunk.source_end_byte,
-                    chunk.content_hash,
+                    chunk.source_content_hash if include_content_in_key else None,
                 )
             if key in seen:
                 continue

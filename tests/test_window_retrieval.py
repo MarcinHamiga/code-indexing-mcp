@@ -422,15 +422,14 @@ def test_sibling_slot_without_window_columns_is_rebuilt_before_queries(tmp_path:
     source = store._project_tables(project.id)
     database = lancedb.connect(store.directory / "projects" / second.partition_id)
     database.create_table("files", source.files.to_arrow())
-    database.create_table(
-        "chunks", source.chunks.to_arrow().drop_columns(["source_start_byte", "source_end_byte"])
-    )
+    window_columns = ["source_start_byte", "source_end_byte", "source_content_hash"]
+    database.create_table("chunks", source.chunks.to_arrow().drop_columns(window_columns))
     database.create_table("references", source.references.to_arrow())
 
     reason = store.incompatibility_reason(
         project.id, indexer.embedder.model_id, partition_id=second.partition_id
     )
-    assert "chunk columns missing: source_start_byte, source_end_byte" in (reason or "")
+    assert f"chunk columns missing: {', '.join(window_columns)}" in (reason or "")
 
     assert indexer.index(project, partition=second).errors == []
     assert (
@@ -440,6 +439,32 @@ def test_sibling_slot_without_window_columns_is_rebuilt_before_queries(tmp_path:
         is None
     )
     assert len(search.find_symbol("process_data", project.id, partition=second).hits) == 1
+
+
+@pytest.mark.parametrize(("chunk_changed", "expected_hits"), [(False, 1), (True, 2)])
+def test_pinned_checkouts_collapse_equal_chunks_in_files_that_differ_elsewhere(
+    tmp_path: Path, chunk_changed: bool, expected_hits: int
+) -> None:
+    _, store, search, project, _ = indexed_windows(tmp_path)
+    first = store.active_partition(project.id)
+    second = _second_checkout(store, project)
+    # The second checkout edited main.py elsewhere, so its file hash differs.
+    # process_data collapses only while its own source chunk is unchanged.
+    rows = store._project_tables(project.id).chunks.to_arrow().to_pylist()
+    for row in rows:
+        digest = hashlib.sha256(f"{second.slot_id}:{row['chunk_id']}".encode()).hexdigest()
+        row["chunk_id"] = f"{project.id}:{digest}"
+        row["content_hash"] = "edited-elsewhere"
+        if chunk_changed and row["source_content_hash"] is not None:
+            row["source_content_hash"] = "edited-chunk"
+    store._project_tables(project.id, partition_id=second.partition_id).chunks.add(rows)
+    store.ensure_indexes(project.id, partition_id=second.partition_id)
+
+    response = search.search_code(
+        "beginning_marker", [project.id], partitions={project.id: [first, second]}
+    )
+
+    assert len([hit for hit in response.hits if hit.symbol == "process_data"]) == expected_hits
 
 
 @pytest.mark.parametrize("example", [False, True])

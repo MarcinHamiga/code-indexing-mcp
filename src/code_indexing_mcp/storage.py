@@ -70,8 +70,9 @@ logger = logging.getLogger(__name__)
 # available through CODE_INDEXING_VECTOR_STORAGE. The bump keeps a pre-float16
 # binary from serving a float16 partition: it sees version 5 against its own 4
 # and marks the partition for rebuild instead of mixing generations.
-# Version 6 records original chunk bounds on embedding windows so retrieval can
-# reconstruct their source chunk without reading a changed checkout.
+# Version 6 records original chunk bounds and a chunk content digest on
+# embedding windows so retrieval can reconstruct their source chunk without
+# reading a changed checkout, and equal chunks in pinned checkouts collapse.
 SCHEMA_VERSION = 6
 
 # Symbol lookups page through the over-matching LIKE prefilter. These bound
@@ -162,6 +163,7 @@ INDEXED_CHUNK_COLUMNS = [
     "part_index",
     "source_start_byte",
     "source_end_byte",
+    "source_content_hash",
 ]
 
 
@@ -2083,6 +2085,7 @@ class LanceStore:
             "part_index",
             "source_start_byte",
             "source_end_byte",
+            "source_content_hash",
             "content_hash",
         ]
         vector_query = tables.chunks.search(
@@ -2158,6 +2161,7 @@ class LanceStore:
             "part_index",
             "source_start_byte",
             "source_end_byte",
+            "source_content_hash",
             "content_hash",
         ]
         best_by_chunk: dict[str, dict[str, Any]] = {}
@@ -2828,6 +2832,7 @@ class LanceStore:
                 ("part_index", pa.int32()),
                 ("source_start_byte", pa.int64()),
                 ("source_end_byte", pa.int64()),
+                ("source_content_hash", pa.string()),
                 (
                     "vector",
                     pa.list_(vector_dtype, vector_dimension),
