@@ -1,7 +1,11 @@
 name: CI
 
 on:
+  # Pull requests run through pull_request; also running on every branch push
+  # started a second, identical run for each PR push. Main keeps its push run
+  # for post-merge signal, and workflow_dispatch covers a branch with no PR.
   push:
+    branches: [main]
   pull_request:
   schedule:
     # Weekly Windows signal (Monday 06:00 UTC); Windows no longer runs on
@@ -12,6 +16,13 @@ on:
       corpus_scale:
         description: Corpus scale for the real-model memory gate
         default: "1"
+
+# A newer push to a pull request cancels the run it supersedes. Every other
+# event gets its own group (the run id), so pushes to main, the weekly
+# schedule, and manual dispatches never cancel or queue behind one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   test:
