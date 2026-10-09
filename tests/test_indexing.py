@@ -2578,3 +2578,18 @@ def test_indexer_rejects_a_live_symlink_substituted_after_scanning(
         result = indexer.index(project)
         assert result.indexed_files == 0
         assert any("symlink" in issue.message for issue in result.errors)
+
+
+def test_prisma_type_block_does_not_hold_the_project_partial(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "schema.prisma").write_text(
+        "model User {\n  id Int @id\n}\n\ntype Address {\n  street String\n}\n"
+    )
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+
+    report = indexer.index(project)
+
+    assert not report.errors
+    assert store.project_state(project.id) == "ready"

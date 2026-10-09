@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from bisect import bisect_left, bisect_right
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -64,6 +64,12 @@ _CONTAINER_KINDS: Final = frozenset(
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 _QUOTE_CHARACTERS: Final = ("'", '"')
 STRUCTURAL_LANGUAGES: Final = frozenset(LANGUAGE_RULES)
+# The packaged Prisma grammar cannot parse valid `type`/`view` blocks or enum-level
+# `@@map`, so parse errors there say nothing about the file. Reporting them would
+# leave every such project `partial` forever; the unparsed text stays searchable
+# through the fallback chunk. Safe only because these languages carry no
+# structural references whose byte offsets an error could invalidate.
+_ERROR_TOLERANT_LANGUAGES: Final = frozenset({"prisma"})
 _PACK_DOWNLOAD_ATTEMPTS: Final = 6
 _PACK_DOWNLOAD_BACKOFF_SECONDS: Final = 1.0
 
@@ -241,42 +247,75 @@ def _pack_language(name: str) -> Language:
     raise AssertionError("unreachable")
 
 
-def _languages() -> dict[str, Language]:
-    return {
-        "python": Language(tree_sitter_python.language()),
-        "java": Language(tree_sitter_java.language()),
-        "javascript": Language(tree_sitter_javascript.language()),
-        "typescript": Language(tree_sitter_typescript.language_typescript()),
-        "tsx": Language(tree_sitter_typescript.language_tsx()),
-        "csharp": Language(tree_sitter_c_sharp.language()),
-        "sql": Language(tree_sitter_sql.language()),
-        "go": Language(tree_sitter_go.language()),
-        "terraform": Language(tree_sitter_hcl.language()),
-        "rust": Language(tree_sitter_rust.language()),
-        "c": Language(tree_sitter_c.language()),
-        "cpp": Language(tree_sitter_cpp.language()),
-        "lua": Language(tree_sitter_lua.language()),
-        # No standalone GDScript grammar is published to PyPI; the language pack
-        # is the only packaged source. It already returns a Language, not a
-        # PyCapsule, so it is not wrapped like the others. The two sibling Godot
-        # formats come from the same pack for the same reason. Kotlin, Zig,
-        # Swift, and XML have dedicated PyPI grammars but all four also ship
-        # in the pack, so they follow the same download-on-first-use path and
-        # add no new dependency.
-        "gdscript": _pack_language("gdscript"),
-        "gdshader": _pack_language("gdshader"),
-        "godot_resource": _pack_language("godot_resource"),
-        "kotlin": _pack_language("kotlin"),
-        "zig": _pack_language("zig"),
-        "swift": _pack_language("swift"),
-        "xml": _pack_language("xml"),
-        # Svelte, Vue, and Prisma are pack-only grammars like the Godot formats.
-        "svelte": _pack_language("svelte"),
-        "vue": _pack_language("vue"),
-        "prisma": _pack_language("prisma"),
-        "yaml": Language(tree_sitter_yaml.language()),
-        "json": Language(tree_sitter_json.language()),
-    }
+class _LazyLanguages(Mapping[str, Language]):
+    """Grammars resolved on first use.
+
+    Pack grammars download on first use, so building them all up front made a
+    failed download (for example offline) break extraction for every language
+    instead of only the files in the missing one.
+    """
+
+    def __init__(self, factories: dict[str, Callable[[], Language]]) -> None:
+        self._factories = factories
+        self._loaded: dict[str, Language] = {}
+        self._lock = threading.Lock()
+
+    def __getitem__(self, name: str) -> Language:
+        loaded = self._loaded.get(name)
+        if loaded is not None:
+            return loaded
+        factory = self._factories[name]
+        with self._lock:
+            loaded = self._loaded.get(name)
+            if loaded is None:
+                loaded = self._loaded[name] = factory()
+            return loaded
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._factories)
+
+    def __len__(self) -> int:
+        return len(self._factories)
+
+
+def _languages() -> _LazyLanguages:
+    return _LazyLanguages(
+        {
+            "python": lambda: Language(tree_sitter_python.language()),
+            "java": lambda: Language(tree_sitter_java.language()),
+            "javascript": lambda: Language(tree_sitter_javascript.language()),
+            "typescript": lambda: Language(tree_sitter_typescript.language_typescript()),
+            "tsx": lambda: Language(tree_sitter_typescript.language_tsx()),
+            "csharp": lambda: Language(tree_sitter_c_sharp.language()),
+            "sql": lambda: Language(tree_sitter_sql.language()),
+            "go": lambda: Language(tree_sitter_go.language()),
+            "terraform": lambda: Language(tree_sitter_hcl.language()),
+            "rust": lambda: Language(tree_sitter_rust.language()),
+            "c": lambda: Language(tree_sitter_c.language()),
+            "cpp": lambda: Language(tree_sitter_cpp.language()),
+            "lua": lambda: Language(tree_sitter_lua.language()),
+            # No standalone GDScript grammar is published to PyPI; the language pack
+            # is the only packaged source. It already returns a Language, not a
+            # PyCapsule, so it is not wrapped like the others. The two sibling Godot
+            # formats come from the same pack for the same reason. Kotlin, Zig,
+            # Swift, and XML have dedicated PyPI grammars but all four also ship
+            # in the pack, so they follow the same download-on-first-use path and
+            # add no new dependency.
+            "gdscript": lambda: _pack_language("gdscript"),
+            "gdshader": lambda: _pack_language("gdshader"),
+            "godot_resource": lambda: _pack_language("godot_resource"),
+            "kotlin": lambda: _pack_language("kotlin"),
+            "zig": lambda: _pack_language("zig"),
+            "swift": lambda: _pack_language("swift"),
+            "xml": lambda: _pack_language("xml"),
+            # Svelte, Vue, and Prisma are pack-only grammars like the Godot formats.
+            "svelte": lambda: _pack_language("svelte"),
+            "vue": lambda: _pack_language("vue"),
+            "prisma": lambda: _pack_language("prisma"),
+            "yaml": lambda: Language(tree_sitter_yaml.language()),
+            "json": lambda: Language(tree_sitter_json.language()),
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -465,7 +504,7 @@ class TreeSitterExtractor:
             chunks=chunks,
             references=references,
             declarations=declarations,
-            has_errors=tree.root_node.has_error,
+            has_errors=tree.root_node.has_error and language not in _ERROR_TOLERANT_LANGUAGES,
             reference_extraction_ns=reference_extraction_ns,
         )
 

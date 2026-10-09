@@ -11,6 +11,8 @@ from code_indexing_mcp.models import (
     LEGACY_DEFAULT_INCLUDES_V1,
     LEGACY_DEFAULT_INCLUDES_V2,
     LEGACY_DEFAULT_INCLUDES_V3,
+    LEGACY_DEFAULT_INCLUDES_V4,
+    LEGACY_DEFAULT_INCLUDES_V5,
     MAX_FILE_BYTES_CEILING,
 )
 from code_indexing_mcp.projects import (
@@ -66,8 +68,14 @@ def test_initialize_project_is_idempotent_unless_forced(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "legacy_includes",
-    [LEGACY_DEFAULT_INCLUDES_V1, LEGACY_DEFAULT_INCLUDES_V2, LEGACY_DEFAULT_INCLUDES_V3],
-    ids=["v1", "v2", "v3"],
+    [
+        LEGACY_DEFAULT_INCLUDES_V1,
+        LEGACY_DEFAULT_INCLUDES_V2,
+        LEGACY_DEFAULT_INCLUDES_V3,
+        LEGACY_DEFAULT_INCLUDES_V4,
+        LEGACY_DEFAULT_INCLUDES_V5,
+    ],
+    ids=["v1", "v2", "v3", "v4", "v5"],
 )
 def test_any_legacy_default_marker_gains_the_current_languages_without_rewriting_file(
     tmp_path: Path, legacy_includes: list[str]

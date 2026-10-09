@@ -12,3 +12,8 @@
 (key_value_block
   .
   (identifier) @name) @definition.object
+
+; Block attributes (@@unique, @@index, @@map, @@schema) as members of their block.
+(model_multi_attribute
+  (attribute_specifier
+    (identifier) @name)) @definition.property

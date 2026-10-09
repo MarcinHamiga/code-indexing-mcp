@@ -43,8 +43,6 @@ SerializablePath = Annotated[Path, _PathAsPlainString()]
 # Version 10 adds Kotlin, Swift, and Zig, with XML indexed definitions-only
 # (no structural references, like YAML and JSON).
 # Version 11 preserves Swift's external call-site labels in declaration shapes.
-# Version 12 adds Svelte, Vue, and Prisma, all indexed definitions-only (no
-# structural references, like XML).
 #
 # Lives here rather than in indexing.py (originally its home) because
 # reference_service.py needs it too and importing it from indexing.py made
@@ -52,7 +50,7 @@ SerializablePath = Annotated[Path, _PathAsPlainString()]
 # docs/plans/2026-09-02-review-remediation-5-application-split-plan.md.
 # indexing.py re-exports the name for one release so nothing importing it from
 # there breaks.
-REFERENCE_SCHEMA_VERSION = 12
+REFERENCE_SCHEMA_VERSION = 11
 
 
 def content_digest(value: str | bytes) -> str:
@@ -98,7 +96,7 @@ LEGACY_DEFAULT_INCLUDES_V3 = [
     "**/*.json",
 ]
 
-DEFAULT_INCLUDES = [
+LEGACY_DEFAULT_INCLUDES_V4 = [
     *LEGACY_DEFAULT_INCLUDES_V3,
     "**/*.go",
     "**/*.tf",
@@ -113,11 +111,19 @@ DEFAULT_INCLUDES = [
     "**/*.hpp",
     "**/*.hxx",
     "**/*.lua",
+]
+
+LEGACY_DEFAULT_INCLUDES_V5 = [
+    *LEGACY_DEFAULT_INCLUDES_V4,
     "**/*.kt",
     "**/*.kts",
     "**/*.zig",
     "**/*.swift",
     "**/*.xml",
+]
+
+DEFAULT_INCLUDES = [
+    *LEGACY_DEFAULT_INCLUDES_V5,
     "**/*.svelte",
     "**/*.vue",
     "**/*.prisma",
