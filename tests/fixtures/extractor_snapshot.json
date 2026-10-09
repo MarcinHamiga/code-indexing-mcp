@@ -6664,6 +6664,109 @@
       ]
     ]
   },
+  "sample.prisma": {
+    "chunks": [
+      [
+        "object",
+        "db",
+        "db",
+        null,
+        0,
+        76,
+        1,
+        4,
+        0,
+        "3e9a23512c803207",
+        "36f2ea5825bf4dc8",
+        "54afc1fa8e929a79",
+        "3b026293f3d9527c",
+        "839148e2dd594b95"
+      ],
+      [
+        "enum",
+        "Role",
+        "Role",
+        null,
+        78,
+        106,
+        6,
+        9,
+        0,
+        "d598c7b9f0b6e6c6",
+        "eb7b66a7aecf48db",
+        "352d48e848a07ae6",
+        "a4400bc2376a5565",
+        "a1778eb57140640a"
+      ],
+      [
+        "record",
+        "User",
+        "User",
+        null,
+        108,
+        123,
+        11,
+        11,
+        0,
+        "7fd8842d48c7912b",
+        "a7e0f8c529ec2eb2",
+        "5bdcca96ef9dfd2d",
+        "6ca3d7d2489c1484",
+        "285c1b9362e428db"
+      ],
+      [
+        "property",
+        "id",
+        "User.id",
+        "User",
+        123,
+        165,
+        12,
+        12,
+        0,
+        "3472d871e341c626",
+        "4e74370194854886",
+        "a8c82e6140ffa8e9",
+        "baafe5ddd9203321",
+        "08a9f17d271000e9"
+      ],
+      [
+        "property",
+        "email",
+        "User.email",
+        "User",
+        168,
+        188,
+        13,
+        13,
+        0,
+        "15b26d3ca3098fc3",
+        "78fcd2e68bf2952a",
+        "b6a7e11b2b004284",
+        "388ba1999e6419b2",
+        "7d1155866ccdd945"
+      ],
+      [
+        "property",
+        "role",
+        "User.role",
+        "User",
+        191,
+        218,
+        14,
+        14,
+        0,
+        "c7f96f33dad0a17b",
+        "4e82c6fd0ec1f487",
+        "ac74338269ff44da",
+        "4c424d522f435175",
+        "0baad39036f74f57"
+      ]
+    ],
+    "declarations": [],
+    "has_errors": false,
+    "references": []
+  },
   "sample.rs": {
     "chunks": [
       [
@@ -8296,6 +8399,61 @@
       ]
     ]
   },
+  "sample.svelte": {
+    "chunks": [
+      [
+        "object",
+        "script",
+        "script",
+        null,
+        0,
+        110,
+        1,
+        7,
+        0,
+        "2750fe5bf2b30665",
+        "e94667e046fde5df",
+        "2111773d3563f4bc",
+        "41a5fda8cae0df97",
+        "155eb254baf853db"
+      ],
+      [
+        "module",
+        null,
+        null,
+        null,
+        110,
+        132,
+        7,
+        9,
+        0,
+        "c26c2f3cfa21d720",
+        "6f9ce624076c4a42",
+        "eac1665fd662715c",
+        "0424868c631157ec",
+        "93164ac7e4482554"
+      ],
+      [
+        "object",
+        "style",
+        "style",
+        null,
+        132,
+        178,
+        11,
+        15,
+        0,
+        "b140eefc8e96ab38",
+        "fecc01605ca76963",
+        "6a9af54592219867",
+        "6065776f5d154d98",
+        "892d6cc9a37e66dd"
+      ]
+    ],
+    "declarations": [],
+    "has_errors": false,
+    "references": []
+  },
   "sample.swift": {
     "chunks": [
       [
@@ -8769,6 +8927,61 @@
         []
       ]
     ],
+    "has_errors": false,
+    "references": []
+  },
+  "sample.vue": {
+    "chunks": [
+      [
+        "object",
+        "template",
+        "template",
+        null,
+        0,
+        48,
+        1,
+        3,
+        0,
+        "2a287289b303f1b1",
+        "45af666e3abe6149",
+        "32e28e1344a653ad",
+        "b4ec766d80791c26",
+        "a408b8bbf5217e89"
+      ],
+      [
+        "object",
+        "script",
+        "script",
+        null,
+        50,
+        109,
+        5,
+        7,
+        0,
+        "493d72ae334cdbd4",
+        "669a5bb21bcd5d79",
+        "fbd7f87de7b95bc2",
+        "c519192b8404fde7",
+        "bc3a93578579784d"
+      ],
+      [
+        "object",
+        "style",
+        "style",
+        null,
+        111,
+        158,
+        9,
+        13,
+        0,
+        "bf20248fddabd1c4",
+        "8597ff7125dda210",
+        "0ad2c697c1a1cfda",
+        "bf3732de6398afaa",
+        "0ed31dcb69148a9a"
+      ]
+    ],
+    "declarations": [],
     "has_errors": false,
     "references": []
   },

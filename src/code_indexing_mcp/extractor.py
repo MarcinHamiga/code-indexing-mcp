@@ -270,6 +270,10 @@ def _languages() -> dict[str, Language]:
         "zig": _pack_language("zig"),
         "swift": _pack_language("swift"),
         "xml": _pack_language("xml"),
+        # Svelte, Vue, and Prisma are pack-only grammars like the Godot formats.
+        "svelte": _pack_language("svelte"),
+        "vue": _pack_language("vue"),
+        "prisma": _pack_language("prisma"),
         "yaml": Language(tree_sitter_yaml.language()),
         "json": Language(tree_sitter_json.language()),
     }

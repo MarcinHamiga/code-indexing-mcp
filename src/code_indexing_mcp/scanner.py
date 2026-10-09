@@ -76,6 +76,9 @@ LANGUAGES = {
     ".zig": "zig",
     ".swift": "swift",
     ".xml": "xml",
+    ".svelte": "svelte",
+    ".vue": "vue",
+    ".prisma": "prisma",
 }
 
 HARD_EXCLUDED_DIRECTORIES = {

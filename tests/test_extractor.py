@@ -281,6 +281,73 @@ pub fn add(a: i32, b: i32) i32 {
                 ("object", "catalog.book"),
             },
         ),
+        (
+            "svelte",
+            "src/Counter.svelte",
+            b"""<script lang="ts">
+  export let count = 0;
+</script>
+
+<button>{count}</button>
+
+<style>
+  button { color: red; }
+</style>
+""",
+            {
+                ("object", "script"),
+                ("object", "style"),
+            },
+        ),
+        (
+            "vue",
+            "src/Counter.vue",
+            b"""<template>
+  <button>{{ count }}</button>
+</template>
+
+<script setup lang="ts">
+const count = 0
+</script>
+
+<style scoped>
+button { color: red; }
+</style>
+""",
+            {
+                ("object", "template"),
+                ("object", "script"),
+                ("object", "style"),
+            },
+        ),
+        (
+            "prisma",
+            "prisma/schema.prisma",
+            b"""datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id    Int    @id
+  email String @unique
+  role  Role   @default(USER)
+}
+""",
+            {
+                ("object", "db"),
+                ("enum", "Role"),
+                ("record", "User"),
+                ("property", "User.id"),
+                ("property", "User.email"),
+                ("property", "User.role"),
+            },
+        ),
     ],
 )
 def test_extracts_next_language_symbols(
@@ -294,6 +361,27 @@ def test_extracts_next_language_symbols(
     assert not result.has_errors
     symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
     assert expected <= symbols
+
+
+def test_prisma_type_blocks_degrade_to_a_fallback_chunk_without_losing_models() -> None:
+    """The packaged Prisma grammar does not parse `type` composite blocks, so a
+    schema that uses one reports errors. The models around it must still index,
+    and the unparsed block must stay searchable through the fallback chunk."""
+    source = b"""model User {
+  id Int @id
+}
+
+type Address {
+  street String
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("schema.prisma"), "prisma", source)
+
+    assert result.has_errors
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert {("record", "User"), ("property", "User.id")} <= symbols
+    assert any(chunk.kind == "module" and "street" in chunk.content for chunk in result.chunks)
 
 
 def test_swift_extension_members_qualify_under_the_extended_type() -> None:

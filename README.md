@@ -674,6 +674,9 @@ TypeScript, and the two Godot data formats are one language.
 | Swift      | `.swift`                       | `swift`           | classes (including structs and enums), interfaces (protocols), functions, methods, constructors, properties, enum cases |
 | Zig        | `.zig`                         | `zig`             | functions, constants, struct fields (as properties)           |
 | XML        | `.xml`                         | `xml`             | elements with nested elements, qualified by their path        |
+| Svelte     | `.svelte`                      | `svelte`          | `<script>` and `<style>` sections (script contents are not parsed into symbols) |
+| Vue        | `.vue`                         | `vue`             | `<template>`, `<script>`, and `<style>` sections (script contents are not parsed into symbols) |
+| Prisma     | `.prisma`                      | `prisma`          | models (as records) with their fields, enums, `datasource` and `generator` blocks; `type` and `view` blocks are not parsed by the packaged grammar and stay searchable as fallback text |
 
 Nested declarations are qualified by their enclosing scope in every language, so a C# method
 indexes as `Outer.Inner.Work` and a Compose service port list as `services.web.ports`.
