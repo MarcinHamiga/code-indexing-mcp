@@ -21,6 +21,8 @@ from .models import (
     LEGACY_DEFAULT_INCLUDES_V1,
     LEGACY_DEFAULT_INCLUDES_V2,
     LEGACY_DEFAULT_INCLUDES_V3,
+    LEGACY_DEFAULT_INCLUDES_V4,
+    LEGACY_DEFAULT_INCLUDES_V5,
     ProjectInfo,
     ScanConfig,
 )
@@ -244,6 +246,8 @@ def read_project_marker(root: Path) -> ProjectInfo:
             LEGACY_DEFAULT_INCLUDES_V1,
             LEGACY_DEFAULT_INCLUDES_V2,
             LEGACY_DEFAULT_INCLUDES_V3,
+            LEGACY_DEFAULT_INCLUDES_V4,
+            LEGACY_DEFAULT_INCLUDES_V5,
         ):
             scan = scan.model_copy(update={"include": list(DEFAULT_INCLUDES)})
         return ProjectInfo(

@@ -281,6 +281,73 @@ pub fn add(a: i32, b: i32) i32 {
                 ("object", "catalog.book"),
             },
         ),
+        (
+            "svelte",
+            "src/Counter.svelte",
+            b"""<script lang="ts">
+  export let count = 0;
+</script>
+
+<button>{count}</button>
+
+<style>
+  button { color: red; }
+</style>
+""",
+            {
+                ("object", "script"),
+                ("object", "style"),
+            },
+        ),
+        (
+            "vue",
+            "src/Counter.vue",
+            b"""<template>
+  <button>{{ count }}</button>
+</template>
+
+<script setup lang="ts">
+const count = 0
+</script>
+
+<style scoped>
+button { color: red; }
+</style>
+""",
+            {
+                ("object", "template"),
+                ("object", "script"),
+                ("object", "style"),
+            },
+        ),
+        (
+            "prisma",
+            "prisma/schema.prisma",
+            b"""datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id    Int    @id
+  email String @unique
+  role  Role   @default(USER)
+}
+""",
+            {
+                ("object", "db"),
+                ("enum", "Role"),
+                ("record", "User"),
+                ("property", "User.id"),
+                ("property", "User.email"),
+                ("property", "User.role"),
+            },
+        ),
     ],
 )
 def test_extracts_next_language_symbols(
@@ -294,6 +361,28 @@ def test_extracts_next_language_symbols(
     assert not result.has_errors
     symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
     assert expected <= symbols
+
+
+def test_prisma_type_blocks_degrade_to_a_fallback_chunk_without_losing_models() -> None:
+    """The packaged Prisma grammar does not parse `type` composite blocks, so a
+    schema that uses one hits parse errors. They must not flag the file (that would
+    hold the project in `partial` forever); the models around it must still index,
+    and the unparsed block must stay searchable through the fallback chunk."""
+    source = b"""model User {
+  id Int @id
+}
+
+type Address {
+  street String
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("schema.prisma"), "prisma", source)
+
+    assert not result.has_errors
+    symbols = {(chunk.kind, chunk.qualified_symbol) for chunk in result.chunks}
+    assert {("record", "User"), ("property", "User.id")} <= symbols
+    assert any(chunk.kind == "module" and "street" in chunk.content for chunk in result.chunks)
 
 
 def test_swift_extension_members_qualify_under_the_extended_type() -> None:
@@ -1039,3 +1128,50 @@ def test_large_symbol_identity_does_not_expand_derived_text_quadratically() -> N
         )
         assert all(len(chunk.embedding_prefix) <= 2048 for chunk in result.chunks)
     assert sizes[1] < sizes[0] * 5
+
+
+def test_vue_nested_templates_stay_inside_the_root_template_chunk() -> None:
+    source = b"""<template>
+  <div>
+    <template v-if="ok">
+      <span>a</span>
+    </template>
+    <MyList>
+      <template #item="{ row }"><li>{{ row }}</li></template>
+    </MyList>
+  </div>
+</template>
+"""
+
+    result = TreeSitterExtractor().extract(Path("Card.vue"), "vue", source)
+
+    templates = [chunk for chunk in result.chunks if chunk.symbol == "template"]
+    assert len(templates) == 1
+    assert "</MyList>" in templates[0].content
+    assert templates[0].content.rstrip().endswith("</template>")
+
+
+def test_prisma_block_attributes_are_indexed_as_members() -> None:
+    source = b"""model Order {
+  id       Int @id
+  tenantId Int
+  number   Int
+
+  @@unique([tenantId, number])
+  @@index([tenantId])
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("schema.prisma"), "prisma", source)
+
+    symbols = {chunk.qualified_symbol for chunk in result.chunks}
+    assert {"Order.unique", "Order.index"} <= symbols
+
+
+def test_a_missing_pack_grammar_only_fails_its_own_language() -> None:
+    extractor = TreeSitterExtractor()
+    extractor._languages._factories["vue"] = lambda: (_ for _ in ()).throw(OSError("offline"))
+
+    with pytest.raises(OSError):
+        extractor.extract(Path("a.vue"), "vue", b"<template></template>")
+    assert extractor.extract(Path("a.py"), "python", b"def f():\n    pass\n").chunks

@@ -393,6 +393,9 @@ def test_next_language_extensions_have_stable_language_names() -> None:
         ".zig": "zig",
         ".swift": "swift",
         ".xml": "xml",
+        ".svelte": "svelte",
+        ".vue": "vue",
+        ".prisma": "prisma",
     }
     assert all(LANGUAGES.get(extension) == language for extension, language in expected.items())
 

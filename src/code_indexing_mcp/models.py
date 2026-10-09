@@ -96,7 +96,7 @@ LEGACY_DEFAULT_INCLUDES_V3 = [
     "**/*.json",
 ]
 
-DEFAULT_INCLUDES = [
+LEGACY_DEFAULT_INCLUDES_V4 = [
     *LEGACY_DEFAULT_INCLUDES_V3,
     "**/*.go",
     "**/*.tf",
@@ -111,11 +111,22 @@ DEFAULT_INCLUDES = [
     "**/*.hpp",
     "**/*.hxx",
     "**/*.lua",
+]
+
+LEGACY_DEFAULT_INCLUDES_V5 = [
+    *LEGACY_DEFAULT_INCLUDES_V4,
     "**/*.kt",
     "**/*.kts",
     "**/*.zig",
     "**/*.swift",
     "**/*.xml",
+]
+
+DEFAULT_INCLUDES = [
+    *LEGACY_DEFAULT_INCLUDES_V5,
+    "**/*.svelte",
+    "**/*.vue",
+    "**/*.prisma",
 ]
 
 # A repository-shipped marker is trusted input up to this point: a project.toml
@@ -215,6 +226,9 @@ LanguageName = Literal[
     "zig",
     "swift",
     "xml",
+    "svelte",
+    "vue",
+    "prisma",
 ]
 
 
