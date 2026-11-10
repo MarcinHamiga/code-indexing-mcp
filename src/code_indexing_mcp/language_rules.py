@@ -8,7 +8,7 @@ only adding a table row and its handlers.
 from __future__ import annotations
 
 import keyword as _keyword_module
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Final, NamedTuple
@@ -41,6 +41,10 @@ class _ModuleIndex(NamedTuple):
     names_by_namespace: dict[str, frozenset[str]]
     receiver_names: dict[tuple[str, str], str]
     rust_crate_roots: dict[str, str]
+    # Every known path keyed by its basename. C/C++ `#include` and Kotlin imports
+    # match by file name; scanning all known paths per import row cost 85-127 ms per
+    # call at 80k paths.
+    paths_by_basename: dict[str, tuple[str, ...]]
 
 
 # Reserved words per language family.
@@ -884,7 +888,53 @@ def _python_import_candidates(
         base = source.parent
         for _ in range(dots - 1):
             base = base.parent
-    return {base / f"{stem}.py", base / stem / "__init__.py"}
+    candidates = {base / f"{stem}.py", base / stem / "__init__.py"}
+    if (
+        dots == 0
+        # A single-segment name (`import json`) may be the standard library or
+        # a third-party package; only a dotted path is distinctive enough.
+        and len(stem.parts) >= 2
+        and module_index is not None
+        and not any(str(candidate) in known_paths for candidate in candidates)
+    ):
+        unique = _python_unique_module_path(stem, known_paths, module_index)
+        if unique is not None:
+            candidates.add(unique)
+    return candidates
+
+
+def _python_unique_module_path(
+    stem: PurePosixPath, known_paths: frozenset[str], module_index: _ModuleIndex
+) -> PurePosixPath | None:
+    """The one indexed file an absolute import could mean when the package root is unknown.
+
+    `_python_package_root` anchors an absolute import at the project root unless
+    the importing directory is itself a package, which misses a `src/` layout
+    imported from a non-package directory (`tests/`, `scripts/`). Such an import
+    resolves here only when exactly one indexed path ends with `<stem>.py` or
+    `<stem>/__init__.py` on a segment boundary and the directory above it is
+    not itself inside a package (a real import root, not `src/app/pkg`, which
+    would need `app.pkg`). Two candidate paths resolve to nothing: the import
+    stays unproven rather than guessed.
+    """
+    segments = stem.parts
+    relative = str(stem)
+    found: set[str] = set()
+    for path in module_index.paths_by_basename.get(f"{segments[-1]}.py", ()):
+        if path == f"{relative}.py" or path.endswith(f"/{relative}.py"):
+            found.add(path)
+    for directory in module_index.directories_by_suffix.get(segments, ()):
+        initializer = f"{directory}/__init__.py"
+        if initializer in known_paths:
+            found.add(initializer)
+    if len(found) != 1:
+        return None
+    (path,) = found
+    prefix = path.removesuffix("/__init__.py").removesuffix(".py").removesuffix(relative)
+    prefix = prefix.removesuffix("/")
+    if prefix and f"{prefix}/__init__.py" in known_paths:
+        return None
+    return PurePosixPath(path)
 
 
 def _ecmascript_import_candidates(
@@ -930,6 +980,8 @@ def _c_include_candidates(
     wanted = PurePosixPath(module_path).name
     if not wanted:
         return set()
+    if module_index is not None:
+        return {PurePosixPath(path) for path in module_index.paths_by_basename.get(wanted, ())}
     return {PurePosixPath(path) for path in known_paths if PurePosixPath(path).name == wanted}
 
 
@@ -997,7 +1049,17 @@ def _kotlin_import_candidates(
     package, symbol = parts[:-1], parts[-1]
     suffixes = {(*package, f"{symbol}.kt"), (*package, f"{symbol}.kts")}
     candidates: set[PurePosixPath] = set()
-    for raw_path in known_paths:
+    if module_index is not None:
+        # Every suffix ends in `<symbol>.kt` or `<symbol>.kts`, so only paths with
+        # one of those two basenames can match.
+        pool: Iterable[str] = (
+            raw
+            for name in (f"{symbol}.kt", f"{symbol}.kts")
+            for raw in module_index.paths_by_basename.get(name, ())
+        )
+    else:
+        pool = known_paths
+    for raw_path in pool:
         path = PurePosixPath(raw_path)
         if any(
             len(path.parts) >= len(suffix) and path.parts[-len(suffix) :] == suffix

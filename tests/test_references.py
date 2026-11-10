@@ -1,8 +1,10 @@
+import sys
 from pathlib import Path
 
 import pyarrow as pa
 import pytest
 
+from code_indexing_mcp import reference_service as reference_service_module
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
@@ -917,6 +919,133 @@ def test_find_references_narrows_the_declaration_fetch_to_files_with_a_reference
     assert len(call_hits) == 1
     assert call_hits[0].path == "main.py"
     assert call_hits[0].resolution == "exact"
+
+
+def test_declaration_fetch_excludes_files_whose_only_rows_are_unrelated_imports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REF-8: import rows of every file used to widen the "narrow" fetch to the project.
+
+    `bystander.py` has an import row (so it was always in the set) but nothing
+    in it can refer to `answer`; only rows that pass `_may_refer` justify
+    fetching their file's declarations.
+    """
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "lib.py": "def answer():\n    return 42\n",
+            "main.py": "from lib import answer\n\ndef caller():\n    return answer()\n",
+            "bystander.py": "import os\n\ndef idle():\n    return os.getcwd()\n",
+        },
+    )
+    declaration_calls: list[frozenset[str]] = []
+    real_declarations_for_files = service.store.declarations_for_files
+
+    def spy_declarations_for_files(
+        project: str, file_ids: object, **kwargs: object
+    ) -> list[object]:
+        declaration_calls.append(frozenset(file_ids))  # type: ignore[arg-type]
+        return real_declarations_for_files(project, file_ids, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service.store, "declarations_for_files", spy_declarations_for_files)
+
+    response = service.find_references(
+        DeclarationSelector(project=project_id, path="lib.py", qualified_symbol="answer")
+    )
+
+    files_by_id = {item.file_id: item.path for item in service.store.list_files(project_id)}
+    fetched_paths = {files_by_id[file_id] for call in declaration_calls for file_id in call}
+    assert "bystander.py" not in fetched_paths
+    assert "main.py" in fetched_paths
+    assert {hit.path for hit in response.hits if hit.kind == "call"} == {"main.py"}
+
+
+def test_dead_code_report_shares_work_across_declarations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REF-7: per-declaration cost must not repeat reads, parses, imports scans or fetches.
+
+    Asserted with call counts, not wall-clock time. The bounds are what the
+    old per-declaration behaviour could never meet: it re-read and re-parsed a
+    file for every declaration that has a hit in it, scanned every import row
+    per declaration, and made two extra storage round trips per declaration.
+    """
+    files: dict[str, str] = {}
+    for index in range(10):
+        files[f"lib{index}.py"] = "\n\n".join(
+            f"def fn{index}_{step}():\n    return {step}\n" for step in range(6)
+        )
+        files[f"use{index}.py"] = (
+            f"from lib{index} import fn{index}_0\n\n\n"
+            f"def run{index}():\n    return fn{index}_0() + fn{index}_0()\n"
+        )
+    service, project_id = _indexed_service(tmp_path, files)
+
+    reads: list[str] = []
+    real_read_source = reference_service_module.read_source
+
+    def spy_read_source(root: Path, path: Path, limit: int) -> tuple[bytes, int]:
+        reads.append(path.as_posix())
+        return real_read_source(root, path, limit)
+
+    monkeypatch.setattr(reference_service_module, "read_source", spy_read_source)
+
+    parses: list[int] = []
+    real_bindings = reference_service_module.PythonBindings
+
+    def counting_bindings(source: bytes) -> object:
+        parses.append(1)
+        return real_bindings(source)
+
+    monkeypatch.setattr(reference_service_module, "PythonBindings", counting_bindings)
+
+    round_trips: list[str] = []
+    for name in ("list_reference_records", "declarations_for_files", "target_name_candidates"):
+        real = getattr(service.store, name)
+
+        def spy(*args: object, _name: str = name, _real: object = real, **kwargs: object) -> object:
+            round_trips.append(_name)
+            return _real(*args, **kwargs)  # type: ignore[operator]
+
+        monkeypatch.setattr(service.store, name, spy)
+
+    import_checks: list[int] = []
+    real_import_targets = reference_service_module.ReferenceService._import_targets_symbol
+
+    def counting_import_targets(self: object, *args: object, **kwargs: object) -> bool:
+        # Only the per-declaration import scan in `_candidate_records` is
+        # under test here, not classification's own per-row checks.
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_code.co_name == "_candidate_records":
+                import_checks.append(1)
+                break
+            frame = frame.f_back  # type: ignore[assignment]
+        return real_import_targets(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        reference_service_module.ReferenceService, "_import_targets_symbol", counting_import_targets
+    )
+
+    report = service.dead_code_report(project_id)
+
+    flagged = {finding.declaration.qualified_symbol for finding in report.review}
+    assert "fn3_0" not in flagged  # called from use3.py
+    assert "fn3_1" in flagged
+    exports = 10 * 6 + 10  # every public module-level function
+    file_count = len(files)
+
+    # Each file read at most once (the coverage check plus every hit share it).
+    assert len(reads) <= file_count
+    assert len(parses) <= file_count
+    # Declaration lookups come from the already-loaded rows: only the candidate
+    # fetch stays per declaration, plus the fixed context/declaration loads.
+    assert "declarations_for_files" not in round_trips
+    assert "target_name_candidates" not in round_trips
+    assert len(round_trips) <= exports + 5
+    # 20 import rows x 70 exports is 1400 naive checks per scan; the inverted
+    # map only tests rows whose module can reach the declaration's file.
+    assert len(import_checks) < exports * 20 // 4
 
 
 def test_find_references_follows_a_renaming_two_hop_barrel_alias(tmp_path: Path) -> None:

@@ -19,6 +19,24 @@ MIN_CONTEXT_LINES: Final = 0
 MAX_CONTEXT_LINES: Final = 50
 
 
+class PatchEncodingError(ValueError):
+    """A hunk holds bytes that are not UTF-8, so patch *text* cannot carry them exactly."""
+
+
+def _split_lines(data: bytes) -> list[bytes]:
+    """Split on ``\\n`` only, keeping terminators, as ``git apply`` counts lines.
+
+    ``bytes.splitlines`` also breaks on a lone ``\\r`` (and form-feed-like
+    separators), which would put a ``\\ No newline at end of file`` marker in
+    the middle of a file that Git sees as one line.
+    """
+    lines = data.split(b"\n")
+    kept = [line + b"\n" for line in lines[:-1]]
+    if lines[-1]:
+        kept.append(lines[-1])
+    return kept
+
+
 class ByteEdit(NamedTuple):
     """One replacement of the half-open byte span [start, end) in one file."""
 
@@ -112,6 +130,7 @@ def render_unified_diff(
     Works purely on bytes, so CRLF terminators and a leading byte-order mark
     survive untouched. Returns None when the byte strings are identical, so
     callers render one diff per changed file and concatenate the results.
+    Raises `PatchEncodingError` when a hunk holds non-UTF-8 bytes.
     """
     if not MIN_CONTEXT_LINES <= context_lines <= MAX_CONTEXT_LINES:
         raise ValueError(
@@ -119,8 +138,8 @@ def render_unified_diff(
         )
     if original == edited:
         return None
-    original_lines = original.splitlines(keepends=True)
-    edited_lines = edited.splitlines(keepends=True)
+    original_lines = _split_lines(original)
+    edited_lines = _split_lines(edited)
     matcher = difflib.SequenceMatcher(a=original_lines, b=edited_lines, autojunk=True)
     old_path = _quote_git_path("a", path)
     new_path = _quote_git_path("b", path)
@@ -144,4 +163,11 @@ def render_unified_diff(
                 _append_lines(out, b"-", original_lines[i1:i2])
             if tag in ("replace", "insert"):
                 _append_lines(out, b"+", edited_lines[j1:j2])
-    return b"".join(out).decode("utf-8", errors="replace")
+    try:
+        return b"".join(out).decode("utf-8")
+    except UnicodeDecodeError as error:
+        # Replacing the bad bytes would make a patch that reads fine and fails
+        # (or worse, applies) against different content.
+        raise PatchEncodingError(
+            f"{path} has non-UTF-8 bytes inside a changed hunk; no exact text patch exists"
+        ) from error

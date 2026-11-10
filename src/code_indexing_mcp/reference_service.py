@@ -5,13 +5,14 @@ from __future__ import annotations
 import ast
 import base64
 import binascii
+import functools
 import hashlib
 import json
 import re
 import threading
 from collections import OrderedDict, deque
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal, NamedTuple, TypedDict, cast
 
@@ -26,6 +27,7 @@ from .language_rules import (
 from .models import (
     MAX_FILE_BYTES_CEILING,
     REFERENCE_SCHEMA_VERSION,
+    ChunkPreview,
     CompletenessReport,
     DeadCodeFinding,
     DeadCodeReport,
@@ -57,10 +59,12 @@ from .patching import (
     MAX_CONTEXT_LINES,
     MIN_CONTEXT_LINES,
     ByteEdit,
+    PatchEncodingError,
     apply_edits,
     render_unified_diff,
 )
 from .python_bindings import PythonBindings
+from .search import _outline_items
 from .source_io import SourceReadError, read_source
 from .storage import LanceStore, PartitionRef, ReferenceRecord
 
@@ -88,6 +92,22 @@ _MAX_REEXPORT_DEPTH: Final = 4
 _COVERAGE_GAP_CODES: Final = frozenset({"unsupported_language", "parse_error", "stale_file"})
 
 _BOM: Final = b"\xef\xbb\xbf"
+
+# `_edit_span` for a declaration whose body repeats its name: the declared name
+# follows a declaration keyword or precedes a parameter list.
+_DECLARATION_KEYWORD_BEFORE: Final = re.compile(
+    rb"(?<![\w$])(?:def|class|function|fn|func|fun|interface|struct|enum|trait|type|"
+    rb"object|module|const|let|var|val|record|namespace)\s+(?:\*\s*)?\Z"
+)
+# Languages where a bare name never reaches a type's member: a member needs an
+# explicit receiver (`self.x`, `this.x`, `s.x`, `Self::x`), unlike Java, C#,
+# Kotlin or Swift, where `x()` inside a method resolves to `this.x()`.
+_NO_IMPLICIT_RECEIVER: Final = frozenset(
+    {"python", "javascript", "typescript", "tsx", "go", "rust", "lua", "zig"}
+)
+_MEMBER_KINDS: Final = frozenset({"method", "property", "constructor"})
+_PROPERTY_ACCESSORS: Final = ("setter", "getter", "deleter")
+_PARAMETER_LIST_AFTER: Final = re.compile(rb"\s*[(<]")
 
 # D1's guard before a symbol is trusted inside a raw `LIKE`/`IN` `where`
 # fragment: identifier characters only (Unicode letters/digits and
@@ -175,6 +195,165 @@ class _ReferenceContext(NamedTuple):
     imports_by_file: dict[str, list[ReferenceRecord]]
     reexport_rows_by_path: dict[str, list[ReferenceRecord]]
     coverage_hashes: dict[str, str]
+    # Import rows keyed by every file path their module could resolve to,
+    # directly or through a chain of barrel re-exports (a superset: names and
+    # depth are ignored). `_import_targets_symbol`/`_reexport_targets_symbol`
+    # can only succeed for a declaration's own path if it is a key here, so a
+    # query tests just those rows instead of every import in the project.
+    import_rows_by_target: dict[str, list[ReferenceRecord]]
+    # Optional in-memory declaration rows for the same pinned snapshot, when a
+    # caller has already loaded them all (`dead_code_report`): the per-query
+    # `declarations_for_files`/`target_name_candidates` fetches are then served
+    # from these instead of one storage round trip each.
+    declarations_by_file: dict[str, list[ReferenceRecord]] | None = None
+    declarations_by_name: dict[str | None, list[ReferenceRecord]] | None = None
+
+
+@dataclass
+class _SourceCaches:
+    """Source bytes, digests and parsed Python bindings shared across queries.
+
+    One `find_references` call owns a private set; `dead_code_report` and an
+    impact traversal share one across every declaration they classify, so a
+    file is read, hashed and parsed once rather than once per declaration.
+    """
+
+    sources: dict[str, tuple[bytes, int]] = field(default_factory=dict)
+    digests: dict[str, str] = field(default_factory=dict)
+    python_bindings: dict[str, PythonBindings] = field(default_factory=dict)
+
+    # Retained parse trees and sources are the memory cost of sharing; past
+    # these bounds the caches restart empty (correctness never depends on a hit).
+    _MAX_SOURCE_BYTES = 128 * 1024 * 1024
+    _MAX_BINDINGS = 256
+
+    def trim(self) -> None:
+        if len(self.python_bindings) > self._MAX_BINDINGS:
+            self.python_bindings.clear()
+        if sum(len(entry[0]) for entry in self.sources.values()) > self._MAX_SOURCE_BYTES:
+            self.sources.clear()
+            self.digests.clear()
+
+
+@functools.lru_cache(maxsize=512)
+def _module_is_indexed(known_paths: frozenset[str], tail: str) -> bool:
+    """Whether some indexed file could be the module spelled `tail` (a `/`-joined path).
+
+    A file qualifies when its path, minus extension and a trailing
+    `__init__`/`index`, ends with `tail` on a path-segment boundary. Deliberately
+    loose (any prefix directory): it answers "could this be project code",
+    so a layout the import resolver misreads still counts as project code.
+    """
+    for path in known_paths:
+        stem = path.rsplit(".", 1)[0] if "." in path.rsplit("/", 1)[-1] else path
+        for suffix in ("/__init__", "/index"):
+            stem = stem.removesuffix(suffix)
+        if stem == tail or stem.endswith("/" + tail):
+            return True
+    return False
+
+
+def _is_external_import(item: ReferenceRecord, known_paths: frozenset[str]) -> bool:
+    """A Python/JS/TS import of a bare module name that matches no indexed file.
+
+    `from subprocess import run` or `import json` cannot bind a project
+    declaration; it names a library. Relative and rooted specifiers are never
+    external here (the resolver, not this test, decides those), and neither is
+    a module that any indexed path could be.
+    """
+    module = item["module_path"]
+    if not module or item["language"] not in {"python", "javascript", "typescript", "tsx"}:
+        return False
+    if module.startswith((".", "/", "@/", "~", "#")):
+        return False
+    tail = "/".join(module.split(".")) if item["language"] == "python" else module
+    imported = item["imported_name"]
+    if (
+        item["language"] == "python"
+        and imported
+        and imported != "*"
+        # `from pkg import mod` may name the submodule `pkg/mod.py` of a
+        # namespace package that has no `pkg/__init__.py` of its own.
+        and _module_is_indexed(known_paths, f"{tail}/{imported}")
+    ):
+        return False
+    return not _module_is_indexed(known_paths, tail)
+
+
+_TYPE_KINDS: Final = frozenset(
+    {"class", "struct", "interface", "enum", "object", "record", "module", "annotation"}
+)
+
+
+_CSHARP_TYPE_KEYWORD: Final = re.compile(rb"\b(?:class|struct|interface|record)\b")
+
+
+def _csharp_type_header(source: bytes, start: int, name: str) -> tuple[bool, int] | None:
+    """`(is_partial, generic_arity)` read from a C# type declaration's header text.
+
+    The header runs from the declaration's start byte to its first `{` or `;`.
+    `partial` must precede the type keyword; the arity is the number of
+    top-level type parameters spelled after the type's own name. Comments and
+    attribute arguments are not parsed (a `partial` inside an attribute
+    argument before the keyword would be misread), so callers treat the
+    answer as evidence, not proof, and only use it to *withhold* exactness.
+    """
+    chunk = source[start : start + 2048]
+    ends = [index for index in (chunk.find(b"{"), chunk.find(b";")) if index >= 0]
+    header = chunk[: min(ends)] if ends else chunk
+    keyword = _CSHARP_TYPE_KEYWORD.search(header)
+    if keyword is None:
+        return None
+    named = re.search(rb"\b" + re.escape(name.encode()) + rb"\b\s*(<)?", header[keyword.end() :])
+    if named is None:
+        return None
+    arity = 0
+    if named.group(1):
+        depth = 1
+        arity = 1
+        for byte in header[keyword.end() + named.end() :]:
+            if byte == 0x3C:  # <
+                depth += 1
+            elif byte == 0x3E:  # >
+                depth -= 1
+                if depth == 0:
+                    break
+            elif byte == 0x2C and depth == 1:  # ,
+                arity += 1
+    is_partial = re.search(rb"\bpartial\b", header[: keyword.start()]) is not None
+    return is_partial, arity
+
+
+@dataclass
+class _OwnerScopes:
+    """What `self`/`this` resolution needs to know about enclosing types (REF-2).
+
+    `types_by_file` maps a file id to the qualified names of the type-like
+    declarations in it. `owner_is_unique` lazily answers whether the selected
+    declaration's owner type is declared exactly once project-wide, the proof a
+    cross-file member call needs when the calling file merely extends the type
+    (a Rust `impl`, a Swift/Kotlin extension).
+    """
+
+    types_by_file: dict[str, frozenset[str]]
+    unique_probe: Callable[[], bool]
+    _unique: bool | None = None
+    # C#: whether every declaration of the owner type name in a namespace is a
+    # part of one type (`csharp_parts_probe(namespace)`); None never proves it.
+    csharp_parts_probe: Callable[[str], bool] | None = None
+    _csharp_parts: dict[str, bool] = field(default_factory=dict)
+
+    def owner_is_unique(self) -> bool:
+        if self._unique is None:
+            self._unique = self.unique_probe()
+        return self._unique
+
+    def csharp_owner_is_one_type(self, namespace: str) -> bool:
+        if self.csharp_parts_probe is None:
+            return False
+        if namespace not in self._csharp_parts:
+            self._csharp_parts[namespace] = self.csharp_parts_probe(namespace)
+        return self._csharp_parts[namespace]
 
 
 class _ReferenceQuery(NamedTuple):
@@ -362,6 +541,18 @@ class ReferenceService:
             record_kinds=("declaration",),
             partition_id=partition.partition_id,
         )
+        # Every declaration is already in memory, so each per-declaration query
+        # below answers its declaration lookups from here instead of two more
+        # storage round trips apiece.
+        declarations_by_file: dict[str, list[ReferenceRecord]] = {}
+        declarations_by_symbol: dict[str | None, list[ReferenceRecord]] = {}
+        for row in declarations:
+            declarations_by_file.setdefault(row["file_id"], []).append(row)
+            declarations_by_symbol.setdefault(row["target_name"], []).append(row)
+        context = context._replace(
+            declarations_by_file=declarations_by_file, declarations_by_name=declarations_by_symbol
+        )
+        caches = _SourceCaches()
         exports_by_file: dict[str, list[ReferenceRecord]] = {}
         for row in context.export_rows:
             # C# export rows carry a namespace rather than a re-export module.
@@ -412,9 +603,9 @@ class ReferenceService:
         # Check even files with no previous uses: a stale file may have ADDED a
         # use, which cannot be discovered by validating candidate hits alone.
         for row in context.coverage_rows:
-            source, bom = self._file_bytes(root, row["path"], {})
+            source, bom = self._file_bytes(root, row["path"], caches.sources)
             if not row["content_hash"] or not self._matches_coverage(
-                row["path"], {row["path"]: row["content_hash"]}, source, bom, {}
+                row["path"], {row["path"]: row["content_hash"]}, source, bom, caches.digests
             ):
                 limitations.append(
                     ReferenceLimitation(
@@ -424,6 +615,7 @@ class ReferenceService:
                         "the structural snapshot.",
                     )
                 )
+        caches.trim()
         review: list[DeadCodeFinding] = []
         for row in exported:
             selected = SelectedDeclaration(
@@ -449,7 +641,9 @@ class ReferenceService:
                 partition=partition,
                 root=root,
                 backfill=backfill,
+                caches=caches,
             )
+            caches.trim()
             limitations.extend(query.response.limitations)
             hits = [
                 hit
@@ -569,6 +763,7 @@ class ReferenceService:
         snapshot_version: int | None = None,
         preselected: SelectedDeclaration | None = None,
         context: _ReferenceContext | None = None,
+        caches: _SourceCaches | None = None,
     ) -> _ReferenceQuery:
         """`find_references`'s body, also returning everything it computed along the way.
 
@@ -648,6 +843,7 @@ class ReferenceService:
                 selected.project_id, partition_id=partition.partition_id
             )
         offset = 0
+        latest_version = version
         if payload is not None:
             if payload["project_id"] != selected.project_id or payload["path"] != selected.path:
                 raise CodeIndexingError(
@@ -709,7 +905,8 @@ class ReferenceService:
                 ErrorCode.STALE_CURSOR, "Reference cursor snapshot expired"
             ) from error
         root = root or self._project_root(selected.project_id)
-        sources: dict[str, tuple[bytes, int]] = {}
+        caches = caches or _SourceCaches()
+        sources = caches.sources
         assert context is not None
         hits, limitations, declarations = self._hits_and_limitations(
             selected,
@@ -721,7 +918,10 @@ class ReferenceService:
             version,
             partition_id=partition.partition_id,
             context=context,
+            caches=caches,
         )
+        if payload is not None and snapshot_version is None and version != latest_version:
+            limitations.append(self._superseded_snapshot_limitation(version, latest_version))
         page = hits[offset : offset + limit]
         next_cursor = None
         if offset + len(page) < len(hits):
@@ -765,6 +965,18 @@ class ReferenceService:
             context,
         )
 
+    @staticmethod
+    def _superseded_snapshot_limitation(served: int, latest: int) -> ReferenceLimitation:
+        """Note that a cursor keeps serving its pinned snapshot after a re-index."""
+        return ReferenceLimitation(
+            code="superseded_snapshot",
+            explanation=(
+                f"This page continues snapshot {served}; the index has since been rebuilt "
+                f"(current snapshot {latest}). Results and offsets describe the older "
+                "snapshot. Re-run the query without a cursor for current results."
+            ),
+        )
+
     def _load_reference_context(
         self, project_id: str, *, partition_id: str, version: int
     ) -> _ReferenceContext:
@@ -800,6 +1012,8 @@ class ReferenceService:
         # build is not a superset of a full rebuild, it is exactly equal to
         # one for every field but `receiver_names` (left empty here).
         module_index = self._build_module_index(coverage_rows + export_rows, None)
+        known_paths = self._known_paths(coverage_rows)
+        reexport_rows_by_path = self._reexport_rows_by_path(import_export_rows)
         return _ReferenceContext(
             project_id=project_id,
             partition_id=partition_id,
@@ -807,14 +1021,84 @@ class ReferenceService:
             coverage_rows=coverage_rows,
             import_rows=import_rows,
             export_rows=export_rows,
-            known_paths=self._known_paths(coverage_rows),
+            known_paths=known_paths,
             module_index=module_index,
             imports_by_file=self._imports_by_file(import_export_rows),
-            reexport_rows_by_path=self._reexport_rows_by_path(import_export_rows),
+            reexport_rows_by_path=reexport_rows_by_path,
             coverage_hashes={
                 row["path"]: row["content_hash"] for row in coverage_rows if row["content_hash"]
             },
+            import_rows_by_target=self._import_rows_by_target(
+                import_rows, reexport_rows_by_path, known_paths, module_index
+            ),
         )
+
+    def _import_rows_by_target(
+        self,
+        import_rows: list[ReferenceRecord],
+        reexport_rows_by_path: dict[str, list[ReferenceRecord]],
+        known_paths: frozenset[str],
+        module_index: _ModuleIndex,
+    ) -> dict[str, list[ReferenceRecord]]:
+        """Invert the import rows: file path -> rows whose module could reach it.
+
+        Resolves each row's module once (through `_module_candidates`, the same
+        resolver `_import_targets_symbol` uses) and follows barrel files through
+        every import/export row they hold, ignoring bound names and the depth
+        cap. That makes it a superset of what `_import_targets_symbol` or
+        `_reexport_targets_symbol` can prove, which is all a prefilter needs;
+        the real predicates still decide.
+        """
+        candidates_cache: dict[tuple[str, str, str], list[str]] = {}
+
+        def candidates(row: ReferenceRecord) -> list[str]:
+            module_path = row["module_path"]
+            if module_path is None:
+                return []
+            key = (row["path"], row["language"], module_path)
+            found = candidates_cache.get(key)
+            if found is None:
+                modules = [module_path]
+                # `from pkg import mod` may bind the submodule file `pkg/mod.py`.
+                submodule = self._submodule_module_path(row)
+                if submodule is not None:
+                    modules.append(submodule)
+                found = [
+                    str(candidate)
+                    for module in modules
+                    for candidate in self._module_candidates(
+                        row["path"], row["language"], module, known_paths, module_index
+                    )
+                ]
+                candidates_cache[key] = found
+            return found
+
+        reach_cache: dict[str, frozenset[str]] = {}
+
+        def reach(start: str) -> frozenset[str]:
+            known = reach_cache.get(start)
+            if known is not None:
+                return known
+            seen = {start}
+            stack = [start]
+            while stack:
+                for hop in reexport_rows_by_path.get(stack.pop(), ()):
+                    for nxt in candidates(hop):
+                        if nxt not in seen:
+                            seen.add(nxt)
+                            stack.append(nxt)
+            result = frozenset(seen)
+            reach_cache[start] = result
+            return result
+
+        by_target: dict[str, list[ReferenceRecord]] = {}
+        for row in import_rows:
+            reachable: set[str] = set()
+            for start in candidates(row):
+                reachable |= reach(start)
+            for path in reachable:
+                by_target.setdefault(path, []).append(row)
+        return by_target
 
     @staticmethod
     def _candidate_condition(selected: SelectedDeclaration, spellings: set[str]) -> str | None:
@@ -844,6 +1128,12 @@ class ReferenceService:
             f"target_name LIKE {quoted_tail}",
             f"written_name LIKE {quoted_tail}",
         ]
+        # A Python property's `@<name>.setter` decorators spell the property
+        # by its head segment (`_is_accessor_decorator`).
+        accessors = ", ".join(
+            _sql_literal(f"{symbol}.{accessor}") for accessor in _PROPERTY_ACCESSORS
+        )
+        terms.append(f"written_name IN ({accessors})")
         if spellings:
             # `IN` values are compared for exact equality, not pattern-matched
             # (unlike the `LIKE` terms above), so an arbitrary spelling is
@@ -900,9 +1190,9 @@ class ReferenceService:
         """
         reexport_rows = context.reexport_rows_by_path
         spellings: set[str] = set()
-        for item in context.import_rows:
+        for item in context.import_rows_by_target.get(str(PurePosixPath(selected.path)), ()):
             binding = item["alias"] or item["written_name"] or item["imported_name"]
-            if binding is None:
+            if binding is None or self._is_member_namespace(item):
                 continue
             if self._import_targets(
                 item, selected, context.known_paths, context.module_index
@@ -1115,6 +1405,15 @@ class ReferenceService:
                 }
             )
 
+        if payload is not None:
+            latest_version = self.store.reference_version(
+                selected.project_id, partition_id=partition.partition_id
+            )
+            if version != latest_version:
+                limitations = [
+                    *limitations,
+                    self._superseded_snapshot_limitation(version, latest_version),
+                ]
         unique_limitations = {
             (item.code, item.explanation, item.path): item for item in limitations
         }
@@ -1211,9 +1510,17 @@ class ReferenceService:
         each node's own fetch narrows to `_candidate_records`'s SQL-pushed-down
         superset (D1/D2) rather than the whole reference table.
         """
-        context = self._load_reference_context(
-            selected.project_id, partition_id=partition.partition_id, version=version
-        )
+        try:
+            context = self._load_reference_context(
+                selected.project_id, partition_id=partition.partition_id, version=version
+            )
+        except (FileNotFoundError, ValueError) as error:
+            # A cursor's pinned snapshot that has since been cleaned up, as
+            # `find_references` reports it, not a raw storage error.
+            raise CodeIndexingError(
+                ErrorCode.STALE_CURSOR, "Reference cursor snapshot expired"
+            ) from error
+        caches = _SourceCaches()
         first_query = self._find_references_with_records(
             selector,
             kinds=kinds,
@@ -1224,6 +1531,7 @@ class ReferenceService:
             snapshot_version=version,
             preselected=selected,
             context=context,
+            caches=caches,
         )
         root = first_query.root
 
@@ -1258,8 +1566,10 @@ class ReferenceService:
                         snapshot_version=version,
                         preselected=source,
                         context=context,
+                        caches=caches,
                     )
                 )
+                caches.trim()
                 limitations.extend(query.response.limitations)
                 rows = {
                     row["reference_id"]: row
@@ -1402,6 +1712,7 @@ class ReferenceService:
         *,
         partition_id: str,
         context: _ReferenceContext,
+        caches: _SourceCaches | None = None,
     ) -> tuple[list[ReferenceHit], list[ReferenceLimitation], list[ReferenceRecord]]:
         """Classify every reference row into a sorted, unsliced hit list.
 
@@ -1426,16 +1737,40 @@ class ReferenceService:
         # below -- narrowing to this set, rather than every known file,
         # is what makes this a real pushdown instead of a redundant fetch of
         # data already in `records`.
-        reference_file_ids = {
-            row["file_id"] for row in records if row["record_kind"] == "reference"
-        }
-        declarations = self.store.declarations_for_files(
-            selected.project_id,
-            reference_file_ids,
-            version=version,
-            schema_version=REFERENCE_SCHEMA_VERSION,
-            partition_id=partition_id,
-        )
+        #
+        # `records` also carries every import and export row in the project
+        # (the context), so "files with a reference-kind row" is nearly every
+        # file. Only a row that can pass `_may_refer` below is ever classified,
+        # and `_may_refer` reads no declaration (nor `receiver_names`), so it
+        # can be decided first and its files alone are fetched.
+        eligible_rows = [
+            row
+            for row in records
+            if row["record_kind"] == "reference"
+            and self._may_refer(
+                row,
+                selected,
+                context.imports_by_file,
+                context.reexport_rows_by_path,
+                context.known_paths,
+                context.module_index,
+            )
+        ]
+        reference_file_ids = {row["file_id"] for row in eligible_rows}
+        if context.declarations_by_file is not None:
+            declarations = [
+                row
+                for file_id in sorted(reference_file_ids)
+                for row in context.declarations_by_file.get(file_id, ())
+            ]
+        else:
+            declarations = self.store.declarations_for_files(
+                selected.project_id,
+                reference_file_ids,
+                version=version,
+                schema_version=REFERENCE_SCHEMA_VERSION,
+                partition_id=partition_id,
+            )
         # Precomputed once per query instead of scanned per row (E2):
         # `_lexical_declaration` only ever wants declarations sharing a
         # row's own `file_id` and bare target name. Filtering `declarations`
@@ -1449,14 +1784,17 @@ class ReferenceService:
         # "exactly one candidate anywhere" from "several" -- fetched
         # directly instead of grouping the whole declaration table by name
         # only to read one bucket out of it.
-        target_candidates = self.store.target_name_candidates(
-            selected.project_id,
-            selected.symbol,
-            record_kind="declaration",
-            version=version,
-            schema_version=REFERENCE_SCHEMA_VERSION,
-            partition_id=partition_id,
-        )
+        if context.declarations_by_name is not None:
+            target_candidates = context.declarations_by_name.get(selected.symbol, [])
+        else:
+            target_candidates = self.store.target_name_candidates(
+                selected.project_id,
+                selected.symbol,
+                record_kind="declaration",
+                version=version,
+                schema_version=REFERENCE_SCHEMA_VERSION,
+                partition_id=partition_id,
+            )
         imports = context.imports_by_file
         reexport_rows = context.reexport_rows_by_path
         known_paths = context.known_paths
@@ -1470,6 +1808,93 @@ class ReferenceService:
             for row in declarations
             if row["kind"] == "class" and (scope := row["source_qualified_symbol"])
         }
+        types_by_file: dict[str, set[str]] = {}
+        for declaration in declarations:
+            if (declaration["kind"] or "").removesuffix("_part") in _TYPE_KINDS and declaration[
+                "source_qualified_symbol"
+            ]:
+                types_by_file.setdefault(declaration["file_id"], set()).add(
+                    declaration["source_qualified_symbol"]
+                )
+        selected_owner = selected.qualified_symbol.rpartition(".")[0]
+        selected_is_member = selected.kind.removesuffix("_part") in _MEMBER_KINDS
+
+        def owner_declared_once() -> bool:
+            if not selected_owner:
+                return False
+            tail = selected_owner.rsplit(".", 1)[-1]
+            if context.declarations_by_name is not None:
+                rows = context.declarations_by_name.get(tail, [])
+            else:
+                rows = self.store.target_name_candidates(
+                    selected.project_id,
+                    tail,
+                    record_kind="declaration",
+                    version=version,
+                    schema_version=REFERENCE_SCHEMA_VERSION,
+                    partition_id=partition_id,
+                )
+            return (
+                sum(
+                    1
+                    for row in rows
+                    if row["source_qualified_symbol"] == selected_owner
+                    and (row["kind"] or "").removesuffix("_part") in _TYPE_KINDS
+                )
+                == 1
+            )
+
+        def csharp_owner_is_one_type(namespace: str) -> bool:
+            """Whether every same-namespace declaration of the owner is one `partial` type.
+
+            Declaration rows carry no modifiers or type parameters, so the
+            evidence is the declaration's own header text read from disk
+            (checked against the extraction hash): each declaration of the
+            owner's qualified name in a file of `namespace` must say `partial`
+            and spell the same generic arity. Anything unreadable, stale or
+            unparseable answers False.
+            """
+            if not selected_owner or module_index.namespace_by_path.get(selected.path) != namespace:
+                return False
+            tail = selected_owner.rsplit(".", 1)[-1]
+            if context.declarations_by_name is not None:
+                rows = context.declarations_by_name.get(tail, [])
+            else:
+                rows = self.store.target_name_candidates(
+                    selected.project_id,
+                    tail,
+                    record_kind="declaration",
+                    version=version,
+                    schema_version=REFERENCE_SCHEMA_VERSION,
+                    partition_id=partition_id,
+                )
+            arities: set[int] = set()
+            found = 0
+            for row in rows:
+                if (
+                    row["language"] != "csharp"
+                    or row["source_qualified_symbol"] != selected_owner
+                    or (row["kind"] or "").removesuffix("_part") not in _TYPE_KINDS
+                    or module_index.namespace_by_path.get(row["path"]) != namespace
+                ):
+                    continue
+                source, bom = self._file_bytes(root, row["path"], sources)
+                if not self._matches_coverage(
+                    row["path"], context.coverage_hashes, source, bom, digests
+                ):
+                    return False
+                header = _csharp_type_header(source, row["start_byte"] or 0, tail)
+                if header is None or not header[0]:
+                    return False
+                arities.add(header[1])
+                found += 1
+            return found > 0 and len(arities) == 1
+
+        owner_scopes = _OwnerScopes(
+            types_by_file={key: frozenset(value) for key, value in types_by_file.items()},
+            unique_probe=owner_declared_once,
+            csharp_parts_probe=csharp_owner_is_one_type,
+        )
         hits: list[ReferenceHit] = []
         limitations: list[ReferenceLimitation] = self._coverage_limitations(records, backfill)
         # Serve-time staleness gate: coverage rows carry the content hash the
@@ -1479,15 +1904,36 @@ class ReferenceService:
         # would otherwise have those old offsets served against text they
         # never described -- a wrong-edit hazard for callers that trust them.
         coverage_hashes = context.coverage_hashes
-        digests: dict[str, str] = {}
+        caches = caches or _SourceCaches()
+        digests = caches.digests
         stale_paths: set[str] = set()
-        python_bindings: dict[str, PythonBindings] = {}
-        for row in records:
-            if row["record_kind"] != "reference" or not self._may_refer(
-                row, selected, imports, reexport_rows, known_paths, module_index
+        python_bindings = caches.python_bindings
+
+        def package_bindings(path: str) -> PythonBindings | None:
+            package_source, package_bom = self._file_bytes(root, path, sources)
+            if not self._matches_coverage(
+                path, coverage_hashes, package_source, package_bom, digests
             ):
-                continue
+                return None
+            found = python_bindings.get(path)
+            if found is None:
+                found = python_bindings[path] = PythonBindings(package_source)
+            return found
+
+        for row in eligible_rows:
             if kinds is not None and row["kind"] not in kinds:
+                continue
+            if (
+                row["receiver_text"] is None
+                and row["language"] in _NO_IMPLICIT_RECEIVER
+                and selected_is_member
+                and row["source_qualified_symbol"] != selected_owner
+                and not self._is_accessor_decorator(row, selected)
+            ):
+                # A bare name can never reach a member in these languages (REF-9):
+                # the global `fetch(url)` inside `Api.fetch`, the builtin `close`
+                # beside a `close` method. Class-body code (source == owner) is
+                # the one place a bare name does see the class scope.
                 continue
             lexical = self._lexical_declaration(row, declarations_by_file_target, class_scopes)
             if (
@@ -1504,6 +1950,7 @@ class ReferenceService:
                 reexport_rows,
                 known_paths,
                 module_index,
+                owner_scopes,
             )
             if reason in _LIMITATION_REASONS or (
                 reason in _CONDITIONAL_LIMITATION_REASONS and resolution != "exact"
@@ -1521,7 +1968,15 @@ class ReferenceService:
                     bindings = PythonBindings(source)
                     python_bindings[row["path"]] = bindings
                 verdict = self._python_binding_verdict(
-                    row, selected, bindings, imports, reexport_rows, known_paths, module_index
+                    row,
+                    selected,
+                    bindings,
+                    imports,
+                    reexport_rows,
+                    known_paths,
+                    module_index,
+                    owner_scopes,
+                    package_bindings,
                 )
                 if verdict is False:
                     continue
@@ -1598,14 +2053,35 @@ class ReferenceService:
         reexports: dict[str, list[ReferenceRecord]],
         known_paths: frozenset[str],
         module_index: _ModuleIndex | None,
+        owner_scopes: _OwnerScopes | None = None,
+        package_bindings: Callable[[str], PythonBindings | None] | None = None,
     ) -> bool | None:
         # Import/export edges name the exported object, not the consumer binding.
-        if row["kind"] == "export":
+        if row["kind"] == "export" or self._is_accessor_decorator(row, selected):
             return True
         receiver = row["receiver_text"]
-        owner_receiver = receiver in {"self", "cls"} and self._same_owner(row, selected)
+        owner_receiver = receiver in {"self", "cls"} and self._same_owner(
+            row, selected, owner_scopes, module_index
+        )
         name = receiver or row["written_name"] or ""
-        nodes, unsupported = bindings.lookup(row["start_byte"] or 0, name)
+        position = row["start_byte"] or 0
+        if receiver is not None and "." in receiver:
+            # `import pkg.mod` binds `pkg`, not `pkg.mod`: look up the first
+            # segment. Several plain `import pkg...` statements share that one
+            # binding (the same package object), so the statement spelling the
+            # whole receiver is the one that proves it; any other binding of
+            # `pkg` (assignment, parameter, `from x import pkg`) is not proof.
+            first = receiver.split(".")[0]
+            nodes, unsupported = bindings.lookup(position, first)
+            if nodes and all(
+                isinstance(node, ast.alias)
+                and node.asname is None
+                and node.name.split(".")[0] == first
+                for node in nodes
+            ):
+                nodes = [node for node in nodes if cast(ast.alias, node).name == receiver]
+        else:
+            nodes, unsupported = bindings.lookup(position, name)
         if row["kind"] == "import":
             nodes = [
                 node
@@ -1630,13 +2106,24 @@ class ReferenceService:
             for item in imports.get(row["file_id"], [])
             if bindings.start(node) <= (item["start_byte"] or 0) < bindings.end(node)
         ]
-        return any(
+        if any(
             self._import_targets(item, selected, known_paths, module_index)
             or self._reexport_targets_symbol(
                 item, selected.symbol, selected.path, reexports, known_paths, module_index
             )
             for item in source_imports
-        )
+        ):
+            return True
+        for item in source_imports:
+            if self._member_tail_is(row, selected.symbol) and self._submodule_targets(
+                item, selected.path, known_paths, module_index
+            ):
+                # The package's own `mod` (or an unreadable `__init__.py`) may
+                # stand in for the submodule: cannot be proven either way.
+                if self._submodule_shadowed(item, package_bindings, known_paths, module_index):
+                    return None
+                return True
+        return False
 
     def analyze_refactor(
         self,
@@ -1701,10 +2188,15 @@ class ReferenceService:
         if isinstance(operation, RenameOperation):
             self._validate_rename(response.selected, operation)
 
-        declaration_finding: RefactorFinding | None = None
+        declaration_findings: list[RefactorFinding] = []
         override_findings: list[RefactorFinding] = []
+        heritage_limitations: list[ReferenceLimitation] = []
         if isinstance(operation, RenameOperation):
-            declaration_finding, override_findings = self._rename_findings(
+            (
+                declaration_findings,
+                override_findings,
+                heritage_limitations,
+            ) = self._rename_findings(
                 response.selected,
                 records,
                 root,
@@ -1747,23 +2239,25 @@ class ReferenceService:
 
         # A declaration and export row may point at the same identifier. Keep one
         # concrete edit, but never merge findings whose edit location is unknown.
-        if (
-            declaration_finding is not None
-            and declaration_finding.edit_start_byte is not None
-            and declaration_finding.edit_end_byte is not None
-        ):
-            dedupe_key = (
-                declaration_finding.path,
-                declaration_finding.edit_start_byte,
-                declaration_finding.edit_end_byte,
-            )
-            if any(
-                (finding.path, finding.edit_start_byte, finding.edit_end_byte) == dedupe_key
-                for finding in full_must
+        surviving_declarations: list[RefactorFinding] = []
+        for declaration_finding in declaration_findings:
+            if (
+                declaration_finding.edit_start_byte is not None
+                and declaration_finding.edit_end_byte is not None
             ):
-                declaration_finding = None
-            else:
+                dedupe_key = (
+                    declaration_finding.path,
+                    declaration_finding.edit_start_byte,
+                    declaration_finding.edit_end_byte,
+                )
+                if any(
+                    (finding.path, finding.edit_start_byte, finding.edit_end_byte) == dedupe_key
+                    for finding in full_must
+                ):
+                    continue
                 required_edit_spans.add(dedupe_key)
+            surviving_declarations.append(declaration_finding)
+        declaration_findings = surviving_declarations
 
         # Exact edits win over likely edits at the same location. Synthetic
         # override findings are considered before hit-derived likely findings
@@ -1772,10 +2266,9 @@ class ReferenceService:
         full_likely = _dedupe_edit_spans(full_likely, required_edit_spans)
 
         binding_limitations: list[ReferenceLimitation] = []
+        withheld_declarations: list[RefactorFinding] = []
         if isinstance(operation, RenameOperation):
-            candidates = [*full_must]
-            if declaration_finding is not None:
-                candidates.append(declaration_finding)
+            candidates = [*full_must, *declaration_findings]
             collision_paths: set[str] = set()
             unsupported_paths: set[str] = {
                 item.path
@@ -1846,7 +2339,7 @@ class ReferenceService:
                     if collision_paths
                     else ("Binding safety cannot be established; all rename edits are withheld.")
                 )
-                full_review.extend(
+                withheld = [
                     finding.model_copy(
                         update={
                             "resolution": "unresolved",
@@ -1858,9 +2351,19 @@ class ReferenceService:
                         }
                     )
                     for finding in candidates
+                ]
+                # The declaration's review copy is not a hit, so no page filter
+                # would ever list it: it is carried apart and listed (and
+                # counted) once, with the first page.
+                declaration_ids = {finding.reference_id for finding in declaration_findings}
+                full_review.extend(
+                    finding for finding in withheld if finding.reference_id not in declaration_ids
                 )
+                withheld_declarations = [
+                    finding for finding in withheld if finding.reference_id in declaration_ids
+                ]
                 full_must = []
-                declaration_finding = None
+                declaration_findings = []
 
         if paginate:
             page_ids = {hit.reference_id for hit in response.hits}
@@ -1874,15 +2377,15 @@ class ReferenceService:
             review = full_review
             evidence = full_evidence
         if cursor is None:
-            if declaration_finding is not None:
-                must_change = [declaration_finding, *must_change]
+            must_change = [*declaration_findings, *must_change]
+            review = [*withheld_declarations, *review]
             likely_change = [*override_findings, *likely_change]
 
-        limitations = [*response.limitations, *binding_limitations]
+        limitations = [*response.limitations, *heritage_limitations, *binding_limitations]
         counts = RefactorCounts(
-            must_change=len(full_must) + (1 if declaration_finding is not None else 0),
+            must_change=len(full_must) + len(declaration_findings),
             likely_change=len(full_likely) + len(override_findings),
-            review=len(full_review),
+            review=len(full_review) + len(withheld_declarations),
             evidence=len(full_evidence),
         )
         analysis = RefactorAnalysis(
@@ -1897,7 +2400,7 @@ class ReferenceService:
             cursor=response.cursor,
             completeness=self._completeness_report(
                 limitations,
-                full_review,
+                [*full_review, *withheld_declarations],
                 full_likely,
                 override_findings,
             ),
@@ -2003,6 +2506,7 @@ class ReferenceService:
 
         conflicted: list[RefactorFinding] = []
         accepted: dict[str, list[ByteEdit]] = {}
+        accepted_findings: dict[str, list[RefactorFinding]] = {}
         for finding, raw_start, raw_end in sorted(
             candidates, key=lambda item: (item[0].path, item[1], item[2])
         ):
@@ -2053,6 +2557,7 @@ class ReferenceService:
                 )
                 continue
             path_edits.append(verification.edit)
+            accepted_findings.setdefault(finding.path, []).append(finding)
 
         # Stale files the gate had already suppressed carry no findings, so
         # the loop above never saw them. Synthesize one conflicted entry per
@@ -2100,7 +2605,21 @@ class ReferenceService:
             original = (_BOM + source) if bom else source
             file_edits = accepted[path]
             edited = apply_edits(original, file_edits)
-            diff = render_unified_diff(path, original, edited, context_lines)
+            try:
+                diff = render_unified_diff(path, original, edited, context_lines)
+            except PatchEncodingError:
+                # Text cannot carry these bytes exactly: leave the file out of
+                # the patch and say so, instead of emitting a mangled hunk.
+                conflicted.extend(
+                    self._patch_conflict(
+                        finding,
+                        "The edited hunk holds bytes that are not valid UTF-8, which a text "
+                        "patch cannot carry exactly, so the file was left out of the patch.",
+                        reason_code="non_utf8_content",
+                    )
+                    for finding in accepted_findings[path]
+                )
+                continue
             if diff is not None:
                 patch_parts.append(diff)
             for edit in file_edits:
@@ -2233,7 +2752,7 @@ class ReferenceService:
         snapshot_version: int,
         partition_id: str,
         context: _ReferenceContext,
-    ) -> tuple[RefactorFinding, list[RefactorFinding]]:
+    ) -> tuple[list[RefactorFinding], list[RefactorFinding], list[ReferenceLimitation]]:
         declarations = self.store.declaration_shapes(
             selected.project_id,
             selected.qualified_symbol,
@@ -2241,46 +2760,75 @@ class ReferenceService:
             schema_version=REFERENCE_SCHEMA_VERSION,
             partition_id=partition_id,
         )
-        declaration = next(
+        # Every declaration of this qualified name in the selected file is one
+        # logical symbol the callers cannot tell apart: overloads, a property's
+        # getter and setter, the branches of `if X: def f() else: def f()`.
+        # Renaming only one would leave the others (and so the import or the
+        # implementation) under the old name while the patch read as complete,
+        # so each gets its own finding (REF-4).
+        same_file = sorted(
             (row for row in declarations if row["file_id"] == selected.file_id),
-            None,
+            key=lambda row: (row["start_byte"] or 0, row["end_byte"] or 0),
         )
-        start_byte, end_byte = 0, 0
-        edit_start, edit_end = None, None
-        if declaration is not None:
-            source, bom = self._file_bytes(root, selected.path, sources)
-            start_byte = (declaration["start_byte"] or 0) + bom
-            end_byte = (declaration["end_byte"] or 0) + bom
-            edit_start, edit_end = self._edit_span(
-                source,
-                declaration["start_byte"] or 0,
-                declaration["end_byte"] or 0,
-                selected.symbol,
-                bom,
+        findings: list[RefactorFinding] = []
+        if not same_file:
+            same_file_rows: list[ReferenceRecord | None] = [None]
+        else:
+            same_file_rows = [*same_file]
+        many = len(same_file_rows) > 1
+        for declaration in same_file_rows:
+            start_byte, end_byte = 0, 0
+            edit_start, edit_end = None, None
+            start_line, end_line = selected.start_line, selected.end_line
+            if declaration is not None:
+                source, bom = self._file_bytes(root, selected.path, sources)
+                start_byte = (declaration["start_byte"] or 0) + bom
+                end_byte = (declaration["end_byte"] or 0) + bom
+                edit_start, edit_end = self._edit_span(
+                    source,
+                    declaration["start_byte"] or 0,
+                    declaration["end_byte"] or 0,
+                    selected.symbol,
+                    bom,
+                    declaration=True,
+                )
+                if many:
+                    start_line = declaration["start_line"] or start_line
+                    end_line = declaration["end_line"] or end_line
+            findings.append(
+                RefactorFinding(
+                    reference_id=(
+                        f"declaration:{selected.file_id}:{start_byte}"
+                        if many
+                        else f"declaration:{selected.file_id}"
+                    ),
+                    project_id=selected.project_id,
+                    path=selected.path,
+                    language=selected.language,
+                    kind="write",
+                    start_line=start_line,
+                    end_line=end_line,
+                    start_byte=start_byte,
+                    end_byte=end_byte,
+                    snippet=selected.symbol,
+                    resolution="exact",
+                    reason_code="declaration",
+                    explanation=(
+                        "A declaration of the selected name must be renamed; every "
+                        "same-named declaration in the file is renamed together."
+                        if many
+                        else "The selected declaration must be renamed."
+                    ),
+                    written_name=selected.symbol,
+                    edit_required=True,
+                    edit_start_byte=edit_start,
+                    edit_end_byte=edit_end,
+                )
             )
-        finding = RefactorFinding(
-            reference_id=f"declaration:{selected.file_id}",
-            project_id=selected.project_id,
-            path=selected.path,
-            language=selected.language,
-            kind="write",
-            start_line=selected.start_line,
-            end_line=selected.end_line,
-            start_byte=start_byte,
-            end_byte=end_byte,
-            snippet=selected.symbol,
-            resolution="exact",
-            reason_code="declaration",
-            explanation="The selected declaration must be renamed.",
-            written_name=selected.symbol,
-            edit_required=True,
-            edit_start_byte=edit_start,
-            edit_end_byte=edit_end,
-        )
-        overrides = self._override_findings(
+        overrides, heritage_limitations = self._override_findings(
             selected, records, root, sources, snapshot_version, partition_id, context
         )
-        return finding, overrides
+        return findings, overrides, heritage_limitations
 
     def _classify_refactor_hits(
         self,
@@ -2313,6 +2861,22 @@ class ReferenceService:
                     and row is not None
                     and row["imported_name"] == selected.symbol
                 )
+                # `Factory.make()` after `from lib import Factory`: the row's name is
+                # the member, but the renamed declaration is its receiver, so the
+                # receiver spelling is the identifier to edit (REF-3). A receiver
+                # that resolved to the selected declaration by import carries it.
+                receiver = row["receiver_text"] if row is not None else None
+                if not needs_edit and hit.reason_code == "property_accessor_decorator":
+                    needs_edit = True
+                    written = selected.symbol
+                if (
+                    not needs_edit
+                    and receiver
+                    and hit.reason_code == "known_namespace_member"
+                    and receiver.rsplit(".", 1)[-1] == selected.symbol
+                ):
+                    needs_edit = True
+                    written = receiver
                 if hit.language == "python" and hit.kind not in {"import", "export"}:
                     source, bom = self._file_bytes(root, hit.path, sources)
                     bindings = binding_indexes.get(hit.path)
@@ -2544,7 +3108,7 @@ class ReferenceService:
         version: int,
         partition_id: str,
         context: _ReferenceContext,
-    ) -> list[RefactorFinding]:
+    ) -> tuple[list[RefactorFinding], list[ReferenceLimitation]]:
         """Walk transitive subclasses of a renamed method's owner class.
 
         A rename of `Base.handle` should also flag `Child.handle` for review:
@@ -2560,7 +3124,7 @@ class ReferenceService:
         """
 
         if "." not in selected.qualified_symbol:
-            return []
+            return [], []
         owner_symbol, method_name = selected.qualified_symbol.rsplit(".", 1)
         owner_declarations = self.store.declaration_shapes(
             selected.project_id,
@@ -2573,12 +3137,13 @@ class ReferenceService:
             (
                 row
                 for row in owner_declarations
-                if row["file_id"] == selected.file_id and row["kind"] == "class"
+                if row["file_id"] == selected.file_id
+                and (row["kind"] or "").removesuffix("_part") in _TYPE_KINDS
             ),
             None,
         )
         if base_decl is None:
-            return []
+            return [], []
         imports = context.imports_by_file
         known_paths = context.known_paths
         module_index = context.module_index
@@ -2601,18 +3166,29 @@ class ReferenceService:
                 classes[(row["path"], qualified)] = (row["file_id"], qualified, row["path"])
         by_path_name: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
         by_path: dict[str, list[tuple[str, str, str]]] = {}
+        by_tail: dict[str, list[tuple[str, str, str]]] = {}
         for identity in classes.values():
-            by_path_name.setdefault((identity[2], identity[1].rsplit(".", 1)[-1]), []).append(
-                identity
-            )
+            tail_name = identity[1].rsplit(".", 1)[-1]
+            by_path_name.setdefault((identity[2], tail_name), []).append(identity)
             by_path.setdefault(identity[2], []).append(identity)
+            by_tail.setdefault(tail_name, []).append(identity)
         adjacency: dict[tuple[str, str], list[ReferenceRecord]] = {}
+        bound_rows: set[str] = set()
         for row in inheritance_rows:
             written = row["target_name"] or ""
             receiver, _, tail = written.rpartition(".")
             candidates = (
                 set(by_path_name.get((row["path"], written), [])) if not receiver else set()
             )
+            if not receiver:
+                # A bare base name also binds, without an import, to a type in
+                # the same package/namespace (`_inheritance_targets` decides).
+                candidates.update(
+                    identity
+                    for identity in by_tail.get(written, [])
+                    if identity[2] != row["path"]
+                    and self._same_package(row["path"], row["language"], identity[2], module_index)
+                )
             for item in imports.get(row["file_id"], []):
                 binding = item["alias"] or item["written_name"] or item["imported_name"]
                 if binding != (receiver or tail) or item["module_path"] is None:
@@ -2637,6 +3213,7 @@ class ReferenceService:
                     module_index,
                 ):
                     adjacency.setdefault((file_id, qualified), []).append(row)
+                    bound_rows.add(row["reference_id"])
         override_shapes = self.store.declaration_shapes_many(
             selected.project_id,
             [f"{qualified}.{method_name}" for _, qualified in classes],
@@ -2701,7 +3278,34 @@ class ReferenceService:
                         edit_end_byte=edit_end,
                     )
                 )
-        return findings
+        # A heritage row that names the owner but bound to no type the walk can
+        # prove, whose class declares the renamed method, may be an override
+        # this analysis cannot see: say so rather than let the rename read as
+        # complete.
+        owner_tail = owner_symbol.rsplit(".", 1)[-1]
+        limitations: list[ReferenceLimitation] = []
+        for row in inheritance_rows:
+            subclass_qualified = row["source_qualified_symbol"]
+            if (
+                row["reference_id"] in bound_rows
+                or not subclass_qualified
+                or (row["target_name"] or "").rsplit(".", 1)[-1] != owner_tail
+                or (row["file_id"], f"{subclass_qualified}.{method_name}") not in overrides_by_key
+                or (row["file_id"], subclass_qualified) == (selected.file_id, owner_symbol)
+            ):
+                continue
+            limitations.append(
+                ReferenceLimitation(
+                    code="unbound_heritage",
+                    path=row["path"],
+                    explanation=(
+                        f"{subclass_qualified} names a base type `{owner_tail}` that could not "
+                        f"be bound to the renamed owner, and declares `{method_name}`: it may "
+                        "be an override that this analysis cannot confirm."
+                    ),
+                )
+            )
+        return findings, limitations
 
     def _inheritance_targets(
         self,
@@ -2748,6 +3352,36 @@ class ReferenceService:
                 item["path"], item["language"], module_path, base_path, known_paths, module_index
             ):
                 return True
+        # Same-package/namespace types need no import (`class Child extends Base`
+        # beside `Base.java`), unless an explicit import of that very name
+        # shadows them (Java) -- that import was already tried above.
+        return (
+            "." not in written_target
+            and not any(
+                (item["alias"] or item["written_name"] or item["imported_name"]) == target
+                and item["imported_name"] not in {None, "*"}
+                for item in imports.get(row["file_id"], [])
+            )
+            and self._same_package(row["path"], row["language"], base_path, module_index)
+        )
+
+    @staticmethod
+    def _same_package(
+        path: str, language: str, other_path: str, module_index: _ModuleIndex | None
+    ) -> bool:
+        """Whether two files share a package that needs no import between them.
+
+        Java and Go packages are directories; a C# namespace is the one the
+        files declare. Other languages offer no such proof here.
+        """
+        if language == "java":
+            return (
+                other_path.endswith(".java")
+                and PurePosixPath(path).parent == PurePosixPath(other_path).parent
+            )
+        if language == "csharp" and module_index is not None:
+            namespace = module_index.namespace_by_path.get(path)
+            return bool(namespace and namespace == module_index.namespace_by_path.get(other_path))
         return False
 
     @staticmethod
@@ -2765,6 +3399,28 @@ class ReferenceService:
         }
         return explanations[issue]
 
+    @staticmethod
+    def _group_declaration_parts(chunks: list[ChunkPreview]) -> list[ChunkPreview]:
+        """Merge the `*_part` chunks of one split declaration into a single entry.
+
+        Grouping is `file_outline`'s (`span_parts`): parts that overlap or abut
+        are one declaration, while a gap or a whole declaration starts another
+        (overloads, a property's getter and setter). Each entry keeps its first
+        part's chunk id, drops the `_part` suffix from its kind and spans the
+        parts' lines.
+        """
+        if len(chunks) < 2 and not any(chunk.kind.endswith("_part") for chunk in chunks):
+            return chunks
+        items = _outline_items(chunks, chunks[0].path, span_parts=True) if chunks else []
+        by_start = {(chunk.qualified_symbol, chunk.start_line): chunk for chunk in chunks}
+        grouped: list[ChunkPreview] = []
+        for item in items:
+            first = by_start.get((item.qualified_symbol, item.start_line))
+            if first is None:
+                continue
+            grouped.append(first.model_copy(update={"kind": item.kind, "end_line": item.end_line}))
+        return grouped or chunks
+
     def _select(
         self, selector: DeclarationSelector, *, partition_id: str | None = None
     ) -> SelectedDeclaration:
@@ -2780,6 +3436,34 @@ class ReferenceService:
                     f"chunk_id {selector.chunk_id} is not a declaration chunk; chunk ids come "
                     "from find_symbol or search_code results and change when a file is reindexed",
                 )
+            kind = selected_chunk.kind
+            start_line, end_line = selected_chunk.start_line, selected_chunk.end_line
+            chunk_id = selected_chunk.chunk_id
+            if kind.endswith("_part"):
+                # A part of a long declaration stands for the whole declaration:
+                # its kind, line span and (first-part) chunk id, as the outline
+                # reports it (REF-5). Without this a part's own range and
+                # `method_part` kind leak into the signature checks.
+                whole = next(
+                    (
+                        group
+                        for group in self._group_declaration_parts(
+                            self.store.find_declarations(
+                                selected_chunk.project_id,
+                                selected_chunk.path,
+                                selected_chunk.qualified_symbol,
+                                partition_id=partition_id,
+                            )
+                        )
+                        if group.start_line <= selected_chunk.start_line <= group.end_line
+                    ),
+                    None,
+                )
+                if whole is not None:
+                    kind, start_line, end_line = whole.kind, whole.start_line, whole.end_line
+                    chunk_id = whole.chunk_id
+                else:
+                    kind = kind.removesuffix("_part")
             return SelectedDeclaration(
                 project_id=selected_chunk.project_id,
                 file_id=selected_chunk.file_id,
@@ -2787,10 +3471,10 @@ class ReferenceService:
                 language=selected_chunk.language,
                 symbol=selected_chunk.symbol,
                 qualified_symbol=selected_chunk.qualified_symbol,
-                kind=selected_chunk.kind,
-                start_line=selected_chunk.start_line,
-                end_line=selected_chunk.end_line,
-                chunk_id=selected_chunk.chunk_id,
+                kind=kind,
+                start_line=start_line,
+                end_line=end_line,
+                chunk_id=chunk_id,
             )
         assert selector.project is not None and selector.path is not None
         assert selector.qualified_symbol is not None
@@ -2800,6 +3484,8 @@ class ReferenceService:
         chunks = self.store.find_declarations(
             selector.project, selector.path, selector.qualified_symbol, partition_id=partition_id
         )
+        # Parts of one long declaration are not distinct declarations.
+        chunks = self._group_declaration_parts(chunks)
         if len(chunks) > 1:
             raise CodeIndexingError(
                 ErrorCode.AMBIGUOUS_SYMBOL,
@@ -2931,9 +3617,13 @@ class ReferenceService:
         known_paths: frozenset[str],
         module_index: _ModuleIndex | None = None,
     ) -> bool:
+        if self._bound_to_external_import(row, imports.get(row["file_id"], []), known_paths):
+            return False
         target_tail = (row["target_name"] or "").rsplit(".", 1)[-1]
         written_tail = (row["written_name"] or "").rsplit(".", 1)[-1]
         if selected.symbol in {row["target_name"], row["written_name"], target_tail, written_tail}:
+            return True
+        if self._is_accessor_decorator(row, selected):
             return True
         if row["kind"] == "import" and self._is_namespace_import(row):
             return False
@@ -2952,6 +3642,10 @@ class ReferenceService:
             return True
         return any(
             (item["alias"] or item["written_name"] or item["imported_name"]) == spelling
+            # A namespace binding names a whole module, never one of its
+            # members: only a row whose own member tail spells the selected
+            # symbol (admitted above) can refer to it (REF-1).
+            and not self._is_member_namespace(item)
             and (
                 self._import_targets(item, selected, known_paths, module_index)
                 or self._reexport_targets_symbol(
@@ -2982,6 +3676,14 @@ class ReferenceService:
             # call sites from every result.
             if scope and scope in class_scopes:
                 continue
+            # Go methods carry no owner prefix and Rust `impl` owners are not
+            # classes, but in these languages no member is ever a bare name's
+            # binding (REF-9).
+            if (
+                row["language"] in _NO_IMPLICIT_RECEIVER
+                and (declaration["kind"] or "").removesuffix("_part") in _MEMBER_KINDS
+            ):
+                continue
             if not scope or source == scope or source.startswith(scope + "."):
                 visible.append((scope.count(".") + bool(scope), declaration))
         return max(visible, key=lambda item: item[0])[1] if visible else None
@@ -2995,7 +3697,14 @@ class ReferenceService:
         reexport_rows: dict[str, list[ReferenceRecord]],
         known_paths: frozenset[str],
         module_index: _ModuleIndex | None = None,
+        owner_scopes: _OwnerScopes | None = None,
     ) -> _Classification:
+        if self._is_accessor_decorator(row, selected):
+            return (
+                "exact",
+                "property_accessor_decorator",
+                "The decorator names the property declared in this class body.",
+            )
         source_imports = imports.get(row["file_id"], [])
         # Java's on-demand imports (`import a.b.*`) are wildcard-shaped but
         # resolve under their own, evidence-based rule (D3) -- never through
@@ -3013,7 +3722,9 @@ class ReferenceService:
             )
         if row["receiver_text"] is not None:
             receiver = row["receiver_text"]
-            if receiver in {"self", "cls", "this"} and self._same_owner(row, selected):
+            if receiver in {"self", "cls", "this"} and self._same_owner(
+                row, selected, owner_scopes, module_index
+            ):
                 return (
                     "exact",
                     "known_owner_member",
@@ -3021,8 +3732,20 @@ class ReferenceService:
                 )
             for item in source_imports:
                 binding = item["alias"] or item["written_name"] or item["imported_name"]
-                if binding == receiver and self._import_targets(
-                    item, selected, known_paths, module_index
+                if binding == receiver and (
+                    (
+                        (
+                            not self._is_member_namespace(item)
+                            or self._member_tail_is(row, selected.symbol)
+                        )
+                        and self._import_targets(item, selected, known_paths, module_index)
+                    )
+                    # `from pkg import mod; mod.f()`: the binding is the
+                    # submodule, so it is a member namespace like `import pkg.mod`.
+                    or (
+                        self._member_tail_is(row, selected.symbol)
+                        and self._submodule_targets(item, selected.path, known_paths, module_index)
+                    )
                 ):
                     return (
                         "exact",
@@ -3071,7 +3794,7 @@ class ReferenceService:
         unproven_reexport = False
         for item in source_imports:
             alias = item["alias"] or item["written_name"] or item["imported_name"]
-            if alias != row["written_name"]:
+            if alias != row["written_name"] or self._is_member_namespace(item):
                 continue
             if self._import_targets(item, selected, known_paths, module_index):
                 return (
@@ -3262,6 +3985,91 @@ class ReferenceService:
                     return True
         return False
 
+    @classmethod
+    def _submodule_module_path(cls, item: ReferenceRecord) -> str | None:
+        """`pkg.mod` for `from pkg import mod` (`.mod` for `from . import mod`)."""
+        imported = item["imported_name"]
+        module = item["module_path"]
+        if (
+            item["language"] != "python"
+            or cls._is_namespace_import(item)
+            or not imported
+            or imported == "*"
+            or module is None
+        ):
+            return None
+        return module + imported if module.endswith(".") else f"{module}.{imported}"
+
+    @classmethod
+    def _submodule_targets(
+        cls,
+        item: ReferenceRecord,
+        path: str,
+        known_paths: frozenset[str],
+        module_index: _ModuleIndex | None = None,
+    ) -> bool:
+        """Whether a Python `from P import M` binds the indexed submodule file `path`.
+
+        Only the import-resolver half: that `P.M` is the file `path`. The
+        imported name may instead be an attribute of `P/__init__.py` that
+        shadows the submodule; the live-source verdict rules that out
+        (`_submodule_shadowed`).
+        """
+        module = cls._submodule_module_path(item)
+        if module is None or path not in known_paths:
+            return False
+        return cls._module_matches(
+            item["path"], item["language"], module, path, known_paths, module_index
+        )
+
+    def _submodule_shadowed(
+        self,
+        item: ReferenceRecord,
+        package_bindings: Callable[[str], PythonBindings | None] | None,
+        known_paths: frozenset[str],
+        module_index: _ModuleIndex | None,
+    ) -> bool:
+        """Whether the package's `__init__.py` binds the submodule's name itself.
+
+        `from pkg import mod` yields `pkg.mod` the attribute when `__init__.py`
+        defines or imports a `mod`, and only falls back to the submodule file
+        otherwise. A package initializer that cannot be read, or whose bindings
+        are uncertain, is treated as shadowing. The importing file is skipped
+        when it is the initializer itself: its sole `mod` binding is this import.
+        """
+        name = item["imported_name"] or ""
+        module_path = item["module_path"] or ""
+        for candidate in self._module_candidates(
+            item["path"], item["language"], module_path, known_paths, module_index
+        ):
+            initializer = str(candidate)
+            if not initializer.endswith("__init__.py") or initializer not in known_paths:
+                continue
+            if initializer == item["path"]:
+                continue
+            package = package_bindings(initializer) if package_bindings else None
+            if package is None or package.module.unsupported or name in package.module.bindings:
+                return True
+            if name in package.module.poisoned:
+                return True
+        return False
+
+    @classmethod
+    def _is_member_namespace(cls, item: ReferenceRecord) -> bool:
+        """A namespace import whose binding stands for a module, not a declaration.
+
+        C# `using` forms are excluded: an alias there (`using A = N.T;`) can
+        name a type itself.
+        """
+        return cls._is_namespace_import(item) and item["language"] != "csharp"
+
+    @staticmethod
+    def _member_tail_is(row: ReferenceRecord, symbol: str) -> bool:
+        return symbol in {
+            (row["target_name"] or "").rsplit(".", 1)[-1],
+            (row["written_name"] or "").rsplit(".", 1)[-1],
+        }
+
     @staticmethod
     def _is_namespace_import(item: ReferenceRecord) -> bool:
         imported = item["imported_name"]
@@ -3434,12 +4242,100 @@ class ReferenceService:
         return None
 
     @staticmethod
-    def _same_owner(row: ReferenceRecord, selected: SelectedDeclaration) -> bool:
-        source = row["source_qualified_symbol"] or ""
-        owner = (
-            selected.qualified_symbol.rsplit(".", 1)[0] if "." in selected.qualified_symbol else ""
+    def _bound_to_external_import(
+        row: ReferenceRecord, source_imports: list[ReferenceRecord], known_paths: frozenset[str]
+    ) -> bool:
+        """The row's name is a library import (`from json import dumps`), not project code.
+
+        Binding-by-import is how a bare name or a namespace receiver gets its
+        meaning in Python/JS/TS, so a spelling that an import of an unindexed
+        module introduces cannot be a use of a project declaration (REF-12).
+        """
+        if row["kind"] == "export" or row["language"] not in {
+            "python",
+            "javascript",
+            "typescript",
+            "tsx",
+        }:
+            return False
+        spelling = (row["receiver_text"] or row["written_name"] or "").split(".")[0]
+        return bool(spelling) and any(
+            (item["alias"] or item["written_name"] or item["imported_name"]) == spelling
+            and _is_external_import(item, known_paths)
+            for item in source_imports
         )
-        return bool(owner and (source == owner or source.startswith(owner + ".")))
+
+    @staticmethod
+    def _is_accessor_decorator(row: ReferenceRecord, selected: SelectedDeclaration) -> bool:
+        """`@value.setter` on the second `def value`: the property's own name (REF-4).
+
+        The decorator reads the class-scope property object by name, so renaming
+        the property must rewrite it too. Only the accessor spellings of a
+        Python property, sitting on a declaration of the selected qualified
+        name in the selected file, qualify.
+        """
+        written = row["written_name"] or ""
+        return (
+            row["kind"] == "decorator"
+            and row["language"] == "python"
+            and selected.language == "python"
+            and row["file_id"] == selected.file_id
+            and row["receiver_text"] is None
+            and row["source_qualified_symbol"] == selected.qualified_symbol
+            and written in {f"{selected.symbol}.{accessor}" for accessor in _PROPERTY_ACCESSORS}
+        )
+
+    @staticmethod
+    def _same_owner(
+        row: ReferenceRecord,
+        selected: SelectedDeclaration,
+        owner_scopes: _OwnerScopes | None,
+        module_index: _ModuleIndex | None,
+    ) -> bool:
+        """Whether `self`/`this` in `row` provably holds the selected declaration's owner.
+
+        The row's innermost enclosing *type* (not a qualified-name prefix, so a
+        nested class never matches its outer class) must be exactly the owner,
+        in the declaration's own file. A type can legitimately span files in
+        two ways, and only those stay exact across files: a C# `partial` class
+        (same declared namespace) and a type the calling file merely extends
+        without declaring (a Rust `impl`, a Swift/Kotlin extension) when the
+        owner is declared exactly once project-wide. Two same-named classes in
+        different files never match.
+        """
+        qualified = selected.qualified_symbol
+        owner = qualified.rsplit(".", 1)[0] if "." in qualified else ""
+        if not owner or owner_scopes is None:
+            return False
+        parts = (row["source_qualified_symbol"] or "").split(".")
+        file_types = owner_scopes.types_by_file.get(row["file_id"], frozenset())
+        declared_here = False
+        row_owner = ""
+        for length in range(len(parts), 0, -1):
+            prefix = ".".join(parts[:length])
+            if prefix in file_types:
+                row_owner, declared_here = prefix, True
+                break
+        if not declared_here:
+            # No type is declared around the row in its own file (a Rust
+            # `impl`, an extension): the member's qualifier names the type.
+            if len(parts) < 2:
+                return False
+            row_owner = ".".join(parts[:-1])
+        if row_owner != owner:
+            return False
+        if row["file_id"] == selected.file_id:
+            return True
+        if row["language"] == "csharp":
+            if module_index is None:
+                return False
+            namespace = module_index.namespace_by_path.get(row["path"])
+            return bool(
+                namespace
+                and namespace == module_index.namespace_by_path.get(selected.path)
+                and owner_scopes.csharp_owner_is_one_type(namespace)
+            )
+        return not declared_here and owner_scopes.owner_is_unique()
 
     @staticmethod
     def _python_package_root(
@@ -3476,6 +4372,7 @@ class ReferenceService:
         receiver_names: dict[tuple[str, str], str] = {}
         rust_directories: set[str] = set()
         rust_crate_markers: set[str] = set()
+        paths_by_basename: dict[str, set[str]] = {}
         if declarations is not None:
             for declaration in declarations:
                 if declaration["kind"] != "method":
@@ -3498,6 +4395,7 @@ class ReferenceService:
         for row in records:
             path = PurePosixPath(row["path"])
             directory = path.parent
+            paths_by_basename.setdefault(path.name, set()).add(row["path"])
             if (
                 row["record_kind"] == "reference"
                 and row["kind"] == "export"
@@ -3550,6 +4448,9 @@ class ReferenceService:
             rust_crate_roots=ReferenceService._rust_crate_roots(
                 rust_directories, rust_crate_markers
             ),
+            paths_by_basename={
+                name: tuple(sorted(paths)) for name, paths in paths_by_basename.items()
+            },
         )
 
     @staticmethod
@@ -3606,7 +4507,13 @@ class ReferenceService:
 
     @staticmethod
     def _edit_span(
-        source: bytes, start_byte: int, end_byte: int, name: str, bom: int
+        source: bytes,
+        start_byte: int,
+        end_byte: int,
+        name: str,
+        bom: int,
+        *,
+        declaration: bool = False,
     ) -> tuple[int | None, int | None]:
         """Locate the identifier to rewrite inside a reference's own range.
 
@@ -3615,12 +4522,28 @@ class ReferenceService:
         (`authorize as check`). Replacing the whole range would drop the module
         qualifier or the alias, so the exact identifier is located instead and
         anything ambiguous is left for a human.
+
+        A declaration's range spans its whole body, so the name may also occur
+        in a recursive call, a docstring or the return type (REF-6). There the
+        declared name is the first occurrence that is either introduced by a
+        declaration keyword (`def fact`, `function fact`, `const fact`) or
+        followed by a parameter list (`void fact(`); with no such occurrence
+        the span stays unlocated rather than guessed.
         """
 
         span = source[start_byte:end_byte]
         if not span or not name:
             return None, None
         matches = list(re.finditer(rf"(?<![\w$]){re.escape(name)}(?![\w$])".encode(), span))
+        if declaration and len(matches) > 1:
+            matches = [
+                match
+                for match in matches
+                if _DECLARATION_KEYWORD_BEFORE.search(
+                    span[max(0, match.start() - 32) : match.start()]
+                )
+                or _PARAMETER_LIST_AFTER.match(span, match.end())
+            ][:1]
         if len(matches) != 1:
             return None, None
         return start_byte + matches[0].start() + bom, start_byte + matches[0].end() + bom

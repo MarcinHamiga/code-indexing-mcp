@@ -16,6 +16,10 @@ class _Scope:
     kind: str
     bindings: dict[str, list[ast.AST]] = field(default_factory=dict)
     unsupported: bool = False
+    # Names whose binding here can change behind the scope's back (`global` /
+    # `nonlocal` writes). Only these lookups are uncertain; the rest of the
+    # scope stays resolvable.
+    poisoned: set[str] = field(default_factory=set)
 
 
 class PythonBindings(ast.NodeVisitor):
@@ -77,19 +81,28 @@ class PythonBindings(ast.NodeVisitor):
             if alias.name == "*":
                 self.scope.unsupported = True
 
+    @staticmethod
+    def _is_staticmethod(decorator: ast.expr) -> bool:
+        if isinstance(decorator, ast.Name):
+            return decorator.id == "staticmethod"
+        return isinstance(decorator, ast.Attribute) and decorator.attr == "staticmethod"
+
     def _function(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> None:
         if not isinstance(node, ast.Lambda):
             if node.type_params:
                 # PEP 695 introduces annotation scopes with distinct binding rules.
                 self.scope.unsupported = True
             positional = [*node.args.posonlyargs, *node.args.args]
+            # The first parameter of any method is its receiver unless the method
+            # is a `staticmethod`. Other decorators (`property`, `cache`,
+            # `setter`, `abstractmethod`, `wraps`-style wrappers) are assumed
+            # to forward the instance (or class, for `classmethod`) as the first
+            # argument; the caller additionally requires the parameter to be
+            # spelled `self`/`cls` and the enclosing type to match the owner.
             if (
                 self.scope.kind == "class"
                 and positional
-                and all(
-                    isinstance(decorator, ast.Name) and decorator.id == "classmethod"
-                    for decorator in node.decorator_list
-                )
+                and not any(self._is_staticmethod(decorator) for decorator in node.decorator_list)
             ):
                 self.receiver_parameters.add(id(positional[0]))
             self._bind(node.name, node)
@@ -146,25 +159,64 @@ class PythonBindings(ast.NodeVisitor):
             self._bind(node.name, node)
         self.generic_visit(node)
 
-    def _unsupported(self, node: ast.AST) -> None:
-        self.scope.unsupported = True
+    def visit_Global(self, node: ast.Global) -> None:
+        # `global x` makes this scope's `x` the module's `x`, and any write
+        # through it rebinds what every other scope reads. Only the named
+        # bindings are uncertain, in this scope and at module level.
+        self.scope.poisoned.update(node.names)
+        self.module.poisoned.update(node.names)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        # `nonlocal x` rebinds `x` in whichever enclosing function owns it.
+        scope: _Scope | None = self.scope
+        while scope is not None and scope.kind != "module":
+            scope.poisoned.update(node.names)
+            scope = scope.parent
+
+    def _binding_scope(self) -> _Scope:
+        # A walrus target escapes comprehension scopes into the enclosing one.
+        scope = self.scope
+        while scope.kind == "comprehension" and scope.parent is not None:
+            scope = scope.parent
+        return scope
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        self._binding_scope().bindings.setdefault(node.target.id, []).append(node)
+
+    def _capture(self, name: str | None, node: ast.AST) -> None:
+        if name:
+            self._bind(name, node)
+
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        # Capture patterns bind exactly the names they spell; `match` opens no
+        # scope of its own.
+        self._capture(node.name, node)
         self.generic_visit(node)
 
-    visit_Global = _unsupported
-    visit_Nonlocal = _unsupported
+    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+        self._capture(node.name, node)
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        self._capture(node.rest, node)
+        self.generic_visit(node)
 
     def _comprehension(
         self, node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp
     ) -> None:
         # The initial iterable belongs to the enclosing scope; iteration
-        # targets and the body have their own scope and cannot shadow the
-        # enclosing call's callee. Walrus targets can escape that scope.
+        # targets and the body have their own scope, whose bindings are exactly
+        # the iteration targets. Walrus targets escape to the enclosing scope
+        # (`_binding_scope`), so the comprehension scope itself is resolvable.
+        # A walrus inside a comprehension still withholds the enclosing scope:
+        # `test_comprehension_walrus_withholds_outer_binding_edits` pins that
+        # conservative behaviour for rename patches.
         if any(isinstance(child, ast.NamedExpr) for child in ast.walk(node)):
             self.scope.unsupported = True
         first, *rest = node.generators
         self.visit(first.iter)
         parent = self.scope
-        self.scope = _Scope(parent, "comprehension", unsupported=True)
+        self.scope = _Scope(parent, "comprehension")
         self.visit(first.target)
         for condition in first.ifs:
             self.visit(condition)
@@ -181,8 +233,6 @@ class PythonBindings(ast.NodeVisitor):
     visit_SetComp = _comprehension
     visit_DictComp = _comprehension
     visit_GeneratorExp = _comprehension
-    visit_NamedExpr = _unsupported
-    visit_Match = _unsupported
 
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name) and node.func.id in {
@@ -200,7 +250,7 @@ class PythonBindings(ast.NodeVisitor):
         if scope is None:
             return [], True
         while scope is not None:
-            if scope.unsupported:
+            if scope.unsupported or name in scope.poisoned:
                 return [], True
             if name in scope.bindings:
                 return scope.bindings[name], False
