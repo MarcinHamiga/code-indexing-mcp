@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import hashlib
 import itertools
@@ -13,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -73,10 +75,15 @@ logger = logging.getLogger(__name__)
 # Version 6 records original chunk bounds and a chunk content digest on
 # embedding windows so retrieval can reconstruct their source chunk without
 # reading a changed checkout, and equal chunks in pinned checkouts collapse.
-SCHEMA_VERSION = 6
+# Version 7 changes chunk boundaries: container chunks now stop before the next
+# member's decorator and the text between nested members becomes `<kind>_part`
+# chunks (EXT-2), C/C++/Go/Swift/GDShader definitions are captured per name, and
+# part line numbers split on `\n` only. Unchanged files keep their stored chunks
+# unless the bump forces a rebuild, so older indexes would stay inconsistent.
+SCHEMA_VERSION = 7
 
-# Symbol lookups page through the over-matching LIKE prefilter. These bound
-# each page, not the total scan needed to find the caller's literal matches.
+# Symbol lookups page through the SQL prefilter's candidates. These bound each
+# page, not the total scan needed to find the caller's literal matches.
 OVERFETCH_FACTOR = 10
 MINIMUM_OVERFETCH = 200
 
@@ -462,6 +469,9 @@ class _ProjectTables:
     chunks: LanceTable
     references: LanceTable | None
     generation: int
+    # Identity of this physical creation of the partition; see
+    # LanceStore._ensure_partition_nonce.
+    nonce: str = ""
 
 
 class ReferenceRecord(TypedDict):
@@ -752,14 +762,23 @@ class LanceStore:
             self._pending_slot_touches.clear()
         if not pending:
             return
-        rows: list[dict[str, Any]] = []
-        for slot_id, touched_at in pending.items():
-            slot = self.get_slot(slot_id)
-            if slot is None:
-                continue
-            rows.append(self._slot_row(slot.model_copy(update={"last_used_at": touched_at})))
-        if rows:
-            self._merge(self._project_slots, "slot_id", rows)
+        # Rewrite only the timestamp. Reading the whole row and merging it back
+        # would overwrite a state or Git stamp that a commit published between
+        # the read and the write. The source carries just ``slot_id`` and
+        # ``last_used_at``, so the matched update leaves every other column as
+        # the table has it; the condition keeps a stale buffered touch from
+        # moving the time backwards, and unknown slots are not inserted.
+        touches = pa.table(
+            {
+                "slot_id": pa.array(list(pending), type=pa.string()),
+                "last_used_at": pa.array(list(pending.values()), type=pa.int64()),
+            }
+        )
+        (
+            self._project_slots.merge_insert("slot_id")
+            .when_matched_update_all(where="target.last_used_at < source.last_used_at")
+            .execute(touches)
+        )
 
     def close(self) -> None:
         """Release in-memory state that must not outlive the process.
@@ -775,6 +794,7 @@ class LanceStore:
         state: str,
         *,
         project: ProjectInfo | None = None,
+        scanned_git: GitState | None = None,
     ) -> None:
         """Update one pinned slot without changing any active pointer.
 
@@ -788,7 +808,9 @@ class LanceStore:
         updates: dict[str, Any] = {"state": state, "last_used_at": time.time_ns()}
         if project is not None:
             git = probe_git_state(project.root, include_status=True)
-            if git.probe is GitProbeOutcome.GIT:
+            if git.probe is GitProbeOutcome.GIT and scanned_git is not None:
+                self._stamp_from_scan(updates, scanned_git, git)
+            elif git.probe is GitProbeOutcome.GIT:
                 updates["indexed_head"] = git.head_oid
                 updates["indexed_clean"] = (
                     None if git.worktree.value == "unknown" else git.worktree.value == "clean"
@@ -813,6 +835,62 @@ class LanceStore:
                 updates["vector_dimension"] = int(rows[0]["vector_dimension"])
                 updates["schema_version"] = int(rows[0]["schema_version"])
         self.upsert_slot(slot.model_copy(update=updates))
+
+    def invalidate_slot_stamp(self, slot_id: str) -> None:
+        """Forget what a slot claims to have indexed, e.g. after a rollback.
+
+        Clears the Git stamp so the next freshness check validates every path.
+        A slot left in ``indexing`` by a dead run goes back to ``pending``.
+        """
+        slot = self.get_slot(slot_id)
+        if slot is None:
+            return
+        self.upsert_slot(
+            slot.model_copy(
+                update={
+                    "state": "pending" if slot.state == "indexing" else slot.state,
+                    "indexed_head": None,
+                    "indexed_clean": None,
+                    "indexed_status_fingerprint": None,
+                    "indexed_status_paths": None,
+                }
+            )
+        )
+
+    @staticmethod
+    def _stamp_from_scan(updates: dict[str, Any], scanned: GitState, after: GitState) -> None:
+        """Stamp a slot from the Git state the run scanned, not the state now.
+
+        The working tree can change between the scan and the commit. Stamping
+        the post-commit probe would claim a clean tree at a HEAD the scan never
+        saw. Instead the stamp keeps the pre-scan HEAD, fingerprint and dirty
+        paths, adds whatever is dirty now, and is clean only if both probes
+        were. A HEAD that moved after the scan leaves the stamp unknown, which
+        forces the next freshness check to validate every path.
+        """
+        if after.head_oid != scanned.head_oid:
+            updates["indexed_head"] = None
+            updates["indexed_clean"] = None
+            updates["indexed_status_fingerprint"] = None
+            updates["indexed_status_paths"] = None
+            return
+        before_clean = (
+            None if scanned.worktree.value == "unknown" else scanned.worktree.value == "clean"
+        )
+        after_clean = None if after.worktree.value == "unknown" else after.worktree.value == "clean"
+        updates["indexed_head"] = scanned.head_oid
+        updates["indexed_clean"] = (
+            None if before_clean is None or after_clean is None else before_clean and after_clean
+        )
+        updates["indexed_status_fingerprint"] = scanned.status_fingerprint
+        updates["indexed_status_paths"] = encode_status_paths(
+            {
+                *scanned.dirty_paths,
+                *scanned.untracked_paths,
+                *after.dirty_paths,
+                *after.untracked_paths,
+            }
+        )
 
     def activate_slot(self, project_id: str, slot_id: str, *, checkout_key: str) -> int:
         """Point *checkout_key*'s active pointer at *slot_id*.
@@ -946,8 +1024,10 @@ class LanceStore:
                     "selector_value": desired.selector_value,
                 }
             )
+        wrote = existing is None or selected != existing
         self.upsert_slot(selected)
         if active is None or active.slot_id != selected.slot_id:
+            wrote = True
             self.activate_slot(project.id, selected.slot_id, checkout_key=selected_key)
         active = self.active_partition_ref(project.id, checkout_key=selected_key)
         if active is None:
@@ -956,10 +1036,12 @@ class LanceStore:
                 f"Project {project.id} has no active index slot",
             )
         self.touch_slot(active.slot_id)
-        # This path already writes (upsert_slot, possibly activate_slot), so
-        # flushing the touch here costs nothing extra and keeps activation
-        # durable rather than leaving it in the in-memory buffer.
-        self.flush_slot_touches()
+        if wrote:
+            # This call already wrote (upsert_slot or activate_slot), so
+            # flushing the touch here costs nothing extra and keeps activation
+            # durable. A call that changed nothing leaves the touch buffered
+            # rather than turning a read into a registry write.
+            self.flush_slot_touches()
         return active
 
     def active_partition_ref(
@@ -1206,14 +1288,30 @@ class LanceStore:
         if str(row["state"]) == "pending":
             return None
         differences: list[str] = []
-        if str(row["model_id"]) != model_id:
-            differences.append(f"embedding model {row['model_id']!r} -> {model_id!r}")
-        if int(row["vector_dimension"]) != self.vector_dimension:
-            differences.append(
-                f"vector dimension {row['vector_dimension']} -> {self.vector_dimension}"
-            )
-        if int(row["schema_version"]) != SCHEMA_VERSION:
-            differences.append(f"index schema version {row['schema_version']} -> {SCHEMA_VERSION}")
+        stored_model = str(row["model_id"])
+        stored_dimension = int(row["vector_dimension"])
+        stored_schema_version = int(row["schema_version"])
+        # The registry row is project-wide, but each branch or worktree slot owns
+        # its own partition and its own stamp of the generation that partition
+        # holds. Rebuilding one slot re-stamps the shared row, so a sibling slot
+        # still on the previous generation would pass a row-only comparison.
+        # A slot with no partition on disk, or one never stamped (empty or zero
+        # fields), is judged by the row alone.
+        if partition_id is not None and (self.directory / "projects" / partition_id).is_dir():
+            slot_rows = self._rows(self._project_slots, f"partition_id = {_quoted(partition_id)}")
+            slot_row = next((r for r in slot_rows if str(r["project_id"]) == project_id), None)
+            if slot_row is not None:
+                stored_model = str(slot_row["model_id"] or "") or stored_model
+                stored_dimension = int(slot_row["vector_dimension"] or 0) or stored_dimension
+                stored_schema_version = int(slot_row["schema_version"] or 0) or (
+                    stored_schema_version
+                )
+        if stored_model != model_id:
+            differences.append(f"embedding model {stored_model!r} -> {model_id!r}")
+        if stored_dimension != self.vector_dimension:
+            differences.append(f"vector dimension {stored_dimension} -> {self.vector_dimension}")
+        if stored_schema_version != SCHEMA_VERSION:
+            differences.append(f"index schema version {stored_schema_version} -> {SCHEMA_VERSION}")
         # The registry row alone cannot describe a dtype flip between two
         # builds of the same schema version, so the partition's own vector
         # column is the authority: a stored float32 partition under a float16
@@ -1224,6 +1322,13 @@ class LanceStore:
             stored_dtype = stored_schema.field("vector").type.value_type
             if stored_dtype != self.vector_dtype:
                 differences.append(f"vector storage {stored_dtype} -> {self.vector_dtype}")
+            stored_size = getattr(stored_schema.field("vector").type, "list_size", None)
+            if (
+                isinstance(stored_size, int)
+                and stored_size != self.vector_dimension
+                and not any(d.startswith("vector dimension") for d in differences)
+            ):
+                differences.append(f"vector dimension {stored_size} -> {self.vector_dimension}")
             # The registry row is project-wide, but each branch or worktree slot
             # owns its own partition. Rebuilding one slot re-stamps the shared
             # schema version while sibling slots still hold the previous chunk
@@ -1309,6 +1414,13 @@ class LanceStore:
         if tables is None:
             return []
         return [StoredFile.model_validate(row) for row in self._rows(tables.files)]
+
+    def count_files(self, project_id: str, *, partition_id: str | None = None) -> int:
+        """Number of stored file rows, without materialising them."""
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return 0
+        return int(tables.files.count_rows())
 
     def has_file_errors(self, project_id: str, *, partition_id: str | None = None) -> bool:
         """Whether any stored file row records a genuine indexing error.
@@ -2349,11 +2461,12 @@ class LanceStore:
         if match == "exact":
             symbol = f"(qualified_symbol = {escaped} OR symbol = {escaped})"
         elif match == "prefix":
-            prefix = _quoted(name + "%")
-            symbol = f"(qualified_symbol LIKE {prefix} OR symbol LIKE {prefix})"
+            # starts_with/contains take the name as a plain string. LIKE would
+            # read `_`, `%` and `\` in it as pattern syntax, matching every row
+            # for a name such as "_" and under-matching one with a backslash.
+            symbol = f"(starts_with(qualified_symbol, {escaped}) OR starts_with(symbol, {escaped}))"
         else:
-            contains = _quoted("%" + name + "%")
-            symbol = f"(qualified_symbol LIKE {contains} OR symbol LIKE {contains})"
+            symbol = f"(contains(qualified_symbol, {escaped}) OR contains(symbol, {escaped}))"
         conditions = [symbol]
         if kinds:
             values = ", ".join(_quoted(kind) for kind in kinds)
@@ -2361,9 +2474,10 @@ class LanceStore:
         tables = self._project_existing_tables(project_id, partition_id=partition_id)
         if tables is None:
             return []
-        # LIKE over-matches literal underscores and percent signs. Page until
-        # enough literal matches or exhaustion; a fixed candidate cap can hide
-        # every valid match behind earlier wildcard false positives.
+        # The SQL condition is exact for these matchers, but the literal
+        # post-filter stays authoritative (it also decides which of
+        # qualified_symbol/symbol a row is compared by), so keep paging until
+        # enough matches or exhaustion rather than trusting a fixed cap.
         page_size = max(limit * OVERFETCH_FACTOR, MINIMUM_OVERFETCH)
         offset = 0
         matches: list[ChunkPreview] = []
@@ -2649,6 +2763,9 @@ class LanceStore:
         recovery_protected = set(protected_slot_ids)
         # Every checkout pointer protects its slot: a worktree of this project
         # may be holding another branch live while maintenance runs.
+        # A pointer whose checkout directory is gone (a deleted linked
+        # worktree) protects nothing: prune it so its slot can age out.
+        self._prune_dead_pointers(project_id)
         pointed = {str(row["slot_id"]) for row in self._active_pointer_rows(project_id)}
         protected = recovery_protected | pointed
 
@@ -2661,17 +2778,19 @@ class LanceStore:
                 partition = self.directory / "projects" / slot.partition_id
                 if partition.exists():
                     shutil.rmtree(partition)
-                generation = self.directory / "partition-generations" / slot.partition_id
-                if generation.exists():
-                    generation.unlink()
+                self._unlink_partition_markers(self.directory, slot.partition_id)
 
         # Branch slots keyed by an obsolete slot-key formula can never be
         # claimed by any checkout again (they only survive from before an
         # upgrade), so they are reclaimed first rather than competing with
         # live slots for the retention budget.
         stale_ids = self._stale_slot_ids(project_id, slots) - protected
+        # Maintenance holds the project writer lock, so no run can be live: a
+        # slot still marked ``indexing`` was left by a dead build and is an
+        # ordinary candidate. Slots a pending recovery journal names are
+        # already in ``protected``.
         stale = sorted(
-            (slot for slot in slots if slot.slot_id in stale_ids and slot.state != "indexing"),
+            (slot for slot in slots if slot.slot_id in stale_ids),
             key=lambda slot: (slot.last_used_at, slot.slot_id),
         )
         for slot in stale:
@@ -2679,10 +2798,11 @@ class LanceStore:
 
         remaining = [slot for slot in self.list_slots(project_id) if slot.slot_id not in protected]
         candidates = sorted(
-            (slot for slot in remaining if slot.state != "indexing"),
+            remaining,
             key=lambda slot: (slot.last_used_at, slot.slot_id),
         )
-        remove_count = max(0, len(remaining) - limit)
+        # The limit counts every retained slot, active ones included.
+        remove_count = max(0, len(remaining) - max(0, limit - len(protected)))
         for slot in candidates[:remove_count]:
             evict(slot)
 
@@ -2700,6 +2820,21 @@ class LanceStore:
                     tables.references.optimize(cleanup_older_than=cleanup_older_than)
             ran = True
         return ran or bool(slots)
+
+    def _prune_dead_pointers(self, project_id: str) -> None:
+        """Delete pointer rows whose checkout directory no longer exists.
+
+        Only absolute checkout keys (a Git directory or workspace root) are
+        judged; an empty legacy key names no path and is left alone. A pointer
+        is a cache of "which slot this checkout uses", not index data, so the
+        next run from a checkout that comes back simply recreates it.
+        """
+        for row in self._active_pointer_rows(project_id):
+            key = str(row["checkout_key"] or "")
+            if key and os.path.isabs(key) and not os.path.exists(key):
+                self._active_slots.delete(
+                    f"project_id = {_quoted(project_id)} AND checkout_key = {_quoted(key)}"
+                )
 
     def _active_pointer_rows(self, project_id: str) -> list[dict[str, Any]]:
         return self._rows(self._active_slots, f"project_id = {_quoted(project_id)}")
@@ -2764,9 +2899,7 @@ class LanceStore:
                 partition = self.directory / "projects" / partition_id
                 if partition.exists():
                     shutil.rmtree(partition)
-                generation = self.directory / "partition-generations" / partition_id
-                if generation.exists():
-                    generation.unlink()
+                self._unlink_partition_markers(self.directory, partition_id)
         return existed
 
     @staticmethod
@@ -3021,12 +3154,14 @@ class LanceStore:
             cached is not None
             and cached.references is not None
             and cached.generation == self._partition_generation(partition_id)
+            and cached.nonce == self._partition_nonce(partition_id)
         ):
             return cached
         database = lancedb.connect(
             self.directory / "projects" / partition_id,
             read_consistency_interval=timedelta(0),
         )
+        nonce = self._ensure_partition_nonce(partition_id)
         tables = _ProjectTables(
             files=self._table(database, "files", self._file_schema()),
             chunks=self._table(
@@ -3036,6 +3171,7 @@ class LanceStore:
             ),
             references=self._table(database, "references", self._reference_schema()),
             generation=self._partition_generation(partition_id),
+            nonce=nonce,
         )
         if cached is not None:
             return self._replace_cached(partition_id, tables)
@@ -3060,8 +3196,9 @@ class LanceStore:
         cached = self._cached(partition_id)
         directory = self.directory / "projects" / partition_id
         generation = self._partition_generation(partition_id)
+        nonce = self._partition_nonce(partition_id)
         if cached is not None:
-            if directory.is_dir() and cached.generation == generation:
+            if directory.is_dir() and cached.generation == generation and cached.nonce == nonce:
                 return cached
             with self._partitions_lock:
                 self._partitions.pop(partition_id, None)
@@ -3074,6 +3211,7 @@ class LanceStore:
                 chunks=cast(LanceTable, database.open_table("chunks")),
                 references=self._open_optional_table(database, "references"),
                 generation=generation,
+                nonce=nonce,
             )
         except (ValueError, FileNotFoundError):
             return None
@@ -3085,6 +3223,39 @@ class LanceStore:
             return int(path.read_text())
         except (OSError, ValueError):
             return 0
+
+    def _partition_nonce(self, partition_id: str) -> str:
+        try:
+            return (self.directory / "partition-generations" / f"{partition_id}.nonce").read_text()
+        except OSError:
+            return ""
+
+    def _ensure_partition_nonce(self, partition_id: str) -> str:
+        """Return the identity of this creation of the partition, minting one if absent.
+
+        Removing a partition unlinks its generation file, which reads back as 0
+        -- the value almost every cached handle in another process holds -- so a
+        partition recreated at the same path would look unchanged to them. The
+        nonce is minted when the partition is first opened for writing and
+        deleted with it, so a recreated partition always carries a different
+        one and stale handles fail the check and reopen. An existing nonce is
+        never replaced (the first creator wins).
+        """
+        path = self.directory / "partition-generations" / f"{partition_id}.nonce"
+        existing = self._partition_nonce(partition_id)
+        if existing:
+            return existing
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(FileExistsError, OSError), path.open("x") as handle:
+            handle.write(uuid.uuid4().hex)
+        return self._partition_nonce(partition_id)
+
+    @staticmethod
+    def _unlink_partition_markers(directory: Path, partition_id: str) -> None:
+        for name in (partition_id, f"{partition_id}.nonce"):
+            marker = directory / "partition-generations" / name
+            if marker.exists():
+                marker.unlink()
 
     def _advance_partition_generation(self, partition_id: str) -> None:
         path = self.directory / "partition-generations" / partition_id

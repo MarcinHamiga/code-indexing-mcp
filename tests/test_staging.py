@@ -727,6 +727,144 @@ def test_a_commit_whose_rollback_fails_keeps_its_journal_for_recovery(
     assert list((tmp_path / "staging").glob("*/*/")) == []
 
 
+class _NoLinearScan(list):  # type: ignore[type-arg]
+    """A list that fails the test if membership is ever answered by scanning it."""
+
+    def __contains__(self, item: object) -> bool:
+        raise AssertionError("membership test scanned the id list")
+
+
+def test_staging_marks_do_not_scan_their_id_lists(tmp_path: Path) -> None:
+    """IDX-13: `x not in list` made every mark O(n); 100k files took half a minute."""
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+    job.replace_file_ids = _NoLinearScan()
+    job.replace_reference_file_ids = _NoLinearScan()
+    job.removed_file_ids = _NoLinearScan()
+
+    for file_id in ("a", "b", "a", "c", "b"):
+        job.mark_replaced(file_id)
+        job.mark_references_replaced(file_id)
+        job.mark_removed(file_id)
+
+    assert list(job.replace_file_ids) == ["a", "b", "c"]
+    assert list(job.replace_reference_file_ids) == ["a", "b", "c"]
+    assert list(job.removed_file_ids) == ["a", "b", "c"]
+
+
+class _HardKill(BaseException):
+    """Stands in for a process death: nothing downstream of it runs normally."""
+
+
+def _leave_crashed_commit(indexer: Indexer, project: object, root: Path, new_source: str) -> None:
+    """Run an index whose commit writes live tables and then 'dies' with no rollback."""
+    (root / "main.py").write_text(new_source)
+    original = LanceStore.replace_files_from_arrow
+
+    def apply_then_die(self: LanceStore, project_id: str, **kwargs: object) -> None:
+        original(self, project_id, **kwargs)  # type: ignore[arg-type]
+        raise _HardKill
+
+    def no_rollback(self: LanceStore, *args: object, **kwargs: object) -> None:
+        raise RuntimeError("process is gone")
+
+    with (
+        patch.object(LanceStore, "replace_files_from_arrow", apply_then_die),
+        patch.object(LanceStore, "restore_versions", no_rollback),
+        pytest.raises(_HardKill),
+    ):
+        indexer.index(project)  # type: ignore[arg-type]
+
+
+def test_a_later_index_retires_a_crashed_commits_journal_instead_of_being_undone(
+    tmp_path: Path,
+) -> None:
+    """IDX-2: replaying an old journal over a later successful commit loses that commit."""
+    root = tmp_path / "repo"
+    project = make_project(root, "def generation_one():\n    return 1\n")
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+
+    _leave_crashed_commit(indexer, project, root, "def generation_two():\n    return 2\n")
+    assert len(list((tmp_path / "staging").glob(f"*/*/*/{JOURNAL_NAME}"))) == 1
+
+    # A later writer in the same (or any) process indexes on top.
+    (root / "main.py").write_text("def generation_three():\n    return 3\n")
+    indexer.index(project)
+    symbols = {chunk.symbol for chunk in store.list_chunks([project.id])}
+    assert symbols == {"generation_three"}
+
+    # A new Application's startup recovery must not replay the old journal.
+    recover_staged_commits(tmp_path / "staging", store)
+    assert {chunk.symbol for chunk in store.list_chunks([project.id])} == {"generation_three"}
+    assert list((tmp_path / "staging").glob("*/*/")) == []
+
+
+def test_recovery_at_index_start_invalidates_the_slot_stamp(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    project = make_project(root, "def generation_one():\n    return 1\n")
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    partition = store.active_partition(project.id)
+    store.upsert_slot(
+        store.get_slot(partition.slot_id).model_copy(  # type: ignore[union-attr]
+            update={"indexed_head": "abc", "indexed_clean": True}
+        )
+    )
+
+    _leave_crashed_commit(indexer, project, root, "def generation_two():\n    return 2\n")
+    store.upsert_slot(
+        store.get_slot(partition.slot_id).model_copy(  # type: ignore[union-attr]
+            update={"indexed_head": "abc", "indexed_clean": True}
+        )
+    )
+    # Recovery restores the pre-crash tables, then the stamp must not claim a
+    # state it can no longer vouch for.
+    assert recover_staged_commits(tmp_path / "staging", store) == 1
+    slot = store.get_slot(partition.slot_id)
+    assert slot is not None
+    assert slot.indexed_head is None
+    assert slot.indexed_clean is None
+
+
+def test_index_refuses_to_run_over_a_journal_it_cannot_roll_back(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    project = make_project(root, "def generation_one():\n    return 1\n")
+    indexer, _ = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    _leave_crashed_commit(indexer, project, root, "def generation_two():\n    return 2\n")
+
+    def fails(self: LanceStore, *args: object, **kwargs: object) -> None:
+        raise RuntimeError("storage unavailable")
+
+    with (
+        patch.object(LanceStore, "restore_versions", fails),
+        pytest.raises(CodeIndexingError) as raised,
+    ):
+        indexer.index(project)
+    assert raised.value.code is ErrorCode.INTERNAL_ERROR
+    # The journal is kept, so the data it protects is not abandoned.
+    assert len(list((tmp_path / "staging").glob(f"*/*/*/{JOURNAL_NAME}"))) == 1
+
+
+def test_startup_recovery_skips_a_project_whose_writer_lock_is_held(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    project = make_project(root, "def generation_one():\n    return 1\n")
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+    _leave_crashed_commit(indexer, project, root, "def generation_two():\n    return 2\n")
+
+    with FileLock(tmp_path / "locks" / f"{project.id}.lock"):
+        assert (
+            recover_staged_commits(tmp_path / "staging", store, lock_directory=tmp_path / "locks")
+            == 0
+        )
+    assert len(list((tmp_path / "staging").glob(f"*/*/*/{JOURNAL_NAME}"))) == 1
+    assert (
+        recover_staged_commits(tmp_path / "staging", store, lock_directory=tmp_path / "locks") == 1
+    )
+
+
 def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     project = make_project(root)

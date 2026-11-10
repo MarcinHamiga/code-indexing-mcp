@@ -25,10 +25,13 @@ from lancedb.table import LanceTable
 from code_indexing_mcp import storage as storage_module
 from code_indexing_mcp.errors import ErrorCode
 from code_indexing_mcp.git_state import (
-    partition_id as _git_partition_id,
+    GitProbeOutcome,
+    GitState,
+    SelectorKind,
+    probe_git_state,
 )
 from code_indexing_mcp.git_state import (
-    probe_git_state,
+    partition_id as _git_partition_id,
 )
 from code_indexing_mcp.git_state import slot_id as _git_slot_id
 from code_indexing_mcp.models import ProjectInfo, ProjectSlot, StoredChunk, StoredFile
@@ -2386,6 +2389,57 @@ def test_delete_partition_preserves_registration_and_re_stamps_the_generation(
     assert not (store.directory / "projects" / project.id).exists()
 
 
+@pytest.mark.parametrize("change", ["schema_version", "model"])
+def test_sibling_slots_are_not_compatible_after_one_slot_is_rebuilt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """STO-3: rebuilding slot A re-stamps the project row; slot B must still rebuild."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    monkeypatch.setattr(storage_module, "SCHEMA_VERSION", 6)
+    store.upsert_project(project, model_id="test/model")
+    for slot_id in ("slot-a", "slot-b"):
+        store.upsert_slot(
+            _slot(project.id, slot_id, partition_id=f"partition-{slot_id}").model_copy(
+                update={"schema_version": 6}
+            )
+        )
+        store.replace_file(
+            stored_file(project.id),
+            _stored_chunks(project.id, 1),
+            partition_id=f"partition-{slot_id}",
+        )
+    for partition_id in ("partition-slot-a", "partition-slot-b"):
+        assert (
+            store.incompatibility_reason(project.id, "test/model", partition_id=partition_id)
+            is None
+        )
+
+    # The release changes the generation; slot A is rebuilt and re-stamped.
+    new_model = "test/model" if change == "schema_version" else "test/other"
+    if change == "schema_version":
+        monkeypatch.setattr(storage_module, "SCHEMA_VERSION", 7)
+    assert store.incompatibility_reason(project.id, new_model, partition_id="partition-slot-a")
+    store.delete_partition(project.id, model_id=new_model, partition_id="partition-slot-a")
+    slot_a = store.get_slot("slot-a")
+    assert slot_a is not None
+    store.upsert_slot(
+        slot_a.model_copy(
+            update={"model_id": new_model, "schema_version": storage_module.SCHEMA_VERSION}
+        )
+    )
+    assert (
+        store.incompatibility_reason(project.id, new_model, partition_id="partition-slot-a") is None
+    )
+
+    # Slot B still holds the old generation's rows and must say so.
+    reason = store.incompatibility_reason(project.id, new_model, partition_id="partition-slot-b")
+    assert reason is not None
+    assert ("schema version" if change == "schema_version" else "embedding model") in reason
+
+
 def test_merge_semantics_probe_passes_on_the_installed_lancedb() -> None:
     # A future lancedb that regresses when_not_matched_by_source_delete to the
     # all-or-nothing gate behavior fails this probe, and with it every batched
@@ -2764,6 +2818,29 @@ def test_remove_project_deletes_slots_pointer_and_partitions(tmp_path: Path) -> 
     assert slot.partition_id == project.id
 
 
+def test_cached_handle_is_dropped_when_another_process_removes_and_recreates_the_project(
+    tmp_path: Path,
+) -> None:
+    """STO-1: unlinking the generation file reset it to 0, which cached handles held."""
+    daemon = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    daemon.upsert_project(project, model_id="test/model")
+    daemon.replace_file(stored_file(project.id), _stored_chunks(project.id, 1))
+    cached = daemon._tables(project.id)
+    assert daemon._tables(project.id) is cached
+
+    cli = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    assert cli.remove_project(project.id) is True
+    cli.upsert_project(project, model_id="test/model")
+    cli.replace_file(stored_file(project.id), _stored_chunks(project.id, 2))
+
+    assert daemon._tables(project.id) is not cached
+    existing = daemon._existing_tables(project.id)
+    assert existing is not None and existing is daemon._tables(project.id)
+
+
 def test_chunk_fetch_is_limited_to_the_active_physical_slot(tmp_path: Path) -> None:
     store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
     root = tmp_path / "repo"
@@ -2817,25 +2894,141 @@ def test_storage_stats_does_not_adopt_or_materialize_a_project(tmp_path: Path) -
     assert not (store.directory / "projects").exists()
 
 
-def test_branch_cache_limit_evicts_the_oldest_inactive_slot(tmp_path: Path) -> None:
-    store = LanceStore(tmp_path / "lancedb", vector_dimension=4, branch_cache_limit=1)
-    store.upsert_slot(_slot("project-a", "slot-a", partition_id="partition-a"))
-    store.upsert_slot(
-        _slot("project-a", "slot-b", partition_id="partition-b").model_copy(
-            update={"last_used_at": 1}
-        )
+def _branch_slot(
+    project_id: str, branch: str, *, last_used_at: int, state: str = "ready"
+) -> ProjectSlot:
+    """A slot whose id is the real key for *branch*, so the stale sweep keeps it."""
+    git = GitState(
+        probe=GitProbeOutcome.GIT,
+        selector_kind=SelectorKind.REF,
+        selector_value=f"refs/heads/{branch}",
+        repository_identity="/repo/.git",
     )
-    store.activate_slot("project-a", "slot-a", checkout_key="checkout")
-    store._tables("partition-a")
-    store._tables("partition-b")
+    slot = _git_slot_id(project_id, git)
+    return _slot(
+        project_id,
+        slot,
+        partition_id=_git_partition_id(slot),
+        selector_value=f"refs/heads/{branch}",
+        state=state,
+    ).model_copy(update={"repository_identity": "/repo/.git", "last_used_at": last_used_at})
+
+
+def _branch_store(
+    tmp_path: Path, branches: dict[str, tuple[int, str]], *, active: str, limit: int
+) -> tuple[LanceStore, dict[str, ProjectSlot]]:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4, branch_cache_limit=limit)
+    checkout = tmp_path / "checkout-git"
+    checkout.mkdir(exist_ok=True)
+    slots: dict[str, ProjectSlot] = {}
+    for branch, (last_used_at, state) in branches.items():
+        slot = _branch_slot("project-a", branch, last_used_at=last_used_at, state=state)
+        store.upsert_slot(slot)
+        store._tables(slot.partition_id)
+        slots[branch] = slot
+    store.activate_slot("project-a", slots[active].slot_id, checkout_key=str(checkout))
+    return store, slots
+
+
+def _surviving_branches(store: LanceStore, slots: dict[str, ProjectSlot]) -> set[str]:
+    alive = {slot.slot_id for slot in store.list_slots("project-a")}
+    return {branch for branch, slot in slots.items() if slot.slot_id in alive}
+
+
+def test_branch_cache_limit_counts_the_active_slot(tmp_path: Path) -> None:
+    """STO-8: the limit covers active plus inactive slots, as the docs say."""
+    store, slots = _branch_store(
+        tmp_path,
+        {"main": (50, "ready"), "old1": (1, "ready"), "old2": (2, "ready")},
+        active="main",
+        limit=1,
+    )
 
     assert store.maintain_project(
         "project-a", cleanup_older_than=timedelta(hours=1), branch_cache_limit=1
     )
 
-    assert [slot.slot_id for slot in store.list_slots("project-a")] == ["slot-a"]
-    assert not (store.directory / "projects" / "partition-b").exists()
-    assert store.active_slot("project-a").slot_id == "slot-a"
+    assert _surviving_branches(store, slots) == {"main"}
+    assert not (store.directory / "projects" / slots["old2"].partition_id).exists()
+    assert store.active_slot("project-a").slot_id == slots["main"].slot_id  # type: ignore[union-attr]
+
+
+def test_branch_cache_limit_evicts_the_oldest_inactive_slot(tmp_path: Path) -> None:
+    store, slots = _branch_store(
+        tmp_path,
+        {"main": (50, "ready"), "old1": (1, "ready"), "old2": (2, "ready")},
+        active="main",
+        limit=2,
+    )
+
+    store.maintain_project("project-a", cleanup_older_than=timedelta(hours=1))
+
+    # One active plus the single most recently used inactive slot.
+    assert _surviving_branches(store, slots) == {"main", "old2"}
+    assert not (store.directory / "projects" / slots["old1"].partition_id).exists()
+
+
+def test_slots_stuck_in_indexing_do_not_displace_healthy_slots(tmp_path: Path) -> None:
+    """STO-9a: maintenance holds the writer lock, so an `indexing` slot is a dead build."""
+    store, slots = _branch_store(
+        tmp_path,
+        {
+            "main": (50, "ready"),
+            "stuck1": (1, "indexing"),
+            "stuck2": (2, "indexing"),
+            "ready1": (100, "ready"),
+            "ready2": (200, "ready"),
+        },
+        active="main",
+        limit=3,
+    )
+
+    store.maintain_project("project-a", cleanup_older_than=timedelta(hours=1))
+
+    assert _surviving_branches(store, slots) == {"main", "ready1", "ready2"}
+
+
+def test_recovery_protected_slots_are_never_evicted(tmp_path: Path) -> None:
+    store, slots = _branch_store(
+        tmp_path,
+        {"main": (50, "ready"), "crashed": (1, "indexing")},
+        active="main",
+        limit=1,
+    )
+
+    store.maintain_project(
+        "project-a",
+        cleanup_older_than=timedelta(hours=1),
+        protected_slot_ids={slots["crashed"].slot_id},
+    )
+
+    assert _surviving_branches(store, slots) == {"main", "crashed"}
+
+
+def test_pointers_to_removed_checkouts_are_pruned_and_free_their_slots(tmp_path: Path) -> None:
+    """STO-9b: an ephemeral worktree's pointer must not pin its branch slot forever."""
+    store, slots = _branch_store(
+        tmp_path,
+        {"main": (50, "ready"), "agent": (60, "ready")},
+        active="main",
+        limit=1,
+    )
+    gone = tmp_path / "removed-worktree" / ".git"
+    store.activate_slot("project-a", slots["agent"].slot_id, checkout_key=str(gone))
+    store.activate_slot("project-a", slots["agent"].slot_id, checkout_key="")
+
+    store.maintain_project("project-a", cleanup_older_than=timedelta(hours=1))
+
+    keys = {str(row["checkout_key"]) for row in store._active_pointer_rows("project-a")}
+    assert str(gone) not in keys
+    # An empty legacy key is not a path and is left alone, so `agent` stays pinned by it.
+    assert "" in keys
+    assert _surviving_branches(store, slots) == {"main", "agent"}
+    store._active_slots.delete("checkout_key = ''")
+
+    store.maintain_project("project-a", cleanup_older_than=timedelta(hours=1))
+
+    assert _surviving_branches(store, slots) == {"main"}
 
 
 def test_touch_slot_buffers_without_writing(tmp_path: Path) -> None:
@@ -2853,6 +3046,41 @@ def test_touch_slot_buffers_without_writing(tmp_path: Path) -> None:
     # written yet.
     slot = store.get_slot("slot-a")
     assert slot is not None
+    assert slot.last_used_at > 1
+
+
+def test_flush_slot_touches_does_not_overwrite_a_state_published_mid_flush(
+    tmp_path: Path,
+) -> None:
+    """STO-11: a commit publishing `ready` between the flush's read and write survives."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    store.upsert_slot(_slot("project-a", "slot-a", state="indexing"))
+    published = _slot("project-a", "slot-a", state="ready").model_copy(
+        update={"indexed_head": "abc123", "indexed_clean": True}
+    )
+    armed = False
+    competing = False
+    original_merge = LanceTable.merge_insert
+
+    def merge_after_competing_commit(self: LanceTable, key: str) -> LanceMergeInsertBuilder:
+        nonlocal competing
+        if armed and not competing and self.name == "project_slots":
+            competing = True
+            try:
+                store.upsert_slot(published)
+            finally:
+                competing = False
+        return original_merge(self, key)
+
+    store.touch_slot("slot-a")
+    armed = True
+    with patch.object(LanceTable, "merge_insert", merge_after_competing_commit):
+        store.flush_slot_touches()
+    armed = False
+
+    slot = store.get_slot("slot-a")
+    assert slot is not None
+    assert (slot.state, slot.indexed_head, slot.indexed_clean) == ("ready", "abc123", True)
     assert slot.last_used_at > 1
 
 
@@ -2905,7 +3133,7 @@ def test_branch_cache_limit_respects_an_unflushed_touch(tmp_path: Path) -> None:
     the unrelated obsolete-slot-key cleanup (that check only looks at
     ``ref``/``commit`` slots) -- this test is only about the LRU limit.
     """
-    store = LanceStore(tmp_path / "lancedb", vector_dimension=4, branch_cache_limit=1)
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4, branch_cache_limit=2)
     store.upsert_slot(
         _slot("project-a", "slot-a", partition_id="partition-a", selector_kind="workspace")
     )
@@ -2928,7 +3156,7 @@ def test_branch_cache_limit_respects_an_unflushed_touch(tmp_path: Path) -> None:
     store.touch_slot("slot-c")
 
     assert store.maintain_project(
-        "project-a", cleanup_older_than=timedelta(hours=1), branch_cache_limit=1
+        "project-a", cleanup_older_than=timedelta(hours=1), branch_cache_limit=2
     )
 
     remaining = {slot.slot_id for slot in store.list_slots("project-a")}
@@ -3014,12 +3242,11 @@ def test_maintain_project_protects_every_checkout_pointer(tmp_path: Path) -> Non
     )
     store.upsert_slot(victim)
     store.upsert_slot(_slot(project.id, "worktree-slot", partition_id="partition-wt"))
-    store.activate_slot(project.id, branch_slot.slot_id, checkout_key="/repo/.git")
-    store.activate_slot(
-        project.id,
-        "worktree-slot",
-        checkout_key="/wt/.git",
-    )
+    # Pointers name real checkout directories: a pointer to a deleted one is pruned.
+    worktree_git = tmp_path / "wt-git"
+    worktree_git.mkdir()
+    store.activate_slot(project.id, branch_slot.slot_id, checkout_key=str(root / ".git"))
+    store.activate_slot(project.id, "worktree-slot", checkout_key=str(worktree_git))
     store._tables(branch_slot.partition_id)
     store._tables("partition-wt")
     store._tables("partition-old")
@@ -3043,7 +3270,9 @@ def test_maintain_project_sweeps_slots_from_an_obsolete_key_formula(tmp_path: Pa
     store.upsert_slot(_slot("project-a", stale_id, partition_id=f"slot-{stale_id[:32]}"))
     current = _slot("project-a", "current-slot", partition_id="partition-current")
     store.upsert_slot(current)
-    store.activate_slot("project-a", "current-slot", checkout_key="/repo/.git")
+    checkout = tmp_path / "checkout-git"
+    checkout.mkdir()
+    store.activate_slot("project-a", "current-slot", checkout_key=str(checkout))
     store._tables(f"slot-{stale_id[:32]}")
     store._tables("partition-current")
 
@@ -3264,3 +3493,51 @@ def test_project_slots_registry_gains_status_columns_in_place(tmp_path: Path) ->
     assert slot.indexed_clean is True
     assert slot.indexed_status_fingerprint is None
     assert slot.indexed_status_paths is None
+
+
+def test_resolve_partition_that_changes_nothing_does_not_write_the_registry(
+    tmp_path: Path,
+) -> None:
+    """STO-2: re-resolving an already active slot must not flush a registry write."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model", state="pending")
+    state = probe_git_state(root)
+    store.resolve_partition(project, state)
+    slots_version = store._project_slots.version
+    active_version = store._active_slots.version
+
+    store.resolve_partition(project, state)
+
+    assert store._project_slots.version == slots_version
+    assert store._active_slots.version == active_version
+
+
+def test_find_symbol_chunks_treats_backslashes_and_wildcards_literally(tmp_path: Path) -> None:
+    """A name with a backslash must match itself; `_` and `%` must not be wildcards."""
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    chunks = _stored_chunks(project.id, 4)
+    names = ["App\\Models\\User", "a_b", "axb", "50%off"]
+    chunks = [
+        chunk.model_copy(update={"symbol": name, "qualified_symbol": name})
+        for chunk, name in zip(chunks, names, strict=True)
+    ]
+    store.replace_file(stored_file(project.id), chunks)
+
+    def found(name: str, match: str) -> list[str]:
+        rows = store.find_symbol_chunks(name, project.id, match=match, kinds=None, limit=10)
+        return sorted(str(row.symbol) for row in rows)
+
+    assert found("App\\Models\\User", "exact") == [names[0]]
+    assert found("App\\Models\\", "prefix") == [names[0]]
+    assert found("Models\\Us", "contains") == [names[0]]
+    assert found("a_", "prefix") == ["a_b"]
+    assert found("_b", "contains") == ["a_b"]
+    assert found("%", "contains") == ["50%off"]
+    assert found("50%", "prefix") == ["50%off"]

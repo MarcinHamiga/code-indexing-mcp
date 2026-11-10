@@ -29,6 +29,7 @@ from typing import Any, cast
 
 import numpy as np
 import pyarrow as pa
+from filelock import FileLock, Timeout
 
 from .models import StoredFile
 from .storage import LanceStore, PartitionRef, TableVersions
@@ -256,6 +257,22 @@ def pending_recovery(staging_root: Path, project_id: str) -> PendingRecovery:
     )
 
 
+def has_committing_journal(staging_root: Path, project_id: str, slot_id: str) -> bool:
+    """Whether a readable ``committing`` journal still exists for one slot.
+
+    Unreadable journals are not counted: they are kept for inspection and do
+    not name versions this slot can be restored to.
+    """
+    for journal_path in _journal_paths(staging_root):
+        relative = journal_path.relative_to(staging_root).parts
+        if relative[0] != project_id or (len(relative) == 4 and relative[1] != slot_id):
+            continue
+        payload = _read_journal(journal_path)
+        if payload is not None and payload.get("phase") == PHASE_COMMITTING:
+            return True
+    return False
+
+
 def has_pending_recovery(staging_root: Path, project_id: str) -> bool:
     """Return whether maintenance must preserve *project_id*'s old versions.
 
@@ -304,6 +321,11 @@ class StagingJob:
         self._chunk_file_ids: set[str] = set()
         self._last_chunk_file_id: str | None = None
         self.removed_file_ids: list[str] = []
+        # Membership sets beside the ordered lists (the lists are what the
+        # journal records); a `not in list` scan made every mark O(n).
+        self._replace_seen: set[str] = set()
+        self._replace_reference_seen: set[str] = set()
+        self._removed_seen: set[str] = set()
         self._journal: dict[str, Any] = {}
         self._files_sink: Any = None
         self._chunks_sink: Any = None
@@ -409,16 +431,19 @@ class StagingJob:
         self._references_writer.write_batch(pa.record_batch(columns, schema=self._reference_schema))
 
     def mark_replaced(self, file_id: str) -> None:
-        if file_id not in self.replace_file_ids:
+        if file_id not in self._replace_seen:
+            self._replace_seen.add(file_id)
             self.replace_file_ids.append(file_id)
 
     def mark_references_replaced(self, file_id: str) -> None:
         """Mark one file's structural rows for replacement, independently of chunks."""
-        if file_id not in self.replace_reference_file_ids:
+        if file_id not in self._replace_reference_seen:
+            self._replace_reference_seen.add(file_id)
             self.replace_reference_file_ids.append(file_id)
 
     def mark_removed(self, file_id: str) -> None:
-        if file_id not in self.removed_file_ids:
+        if file_id not in self._removed_seen:
+            self._removed_seen.add(file_id)
             self.removed_file_ids.append(file_id)
 
     def begin_commit(self, versions: TableVersions) -> None:
@@ -687,7 +712,15 @@ class StagingJob:
         _write_atomically(self.directory / JOURNAL_NAME, payload)
 
 
-def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
+def recover_staged_commits(
+    staging_root: Path,
+    store: LanceStore,
+    *,
+    lock_directory: Path | None = None,
+    project_id: str | None = None,
+    slot_id: str | None = None,
+    project_lock_held: bool = False,
+) -> int:
     """Roll back every interrupted commit before queries are accepted.
 
     A journal still in ``staging`` never reached the live tables, and one in a
@@ -701,109 +734,140 @@ def recover_staged_commits(staging_root: Path, store: LanceStore) -> int:
     :data:`MAX_RECOVERY_ATTEMPTS`. Past that the journal is retired and its
     project marked ``error``: the rollback is never going to succeed, and
     retrying it forever would block every startup behind a lost cause.
+
+    The project writer lock is what proves a journal belongs to a dead writer:
+    a live index or backfill holds it for the whole run. With
+    ``lock_directory`` each journal is handled under a non-blocking attempt at
+    its project's lock and skipped when another process holds it. A caller that
+    already holds that lock passes ``project_lock_held``; ``project_id`` and
+    ``slot_id`` narrow the sweep to one project, or one slot plus the legacy
+    journals that predate slot directories.
     """
     if not staging_root.is_dir():
         return 0
     recovered = 0
     for journal_path in _journal_paths(staging_root):
-        directory = journal_path.parent
-        journal = _read_journal(journal_path)
-        if journal is None:
-            logger.warning("Ignoring unreadable staging journal: %s", journal_path)
+        relative = journal_path.relative_to(staging_root).parts
+        path_project = relative[0]
+        path_slot = relative[1] if len(relative) == 4 else None
+        if project_id is not None and path_project != project_id:
             continue
-        if journal.get("phase") != PHASE_COMMITTING:
-            _remove_job_directory(directory, staging_root)
+        if slot_id is not None and path_slot not in {None, slot_id}:
             continue
-        project_id = str(journal.get("project_id", ""))
-        slot_id: str | None = None
-        partition_id: str | None = None
+        if lock_directory is None or project_lock_held:
+            recovered += _recover_journal(journal_path, staging_root, store)
+            continue
+        lock = FileLock(lock_directory / f"{path_project}.lock", timeout=0)
         try:
-            if not project_id:
-                raise ValueError("Staging journal has no project_id")
-            journal_version = int(journal.get("version", LEGACY_JOURNAL_FORMAT_VERSION))
-            if journal_version == LEGACY_JOURNAL_FORMAT_VERSION:
-                versions = TableVersions(
-                    files=int(journal["files_version"]),
-                    chunks=int(journal["chunks_version"]),
-                    references=0,
-                )
+            with lock:
+                recovered += _recover_journal(journal_path, staging_root, store)
+        except Timeout:
+            logger.info("Leaving staging journal %s: its project is being written", journal_path)
+    return recovered
+
+
+def _recover_journal(journal_path: Path, staging_root: Path, store: LanceStore) -> int:
+    """Roll back or retire one journal; return 1 when a rollback was applied."""
+    directory = journal_path.parent
+    journal = _read_journal(journal_path)
+    if journal is None:
+        if journal_path.exists():
+            logger.warning("Ignoring unreadable staging journal: %s", journal_path)
+        return 0
+    if journal.get("phase") != PHASE_COMMITTING:
+        _remove_job_directory(directory, staging_root)
+        return 0
+    project_id = str(journal.get("project_id", ""))
+    slot_id: str | None = None
+    partition_id: str | None = None
+    try:
+        if not project_id:
+            raise ValueError("Staging journal has no project_id")
+        journal_version = int(journal.get("version", LEGACY_JOURNAL_FORMAT_VERSION))
+        if journal_version == LEGACY_JOURNAL_FORMAT_VERSION:
+            versions = TableVersions(
+                files=int(journal["files_version"]),
+                chunks=int(journal["chunks_version"]),
+                references=0,
+            )
+            partition_id = project_id
+            restore_references = False
+        elif journal_version in {THREE_TABLE_JOURNAL_FORMAT_VERSION, JOURNAL_FORMAT_VERSION}:
+            versions = TableVersions(
+                files=int(journal["files_version"]),
+                chunks=int(journal["chunks_version"]),
+                references=int(journal["references_version"]),
+            )
+            raw_slot_id = journal.get("slot_id")
+            raw_partition_id = journal.get("partition_id")
+            if isinstance(raw_slot_id, str) and isinstance(raw_partition_id, str):
+                slot_id = raw_slot_id
+                partition_id = raw_partition_id
+            elif journal_version == THREE_TABLE_JOURNAL_FORMAT_VERSION:
+                # Version 2 predated mandatory slot identity and could only
+                # have written the logical project's legacy partition.
                 partition_id = project_id
-                restore_references = False
-            elif journal_version in {THREE_TABLE_JOURNAL_FORMAT_VERSION, JOURNAL_FORMAT_VERSION}:
-                versions = TableVersions(
-                    files=int(journal["files_version"]),
-                    chunks=int(journal["chunks_version"]),
-                    references=int(journal["references_version"]),
-                )
-                raw_slot_id = journal.get("slot_id")
-                raw_partition_id = journal.get("partition_id")
-                if isinstance(raw_slot_id, str) and isinstance(raw_partition_id, str):
-                    slot_id = raw_slot_id
-                    partition_id = raw_partition_id
-                elif journal_version == THREE_TABLE_JOURNAL_FORMAT_VERSION:
-                    # Version 2 predated mandatory slot identity and could only
-                    # have written the logical project's legacy partition.
-                    partition_id = project_id
-                else:
-                    raise ValueError("Slot-aware staging journal has incomplete identity")
-                restore_references = True
             else:
-                raise ValueError(f"Unsupported staging journal version: {journal_version}")
-            assert partition_id is not None
-            if not store.owns_recovery_partition(project_id, partition_id, slot_id=slot_id):
-                restored = False
-            else:
-                restored = store.restore_versions(
-                    project_id,
-                    versions,
-                    restore_references=restore_references,
-                    partition_id=partition_id,
-                )
-        except Exception:
-            attempts = int(journal.get("recovery_attempts", 0)) + 1
-            if attempts < MAX_RECOVERY_ATTEMPTS:
-                # Could be transient. Record the attempt so the retries are
-                # bounded even though the journal survives this startup.
-                logger.exception(
-                    "Could not roll back interrupted commit in %s (attempt %d of %d)",
-                    directory,
-                    attempts,
-                    MAX_RECOVERY_ATTEMPTS,
-                )
-                journal["recovery_attempts"] = attempts
-                _write_atomically(
-                    journal_path, json.dumps(journal, indent=2, sort_keys=True).encode()
-                )
-                continue
+                raise ValueError("Slot-aware staging journal has incomplete identity")
+            restore_references = True
+        else:
+            raise ValueError(f"Unsupported staging journal version: {journal_version}")
+        assert partition_id is not None
+        if not store.owns_recovery_partition(project_id, partition_id, slot_id=slot_id):
+            restored = False
+        else:
+            restored = store.restore_versions(
+                project_id,
+                versions,
+                restore_references=restore_references,
+                partition_id=partition_id,
+            )
+    except Exception:
+        attempts = int(journal.get("recovery_attempts", 0)) + 1
+        if attempts < MAX_RECOVERY_ATTEMPTS:
+            # Could be transient. Record the attempt so the retries are
+            # bounded even though the journal survives this startup.
             logger.exception(
-                "Giving up on the interrupted commit in %s after %d attempts. Project "
-                "%s may hold partially committed data; re-index it to rebuild.",
+                "Could not roll back interrupted commit in %s (attempt %d of %d)",
                 directory,
                 attempts,
-                project_id,
+                MAX_RECOVERY_ATTEMPTS,
             )
-            # Flagging the project is a courtesy to the operator; recovery runs
-            # during startup, so it must not fail construction if this does.
-            with contextlib.suppress(Exception):
-                if slot_id is not None and partition_id is not None:
-                    store.set_slot_state(
-                        PartitionRef(project_id, slot_id, partition_id, activation_epoch=0),
-                        "error",
-                    )
-                else:
-                    store.mark_project_state(project_id, "error")
-            _remove_job_directory(directory, staging_root)
-            continue
-        if not restored:
-            # The project was removed after the journal was written, so there
-            # is no longer anything to roll back.
-            logger.info(
-                "Discarding staged commit for removed project %s in %s", project_id, directory
-            )
-            _remove_job_directory(directory, staging_root)
-            continue
-        journal["phase"] = PHASE_ROLLED_BACK
-        _write_atomically(journal_path, json.dumps(journal, indent=2, sort_keys=True).encode())
+            journal["recovery_attempts"] = attempts
+            _write_atomically(journal_path, json.dumps(journal, indent=2, sort_keys=True).encode())
+            return 0
+        logger.exception(
+            "Giving up on the interrupted commit in %s after %d attempts. Project "
+            "%s may hold partially committed data; re-index it to rebuild.",
+            directory,
+            attempts,
+            project_id,
+        )
+        # Flagging the project is a courtesy to the operator; recovery runs
+        # during startup, so it must not fail construction if this does.
+        with contextlib.suppress(Exception):
+            if slot_id is not None and partition_id is not None:
+                store.set_slot_state(
+                    PartitionRef(project_id, slot_id, partition_id, activation_epoch=0),
+                    "error",
+                )
+            else:
+                store.mark_project_state(project_id, "error")
         _remove_job_directory(directory, staging_root)
-        recovered += 1
-    return recovered
+        return 0
+    if not restored:
+        # The project was removed after the journal was written, so there
+        # is no longer anything to roll back.
+        logger.info("Discarding staged commit for removed project %s in %s", project_id, directory)
+        _remove_job_directory(directory, staging_root)
+        return 0
+    if slot_id is not None:
+        # The slot row may describe the commit that was just undone (or a later
+        # one the restore cannot vouch for); drop the Git stamp so the next
+        # freshness check validates every path instead of trusting it.
+        with contextlib.suppress(Exception):
+            store.invalidate_slot_stamp(slot_id)
+    journal["phase"] = PHASE_ROLLED_BACK
+    _write_atomically(journal_path, json.dumps(journal, indent=2, sort_keys=True).encode())
+    _remove_job_directory(directory, staging_root)
+    return 1
