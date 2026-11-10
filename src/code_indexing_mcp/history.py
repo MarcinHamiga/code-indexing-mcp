@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -80,6 +81,18 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project_started ON runs(project_id, started_at DESC);
 """
+
+# Columns added after the first release of the table; older databases get them
+# on open. Mirrors _SCHEMA so a fresh database needs no migration.
+_COLUMN_MIGRATIONS = {
+    "pid": "INTEGER NOT NULL DEFAULT 0",
+    "rebuild_reason": "TEXT",
+    "reused_candidates": "INTEGER NOT NULL DEFAULT 0",
+    "reused_segments": "INTEGER NOT NULL DEFAULT 0",
+    "embedding_cache_lookup_ms": "INTEGER NOT NULL DEFAULT 0",
+    "embedding_cache_write_ms": "INTEGER NOT NULL DEFAULT 0",
+    "embedding_cache_status": "TEXT",
+}
 
 # Columns updated by HistoryStore.finish; anything else is rejected so a
 # recording bug fails loudly instead of silently widening the schema.
@@ -161,30 +174,57 @@ class HistoryStore:
         self.directory = directory
         self.path = directory / "runs.sqlite"
         directory.mkdir(parents=True, exist_ok=True)
-        with closing(self._connect()) as connection, connection:
+        self._initialize()
+
+    def _initialize(self) -> None:
+        """Create the schema, switch to WAL and migrate, safely under racing starts.
+
+        Several processes (the daemon and direct-mode servers) can construct a
+        store at the same moment. The WAL switch needs a lock SQLite does not wait
+        for, so it is retried; the column migration runs inside one
+        ``BEGIN IMMEDIATE`` transaction so only one process inspects and alters
+        the table at a time.
+        """
+        connection = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+        with closing(connection):
+            connection.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_SECONDS * 1000)}")
+            self._enable_wal(connection)
             connection.executescript(_SCHEMA)
-            # Databases created before pid tracking have no owner column;
-            # ALTER is cheap and idempotent because of the guard above.
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
-            if "pid" not in columns:
-                connection.execute("ALTER TABLE runs ADD COLUMN pid INTEGER NOT NULL DEFAULT 0")
-            if "rebuild_reason" not in columns:
-                connection.execute("ALTER TABLE runs ADD COLUMN rebuild_reason TEXT")
-            migrations = {
-                "reused_candidates": "INTEGER NOT NULL DEFAULT 0",
-                "reused_segments": "INTEGER NOT NULL DEFAULT 0",
-                "embedding_cache_lookup_ms": "INTEGER NOT NULL DEFAULT 0",
-                "embedding_cache_write_ms": "INTEGER NOT NULL DEFAULT 0",
-                "embedding_cache_status": "TEXT",
-            }
-            for column, definition in migrations.items():
-                if column not in columns:
-                    connection.execute(f"ALTER TABLE runs ADD COLUMN {column} {definition}")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+                for column, definition in _COLUMN_MIGRATIONS.items():
+                    if column not in columns:
+                        connection.execute(f"ALTER TABLE runs ADD COLUMN {column} {definition}")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            connection.execute("COMMIT")
+
+    @staticmethod
+    def _enable_wal(connection: sqlite3.Connection) -> None:
+        """Put the database in WAL mode once; the mode persists in the file."""
+        deadline = time.monotonic() + BUSY_TIMEOUT_SECONDS
+        delay = 0.005
+        while True:
+            try:
+                mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+                if str(mode).lower() != "wal":
+                    connection.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError as exc:
+                # Changing the journal mode takes a lock the busy handler does not
+                # wait for, so a concurrent starter surfaces as "database is locked".
+                if "locked" not in str(exc) and "busy" not in str(exc):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.1)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_SECONDS)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_SECONDS * 1000)}")
         return connection
 

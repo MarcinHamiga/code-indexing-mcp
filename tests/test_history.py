@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -331,3 +332,52 @@ def test_write_connections_close_after_the_operation(
 
     with pytest.raises(sqlite3.ProgrammingError):
         connections[0].execute("SELECT 1")
+
+
+def _construct_simultaneously(directory: Path, workers: int = 4) -> list[BaseException]:
+    barrier = threading.Barrier(workers)
+    failures: list[BaseException] = []
+
+    def construct() -> None:
+        barrier.wait(timeout=10)
+        try:
+            HistoryStore(directory)
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=construct) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    return failures
+
+
+def test_simultaneous_first_starts_all_construct(tmp_path: Path) -> None:
+    """Fresh data directory: the WAL switch must not fail with 'database is locked'."""
+    for round_ in range(15):
+        failures = _construct_simultaneously(tmp_path / f"fresh-{round_}")
+        assert failures == [], f"round {round_}: {failures!r}"
+
+
+def test_simultaneous_starts_on_a_pre_migration_schema_all_construct(tmp_path: Path) -> None:
+    """Old schema: racing migrations must not fail with 'duplicate column name'."""
+    for round_ in range(15):
+        directory = tmp_path / f"old-{round_}"
+        HistoryStore(directory)
+        with closing(sqlite3.connect(directory / "runs.sqlite")) as connection, connection:
+            for column in (
+                "pid",
+                "rebuild_reason",
+                "reused_candidates",
+                "reused_segments",
+                "embedding_cache_lookup_ms",
+                "embedding_cache_write_ms",
+                "embedding_cache_status",
+            ):
+                connection.execute(f"ALTER TABLE runs DROP COLUMN {column}")
+        failures = _construct_simultaneously(directory)
+        assert failures == [], f"round {round_}: {failures!r}"
+        with closing(sqlite3.connect(directory / "runs.sqlite")) as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+        assert {"pid", "rebuild_reason", "embedding_cache_status"} <= columns

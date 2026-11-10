@@ -5,12 +5,20 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
-from .embedding import Embedder, compose_passage
+import numpy as np
+
+from .embedding import (
+    Embedder,
+    PassageCandidate,
+    SegmentingEmbedder,
+    SegmentPlan,
+    compose_passage,
+)
 from .errors import CodeIndexingError, ErrorCode
-from .extractor import TreeSitterExtractor
+from .extractor import _CONTAINER_KINDS, TreeSitterExtractor
 from .models import (
     ChunkPreview,
     CodeChunk,
@@ -23,41 +31,41 @@ from .models import (
     SearchResponse,
     SymbolResponse,
 )
-from .path_filter import path_condition
+from .path_filter import (
+    PathPattern,
+    PathPatternError,
+    compile_path_patterns,
+    path_condition,
+    path_matches,
+)
+from .scanner import LANGUAGES
 from .storage import LanceStore, PartitionRef, RankComponents, _quoted
-from .token_batching import MAX_WINDOWS_PER_CANDIDATE
+from .token_batching import DEFAULT_MAX_TOKENS, MAX_WINDOWS_PER_CANDIDATE
 
 logger = logging.getLogger(__name__)
 
-# Rows fetched when path patterns cannot be pushed into the scan. Ten times the
-# ordinary window: enough that a moderately low-ranking match survives the Python
-# filter, without materialising a whole project's chunks.
-_FALLBACK_FETCH_ROWS = 500
-
 MAX_EXAMPLE_LENGTH = 16_384
 
-_EXAMPLE_SUFFIX: dict[str, str] = {
-    "python": ".py",
-    "java": ".java",
-    "javascript": ".js",
-    "typescript": ".ts",
-    "tsx": ".tsx",
-    "csharp": ".cs",
-    "sql": ".sql",
-    "gdscript": ".gd",
-    "gdshader": ".gdshader",
-    "godot_resource": ".tres",
-    "yaml": ".yaml",
-    "json": ".json",
-    "go": ".go",
-    "terraform": ".tf",
-    "rust": ".rs",
-    "c": ".c",
-    "cpp": ".cpp",
-    "lua": ".lua",
-}
 
-_DETECTION_ORDER: tuple[str, ...] = (
+def _example_suffixes() -> dict[str, str]:
+    """One representative file suffix per language, from the scanner's table.
+
+    The scanner's extension map is what indexing uses to decide a file's
+    language, so deriving from it keeps `search_by_example(language=...)` accepting
+    exactly the languages the tool schema (`LanguageName`) advertises.
+    """
+    suffixes: dict[str, str] = {}
+    for suffix, language in LANGUAGES.items():
+        suffixes.setdefault(language, suffix)
+    return suffixes
+
+
+_EXAMPLE_SUFFIX: dict[str, str] = _example_suffixes()
+
+# Order matters only for the first match among equally plausible candidates:
+# detection accepts a snippet only when exactly one language parses it cleanly.
+# The historical order is kept, then every other indexed language follows.
+_PRIMARY_DETECTION_ORDER: tuple[str, ...] = (
     "python",
     "typescript",
     "javascript",
@@ -76,6 +84,18 @@ _DETECTION_ORDER: tuple[str, ...] = (
     "terraform",
     "gdshader",
     "godot_resource",
+)
+# Zig's grammar accepts a bare `name: value` line as a declaration, so prose such
+# as "Note: fix this" would auto-detect as Zig and be chunked as code. It stays
+# available through the explicit `language="zig"` argument.
+_NOT_AUTO_DETECTED: frozenset[str] = frozenset({"zig"})
+_DETECTION_ORDER: tuple[str, ...] = (
+    *_PRIMARY_DETECTION_ORDER,
+    *(
+        language
+        for language in _EXAMPLE_SUFFIX
+        if language not in _PRIMARY_DETECTION_ORDER and language not in _NOT_AUTO_DETECTED
+    ),
 )
 
 
@@ -99,6 +119,26 @@ def _detect_example(
 def detect_example_language(extractor: TreeSitterExtractor, source: str) -> str | None:
     language, _ = _detect_example(extractor, source)
     return language
+
+
+def _embed_example_passages(embedder: Embedder, passages: list[str]) -> list[list[float]]:
+    """Embed example passages, windowing any that exceed the token budget.
+
+    An ambiguous snippet comes back as one passage of up to 16 KB; embedding it
+    whole would run a multi-thousand-token sequence in the long-lived process.
+    A passage within the budget is one window and embeds exactly as before;
+    a longer one contributes one vector per window, which is how example
+    search already treats a multi-chunk snippet.
+    """
+    if not isinstance(embedder, SegmentingEmbedder):
+        return embedder.embed_passages(passages)
+    plan = SegmentPlan(max_tokens=getattr(embedder, "max_input_tokens", DEFAULT_MAX_TOKENS))
+    segments = embedder.plan_and_embed([PassageCandidate("", text) for text in passages], plan)
+    return [
+        np.frombuffer(segment.vector, dtype="<f4").astype(float).tolist()
+        for candidate_segments in segments
+        for segment in candidate_segments
+    ]
 
 
 def _example_passages(
@@ -170,8 +210,14 @@ def _outline_items(
             index, from_parts = latest[key]
             existing = items[index]
             # A split declaration's parts overlap or abut; a gap or a whole
-            # declaration means another declaration with the same name.
-            if is_part and from_parts and chunk.start_line <= existing.end_line + 1:
+            # declaration means another declaration with the same name. A
+            # container's gap chunks (`class_part` text between and after its
+            # members) are the exception: member chunks sit between them, so they
+            # never abut, yet they belong to the container's latest entry.
+            container_gap = is_part and key[0] in _CONTAINER_KINDS
+            if container_gap or (
+                is_part and from_parts and chunk.start_line <= existing.end_line + 1
+            ):
                 if chunk.end_line > existing.end_line:
                     items[index] = existing.model_copy(update={"end_line": chunk.end_line})
                 continue
@@ -201,7 +247,7 @@ class _SearchPreparation:
     selected: dict[str, list[PartitionRef]]
     partition_ids: dict[str, list[str]]
     condition: str | None
-    paths: list[str] | None
+    paths: list[PathPattern]
     limit: int
     fetch: int
 
@@ -233,16 +279,17 @@ class SearchService:
             conditions.append(self._in_condition("language", languages))
         if kinds:
             conditions.append(self._in_condition("kind", kinds))
-        pushed_paths = path_condition(paths) if paths else None
+        try:
+            patterns = compile_path_patterns(paths or ())
+        except PathPatternError as exc:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER, f"Invalid paths filter: {exc}", paths=paths
+            ) from exc
+        # Every pattern compiles to a regex, so the filter is always pushed into
+        # the scan; the same regex then re-checks each fetched row.
+        pushed_paths = path_condition(patterns)
         if pushed_paths is not None:
             conditions.append(pushed_paths)
-        elif paths:
-            logger.debug(
-                "Path patterns %r could not be pushed down; filtering %d fetched rows in "
-                "Python, so low-ranking matches may be missed",
-                paths,
-                _FALLBACK_FETCH_ROWS,
-            )
         if partitions is None:
             selected = {
                 project_id: [self.store.active_partition(project_id)] for project_id in project_ids
@@ -268,9 +315,9 @@ class SearchService:
                 for project_id, refs in selected.items()
             },
             condition=" AND ".join(conditions) if conditions else None,
-            paths=paths,
+            paths=patterns,
             limit=limit,
-            fetch=_FALLBACK_FETCH_ROWS if paths and pushed_paths is None else max(50, limit * 5),
+            fetch=max(50, limit * 5),
         )
 
     def _collect_hits(
@@ -285,9 +332,7 @@ class SearchService:
         seen: set[tuple[object, ...]] = set()
         for row in rows:
             chunk = ChunkPreview.model_validate(row)
-            if preparation.paths and not any(
-                PurePosixPath(chunk.path).match(pattern) for pattern in preparation.paths
-            ):
+            if not path_matches(chunk.path, preparation.paths):
                 continue
             key: tuple[object, ...] = (
                 chunk.project_id,
@@ -394,10 +439,12 @@ class SearchService:
                 preparation,
                 include_content_in_key=True,
             )
-        if hits:
-            hits = self._explain_hits(
-                query, query_vector, hits, preparation.condition, preparation.selected
-            )
+            if hits:
+                # Same locked view as the hits: no second lock round trip, and
+                # no commit can land between a search and its explanation.
+                hits = self._explain_hits(
+                    query, query_vector, hits, preparation.condition, preparation.selected
+                )
         return SearchResponse(query=query, hits=hits)
 
     def search_by_example(
@@ -426,7 +473,7 @@ class SearchService:
             limit=limit,
             partitions=partitions,
         )
-        vectors = self.embedder.embed_passages(passages)
+        vectors = _embed_example_passages(self.embedder, passages)
         names = {project.id: project.name for project in self.store.list_projects()}
         with self.store.partitions_access(preparation.selected):
             hits = self._window_aware_hits(
@@ -540,7 +587,10 @@ class SearchService:
         condition: str | None,
         selected: dict[str, list[PartitionRef]],
     ) -> list[SearchHit]:
-        """Attach per-signal ranking explanations; never fails the search."""
+        """Attach per-signal ranking explanations; never fails the search.
+
+        The caller must already hold the partitions' access (``partitions_access``).
+        """
         wanted: dict[str, list[str]] = {}
         for hit in hits:
             wanted.setdefault(hit.project_id, []).append(hit.chunk_id)
@@ -549,10 +599,9 @@ class SearchService:
         }
         components: dict[str, RankComponents] = {}
         try:
-            with self.store.partitions_access(selected):
-                components = self.store.explain_hits(
-                    query, query_vector, wanted, condition, partition_ids=partition_ids
-                )
+            components = self.store.explain_hits(
+                query, query_vector, wanted, condition, partition_ids=partition_ids
+            )
         except Exception:
             logger.debug("Ranking explanation probes failed", exc_info=True)
         if not components:

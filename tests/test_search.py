@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -419,47 +420,54 @@ def test_path_filter_finds_matches_below_the_fetch_window(tmp_path: Path) -> Non
     assert [hit.path for hit in filtered.hits] == ["rare/needle.py"]
 
 
-def test_path_filter_respects_right_anchored_glob_semantics(tmp_path: Path) -> None:
+def test_path_filter_uses_gitignore_style_recursive_globs(tmp_path: Path) -> None:
     search, project = _indexed_tree(
         tmp_path,
         {
+            "top.py": "def alpha_zero():\n    return 0\n",
             "src/deep/b.py": "def alpha_one():\n    return 1\n",
             "src/a.py": "def alpha_two():\n    return 2\n",
+            "src/pkg/deep/c.py": "def alpha_four():\n    return 4\n",
             "tests/c.py": "def alpha_three():\n    return 3\n",
+            "vendor/x/src/y.py": "def alpha_five():\n    return 5\n",
         },
     )
 
-    # "src/*" spans one segment; "*.py" matches at any depth.
-    assert {hit.path for hit in search.search_code("alpha", [project], paths=["src/*"]).hits} == {
-        "src/a.py"
-    }
-    assert {hit.path for hit in search.search_code("alpha", [project], paths=["*.py"]).hits} == {
+    def found(*patterns: str) -> set[str]:
+        response = search.search_code("alpha", [project], paths=list(patterns), limit=50)
+        return {hit.path for hit in response.hits}
+
+    everything = {
+        "top.py",
         "src/deep/b.py",
         "src/a.py",
+        "src/pkg/deep/c.py",
         "tests/c.py",
+        "vendor/x/src/y.py",
     }
-    assert [
-        hit.path for hit in search.search_code("alpha", [project], paths=["src//a.py"]).hits
-    ] == ["src/a.py"]
-    assert {hit.path for hit in search.search_code("alpha", [project], paths=["*/"]).hits} == {
-        "src/deep/b.py",
-        "src/a.py",
-        "tests/c.py",
-    }
+    # Before: "**/*.py" dropped top.py, "src/**" matched only src/a.py,
+    # "src/**/*.py" only src/deep/b.py, "src/pkg" nothing.
+    assert found("**/*.py") == everything
+    assert found("*.py") == everything
+    assert found("src/**") == {"src/deep/b.py", "src/a.py", "src/pkg/deep/c.py"}
+    assert found("src/**/*.py") == {"src/deep/b.py", "src/a.py", "src/pkg/deep/c.py"}
+    assert found("src/pkg") == {"src/pkg/deep/c.py"}
+    # Before: "src/*" also matched vendor/x/src/y.py (right-anchored).
+    assert found("src/*") == {"src/a.py"}
+    assert found("src//a.py") == {"src/a.py"}
+    assert found("*/") == everything
 
 
-def test_untranslatable_path_pattern_still_filters_in_python(tmp_path: Path) -> None:
-    search, project = _indexed_tree(
-        tmp_path,
-        {
-            "src/a.py": "def alpha_two():\n    return 2\n",
-            "tests/c.py": "def alpha_three():\n    return 3\n",
-        },
-    )
+def test_path_filter_rejects_empty_and_absolute_patterns(tmp_path: Path) -> None:
+    search, project = _indexed_tree(tmp_path, {"src/a.py": "def alpha_two():\n    return 2\n"})
 
-    # An absolute pattern disables the pushdown; the post-filter must still apply,
-    # and PurePosixPath.match never matches an absolute pattern against these paths.
-    assert search.search_code("alpha", [project], paths=["/src/a.py"]).hits == []
+    for bad in ("", "/src/a.py"):
+        with pytest.raises(CodeIndexingError) as raised:
+            search.search_code("alpha", [project], paths=[bad])
+        assert raised.value.code is ErrorCode.INVALID_FILTER
+        with pytest.raises(CodeIndexingError) as raised:
+            search.search_by_example("def alpha_two():\n    return 2\n", [project], paths=[bad])
+        assert raised.value.code is ErrorCode.INVALID_FILTER
 
 
 def test_literal_empty_character_class_falls_back_without_a_regex_error(tmp_path: Path) -> None:
@@ -562,6 +570,48 @@ def test_detect_example_language() -> None:
         detect_example_language(extractor, "This is plain prose explaining how something works.")
         is None
     )
+
+
+def test_example_language_tables_cover_every_advertised_language() -> None:
+    """`language=` must accept exactly what the tool schema's LanguageName lists."""
+    from typing import get_args
+
+    from code_indexing_mcp.models import LanguageName
+    from code_indexing_mcp.scanner import LANGUAGES
+    from code_indexing_mcp.search import _DETECTION_ORDER, _NOT_AUTO_DETECTED
+
+    advertised = set(get_args(LanguageName))
+    assert set(_EXAMPLE_SUFFIX) == advertised
+    # Each representative suffix is one the scanner maps back to that language.
+    assert {LANGUAGES[suffix] for suffix in _EXAMPLE_SUFFIX.values()} == advertised
+    assert all(LANGUAGES[suffix] == language for language, suffix in _EXAMPLE_SUFFIX.items())
+    assert set(_DETECTION_ORDER) | _NOT_AUTO_DETECTED == advertised
+    assert len(set(_DETECTION_ORDER)) == len(_DETECTION_ORDER)
+
+
+@pytest.mark.parametrize(
+    ("language", "source"),
+    [
+        ("kotlin", "fun main() { println(1) }\n"),
+        ("swift", "struct S { var a: Int }\nfunc g() {}\n"),
+        ("zig", 'const std = @import("std");\npub fn main() void {}\n'),
+        ("prisma", "model User {\n  id Int @id\n}\n"),
+        ("xml", "<a><b>1</b></a>\n"),
+    ],
+)
+def test_example_passages_accept_every_advertised_language(language: str, source: str) -> None:
+    detected, passages = _example_passages(TreeSitterExtractor(), source, language=language)
+
+    assert detected == language
+    assert passages
+
+
+def test_auto_detection_covers_newer_languages_without_claiming_prose() -> None:
+    extractor = TreeSitterExtractor()
+
+    assert detect_example_language(extractor, "fun main() { println(1) }") == "kotlin"
+    assert detect_example_language(extractor, "model User {\n  id Int @id\n}\n") == "prisma"
+    assert detect_example_language(extractor, "Note: fix this later\n") is None
 
 
 def test_example_passages_prose_fallback() -> None:
@@ -700,3 +750,122 @@ def test_search_by_example_partitions_validation_errors(tmp_path: Path) -> None:
                 )
             },
         )
+
+
+def test_example_passages_are_windowed_by_tokens_when_the_embedder_can(tmp_path: Path) -> None:
+    """EMB-2: an over-budget example becomes bounded windows, not one sequence."""
+    import numpy as np
+
+    from code_indexing_mcp.embedding import EmbeddedSegment, SegmentPlan
+    from code_indexing_mcp.search import _embed_example_passages
+
+    seen: list[SegmentPlan] = []
+
+    class Windowing:
+        model_id = "x"
+        dimension = 2
+        max_input_tokens = 7
+
+        def plan_and_embed(self, candidates, plan):  # type: ignore[no-untyped-def]
+            seen.append(plan)
+            vector = np.asarray([1.0, 2.0], dtype="<f4").tobytes()
+            return [
+                [EmbeddedSegment(0, 1, 1, vector), EmbeddedSegment(1, 2, 1, vector)]
+                for _ in candidates
+            ]
+
+    vectors = _embed_example_passages(Windowing(), ["a", "b"])  # type: ignore[arg-type]
+
+    assert seen[0].max_tokens == 7
+    assert vectors == [[1.0, 2.0]] * 4
+
+
+def test_find_symbol_wildcard_characters_are_literal_without_paging(tmp_path: Path) -> None:
+    """LIKE wildcards in a name must not make the prefilter match every row.
+
+    The literal post-filter then rejected all of them and the loop paged through
+    the whole project. The names here exceed one page so a regression shows as a
+    second storage scan, not just a slow call.
+    """
+    source = "".join(f"def fn{index}():\n    return {index}\n\n" for index in range(230))
+    source += (
+        "def _private():\n    return 1\n\ndef a_b():\n    return 2\n\ndef axb():\n    return 3\n"
+    )
+    search, project = _indexed_tree(tmp_path, {"mod.py": source})
+
+    scans = 0
+    original = search.store._projected_chunks
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        nonlocal scans
+        scans += 1
+        return original(*args, **kwargs)
+
+    search.store._projected_chunks = counting  # type: ignore[method-assign]
+    try:
+        assert search.find_symbol("%", project, match="contains").hits == []
+        assert scans == 1
+        scans = 0
+        assert search.find_symbol("zz_", project, match="prefix").hits == []
+        assert scans == 1
+    finally:
+        search.store._projected_chunks = original  # type: ignore[method-assign]
+
+    assert [hit.symbol for hit in search.find_symbol("_", project, match="prefix").hits] == [
+        "_private"
+    ]
+    assert [hit.symbol for hit in search.find_symbol("a_", project, match="contains").hits] == [
+        "a_b"
+    ]
+    assert [hit.symbol for hit in search.find_symbol("a_b", project, match="prefix").hits] == [
+        "a_b"
+    ]
+
+
+def test_search_code_holds_the_partition_lock_once_for_hits_and_explanations(
+    tmp_path: Path,
+) -> None:
+    """Hits and their ranking explanations come from one locked view of the partition.
+
+    Re-acquiring the lock for the explanation probes cost a second lock round trip
+    and let a commit land between the search and its explanation.
+    """
+    search, project = _indexed_tree(tmp_path, {"src/a.py": "def alpha_two():\n    return 2\n"})
+    acquisitions = 0
+    original = search.store.partitions_access
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        nonlocal acquisitions
+        acquisitions += 1
+        return original(*args, **kwargs)
+
+    search.store.partitions_access = counting  # type: ignore[method-assign]
+    try:
+        response = search.search_code("alpha", [project])
+    finally:
+        search.store.partitions_access = original  # type: ignore[method-assign]
+
+    assert response.hits
+    assert response.hits[0].explanation is not None
+    assert acquisitions == 1
+
+
+def test_path_pushdown_adds_the_literal_prefix_conjunct(tmp_path: Path) -> None:
+    search, project = _indexed_tree(tmp_path, {"src/pkg7/a.py": "def alpha():\n    return 1\n"})
+    conditions: list[str | None] = []
+    original = search.store.hybrid_search
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        conditions.append(args[3])
+        return original(*args, **kwargs)
+
+    search.store.hybrid_search = spy  # type: ignore[method-assign]
+    try:
+        hits = search.search_code("alpha", [project], paths=["src/pkg7/*.py"]).hits
+    finally:
+        search.store.hybrid_search = original  # type: ignore[method-assign]
+
+    assert [hit.path for hit in hits] == ["src/pkg7/a.py"]
+    assert conditions[0] is not None
+    assert "starts_with(path, 'src/pkg7/')" in conditions[0]
+    assert "regexp_like(path," in conditions[0]

@@ -877,9 +877,13 @@ resolve to at least two distinct projects. It returns one globally ranked hit li
 `project_id` and `project_name` on every result.
 
 `languages`, `paths`, `kinds`, and `limit` apply across the complete selected scope rather than
-once per repository. Path globs are interpreted relative to each project root; `*.py` matches a
-Python file at any depth while `src/*` matches only direct children of `src`. A single `*` and
-`**` both span one path segment. Patterns are translated into the index scan itself, so a filtered
+once per repository. Path globs are gitignore-style and relative to each project root. `*` and `?` never
+cross `/`; `**` as a whole segment spans zero or more directories, so `**/*.py` includes a
+top-level `top.py` and `src/**` is everything under `src`. A pattern containing `/` is anchored at
+the project root (`src/*` matches only direct children of `src`, not `vendor/x/src/y.py`); a
+pattern without one (`*.py`, `conftest.py`) matches at any depth. A plain path with no wildcard
+matches that file or everything under that directory (`src/pkg`). Empty and absolute patterns are
+rejected with `INVALID_FILTER`. Patterns are translated into the index scan itself, so a filtered
 search finds matches that rank below the unfiltered result window instead of returning an empty
 result.
 
@@ -908,7 +912,7 @@ Configure it with:
 ```bash
 export CODE_INDEXING_EMBED_MEMORY_MB=1536   # CODE_INDEXING_INDEX_MEMORY_MB is the older name and still works
 export CODE_INDEXING_EMBED_BATCH_SIZE=auto  # auto, or 1–256
-export CODE_INDEXING_EMBED_MAX_TOKENS=1024
+export CODE_INDEXING_EMBED_MAX_TOKENS=1024  # 256–8192
 export CODE_INDEXING_EMBED_OVERLAP_TOKENS=64
 export CODE_INDEXING_EMBED_THREADS=2
 export CODE_INDEXING_EMBED_CPU_ARENA=0
