@@ -42,7 +42,9 @@ def test_long_boolean_chain_extraction_is_not_cubic() -> None:
     result = _extract("python", source)
     elapsed = time.perf_counter() - started
     assert len(result.references) >= terms
-    assert elapsed < 3.0, f"boolean chain took {elapsed:.2f}s"
+    # About 2 s on a developer laptop and 5-6 s on a shared CI runner under
+    # xdist; the cubic climb took 27 s on the laptop, so 12 s still catches it.
+    assert elapsed < 12.0, f"boolean chain took {elapsed:.2f}s"
 
 
 def test_char_limited_windows_keep_a_bounded_duplication_factor() -> None:
