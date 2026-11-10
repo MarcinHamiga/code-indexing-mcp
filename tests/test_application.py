@@ -21,6 +21,7 @@ from code_indexing_mcp.accelerator_env import (
 )
 from code_indexing_mcp.application import Application, RuntimePaths
 from code_indexing_mcp.backends import CPU_BACKEND, Accelerator
+from code_indexing_mcp.embedding import SegmentPlan
 from code_indexing_mcp.embedding_worker import default_launcher
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.git_state import GitProbeOutcome, GitState, SelectorKind, probe_git_state
@@ -1411,6 +1412,9 @@ def test_a_batch_size_a_ceiling_overrun_reduced_is_reported_as_reduced(
         characters_per_second=500.0,
         load_ns=1,
         limited_by="memory",
+        # A reduction a run wrote today carries the settings it was measured
+        # under; one without them (an older record) is re-measured instead.
+        context=app.backends._probe_context(),
     )
 
     rebuilt = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
@@ -2272,6 +2276,53 @@ def test_edits_are_detected_on_the_next_status_check(
     assert app.project_status(project.id).state == "stale"
 
 
+def test_cached_clean_freshness_does_not_hide_a_clean_to_dirty_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRV-7: the Git status fingerprint is part of the cache fingerprint, so an
+    edit made right after a clean status check is reported at once."""
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 60.0)
+
+    assert app.project_status(project.id).state == "ready"
+
+    (root / "main.py").write_text("def edited():\n    return 2\n")
+
+    assert app.project_status(project.id).state == "stale"
+
+
+def test_project_status_does_not_materialise_file_rows_on_the_cached_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRV-9: a cached clean answer only needs the file count, not every row."""
+    root, _ = _git_repo_with_main(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 60.0)
+    assert app.project_status(project.id).state == "ready"
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("list_files must not run when the slot is current")
+
+    monkeypatch.setattr(app.store, "list_files", forbidden)
+
+    status = app.project_status(project.id)
+    assert status.state == "ready"
+    assert status.file_count == 1
+
+
 def test_dirty_worktree_freshness_uses_only_the_changed_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2328,6 +2379,30 @@ def test_dirty_worktree_freshness_uses_only_the_changed_paths(
 
     # (d) A brand-new untracked file is never in the index and must be caught.
     (root / "extra.py").write_text("def extra():\n    return 4\n")
+    assert app.project_status(project.id).state == "stale"
+    assert scans[0] == 0
+
+
+@pytest.mark.parametrize("rule_file", [".gitignore", ".git/info/exclude"])
+def test_ignoring_an_indexed_untracked_file_marks_the_project_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rule_file: str
+) -> None:
+    root, _ = _git_repo_with_main(tmp_path)
+    (root / "scratch.py").write_text("def leaked_token():\n    return 1\n")
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    monkeypatch.setattr("code_indexing_mcp.application.FRESHNESS_CACHE_SECONDS", 0.0)
+    scans = _counted_scanner_scans(app, monkeypatch)
+    assert app.project_status(project.id).state == "ready"
+
+    with (root / rule_file).open("a") as handle:
+        handle.write("scratch.py\n")
+
     assert app.project_status(project.id).state == "stale"
     assert scans[0] == 0
 
@@ -3048,3 +3123,166 @@ def test_clean_git_status_is_stale_after_scan_configuration_changes(tmp_path: Pa
     )
     app.store.upsert_project(changed, model_id="test/tiny", state="ready")
     assert app.project_status(project.id).state == "stale"
+
+
+@pytest.mark.parametrize("checkout", ["main", "worktree"])
+def test_read_only_queries_from_either_checkout_do_not_write_the_registry(
+    tmp_path: Path, checkout: str
+) -> None:
+    """STO-2: the checkout whose pointer was activated earlier took the slow path."""
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    assert app.init_project(worktree).id == project.id
+    app.index_project(project.id, roots=[root])
+    app.index_project(project.id, roots=[worktree])
+    queried = root if checkout == "main" else worktree
+    app.search_code("return", roots=[queried])
+    slots = app.store._project_slots.version
+    active = app.store._active_slots.version
+
+    for _ in range(3):
+        app.search_code("return", roots=[queried])
+
+    assert app.store._project_slots.version == slots
+    assert app.store._active_slots.version == active
+
+
+def _reference_app(tmp_path: Path) -> tuple[Application, ProjectInfo]:
+    root = tmp_path / "repo"
+    root.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(root))
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    run_git("add", "main.py", cwd=root)
+    run_git(
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Tests",
+        "commit",
+        "-qm",
+        "init",
+        cwd=root,
+    )
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    return app, project
+
+
+def test_reference_check_neither_walks_the_tree_nor_waits_on_another_projects_lock(
+    tmp_path: Path,
+) -> None:
+    """SRV-5: a current project's reference check is a lock-free, walk-free read."""
+    from filelock import FileLock
+
+    app, project = _reference_app(tmp_path)
+    lock_directory = app.paths.data / "locks"
+
+    # The unrelated-project case: another run holds the global index lock for
+    # its whole duration. Before the fix this call blocked until it was freed.
+    other_run = FileLock(lock_directory / "index-global.lock")
+    other_run.acquire()
+    try:
+        with (
+            patch.object(
+                app.indexer.scanner, "iter_scan", side_effect=AssertionError("tree walked")
+            ),
+            patch("code_indexing_mcp.application.REFERENCE_LOCK_WAIT_SECONDS", 0.2),
+        ):
+            started = time.monotonic()
+            report = app.ensure_reference_index(project.id)
+            second = app.ensure_reference_index(project.id)
+    finally:
+        other_run.release()
+
+    assert report.complete is True
+    assert second.files_current == 1
+    assert time.monotonic() - started < 5
+
+
+def test_reference_backfill_surfaces_index_busy_after_a_bounded_wait(tmp_path: Path) -> None:
+    """SRV-5: contention on the project's own lock ends in INDEX_BUSY, not a hang."""
+    from filelock import FileLock
+
+    from code_indexing_mcp.indexing import _ReferenceGap
+
+    app, project = _reference_app(tmp_path)
+    holder = FileLock(app.paths.data / "locks" / f"{project.id}.lock")
+    holder.acquire()
+    pending = _ReferenceGap(existing={}, stale_schema_file_ids=set(), missing={}, settled=None)
+    try:
+        with (
+            patch.object(app.indexer, "_reference_gap", return_value=pending),
+            patch("code_indexing_mcp.application.REFERENCE_LOCK_WAIT_SECONDS", 0.2),
+            pytest.raises(CodeIndexingError) as raised,
+        ):
+            app.ensure_reference_index(project.id)
+    finally:
+        holder.release()
+
+    assert raised.value.code is ErrorCode.INDEX_BUSY
+
+
+class _SessionFactoryEmbedder:
+    cache_directory = "unused"
+    offline = True
+    dimension = 4
+    model_id = "test/tiny"
+
+
+def test_an_explicit_batch_size_on_an_accelerator_machine_still_gets_a_probe_key(
+    tmp_path: Path,
+) -> None:
+    """EMB-3: without a key every run re-probed and re-calibrated, and the
+    measured size then overrode the explicit one."""
+    _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(
+        IndexSettings.from_environment({}), embedding_batch_size=4, embedding_batch_auto=False
+    )
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+
+    assert app.backends._probe_key is not None
+    factory = app.backends._passage_session_factory(
+        _SessionFactoryEmbedder(),  # type: ignore[arg-type]
+        segment_plan=lambda: SegmentPlan(),
+    )
+    session = factory()
+    assert session._probe_key is not None
+    assert session._batch_ceiling == 4
+    assert app.model_status().batch_calibration == "explicit"
+    assert app.model_status().batch_size == 4
+
+
+def test_a_record_without_a_rate_does_not_make_the_crossover_unreachable(
+    tmp_path: Path,
+) -> None:
+    """EMB-7: a CPU record holding only a reduced batch size has no rate; read
+    as a rate of zero it meant 'the accelerator never overtakes CPU'."""
+    _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    app.probe_cache.store(
+        app.backends._build_probe_key(app.embedder),
+        batch_size=8,
+        dimension=app.embedder.dimension,
+        characters_per_second=2_000.0,
+        load_ns=1,
+    )
+    app.probe_cache.store(
+        app.backends._cpu_probe_key(),
+        batch_size=1,
+        dimension=app.embedder.dimension,
+        limited_by="memory",
+    )
+
+    assert app.crossover_characters() == 0

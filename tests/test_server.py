@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+import anyio
 import pytest
 from conftest import run_git
 from filelock import FileLock
@@ -14,7 +15,7 @@ from mcp import types
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from support import DeterministicEmbedder
-from test_application import _git_repo_with_worktree
+from test_application import _git_repo_with_main, _git_repo_with_worktree
 
 from code_indexing_mcp import server as server_module
 from code_indexing_mcp.application import Application, RuntimePaths
@@ -2093,6 +2094,43 @@ async def test_first_query_fails_when_a_competing_index_holds_the_lock_past_the_
 
 
 @pytest.mark.asyncio
+async def test_reference_tool_fails_with_index_busy_when_a_competing_index_holds_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRV-5: reference tools honour the query tools' INDEX_BUSY contract.
+
+    They used to run the stale-index build inside the tool call with an
+    unbounded lock wait, so a held lock hung the call instead of failing.
+    """
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    monkeypatch.setenv("CODE_INDEXING_INDEX_WAIT_SECONDS", "1")
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    lock_directory = paths.data / "locks"
+    lock_directory.mkdir(parents=True, exist_ok=True)
+    competing = FileLock(lock_directory / "index-global.lock")
+    with competing:
+        async with create_connected_server_and_client_session(
+            server, list_roots_callback=list_roots
+        ) as client:
+            result = await asyncio.wait_for(client.call_tool("dead_code_report", {}), timeout=20)
+
+    assert result.isError
+    message = "".join(
+        block.text for block in result.content if isinstance(block, types.TextContent)
+    )
+    assert ErrorCode.INDEX_BUSY.value in message
+
+
+@pytest.mark.asyncio
 async def test_a_second_root_gives_up_instead_of_queueing_behind_the_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2994,3 +3032,362 @@ async def test_eager_watcher_marks_the_root_dirty_without_a_freshness_walk(
     # carried the change signal for both scheduling and the query readiness
     # path.
     assert stale_checks == baseline
+
+
+@pytest.mark.asyncio
+async def test_get_chunk_resolves_in_the_checkout_the_client_root_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRV-1: a hit found through a linked worktree must expand through it."""
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, worktree = _git_repo_with_worktree(tmp_path)
+    app = _tiny_application(tmp_path)
+    project = app.init_project(root)
+    assert app.init_project(worktree).id == project.id
+    app.index_project(project.id, roots=[root])
+    app.index_project(project.id, roots=[worktree])
+    app.cwd = root
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=worktree.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        found = await client.call_tool("find_symbol", {"name": "worktree_branch"})
+        assert not found.isError
+        assert found.structuredContent is not None
+        hits = found.structuredContent["hits"]
+        assert [hit["symbol"] for hit in hits] == ["worktree_branch"]
+        chunk = await client.call_tool("get_chunk", {"chunk_id": hits[0]["chunk_id"]})
+
+    assert not chunk.isError, chunk.content
+    assert chunk.structuredContent is not None
+    assert "worktree_branch" in chunk.structuredContent["content"]
+
+
+def test_root_uris_are_percent_decoded_once() -> None:
+    """SRV-8: %2541 is a literal '%41', not 'A'."""
+    uri = "file:///tmp/proj%20100%2541%20done"
+    assert server_module._root_path(uri) == Path("/tmp/proj 100%41 done").resolve()
+
+
+@pytest.mark.asyncio
+async def test_roots_are_listed_once_per_session_until_the_client_reports_a_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRV-11: no roots/list round trip per tool call; list_changed invalidates."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    for repo in (first, second):
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text("[project]\nname = 'p'\n")
+    app = _tiny_application(tmp_path)
+    first_id = app.init_project(first).id
+    second_id = app.init_project(second).id
+    server = create_server(app, auto_index=False)
+    served = [first]
+    requests = 0
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        nonlocal requests
+        requests += 1
+        return types.ListRootsResult(roots=[types.Root(uri=served[0].as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        for _ in range(3):
+            status = await client.call_tool("project_status", {})
+            assert status.structuredContent is not None
+            assert status.structuredContent["project"]["id"] == first_id
+        assert requests == 1
+
+        served[0] = second
+        await client.send_roots_list_changed()
+        for _ in range(50):
+            status = await client.call_tool("project_status", {})
+            assert status.structuredContent is not None
+            if status.structuredContent["project"]["id"] == second_id:
+                break
+            await asyncio.sleep(0.02)
+        assert status.structuredContent["project"]["id"] == second_id
+        assert requests == 2
+
+
+@pytest.mark.asyncio
+async def test_a_roots_timeout_reuses_the_last_known_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRV-11: a late roots/list answer is not read as 'the client has no roots'."""
+    first = tmp_path / "first"
+    other = tmp_path / "other"
+    for repo in (first, other):
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text("[project]\nname = 'p'\n")
+    app = _tiny_application(tmp_path)
+    first_id = app.init_project(first).id
+    app.init_project(other)
+    app.cwd = other
+    server = create_server(app, auto_index=False)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=first.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        first_status = await client.call_tool("project_status", {})
+        assert first_status.structuredContent is not None
+        assert first_status.structuredContent["project"]["id"] == first_id
+
+        async def silent_roots(_session: object) -> types.ListRootsResult:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        # Shorten the timeout only now: the first, answered listing must not
+        # race a 50 ms deadline on a loaded test runner.
+        monkeypatch.setattr(server_module, "ROOTS_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(server_module.ServerSession, "list_roots", silent_roots)
+        await client.send_roots_list_changed()
+        await asyncio.sleep(0.1)
+        again = await client.call_tool("project_status", {})
+        assert again.structuredContent is not None
+        assert again.structuredContent["project"]["id"] == first_id
+
+
+def _commit_all(root: Path, message: str) -> None:
+    run_git("add", "-A", cwd=root)
+    run_git(
+        "-c", "user.email=test@example.test", "-c", "user.name=Tests",
+        "commit", "-qm", message, cwd=root,
+    )  # fmt: skip
+
+
+@pytest.mark.asyncio
+async def test_lazy_query_reindexes_after_a_commit_of_indexed_edits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRV-3 / SRV-10: status says stale after a commit, so the gate schedules
+    the refresh instead of re-walking the tree and concluding "not stale"."""
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, _ = _git_repo_with_main(tmp_path)
+    app = _tiny_application(tmp_path)
+    walks = 0
+    original_is_stale = app.project_is_stale
+
+    def counted_is_stale(*args: object, **kwargs: object) -> bool:
+        nonlocal walks
+        walks += 1
+        return original_is_stale(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(app, "project_is_stale", counted_is_stale)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        await client.call_tool("find_symbol", {"name": "main_branch"})
+        (root / "main.py").write_text("def edited():\n    return 2\n")
+        assert not (await client.call_tool("find_symbol", {"name": "edited"})).isError
+        project = app.list_projects()[0]
+        _commit_all(root, "commit the edit")
+        assert app.project_status(project.id, roots=[root]).state == "stale"
+        walks_before = walks
+
+        assert not (await client.call_tool("find_symbol", {"name": "edited"})).isError
+
+        assert app.project_status(project.id, roots=[root]).state == "ready"
+        assert walks == walks_before
+
+
+@pytest.mark.asyncio
+async def test_failed_lazy_refresh_does_not_poison_later_queries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRV-4: a project selected outside the advertised roots whose lazy build
+    failed once keeps failing after another path made the index ready."""
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    embedder = FlakyEmbedder()
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=embedder,
+        cwd=tmp_path,
+    )
+    project = app.init_project(root)
+    server = create_server(app)
+
+    async def no_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=no_roots
+    ) as client:
+        await client.list_tools()
+        first = await client.call_tool("find_symbol", {"name": "answer", "project": project.id})
+        assert first.isError
+        app.index_project(project.id)
+
+        second = await client.call_tool("find_symbol", {"name": "answer", "project": project.id})
+        assert not second.isError
+
+
+@pytest.mark.asyncio
+async def test_eager_watcher_ignores_events_in_gitignored_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRV-6: writes under a gitignored build directory must not start index
+    runs (each one holds the global lock and adds a history row)."""
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root, _ = _git_repo_with_main(tmp_path)
+    (root / ".gitignore").write_text("build/\n")
+    _commit_all(root, "ignore build")
+    (root / "build").mkdir()
+    noise = root / "build" / "out.o.py"
+    noise.write_text("x = 1\n")
+    app = _tiny_application(tmp_path)
+    runs = 0
+    original_index = app.index_project
+
+    def counted_index(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal runs
+        runs += 1
+        return original_index(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(app, "index_project", counted_index)
+    seed_refresh_finished = _observe_freshness_check(app, monkeypatch)
+    change = asyncio.Event()
+
+    async def one_shot_watch(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        await change.wait()
+        yield {(2, str(noise))}
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(server_module, "awatch", one_shot_watch)
+    monkeypatch.setattr(server_module, "EAGER_RECONCILE_SECONDS", 3600.0)
+    server = create_server(app, auto_index=True)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        await client.call_tool("find_symbol", {"name": "main_branch"})
+        assert await asyncio.to_thread(seed_refresh_finished.wait, 5)
+        await asyncio.sleep(0.5)
+        baseline = runs
+
+        noise.write_text("x = 2\n")
+        change.set()
+        await asyncio.sleep(1.5)
+
+    assert runs == baseline
+
+
+@pytest.mark.asyncio
+async def test_remove_project_lets_the_same_session_register_the_root_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRV-12: a finished startup job must not outlive the removed registration."""
+    monkeypatch.setenv("CODE_INDEXING_AUTO_MAINTENANCE", "0")
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+    app = _tiny_application(tmp_path)
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        await client.list_tools()
+        assert not (await client.call_tool("find_symbol", {"name": "answer"})).isError
+        project_id = app.list_projects()[0].id
+        assert not (await client.call_tool("remove_project", {"project": project_id})).isError
+
+        again = await client.call_tool("find_symbol", {"name": "answer"})
+
+    assert not again.isError
+
+
+@pytest.mark.asyncio
+async def test_cancelled_manual_index_leaves_waiters_an_error_not_a_missing_report() -> None:
+    """SRV-12: cancellation while the shielded thread runs must not leave
+    ``job.report`` and ``job.error`` both unset."""
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingApp:
+        def index_project(self, *args: object, **kwargs: object) -> object:
+            started.set()
+            release.wait(timeout=10)
+            return object()
+
+    async with anyio.create_task_group() as task_group:
+        coordinator = server_module.StartupCoordinator(
+            BlockingApp(),  # type: ignore[arg-type]
+            task_group,
+            mode=server_module.IndexMode.LAZY,
+        )
+        job = server_module._ManualIndexJob(force=False)
+        key = ("project-id", Path("/tmp/project"))
+        coordinator._manual_jobs[key] = job
+        task = asyncio.create_task(coordinator._run_manual(key, job, [], False))
+        await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert job.ready.is_set()
+    assert job.report is None
+    assert job.error is not None
+    assert key not in coordinator._manual_jobs
+
+
+@pytest.mark.asyncio
+async def test_schedule_does_not_hold_the_coordinator_lock_during_a_freshness_walk() -> None:
+    """SRV-10: other tool calls (``_jobs_for``) must not queue behind the walk."""
+    walking = threading.Event()
+    release = threading.Event()
+
+    class WalkingApp:
+        def project_is_stale(self, *args: object, **kwargs: object) -> bool:
+            walking.set()
+            release.wait(timeout=10)
+            return False
+
+    async with anyio.create_task_group() as task_group:
+        coordinator = server_module.StartupCoordinator(
+            WalkingApp(),  # type: ignore[arg-type]
+            task_group,
+            mode=server_module.IndexMode.LAZY,
+        )
+        job = server_module._StartupJob(indexes=True, project_id="p")
+        job.discovered.set()
+        job.ready.set()
+        root = Path("/tmp/walk-project").resolve()
+        coordinator._jobs[root] = job
+        scheduling = asyncio.create_task(coordinator.schedule([root], indexes=True))
+        await asyncio.to_thread(walking.wait, 5)
+        try:
+            jobs = await asyncio.wait_for(coordinator._jobs_for([root]), timeout=2)
+            assert jobs == [job]
+        finally:
+            release.set()
+            await scheduling

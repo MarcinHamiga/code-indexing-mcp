@@ -422,8 +422,16 @@ async def test_tui_app_navigation_and_quit() -> None:
         assert app.return_code == 0
 
 
-def test_tui_main_invalid_project_exits_with_error(capsys: pytest.CaptureFixture[str]) -> None:
+def test_tui_main_invalid_project_exits_with_error(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from code_indexing_mcp.tui import main as tui_main
+
+    # Stay off the developer's real data directory and per-user daemon: without
+    # this the test retires and respawns the live daemon on every source edit.
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("CODE_INDEXING_BROKER", "off")
 
     exit_code = tui_main(["nonexistent-project-xyz"])
     assert exit_code == 2

@@ -25,7 +25,14 @@ from .changes import collect_changes, resolve_base, source_lines
 from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import TreeSitterExtractor
-from .git_state import GitProbeOutcome, GitState, WorktreeStatus, head_snapshot, probe_git_state
+from .git_state import (
+    GitProbeOutcome,
+    GitState,
+    WorktreeStatus,
+    checkout_key,
+    head_snapshot,
+    probe_git_state,
+)
 from .git_state import slot_id as git_slot_id
 from .history import HistoryStore
 from .indexing import Indexer
@@ -66,7 +73,7 @@ from .models import (
     content_digest,
 )
 from .passage_backend import PassageBackendSession
-from .passage_cache import PassageReuseContext
+from .passage_cache import PassageCacheNamespace, PassageReuseContext
 from .probe_cache import ProbeCache
 from .progress import IndexProgress, read_progress
 from .projects import (
@@ -112,8 +119,16 @@ RESOLVE_TARGET_MAX_WORKERS = 8
 # Negative freshness answers are cached briefly so a burst of tool calls in one
 # agent interaction does not walk the same clean repository once per call. The
 # window is short enough that an external edit surfaces on the next check, and
-# watcher events, indexing, and registration invalidate it immediately.
+# watcher events, indexing, and registration invalidate it immediately. The
+# cache fingerprint includes Git's status fingerprint (already computed by the
+# status probe), so a clean-to-dirty edit invalidates it at no extra cost. A
+# further edit to a file that was already dirty keeps the same status
+# fingerprint and can still be hidden for up to this window.
 FRESHNESS_CACHE_SECONDS = 5.0
+
+# How long a reference tool waits for the project's writer lock before it
+# answers INDEX_BUSY, matching the 10 s contract of the other query tools.
+REFERENCE_LOCK_WAIT_SECONDS = 10.0
 
 # A lazy tool call probes Git in `project_status` and then again when the query
 # resolves its target a few milliseconds later. The query reuses the status
@@ -408,7 +423,7 @@ class ApplicationLike(Protocol):
         roots: list[Path] | None = None,
     ) -> ChangedSymbolsResponse: ...
 
-    def get_chunk(self, chunk_id: str) -> CodeChunk: ...
+    def get_chunk(self, chunk_id: str, *, roots: list[Path] | None = None) -> CodeChunk: ...
 
 
 class Application:
@@ -423,6 +438,9 @@ class Application:
         self.paths = paths
         paths.ensure_private()
         self.cwd = (cwd or Path.cwd()).resolve()
+        # A shared daemon serves many clients, so its own cwd must never scope
+        # a request; DaemonServer turns this off and brokers send their roots.
+        self.cwd_scopes_requests = True
         self.settings = settings or IndexSettings.from_environment()
         if embedder is None:
             embedder = FastEmbedder(
@@ -460,7 +478,9 @@ class Application:
             with FileLock(
                 lock_directory / "index-global.lock", timeout=RECOVERY_LOCK_TIMEOUT_SECONDS
             ):
-                recover_staged_commits(paths.data / "staging", self.store)
+                recover_staged_commits(
+                    paths.data / "staging", self.store, lock_directory=lock_directory
+                )
         except Timeout:
             logger.warning(
                 "Skipping staged-commit recovery: an index run holds the global lock. "
@@ -499,7 +519,24 @@ class Application:
             def passage_cache(current_project: ProjectInfo, force: bool) -> PassageReuseContext:
                 namespace = self.backends.passage_cache_namespace(current_project.id)
 
-                def producer_matches(producer: object) -> bool:
+                # A run that selected an accelerator may still embed on CPU
+                # (below the crossover, or after a degradation). Those are CPU
+                # vectors: they are stored under the CPU namespace and served
+                # from either, which is the mix a deferred run already puts in
+                # one index. Accelerator vectors only ever go under the
+                # accelerator's namespace, so neither producer is mislabelled.
+                cpu_namespace = (
+                    self.backends.cpu_passage_cache_namespace(current_project.id)
+                    if namespace is not None and namespace.producer != "cpu-float32"
+                    else None
+                )
+                by_producer = {
+                    candidate.producer: candidate
+                    for candidate in (namespace, cpu_namespace)
+                    if candidate is not None
+                }
+
+                def producer_namespace(producer: object) -> PassageCacheNamespace | None:
                     backend = getattr(producer, "backend_used", None)
                     actual = (
                         "mlx-float32"
@@ -508,14 +545,15 @@ class Application:
                         if backend == "cpu"
                         else None
                     )
-                    return actual == namespace.producer if namespace is not None else False
+                    return by_producer.get(actual) if actual is not None else None
 
                 return PassageReuseContext(
                     paths.cache / "passage-embeddings.sqlite3",
                     namespace,
                     force=force,
                     strict=self.settings.embedding_strict,
-                    producer_matches=producer_matches,
+                    alternate_namespaces=[cpu_namespace] if cpu_namespace is not None else [],
+                    producer_namespace=producer_namespace,
                 )
 
             passage_cache_factory = passage_cache
@@ -638,6 +676,12 @@ class Application:
                     "Multiple MCP roots are available; provide an explicit path",
                 )
             path = unique_roots[0]
+        if path is None and not self.cwd_scopes_requests:
+            raise CodeIndexingError(
+                ErrorCode.PROJECT_NOT_FOUND,
+                "init_project needs a path or an MCP root; the daemon has no working directory "
+                "of its own to register",
+            )
         root = Path(path) if path is not None else self.cwd
         # The daemon serves every client on its own thread, so N clients calling
         # this for one root would otherwise all miss the marker and register N
@@ -821,7 +865,7 @@ class Application:
         lock_directory.mkdir(parents=True, exist_ok=True)
 
         def current_target() -> ActiveIndexTarget | None:
-            partition = self.store.active_partition_ref(project.id)
+            partition = self.store.active_partition_ref(project.id, checkout_key=checkout_key(git))
             if partition is None or partition.slot_id != git_slot_id(project.id, git):
                 return None
             slot = self.store.get_slot(partition.slot_id)
@@ -1035,14 +1079,16 @@ class Application:
         """
 
         resolved = self._resolve(project, roots)
-        target = _target or self._resolve_active_target(resolved)
+        target = _target or self._resolve_active_target(resolved, include_status=True)
         if target.project.id != resolved.id:
             raise ValueError("reference target does not belong to project")
         return self._ensure_reference_target(target)
 
     def _ensure_reference_target(self, target: ActiveIndexTarget) -> ReferenceBackfillReport:
         resolved = target.project
-        if self._project_is_stale(resolved, partition_id=target.partition_id):
+        changed = False
+        if self._reference_target_is_stale(target):
+            changed = True
             self.indexer.index(
                 resolved,
                 target=target,
@@ -1053,9 +1099,11 @@ class Application:
             resolved,
             target=target,
             wait_for_lock=True,
+            lock_timeout=REFERENCE_LOCK_WAIT_SECONDS,
             trigger="reference-backfill",
         )
         if report.stale_paths:
+            changed = True
             self.indexer.index(
                 resolved,
                 target=target,
@@ -1066,10 +1114,20 @@ class Application:
                 resolved,
                 target=target,
                 wait_for_lock=True,
+                lock_timeout=REFERENCE_LOCK_WAIT_SECONDS,
                 trigger="reference-backfill",
             )
-        self.invalidate_freshness(resolved.id)
+        if changed or report.files_backfilled:
+            # Only a call that wrote something can have outdated a cached
+            # clean answer; a no-op must leave the cache serving the next one.
+            self.invalidate_freshness(resolved.id)
         return report
+
+    def _reference_target_is_stale(self, target: ActiveIndexTarget) -> bool:
+        """The freshness decision project_status makes, without an unconditional walk."""
+        if target.slot.state in {"ready", "partial"}:
+            return self._project_status_for_target(target).state == "stale"
+        return self._project_is_stale(target.project, partition_id=target.partition_id)
 
     def project_status(
         self, project: str | None = None, *, roots: list[Path] | None = None
@@ -1125,13 +1183,13 @@ class Application:
         resolved = target.project
         partition = target.partition
         slot = target.slot
-        files = self.store.list_files(resolved.id, partition_id=target.partition_id)
+        files: list[StoredFile] | None = None
         state = slot.state
         git = target.git_state
         if state in {"ready", "partial"}:
             fingerprint = (
                 f"{partition.slot_id}:{partition.activation_epoch}:{git.head_oid}:"
-                f"{resolved.scan.model_dump_json()}"
+                f"{git.status_fingerprint}:{resolved.scan.model_dump_json()}"
             )
             # Keyed per slot, not per project: several worktrees share one
             # registration id and must not thrash each other's cached answer.
@@ -1160,6 +1218,7 @@ class Application:
                 self._pop_cached_freshness(cache_key)
                 state = "stale"
             else:
+                files = self.store.list_files(resolved.id, partition_id=target.partition_id)
                 existing_files = {record.path: record for record in files}
                 # Eligibility changes affect clean tracked files as well as dirty paths.
                 candidates = (
@@ -1187,7 +1246,11 @@ class Application:
         return ProjectStatus(
             project=resolved,
             state=state,
-            file_count=len(files),
+            file_count=(
+                len(files)
+                if files is not None
+                else self.store.count_files(resolved.id, partition_id=target.partition_id)
+            ),
             chunk_count=self.store.count_chunks(
                 [resolved.id], partition_ids={resolved.id: partition.partition_id}
             ),
@@ -1399,6 +1462,14 @@ class Application:
                     or scanned.language != indexed.language
                 )
             ):
+                return True
+        # The candidates came from ``git status`` (or the stored copy of it), so
+        # scan_paths did not re-apply ignore rules. A stored untracked file that
+        # was added to .gitignore or info/exclude has vanished from status yet
+        # still exists on disk; the full walk would drop it, so ask Git once.
+        if current:
+            root = project.root.resolve()
+            if self.indexer.scanner._git_ignored_paths(root, [root / path for path in current]):
                 return True
         return False
 
@@ -1736,11 +1807,11 @@ class Application:
             return None
         return source if content_digest(source) == record.content_hash else None
 
-    def get_chunk(self, chunk_id: str) -> CodeChunk:
+    def get_chunk(self, chunk_id: str, *, roots: list[Path] | None = None) -> CodeChunk:
         project_id = self.store.chunk_project_id(chunk_id)
         if project_id is None:
             return self.search.get_chunk(chunk_id)
-        resolved = self._resolve(project_id, None)
+        resolved = self._resolve(project_id, roots)
         return self._run_repository_stable_query(
             [resolved],
             lambda targets: self._get_chunk_for_target(
@@ -1761,6 +1832,7 @@ class Application:
             lambda targets: self._dead_code_report_for_target(
                 self._primary_target(targets, resolved.id)
             ),
+            include_status=True,
         )
 
     def _dead_code_report_for_target(self, target: ActiveIndexTarget) -> DeadCodeReport:
@@ -1854,6 +1926,7 @@ class Application:
                 limit=limit,
                 cursor=cursor,
             ),
+            include_status=True,
         )
 
     def _find_references_for_target(
@@ -1901,6 +1974,7 @@ class Application:
                 limit=limit,
                 cursor=cursor,
             ),
+            include_status=True,
         )
 
     def _impact_radius_for_target(
@@ -1948,6 +2022,7 @@ class Application:
                 limit=limit,
                 cursor=cursor,
             ),
+            include_status=True,
         )
 
     def _analyze_refactor_for_target(
@@ -1988,6 +2063,7 @@ class Application:
                 self._primary_target(targets, resolved.id),
                 context_lines=context_lines,
             ),
+            include_status=True,
         )
 
     def _emit_refactor_patch_for_target(
@@ -2123,14 +2199,14 @@ class Application:
             seen: set[tuple[str, str]] = set()
             for selector in projects:
                 for project in resolver.resolve_scope(
-                    explicit=selector, roots=roots or [], cwd=self.cwd, all_checkouts=True
+                    explicit=selector, roots=roots or [], cwd=self._scope_cwd, all_checkouts=True
                 ):
                     key = (project.id, project_root_identity(project.root))
                     if key not in seen:
                         seen.add(key)
                         scope.append(project)
         else:
-            scope = resolver.resolve_scope(roots=roots or [], cwd=self.cwd)
+            scope = resolver.resolve_scope(roots=roots or [], cwd=self._scope_cwd)
         if not scope:
             raise CodeIndexingError(
                 ErrorCode.PROJECT_NOT_FOUND,
@@ -2139,9 +2215,13 @@ class Application:
             )
         return scope
 
+    @property
+    def _scope_cwd(self) -> Path | None:
+        return self.cwd if self.cwd_scopes_requests else None
+
     def _resolve(self, explicit: str | None, roots: list[Path] | None) -> ProjectInfo:
         return ProjectResolver(self.store.list_projects()).resolve(
             explicit=explicit,
             roots=roots or [],
-            cwd=self.cwd,
+            cwd=self._scope_cwd,
         )

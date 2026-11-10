@@ -5,16 +5,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from functools import partial, wraps
 from pathlib import Path
 from typing import Annotated, Literal
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 import anyio
+from mcp import types
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.session import ServerSession
@@ -57,6 +59,7 @@ from .models import (
 )
 from .projects import find_project_root, rooted_under, same_project_root
 from .reference_service import validate_patch_request
+from .scanner import SourceScanner
 from .settings import IndexMode, IndexSettings
 
 logger = logging.getLogger(__name__)
@@ -222,14 +225,40 @@ class StartupCoordinator:
             job.error = exc
             logger.exception("Manual indexing failed for %s", key[1])
         finally:
+            if job.report is None and job.error is None:
+                # Cancelled (shutdown) while the shielded thread ran: the report
+                # is lost, and a waiter must see an error, not a missing report.
+                job.error = CodeIndexingError(
+                    ErrorCode.INDEX_BUSY,
+                    "Manual indexing was interrupted before it reported a result. "
+                    "Poll project_status before retrying.",
+                    project=key[0],
+                    checkout_root=str(key[1]),
+                )
             job.ready.set()
             self._manual_jobs.pop(key, None)
 
     async def schedule(
-        self, roots: list[Path], *, indexes: bool, trigger: IndexTrigger = "startup"
+        self,
+        roots: list[Path],
+        *,
+        indexes: bool,
+        trigger: IndexTrigger = "startup",
+        known_stale: bool = False,
     ) -> None:
+        """Start jobs for *roots* that have none, failed, or need a fresh refresh.
+
+        ``known_stale`` says the caller already established that every root is
+        out of date (``project_status`` reported it), so a finished job is
+        replaced without re-walking the tree: the gate and the status check
+        agree by construction instead of running two different tests.
+        """
         if self.mode is IndexMode.MANUAL:
             return
+        # Roots whose finished job needs a freshness walk to decide. The walk is
+        # a thread call over the whole tree, so it runs outside the coordinator
+        # lock; other tool calls must not queue behind it.
+        to_check: list[tuple[Path, _StartupJob, str]] = []
         async with self._lock:
             for root in roots:
                 root = root.resolve()
@@ -238,6 +267,7 @@ class StartupCoordinator:
                     None,
                 )
                 existing = self._jobs.get(registered_root) if registered_root is not None else None
+                job_root = registered_root or root
                 if existing is not None:
                     if not existing.ready.is_set():
                         continue
@@ -247,17 +277,48 @@ class StartupCoordinator:
                         if (
                             existing.indexes
                             and existing.project_id is not None
-                            and (registered_root or root) not in self._dirty_roots
-                            and not await self._is_stale(
-                                existing.project_id, registered_root or root
-                            )
+                            and job_root not in self._dirty_roots
+                            and not known_stale
                         ):
+                            to_check.append((job_root, existing, existing.project_id))
                             continue
-                job = _StartupJob(indexes=indexes, trigger=trigger)
-                job_root = registered_root or root
-                self._jobs[job_root] = job
-                self.task_group.start_soon(self._run, job_root, job)
+                self._start_job(job_root, indexes=indexes, trigger=trigger)
+        for job_root, existing, project_id in to_check:
+            if not await self._is_stale(project_id, job_root):
+                continue
+            async with self._lock:
+                # Another caller may have replaced the job while the walk ran.
+                if self._jobs.get(job_root) is existing:
+                    self._start_job(job_root, indexes=indexes, trigger=trigger)
         self._first_schedule.set()
+
+    def _start_job(self, root: Path, *, indexes: bool, trigger: IndexTrigger) -> None:
+        job = _StartupJob(indexes=indexes, trigger=trigger)
+        self._jobs[root] = job
+        self.task_group.start_soon(self._run, root, job)
+
+    async def forget_project(self, project_id: str) -> None:
+        """Drop finished jobs for a removed registration so its root can re-register."""
+        async with self._lock:
+            for candidate, job in list(self._jobs.items()):
+                if job.project_id == project_id and job.ready.is_set():
+                    del self._jobs[candidate]
+
+    async def discard_failed_indexing(self, root: Path) -> None:
+        """Forget an indexing failure for *root* that the index has since outlived.
+
+        A caller that finds the project ready or partial again (another process,
+        or the manual ``index_project`` tool, rebuilt it) must not have the old
+        failure re-raised by the next ``wait_for_ready``.
+        """
+        async with self._lock:
+            for candidate, job in list(self._jobs.items()):
+                if (
+                    same_project_root(candidate, root)
+                    and job.ready.is_set()
+                    and job.indexing_error is not None
+                ):
+                    del self._jobs[candidate]
 
     async def wait_for_startup_settled(self) -> None:
         """Return once startup scheduling has begun and its index jobs have settled.
@@ -393,6 +454,11 @@ class StartupCoordinator:
                     ignore_permission_denied=True,
                 ):
                     retry_seconds = WATCH_RETRY_INITIAL_SECONDS
+                    # watchfiles only skips .git, node_modules and the like.
+                    # Writes under project-ignored directories (build/, dist/)
+                    # cannot change the index, so they must not start runs.
+                    if not await asyncio.to_thread(_has_indexable_change, root, _changes):
+                        continue
                     # Mark the root known-changed before anything is scheduled:
                     # a query arriving now must treat it as stale without paying
                     # for a freshness walk, and scheduling must not skip it via
@@ -559,24 +625,96 @@ class StartupCoordinator:
 ServerContext = Context[ServerSession, StartupCoordinator]
 
 
+def _root_path(uri: str) -> Path | None:
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        return None
+    # url2pathname already percent-decodes on every platform; unquoting first
+    # would decode "%2541" twice into "A".
+    return Path(url2pathname(parsed.path)).resolve()
+
+
+WATCH_FILTER_MAXIMUM_PATHS = 2000
+
+
+def _has_indexable_change(root: Path, changes: Iterable[tuple[object, str]]) -> bool:
+    """Whether any watcher event is for a path Git does not ignore.
+
+    Conservative: a path outside *root*, an oversized batch, or a failed Git
+    probe counts as a relevant change.
+    """
+    relative: list[Path] = []
+    for _kind, raw in changes:
+        try:
+            relative.append(Path(raw).relative_to(root))
+        except ValueError:
+            return True
+    if not relative:
+        return True
+    if len(relative) > WATCH_FILTER_MAXIMUM_PATHS:
+        return True
+    ignored = SourceScanner._git_ignored_paths(root, [root / path for path in relative])
+    return any(path not in ignored for path in relative)
+
+
+class _RootsCache:
+    """Per-session roots, valid until the client reports a roots change.
+
+    A shared lock-free epoch invalidates every session at once on
+    ``notifications/roots/list_changed``: the notification handler receives no
+    session, and one server process normally serves exactly one.
+    """
+
+    def __init__(self) -> None:
+        self.epoch = 0
+        self._entries: weakref.WeakKeyDictionary[ServerSession, tuple[int, list[Path]]] = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def get(self, session: ServerSession) -> tuple[int, list[Path]] | None:
+        return self._entries.get(session)
+
+    def put(self, session: ServerSession, epoch: int, roots: list[Path]) -> None:
+        self._entries[session] = (epoch, roots)
+
+    async def invalidate(self, _: object) -> None:
+        self.epoch += 1
+
+
 async def _roots(ctx: ServerContext) -> list[Path]:
-    client_params = ctx.session.client_params
+    try:
+        session = ctx.session
+    except ValueError:
+        # Called directly, outside a connected request (no client to ask).
+        return []
+    client_params = session.client_params
     if client_params is None or client_params.capabilities.roots is None:
         return []
+    fastmcp = ctx.fastmcp
+    cache = fastmcp.roots_cache if isinstance(fastmcp, AutoIndexingMCP) else None
+    epoch = cache.epoch if cache is not None else 0
+    cached = cache.get(session) if cache is not None else None
+    if cached is not None and cached[0] == epoch:
+        return list(cached[1])
     try:
         async with asyncio.timeout(ROOTS_TIMEOUT_SECONDS):
-            result = await ctx.session.list_roots()
+            result = await session.list_roots()
     except TimeoutError:
-        logger.warning("Client roots/list timed out; using explicit project or working directory")
-        return []
+        logger.warning("Client roots/list timed out; reusing the last known roots")
+        # A slow answer is not "the client has no roots": keep the previous
+        # answer, even a stale one, rather than falling back to ambient scope.
+        return list(cached[1]) if cached is not None else []
     except Exception:
-        return []
+        return list(cached[1]) if cached is not None else []
     roots: list[Path] = []
     for root in result.roots:
-        parsed = urlparse(str(root.uri))
-        if parsed.scheme == "file":
-            roots.append(Path(url2pathname(unquote(parsed.path))).resolve())
-    return _unique_project_roots(roots)
+        path = _root_path(str(root.uri))
+        if path is not None:
+            roots.append(path)
+    unique = _unique_project_roots(roots)
+    if cache is not None:
+        cache.put(session, epoch, unique)
+    return list(unique)
 
 
 def _coordinator(ctx: ServerContext) -> StartupCoordinator | None:
@@ -702,6 +840,34 @@ async def _wait_for_startup_projects(
         await _prepare_startup_projects(ctx, coordinator, roots, projects)
 
 
+async def _wait_for_reference_project(
+    ctx: ServerContext,
+    app: ApplicationLike,
+    roots: list[Path],
+    *,
+    project: str | None = None,
+    selector: DeclarationSelector | None = None,
+) -> None:
+    """Give a reference tool the query tools' coordinated, 10 s-bounded freshness wait.
+
+    Without it a stale project would index inside the tool call with no
+    deadline or progress. A selector or project that cannot be resolved here is
+    left for the reference operation to reject with its own error.
+    """
+    if selector is not None:
+        project = selector.project
+        if project is None:
+            # Chunk ids carry the logical project prefix.
+            project = (selector.chunk_id or "").partition(":")[0] or None
+    if _coordinator(ctx) is None:
+        return
+    try:
+        resolved = await asyncio.to_thread(app.resolve_project, project, roots)
+    except CodeIndexingError:
+        return
+    await _wait_for_startup_projects(ctx, roots, [resolved])
+
+
 async def _prepare_startup_projects(
     ctx: ServerContext,
     coordinator: StartupCoordinator,
@@ -729,13 +895,19 @@ async def _prepare_startup_projects(
     # query is answered. Dirtiness compares against every bound checkout root,
     # not just the registration's canonical one.
     dirty_roots = set(coordinator._dirty_roots)
-    refresh_roots = [
-        project.root
-        for project, status in zip(projects, statuses, strict=True)
-        if status.state not in {"ready", "partial"}
-        or any(same_project_root(dirty, project.root) for dirty in dirty_roots)
-    ]
-    await coordinator.schedule(refresh_roots, indexes=True, trigger="lazy-query")
+    refresh_roots: list[Path] = []
+    for project, status in zip(projects, statuses, strict=True):
+        if status.state not in {"ready", "partial"} or any(
+            same_project_root(dirty, project.root) for dirty in dirty_roots
+        ):
+            refresh_roots.append(project.root)
+        else:
+            # Status found the index current, so a failure left by an earlier
+            # refresh (for example a transient worker error before another path
+            # rebuilt the index) is moot and must not be re-raised below.
+            await coordinator.discard_failed_indexing(project.root)
+    # Status already decided these are out of date; the gate must not re-walk.
+    await coordinator.schedule(refresh_roots, indexes=True, trigger="lazy-query", known_stale=True)
     await coordinator.wait_for_discovery(selected_roots)
     wanted = {project.id for project in projects}
     # A lazy query blocks on any refresh its selected scope needs. Report
@@ -853,11 +1025,15 @@ class AutoIndexingMCP(FastMCP):
         self.application = application
         self.mode = mode
         self.wait_seconds = wait_seconds
+        self.roots_cache = _RootsCache()
         super().__init__(
             "code-indexing-mcp",
             instructions=f"{_TOOL_INSTRUCTIONS}\n\n{SERVER_INSTRUCTIONS}",
             json_response=True,
             lifespan=self._lifespan,
+        )
+        self._mcp_server.notification_handlers[types.RootsListChangedNotification] = (
+            self.roots_cache.invalidate
         )
 
     @asynccontextmanager
@@ -1455,8 +1631,14 @@ def create_server(
             str, Field(description="Project id, name, or path to remove. Required — no default.")
         ],
     ) -> RemovalReport:
-        del ctx
-        return await asyncio.to_thread(app.remove_project, project)
+        report = await asyncio.to_thread(app.remove_project, project)
+        coordinator = _coordinator(ctx)
+        if coordinator is not None:
+            # A finished job still names the removed registration, so the next
+            # query would skip discovery and fail with PROJECT_NOT_FOUND instead
+            # of registering the root again.
+            await coordinator.forget_project(report.project_id)
+        return report
 
     @mcp.tool(
         title="Search code",
@@ -1513,9 +1695,14 @@ def create_server(
             list[str] | None,
             Field(
                 description=(
-                    "Restrict to paths matching these glob patterns, relative to the project "
-                    "root, for example 'src/*' or '**/*.py'. Patterns match from the right, so "
-                    "'*.py' matches any Python file at any depth."
+                    "Restrict to paths matching these gitignore-style glob patterns, relative "
+                    "to the project root. '*' and '?' do not cross '/'; '**' as a whole "
+                    "segment spans zero or more directories ('**/*.py', 'src/**'). A pattern "
+                    "containing '/' is anchored at the project root ('src/*' matches only "
+                    "direct children of src); one without ('*.py', 'conftest.py') matches at "
+                    "any depth. A plain path with no wildcard matches that file or everything "
+                    "under that directory ('src/pkg'). Empty and absolute patterns are "
+                    "rejected with INVALID_FILTER."
                 )
             ),
         ] = None,
@@ -1593,9 +1780,14 @@ def create_server(
             list[str] | None,
             Field(
                 description=(
-                    "Restrict to paths matching these glob patterns, relative to the project "
-                    "root, for example 'src/*' or '**/*.py'. Patterns match from the right, so "
-                    "'*.py' matches any Python file at any depth."
+                    "Restrict to paths matching these gitignore-style glob patterns, relative "
+                    "to the project root. '*' and '?' do not cross '/'; '**' as a whole "
+                    "segment spans zero or more directories ('**/*.py', 'src/**'). A pattern "
+                    "containing '/' is anchored at the project root ('src/*' matches only "
+                    "direct children of src); one without ('*.py', 'conftest.py') matches at "
+                    "any depth. A plain path with no wildcard matches that file or everything "
+                    "under that directory ('src/pkg'). Empty and absolute patterns are "
+                    "rejected with INVALID_FILTER."
                 )
             ),
         ] = None,
@@ -1682,9 +1874,14 @@ def create_server(
             list[str] | None,
             Field(
                 description=(
-                    "Restrict to paths matching these glob patterns relative to each selected "
-                    "project root, for example 'src/*' or '**/*.py'. Patterns match from the "
-                    "right, so '*.py' matches any Python file at any depth."
+                    "Restrict to paths matching these gitignore-style glob patterns, relative "
+                    "to each selected project root. '*' and '?' do not cross '/'; '**' as a "
+                    "whole segment spans zero or more directories ('**/*.py', 'src/**'). A "
+                    "pattern containing '/' is anchored at the project root ('src/*' matches "
+                    "only direct children of src); one without ('*.py', 'conftest.py') matches "
+                    "at any depth. A plain path with no wildcard matches that file or "
+                    "everything under that directory ('src/pkg'). Empty and absolute patterns "
+                    "are rejected with INVALID_FILTER."
                 )
             ),
         ] = None,
@@ -1839,6 +2036,7 @@ def create_server(
         ] = None,
     ) -> DeadCodeReport:
         roots = await scoped_roots(ctx, project=project)
+        await _wait_for_reference_project(ctx, app, roots, project=project)
         return await asyncio.to_thread(app.dead_code_report, project, roots=roots)
 
     @mcp.tool(
@@ -1874,6 +2072,7 @@ def create_server(
         cursor: Annotated[str | None, Field(description="Opaque page cursor.")] = None,
     ) -> ReferenceResponse:
         roots = await scoped_roots(ctx, selector=selector)
+        await _wait_for_reference_project(ctx, app, roots, selector=selector)
         return await asyncio.to_thread(
             app.find_references,
             selector,
@@ -1931,6 +2130,7 @@ def create_server(
         ] = None,
     ) -> ImpactRadiusResponse:
         roots = await scoped_roots(ctx, selector=selector)
+        await _wait_for_reference_project(ctx, app, roots, selector=selector)
         return await asyncio.to_thread(
             app.impact_radius,
             selector,
@@ -1972,6 +2172,7 @@ def create_server(
         cursor: Annotated[str | None, Field(description="Opaque analysis page cursor.")] = None,
     ) -> RefactorAnalysis:
         roots = await scoped_roots(ctx, selector=selector)
+        await _wait_for_reference_project(ctx, app, roots, selector=selector)
         return await asyncio.to_thread(
             app.analyze_refactor,
             selector,
@@ -2016,6 +2217,7 @@ def create_server(
     ) -> RefactorPatch:
         validate_patch_request(operation, context_lines)
         roots = await scoped_roots(ctx, selector=selector)
+        await _wait_for_reference_project(ctx, app, roots, selector=selector)
         return await asyncio.to_thread(
             app.emit_refactor_patch,
             selector,
@@ -2158,8 +2360,8 @@ def create_server(
             str, Field(description="Chunk id from a search_code or find_symbol hit.")
         ],
     ) -> CodeChunk:
-        del ctx
-        return await asyncio.to_thread(app.get_chunk, chunk_id)
+        roots = await _roots(ctx)
+        return await asyncio.to_thread(partial(app.get_chunk, chunk_id, roots=roots))
 
     return mcp
 
