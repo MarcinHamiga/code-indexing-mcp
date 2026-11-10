@@ -55,7 +55,11 @@ Tune your `search_code` queries and checklist to the chosen angle:
 
 For any other angle, derive 3–5 semantic queries from the angle's intent and proceed the same way.
 
-## 5. Report
+## 5. Confirm findings empirically when possible
+
+Before finalizing the report, empirically verify candidate logic bugs and security vulnerabilities whenever feasible (e.g., by running targeted unit tests, reproduction specs, or one-off scratch scripts against the real modules under review). State the empirical verification status for each finding in the report.
+
+## 6. Report
 
 Produce a structured review report:
 
