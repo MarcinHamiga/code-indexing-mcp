@@ -19,19 +19,41 @@ class SourceReadError(OSError):
         self.reason = reason
 
 
-def checked_source_stat(root: Path, relative: Path) -> os.stat_result:
-    """Reject every symlink component, including Windows junctions."""
+def checked_source_stat(
+    root: Path, relative: Path, *, vetted_directories: set[Path] | None = None
+) -> os.stat_result:
+    """Reject every symlink component, including Windows junctions.
+
+    *vetted_directories* lets one bulk walk (a scan batch) remember ancestor
+    directories, given relative to *root*, that already passed the symlink and
+    directory checks, so a directory shared by many files is lstat'd once
+    rather than once per file. The final component is always lstat'd. Reads
+    never pass the set: ``open_source`` re-vets the whole chain per file.
+    """
     if relative.is_absolute() or relative.drive or not relative.parts or ".." in relative.parts:
         raise SourceReadError("path_escapes_root", relative)
+    parts = relative.parts
+    last = len(parts) - 1
+    start = 0
     current = root
-    for index, part in enumerate(relative.parts):
-        current = current / part
+    if vetted_directories is not None and last > 0:
+        # Resume below the deepest ancestor already vetted.
+        for depth in range(last, 0, -1):
+            if relative.parents[last - depth] in vetted_directories:
+                start = depth
+                break
+        for part in parts[:start]:
+            current = current / part
+    for index in range(start, len(parts)):
+        current = current / parts[index]
         info = current.lstat()
         if stat.S_ISLNK(info.st_mode) or current.is_junction():
             raise SourceReadError("symlink", relative)
-        if index < len(relative.parts) - 1:
+        if index < last:
             if not stat.S_ISDIR(info.st_mode):
                 raise SourceReadError("not_directory", relative)
+            if vetted_directories is not None:
+                vetted_directories.add(relative.parents[last - index - 1])
         elif not stat.S_ISREG(info.st_mode):
             raise SourceReadError("not_regular", relative)
     return info

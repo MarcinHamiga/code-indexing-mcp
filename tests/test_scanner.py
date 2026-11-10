@@ -363,6 +363,26 @@ def test_walk_mode_passes_only_supported_files_to_check_ignore(
     assert batches and all(path.suffix == ".py" for batch in batches for path in batch)
 
 
+def test_project_inside_a_directory_an_enclosing_repo_ignores_is_still_scanned(
+    tmp_path: Path,
+) -> None:
+    """IDX-13: `git ls-files` is empty there, which used to mean 'index nothing'."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / ".gitignore").write_text("scratch/\n")
+    root = repo / "scratch" / "app"
+    root.mkdir(parents=True)
+    (root / "main.py").write_text("def run():\n    return 1\n")
+    project = initialize_project(root)
+    scanner = SourceScanner()
+
+    result = scanner.scan(project)
+
+    assert [file.path.as_posix() for file in result.files] == ["main.py"]
+    assert scanner.has_supported_source(root, project.scan)
+
+
 def test_default_includes_and_the_extension_map_describe_the_same_languages() -> None:
     """The two lists are edited separately, and either one alone is useless.
 
@@ -791,3 +811,37 @@ def test_git_enumeration_timeout_excludes_consumer_suspension(
     offset[0] += 11.0
     count += sum(len(batch) for batch in batches)
     assert count == 1000
+
+
+def test_git_enumeration_yields_unmerged_path_once(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def git(*args: str, check: bool = True) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            cwd=root,
+            check=check,
+            capture_output=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    (root / "a.py").write_text("x = 0\n")
+    (root / "b.py").write_text("y = 0\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    git("checkout", "-q", "-b", "side")
+    (root / "a.py").write_text("x = 'side'\n")
+    git("commit", "-qam", "side")
+    git("checkout", "-q", "main")
+    (root / "a.py").write_text("x = 'main'\n")
+    git("commit", "-qam", "main")
+    git("merge", "side", check=False)
+    unmerged = subprocess.run(
+        ["git", "ls-files", "-u"], cwd=root, capture_output=True, text=True, check=True
+    ).stdout
+    assert unmerged.count("a.py") == 3
+
+    paths = [path.name for batch in SourceScanner._iter_git_batches(root) for path in batch]
+
+    assert sorted(paths) == ["a.py", "b.py"]

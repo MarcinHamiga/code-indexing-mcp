@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -38,6 +39,7 @@ from .git_state import (
     GitState,
     changed_paths_between,
     checkout_head,
+    head_snapshot,
     probe_git_state,
 )
 from .git_state import (
@@ -74,7 +76,13 @@ from .passage_cache import PassageReuseContext
 from .progress import IndexProgress, ProgressPublisher
 from .scanner import SourceScanner
 from .source_io import read_source
-from .staging import ChunkRow, ReferenceRow, StagingJob
+from .staging import (
+    ChunkRow,
+    ReferenceRow,
+    StagingJob,
+    has_committing_journal,
+    recover_staged_commits,
+)
 from .storage import SCHEMA_VERSION, ActiveIndexTarget, LanceStore, PartitionRef
 
 logger = logging.getLogger(__name__)
@@ -170,6 +178,63 @@ class _PhaseTimer:
         return self.totals.get(phase, 0) // 1_000_000
 
 
+#: A file whose replacement failed is retried on later runs (its size and mtime
+#: are not trusted as "unchanged") until this many consecutive attempts have
+#: failed on the same file version; after that it is left alone until the file
+#: changes or the index is forced. The count lives in the stored error string
+#: so no schema change is needed.
+MAX_FAILED_ATTEMPTS = 3
+_FAILED_ATTEMPTS = re.compile(r" \[failed attempts: (\d+)\]$")
+
+
+def _failed_attempts(error: str | None) -> int:
+    match = _FAILED_ATTEMPTS.search(error or "")
+    return int(match.group(1)) if match else 1
+
+
+# Git's "racy clean" rule. A file modified within one filesystem timestamp tick
+# of being indexed can be edited again to the same size without its mtime moving,
+# so size and mtime cannot vouch for it. Only filesystems with coarse timestamps
+# are exposed, and they show themselves: a whole-second mtime is the signature
+# of 1 s or 2 s granularity (a nanosecond-granular filesystem lands on an exact
+# second about once in a billion writes). Restricting the rule to those rows
+# keeps it from re-hashing every recently indexed file on ordinary filesystems.
+# The slack covers the coarsest common granularity (FAT, 2 s); re-verifying a
+# racy row restamps ``indexed_at``, so it stops being racy once the window
+# passes and the extra hashing is bounded to files edited moments before a run.
+RACY_SLACK_NS = 2_000_000_000
+_NS_PER_SECOND = 1_000_000_000
+
+
+def _is_racy(previous: StoredFile) -> bool:
+    return (
+        previous.mtime_ns % _NS_PER_SECOND == 0
+        and previous.mtime_ns >= previous.indexed_at - RACY_SLACK_NS
+    )
+
+
+def _is_retryable_failure(previous: StoredFile | None) -> bool:
+    """True for a stored genuine failure that still has retries left."""
+    return (
+        previous is not None
+        and previous.has_errors
+        and previous.error is not None
+        and not previous.error.startswith("rejected:")
+        and _failed_attempts(previous.error) < MAX_FAILED_ATTEMPTS
+    )
+
+
+@dataclass(frozen=True)
+class _ReferenceGap:
+    """Which files lack current structural coverage, as read at one moment."""
+
+    existing: dict[str, StoredFile]
+    stale_schema_file_ids: set[str]
+    missing: dict[str, StoredFile]
+    # The finished report when there is no parse work to do, else None.
+    settled: ReferenceBackfillReport | None
+
+
 @dataclass(frozen=True)
 class _GitGuard:
     """Git identity captured under the index lock and re-verified at commit.
@@ -216,6 +281,7 @@ class _IndexScanState:
     staged_reference_rows: int = 0
     peak_memory_bytes: int = 0
     partition: PartitionRef | None = None
+    guard: _GitGuard | None = None
 
     def record_skip(self, path: str, reason: str) -> None:
         self.skipped += 1
@@ -417,6 +483,7 @@ class Indexer:
                         partition = self.store.active_partition(project.id)
                 if partition.project_id != project.id:
                     raise ValueError("index partition does not belong to project")
+                self._recover_interrupted_commits(project, partition)
                 # Capture the checkout identity before scanning. The guard is
                 # verified again immediately before the staged commit, so a
                 # branch that moved mid-scan can never publish rows into the
@@ -508,6 +575,7 @@ class Indexer:
         partition: PartitionRef | None = None,
         target: ActiveIndexTarget | None = None,
         wait_for_lock: bool = False,
+        lock_timeout: float | None = None,
         on_progress: Callable[[IndexProgress], None] | None = None,
         trigger: IndexTrigger = "reference-backfill",
     ) -> ReferenceBackfillReport:
@@ -549,14 +617,28 @@ class Indexer:
             # caller sees those coverage limitations instead of a false clean
             # report.
 
+        # Reference tools call this on every query and the usual answer is
+        # "nothing to do". Decide that from a lock-free read so a query never
+        # queues behind an unrelated project's index run. A concurrent writer
+        # can only make the read look incomplete (it replaces files and
+        # references together), which falls through to the locked path.
+        with contextlib.suppress(CodeIndexingError):
+            early = self._reference_gap(project, partition).settled
+            if early is not None:
+                return early
+
         self.lock_directory.mkdir(parents=True, exist_ok=True)
         run_id = uuid.uuid4().hex
-        global_lock = FileLock(self.lock_directory / "index-global.lock")
+        # Backfill writes only this project's tables and never embeds, and
+        # every other writer of those tables takes the project lock too, so it
+        # does not need the global lock that an unrelated project's index run
+        # holds for its whole duration.
         project_lock = FileLock(self.lock_directory / f"{project.id}.lock")
         try:
             with (
-                global_lock.acquire() if wait_for_lock else global_lock.acquire(timeout=0),
-                project_lock.acquire() if wait_for_lock else project_lock.acquire(timeout=0),
+                project_lock.acquire(
+                    timeout=(-1 if lock_timeout is None else lock_timeout) if wait_for_lock else 0
+                ),
                 # Deferred: reference tools run a backfill on every query, and
                 # the overwhelmingly common outcome is "nothing missing". Only
                 # a backfill that actually starts work earns an audit row.
@@ -568,6 +650,7 @@ class Indexer:
                     partition_id=partition.partition_id,
                 ) as record,
             ):
+                self._recover_interrupted_commits(project, partition)
                 # Same contract as index(): capture the checkout identity
                 # under the lock so a branch switch while waiting cannot
                 # publish progress or staged rows for the wrong selector.
@@ -614,6 +697,34 @@ class Indexer:
                 f"Another indexing job is already active: {project.name}",
                 project=project.id,
             ) from exc
+
+    def _recover_interrupted_commits(self, project: ProjectInfo, partition: PartitionRef) -> None:
+        """Roll back a dead writer's ``committing`` journal before writing.
+
+        Called with the project writer lock held, so any journal for this slot
+        belongs to a writer that is gone (or to this process's own failed
+        rollback). Replaying it later, after a newer commit, would undo that
+        commit; restoring it now, before anything is written, cannot. A journal
+        that still cannot be rolled back blocks the run: writing on top of it
+        would bury the versions it needs.
+        """
+        root = self.staging_directory
+        if not root.is_dir():
+            return
+        recover_staged_commits(
+            root,
+            self.store,
+            project_id=project.id,
+            slot_id=partition.slot_id,
+            project_lock_held=True,
+        )
+        if has_committing_journal(root, project.id, partition.slot_id):
+            raise CodeIndexingError(
+                ErrorCode.INTERNAL_ERROR,
+                f"An interrupted commit for {project.name} could not be rolled back yet; "
+                "the index was left untouched. Retry, or restart to run recovery again.",
+                project=project.id,
+            )
 
     @contextlib.contextmanager
     def _recorded_run(
@@ -722,34 +833,14 @@ class Indexer:
                 }
         return {}
 
-    def _backfill_references_locked(
-        self,
-        project: ProjectInfo,
-        *,
-        partition: PartitionRef,
-        progress: ProgressPublisher,
-        run_record: _RunRecord,
-        guard: _GitGuard | None = None,
-    ) -> ReferenceBackfillReport:
-        # Backfill never embeds or re-parses chunks; it must not use its own
-        # (always error-free) run to promote a project past whatever state a
-        # prior full index earned it (S2 -- e.g. "partial" from a failed
-        # index must stay "partial" until a real index run heals it).
-        try:
-            prior_state = self.store.project_state(project.id)
-        except CodeIndexingError as exc:
-            if exc.code is not ErrorCode.PROJECT_NOT_FOUND:
-                raise
-            # A marker-resolved project that was never registered -- e.g. it
-            # has zero eligible source files, so `_project_is_stale` never
-            # called `index()` to register it, or the data directory was
-            # wiped while the on-disk marker survived (S11) -- has no prior
-            # run to protect. `existing` below reads the same per-project
-            # partition this lookup just proved absent, so it comes back
-            # empty and the early "nothing missing" return fires before this
-            # value would ever be read; it exists only so a future change to
-            # that invariant fails safe instead of crashing.
-            prior_state = "ready"
+    def _reference_gap(self, project: ProjectInfo, partition: PartitionRef) -> _ReferenceGap:
+        """Read which files lack current structural coverage, and whether that is final.
+
+        Reads only; takes no lock. The locked backfill recomputes it, so an
+        unlocked caller may use ``settled`` to skip taking any lock at all when
+        a concurrent writer cannot have changed the answer.
+        """
+
         existing = {
             record.path: record
             for record in self.store.list_files(project.id, partition_id=partition.partition_id)
@@ -784,8 +875,77 @@ class Indexer:
             if (known := coverage.get(record.file_id)) is None
             or known.content_hash != record.content_hash
         }
+        settled: ReferenceBackfillReport | None = None
         if not missing:
-            return ReferenceBackfillReport(project_id=project.id, files_current=len(existing))
+            settled = ReferenceBackfillReport(project_id=project.id, files_current=len(existing))
+        # A parse-failed file (not a deliberate rejection) with no reference
+        # rows of any generation has nothing left to retire and nothing this
+        # parse-only pass can add: it stays uncovered until a successful index
+        # replaces it. Without this split it is "missing" on every call and
+        # each call scans the tree, stages a retirement, and writes an audit
+        # row for nothing. The marker is the absence of any row for the file,
+        # so no schema change is needed. The reference table must already
+        # exist, though: creating it is real work (S8).
+        rows_on_file = {row["file_id"] for row in coverage_rows}
+        known_incomplete = {
+            file_id: record
+            for file_id, record in missing.items()
+            if record.has_errors
+            and not (record.error or "").startswith("rejected:")
+            and file_id not in rows_on_file
+        }
+        if (
+            missing
+            and len(known_incomplete) == len(missing)
+            and self.store.has_reference_table(project.id, partition_id=partition.partition_id)
+        ):
+            settled = ReferenceBackfillReport(
+                project_id=project.id,
+                files_current=len(existing) - len(known_incomplete),
+                incomplete_paths=sorted(record.path for record in known_incomplete.values()),
+            )
+
+        return _ReferenceGap(
+            existing=existing,
+            stale_schema_file_ids=stale_schema_file_ids,
+            missing=missing,
+            settled=settled,
+        )
+
+    def _backfill_references_locked(
+        self,
+        project: ProjectInfo,
+        *,
+        partition: PartitionRef,
+        progress: ProgressPublisher,
+        run_record: _RunRecord,
+        guard: _GitGuard | None = None,
+    ) -> ReferenceBackfillReport:
+        # Backfill never embeds or re-parses chunks; it must not use its own
+        # (always error-free) run to promote a project past whatever state a
+        # prior full index earned it (S2 -- e.g. "partial" from a failed
+        # index must stay "partial" until a real index run heals it).
+        try:
+            prior_state = self.store.project_state(project.id)
+        except CodeIndexingError as exc:
+            if exc.code is not ErrorCode.PROJECT_NOT_FOUND:
+                raise
+            # A marker-resolved project that was never registered -- e.g. it
+            # has zero eligible source files, so `_project_is_stale` never
+            # called `index()` to register it, or the data directory was
+            # wiped while the on-disk marker survived (S11) -- has no prior
+            # run to protect. `existing` below reads the same per-project
+            # partition this lookup just proved absent, so it comes back
+            # empty and the early "nothing missing" return fires before this
+            # value would ever be read; it exists only so a future change to
+            # that invariant fails safe instead of crashing.
+            prior_state = "ready"
+        gap = self._reference_gap(project, partition)
+        existing = gap.existing
+        stale_schema_file_ids = gap.stale_schema_file_ids
+        missing = gap.missing
+        if gap.settled is not None:
+            return gap.settled
 
         # Real work is about to start; only now does this run earn its audit
         # row. The storage snapshot inside start() still precedes every write.
@@ -941,7 +1101,9 @@ class Indexer:
             # reference backfill that outlived a branch switch must not pin
             # its generations into the moved-from slot.
             self._verify_git_guard(project, partition, guard)
-            self._commit_staged(project, job, partition=partition, errors=[], state=prior_state)
+            self._commit_staged(
+                project, job, partition=partition, errors=[], state=prior_state, guard=guard
+            )
             return ReferenceBackfillReport(
                 project_id=project.id,
                 files_checked=files_checked,
@@ -1001,6 +1163,26 @@ class Indexer:
             git_slot_id(project.id, state) != guard.slot_id
             or state.head_oid != guard.state.head_oid
         ):
+            raise CodeIndexingError(
+                ErrorCode.REPOSITORY_CHANGED,
+                f"The Git checkout of {project.name} changed while it was being indexed",
+                project=project.id,
+            )
+
+    def _abort_if_checkout_moved(self, project: ProjectInfo, state: _IndexScanState) -> None:
+        """Stop before embedding a batch when the checkout already left the guard.
+
+        The commit-time :meth:`_verify_git_guard` is the authority; this is a
+        file-read-only early exit (no Git subprocess) so a branch switch does
+        not cost the rest of the run's embeddings. An unreadable HEAD defers to
+        the commit-time check.
+        """
+        guard = state.guard
+        if guard is None:
+            return
+        snapshot = head_snapshot(guard.state)
+        expected = (guard.state.selector_kind, guard.state.selector_value, guard.state.head_oid)
+        if snapshot is not None and snapshot != expected:
             raise CodeIndexingError(
                 ErrorCode.REPOSITORY_CHANGED,
                 f"The Git checkout of {project.name} changed while it was being indexed",
@@ -1177,6 +1359,19 @@ class Indexer:
         # the sum of their reason counts.
         state.errors.append(IndexIssue(path=record.path, message=str(exc)))
         previous = existing.get(record.path)
+        message = str(exc)
+        attempts = 1
+        if (
+            previous is not None
+            and previous.has_errors
+            and previous.error is not None
+            and not previous.error.startswith("rejected:")
+            and previous.size == record.size
+            and previous.mtime_ns == record.mtime_ns
+        ):
+            # The same file version failed again: carry the count forward.
+            attempts = _failed_attempts(previous.error) + 1
+        stored_error = _FAILED_ATTEMPTS.sub("", message) + f" [failed attempts: {attempts}]"
         # Retained chunks and references still describe the previous content, so
         # a failed replacement must keep that generation's hash on the file row.
         self._staging_job(project, state).stage_file(
@@ -1186,7 +1381,7 @@ class Indexer:
                         previous.content_hash if previous is not None else record.content_hash
                     ),
                     "has_errors": True,
-                    "error": str(exc),
+                    "error": stored_error,
                     "indexed_at": time.time_ns(),
                 }
             )
@@ -1205,6 +1400,7 @@ class Indexer:
     ) -> None:
         if not state.pending:
             return
+        self._abort_if_checkout_moved(project, state)
         candidates = [
             _PendingCandidate(owner, chunk)
             for owner, pending_file in enumerate(state.pending)
@@ -1332,13 +1528,19 @@ class Indexer:
     ) -> None:
         path = item.path.as_posix()
         previous = existing.get(path)
+        # A file whose last replacement genuinely failed is retried (bounded by
+        # MAX_FAILED_ATTEMPTS) instead of trusting its size/mtime or content
+        # hash: the failure stored the old hash with the new metadata.
+        retrying = _is_retryable_failure(previous)
         if (
             not force
+            and not retrying
             and not verify_all
             and path not in verify_paths
             and previous is not None
             and previous.size == item.size
             and previous.mtime_ns == item.mtime_ns
+            and not _is_racy(previous)
         ):
             # Size and mtime alone trusted the filesystem's version of a
             # branch switch or reset: identical metadata can hide different
@@ -1384,10 +1586,20 @@ class Indexer:
                         job.mark_references_replaced(rejected_record.file_id)
                 state.record_skip(path, rejection)
                 return
-            if not force and previous is not None and previous.content_hash == content_hash:
+            if (
+                not force
+                and not retrying
+                and previous is not None
+                and previous.content_hash == content_hash
+            ):
                 with timer.measure("commit"):
+                    # A racy row is restamped so it stops being racy once the
+                    # window has passed, instead of being re-hashed forever.
+                    restamp = {"indexed_at": time.time_ns()} if _is_racy(previous) else {}
                     self._staging_job(project, state).stage_file(
-                        previous.model_copy(update={"size": item.size, "mtime_ns": item.mtime_ns})
+                        previous.model_copy(
+                            update={"size": item.size, "mtime_ns": item.mtime_ns, **restamp}
+                        )
                     )
                 state.metadata_only += 1
                 return
@@ -1487,7 +1699,7 @@ class Indexer:
             }
         # Streaming scans do not know their total until the walk finishes.
         progress.update(phase="scanning", force=True)
-        state = _IndexScanState(partition=partition)
+        state = _IndexScanState(partition=partition, guard=guard)
         process = psutil.Process()
         state.sample_memory(process)
         stream = self.scanner.iter_scan(project, existing)
@@ -1571,7 +1783,7 @@ class Indexer:
                         state.removed += 1
                 if state.job is not None:
                     self._commit_staged(
-                        project, state.job, partition=partition, errors=state.errors
+                        project, state.job, partition=partition, errors=state.errors, guard=guard
                     )
                 else:
                     final_state = self._derive_index_state(
@@ -1582,7 +1794,12 @@ class Indexer:
                         model_id=self.embedder.model_id,
                         state=final_state,
                     )
-                    self.store.set_slot_state(partition, final_state, project=project)
+                    self.store.set_slot_state(
+                        partition,
+                        final_state,
+                        project=project,
+                        scanned_git=guard.state if guard is not None else None,
+                    )
         except BaseException:
             # Discard staged bytes unless a failed rollback left a committing
             # journal that startup recovery still needs.
@@ -1601,9 +1818,11 @@ class Indexer:
         this run is already visible there; the important case is the reverse:
         a no-op run with no fresh errors must not promote a project that still
         has stored file errors back to "ready" (it earned "partial" and only a
-        real index run that heals every failed file may clear it). Rejection
-        tombstones are skips, not errors, so they do not keep a project
-        partial.
+        run that heals every failed file may clear it). Ordinary runs retry a
+        failed file up to ``MAX_FAILED_ATTEMPTS`` times; a file that has used
+        up its attempts keeps the project partial until it is edited or a
+        forced run rebuilds it. Rejection tombstones are skips, not errors, so
+        they do not keep a project partial.
         """
         if errors:
             return "partial"
@@ -1619,6 +1838,7 @@ class Indexer:
         partition: PartitionRef,
         errors: list[IndexIssue],
         state: str | None = None,
+        guard: _GitGuard | None = None,
     ) -> None:
         """Apply a fully staged run, rolling the live tables back on any failure.
 
@@ -1659,7 +1879,12 @@ class Indexer:
                     model_id=self.embedder.model_id,
                     state=final_state,
                 )
-                self.store.set_slot_state(partition, final_state, project=project)
+                self.store.set_slot_state(
+                    partition,
+                    final_state,
+                    project=project,
+                    scanned_git=guard.state if guard is not None else None,
+                )
         except BaseException:
             try:
                 with self.store.partition_access(project.id, partition_id=partition.partition_id):

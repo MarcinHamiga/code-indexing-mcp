@@ -28,7 +28,7 @@ from code_indexing_mcp.embedding import (
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.history import HistoryStore
-from code_indexing_mcp.indexing import REFERENCE_SCHEMA_VERSION, Indexer
+from code_indexing_mcp.indexing import MAX_FAILED_ATTEMPTS, REFERENCE_SCHEMA_VERSION, Indexer
 from code_indexing_mcp.models import (
     ExtractedChunk,
     ExtractionResult,
@@ -131,6 +131,59 @@ def test_indexer_skips_unchanged_and_metadata_only_files(tmp_path: Path) -> None
     assert metadata_only.parsed_files == 0
     assert len(embedder.passage_batches) == 1
     assert len(store.list_files(project.id)) == 1
+
+
+def make_project(root: Path, source: str):  # type: ignore[no-untyped-def]
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "main.py").write_text(source)
+    return initialize_project(root)
+
+
+def _whole_second_now_ns() -> int:
+    """A mtime as a 1 s-granularity filesystem would stamp a write made now."""
+    return int(time.time()) * 1_000_000_000
+
+
+def test_same_size_edit_within_one_mtime_tick_is_detected(tmp_path: Path) -> None:
+    """IDX-13: a racy-clean row on a coarse-timestamp filesystem is verified by content."""
+    root = tmp_path / "repo"
+    project = make_project(root, "def alpha():\n    return 1\n")
+    file = root / "main.py"
+    tick = _whole_second_now_ns()
+    os.utime(file, ns=(tick, tick))
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+
+    # Same size, same mtime, different content: the second edit inside one tick.
+    file.write_text("def omega():\n    return 1\n")
+    os.utime(file, ns=(tick, tick))
+    indexer.index(project)
+
+    assert {chunk.symbol for chunk in store.list_chunks([project.id])} == {"omega"}
+
+
+def test_settled_and_fine_grained_files_are_not_rehashed(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    project = make_project(root, "def alpha():\n    return 1\n")
+    settled = root / "settled.py"
+    settled.write_text("def beta():\n    return 2\n")
+    long_ago = (int(time.time()) - 60) * 1_000_000_000
+    os.utime(settled, ns=(long_ago, long_ago))
+    racy = root / "racy.py"
+    racy.write_text("def gamma():\n    return 3\n")
+    tick = _whole_second_now_ns()
+    os.utime(racy, ns=(tick, tick))
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    indexer.index(project)
+
+    report = indexer.index(project)
+
+    # main.py has a nanosecond mtime (a fine-grained filesystem), settled.py is
+    # old: both are trusted. Only the whole-second, just-indexed file is re-verified.
+    assert report.bytes_read == racy.stat().st_size
+    rows = {record.path: record for record in store.list_files(project.id)}
+    # Verifying it restamps it, so it stops being racy once the window passes.
+    assert rows["racy.py"].indexed_at > tick
 
 
 def test_walk_fallback_after_partial_git_enumeration_indexes_each_file_once(
@@ -447,11 +500,16 @@ def test_failed_changed_file_preserves_previous_generation(tmp_path: Path) -> No
     assert failed.content_hash == original_hash
     assert failed.has_errors is True
     assert store.project_state(project.id) == "partial"
-    # A failed file is recorded with its current size/mtime, so subsequent
-    # runs skip it instead of re-reading, re-parsing, and re-embedding it.
+    # A failed file is retried on later runs (bounded), and every failed retry
+    # keeps the previous generation intact.
     batches = len(embedder.passage_batches)
     second = indexer.index(project)
     assert len(embedder.passage_batches) == batches
+    assert second.unchanged_files == 0
+    assert len(second.errors) == 1
+    # Once the attempt budget is spent the file is skipped like any unchanged one.
+    for _ in range(MAX_FAILED_ATTEMPTS):
+        second = indexer.index(project)
     assert second.unchanged_files == 1
     assert second.errors == []
     assert store.list_chunks([project.id]) == original_chunks
@@ -1267,13 +1325,51 @@ def test_a_noop_run_cannot_promote_a_partial_project_with_stored_errors_to_ready
     assert store.project_state(project.id) == "partial"
     assert store.list_files(project.id)[0].has_errors is True
 
-    # Nothing changed, so this is a no-op run with no fresh errors -- but the
-    # stored file error still says the project is partial.
+    # Spend the retry budget: each run re-attempts the failed file and fails.
+    for _ in range(MAX_FAILED_ATTEMPTS):
+        indexer.index(project)
+
+    # Nothing changed and the file is no longer retried, so this is a no-op
+    # run with no fresh errors -- but the stored file error still says the
+    # project is partial.
     noop = indexer.index(project)
 
     assert noop.errors == []
     assert noop.unchanged_files == 1
     assert store.project_state(project.id) == "partial"
+
+
+def test_a_failed_file_is_retried_and_heals_when_the_failure_was_transient(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def renamed_symbol():\n    return 1\n")
+    project = initialize_project(root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    indexer.index(project)
+    (root / "main.py").write_text("def new_symbol_name():\n    return 2\n")
+    original_embed = embedder.embed_passages
+    failing = [True]
+
+    def flaky(texts: list[str]) -> list[list[float]]:
+        if failing[0]:
+            raise RuntimeError("transient")
+        return original_embed(texts)
+
+    with patch.object(embedder, "embed_passages", flaky):
+        failed = indexer.index(project)
+        assert len(failed.errors) == 1
+        assert store.project_state(project.id) == "partial"
+        failing[0] = False
+        healed = indexer.index(project)
+
+    assert healed.errors == []
+    assert healed.indexed_files == 1
+    assert store.list_files(project.id)[0].has_errors is False
+    assert store.project_state(project.id) == "ready"
+    assert "new_symbol_name" in " ".join(chunk.content for chunk in store.list_chunks([project.id]))
 
 
 def test_unexpected_index_failure_marks_project_error(tmp_path: Path) -> None:
@@ -2473,6 +2569,89 @@ def test_a_branch_switch_during_the_scan_discards_the_staged_run(tmp_path: Path)
     assert slot.partition_id != active.partition_id
 
 
+def test_a_branch_switch_mid_run_aborts_before_embedding(tmp_path: Path) -> None:
+    root, project = _git_project(tmp_path)
+    run_git("checkout", "-qb", "feature", cwd=root)
+    run_git("checkout", "-q", "main", cwd=root)
+    embedder = RecordingEmbedder()
+    indexer, store = make_indexer(tmp_path, embedder)
+    store.upsert_project(project, model_id="test/code", state="pending")
+    partition = store.active_partition(project.id)
+    original_scan = indexer.scanner.iter_scan
+
+    def switching_scan(
+        scan_project: ProjectInfo,
+        known_files: dict[str, StoredFile] | None = None,
+        **kwargs: bool,
+    ):
+        stream = original_scan(scan_project, known_files, **kwargs)
+        for index, item in enumerate(stream):
+            if index == 0:
+                run_git("checkout", "-q", "feature", cwd=root)
+            yield item
+
+    with (
+        patch.object(indexer.scanner, "iter_scan", switching_scan),
+        pytest.raises(CodeIndexingError) as excinfo,
+    ):
+        indexer.index(project, partition=partition)
+
+    assert excinfo.value.code is ErrorCode.REPOSITORY_CHANGED
+    # The guard is checked before each embedding batch, not only at commit.
+    assert embedder.passage_batches == []
+
+
+def test_a_dirty_file_reverted_mid_run_is_not_stamped_clean(tmp_path: Path) -> None:
+    root, project = _git_project(tmp_path)
+    (root / "main.py").write_text("def scratch_version():\n    return 9\n")
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    original_scan = indexer.scanner.iter_scan
+
+    def reverting_scan(
+        scan_project: ProjectInfo,
+        known_files: dict[str, StoredFile] | None = None,
+        **kwargs: bool,
+    ):
+        stream = original_scan(scan_project, known_files, **kwargs)
+        for index, item in enumerate(stream):
+            yield item
+            if index == 0:
+                run_git("checkout", "--", "main.py", cwd=root)
+
+    with patch.object(indexer.scanner, "iter_scan", reverting_scan):
+        indexer.index(project)
+
+    slot = store.get_slot(store.active_partition(project.id).slot_id)
+    assert slot is not None
+    # The stamp must describe the scanned (dirty) tree, not the reverted one.
+    assert slot.indexed_clean is not True
+    assert slot.indexed_status_paths is not None and "main.py" in slot.indexed_status_paths
+
+
+def test_a_head_advanced_after_the_guard_is_not_stamped_on_the_slot(tmp_path: Path) -> None:
+    root, project = _git_project(tmp_path)
+    scanned_head = _git_head(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    original_verify = indexer._verify_git_guard
+    advanced: list[str] = []
+
+    def advancing_verify(*args: object, **kwargs: object) -> None:
+        original_verify(*args, **kwargs)  # type: ignore[arg-type]
+        if not advanced:
+            (root / "main.py").write_text("def pulled_version():\n    return 5\n")
+            _git_commit(root, "pulled")
+            advanced.append(_git_head(root))
+
+    with patch.object(indexer, "_verify_git_guard", advancing_verify):
+        indexer.index(project)
+
+    slot = store.get_slot(store.active_partition(project.id).slot_id)
+    assert slot is not None
+    assert advanced and advanced[0] != scanned_head
+    assert slot.indexed_head != advanced[0]
+    assert slot.indexed_clean is not True
+
+
 def test_progress_publishes_the_slot_identity(tmp_path: Path) -> None:
     root, project = _git_project(tmp_path)
     indexer, store = make_indexer(tmp_path, RecordingEmbedder())
@@ -2593,3 +2772,40 @@ def test_prisma_type_block_does_not_hold_the_project_partial(tmp_path: Path) -> 
 
     assert not report.errors
     assert store.project_state(project.id) == "ready"
+
+
+def test_backfill_of_a_syntax_error_file_converges_without_rewriting(tmp_path: Path) -> None:
+    """IDX-5: a file that never parses must not redo a backfill on every call.
+
+    The file has no coverage row, so it stays "missing" forever. Once it is
+    known-incomplete with no stale rows left to retire, later calls must
+    report it again without a scan, a staging commit, or an audit row.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "good.py").write_text("def answer():\n    return 42\n")
+    (root / "broken.py").write_text("def broken(:\n    return (\n")
+    project = initialize_project(root)
+    history = HistoryStore(tmp_path / "history")
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder(), history=history)
+    indexer.index(project)
+    records = {record.path: record for record in store.list_files(project.id)}
+    assert records["broken.py"].has_errors is True
+    assert not store.coverage_for_file(
+        project.id, records["broken.py"].file_id, REFERENCE_SCHEMA_VERSION
+    )
+
+    first = indexer.backfill_references(project)
+    assert first.incomplete_paths == ["broken.py"]
+    versions = store.table_versions(project.id)
+    runs = len(history.list_runs(project.id).runs)
+
+    with patch.object(indexer.scanner, "iter_scan", side_effect=AssertionError("tree scanned")):
+        second = indexer.backfill_references(project)
+        third = indexer.backfill_references(project)
+
+    assert second.incomplete_paths == ["broken.py"]
+    assert second.files_current == first.files_current == 1
+    assert third == second
+    assert store.table_versions(project.id) == versions
+    assert len(history.list_runs(project.id).runs) == runs

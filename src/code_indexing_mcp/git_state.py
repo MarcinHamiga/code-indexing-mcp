@@ -71,12 +71,16 @@ class GitCommandResult(FrozenModel):
 GitRunner = Callable[[Sequence[str], Path], GitCommandResult]
 
 
-def run_git(command: Sequence[str], cwd: Path, *, errors: str = "strict") -> GitCommandResult:
+def run_git(
+    command: Sequence[str], cwd: Path, *, errors: str = "surrogateescape"
+) -> GitCommandResult:
     """Run one Git command without a shell and with bounded patience.
 
     ``GIT_OPTIONAL_LOCKS=0`` keeps even ``git status`` from taking the
     repository's index lock: a probe must never disturb the working checkout.
-    *errors* is the output decoding's error handler; a caller reading file
+    Output is decoded as UTF-8 on every platform. *errors* is the decoding's
+    error handler: the default ``"surrogateescape"`` round-trips a non-UTF-8
+    path exactly like the scanner's ``os.fsdecode``; a caller reading file
     content, which need not be UTF-8, passes ``"replace"``.
     """
     environment = os.environ.copy()
@@ -87,6 +91,7 @@ def run_git(command: Sequence[str], cwd: Path, *, errors: str = "strict") -> Git
             cwd=cwd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             errors=errors,
             timeout=GIT_TIMEOUT_SECONDS,
             check=False,
@@ -407,13 +412,28 @@ def head_snapshot(state: GitState) -> tuple[SelectorKind, str, str | None] | Non
         return None
     if content.startswith("ref:"):
         ref = content.removeprefix("ref:").strip()
-        if not ref.startswith("refs/"):
+        if not ref.startswith("refs/") or ref == _REFTABLE_HEAD_STUB:
+            return None
+        if _uses_reftable(checkout, state.repository_identity):
+            # Refs live in binary reftable files this reader cannot parse, so
+            # any answer from the loose/packed lookup would be wrong.
             return None
         oid = _resolve_ref(checkout, state.repository_identity, ref)
         return (SelectorKind.REF, ref, oid)
     if _looks_like_oid(content):
         return (SelectorKind.COMMIT, content, content)
     return None
+
+
+_REFTABLE_HEAD_STUB = "refs/heads/.invalid"
+
+
+def _uses_reftable(checkout: Path, repository_identity: str | None) -> bool:
+    """True when the repository stores refs in the reftable backend."""
+    candidates = [checkout]
+    if repository_identity is not None:
+        candidates.append(Path(repository_identity))
+    return any((directory / "reftable").is_dir() for directory in candidates)
 
 
 def _resolve_ref(checkout: Path, repository_identity: str | None, ref: str) -> str | None:
@@ -535,7 +555,7 @@ def _parse_status(
         worktree = WorktreeStatus.CLEAN
     digest = hashlib.sha256()
     for code, path in sorted(records):
-        digest.update(f"{code} {path}".encode())
+        digest.update(f"{code} {path}".encode("utf-8", "surrogateescape"))
         digest.update(b"\0")
     return worktree, tracked, untracked, digest.hexdigest()
 

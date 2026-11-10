@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import pytest
 from conftest import run_git
 
 from code_indexing_mcp.git_state import (
@@ -552,3 +554,62 @@ def test_head_snapshot_returns_none_for_a_corrupt_head(tmp_path: Path) -> None:
     (root / ".git" / "HEAD").write_text("garbage\n")
 
     assert head_snapshot(state) is None
+
+
+def test_head_snapshot_returns_none_for_a_reftable_repository(tmp_path: Path) -> None:
+    root = tmp_path / "reftable"
+    root.mkdir()
+    init = subprocess.run(
+        ["git", "init", "-q", "--ref-format=reftable", "--initial-branch", "main", str(root)],
+        capture_output=True,
+    )
+    if init.returncode != 0:
+        pytest.skip("git without reftable support")
+    (root / "main.py").write_text("value = 1\n")
+    _commit_all(root, "init")
+    state = probe_git_state(root)
+    assert state.head_oid == _head_oid(root)
+
+    assert head_snapshot(state) is None
+
+
+def test_head_snapshot_returns_none_for_the_reftable_head_stub(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    state = probe_git_state(root)
+    (root / ".git" / "HEAD").write_text("ref: refs/heads/.invalid\n")
+
+    assert head_snapshot(state) is None
+
+
+def _commit_non_utf8_path(root: Path, name: bytes) -> None:
+    """Commit a blob under a non-UTF-8 name without touching the filesystem."""
+    blob = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=root,
+        input=b"value = 2\n",
+        check=True,
+        capture_output=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-index", "--index-info"],
+        cwd=root,
+        input=b"100644 " + blob + b"\t" + name + b"\n",
+        check=True,
+    )
+    run_git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "latin1", cwd=root)
+
+
+def test_non_utf8_path_does_not_crash_status_or_diff(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "repo")
+    first = _head_oid(root)
+    name = b"caf\xe9.py"
+    _commit_non_utf8_path(root, name)
+    # The name is tracked but absent from the work tree: status prints " D".
+    odd = os.fsdecode(name)
+
+    state = probe_git_state(root, include_status=True)
+    changed = changed_paths_between(root, first, _head_oid(root))
+
+    assert state.probe is GitProbeOutcome.GIT
+    assert odd in state.dirty_paths
+    assert changed is not None and odd in changed

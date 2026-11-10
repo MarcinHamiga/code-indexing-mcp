@@ -1,6 +1,7 @@
 """Source access rejects unsafe live paths before reading their contents."""
 
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +10,7 @@ import pytest
 
 from code_indexing_mcp.errors import CodeIndexingError
 from code_indexing_mcp.reference_service import ReferenceService
-from code_indexing_mcp.source_io import SourceReadError, read_source
+from code_indexing_mcp.source_io import SourceReadError, checked_source_stat, read_source
 
 
 def test_reader_preserves_bytes_and_enforces_exact_size(tmp_path: Path) -> None:
@@ -119,3 +120,49 @@ def test_reader_rejects_growth_without_unbounded_reading(
     with pytest.raises(SourceReadError, match="oversized"):
         read_source(tmp_path, Path("source.py"), 8)
     assert requested == [9]
+
+
+def test_vetted_directory_cache_spares_ancestor_lstats_but_keeps_final_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deep = tmp_path / "a" / "b"
+    deep.mkdir(parents=True)
+    for name in ("one.py", "two.py"):
+        (deep / name).write_text("x = 1\n")
+    calls: list[Path] = []
+    real_lstat = Path.lstat
+
+    def counting_lstat(self: Path) -> os.stat_result:
+        calls.append(self)
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", counting_lstat)
+    vetted: set[Path] = set()
+
+    first = checked_source_stat(tmp_path, Path("a/b/one.py"), vetted_directories=vetted)
+    first_calls = len(calls)
+    second = checked_source_stat(tmp_path, Path("a/b/two.py"), vetted_directories=vetted)
+
+    assert stat.S_ISREG(first.st_mode) and stat.S_ISREG(second.st_mode)
+    assert first_calls == 3
+    assert len(calls) - first_calls == 1
+    assert vetted == {Path("a"), Path("a/b")}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
+def test_vetted_directory_cache_never_hides_a_symlinked_component(tmp_path: Path) -> None:
+    (tmp_path / "real").mkdir()
+    (tmp_path / "real" / "ok.py").write_text("x = 1\n")
+    (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+    (tmp_path / "real" / "sub").mkdir()
+    (tmp_path / "real" / "sub" / "f.py").write_text("x = 1\n")
+    vetted: set[Path] = set()
+
+    checked_source_stat(tmp_path, Path("real/ok.py"), vetted_directories=vetted)
+    with pytest.raises(SourceReadError, match="symlink"):
+        checked_source_stat(tmp_path, Path("link/ok.py"), vetted_directories=vetted)
+    # A deeper path under a vetted ancestor still vets its new directories.
+    (tmp_path / "real" / "sub").rename(tmp_path / "real" / "sub_moved")
+    (tmp_path / "real" / "sub").symlink_to(tmp_path / "real" / "sub_moved")
+    with pytest.raises(SourceReadError, match="symlink"):
+        checked_source_stat(tmp_path, Path("real/sub/f.py"), vetted_directories=vetted)

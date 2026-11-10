@@ -133,6 +133,9 @@ class SourceScanner:
         config_excludes = GitIgnoreSpec.from_lines(scan.exclude)
         include_spec = GitIgnoreSpec.from_lines(scan.include)
         in_worktree = self._in_git_worktree(root)
+        root_ignored = in_worktree and self._git_ignores_root(root)
+        if root_ignored:
+            in_worktree = False
         if in_worktree:
             try:
                 for batch in self._iter_git_batches(root):
@@ -174,15 +177,21 @@ class SourceScanner:
                 if isinstance(scanned, ScannedFile):
                     pending.append(scanned.path)
                     if len(pending) >= GIT_IGNORE_DISCOVERY_BATCH_SIZE:
-                        ignored = self._git_ignored_paths(
-                            root, [root / relative for relative in pending]
+                        ignored = (
+                            self._git_ignored_paths(root, [root / relative for relative in pending])
+                            if not root_ignored
+                            else set()
                         )
                         for relative in pending:
                             if relative not in ignored:
                                 yield relative
                         pending = []
         if pending:
-            ignored = self._git_ignored_paths(root, [root / relative for relative in pending])
+            ignored = (
+                self._git_ignored_paths(root, [root / relative for relative in pending])
+                if not root_ignored
+                else set()
+            )
             for relative in pending:
                 if relative not in ignored:
                     yield relative
@@ -261,6 +270,9 @@ class SourceScanner:
         config_excludes = GitIgnoreSpec.from_lines(project.scan.exclude)
         include_spec = GitIgnoreSpec.from_lines(project.scan.include)
         in_worktree = self._in_git_worktree(root)
+        root_ignored = in_worktree and self._git_ignores_root(root)
+        if root_ignored:
+            in_worktree = False
         git_yielded: set[str] = set()
         fallback = False
         if in_worktree:
@@ -426,6 +438,27 @@ class SourceScanner:
         return result.returncode == 0 and result.stdout.strip() == b"true"
 
     @staticmethod
+    def _git_ignores_root(root: Path) -> bool:
+        """Return whether the enclosing repository ignores *root* itself.
+
+        A project nested in an ignored directory has no tracked or "other"
+        files for ``ls-files`` to list, so trusting Git would index nothing.
+        Such a root is walked instead; the walk applies its own ``.gitignore``
+        files.
+        """
+        try:
+            ignored = subprocess.run(
+                ["git", "-C", str(root), "check-ignore", "-q", "."],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=GIT_CHECK_IGNORE_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return ignored.returncode == 0
+
+    @staticmethod
     def _iter_git_batches(root: Path) -> Iterator[list[Path]]:
         """Stream ``git ls-files`` output in bounded, sorted batches.
 
@@ -476,6 +509,10 @@ class SourceScanner:
         batch: list[Path] = []
         buffer = bytearray()
         start = 0
+        # An unmerged path is listed once per stage (up to three times) and the
+        # stages are adjacent in Git's index order, so comparing with the
+        # previous entry across batch boundaries removes every duplicate.
+        previous_raw: bytes | None = None
         deadline = time.monotonic() + GIT_LS_FILES_TIMEOUT_SECONDS
         try:
             while True:
@@ -501,8 +538,9 @@ class SourceScanner:
                         break
                     raw = bytes(buffer[start:separator])
                     start = separator + 1
-                    if raw:
+                    if raw and raw != previous_raw:
                         batch.append(root / os.fsdecode(raw))
+                    previous_raw = raw
                     if len(batch) >= GIT_IGNORE_DISCOVERY_BATCH_SIZE:
                         batch.sort()
                         suspended = time.monotonic()
@@ -553,6 +591,10 @@ class SourceScanner:
         subprocess entirely because there is nothing for it to apply.
         """
         ignored_paths: set[Path] = set()
+        # Ancestor directories already vetted during this batch; the content
+        # read below re-vets the full chain per file, so this only spares the
+        # repeated stat-only lstat of shared directories.
+        vetted_directories: set[Path] = set()
         if run_check_ignore and items:
             ignored_paths = self._git_ignored_paths(root, [absolute for absolute, _ in items])
         for absolute, ignore_specs in items:
@@ -576,7 +618,7 @@ class SourceScanner:
                     yield SkippedFile(path=relative, reason=skip_reason)
                 continue
             try:
-                stat = checked_source_stat(root, relative)
+                stat = checked_source_stat(root, relative, vetted_directories=vetted_directories)
                 if stat.st_size > max_file_bytes:
                     yield SkippedFile(path=relative, reason="oversized")
                     continue
