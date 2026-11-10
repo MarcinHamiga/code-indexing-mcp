@@ -416,3 +416,39 @@ def test_microbatching_an_empty_plan_produces_no_batches() -> None:
 def test_a_zero_item_limit_is_rejected() -> None:
     with pytest.raises(ValueError, match="max_items"):
         plan_microbatches([1, 2], max_items=0)
+
+
+def _dense_truncating_encode(limit: int, per_char: int = 3):  # type: ignore[no-untyped-def]
+    """Every character costs *per_char* tokens and the tokenizer truncates at *limit*.
+
+    This is the shape of the production tokenizer wrapper, which calls
+    ``enable_truncation(max_length=...)`` on the very object the planner encodes with.
+    """
+
+    def encode(text: str) -> FakeEncoding:
+        spans = [(index, index + 1) for index in range(len(text)) for _ in range(per_char)]
+        spans = spans[: limit - 2]
+        return FakeEncoding(
+            offsets=[(0, 0), *spans, (0, 0)],
+            special_tokens_mask=[1, *([0] * len(spans)), 1],
+        )
+
+    return encode
+
+
+def test_tokens_past_the_tokenizers_truncation_limit_are_still_planned() -> None:
+    """EMB-11: the planner only sees what the tokenizer returns. A chunk denser
+    than the limit used to have its whole unseen tail absorbed by the last
+    window, and the overflow replan then collapsed until planning raised."""
+    text = "".join(chr(0x4E00 + index) for index in range(40))  # 120 tokens, limit 50
+    encode = _dense_truncating_encode(limit=50)
+
+    (windows,) = plan_candidate_windows(encode, [("", text)], max_tokens=16, overlap_tokens=4)
+
+    assert windows[0].start_char == 0
+    assert windows[-1].end_char == len(text)
+    previous_end = 0
+    for window in windows:
+        assert window.start_char <= previous_end, "no gap between windows"
+        previous_end = max(previous_end, window.end_char)
+        assert window.input_token_count is not None and window.input_token_count <= 16

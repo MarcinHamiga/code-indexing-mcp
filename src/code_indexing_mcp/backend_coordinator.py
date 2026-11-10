@@ -98,16 +98,38 @@ class BackendCoordinator:
         self.batch_calibration: str = "explicit"
         if settings.embedding_batch_auto:
             self.batch_calibration = "default"
-            if self.backend_selection.uses_accelerator:
-                self._probe_key = self._build_probe_key(embedder)
-                cached = self.probe_cache.load(self._probe_key)
-                if cached is not None and cached.batch_size > 0:
+        if self.backend_selection.uses_accelerator:
+            # Built for an explicit batch size too: the probe and the rates it
+            # records are what the crossover is computed from, and none of that
+            # depends on how the batch size was chosen.
+            self._probe_key = self._build_probe_key(embedder)
+            cached = self.probe_cache.load(self._probe_key, context=self._probe_context())
+            if cached is not None and cached.batch_size > 0:
+                # Precedence: an explicit size is an upper bound, so only a
+                # reduced record may lower it; auto adopts any recorded size.
+                if settings.embedding_batch_auto:
                     self.embedding_batch_size = cached.batch_size
                     # A size something forced down is not the size calibration
                     # chose, and a machine pinned low by one bad run has to be
                     # able to say so. Which kind of ceiling stopped it is a
                     # question for the recommendation, not for this label.
                     self.batch_calibration = "reduced" if cached.limited_by else "measured"
+                elif cached.limited_by and cached.batch_size < self.embedding_batch_size:
+                    self.embedding_batch_size = cached.batch_size
+                    self.batch_calibration = "reduced"
+
+    def _probe_context(self) -> str:
+        """The settings a stored measurement depends on and the probe key omits.
+
+        The memory ceiling and token budget shape the batches that were timed or
+        overran, and the thread count shapes CPU speed. The padded-token product
+        is derived from the first two, so it is not stored separately.
+        """
+        settings = self.settings
+        return (
+            f"mem={settings.index_memory_bytes};tok={settings.embedding_max_tokens};"
+            f"ovl={settings.embedding_overlap_tokens};thr={settings.embedding_threads}"
+        )
 
     def _select_backend(self) -> BackendSelection:
         """Choose a backend from everything this machine can actually execute."""
@@ -216,14 +238,31 @@ class BackendCoordinator:
         when nothing has been measured and when the operator set a size
         explicitly -- an explicit size is a size for the whole installation.
         """
-        if not self.settings.embedding_batch_auto:
+        record = self.probe_cache.load(self._cpu_probe_key(), context=self._probe_context())
+        if record is None:
             return 0
-        record = self.probe_cache.load(self._cpu_probe_key())
-        return 0 if record is None else record.batch_size
+        if not self.settings.embedding_batch_auto:
+            # Only a size an overrun forced down may lower an explicit one; the
+            # session bounds it by the explicit size.
+            return record.batch_size if record.limited_by else 0
+        return record.batch_size
 
     def passage_cache_namespace(self, project_id: str) -> PassageCacheNamespace | None:
         """Return a durable identity for a supported, locally known producer."""
-        descriptor = self.effective_backend_selection.descriptor
+        return self._passage_namespace(project_id, self.effective_backend_selection.descriptor)
+
+    def cpu_passage_cache_namespace(self, project_id: str) -> PassageCacheNamespace | None:
+        """Return the identity of CPU-produced vectors, whatever was selected.
+
+        A run that selected an accelerator may still embed on CPU (below the
+        crossover, or after a degradation). Those vectors are CPU vectors and
+        are stored under, and only under, this namespace.
+        """
+        return self._passage_namespace(project_id, CPU_BACKEND)
+
+    def _passage_namespace(
+        self, project_id: str, descriptor: BackendDescriptor
+    ) -> PassageCacheNamespace | None:
         if descriptor.accelerator not in {Accelerator.CPU, Accelerator.MLX}:
             return None
         cache_directory = Path(
@@ -270,10 +309,12 @@ class BackendCoordinator:
     def _measurements(self) -> tuple[ProbeRecord | None, ProbeRecord | None]:
         """Return what calibration recorded for CPU and for the accelerator."""
         selection = self.effective_backend_selection
+        context = self._probe_context()
+        cpu = self.probe_cache.load(self._cpu_probe_key(), context=context)
         if not selection.uses_accelerator:
-            return self.probe_cache.load(self._cpu_probe_key()), None
+            return cpu, None
         key = self._probe_key or self._build_probe_key(self.embedder)
-        return self.probe_cache.load(self._cpu_probe_key()), self.probe_cache.load(key)
+        return cpu, self.probe_cache.load(key, context=context)
 
     def crossover_characters(self) -> int | None:
         """Return the run size below which this machine should stay on CPU.
@@ -301,7 +342,10 @@ class BackendCoordinator:
             return self.settings.embedding_crossover_characters
         measurements = self._measurements()
         cpu, accelerator = measurements
-        if cpu is None or accelerator is None:
+        # A record without a rate was verified or reduced but never timed. It
+        # says nothing about speed, and treating it as "never overtakes" would
+        # stop the accelerator from ever starting.
+        if _rate(cpu) is None or _rate(accelerator) is None:
             return 0
         return self._measured_crossover(measurements)
 
@@ -423,6 +467,10 @@ class BackendCoordinator:
                 # because that is whose batch size calibration adopted. A run
                 # that defers or degrades to CPU is packed for CPU instead.
                 cpu_max_items=self._cpu_max_items(),
+                batch_ceiling=0
+                if self.settings.embedding_batch_auto
+                else self.settings.embedding_batch_size,
+                probe_context=self._probe_context(),
             )
 
         return new_passage_session
@@ -436,7 +484,7 @@ class BackendCoordinator:
             probe_state = "not-applicable"
         else:
             key = self._probe_key or self._build_probe_key(self.embedder)
-            probe_state = self.probe_cache.state(key)
+            probe_state = self.probe_cache.state(key, context=self._probe_context())
         record = self.accelerator_environment.environment
         external = selection.uses_accelerator and self._runs_externally(descriptor)
         cpu, accelerator = self._measurements()

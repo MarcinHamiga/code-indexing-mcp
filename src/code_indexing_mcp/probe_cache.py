@@ -106,6 +106,12 @@ class ProbeRecord:
     # "memory" when the batch size above is the last one that fit rather than
     # the fastest one measured.
     limited_by: str = ""
+    # Inputs the key does not carry (memory ceiling, token budget, thread
+    # count), so a record written under other settings is re-measured instead of
+    # trusted. Empty for records written before this field existed; those stay
+    # readable and are honoured, except that an old *reduced* record is treated
+    # as absent because nothing says which ceiling reduced it.
+    context: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -135,6 +141,7 @@ class ProbeRecord:
                 characters_per_second=characters_per_second,
                 load_ns=load_ns,
                 limited_by=str(value.get("limited_by", "")),
+                context=str(value.get("context", "")),
             )
         except (KeyError, TypeError, ValueError):
             # A record we cannot read is a record we cannot trust. Dropping it
@@ -214,12 +221,24 @@ class ProbeCache:
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def load(self, key: ProbeKey) -> ProbeRecord | None:
-        """Return the record for *key*, or ``None`` when nothing matches it."""
+    def load(self, key: ProbeKey, *, context: str | None = None) -> ProbeRecord | None:
+        """Return the record for *key*, or ``None`` when nothing matches it.
+
+        With *context*, a record written under a different context is absent: it
+        was measured against inputs (memory ceiling, token budget, threads) that
+        no longer hold. A record with no context predates the field and is kept,
+        unless it records a reduction, which an unknown ceiling may have caused.
+        """
         fingerprint = key.fingerprint()
         for record in self._records():
-            if record.fingerprint == fingerprint:
-                return record
+            if record.fingerprint != fingerprint:
+                continue
+            if context:
+                if record.context and record.context != context:
+                    return None
+                if not record.context and record.limited_by:
+                    return None
+            return record
         return None
 
     def store(
@@ -232,6 +251,7 @@ class ProbeCache:
         characters_per_second: float = 0.0,
         load_ns: int = 0,
         limited_by: str = "",
+        context: str = "",
     ) -> None:
         """Record a successful probe, replacing any earlier one for *key*.
 
@@ -248,6 +268,7 @@ class ProbeCache:
             characters_per_second=characters_per_second,
             load_ns=load_ns,
             limited_by=limited_by,
+            context=context,
         )
         lock = self._acquire()
         if lock is None:
@@ -277,9 +298,9 @@ class ProbeCache:
             return None
         return lock
 
-    def state(self, key: ProbeKey) -> str:
+    def state(self, key: ProbeKey, *, context: str | None = None) -> str:
         """Return ``"hit"`` or ``"miss"`` for diagnostics such as model status."""
-        return "hit" if self.load(key) is not None else "miss"
+        return "hit" if self.load(key, context=context) is not None else "miss"
 
     def _records(self) -> list[ProbeRecord]:
         try:

@@ -185,6 +185,8 @@ def _backend(
     calibration_plan: SegmentPlan | None = None,
     cpu_probe_key: ProbeKey | None = None,
     cpu_max_items: int = 0,
+    batch_ceiling: int = 0,
+    probe_context: str = "",
 ) -> PassageBackendSession:
     cpu_started: list[int] = []
     accelerator_started: list[int] = []
@@ -217,6 +219,8 @@ def _backend(
         crossover_characters=crossover_characters,
         calibration_plan=calibration_plan,
         cpu_max_items=cpu_max_items,
+        batch_ceiling=batch_ceiling,
+        probe_context=probe_context,
     )
     session.cpu_starts = cpu_started  # type: ignore[attr-defined]
     session.accelerator_starts = accelerator_started  # type: ignore[attr-defined]
@@ -931,7 +935,9 @@ def test_a_batch_size_an_overrun_reduced_replaces_the_calibrated_one(
     """Otherwise the next run rediscovers the same ceiling by overrunning it."""
     cache = ProbeCache(tmp_path / "probes.json")
     key = _probe_key()
-    cache.store(key, batch_size=8, dimension=DIMENSION, characters_per_second=100.0, load_ns=1)
+    # The recorded size is what the plan was built from (EMB-4: a cached size is
+    # now applied to the run), so the two agree here.
+    cache.store(key, batch_size=4, dimension=DIMENSION, characters_per_second=100.0, load_ns=1)
 
     with _backend(_shrinking_worker, probe_cache=cache, probe_key=key) as backend:
         backend.plan_and_embed(_candidates(2), SegmentPlan(max_tokens=8, max_items=4))
@@ -1107,3 +1113,227 @@ def test_cache_tokenizer_capability_comes_from_current_worker(available: bool | 
         backend._session = backend._cpu_factory()
         backend._session.tokenizer_available = available
         assert backend.tokenizer_available is available
+
+
+# -- track J: session state ------------------------------------------------
+
+
+def test_a_reference_measurement_that_cannot_start_never_fails_the_run(tmp_path: Path) -> None:
+    """EMB-1: the CPU reference is diagnostic. Its worker refusing to start (for
+    instance INDEX_RESOURCE_LIMIT when memory is low at teardown) must not turn
+    an already-committed run into an error."""
+    cache = ProbeCache(tmp_path / "probes.json")
+    cache.store(
+        _probe_key(), batch_size=8, dimension=DIMENSION, characters_per_second=100.0, load_ns=1
+    )
+
+    backend = _backend(
+        _healthy_worker,
+        probe_cache=cache,
+        probe_key=_probe_key(),
+        cpu_probe_key=_cpu_probe_key(),
+        calibration_plan=PLAN,
+    )
+
+    def refuse() -> EmbeddingWorkerSession:
+        raise CodeIndexingError(ErrorCode.INDEX_RESOURCE_LIMIT, "Insufficient available memory")
+
+    with backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+        backend._cpu_factory = refuse  # type: ignore[method-assign]
+
+    assert cache.load(_cpu_probe_key()) is None
+
+
+def _product_bound_worker(connection: Connection, config: WorkerConfig) -> None:
+    """Overruns whenever the padded-token product exceeds 1,024, whatever the item count."""
+    while True:
+        command, payload = connection.recv()
+        if command == "stop":
+            return
+        if command == "initialize":
+            connection.send(("initialized", (tuple(config.providers), config.dimension)))
+            continue
+        if command == "probe":
+            connection.send(("probed", [_unit_vector(1.0) for _ in PROBE_TEXTS]))
+            continue
+        candidates, plan = payload
+        if plan.max_token_product > 1024:
+            connection.send(("error", "INDEX_RESOURCE_LIMIT: exceeded its memory ceiling"))
+            continue
+        connection.send(("planned", (_packed_segments(len(candidates)), True)))
+
+
+def test_a_memory_retry_shrinks_the_token_product_not_just_the_item_count() -> None:
+    """EMB-6: when the token product binds, halving max_items alone re-sends the
+    identical batch every time, so every retry fails the same way."""
+    session = _session(_product_bound_worker, _config("cpu", CPU_BACKEND.providers))
+    plan = SegmentPlan(max_tokens=64, max_items=32, max_token_product=4096)
+    try:
+        result = session.plan_and_embed(_candidates(2), plan)
+    finally:
+        session.close()
+
+    assert len(result) == 2
+    assert session.retry_count >= 1
+    assert session.safe_max_items < 32
+
+
+def _sizes(result: list[list[object]]) -> list[int]:
+    return [segments[0].token_count for segments in result]  # type: ignore[attr-defined]
+
+
+def test_a_later_run_in_the_same_process_uses_the_cached_calibrated_size(tmp_path: Path) -> None:
+    """EMB-4: the plan is built once per process, so a record written after it
+    was built has to be applied by the session, not left at the stale size."""
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _probe_key()
+    cache.store(key, batch_size=8, dimension=DIMENSION, characters_per_second=50.0, load_ns=1)
+
+    with _backend(_plan_recording_worker, probe_cache=cache, probe_key=key) as backend:
+        result = backend.plan_and_embed(_candidates(2), SegmentPlan(max_tokens=8, max_items=1))
+
+    assert backend.probe_state == "cached"
+    assert _sizes(result) == [8, 8]
+
+
+def test_a_persisted_reduction_reaches_later_runs_with_a_stale_larger_plan(
+    tmp_path: Path,
+) -> None:
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _probe_key()
+    cache.store(
+        key,
+        batch_size=2,
+        dimension=DIMENSION,
+        characters_per_second=50.0,
+        load_ns=1,
+        limited_by="memory",
+    )
+
+    with _backend(_plan_recording_worker, probe_cache=cache, probe_key=key) as backend:
+        result = backend.plan_and_embed(_candidates(2), SegmentPlan(max_tokens=8, max_items=16))
+
+    assert _sizes(result) == [2, 2]
+
+
+def test_calibration_never_raises_an_explicit_batch_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EMB-3: an explicit size is the operator's upper bound."""
+    monkeypatch.setattr(
+        "code_indexing_mcp.passage_backend.calibrate",
+        lambda *args, **kwargs: CalibrationResult(
+            max_items=8, characters_per_second=1_000.0, load_ns=1
+        ),
+    )
+    with _backend(_plan_recording_worker, calibration_plan=PLAN, batch_ceiling=4) as backend:
+        measured = backend.plan_and_embed(_candidates(1), SegmentPlan(max_tokens=8, max_items=4))
+    assert _sizes(measured) == [4]
+
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _probe_key()
+    cache.store(key, batch_size=8, dimension=DIMENSION, characters_per_second=50.0, load_ns=1)
+    with _backend(
+        _plan_recording_worker, probe_cache=cache, probe_key=key, batch_ceiling=4
+    ) as backend:
+        cached = backend.plan_and_embed(_candidates(1), SegmentPlan(max_tokens=8, max_items=4))
+    assert _sizes(cached) == [4]
+
+
+def test_a_recorded_reduction_still_lowers_an_explicit_batch_size(tmp_path: Path) -> None:
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _probe_key()
+    cache.store(
+        key,
+        batch_size=2,
+        dimension=DIMENSION,
+        characters_per_second=50.0,
+        load_ns=1,
+        limited_by="memory",
+    )
+    with _backend(
+        _plan_recording_worker, probe_cache=cache, probe_key=key, batch_ceiling=4
+    ) as backend:
+        result = backend.plan_and_embed(_candidates(1), SegmentPlan(max_tokens=8, max_items=4))
+    assert _sizes(result) == [2]
+
+
+def _cpu_only() -> BackendSelection:
+    return BackendSelection(
+        requested=Accelerator.CPU, descriptor=CPU_BACKEND, available_providers=(CPU_PROVIDER,)
+    )
+
+
+def test_a_size_an_overrun_forced_down_on_cpu_is_adopted_and_recorded(tmp_path: Path) -> None:
+    """EMB-5: the CPU path used to ignore safe_max_items, so every group
+    re-requested the size that had overrun."""
+    cache = ProbeCache(tmp_path / "probes.json")
+    plan = SegmentPlan(max_tokens=8, max_items=4)
+
+    with _backend(
+        _healthy_worker,
+        cpu_target=_fragile_recording_worker,
+        selection=_cpu_only(),
+        probe_cache=cache,
+        cpu_probe_key=_cpu_probe_key(),
+    ) as backend:
+        backend.plan_and_embed(_candidates(2), plan)
+        retries = backend.telemetry().retry_count
+        second = backend.plan_and_embed(_candidates(2), plan)
+        third = backend.plan_and_embed(_candidates(2), plan)
+
+    assert retries > 0
+    assert _sizes(second) == [1, 1]
+    assert _sizes(third) == [1, 1]
+    assert backend.telemetry().retry_count == retries
+    record = cache.load(_cpu_probe_key())
+    assert record is not None
+    assert (record.batch_size, record.limited_by) == (1, "memory")
+
+
+def test_a_zero_rate_record_does_not_suppress_calibration(tmp_path: Path) -> None:
+    """EMB-7(b): a probe stored unmeasured is verified, not calibrated."""
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _probe_key()
+    cache.store(key, batch_size=0, dimension=DIMENSION)
+
+    with _backend(
+        _healthy_worker, probe_cache=cache, probe_key=key, calibration_plan=PLAN
+    ) as backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+
+    record = cache.load(key)
+    assert record is not None
+    assert record.characters_per_second > 0
+    assert record.batch_size > 0
+
+
+def test_a_record_measured_under_other_settings_is_measured_again(tmp_path: Path) -> None:
+    """EMB-7(a): a memory-limited reduction must not outlive the ceiling that caused it."""
+    cache = ProbeCache(tmp_path / "probes.json")
+    key = _probe_key()
+    cache.store(
+        key,
+        batch_size=1,
+        dimension=DIMENSION,
+        characters_per_second=10.0,
+        load_ns=1,
+        limited_by="memory",
+        context="mem=1",
+    )
+
+    with _backend(
+        _healthy_worker,
+        probe_cache=cache,
+        probe_key=key,
+        calibration_plan=PLAN,
+        probe_context="mem=2",
+    ) as backend:
+        backend.plan_and_embed(_candidates(1), PLAN)
+
+    assert backend.probe_state == "verified"
+    record = cache.load(key, context="mem=2")
+    assert record is not None
+    assert record.limited_by == ""
+    assert record.context == "mem=2"

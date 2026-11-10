@@ -166,7 +166,7 @@ SETTINGS: tuple[Setting, ...] = (
         "attention memory grows quadratically. Default: 1024.",
         "int",
         "1024",
-        minimum=64,
+        minimum=256,
         maximum=8192,
     ),
     Setting(

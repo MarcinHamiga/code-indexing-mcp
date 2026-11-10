@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 from code_indexing_mcp import embedding
@@ -20,6 +21,7 @@ from code_indexing_mcp.embedding import (
     resolve_session_providers,
     resolve_tokenizer,
 )
+from code_indexing_mcp.token_batching import DEFAULT_MAX_TOKENS
 
 
 class _FakeModel:
@@ -225,3 +227,40 @@ def test_embed_windows_restores_candidates_and_sorts_their_windows() -> None:
         compose_passage("candidate-b", "c"),
         compose_passage("candidate-b", "d"),
     ]
+
+
+class _SpanEncoding:
+    def __init__(self, text: str) -> None:
+        self.offsets = [(0, 0), *[(i, i + 1) for i in range(len(text))], (0, 0)]
+        self.special_tokens_mask = [1, *([0] * len(text)), 1]
+
+
+class _CharTokenizer:
+    def encode(self, text: str) -> _SpanEncoding:
+        return _SpanEncoding(text)
+
+
+class _QueryModel:
+    """One token per character; records what reached the model."""
+
+    def __init__(self) -> None:
+        self.tokenizer = _CharTokenizer()
+        self.queries: list[str] = []
+
+    def query_embed(self, text: str) -> list[np.ndarray]:
+        self.queries.append(text)
+        return [np.zeros(4, dtype=np.float32)]
+
+
+def test_a_query_is_bounded_by_tokens_before_it_reaches_the_model(tmp_path: Path) -> None:
+    """EMB-2: a 16 KB query used to run as one multi-thousand-token sequence in
+    the long-lived process."""
+    embedder = FastEmbedder(tmp_path / "models")
+    model = _QueryModel()
+    embedder._model = model  # type: ignore[assignment]
+
+    embedder.embed_query("x" * 5000)
+    embedder.embed_query("find the retry logic")
+
+    assert len(model.queries[0]) == DEFAULT_MAX_TOKENS - 2
+    assert model.queries[1] == "find the retry logic", "ordinary queries are untouched"

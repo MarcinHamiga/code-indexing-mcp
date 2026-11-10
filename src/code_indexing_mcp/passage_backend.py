@@ -100,6 +100,8 @@ class PassageBackendSession:
         crossover_characters: int | None = 0,
         calibration_plan: SegmentPlan | None = None,
         cpu_max_items: int = 0,
+        batch_ceiling: int = 0,
+        probe_context: str = "",
     ) -> None:
         self.selection = selection
         self.strict = strict
@@ -129,6 +131,18 @@ class PassageBackendSession:
         # CPU's one, that is a run retrying its way through the whole corpus.
         # 0 leaves whatever the caller planned alone.
         self._cpu_max_items = cpu_max_items
+        # A microbatch size the operator set explicitly, or 0 for auto. It is an
+        # upper bound: calibration may never raise a run above it, while a size
+        # an overrun forced down (a recorded or in-run reduction) still lowers
+        # it. See ``_bounded`` for where the precedence is applied.
+        self._batch_ceiling = batch_ceiling
+        # Inputs a stored measurement depends on but the probe key does not
+        # carry (memory ceiling, token budget, thread count). A record written
+        # under a different context is re-measured rather than trusted.
+        self._probe_context = probe_context
+        # The reduced size a ceiling overrun established on CPU, as against the
+        # accelerator's ``_session_max_items``.
+        self._cpu_safe_items = 0
         # Characters this run has embedded, and the size above which starting
         # the accelerator repays its model load. 0 means no measured crossover,
         # which is the pre-calibration behaviour: use the accelerator at once.
@@ -219,11 +233,37 @@ class PassageBackendSession:
         itself at a size the sweep superseded, and a run whose batch was forced
         down re-requests the size that overran for every group after it.
         """
+        # Batch-size precedence, applied here and nowhere else:
+        #   1. An explicit CODE_INDEXING_EMBED_BATCH_SIZE (``_batch_ceiling``) is
+        #      an upper bound the operator chose. Calibration never raises a run
+        #      above it (see ``_bounded``).
+        #   2. A size an overrun forced down -- recorded by an earlier run, read
+        #      back from the probe cache, or found by this run's own retries --
+        #      lowers whatever the plan asked for, explicit or not.
+        #   3. Otherwise, in auto mode, the size calibrated for the backend that
+        #      is about to run replaces the plan's.
         if session.config.accelerator == CPU_BACKEND.accelerator.value:
-            return replace(plan, max_items=self._cpu_max_items) if self._cpu_max_items else plan
+            items = self._cpu_max_items or plan.max_items
+            if self._batch_ceiling:
+                items = min(items, self._batch_ceiling)
+            if self._cpu_safe_items:
+                items = min(items, self._cpu_safe_items)
+            return replace(plan, max_items=items) if items != plan.max_items else plan
         if self._session_max_items and self._session_max_items != plan.max_items:
             return replace(plan, max_items=self._session_max_items)
         return plan
+
+    def _bounded(self, size: int, *, reduced: bool) -> int:
+        """Return the size to apply for a calibrated or recorded *size*.
+
+        Auto mode adopts it as is. With an explicit batch size the operator's
+        number is the ceiling: only a *reduced* size (one a memory overrun
+        forced down) may lower it, and a size merely measured fastest is not
+        applied at all (0 leaves the plan alone).
+        """
+        if not self._batch_ceiling:
+            return size
+        return min(size, self._batch_ceiling) if reduced and size > 0 else 0
 
     def embed_passages(self, texts: list[str]) -> list[list[float]]:
         return self._attempt(
@@ -340,6 +380,21 @@ class PassageBackendSession:
             self.probe_state = "cached"
             self._verified_spawn = session.spawn_count
             self.calibration = _recorded_calibration(cached)
+            if cached.batch_size > 0:
+                # The record outlives the process that wrote it, and the plan
+                # this run was built from was fixed before it was read. Applying
+                # it here is what lets a daemon started before calibration
+                # existed use the measured size, and a persisted reduction
+                # reach the runs after it.
+                self._calibrated_batch_size = cached.batch_size
+                self._session_max_items = self._bounded(
+                    cached.batch_size, reduced=bool(cached.limited_by)
+                )
+            elif self._calibration_plan is not None:
+                # Verified but never measured (calibration was off, or its first
+                # step failed). That must not suppress calibration for good.
+                self._measure(session)
+                self._record_probe()
             return
         session.probe()
         self.probe_state = "verified"
@@ -375,7 +430,9 @@ class PassageBackendSession:
         self._verified_spawn = session.spawn_count
         if self.calibration is not None:
             self._calibrated_batch_size = self.calibration.max_items
-            self._session_max_items = self.calibration.max_items
+            self._session_max_items = self._bounded(
+                self.calibration.max_items, reduced=bool(self.calibration.limited_by)
+            )
 
     def _measure_reference(self) -> None:
         """Measure CPU too, so the crossover has both of the rates it needs.
@@ -395,30 +452,46 @@ class PassageBackendSession:
         if self._calibration_plan is None or self._probe_cache is None:
             return
         key = self._cpu_probe_key
-        if key is None or self._probe_cache.load(key) is not None:
+        if key is None:
             return
-        session = self._cpu_factory()
+        existing = self._probe_cache.load(key, context=self._probe_context)
+        if existing is not None and existing.characters_per_second > 0:
+            return
+        session: EmbeddingWorkerSession | None = None
         try:
+            # The factory is inside the try on purpose: constructing a session
+            # can itself raise (INDEX_RESOURCE_LIMIT when memory is low at
+            # teardown), and this runs after the index run has committed.
+            session = self._cpu_factory()
             session.initialize()
             measured = calibrate(session, self._calibration_plan, load_ns=session.load_duration_ns)
-        except (CodeIndexingError, ValueError) as exc:
+        except Exception as exc:
             # The reference backend failing to measure is a diagnostic gap, not
             # a run-ending condition: without a crossover the accelerator is
-            # simply used as it was before any of this existed.
+            # simply used as it was before any of this existed. Nothing on this
+            # path may fail a run that has already succeeded, so the catch is
+            # deliberately broad.
             logger.debug("Could not measure the CPU reference backend: %s", exc)
             return
         finally:
-            session.close()
+            if session is not None:
+                session.close()
         if measured is None:
             return
+        batch_size, limited_by = measured.max_items, measured.limited_by
+        if existing is not None and existing.limited_by and existing.batch_size > 0:
+            # An overrun on CPU recorded a smaller size before any rate existed.
+            # The sweep must not undo what a real overrun taught.
+            batch_size, limited_by = min(batch_size, existing.batch_size), existing.limited_by
         self._probe_cache.store(
             key,
-            batch_size=measured.max_items,
+            batch_size=batch_size,
             dimension=self._dimension,
             detail=CPU_BACKEND.provider,
             characters_per_second=measured.characters_per_second,
             load_ns=measured.load_ns,
-            limited_by=measured.limited_by,
+            limited_by=limited_by,
+            context=self._probe_context,
         )
 
     def _adopt_reduced_batch_size(self) -> None:
@@ -431,29 +504,54 @@ class PassageBackendSession:
         a session without one still stops overrunning.
         """
         session = self._session
-        if (
-            session is None
-            or self._on_cpu
-            or self._on_provisional_cpu
-            or not session.safe_max_items
-            or session.safe_max_items == self._calibrated_batch_size
-        ):
+        if session is None or not session.safe_max_items:
             return
-        self._calibrated_batch_size = session.safe_max_items
-        self._session_max_items = session.safe_max_items
+        safe = session.safe_max_items
+        if self._on_cpu or self._on_provisional_cpu:
+            # The CPU path used to ignore this, so every group after the first
+            # re-requested the size that had just overrun and paid the same
+            # worker respawns to rediscover it.
+            if safe != self._cpu_safe_items:
+                self._cpu_safe_items = safe
+                self._record_cpu_reduction(safe)
+            return
+        if safe == self._session_max_items:
+            return
+        self._calibrated_batch_size = safe
+        self._session_max_items = safe
         if self.calibration is not None:
             self.calibration = replace(
                 self.calibration,
-                max_items=session.safe_max_items,
+                max_items=safe,
                 limited_by=LIMITED_BY_MEMORY,
             )
         # Returns on its own when there is no cache to write to.
         self._record_probe(limited_by=LIMITED_BY_MEMORY)
 
+    def _record_cpu_reduction(self, size: int) -> None:
+        """Persist a CPU microbatch size an overrun forced down.
+
+        Whatever rate and load time were already measured for CPU are kept: the
+        reduction changes the batch size, not what the crossover compares.
+        """
+        if self._probe_cache is None or self._cpu_probe_key is None:
+            return
+        existing = self._probe_cache.load(self._cpu_probe_key, context=self._probe_context)
+        self._probe_cache.store(
+            self._cpu_probe_key,
+            batch_size=size,
+            dimension=self._dimension,
+            detail=CPU_BACKEND.provider,
+            characters_per_second=0.0 if existing is None else existing.characters_per_second,
+            load_ns=0 if existing is None else existing.load_ns,
+            limited_by=LIMITED_BY_MEMORY,
+            context=self._probe_context,
+        )
+
     def _cached_probe(self) -> ProbeRecord | None:
         if self._probe_cache is None or self._probe_key is None:
             return None
-        return self._probe_cache.load(self._probe_key)
+        return self._probe_cache.load(self._probe_key, context=self._probe_context)
 
     def _record_probe(self, *, limited_by: str = "") -> None:
         if self._probe_cache is None or self._probe_key is None:
@@ -467,6 +565,7 @@ class PassageBackendSession:
             characters_per_second=0.0 if measured is None else measured.characters_per_second,
             load_ns=0 if measured is None else measured.load_ns,
             limited_by=limited_by or (measured.limited_by if measured else ""),
+            context=self._probe_context,
         )
 
     def _degrade(self, reason: str) -> None:

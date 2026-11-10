@@ -190,7 +190,7 @@ Each entry: env name, group, label, help text, type, default, validation. Types:
 | Indexing | `CODE_INDEXING_CACHE_DIR` | path | platformdirs user cache | — |
 | Indexing | `CODE_INDEXING_OFFLINE` | bool | off | — |
 | Embedding | `CODE_INDEXING_EMBED_BATCH_SIZE` | auto\|int | auto | 1–256 |
-| Embedding | `CODE_INDEXING_EMBED_MAX_TOKENS` | int | 1024 | 64–8192 |
+| Embedding | `CODE_INDEXING_EMBED_MAX_TOKENS` | int | 1024 | 256–8192 |
 | Embedding | `CODE_INDEXING_EMBED_OVERLAP_TOKENS` | int | 64 | 0–4096 |
 | Embedding | `CODE_INDEXING_EMBED_THREADS` | int | min(2, cpu_count) | 1–64 |
 | Embedding | `CODE_INDEXING_EMBED_CPU_ARENA` | bool | off | — |

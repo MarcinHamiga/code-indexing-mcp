@@ -227,13 +227,16 @@ def decode_segments(
     return segments
 
 
-_DIGEST_CACHE: dict[tuple[str, int, int, int, int, int], str] = {}
+_DIGEST_CACHE: dict[tuple[int, int, int, int, int], str] = {}
 _DIGEST_LOCK = threading.Lock()
 
 
-def _stat_key(path: Path, stat_result: os.stat_result) -> tuple[str, int, int, int, int, int]:
+def _stat_key(path: Path, stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
+    # No path: the Hugging Face layout names one blob twice (``blobs/<sha>`` and
+    # a ``snapshots/<rev>/...`` symlink to it), and two names for one inode are
+    # one file and one hash. ``path`` stays in the signature for callers.
+    del path
     return (
-        str(path),
         stat_result.st_dev,
         stat_result.st_ino,
         stat_result.st_size,
@@ -264,6 +267,21 @@ def _file_digest(path: Path) -> str | None:
         return value
     except OSError:
         return None
+
+
+def _is_busy(error: sqlite3.Error) -> bool:
+    """Whether *error* is SQLite contention (``SQLITE_BUSY``/``SQLITE_LOCKED``).
+
+    Contention says another process holds the file for a moment, not that the
+    cache is unusable, so the affected batch is skipped rather than the cache
+    being disabled for the rest of the run.
+    """
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 0xFF) in {5, 6}
+    return "locked" in str(error).lower() or "busy" in str(error).lower()
 
 
 def artifact_digest(path: Path) -> str | None:
@@ -337,6 +355,8 @@ class PassageEmbeddingCache:
         self.busy_timeout_ms = busy_timeout_ms
         self.payload_bytes = 0
         self.disabled = False
+        # Write batches skipped because another process held the write lock.
+        self.skipped_batches = 0
         self._connection: sqlite3.Connection | None = None
         self._reported_failure = False
 
@@ -372,6 +392,7 @@ class PassageEmbeddingCache:
             return None
         if self._connection is not None:
             return self._connection
+        connection: sqlite3.Connection | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(
@@ -384,21 +405,37 @@ class PassageEmbeddingCache:
             page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
             max_pages = max(1, self.max_database_bytes // page_size)
             connection.execute(f"PRAGMA max_page_count = {max_pages}")
+            # Disposable cache: a lost last write costs a re-embed, so the
+            # cheaper sync level is enough.
+            connection.execute("PRAGMA synchronous = NORMAL")
             connection.executescript(_SCHEMA)
-            connection.execute(
-                "INSERT OR IGNORE INTO cache_meta(singleton, format_version, payload_bytes) "
-                "VALUES (1, ?, 0)",
-                (PASSAGE_CACHE_FORMAT,),
-            )
             meta = connection.execute(
                 "SELECT format_version, payload_bytes FROM cache_meta WHERE singleton = 1"
             ).fetchone()
+            if meta is None:
+                # Only the first opener writes; every later open stays a read
+                # and cannot be refused by another process's write transaction.
+                connection.execute(
+                    "INSERT OR IGNORE INTO cache_meta(singleton, format_version, payload_bytes) "
+                    "VALUES (1, ?, 0)",
+                    (PASSAGE_CACHE_FORMAT,),
+                )
+                meta = connection.execute(
+                    "SELECT format_version, payload_bytes FROM cache_meta WHERE singleton = 1"
+                ).fetchone()
             if meta is None or int(meta[0]) != PASSAGE_CACHE_FORMAT:
                 raise sqlite3.DatabaseError("unsupported passage cache format")
             self.payload_bytes = int(meta[1])
             self._connection = connection
             return connection
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error) as exc:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.close()
+            if isinstance(exc, sqlite3.Error) and _is_busy(exc):
+                # Skipped this time; the next call tries to open again.
+                logger.debug("passage embedding cache busy at %s", self.path)
+                return None
             self._disable("could not open passage embedding cache")
             return None
 
@@ -434,7 +471,9 @@ class PassageEmbeddingCache:
                         )
                     except ValueError:
                         continue
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error) as exc:
+            if isinstance(exc, sqlite3.Error) and _is_busy(exc):
+                return {}
             self._disable("could not read passage embedding cache")
             return {}
         return hits
@@ -525,9 +564,14 @@ class PassageEmbeddingCache:
             )
             connection.execute("COMMIT")
             self.payload_bytes = payload_bytes
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error) as exc:
             with suppress(sqlite3.Error):
                 connection.execute("ROLLBACK")
+            if isinstance(exc, sqlite3.Error) and _is_busy(exc):
+                # Another writer holds the lock: drop only this batch.
+                self.skipped_batches += 1
+                logger.debug("passage embedding cache busy at %s; batch skipped", self.path)
+                return
             self._disable("could not write passage embedding cache")
 
 
@@ -549,10 +593,18 @@ class PassageReuseContext:
         force: bool = False,
         strict: bool = False,
         producer_matches: Callable[[object], bool] | None = None,
+        alternate_namespaces: Sequence[PassageCacheNamespace] = (),
+        producer_namespace: Callable[[object], PassageCacheNamespace | None] | None = None,
         max_windows: int = MAX_WINDOWS_PER_CANDIDATE,
     ) -> None:
         self.path = path
         self.namespace = namespace
+        # Other producers' vectors this run may read, and may write only when
+        # ``producer_namespace`` says that producer is the one that embedded.
+        # Writing is always under the namespace of the producer that actually
+        # ran, so CPU vectors can never land in an accelerator's namespace.
+        self.alternate_namespaces = tuple(alternate_namespaces)
+        self.producer_namespace = producer_namespace
         self.force = force
         self.strict = strict
         self.producer_matches = producer_matches
@@ -608,8 +660,12 @@ class PassageReuseContext:
         if self.status != "active" or cache is None or namespace is None or not candidates:
             return {}, misses
         keys = [candidate_key(namespace, candidate, plan) for candidate in candidates]
+        alternate_keys = [
+            [candidate_key(alternate, candidate, plan) for candidate in candidates]
+            for alternate in self.alternate_namespaces
+        ]
         started = time.monotonic_ns()
-        values = cache.get_many(keys)
+        values = cache.get_many([*keys, *(key for group in alternate_keys for key in group)])
         self.lookup_duration_ns += time.monotonic_ns() - started
         if cache.disabled:
             self.status = "error"
@@ -618,6 +674,10 @@ class PassageReuseContext:
         misses = []
         for index, candidate in enumerate(candidates):
             segments = values.get(keys[index])
+            for group in alternate_keys:
+                if segments is not None:
+                    break
+                segments = values.get(group[index])
             if segments is None:
                 misses.append(index)
                 continue
@@ -644,7 +704,11 @@ class PassageReuseContext:
         namespace = self.namespace
         if self.status != "active" or cache is None or namespace is None or not results:
             return
-        if self.producer_matches is not None and not self.producer_matches(producer):
+        if self.producer_namespace is not None:
+            namespace = self.producer_namespace(producer)
+            if namespace is None:
+                return
+        elif self.producer_matches is not None and not self.producer_matches(producer):
             return
         if getattr(producer, "tokenizer_available", None) is not True:
             return

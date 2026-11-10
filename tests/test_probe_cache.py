@@ -323,3 +323,37 @@ def test_an_unrecognised_layout_falls_back_to_the_whole_cache(tmp_path: Path) ->
     (cache / "model.onnx").write_bytes(b"x" * 65)
 
     assert model_artifact_fingerprint(cache, "jina") != before
+
+
+def test_a_record_without_a_context_stays_readable_but_an_old_reduction_does_not(
+    tmp_path: Path,
+) -> None:
+    """EMB-7: records written before the context field existed must load."""
+    from code_indexing_mcp.probe_cache import CACHE_SCHEMA_VERSION, ProbeCache, ProbeKey
+
+    key = ProbeKey("m", "a", "cuda", "p", "1", "plat", "d")
+    other = ProbeKey("m", "a", "cpu", "p", "1", "plat", "d")
+    path = tmp_path / "probes.json"
+    legacy = {"dimension": 4, "recorded_at_ns": 1, "characters_per_second": 5.0, "load_ns": 2}
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": CACHE_SCHEMA_VERSION,
+                "records": [
+                    {**legacy, "fingerprint": key.fingerprint(), "batch_size": 8},
+                    {
+                        **legacy,
+                        "fingerprint": other.fingerprint(),
+                        "batch_size": 1,
+                        "limited_by": "memory",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cache = ProbeCache(path)
+
+    assert cache.load(key, context="mem=1") is not None
+    assert cache.load(other, context="mem=1") is None
+    assert cache.load(other) is not None

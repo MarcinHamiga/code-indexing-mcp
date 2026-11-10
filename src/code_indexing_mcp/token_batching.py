@@ -161,48 +161,113 @@ def plan_candidate_windows(
         budget = max_tokens - prefix_tokens[prefix]
         if budget < 1:
             raise ValueError("prefix consumes the complete token window budget")
-        offsets = content_token_offsets(encode(content))
-        while True:
-            planned = plan_token_windows(
-                offsets,
-                text_length=len(content),
-                max_tokens=budget,
-                overlap_tokens=overlap_tokens,
-                max_windows=max_windows,
+        measured: list[TokenWindow] = []
+        for span_start, span_end, offsets in _encodable_spans(encode, content, max_tokens):
+            measured.extend(
+                _plan_span(
+                    encode,
+                    prefix,
+                    content,
+                    span_start,
+                    span_end,
+                    offsets,
+                    max_tokens=max_tokens,
+                    budget=budget,
+                    overlap_tokens=overlap_tokens,
+                    max_windows=max_windows,
+                )
             )
-            measured: list[TokenWindow] = []
-            overflow = 0
-            for window in planned:
-                composed = (
-                    f"{prefix}\n{content[window.start_char : window.end_char]}"
-                    if prefix
-                    else content[window.start_char : window.end_char]
-                )
-                input_tokens = len(encode(composed).offsets)
-                overflow = max(overflow, input_tokens - max_tokens)
-                measured.append(
-                    TokenWindow(
-                        window.start_char,
-                        window.end_char,
-                        window.token_count,
-                        input_token_count=input_tokens,
-                    )
-                )
-            if overflow == 0:
-                break
-            # Token counts are not additive: a continuation at a slice boundary
-            # can become several tokens when encoded as a fresh model input.
-            # Replan all windows so the smaller slices still cover every source
-            # character, with overlap clamped to the new budget. The budget
-            # strictly decreases, independent of memory and batch scheduling.
-            if budget == 1:
-                raise ValueError(
-                    "composed embedding input cannot fit the token window budget "
-                    "even with a one-token content window"
-                )
-            budget = max(1, budget - overflow)
+        if len(measured) > max_windows:
+            raise ValueError(
+                f"Token planning exceeded {max_windows} windows for a "
+                f"{len(content)}-character candidate"
+            )
         plans.append(measured)
     return plans
+
+
+# A tokenizer that truncates (the production one stops at the model's context
+# length) reports at most its limit, so a candidate denser than that looks
+# shorter than it is. Special tokens are not part of the offsets the planner
+# sees, so a truncated encoding falls this many short of the budget.
+_SPECIAL_TOKEN_ALLOWANCE = 2
+
+
+def _encodable_spans(
+    encode: Callable[[str], Any], content: str, max_tokens: int
+) -> list[tuple[int, int, list[tuple[int, int]]]]:
+    """Split *content* into spans the tokenizer encodes without truncating.
+
+    Returns ``(start, end, offsets)`` with offsets relative to ``start``. An
+    encoding that stops before the end of the text, after reaching at least one
+    full window of tokens, was truncated: the tokens past it are invisible to
+    the planner. The visible head becomes its own span and the remainder is
+    encoded again, so every character is planned from tokens that were seen.
+    """
+    spans: list[tuple[int, int, list[tuple[int, int]]]] = []
+    start = 0
+    offsets = content_token_offsets(encode(content))
+    while True:
+        remaining = content[start:]
+        covered = offsets[-1][1] if offsets else 0
+        truncated = (
+            0 < covered < len(remaining.rstrip())
+            and len(offsets) >= max_tokens - _SPECIAL_TOKEN_ALLOWANCE
+        )
+        if not truncated:
+            spans.append((start, len(content), offsets))
+            return spans
+        spans.append((start, start + covered, offsets))
+        start += covered
+        offsets = content_token_offsets(encode(content[start:]))
+
+
+def _plan_span(
+    encode: Callable[[str], Any],
+    prefix: str,
+    content: str,
+    span_start: int,
+    span_end: int,
+    offsets: list[tuple[int, int]],
+    *,
+    max_tokens: int,
+    budget: int,
+    overlap_tokens: int,
+    max_windows: int,
+) -> list[TokenWindow]:
+    """Window ``content[span_start:span_end]``, replanning until every input fits."""
+    while True:
+        planned = plan_token_windows(
+            offsets,
+            text_length=span_end - span_start,
+            max_tokens=budget,
+            overlap_tokens=overlap_tokens,
+            max_windows=max_windows,
+        )
+        measured: list[TokenWindow] = []
+        overflow = 0
+        for window in planned:
+            start = span_start + window.start_char
+            end = span_start + window.end_char
+            composed = f"{prefix}\n{content[start:end]}" if prefix else content[start:end]
+            input_tokens = len(encode(composed).offsets)
+            overflow = max(overflow, input_tokens - max_tokens)
+            measured.append(
+                TokenWindow(start, end, window.token_count, input_token_count=input_tokens)
+            )
+        if overflow == 0:
+            return measured
+        # Token counts are not additive: a continuation at a slice boundary
+        # can become several tokens when encoded as a fresh model input.
+        # Replan all windows so the smaller slices still cover every source
+        # character, with overlap clamped to the new budget. The budget
+        # strictly decreases, independent of memory and batch scheduling.
+        if budget == 1:
+            raise ValueError(
+                "composed embedding input cannot fit the token window budget "
+                "even with a one-token content window"
+            )
+        budget = max(1, budget - overflow)
 
 
 def plan_microbatches(

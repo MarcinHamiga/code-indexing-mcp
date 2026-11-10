@@ -23,6 +23,7 @@ from .token_batching import (
     DEFAULT_OVERLAP_TOKENS,
     MAX_WINDOWS_PER_CANDIDATE,
     TokenWindow,
+    content_token_offsets,
     plan_candidate_windows,
     plan_microbatches,
 )
@@ -350,8 +351,13 @@ class FastEmbedder:
         offline: bool = False,
         threads: int | None = None,
         enable_cpu_mem_arena: bool = False,
+        max_input_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> None:
         self.cache_directory = cache_directory
+        # Bounds a search query (and the windows of an example snippet). The
+        # model's own tokenizer only truncates at its 8,192-token context, and
+        # attention memory is quadratic in the sequence this process runs.
+        self.max_input_tokens = max_input_tokens
         self.offline = offline
         self.threads = threads
         self.enable_cpu_mem_arena = enable_cpu_mem_arena
@@ -397,8 +403,26 @@ class FastEmbedder:
         ]
 
     def embed_query(self, text: str) -> list[float]:
-        vectors = self._vectors(self._get_model().query_embed(text))
+        model = self._get_model()
+        vectors = self._vectors(model.query_embed(self._bounded_query(model, text)))
         return vectors[0]
+
+    def _bounded_query(self, model: _TextEmbedding, text: str) -> str:
+        """Truncate *text* to the token budget; shorter text is returned as is.
+
+        A query is a retrieval key, so its tail past the budget is dropped
+        rather than windowed.
+        """
+        tokenizer = resolve_tokenizer(model)
+        if tokenizer is None:
+            return text
+        # Model-added special tokens count against the budget but are not in
+        # the content offsets.
+        budget = max(1, self.max_input_tokens - 2)
+        offsets = content_token_offsets(tokenizer.encode(text))
+        if len(offsets) <= budget:
+            return text
+        return text[: offsets[budget][0]]
 
     def _get_model(self) -> _TextEmbedding:
         if self._model is not None:

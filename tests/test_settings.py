@@ -111,6 +111,22 @@ def test_a_token_budget_above_the_model_limit_is_rejected() -> None:
     assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
 
 
+@pytest.mark.parametrize("value", ["64", "96", "255"])
+def test_a_token_budget_too_small_to_plan_ordinary_chunks_is_rejected(value: str) -> None:
+    """EMB-10: below the floor an ordinary chunk exceeds the planner's 16-window
+    limit and fails its whole file, so the value is refused at startup."""
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment({"CODE_INDEXING_EMBED_MAX_TOKENS": value})
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+    assert (
+        IndexSettings.from_environment(
+            {"CODE_INDEXING_EMBED_MAX_TOKENS": "256"}
+        ).embedding_max_tokens
+        == 256
+    )
+
+
 def test_the_accelerator_defaults_to_automatic_selection() -> None:
     settings = IndexSettings.from_environment({})
 

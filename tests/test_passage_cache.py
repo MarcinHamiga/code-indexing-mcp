@@ -225,7 +225,7 @@ def test_cache_disables_itself_after_a_database_error(tmp_path: Path) -> None:
         assert cache.disabled is True
 
 
-def test_contending_writer_disables_only_its_cache_connection(tmp_path: Path) -> None:
+def test_contending_writer_skips_only_the_contended_batch(tmp_path: Path) -> None:
     path = tmp_path / "passage.sqlite3"
     first = PassageEmbeddingCache(path, dimension=DIMENSION)
     second = PassageEmbeddingCache(path, dimension=DIMENSION, busy_timeout_ms=1)
@@ -233,8 +233,16 @@ def test_contending_writer_disables_only_its_cache_connection(tmp_path: Path) ->
         assert first._connection is not None
         first._connection.execute("BEGIN IMMEDIATE")
         second.put_many({"a": _segments()})
-        assert second.disabled is True
+        assert second.disabled is False
+        assert second.skipped_batches == 1
         first._connection.execute("ROLLBACK")
+
+        assert first.disabled is False
+        assert second.get_many(["a"]) == {}
+        second.put_many({"b": _segments()})
+        assert second.disabled is False
+        assert set(second.get_many(["a", "b"])) == {"b"}
+        assert set(first.get_many(["b"])) == {"b"}
 
 
 def test_cache_uses_rollback_journaling_and_respects_the_page_ceiling(tmp_path: Path) -> None:
@@ -396,3 +404,103 @@ def test_reuse_rejects_windows_cached_before_special_token_accounting(tmp_path: 
         hits, misses = reuse.lookup([candidate], PLAN)
         assert hits == {}
         assert misses == [0]
+
+
+def test_a_run_deferred_to_cpu_stores_under_the_cpu_namespace_and_reads_both(
+    tmp_path: Path,
+) -> None:
+    """EMB-9: an accelerator-selected run that embedded on CPU used to store
+    nothing. CPU vectors go under the CPU namespace only, and are served to a
+    later run of either producer."""
+    path = tmp_path / "passage.sqlite3"
+    accelerator = _namespace(producer="mlx-float32")
+    cpu = _namespace(producer="cpu-float32")
+    by_backend = {"mlx": accelerator, "cpu": cpu}
+
+    def context() -> PassageReuseContext:
+        return PassageReuseContext(
+            path,
+            accelerator,
+            alternate_namespaces=[cpu],
+            producer_namespace=lambda producer: by_backend.get(
+                getattr(producer, "backend_used", None)
+            ),
+        )
+
+    candidates = [_candidate(), _candidate(content="changed text!!")]
+    cpu_producer = SimpleNamespace(backend_used="cpu", tokenizer_available=True)
+    with context() as reuse:
+        reuse.store(candidates, {0: _segments()}, PLAN, producer=cpu_producer)
+
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        stored = cache.get_many(
+            [
+                candidate_key(cpu, candidates[0], PLAN),
+                candidate_key(accelerator, candidates[0], PLAN),
+            ]
+        )
+    assert list(stored) == [candidate_key(cpu, candidates[0], PLAN)], "CPU vectors only under cpu"
+
+    with context() as reuse:
+        hits, misses = reuse.lookup(candidates, PLAN)
+        assert list(hits) == [0]
+        assert misses == [1]
+        reuse.store(
+            candidates,
+            {1: _segments()},
+            PLAN,
+            producer=SimpleNamespace(backend_used="mlx", tokenizer_available=True),
+        )
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        assert candidate_key(accelerator, candidates[1], PLAN) in cache.get_many(
+            [candidate_key(accelerator, candidates[1], PLAN)]
+        )
+        assert not cache.get_many([candidate_key(cpu, candidates[1], PLAN)])
+
+
+def test_artifact_digest_hashes_a_model_once_through_its_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EMB-8: the Hugging Face layout links snapshots/<rev>/file to blobs/<sha>;
+    both names are one inode and one hash."""
+    from code_indexing_mcp import passage_cache
+
+    root = tmp_path / "models--org--name"
+    (root / "blobs").mkdir(parents=True)
+    (root / "snapshots" / "rev").mkdir(parents=True)
+    (root / "blobs" / "abc").write_bytes(b"weights" * 100)
+    (root / "snapshots" / "rev" / "model.onnx").symlink_to(root / "blobs" / "abc")
+    passage_cache._DIGEST_CACHE.clear()
+
+    opened: list[str] = []
+    original = Path.open
+
+    def counting_open(self: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        if "rb" in args:
+            opened.append(str(self))
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    assert artifact_digest(root) is not None
+    assert len(opened) == 1
+
+
+def test_a_cache_opened_or_read_while_another_process_holds_the_file_stays_usable(
+    tmp_path: Path,
+) -> None:
+    """EMB-12: SQLITE_BUSY while opening or reading is contention, not damage.
+    (A busy *write* still disables; an existing test pins that.)"""
+    path = tmp_path / "passage.sqlite3"
+    with PassageEmbeddingCache(path, dimension=DIMENSION) as cache:
+        cache.put_many({"seed": _segments()})
+
+    blocker = sqlite3.connect(path, isolation_level=None)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        with PassageEmbeddingCache(path, dimension=DIMENSION, busy_timeout_ms=1) as cache:
+            assert cache.get_many(["seed"]) == {}
+            assert not cache.disabled
+            blocker.execute("ROLLBACK")
+            assert list(cache.get_many(["seed"])) == ["seed"]
+    finally:
+        blocker.close()

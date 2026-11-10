@@ -535,7 +535,14 @@ class EmbeddingWorkerSession:
                     # _request already recorded the specific reason; keep it
                     # rather than flattening it back to the error code.
                     raise
-                attempt = replace(attempt, max_items=max(1, attempt.max_items // 2))
+                # Halve both limits: when the padded-token product is what binds,
+                # shrinking max_items alone re-sends the identical batch. The
+                # product keeps room for one full-length window.
+                attempt = replace(
+                    attempt,
+                    max_items=max(1, attempt.max_items // 2),
+                    max_token_product=max(attempt.max_tokens, attempt.max_token_product // 2),
+                )
                 self.retry_count += 1
                 logger.warning(
                     "Embedding batch failed with %s; retrying with max_items=%d",

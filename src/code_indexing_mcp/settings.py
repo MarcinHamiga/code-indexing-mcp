@@ -174,7 +174,7 @@ class IndexSettings:
     version_retention_hours: int = DEFAULT_VERSION_RETENTION_HOURS
     # How many branch index slots, counting the active ones (one per live
     # checkout of a shared registration), a project retains before maintenance
-    # evicts the least recently used. Protection of the active, indexing, or
+    # evicts the least recently used. Protection of the active or
     # recovery-pending slots can exceed it temporarily.
     branch_cache_limit: int = 4
     # When true, the embedder never reaches out to fetch model files, using
@@ -249,8 +249,12 @@ class IndexSettings:
             # attention is quadratic in tokens. 1,024 keeps the widest window
             # well inside the model's 8,192-token limit and inside the default
             # memory ceiling even for token-dense minified source.
+            # The floor is 256 because the window planner allows a candidate at
+            # most 16 windows: below ~128 tokens an ordinary 4,096-character
+            # chunk cannot be planned at all, and each such chunk fails its
+            # whole file. Rejecting the value here fails once, at startup.
             embedding_max_tokens=_integer(
-                environment, "CODE_INDEXING_EMBED_MAX_TOKENS", DEFAULT_MAX_TOKENS, 64, 8192
+                environment, "CODE_INDEXING_EMBED_MAX_TOKENS", DEFAULT_MAX_TOKENS, 256, 8192
             ),
             embedding_overlap_tokens=_integer(
                 environment, "CODE_INDEXING_EMBED_OVERLAP_TOKENS", DEFAULT_OVERLAP_TOKENS, 0, 4096

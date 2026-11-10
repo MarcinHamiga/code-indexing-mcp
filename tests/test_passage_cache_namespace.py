@@ -71,3 +71,17 @@ def test_mlx_namespace_changes_with_conversion_contract(
     second = coordinator.passage_cache_namespace("project")
     assert first is not None and second is not None
     assert first.artifact_digest != second.artifact_digest
+
+
+def test_cpu_namespace_is_distinct_from_the_mlx_one(tmp_path: Path) -> None:
+    """EMB-9: CPU vectors need an identity of their own, with the source-model
+    digest and the CPU runtime, never the MLX conversion's."""
+    coordinator, weights = _coordinator(tmp_path)
+    weights.write_bytes(b"first weights")
+    mlx = coordinator.passage_cache_namespace("project")
+    cpu = coordinator.cpu_passage_cache_namespace("project")
+    assert mlx is not None and cpu is not None
+    assert mlx.producer == "mlx-float32"
+    assert cpu.producer == "cpu-float32"
+    assert cpu.artifact_digest == mlx.tokenizer_digest != mlx.artifact_digest
+    assert cpu.project_id == mlx.project_id
