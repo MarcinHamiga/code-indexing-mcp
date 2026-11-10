@@ -301,10 +301,19 @@ class ProjectResolver:
         """
         scope = self.resolve_scope(explicit=explicit, roots=roots, cwd=cwd)
         if len(scope) > 1:
+            unique_ids = [project.id for project in self._dedupe_by_id(scope)]
+            if len(unique_ids) == 1:
+                raise CodeIndexingError(
+                    ErrorCode.AMBIGUOUS_PROJECT,
+                    "Multiple MCP roots point to checkouts of the same project; "
+                    "pass an explicit checkout path",
+                    projects=unique_ids,
+                    checkouts=[str(project.root) for project in scope],
+                )
             raise CodeIndexingError(
                 ErrorCode.AMBIGUOUS_PROJECT,
                 "Multiple MCP roots contain initialized projects",
-                projects=[project.id for project in scope],
+                projects=unique_ids,
             )
         return scope[0]
 
@@ -418,10 +427,33 @@ class ProjectResolver:
             except CodeIndexingError:
                 continue
             if marker.id == project.id:
-                # A matching canonical root wins over cwd too, but keeps the
-                # registered payload (including updated scan configuration).
-                return project if same_project_root(marker.root, project.root) else marker
+                # A matching canonical root wins over cwd too, and keeps the
+                # registered payload; a linked worktree inherits canonical scan
+                # settings unless its local marker customized them.
+                return self._merge_checkout_marker(project, marker)
         return project
+
+    @staticmethod
+    def _merge_checkout_marker(project: ProjectInfo, marker: ProjectInfo) -> ProjectInfo:
+        if same_project_root(marker.root, project.root):
+            return project
+        if marker.scan == ScanConfig():
+            return marker.model_copy(update={"scan": project.scan})
+        return marker
+
+    def checkout_at(self, root: Path, project_id: str) -> ProjectInfo | None:
+        """Resolve *root* when it carries a valid marker for *project_id*."""
+        try:
+            marker_root = find_project_root(root.expanduser())
+        except OSError:
+            return None
+        if marker_root is None:
+            return None
+        try:
+            resolved = self._by_root_or_marker(marker_root)
+        except CodeIndexingError:
+            return None
+        return resolved if resolved.id == project_id else None
 
     @staticmethod
     def _dedupe_by_id(projects: list[ProjectInfo]) -> list[ProjectInfo]:
@@ -460,4 +492,8 @@ class ProjectResolver:
         for project in self._projects:
             if same_project_root(project.root, resolved):
                 return project
-        return read_project_marker(resolved)
+        marker = read_project_marker(resolved)
+        for project in self._projects:
+            if project.id == marker.id:
+                return self._merge_checkout_marker(project, marker)
+        return marker

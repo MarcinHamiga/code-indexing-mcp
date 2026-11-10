@@ -354,15 +354,19 @@ def _remove_jsonc_entry(text: str, object_key: str, entry_key: str) -> str | Non
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    # Write through existing symlinks (e.g. Stow/chezmoi dotfiles) instead of
+    # unlinking the symlink with os.replace; stage in target.parent so the
+    # rename stays on the target's filesystem.
+    target = path.resolve() if path.is_symlink() else path
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
             stream.write(content)
-        if path.exists():
-            temporary.chmod(path.stat().st_mode)
-        os.replace(temporary, path)
+        if target.exists():
+            temporary.chmod(target.stat().st_mode)
+        os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
 

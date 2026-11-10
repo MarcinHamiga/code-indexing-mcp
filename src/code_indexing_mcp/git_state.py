@@ -213,14 +213,39 @@ def probe_git_state(
     *,
     include_status: bool = False,
     runner: GitRunner | None = None,
+    cached: GitState | None = None,
 ) -> GitState:
     """Probe *root*'s checkout identity, HEAD selector, and optional dirtiness.
 
     The identity and selector queries are cheap rev-parse-class calls so query
     entrypoints can run this on every request; ``git status`` is spawned only
-    when ``include_status`` asks for cleanliness or dirty paths.
+    when ``include_status`` asks for cleanliness or dirty paths. When *cached*
+    provides a verified recent Git identity and HEAD snapshot for *root*, only
+    ``git status`` needs to run.
     """
     run = run_git if runner is None else runner
+    if (
+        cached is not None
+        and include_status
+        and cached.probe is GitProbeOutcome.GIT
+        and head_snapshot(cached) == (cached.selector_kind, cached.selector_value, cached.head_oid)
+    ):
+        try:
+            status = run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], root)
+        except GitRunnerError:
+            status = None
+        if status is not None and status.returncode == 0:
+            cached_wt, cached_dirty, cached_untracked, cached_fp = _parse_status(
+                status.stdout, cached.project_prefix
+            )
+            return cached.model_copy(
+                update={
+                    "worktree": cached_wt,
+                    "dirty_paths": cached_dirty,
+                    "untracked_paths": cached_untracked,
+                    "status_fingerprint": cached_fp,
+                }
+            )
     resolved = root.resolve()
     try:
         identities = run(

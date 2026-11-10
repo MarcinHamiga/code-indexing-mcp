@@ -342,16 +342,23 @@ class HistoryStore:
         limit = min(limit, MAX_RUNS_PER_PROJECT)
         conditions = ["project_id = ?"]
         parameters: list[Any] = [project_id]
+        cursor_parts: tuple[str, str] | None = None
         if cursor is not None:
             parts = cursor.split("|", 1)
             if len(parts) != 2 or not parts[0] or not parts[1]:
                 raise ValueError("invalid history cursor")
-            started_at, run_id = parts
-            conditions.append(
-                "(started_at, rowid) < (?, (SELECT rowid FROM runs WHERE run_id = ?))"
-            )
-            parameters.extend([started_at, run_id])
+            cursor_parts = (parts[0], parts[1])
         with closing(self._connect()) as connection:
+            if cursor_parts is not None:
+                started_at, run_id = cursor_parts
+                anchor = connection.execute(
+                    "SELECT rowid, started_at FROM runs WHERE project_id = ? AND run_id = ?",
+                    [project_id, run_id],
+                ).fetchone()
+                if anchor is None or str(anchor["started_at"]) != started_at:
+                    raise ValueError("invalid history cursor")
+                conditions.append("(started_at, rowid) < (?, ?)")
+                parameters.extend([started_at, int(anchor["rowid"])])
             rows = list(
                 connection.execute(
                     f"""

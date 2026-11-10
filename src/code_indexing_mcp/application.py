@@ -28,6 +28,7 @@ from .extractor import TreeSitterExtractor
 from .git_state import (
     GitProbeOutcome,
     GitState,
+    SelectorKind,
     WorktreeStatus,
     checkout_key,
     head_snapshot,
@@ -823,25 +824,33 @@ class Application:
         plain probe would have returned.
         """
         key = project_root_identity(root)
-        if not include_status:
-            with self._git_probe_lock:
-                entry = self._recent_git_probes.get(key)
-            if entry is not None and entry[0] > time.monotonic():
-                cached = entry[1]
-                if head_snapshot(cached) == (
-                    cached.selector_kind,
-                    cached.selector_value,
-                    cached.head_oid,
-                ):
-                    return cached.model_copy(
-                        update={
-                            "worktree": WorktreeStatus.UNKNOWN,
-                            "dirty_paths": (),
-                            "untracked_paths": (),
-                            "status_fingerprint": None,
-                        }
-                    )
-        state = probe_git_state(root, include_status=include_status)
+        reusable: GitState | None = None
+        with self._git_probe_lock:
+            entry = self._recent_git_probes.get(key)
+        if entry is not None and entry[0] > time.monotonic():
+            cached = entry[1]
+            if head_snapshot(cached) == (
+                cached.selector_kind,
+                cached.selector_value,
+                cached.head_oid,
+            ):
+                reusable = cached
+        if not include_status and reusable is not None:
+            return reusable.model_copy(
+                update={
+                    "worktree": WorktreeStatus.UNKNOWN,
+                    "dirty_paths": (),
+                    "untracked_paths": (),
+                    "status_fingerprint": None,
+                }
+            )
+        if reusable is not None:
+            try:
+                state = probe_git_state(root, include_status=include_status, cached=reusable)
+            except TypeError:
+                state = probe_git_state(root, include_status=include_status)
+        else:
+            state = probe_git_state(root, include_status=include_status)
         with self._git_probe_lock:
             if state.probe is GitProbeOutcome.GIT:
                 self._recent_git_probes[key] = (
@@ -1123,10 +1132,15 @@ class Application:
             self.invalidate_freshness(resolved.id)
         return report
 
-    def _reference_target_is_stale(self, target: ActiveIndexTarget) -> bool:
+    def _reference_target_is_stale(
+        self, target: ActiveIndexTarget, *, use_cache: bool = True
+    ) -> bool:
         """The freshness decision project_status makes, without an unconditional walk."""
+        if target.slot.state == "rebuild_required":
+            return True
         if target.slot.state in {"ready", "partial"}:
-            return self._project_status_for_target(target).state == "stale"
+            state, _ = self._target_freshness_state(target, use_cache=use_cache)
+            return state in {"stale", "rebuild_required"}
         return self._project_is_stale(target.project, partition_id=target.partition_id)
 
     def project_status(
@@ -1179,7 +1193,9 @@ class Application:
         with self._freshness_lock:
             self._clean_freshness_until.pop(cache_key, None)
 
-    def _project_status_for_target(self, target: ActiveIndexTarget) -> ProjectStatus:
+    def _target_freshness_state(
+        self, target: ActiveIndexTarget, *, use_cache: bool = True
+    ) -> tuple[str, list[StoredFile] | None]:
         resolved = target.project
         partition = target.partition
         slot = target.slot
@@ -1194,8 +1210,17 @@ class Application:
             # Keyed per slot, not per project: several worktrees share one
             # registration id and must not thrash each other's cached answer.
             cache_key = (resolved.id, partition.slot_id)
-            cached = self._cached_freshness(cache_key)
-            if cached is not None and cached[1] == fingerprint and cached[0] > time.monotonic():
+            cached = self._cached_freshness(cache_key) if use_cache else None
+            if (
+                self.store.incompatibility_reason(
+                    resolved.id, self.embedder.model_id, partition_id=target.partition_id
+                )
+                is not None
+            ):
+                if use_cache:
+                    self._pop_cached_freshness(cache_key)
+                state = "rebuild_required"
+            elif cached is not None and cached[1] == fingerprint and cached[0] > time.monotonic():
                 # A recent check found this exact slot, activation, HEAD, and
                 # scan configuration clean; do not walk the repository again
                 # for this call.
@@ -1204,7 +1229,8 @@ class Application:
                 # A clean slot indexed at exactly this HEAD cannot be stale:
                 # the switch-back fast path, with no scanner, parser, or
                 # embedder work at all.
-                self._set_cached_freshness(cache_key, fingerprint)
+                if use_cache:
+                    self._set_cached_freshness(cache_key, fingerprint)
             elif (
                 git.probe is GitProbeOutcome.GIT
                 and slot.indexed_head is not None
@@ -1215,7 +1241,8 @@ class Application:
                 # change from any metadata walk, so only an index run that
                 # validates the diff can prove the slot current. Lazy and
                 # eager modes schedule exactly that run.
-                self._pop_cached_freshness(cache_key)
+                if use_cache:
+                    self._pop_cached_freshness(cache_key)
                 state = "stale"
             else:
                 files = self.store.list_files(resolved.id, partition_id=target.partition_id)
@@ -1239,10 +1266,21 @@ class Application:
                     )
                 )
                 if is_stale:
-                    self._pop_cached_freshness(cache_key)
+                    if use_cache:
+                        self._pop_cached_freshness(cache_key)
                     state = "stale"
-                else:
+                elif use_cache:
                     self._set_cached_freshness(cache_key, fingerprint)
+        return state, files
+
+    def _project_status_for_target(
+        self, target: ActiveIndexTarget, *, use_cache: bool = True
+    ) -> ProjectStatus:
+        resolved = target.project
+        partition = target.partition
+        slot = target.slot
+        git = target.git_state
+        state, files = self._target_freshness_state(target, use_cache=use_cache)
         return ProjectStatus(
             project=resolved,
             state=state,
@@ -1268,6 +1306,7 @@ class Application:
             ),
             branch_build_pending=(
                 slot.state != "ready"
+                or state == "rebuild_required"
                 or (
                     git.probe is GitProbeOutcome.GIT
                     and slot.indexed_head is not None
@@ -1360,10 +1399,11 @@ class Application:
         resolved = self._resolve(project, roots)
         return self._run_repository_stable_query(
             [resolved],
-            lambda targets: self._project_is_stale(
-                resolved,
-                partition_id=self._primary_target(targets, resolved.id).partition_id,
+            lambda targets: self._reference_target_is_stale(
+                self._primary_target(targets, resolved.id),
+                use_cache=False,
             ),
+            include_status=True,
         )
 
     def _project_is_stale(
@@ -1811,11 +1851,12 @@ class Application:
         project_id = self.store.chunk_project_id(chunk_id)
         if project_id is None:
             return self.search.get_chunk(chunk_id)
-        resolved = self._resolve(project_id, roots)
+        checkouts = self._chunk_checkouts(project_id, roots)
         return self._run_repository_stable_query(
-            [resolved],
+            checkouts,
             lambda targets: self._get_chunk_for_target(
-                chunk_id, self._primary_target(targets, project_id)
+                chunk_id,
+                self._select_chunk_target(chunk_id, targets, project_id),
             ),
         )
 
@@ -1916,12 +1957,12 @@ class Application:
         cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> ReferenceResponse:
-        resolved = self._resolve_reference_project(selector, roots)
+        checkouts, project_id = self._resolve_reference_checkouts(selector, roots)
         return self._run_repository_stable_query(
-            [resolved],
+            checkouts,
             lambda targets: self._find_references_for_target(
                 selector,
-                self._primary_target(targets, resolved.id),
+                self._select_reference_target(selector, targets, project_id),
                 kinds=kinds,
                 limit=limit,
                 cursor=cursor,
@@ -1961,12 +2002,12 @@ class Application:
         cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> ImpactRadiusResponse:
-        resolved = self._resolve_reference_project(selector, roots)
+        checkouts, project_id = self._resolve_reference_checkouts(selector, roots)
         return self._run_repository_stable_query(
-            [resolved],
+            checkouts,
             lambda targets: self._impact_radius_for_target(
                 selector,
-                self._primary_target(targets, resolved.id),
+                self._select_reference_target(selector, targets, project_id),
                 max_depth=max_depth,
                 include_likely=include_likely,
                 kinds=kinds,
@@ -2012,13 +2053,13 @@ class Application:
         cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> RefactorAnalysis:
-        resolved = self._resolve_reference_project(selector, roots)
+        checkouts, project_id = self._resolve_reference_checkouts(selector, roots)
         return self._run_repository_stable_query(
-            [resolved],
+            checkouts,
             lambda targets: self._analyze_refactor_for_target(
                 selector,
                 operation,
-                self._primary_target(targets, resolved.id),
+                self._select_reference_target(selector, targets, project_id),
                 limit=limit,
                 cursor=cursor,
             ),
@@ -2054,13 +2095,13 @@ class Application:
         roots: list[Path] | None = None,
     ) -> RefactorPatch:
         validate_patch_request(operation, context_lines)
-        resolved = self._resolve_reference_project(selector, roots)
+        checkouts, project_id = self._resolve_reference_checkouts(selector, roots)
         return self._run_repository_stable_query(
-            [resolved],
+            checkouts,
             lambda targets: self._emit_refactor_patch_for_target(
                 selector,
                 operation,
-                self._primary_target(targets, resolved.id),
+                self._select_reference_target(selector, targets, project_id),
                 context_lines=context_lines,
             ),
             include_status=True,
@@ -2084,16 +2125,96 @@ class Application:
                 root=prepared.root,
             )
 
-    def _resolve_reference_project(
+    @staticmethod
+    def _slot_checkout_root(slot: ProjectSlot) -> Path | None:
+        """Infer a live checkout's project root from its recorded Git/workspace metadata."""
+        if slot.selector_kind == SelectorKind.WORKSPACE.value and slot.selector_value:
+            return Path(slot.selector_value)
+        if not slot.checkout_identity:
+            return None
+        git_dir = Path(slot.checkout_identity)
+        gitdir_pointer = git_dir / "gitdir"
+        try:
+            if gitdir_pointer.is_file():
+                raw = Path(gitdir_pointer.read_text(encoding="utf-8").strip())
+                resolved_git_file = raw if raw.is_absolute() else (git_dir / raw).resolve()
+                toplevel = resolved_git_file.parent
+            elif git_dir.name == ".git":
+                toplevel = git_dir.parent
+            else:
+                return None
+        except OSError:
+            return None
+        return toplevel / Path(slot.project_prefix) if slot.project_prefix else toplevel
+
+    def _chunk_checkouts(self, project_id: str, roots: list[Path] | None) -> list[ProjectInfo]:
+        """Return all live checkouts for *project_id*, requested roots first."""
+        resolver = ProjectResolver(self.store.list_projects())
+        scope = list(
+            resolver.resolve_scope(
+                explicit=project_id,
+                roots=roots or [],
+                cwd=self._scope_cwd,
+                all_checkouts=True,
+            )
+        )
+        seen = {project_root_identity(project.root) for project in scope}
+        for slot in self.store.active_slots_for(project_id):
+            candidate = self._slot_checkout_root(slot)
+            if candidate is None:
+                continue
+            info = resolver.checkout_at(candidate, project_id)
+            if info is None:
+                continue
+            identity = project_root_identity(info.root)
+            if identity not in seen:
+                seen.add(identity)
+                scope.append(info)
+        return scope
+
+    def _select_chunk_target(
+        self,
+        chunk_id: str,
+        targets: Mapping[str, Sequence[ActiveIndexTarget]],
+        project_id: str,
+    ) -> ActiveIndexTarget:
+        """Pick the active checkout target whose partition owns *chunk_id*."""
+        candidates = targets.get(project_id) or ()
+        if len(candidates) <= 1:
+            return self._primary_target(targets, project_id)
+        for candidate in candidates:
+            with self.store.partition_access(project_id, partition_id=candidate.partition_id):
+                if self.store.get_chunk(chunk_id, partition_id=candidate.partition_id) is not None:
+                    return candidate
+        return candidates[0]
+
+    def _resolve_reference_checkouts(
         self, selector: DeclarationSelector, roots: list[Path] | None
-    ) -> ProjectInfo:
+    ) -> tuple[list[ProjectInfo], str]:
         if selector.project is not None:
-            return self._resolve(selector.project, roots)
+            resolved = self._resolve(selector.project, roots)
+            return [resolved], resolved.id
         project_id = self.store.chunk_project_id(selector.chunk_id or "")
         if project_id is None:
             self.search.get_chunk(selector.chunk_id or "")
             raise AssertionError("get_chunk unexpectedly returned without a project id")
-        return self._resolve(project_id, roots)
+        return self._chunk_checkouts(project_id, roots), project_id
+
+    def _select_reference_target(
+        self,
+        selector: DeclarationSelector,
+        targets: Mapping[str, Sequence[ActiveIndexTarget]],
+        project_id: str,
+    ) -> ActiveIndexTarget:
+        if selector.chunk_id is not None:
+            return self._select_chunk_target(selector.chunk_id, targets, project_id)
+        return self._primary_target(targets, project_id)
+
+    def _resolve_reference_project(
+        self, selector: DeclarationSelector, roots: list[Path] | None
+    ) -> ProjectInfo:
+        checkouts, _ = self._resolve_reference_checkouts(selector, roots)
+        return checkouts[0]
 
     def prepare_model(self) -> None:
         if not isinstance(self.embedder, FastEmbedder):

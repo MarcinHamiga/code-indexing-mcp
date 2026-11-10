@@ -291,7 +291,11 @@ def parse_unified_zero(patch: str) -> dict[str, _Hunks]:
     # Set after a pure-deletion hunk header until its first non-blank removed
     # line gives the deletion's indentation.
     awaiting_indent = False
-    for line in patch.splitlines():
+    # Split on "\n" alone (matching source_lines and Git's diff framing) so
+    # lone CR, FF, VT, or Unicode line separators inside source lines never
+    # break mid-line and masquerade as diff/hunk headers.
+    for raw_line in patch.removesuffix("\n").split("\n") if patch else ():
+        line = raw_line.removesuffix("\r")
         if line.startswith("diff --git "):
             # A section whose header names its file is recorded even without
             # hunks: a mode-only change touches no lines.

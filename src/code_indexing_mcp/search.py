@@ -197,9 +197,12 @@ def _outline_items(
     no merged span reaches over the declarations between them.
     """
     items: list[OutlineItem] = []
-    # Each key's latest entry, and whether it was built from split parts.
-    latest: dict[tuple[str, str], tuple[int, bool]] = {}
-    for chunk in sorted(chunks, key=lambda item: (item.path, item.start_line)):
+    # Each key's latest entry, whether it was built from split parts, and its
+    # latest part_index (so parts separated by stripped blank lines still merge,
+    # while a subsequent same-named overload restarting at part_index 0 stays
+    # separate).
+    latest: dict[tuple[str, str], tuple[int, bool, int]] = {}
+    for chunk in sorted(chunks, key=lambda item: (item.path, item.start_line, item.part_index)):
         if chunk.path != path or not chunk.symbol or not chunk.qualified_symbol:
             continue
         key = (chunk.kind.removesuffix("_part"), chunk.qualified_symbol)
@@ -207,21 +210,33 @@ def _outline_items(
         if key in latest:
             if not span_parts:
                 continue
-            index, from_parts = latest[key]
+            index, from_parts, last_part_index = latest[key]
             existing = items[index]
-            # A split declaration's parts overlap or abut; a gap or a whole
-            # declaration means another declaration with the same name. A
-            # container's gap chunks (`class_part` text between and after its
-            # members) are the exception: member chunks sit between them, so they
-            # never abut, yet they belong to the container's latest entry.
+            # A split declaration's parts advance part_index monotonically (or,
+            # for synthetic/windowed previews sharing a part_index, overlap or
+            # abut); a reset to part_index 0 across a gap or a whole declaration
+            # means another declaration with the same name. A container's gap
+            # chunks (`class_part` text between and after its members) are the
+            # exception: member chunks sit between them, so they never abut, yet
+            # they belong to the container's latest entry.
             container_gap = is_part and key[0] in _CONTAINER_KINDS
-            if container_gap or (
-                is_part and from_parts and chunk.start_line <= existing.end_line + 1
-            ):
+            continuing_part = (
+                is_part
+                and from_parts
+                and (
+                    chunk.part_index > last_part_index
+                    or (
+                        chunk.part_index == last_part_index
+                        and chunk.start_line <= existing.end_line + 1
+                    )
+                )
+            )
+            if container_gap or continuing_part:
                 if chunk.end_line > existing.end_line:
                     items[index] = existing.model_copy(update={"end_line": chunk.end_line})
+                latest[key] = (index, from_parts, chunk.part_index)
                 continue
-        latest[key] = (len(items), is_part)
+        latest[key] = (len(items), is_part, chunk.part_index)
         items.append(
             OutlineItem(
                 kind=key[0],
@@ -426,15 +441,25 @@ class SearchService:
         query_vector = self.embedder.embed_query(query)
         names = {project.id: project.name for project in self.store.list_projects()}
         with self.store.partitions_access(preparation.selected):
-            hits = self._window_aware_hits(
-                lambda fetch: self.store.hybrid_search(
+            known_vector_scores: dict[str, float] = {}
+
+            def fetch_hybrid(fetch: int) -> list[dict[str, Any]]:
+                known_vector_scores.clear()
+                rows = self.store.hybrid_search(
                     query,
                     query_vector,
                     project_ids,
                     preparation.condition,
                     fetch,
                     partition_ids=preparation.partition_ids,
-                ),
+                )
+                for row in rows:
+                    if "_distance" in row:
+                        known_vector_scores[str(row["chunk_id"])] = 1.0 - float(row["_distance"])
+                return rows
+
+            hits = self._window_aware_hits(
+                fetch_hybrid,
                 names,
                 preparation,
                 include_content_in_key=True,
@@ -443,7 +468,12 @@ class SearchService:
                 # Same locked view as the hits: no second lock round trip, and
                 # no commit can land between a search and its explanation.
                 hits = self._explain_hits(
-                    query, query_vector, hits, preparation.condition, preparation.selected
+                    query,
+                    query_vector,
+                    hits,
+                    preparation.condition,
+                    preparation.selected,
+                    known_vector_scores=known_vector_scores,
                 )
         return SearchResponse(query=query, hits=hits)
 
@@ -586,6 +616,8 @@ class SearchService:
         hits: list[SearchHit],
         condition: str | None,
         selected: dict[str, list[PartitionRef]],
+        *,
+        known_vector_scores: Mapping[str, float] | None = None,
     ) -> list[SearchHit]:
         """Attach per-signal ranking explanations; never fails the search.
 
@@ -600,7 +632,12 @@ class SearchService:
         components: dict[str, RankComponents] = {}
         try:
             components = self.store.explain_hits(
-                query, query_vector, wanted, condition, partition_ids=partition_ids
+                query,
+                query_vector,
+                wanted,
+                condition,
+                partition_ids=partition_ids,
+                known_vector_scores=known_vector_scores,
             )
         except Exception:
             logger.debug("Ranking explanation probes failed", exc_info=True)

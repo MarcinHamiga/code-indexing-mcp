@@ -207,6 +207,8 @@ class _ReferenceContext(NamedTuple):
     # from these instead of one storage round trip each.
     declarations_by_file: dict[str, list[ReferenceRecord]] | None = None
     declarations_by_name: dict[str | None, list[ReferenceRecord]] | None = None
+    references_by_key: dict[str, list[ReferenceRecord]] | None = None
+    precomputed_receiver_names: bool = False
 
 
 @dataclass
@@ -549,8 +551,23 @@ class ReferenceService:
         for row in declarations:
             declarations_by_file.setdefault(row["file_id"], []).append(row)
             declarations_by_symbol.setdefault(row["target_name"], []).append(row)
+        reference_rows = self.store.list_reference_records(
+            project_id,
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+            record_kinds=("reference",),
+            partition_id=partition.partition_id,
+        )
+        references_by_key = self._index_references_by_key(reference_rows)
+        full_receiver_index = self._build_module_index([], declarations)
         context = context._replace(
-            declarations_by_file=declarations_by_file, declarations_by_name=declarations_by_symbol
+            declarations_by_file=declarations_by_file,
+            declarations_by_name=declarations_by_symbol,
+            references_by_key=references_by_key,
+            module_index=context.module_index._replace(
+                receiver_names=full_receiver_index.receiver_names
+            ),
+            precomputed_receiver_names=True,
         )
         caches = _SourceCaches()
         exports_by_file: dict[str, list[ReferenceRecord]] = {}
@@ -629,26 +646,24 @@ class ReferenceService:
                 start_line=row["start_line"] or 0,
                 end_line=row["end_line"] or 0,
             )
-            query = self._find_references_with_records(
-                DeclarationSelector(
-                    project=project_id,
-                    path=selected.path,
-                    qualified_symbol=selected.qualified_symbol,
-                ),
-                preselected=selected,
-                snapshot_version=version,
+            candidate_rows = self._memory_candidate_records(selected, context, reference_rows)
+            raw_hits, query_limitations, _ = self._hits_and_limitations(
+                selected,
+                None,
+                candidate_rows,
+                root,
+                caches.sources,
+                backfill,
+                version,
+                partition_id=partition.partition_id,
                 context=context,
-                partition=partition,
-                root=root,
-                backfill=backfill,
                 caches=caches,
+                include_coverage_limitations=False,
             )
             caches.trim()
-            limitations.extend(query.response.limitations)
+            limitations.extend(query_limitations)
             hits = [
-                hit
-                for hit in query.hits
-                if not (hit.kind == "export" and hit.path == selected.path)
+                hit for hit in raw_hits if not (hit.kind == "export" and hit.path == selected.path)
             ]
             if any(hit.resolution == "exact" for hit in hits):
                 continue
@@ -1700,6 +1715,67 @@ class ReferenceService:
             visited_count=len(visited),
         )
 
+    @staticmethod
+    def _index_references_by_key(
+        rows: list[ReferenceRecord],
+    ) -> dict[str, list[ReferenceRecord]]:
+        """Bucket reference rows by every identifier key ``_may_refer`` can match."""
+        by_key: dict[str, list[ReferenceRecord]] = {}
+        for row in rows:
+            keys: set[str] = set()
+            target = row["target_name"]
+            if target:
+                keys.add(target)
+                keys.add(target.rsplit(".", 1)[-1])
+            written = row["written_name"]
+            if written:
+                keys.add(written)
+                keys.add(written.rsplit(".", 1)[-1])
+                if row["language"] == "python" and row["kind"] == "decorator" and "." in written:
+                    keys.add(written.split(".", 1)[0])
+            receiver = row["receiver_text"]
+            if receiver:
+                keys.add(receiver)
+            for key in keys:
+                by_key.setdefault(key, []).append(row)
+        return by_key
+
+    def _memory_candidate_records(
+        self,
+        selected: SelectedDeclaration,
+        context: _ReferenceContext,
+        fallback_rows: list[ReferenceRecord],
+    ) -> list[ReferenceRecord]:
+        """Select candidate reference rows in memory without per-symbol storage queries."""
+        if context.references_by_key is None or not selected.symbol:
+            return fallback_rows
+        spellings: set[str] = {selected.symbol}
+        reexport_rows = context.reexport_rows_by_path
+        for item in context.import_rows_by_target.get(str(PurePosixPath(selected.path)), ()):
+            binding = item["alias"] or item["written_name"] or item["imported_name"]
+            if binding is None or self._is_member_namespace(item):
+                continue
+            if self._import_targets(
+                item, selected, context.known_paths, context.module_index
+            ) or self._reexport_targets_symbol(
+                item,
+                selected.symbol,
+                selected.path,
+                reexport_rows,
+                context.known_paths,
+                context.module_index,
+            ):
+                spellings.add(binding)
+        seen: set[str] = set()
+        candidates: list[ReferenceRecord] = []
+        for spelling in spellings:
+            for row in context.references_by_key.get(spelling, ()):
+                reference_id = row["reference_id"]
+                if reference_id not in seen:
+                    seen.add(reference_id)
+                    candidates.append(row)
+        return candidates
+
     def _hits_and_limitations(
         self,
         selected: SelectedDeclaration,
@@ -1713,6 +1789,7 @@ class ReferenceService:
         partition_id: str,
         context: _ReferenceContext,
         caches: _SourceCaches | None = None,
+        include_coverage_limitations: bool = True,
     ) -> tuple[list[ReferenceHit], list[ReferenceLimitation], list[ReferenceRecord]]:
         """Classify every reference row into a sorted, unsliced hit list.
 
@@ -1798,8 +1875,13 @@ class ReferenceService:
         imports = context.imports_by_file
         reexport_rows = context.reexport_rows_by_path
         known_paths = context.known_paths
-        receiver_index = self._build_module_index([], declarations)
-        module_index = context.module_index._replace(receiver_names=receiver_index.receiver_names)
+        if context.precomputed_receiver_names:
+            module_index = context.module_index
+        else:
+            receiver_index = self._build_module_index([], declarations)
+            module_index = context.module_index._replace(
+                receiver_names=receiver_index.receiver_names
+            )
         # A declaration nested directly in a class body is reachable only
         # through a receiver, so it must not shadow a bare name the way a
         # nested function does.
@@ -1896,7 +1978,9 @@ class ReferenceService:
             csharp_parts_probe=csharp_owner_is_one_type,
         )
         hits: list[ReferenceHit] = []
-        limitations: list[ReferenceLimitation] = self._coverage_limitations(records, backfill)
+        limitations: list[ReferenceLimitation] = (
+            self._coverage_limitations(records, backfill) if include_coverage_limitations else []
+        )
         # Serve-time staleness gate: coverage rows carry the content hash the
         # structural rows were extracted from, and offsets are applied to the
         # file as it sits on disk. A file whose bytes changed since extraction
@@ -2276,21 +2360,31 @@ class ReferenceService:
                 if item.code == "unsupported_binding" and item.path is not None
             }
             binding_indexes: dict[str, PythonBindings] = {}
+            non_python_checks: dict[str, tuple[bool, bool]] = {}
+            collision_pattern = re.compile(
+                r"(?<![\w$])" + re.escape(operation.new_name) + r"(?![\w$])"
+            )
             for finding in candidates:
                 source, bom = self._file_bytes(root, finding.path, sources)
                 if finding.language != "python":
                     # Structural rows do not model local bindings in these languages.
                     # Keep declaration/import-only renames when the destination is
                     # absent; calls, reads and escaped identifiers need a binder.
-                    text = source.decode("utf-8", errors="replace")
-                    if re.search(
-                        r"(?<![\w$])" + re.escape(operation.new_name) + r"(?![\w$])", text
-                    ):
+                    checked = non_python_checks.get(finding.path)
+                    if checked is None:
+                        text = source.decode("utf-8", errors="replace")
+                        checked = (
+                            collision_pattern.search(text) is not None,
+                            "\\" in text,
+                        )
+                        non_python_checks[finding.path] = checked
+                    has_collision, has_backslash = checked
+                    if has_collision:
                         collision_paths.add(finding.path)
                     if (
                         finding.kind not in {"import", "export"}
                         and finding.reason_code != "declaration"
-                    ) or "\\" in text:
+                    ) or has_backslash:
                         unsupported_paths.add(finding.path)
                     continue
                 bindings = binding_indexes.get(finding.path)
@@ -3412,7 +3506,9 @@ class ReferenceService:
         if len(chunks) < 2 and not any(chunk.kind.endswith("_part") for chunk in chunks):
             return chunks
         items = _outline_items(chunks, chunks[0].path, span_parts=True) if chunks else []
-        by_start = {(chunk.qualified_symbol, chunk.start_line): chunk for chunk in chunks}
+        by_start: dict[tuple[str | None, int], ChunkPreview] = {}
+        for chunk in sorted(chunks, key=lambda item: (item.start_line, item.part_index)):
+            by_start.setdefault((chunk.qualified_symbol, chunk.start_line), chunk)
         grouped: list[ChunkPreview] = []
         for item in items:
             first = by_start.get((item.qualified_symbol, item.start_line))

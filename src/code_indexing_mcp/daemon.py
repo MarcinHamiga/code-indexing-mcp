@@ -1222,7 +1222,7 @@ class BrokerApplication:
         self, project: str | None = None, *, roots: list[Path] | None = None
     ) -> bool:
         """Use the status RPC so adding freshness does not change the daemon protocol."""
-        return self.project_status(project, roots=roots).state == "stale"
+        return self.project_status(project, roots=roots).state in {"stale", "rebuild_required"}
 
     def remove_project(self, project: str) -> RemovalReport:
         return RemovalReport.model_validate(self._call("remove_project", project=project))

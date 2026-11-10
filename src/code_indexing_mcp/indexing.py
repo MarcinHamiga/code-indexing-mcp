@@ -925,21 +925,25 @@ class Indexer:
         # (always error-free) run to promote a project past whatever state a
         # prior full index earned it (S2 -- e.g. "partial" from a failed
         # index must stay "partial" until a real index run heals it).
-        try:
-            prior_state = self.store.project_state(project.id)
-        except CodeIndexingError as exc:
-            if exc.code is not ErrorCode.PROJECT_NOT_FOUND:
-                raise
-            # A marker-resolved project that was never registered -- e.g. it
-            # has zero eligible source files, so `_project_is_stale` never
-            # called `index()` to register it, or the data directory was
-            # wiped while the on-disk marker survived (S11) -- has no prior
-            # run to protect. `existing` below reads the same per-project
-            # partition this lookup just proved absent, so it comes back
-            # empty and the early "nothing missing" return fires before this
-            # value would ever be read; it exists only so a future change to
-            # that invariant fails safe instead of crashing.
-            prior_state = "ready"
+        slot = self.store.get_slot(partition.slot_id)
+        if slot is not None and slot.state != "pending":
+            prior_state = slot.state
+        else:
+            try:
+                prior_state = self.store.project_state(project.id)
+            except CodeIndexingError as exc:
+                if exc.code is not ErrorCode.PROJECT_NOT_FOUND:
+                    raise
+                # A marker-resolved project that was never registered -- e.g. it
+                # has zero eligible source files, so `_project_is_stale` never
+                # called `index()` to register it, or the data directory was
+                # wiped while the on-disk marker survived (S11) -- has no prior
+                # run to protect. `existing` below reads the same per-project
+                # partition this lookup just proved absent, so it comes back
+                # empty and the early "nothing missing" return fires before this
+                # value would ever be read; it exists only so a future change to
+                # that invariant fails safe instead of crashing.
+                prior_state = "ready"
         gap = self._reference_gap(project, partition)
         existing = gap.existing
         stale_schema_file_ids = gap.stale_schema_file_ids
@@ -1540,6 +1544,7 @@ class Indexer:
             and previous is not None
             and previous.size == item.size
             and previous.mtime_ns == item.mtime_ns
+            and previous.language == item.language
             and not _is_racy(previous)
         ):
             # Size and mtime alone trusted the filesystem's version of a
@@ -1591,6 +1596,7 @@ class Indexer:
                 and not retrying
                 and previous is not None
                 and previous.content_hash == content_hash
+                and previous.language == item.language
             ):
                 with timer.measure("commit"):
                     # A racy row is restamped so it stops being racy once the

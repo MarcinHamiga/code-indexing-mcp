@@ -57,6 +57,7 @@ from .models import (
     ProjectInfo,
     ProjectSlot,
     ProjectStorageStats,
+    ScanConfig,
     SlotStorageStats,
     StoredChunk,
     StoredFile,
@@ -472,6 +473,7 @@ class _ProjectTables:
     # Identity of this physical creation of the partition; see
     # LanceStore._ensure_partition_nonce.
     nonce: str = ""
+    database: Any = None
 
 
 class ReferenceRecord(TypedDict):
@@ -636,8 +638,11 @@ class LanceStore:
                 # A checkout of the same repository -- a linked worktree --
                 # legally carries this registration id in its local marker.
                 # The canonical root stays whichever checkout registered
-                # first; only the marker's mutable payload flows through.
-                project = project.model_copy(update={"root": registered_root})
+                # first; preserve canonical scan settings when the incoming
+                # worktree marker still carries unedited defaults.
+                canonical = ProjectInfo.model_validate_json(str(existing[0]["payload"]))
+                merged_scan = canonical.scan if project.scan == ScanConfig() else project.scan
+                project = project.model_copy(update={"root": registered_root, "scan": merged_scan})
         if (
             existing
             and str(existing[0]["state"]) != "pending"
@@ -1360,11 +1365,17 @@ class LanceStore:
         row["state"] = "rebuild_required"
         row["updated_at"] = time.time_ns()
         self._merge(self._projects, "id", [row])
+        for slot in self.list_slots(project_id):
+            if (
+                slot.state not in {"pending", "rebuild_required"}
+                and (self.directory / "projects" / slot.partition_id).is_dir()
+            ):
+                self.upsert_slot(slot.model_copy(update={"state": "rebuild_required"}))
         active = self.active_partition_ref(project_id)
         if active is not None:
-            slot = self.get_slot(active.slot_id)
-            if slot is not None and slot.state != "rebuild_required":
-                self.upsert_slot(slot.model_copy(update={"state": "rebuild_required"}))
+            active_slot = self.get_slot(active.slot_id)
+            if active_slot is not None and active_slot.state != "rebuild_required":
+                self.upsert_slot(active_slot.model_copy(update={"state": "rebuild_required"}))
 
     def delete_partition(
         self, project_id: str, *, model_id: str, partition_id: str | None = None
@@ -1892,24 +1903,14 @@ class LanceStore:
             return None
         row = dict(rows[0])
         if row.get("source_start_byte") is not None:
-            # Pin both reads to one table version: an incremental replacement
-            # must not swap out the sibling windows between these lookups.
+            # Pin reads to one table version: an incremental replacement must
+            # not swap out the sibling windows between lookups.
             version = tables.chunks.version
-            database = lancedb.connect(
+            database = tables.database or lancedb.connect(
                 self.directory / "projects" / physical,
                 read_consistency_interval=timedelta(0),
             )
             snapshot = cast(LanceTable, database.open_table("chunks", version=version))
-            rows = cast(
-                list[dict[str, Any]],
-                snapshot.search()
-                .where(f"chunk_id = {_quoted(chunk_id)}")
-                .select(CHUNK_PAYLOAD_COLUMNS)
-                .to_list(),
-            )
-            if not rows:
-                return None
-            row = dict(rows[0])
             siblings = cast(
                 list[dict[str, Any]],
                 snapshot.search()
@@ -1917,6 +1918,30 @@ class LanceStore:
                 .select(CHUNK_PAYLOAD_COLUMNS)
                 .to_list(),
             )
+            pinned_target = next(
+                (sibling for sibling in siblings if str(sibling["chunk_id"]) == chunk_id),
+                None,
+            )
+            if pinned_target is None:
+                rows = cast(
+                    list[dict[str, Any]],
+                    snapshot.search()
+                    .where(f"chunk_id = {_quoted(chunk_id)}")
+                    .select(CHUNK_PAYLOAD_COLUMNS)
+                    .to_list(),
+                )
+                if not rows:
+                    return None
+                row = dict(rows[0])
+                siblings = cast(
+                    list[dict[str, Any]],
+                    snapshot.search()
+                    .where(self._source_chunk_condition(row))
+                    .select(CHUNK_PAYLOAD_COLUMNS)
+                    .to_list(),
+                )
+            else:
+                row = dict(pinned_target)
             row = self._reconstruct_source_chunk(row, siblings)
         row["project_id"] = project_id
         return CodeChunk.model_validate(row)
@@ -2311,17 +2336,20 @@ class LanceStore:
         condition: str | None,
         *,
         partition_ids: Mapping[str, str | Sequence[str]] | None = None,
+        known_vector_scores: Mapping[str, float] | None = None,
     ) -> dict[str, RankComponents]:
         """Probe per-signal scores for already-ranked chunks.
 
-        Runs one FTS probe per indexed text column and one vector probe per
-        pinned partition, each restricted to the given chunk ids so the cost
-        stays bounded by the returned hits rather than the fetch window. Best
-        score per signal wins across partitions; ranks are recomputed over the
-        merged explained set and are diagnostic positions within that set, not
-        global fusion ranks. In particular the diagnostic FTS scores are raw
-        partition-local BM25, whereas fusion compares ordinal lexical evidence.
-        A probe that fails leaves its signal None instead of failing the search.
+        Runs one FTS probe per indexed text column and (for chunks whose cosine
+        distance was not already returned by ``hybrid_search``) one exact vector
+        probe per pinned partition, each restricted to the given chunk ids so
+        the cost stays bounded by the returned hits rather than the fetch
+        window. Best score per signal wins across partitions; ranks are
+        recomputed over the merged explained set and are diagnostic positions
+        within that set, not global fusion ranks. In particular the diagnostic
+        FTS scores are raw partition-local BM25, whereas fusion compares ordinal
+        lexical evidence. A probe that fails leaves its signal None instead of
+        failing the search.
         """
         wanted = {
             project_id: list(dict.fromkeys(chunk_ids))
@@ -2330,6 +2358,7 @@ class LanceStore:
         }
         if not wanted:
             return {}
+        precomputed_vectors = known_vector_scores or {}
         per_partition = self._fan_out_partitions(
             wanted,
             partition_ids,
@@ -2340,10 +2369,16 @@ class LanceStore:
                 condition,
                 wanted[project_id],
                 partition_id=partition_id,
+                known_vector_scores=precomputed_vectors,
             ),
         )
         merged_fts: dict[str, float] = {}
-        merged_vector: dict[str, float] = {}
+        merged_vector: dict[str, float] = {
+            chunk_id: float(precomputed_vectors[chunk_id])
+            for chunk_ids in wanted.values()
+            for chunk_id in chunk_ids
+            if chunk_id in precomputed_vectors
+        }
         for row in per_partition:
             chunk_id = str(row["chunk_id"])
             fts_score = row["fts_score"]
@@ -2383,6 +2418,7 @@ class LanceStore:
         chunk_ids: Sequence[str],
         *,
         partition_id: str | None = None,
+        known_vector_scores: Mapping[str, float] | None = None,
     ) -> list[dict[str, Any]]:
         """Score known chunks per signal inside one partition; never raises."""
         tables = self._project_existing_tables(project_id, partition_id=partition_id)
@@ -2417,26 +2453,36 @@ class LanceStore:
                 score = float(probe_row.get("_score", 0.0))
                 if score > fts_best.get(chunk_id, float("-inf")):
                     fts_best[chunk_id] = score
+        precomputed = known_vector_scores or {}
+        missing_vector = [chunk_id for chunk_id in wanted if chunk_id not in precomputed]
         vector_best: dict[str, float] = {}
-        try:
-            query = tables.chunks.search(
-                vector, vector_column_name="vector", query_type="vector"
-            ).distance_type("cosine")
-            query = query.where(combined, prefilter=True)
-            query = query.limit(len(wanted)).select(["chunk_id", "_distance"])
-            if self.vector_index == "exact":
-                query = query.bypass_vector_index()
-            else:
-                query = query.ef(VECTOR_INDEX_EF).refine_factor(VECTOR_INDEX_REFINE_FACTOR)
-            vector_rows = cast(list[dict[str, Any]], query.to_list())
-        except Exception:
-            logger.debug("Vector explanation probe failed for %s", project_id, exc_info=True)
-            vector_rows = []
-        for vector_row in vector_rows:
-            chunk_id = str(vector_row["chunk_id"])
-            score = 1.0 - float(vector_row["_distance"])
-            if score > vector_best.get(chunk_id, float("-inf")):
-                vector_best[chunk_id] = score
+        if missing_vector:
+            vector_scoped = (
+                f"chunk_id IN ({', '.join(_quoted(chunk_id) for chunk_id in missing_vector)})"
+            )
+            vector_combined = f"({condition}) AND {vector_scoped}" if condition else vector_scoped
+            try:
+                # `missing_vector` is bounded to the returned page (typically
+                # <= 20 chunk ids) and `chunk_id` carries a BTree index, so
+                # computing exact cosine distance over the prefiltered rows
+                # avoids traversing the HNSW graph just to score known ids.
+                query = (
+                    tables.chunks.search(vector, vector_column_name="vector", query_type="vector")
+                    .distance_type("cosine")
+                    .where(vector_combined, prefilter=True)
+                    .limit(len(missing_vector))
+                    .select(["chunk_id", "_distance"])
+                    .bypass_vector_index()
+                )
+                vector_rows = cast(list[dict[str, Any]], query.to_list())
+            except Exception:
+                logger.debug("Vector explanation probe failed for %s", project_id, exc_info=True)
+                vector_rows = []
+            for vector_row in vector_rows:
+                chunk_id = str(vector_row["chunk_id"])
+                score = 1.0 - float(vector_row["_distance"])
+                if score > vector_best.get(chunk_id, float("-inf")):
+                    vector_best[chunk_id] = score
         return [
             {
                 "chunk_id": chunk_id,
@@ -2481,7 +2527,8 @@ class LanceStore:
         page_size = max(limit * OVERFETCH_FACTOR, MINIMUM_OVERFETCH)
         offset = 0
         matches: list[ChunkPreview] = []
-        while len(self._coalesce_source_previews(matches)) < limit:
+        seen_groups: set[tuple[object, ...]] = set()
+        while len(seen_groups) < limit:
             rows = self._projected_chunks(
                 tables.chunks,
                 " AND ".join(conditions),
@@ -2498,6 +2545,7 @@ class LanceStore:
                 preview = ChunkPreview.model_validate(row)
                 if _symbol_matches(preview, name, match):
                     matches.append(preview)
+                    seen_groups.add(self._source_preview_key(preview))
             if len(rows) < page_size:
                 break
             offset += len(rows)
@@ -2524,6 +2572,20 @@ class LanceStore:
         return selected
 
     @staticmethod
+    def _source_preview_key(chunk: ChunkPreview) -> tuple[object, ...]:
+        if chunk.source_start_byte is None:
+            return (chunk.chunk_id,)
+        return (
+            chunk.file_id,
+            chunk.kind,
+            chunk.qualified_symbol,
+            chunk.part_index,
+            chunk.source_start_byte,
+            chunk.source_end_byte,
+            chunk.content_hash,
+        )
+
+    @staticmethod
     def _coalesce_source_previews(chunks: Sequence[ChunkPreview]) -> list[ChunkPreview]:
         """Collapse embedding windows, preserving distinct extractor chunks.
 
@@ -2532,17 +2594,7 @@ class LanceStore:
         """
         grouped: dict[tuple[object, ...], ChunkPreview] = {}
         for chunk in chunks:
-            key: tuple[object, ...] = (chunk.chunk_id,)
-            if chunk.source_start_byte is not None:
-                key = (
-                    chunk.file_id,
-                    chunk.kind,
-                    chunk.qualified_symbol,
-                    chunk.part_index,
-                    chunk.source_start_byte,
-                    chunk.source_end_byte,
-                    chunk.content_hash,
-                )
+            key = LanceStore._source_preview_key(chunk)
             previous = grouped.get(key)
             grouped[key] = (
                 chunk
@@ -2595,7 +2647,7 @@ class LanceStore:
             for row in rows:
                 row["project_id"] = project_id
             previews.extend(ChunkPreview.model_validate(row) for row in rows)
-        return previews
+        return self._coalesce_source_previews(previews)
 
     def files_for_paths(
         self, paths: Iterable[str], project_id: str, *, partition_id: str | None = None
@@ -2705,7 +2757,11 @@ class LanceStore:
                     config=FTS(lower_case=True, stem=False, remove_stop_words=False),
                     replace=False,
                 )
-        for column in ("file_id", "language", "path", "symbol"):
+        # Deliberately omit `qualified_symbol` here while `find_symbol_chunks`
+        # issues `(qualified_symbol = X OR symbol = X) ... ORDER BY ...`: Lance
+        # 8.0.0's planner fails (`TakeExec requires ... '_rowaddr'`) on an OR
+        # across two BTree-indexed string columns with ORDER BY.
+        for column in ("chunk_id", "file_id", "language", "path", "symbol"):
             if column not in indexed_columns:
                 chunks.create_index(column, config=BTree(), replace=False)
         vector_indices = [index for index in indices if "vector" in index.columns]
@@ -2725,6 +2781,7 @@ class LanceStore:
             column for index in reference_indices for column in index.columns
         }
         for column in (
+            "reference_id",
             "file_id",
             "record_kind",
             "target_name",
@@ -3172,6 +3229,7 @@ class LanceStore:
             references=self._table(database, "references", self._reference_schema()),
             generation=self._partition_generation(partition_id),
             nonce=nonce,
+            database=database,
         )
         if cached is not None:
             return self._replace_cached(partition_id, tables)
@@ -3212,6 +3270,7 @@ class LanceStore:
                 references=self._open_optional_table(database, "references"),
                 generation=generation,
                 nonce=nonce,
+                database=database,
             )
         except (ValueError, FileNotFoundError):
             return None
