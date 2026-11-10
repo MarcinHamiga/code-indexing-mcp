@@ -341,6 +341,12 @@ def _write_handshake(popen: subprocess.Popen[bytes], payload: str) -> None:
         popen.stdin.close()
 
 
+# Shortest supported sockaddr_un.sun_path, minus the terminating NUL.
+UNIX_SOCKET_PATH_BYTES = 103
+_SOCKET_NAME = "worker.sock"
+_SHORT_TEMP_ROOT = "/tmp"
+
+
 @dataclass(frozen=True)
 class _Channel:
     """The listening socket an external worker dials back to."""
@@ -368,9 +374,24 @@ class _Channel:
             address: str | tuple[str, int] = (str(host), int(port))
         else:
             directory = Path(tempfile.mkdtemp(prefix="code-indexing-mcp-worker-"))
+            if len(os.fsencode(directory / _SOCKET_NAME)) > UNIX_SOCKET_PATH_BYTES:
+                # A long per-user TMPDIR (macOS) pushes the path past what
+                # sockaddr_un holds; /tmp is always short enough.
+                shutil.rmtree(directory, ignore_errors=True)
+                directory = Path(
+                    tempfile.mkdtemp(prefix="code-indexing-mcp-worker-", dir=_SHORT_TEMP_ROOT)
+                )
+            address = str(directory / _SOCKET_NAME)
             server = socket.socket(socket.AF_UNIX)
-            address = str(directory / "worker.sock")
-            server.bind(address)
+            try:
+                server.bind(address)
+            except OSError as exc:
+                server.close()
+                shutil.rmtree(directory, ignore_errors=True)
+                raise CodeIndexingError(
+                    ErrorCode.EMBEDDING_WORKER_FAILED,
+                    f"Could not open the accelerator worker channel: {exc}",
+                ) from exc
         server.listen(1)
         return cls(
             server=server,

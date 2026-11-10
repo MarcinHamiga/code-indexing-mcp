@@ -69,6 +69,8 @@ logger = logging.getLogger(__name__)
 # reject requests it cannot dispatch instead of failing inside them, and the
 # mismatch is what tells ensure_daemon to retire it and start a current one.
 PROTOCOL_VERSION = 6
+# The module the daemon process is started from; see ensure_daemon (DMN-5).
+DAEMON_ENTRY_MODULE = "code_indexing_mcp.daemon_entry"
 MAX_FRAME_BYTES = 16 * 1024**2
 MAX_RESPONSE_BYTES = 256 * 1024**2
 MAX_RESPONSE_CHUNK_BYTES = 8 * 1024**2
@@ -83,9 +85,44 @@ _REFACTOR_OPERATION: TypeAdapter[RefactorOperation] = TypeAdapter(RefactorOperat
 # choosing to wait out.
 REQUEST_RECEIVE_TIMEOUT_SECONDS = 30
 DAEMON_QUERY_TIMEOUT_SECONDS = 900
-_UNBOUNDED_CLIENT_TIMEOUT_METHODS = frozenset(
-    {"index_project", "maintain_storage", "init_project", "stop"}
+_UNBOUNDED_CLIENT_TIMEOUT_METHODS = frozenset({"index_project", "maintain_storage", "init_project"})
+# DMN-7: liveness and control calls do no work, so a daemon that does not answer
+# within a few seconds is wedged, not busy. ``stop`` only acknowledges: the
+# caller waits for the process (lifetime lock) to go away separately, so a
+# drain in progress never needs a long socket timeout.
+DAEMON_CONTROL_TIMEOUT_SECONDS = 5
+_CONTROL_METHODS = frozenset({"ping", "stop"})
+# DMN-4: after a stop the daemon closes its listener and lets requests that are
+# already running finish, up to these bounds. An index run (or other call a
+# client already waits on without a budget) gets the longer one because cutting
+# it off throws away minutes of embedding; both are finite so a wedged request
+# cannot keep a stopping daemon, and everything waiting on its lock, forever.
+STOP_DRAIN_SECONDS = 30
+STOP_INDEX_DRAIN_SECONDS = 300
+# How long a replacement daemon waits for the lifetime lock a stopping one
+# still holds (DMN-3), and how long a caller waits for a stop to complete:
+# long enough to cover an ordinary drain, short enough to report back.
+LIFETIME_LOCK_WAIT_SECONDS = 15
+DAEMON_STOP_WAIT_SECONDS = STOP_DRAIN_SECONDS + 5
+# DMN-2: how long an index request waits for the startup model warm-up so the
+# run's parent-memory baseline is not sampled while the model load is growing
+# RSS. Warm-up failures end the wait too; this only bounds a stalled load.
+MODEL_WARMUP_WAIT_SECONDS = 60
+_NO_WARMUP_WAIT_METHODS = frozenset(
+    {
+        "ping",
+        "stop",
+        "list_projects",
+        "discover_project",
+        "remove_project",
+        "init_project",
+        "model_status",
+    }
 )
+ACCEPT_ERROR_BACKOFF_SECONDS = 0.1
+# Answered without taking a dispatch slot (DMN-6): they do no work, and a
+# saturated daemon must still report itself alive and accept a stop.
+_SEMAPHORE_EXEMPT_METHODS = frozenset({"ping", "stop"})
 # D4: an unbounded thread-per-connection accept loop is fine for the sockets
 # themselves, but every thread past this many concurrently *dispatching* a
 # request is refused outright rather than left to queue invisibly behind the
@@ -281,7 +318,10 @@ def _receive_exact(connection: socket.socket, size: int) -> bytes:
 
 
 def send_frame(connection: socket.socket, payload: Mapping[str, Any]) -> None:
-    encoded = json.dumps(payload, separators=(",", ":")).encode()
+    _send_encoded_frame(connection, json.dumps(payload, separators=(",", ":")).encode())
+
+
+def _send_encoded_frame(connection: socket.socket, encoded: bytes) -> None:
     if len(encoded) > MAX_FRAME_BYTES:
         raise CodeIndexingError(
             ErrorCode.PROTOCOL_ERROR,
@@ -315,7 +355,7 @@ def _send_response(connection: socket.socket, payload: Mapping[str, Any]) -> Non
             maximum_bytes=MAX_RESPONSE_BYTES,
         )
     if len(encoded) <= MAX_FRAME_BYTES:
-        send_frame(connection, payload)
+        _send_encoded_frame(connection, encoded)
         return
     # Base64 expands by 4/3. The additional frame headroom covers the id,
     # chunk markers, and JSON punctuation even when tests lower the frame cap.
@@ -375,6 +415,15 @@ def _receive_response(connection: socket.socket) -> dict[str, Any]:
     return value
 
 
+def _client_budget(method: str) -> float | None:
+    """The socket timeout a client applies while waiting for *method*'s answer."""
+    if method in _CONTROL_METHODS:
+        return DAEMON_CONTROL_TIMEOUT_SECONDS
+    if method in _UNBOUNDED_CLIENT_TIMEOUT_METHODS:
+        return None
+    return DAEMON_QUERY_TIMEOUT_SECONDS
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
@@ -422,6 +471,7 @@ class DaemonServer:
     ) -> None:
         self.paths = paths
         self.application = application or Application(paths)
+        self.application.cwd_scopes_requests = False
         self.idle_timeout_seconds = idle_timeout_seconds
         self.endpoint = daemon_endpoint(paths)
         self.token_path = paths.data / "daemon.token"
@@ -437,6 +487,11 @@ class DaemonServer:
         self._active_requests = 0
         self._maintenance_active = False
         self._model_warmup_active = False
+        # Set whenever no startup warm-up is loading (initially, so a server
+        # that is dispatched to directly never waits); cleared by serve().
+        self._model_warmup_finished = threading.Event()
+        self._model_warmup_finished.set()
+        self._active_long_requests = 0
         self._activity_lock = threading.Lock()
         self._token = ""
         self._listener: socket.socket | None = None
@@ -447,13 +502,20 @@ class DaemonServer:
         # is refused outright rather than left to queue invisibly.
         self._request_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
 
+    def request_stop(self) -> None:
+        """Ask ``serve`` to stop accepting, drain, clean up and return."""
+        self._stop.set()
+
     def serve(self) -> None:
         self.paths.ensure_private()
         lock_directory = self.paths.data / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
         lifetime_lock = FileLock(lock_directory / "daemon.lock")
         try:
-            lifetime_lock.acquire(timeout=0)
+            # DMN-3: a daemon that was just asked to stop keeps the lock until
+            # its drain and background threads finish, so a replacement waits
+            # (bounded) instead of failing the moment it starts.
+            lifetime_lock.acquire(timeout=LIFETIME_LOCK_WAIT_SECONDS)
         except Timeout as exc:
             raise CodeIndexingError(
                 ErrorCode.INDEX_BUSY, "The per-user indexing daemon is already running"
@@ -474,6 +536,11 @@ class DaemonServer:
             listener.listen(32)
             listener.settimeout(0.5)
             _publish_daemon_endpoint(self.paths, self.endpoint)
+            # Marked before requests can arrive: an index request must see the
+            # warm-up as pending, not as not-yet-started (DMN-2).
+            with self._activity_lock:
+                self._model_warmup_active = True
+            self._model_warmup_finished.clear()
             self.ready.set()
             maintenance_thread = threading.Thread(
                 target=self._run_startup_maintenance,
@@ -506,6 +573,7 @@ class DaemonServer:
             except BaseException:
                 with self._activity_lock:
                     self._model_warmup_active = False
+                self._model_warmup_finished.set()
                 self._model_warmup_thread = None
                 raise
             while not self._stop.is_set():
@@ -521,6 +589,15 @@ class DaemonServer:
                 try:
                     connection, _ = listener.accept()
                 except TimeoutError:
+                    continue
+                except OSError as exc:
+                    # DMN-8: EMFILE/ENFILE/ECONNABORTED and friends are
+                    # conditions of the moment, not reasons to take every
+                    # client's daemon down. Back off briefly and keep serving.
+                    if self._stop.is_set():
+                        break
+                    logger.warning("Daemon accept failed (%s); retrying", exc)
+                    self._stop.wait(ACCEPT_ERROR_BACKOFF_SECONDS)
                     continue
                 with self._activity_lock:
                     self._last_activity = time.monotonic()
@@ -541,6 +618,10 @@ class DaemonServer:
                     raise
         finally:
             listener.close()
+            # DMN-4: stop (or idle exit) must not pull the process out from
+            # under requests that are mid-flight. The listener is already
+            # closed, so nothing new arrives while they finish.
+            self._drain_requests()
             if self._maintenance_thread is not None:
                 self._maintenance_thread.join()
                 self._maintenance_thread = None
@@ -557,6 +638,25 @@ class DaemonServer:
             self.application.store.close()
             lifetime_lock.release()
             self.ready.set()
+
+    def _drain_requests(self) -> None:
+        """Wait, bounded, for in-flight requests; index-class calls get longer."""
+        started = time.monotonic()
+        while True:
+            with self._activity_lock:
+                active = self._active_requests
+                long_running = self._active_long_requests
+            if active == 0:
+                return
+            budget = STOP_INDEX_DRAIN_SECONDS if long_running else STOP_DRAIN_SECONDS
+            if time.monotonic() - started >= budget:
+                logger.warning(
+                    "Daemon stopping with %d request(s) still in flight after %.0fs",
+                    active,
+                    budget,
+                )
+                return
+            time.sleep(0.02)
 
     def _run_startup_maintenance(self) -> None:
         """Run overdue scheduled maintenance after startup, without blocking serving.
@@ -598,11 +698,13 @@ class DaemonServer:
             with self._activity_lock:
                 self._model_warmup_active = False
                 self._last_activity = time.monotonic()
+            self._model_warmup_finished.set()
 
     def _handle(self, connection: socket.socket) -> None:
         with connection:
             request_id: Any = None
             method = "<unknown>"
+            long_running = False
             try:
                 # D3: bounds how long a connected-but-silent client can be
                 # held open; lifted once a request has actually arrived so a
@@ -624,18 +726,31 @@ class DaemonServer:
                     connection.settimeout(None)
                 request_id = request.get("id")
                 method = str(request.get("method"))
+                if method in _UNBOUNDED_CLIENT_TIMEOUT_METHODS:
+                    long_running = True
+                    with self._activity_lock:
+                        self._active_long_requests += 1
                 if request.get("protocol") != PROTOCOL_VERSION:
                     raise CodeIndexingError(
                         ErrorCode.INVALID_CONFIGURATION,
                         "Incompatible local daemon protocol",
                         expected=PROTOCOL_VERSION,
                     )
-                if not secrets.compare_digest(str(request.get("token", "")), self._token):
+                if not self._token or not secrets.compare_digest(
+                    str(request.get("token", "")), self._token
+                ):
                     raise CodeIndexingError(
                         ErrorCode.INVALID_CONFIGURATION,
                         "Local daemon authentication failed",
                     )
-                if not self._request_semaphore.acquire(blocking=False):
+                if method in _SEMAPHORE_EXEMPT_METHODS:
+                    # Liveness and control calls cost nothing and must still
+                    # work when every dispatch slot is held by queries whose
+                    # clients gave up: otherwise a saturated daemon reads as
+                    # "not running" and cannot be stopped.
+                    result = self._dispatch(method, request.get("params") or {})
+                    _send_response(connection, {"id": request_id, "result": _jsonable(result)})
+                elif not self._request_semaphore.acquire(blocking=False):
                     # D4: refused outright rather than left to queue behind the
                     # MAX_CONCURRENT_REQUESTS already dispatching -- an invisible
                     # queue would just move the hang from "no response" to
@@ -645,11 +760,12 @@ class DaemonServer:
                         "The local daemon is at its request limit",
                         limit=MAX_CONCURRENT_REQUESTS,
                     )
-                try:
-                    result = self._dispatch(method, request.get("params") or {})
-                    _send_response(connection, {"id": request_id, "result": _jsonable(result)})
-                finally:
-                    self._request_semaphore.release()
+                else:
+                    try:
+                        result = self._dispatch(method, request.get("params") or {})
+                        _send_response(connection, {"id": request_id, "result": _jsonable(result)})
+                    finally:
+                        self._request_semaphore.release()
             except CodeIndexingError as exc:
                 # A client that has already given up (D3's own query budget,
                 # or a plain disconnect) leaves nothing on the other end to
@@ -662,11 +778,17 @@ class DaemonServer:
                             "id": request_id,
                             "error": {
                                 "code": exc.code.value,
-                                "message": str(exc),
+                                # The bare message: str(exc) already carries the
+                                # code, and the client rebuilds the prefix (DMN-10).
+                                "message": exc.args[0] if exc.args else "",
                                 "details": exc.details,
                             },
                         },
                     )
+            except (EOFError, ConnectionResetError, BrokenPipeError) as exc:
+                # The client went away (hung up before or while we answered).
+                # That is routine, not a dispatch failure worth a traceback.
+                logger.debug("Client disconnected during %s: %s", method, exc)
             except Exception as exc:
                 # D5: everything that reaches here is a dispatch failure, not a
                 # transport one (those are CodeIndexingError above); the type
@@ -693,6 +815,8 @@ class DaemonServer:
                 with self._activity_lock:
                     self._last_activity = time.monotonic()
                     self._active_requests -= 1
+                    if long_running:
+                        self._active_long_requests -= 1
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "ping":
@@ -703,8 +827,10 @@ class DaemonServer:
                 "settings_digest": self._settings_digest,
             }
         if method == "stop":
-            self._stop.set()
+            self.request_stop()
             return {"stopping": True}
+        if method not in _NO_WARMUP_WAIT_METHODS:
+            self._model_warmup_finished.wait(MODEL_WARMUP_WAIT_SECONDS)
         app = self.application
         roots = [Path(root) for root in params.pop("roots", [])]
         if method == "init_project":
@@ -749,7 +875,7 @@ class DaemonServer:
         if method == "changed_symbols":
             return app.changed_symbols(roots=roots, **params)
         if method == "get_chunk":
-            return app.get_chunk(**params)
+            return app.get_chunk(roots=roots, **params)
         if method == "find_references":
             selector = DeclarationSelector.model_validate(params.pop("selector"))
             kinds = params.pop("kinds", None)
@@ -778,17 +904,28 @@ class DaemonServer:
 
     def _load_or_create_token(self) -> str:
         if self.token_path.exists():
-            return self.token_path.read_text().strip()
+            existing = self.token_path.read_text().strip()
+            # An empty file (a crash between create and write) would otherwise
+            # authenticate an empty token; replace it instead.
+            if existing:
+                return existing
         token = secrets.token_hex(32)
-        # Create the file already restricted rather than widening a default-mode
-        # file afterwards, which would leave the token briefly world-readable.
+        # Written to a private temporary file and renamed into place: the token
+        # is never world-readable, and a crash cannot leave an empty file.
+        temporary = self.token_path.with_name(f".daemon-token-{secrets.token_hex(4)}")
+        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
-            descriptor = os.open(self.token_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            return self.token_path.read_text().strip()
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(token)
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write(token)
+            os.replace(temporary, self.token_path)
+        finally:
+            temporary.unlink(missing_ok=True)
         return token
+
+
+_CWD_INDEPENDENT_METHODS = frozenset(
+    {"ping", "stop", "list_projects", "remove_project", "discover_project"}
+)
 
 
 class BrokerApplication:
@@ -833,13 +970,19 @@ class BrokerApplication:
 
     def _call_once(self, method: str, *, _protocol: int = PROTOCOL_VERSION, **params: Any) -> Any:
         token = self.token_path.read_text().strip()
+        if method not in _CWD_INDEPENDENT_METHODS:
+            # The daemon serves many clients from one process, so its own cwd
+            # says nothing about this caller. Scope rootless requests to the
+            # caller's cwd (the resolver walks up to the nearest marker).
+            if not params.get("roots"):
+                params["roots"] = [self.cwd]
+            if method == "init_project" and params.get("path") is not None:
+                params["path"] = (self.cwd / Path(params["path"]).expanduser()).resolve()
         # D3: unbounded only for the calls a caller is already choosing to
         # wait out (index_project's own repository can take minutes to
         # embed); every other method gets a generous but finite budget so a
         # wedged daemon fails the call instead of hanging it forever.
-        budget = (
-            None if method in _UNBOUNDED_CLIENT_TIMEOUT_METHODS else DAEMON_QUERY_TIMEOUT_SECONDS
-        )
+        budget = _client_budget(method)
         # Discovery retries only connect failures, before any request is sent.
         # Refresh the record on every call so retained brokers follow restarts.
         with self._connect() as connection:
@@ -874,15 +1017,24 @@ class BrokerApplication:
 
     def _call(self, method: str, **params: Any) -> Any:
         try:
-            return self._call_once(method, **params)
-        except (FileNotFoundError, ConnectionRefusedError):
-            # The daemon intentionally exits after an idle timeout, but an MCP
-            # server can retain this broker for much longer. Restart only when
-            # no request could have been sent; retrying broader socket failures
-            # could duplicate a completed non-idempotent operation.
-            ensure_daemon(self.paths)
-            return self._call_once(method, **params)
-        except (EOFError, ConnectionResetError, BrokenPipeError, TimeoutError) as exc:
+            try:
+                return self._call_once(method, **params)
+            except (FileNotFoundError, ConnectionRefusedError):
+                # The daemon intentionally exits after an idle timeout, but an MCP
+                # server can retain this broker for much longer. Restart only when
+                # no request could have been sent; retrying broader socket failures
+                # could duplicate a completed non-idempotent operation.
+                ensure_daemon(self.paths)
+                # Inside the outer try: the retry fails like any other call (DMN-11).
+                return self._call_once(method, **params)
+        except (
+            EOFError,
+            ConnectionResetError,
+            BrokenPipeError,
+            TimeoutError,
+            FileNotFoundError,
+            ConnectionRefusedError,
+        ) as exc:
             # D5: the connection died mid-request (the daemon crashed, was
             # killed, or the socket otherwise dropped) rather than at connect
             # time -- unlike the retry above, this is never retried, because
@@ -1134,8 +1286,10 @@ class BrokerApplication:
             self._call("changed_symbols", project=project, **params)
         )
 
-    def get_chunk(self, chunk_id: str) -> CodeChunk:
-        return CodeChunk.model_validate(self._call("get_chunk", chunk_id=chunk_id))
+    def get_chunk(self, chunk_id: str, *, roots: list[Path] | None = None) -> CodeChunk:
+        return CodeChunk.model_validate(
+            self._call("get_chunk", chunk_id=chunk_id, roots=roots or [])
+        )
 
     def find_references(self, selector: DeclarationSelector, **params: Any) -> ReferenceResponse:
         return ReferenceResponse.model_validate(
@@ -1191,30 +1345,77 @@ def daemon_status(paths: RuntimePaths) -> dict[str, Any]:
         return {"running": False}
 
 
+def _lifetime_lock_free(paths: RuntimePaths) -> bool:
+    """Whether no daemon process holds the per-user lifetime lock.
+
+    A stopping daemon closes its socket long before it exits (it drains
+    requests and joins background threads first), so "the socket refuses" does
+    not mean "stopped"; the lock is held for exactly as long as the process
+    is still doing daemon work.
+    """
+    lock_path = paths.data / "locks" / "daemon.lock"
+    if not lock_path.exists():
+        return True
+    lock = FileLock(lock_path)
+    try:
+        lock.acquire(timeout=0)
+    except Timeout:
+        return False
+    except OSError:
+        return True
+    lock.release()
+    return True
+
+
+def raise_open_file_limit(target: int = 4096) -> None:
+    """Raise this process's soft descriptor limit toward *target* (DMN-8).
+
+    macOS starts at 256, which an index run plus several clients can exhaust.
+    Best-effort: a hard limit below the target just caps it.
+    """
+    if sys.platform == "win32":
+        return
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = target if hard == resource.RLIM_INFINITY else min(hard, target)
+    if soft < wanted:
+        with contextlib.suppress(ValueError, OSError):
+            resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+
+
 def stop_daemon_and_wait(
     paths: RuntimePaths,
     *,
-    timeout_seconds: float = 5.0,
+    timeout_seconds: float = DAEMON_STOP_WAIT_SECONDS,
     poll_interval: float = 0.05,
     status: Callable[[RuntimePaths], Mapping[str, Any]] = daemon_status,
     stop: Callable[[], object] | None = None,
     initial_running: bool | None = None,
 ) -> bool:
-    """Stop the current daemon and report whether it exited before the deadline."""
+    """Stop the current daemon and report whether it exited before the deadline.
+
+    "Exited" means the socket no longer answers *and* the lifetime lock is free:
+    ``stop`` is acknowledged immediately, then the daemon drains in-flight
+    requests (bounded) before the process goes away, so this waits for that
+    rather than for the listener to close. A ``False`` return means the daemon
+    is still draining; nothing was forced.
+    """
     if not daemon_supported():
         return True
     if initial_running is None:
         initial_running = bool(status(paths).get("running"))
-    if not initial_running:
+    if initial_running:
+        stopper = stop or (lambda: BrokerApplication(paths).stop())
+        stopper()
+    elif _lifetime_lock_free(paths):
         return True
-    stopper = stop or (lambda: BrokerApplication(paths).stop())
-    stopper()
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        if not status(paths)["running"]:
+        if not status(paths)["running"] and _lifetime_lock_free(paths):
             return True
         time.sleep(poll_interval)
-    return not status(paths)["running"]
+    return not status(paths)["running"] and _lifetime_lock_free(paths)
 
 
 def _retire_stale_daemon(paths: RuntimePaths, protocol: int) -> None:
@@ -1223,15 +1424,21 @@ def _retire_stale_daemon(paths: RuntimePaths, protocol: int) -> None:
     The stale daemon rejects every frame that does not carry its own protocol
     version, so the stop request is sent speaking it; ``stop`` has existed in
     every protocol version. Best-effort: if the daemon does not go away within
-    the wait, startup proceeds and surfaces its usual timeout error.
+    the wait, ``ensure_daemon`` reports that the old daemon is still shutting down.
     """
     broker = BrokerApplication(paths)
     with contextlib.suppress(EOFError, OSError, CodeIndexingError):
         broker._call_once("stop", _protocol=protocol)
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if not daemon_status(paths)["running"]:
-            return
+    _wait_until_stopped(paths, DAEMON_STOP_WAIT_SECONDS)
+
+
+def _wait_until_stopped(paths: RuntimePaths, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if not daemon_status(paths)["running"] and _lifetime_lock_free(paths):
+            return True
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.05)
 
 
@@ -1270,19 +1477,47 @@ def ensure_daemon(paths: RuntimePaths, *, timeout_seconds: float = 10) -> Broker
                 broker.warn_on_settings_mismatch(status.get("settings_digest"))
                 return broker
             _retire_stale_daemon(paths, int(status.get("protocol") or 0))
+        # DMN-3: a daemon that was stopped keeps its lifetime lock until it has
+        # drained and exited. Starting a replacement before then only makes the
+        # replacement wait (or fail), so wait here, bounded, and say so plainly.
+        if not _wait_until_stopped(paths, DAEMON_STOP_WAIT_SECONDS):
+            status = daemon_status(paths)
+            if _daemon_is_current(status):
+                broker = BrokerApplication(paths)
+                broker.warn_on_settings_mismatch(status.get("settings_digest"))
+                return broker
+            raise CodeIndexingError(
+                ErrorCode.DAEMON_UNAVAILABLE,
+                "The previous indexing daemon is still shutting down (it holds the daemon "
+                f"lock); retry shortly; see {log_path}",
+                log_path=str(log_path),
+                timeout_seconds=DAEMON_STOP_WAIT_SECONDS,
+            )
         # Keep the child's stderr: a daemon that dies during startup is otherwise
         # indistinguishable from a slow one, and surfaces only as a timeout.
         with log_path.open("a") as log:
-            subprocess.Popen(
-                [sys.executable, "-m", "code_indexing_mcp.cli", "daemon", "run"],
+            process = subprocess.Popen(
+                # A tiny entry module, not ``code_indexing_mcp.cli``: spawned
+                # CPU embedding workers re-import the daemon's ``__main__``,
+                # and importing the whole CLI/server stack there costs ~0.7 s
+                # and ~115 MB per worker (DMN-5).
+                [sys.executable, "-m", DAEMON_ENTRY_MODULE],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=log,
                 start_new_session=True,
             )
+        # Nobody else waits on the child, so an exited daemon would stay a
+        # zombie of this (possibly long-lived) process.
+        threading.Thread(
+            target=process.wait, name="code-indexing-mcp-daemon-reaper", daemon=True
+        ).start()
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             broker = BrokerApplication(paths)
+            # Observed before the ping: a ping that fails after the child was
+            # seen exiting is a daemon that is not coming up.
+            exit_code = process.poll()
             try:
                 ping = broker._ping_once()
                 # A freshly spawned daemon inherits this very process's
@@ -1293,6 +1528,14 @@ def ensure_daemon(paths: RuntimePaths, *, timeout_seconds: float = 10) -> Broker
                 return broker
             except (OSError, EOFError, CodeIndexingError) as exc:
                 last_error = exc
+                if exit_code is not None:
+                    raise CodeIndexingError(
+                        ErrorCode.DAEMON_UNAVAILABLE,
+                        f"The local indexing daemon exited with status {exit_code} during "
+                        f"startup; last connection error: {exc}; see {log_path}",
+                        log_path=str(log_path),
+                        exit_code=exit_code,
+                    ) from exc
                 time.sleep(0.05)
     reason = f"; last connection error: {last_error}" if last_error is not None else ""
     raise CodeIndexingError(

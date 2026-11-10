@@ -7,7 +7,9 @@ import json
 import logging
 import os
 import shutil
+import signal
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -27,6 +29,7 @@ from .daemon import (
     DaemonServer,
     daemon_status,
     ensure_daemon,
+    raise_open_file_limit,
     require_daemon_support,
     stop_daemon_and_wait,
 )
@@ -410,6 +413,15 @@ def _json(value: BaseModel | Sequence[BaseModel] | dict[str, Any]) -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
+def _stop_on_sigterm(server: DaemonServer) -> None:
+    """Turn SIGTERM into the clean-stop path (drain, close the store, unlink the socket)."""
+    if threading.current_thread() is not threading.main_thread():
+        return
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        signal.signal(sigterm, lambda _signum, _frame: server.request_stop())
+
+
 def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> int:
     args = _parser(prog).parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -426,7 +438,10 @@ def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> 
                 notice = _update_notice(paths.cache)
                 if notice is not None:
                     logging.info(notice)
-                DaemonServer(paths).serve()
+                raise_open_file_limit()
+                server = DaemonServer(paths)
+                _stop_on_sigterm(server)
+                server.serve()
                 return 0
             if args.daemon_command == "status":
                 print(_json(daemon_status(paths)))
@@ -438,7 +453,16 @@ def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> 
                 print(_json({"stopped": bool(status["running"])}))
                 return 0
             if args.daemon_command == "restart":
-                stop_daemon_and_wait(paths)
+                if not stop_daemon_and_wait(paths):
+                    # Still draining in-flight requests: say so rather than
+                    # blocking on, or racing, the old process.
+                    print(
+                        "The running daemon has not exited yet (it finishes in-flight "
+                        "requests before stopping); run `code-indexing-mcp daemon "
+                        "restart` again shortly",
+                        file=sys.stderr,
+                    )
+                    return 2
                 broker = ensure_daemon(paths)
                 print(_json({"restarted": True, **broker.ping()}))
                 return 0

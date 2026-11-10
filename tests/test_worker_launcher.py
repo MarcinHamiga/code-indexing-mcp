@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import os
 import socket
 import sys
+import tempfile
 import threading
 from multiprocessing.connection import Connection, answer_challenge, deliver_challenge
 from pathlib import Path
 
 import pytest
 
+from code_indexing_mcp import worker_launcher
 from code_indexing_mcp.embedding_worker import EmbeddingWorkerSession, WorkerConfig
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
-from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher, _authenticated
+from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher, _authenticated, _Channel
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BODY = "external_worker_body:echo"
@@ -198,3 +201,38 @@ def test_a_stranger_on_the_channel_cannot_hold_the_launch_open(tmp_path: Path) -
 
     assert failure.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
     assert "failed the handshake" in str(failure.value)
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="AF_UNIX path limits are POSIX")
+def test_the_dial_back_socket_survives_a_long_temporary_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DMN-9: a long TMPDIR must not push worker.sock past the AF_UNIX path limit."""
+    long_root = tmp_path / ("x" * 90)
+    long_root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(long_root))
+    channel = _Channel.open()
+    try:
+        assert isinstance(channel.address, str)
+        assert len(os.fsencode(channel.address)) <= 103
+    finally:
+        channel.close()
+    assert channel.directory is not None
+    assert not channel.directory.exists()
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="AF_UNIX path limits are POSIX")
+def test_a_channel_that_cannot_bind_is_a_worker_error_and_leaves_nothing_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    class RefusingSocket(socket.socket):
+        def bind(self, address: object) -> None:
+            raise OSError(36, "AF_UNIX path too long")
+
+    monkeypatch.setattr(worker_launcher.socket, "socket", RefusingSocket)
+    with pytest.raises(CodeIndexingError) as failure:
+        _Channel.open()
+    assert failure.value.code is ErrorCode.EMBEDDING_WORKER_FAILED
+    assert list(tmp_path.iterdir()) == []

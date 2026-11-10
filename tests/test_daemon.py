@@ -8,6 +8,7 @@ import stat
 import tempfile
 import threading
 import time
+import types
 from pathlib import Path
 from typing import cast
 
@@ -171,7 +172,12 @@ def test_startup_timeout_preserves_connection_failure(
         raise failure
 
     monkeypatch.setattr(BrokerApplication, "_ping_once", fail_ping)
-    monkeypatch.setattr(daemon.subprocess, "Popen", lambda *args, **kwargs: None)
+    # A daemon process that is still starting: ensure_daemon polls and reaps it.
+    monkeypatch.setattr(
+        daemon.subprocess,
+        "Popen",
+        lambda *args, **kwargs: types.SimpleNamespace(poll=lambda: None, wait=lambda: 0),
+    )
     with pytest.raises(CodeIndexingError) as caught:
         daemon.ensure_daemon(paths, timeout_seconds=0.01)
     assert caught.value.code is ErrorCode.DAEMON_UNAVAILABLE
@@ -771,6 +777,36 @@ def test_the_request_past_the_concurrency_cap_gets_index_busy(
         server._request_semaphore.release()
     BrokerApplication(paths, cwd=tmp_path).stop()
     thread.join(timeout=2)
+
+
+@requires_local_sockets
+def test_ping_and_stop_are_answered_when_every_dispatch_slot_is_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DMN-6: liveness and control calls bypass the request-concurrency cap.
+
+    With every slot held, ``ping`` used to come back INDEX_BUSY (reported as
+    "daemon not running") and ``stop`` could not stop the daemon.
+    """
+    monkeypatch.setattr(daemon, "MAX_CONCURRENT_REQUESTS", 2)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    application = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+
+    assert server._request_semaphore.acquire(blocking=False)
+    assert server._request_semaphore.acquire(blocking=False)
+    try:
+        broker = BrokerApplication(paths, cwd=tmp_path)
+        assert daemon.daemon_status(paths)["running"] is True
+        assert broker.stop() == {"stopping": True}
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    finally:
+        server._request_semaphore.release()
+        server._request_semaphore.release()
 
 
 @requires_local_sockets
@@ -1621,11 +1657,11 @@ def test_ensure_daemon_retires_a_running_daemon_with_a_mismatched_build(
     fresh_server = DaemonServer(paths, application=fresh_application, idle_timeout_seconds=60)
     fresh_thread: threading.Thread | None = None
 
-    def fake_popen(*args: object, **kwargs: object) -> None:
+    def fake_popen(*args: object, **kwargs: object) -> types.SimpleNamespace:
         nonlocal fresh_thread
         fresh_thread = threading.Thread(target=fresh_server.serve, daemon=True)
         fresh_thread.start()
-        return None
+        return types.SimpleNamespace(poll=lambda: None, wait=lambda: 0)
 
     monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
 
@@ -1792,3 +1828,42 @@ def test_discovery_skips_an_overlong_published_candidate(
             )
             with broker._connect():
                 assert broker.endpoint == endpoint
+
+
+@requires_local_sockets
+def test_broker_scopes_rootless_requests_to_the_clients_cwd_not_the_daemons(
+    tmp_path: Path,
+) -> None:
+    """DMN-1: a client without MCP roots must not inherit the daemon's cwd."""
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    repo_x = tmp_path / "repo_x"
+    repo_y = tmp_path / "repo_y"
+    for repo in (repo_x, repo_y):
+        repo.mkdir()
+    # The daemon was started from repo_x; the second client lives in repo_y.
+    application = Application(paths, embedder=TinyEmbedder(), cwd=repo_x)
+    project_x = application.init_project(repo_x)
+    project_y = application.init_project(repo_y)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=repo_y)
+
+    try:
+        status = broker.project_status()
+        resolved = broker.resolve_project(None)
+        unrooted_repo = tmp_path / "unregistered"
+        unrooted_repo.mkdir()
+        with pytest.raises(CodeIndexingError) as missing:
+            BrokerApplication(paths, cwd=unrooted_repo).project_status()
+        relative = BrokerApplication(paths, cwd=tmp_path).init_project(Path("repo_y"))
+    finally:
+        broker.stop()
+        thread.join(timeout=2)
+
+    assert project_x.id != project_y.id
+    assert status.project.id == project_y.id
+    assert resolved.id == project_y.id
+    assert missing.value.code == ErrorCode.PROJECT_NOT_FOUND
+    assert relative.id == project_y.id
