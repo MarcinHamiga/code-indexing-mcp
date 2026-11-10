@@ -17,5 +17,8 @@
   name: (pattern
     (simple_identifier) @name)) @definition.property
 
+;; `case north, south, east` is one enum_entry holding several names, and one node
+;; can carry only one definition, so each name is its own definition. The
+;; extractor widens a lone name back to its `case` entry.
 (enum_entry
-  (simple_identifier) @name) @definition.constant
+  name: (simple_identifier) @name @definition.constant)

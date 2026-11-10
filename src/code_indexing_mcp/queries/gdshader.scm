@@ -9,6 +9,11 @@
 (uniform_declaration
   (identifier) @name) @definition.property
 
+;; `const float A = 1.0, B = 2.0;` holds several init_declarators, and one node
+;; can carry only one definition, so each declarator is its own definition. The
+;; name is the declarator's own identifier, never one inside its value
+;; (`const float C = A;` defines C). The extractor widens a lone declarator back
+;; to its declaration.
 (const_declaration
   (init_declarator
-    (identifier) @name)) @definition.constant
+    declarator: (identifier) @name) @definition.constant)

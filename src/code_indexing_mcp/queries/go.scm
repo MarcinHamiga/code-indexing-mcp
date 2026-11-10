@@ -1,6 +1,8 @@
-(type_declaration
-  (type_spec
-    name: (type_identifier) @name)) @definition.class
+;; The definition is the type_spec, not the enclosing type_declaration: a grouped
+;; `type ( A struct{}; B struct{} )` holds several specs under one declaration
+;; node. The extractor widens a lone spec back to its declaration (`type` keyword).
+(type_spec
+  name: (type_identifier) @name) @definition.class
 
 (method_declaration
   name: (field_identifier) @name) @definition.method

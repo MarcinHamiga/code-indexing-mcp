@@ -7,6 +7,7 @@ import threading
 import time
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -26,7 +27,7 @@ import tree_sitter_rust
 import tree_sitter_sql
 import tree_sitter_typescript
 import tree_sitter_yaml
-from tree_sitter import Language, Node, Parser, Query, QueryCursor
+from tree_sitter import Language, Node, Parser, Query, QueryCursor, Tree
 from tree_sitter import Query as StructuralQuery
 from tree_sitter_language_pack import DownloadError, get_language
 
@@ -61,15 +62,26 @@ _CONTAINER_KINDS: Final = frozenset(
         "struct",
     }
 )
+# (definition node type, parent type) pairs where one parent can hold several
+# named definitions: Swift `case a, b`, GDShader `const float A = 1, B = 2;`,
+# Go `type ( A struct{}; B struct{} )`.
+_SINGLE_ENTRY_WRAPPERS: Final = frozenset(
+    {
+        ("simple_identifier", "enum_entry"),
+        ("init_declarator", "const_declaration"),
+        ("type_spec", "type_declaration"),
+    }
+)
 _CALLABLE_KINDS: Final = frozenset({"constructor", "function", "method"})
 _QUOTE_CHARACTERS: Final = ("'", '"')
 STRUCTURAL_LANGUAGES: Final = frozenset(LANGUAGE_RULES)
 # The packaged Prisma grammar cannot parse valid `type`/`view` blocks or enum-level
-# `@@map`, so parse errors there say nothing about the file. Reporting them would
+# `@@map`, and the Svelte grammar predates Svelte 5 (`{@render children?.()}`,
+# `{@attach ...}`), so parse errors there say nothing about the file. Reporting them would
 # leave every such project `partial` forever; the unparsed text stays searchable
 # through the fallback chunk. Safe only because these languages carry no
 # structural references whose byte offsets an error could invalidate.
-_ERROR_TOLERANT_LANGUAGES: Final = frozenset({"prisma"})
+_ERROR_TOLERANT_LANGUAGES: Final = frozenset({"prisma", "svelte"})
 _PACK_DOWNLOAD_ATTEMPTS: Final = 6
 _PACK_DOWNLOAD_BACKOFF_SECONDS: Final = 1.0
 
@@ -112,6 +124,75 @@ class _TypeLeaf(NamedTuple):
 def _node_text(node: Node) -> str:
     """Decode a node's own bytes, tolerating invalid UTF-8 in type spellings."""
     return (node.text or b"").decode("utf-8", errors="replace")
+
+
+# A callee such as `a.b(x).c(y).d` is the whole prefix of a fluent chain, arguments and
+# lambdas included, so row names grew quadratically with chain length (27.9 M chars for
+# a 1,000-call chain). Dotted name chains are stored verbatim; anything with call
+# arguments or other non-name content is collapsed, and everything is capped.
+MAX_REFERENCE_NAME_CHARS: Final = 256
+_NON_NAME_CHARS: Final = frozenset("()[]{}")
+_GROUP_CLOSERS: Final = {"(": ")", "[": "]", "{": "}"}
+_HEAD_CHARS: Final = 64
+
+
+def _bound_reference_name(text: str) -> str:
+    """Bound a stored reference name without touching ordinary dotted chains.
+
+    Plain `a.b.c` / `Ns::name` chains up to the cap are returned unchanged. Text with
+    call arguments, lambdas or literals has each balanced bracket group collapsed to
+    an empty pair (`a.b(x).c(y)` -> `a.b().c()`), keeping the head segment and every
+    member name. Anything still over the cap keeps its head segment and its tail, since
+    consumers read the first segment as the binding and the last as the member.
+    """
+    if len(text) <= MAX_REFERENCE_NAME_CHARS and _NON_NAME_CHARS.isdisjoint(text):
+        return text
+    if not _NON_NAME_CHARS.isdisjoint(text):
+        text = _collapse_groups(text) or text
+    if len(text) <= MAX_REFERENCE_NAME_CHARS:
+        return text
+    head = text[:_HEAD_CHARS]
+    window = text[-(MAX_REFERENCE_NAME_CHARS - len(head) - 1) :]
+    cut = window.find(".")
+    if cut >= 0:
+        window = window[cut + 1 :]
+    return f"{head}.{window}"
+
+
+def _collapse_groups(text: str) -> str | None:
+    """Empty each top-level bracket group; None when the brackets do not balance.
+
+    Double-quoted strings inside a group are skipped so a `")"` argument cannot end it
+    early. Unbalanced text (an unterminated string, a stray closer) is left to the
+    caller's plain cap instead of guessing where the member name went.
+    """
+    out: list[str] = []
+    opener = closer = ""
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if not depth:
+            out.append(char)
+            if char in _GROUP_CLOSERS:
+                opener, closer, depth = char, _GROUP_CLOSERS[char], 1
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if not depth:
+                out.append(char)
+    return "".join(out) if not depth else None
 
 
 def _capture_name(source: bytes, node: Node) -> str:
@@ -350,6 +431,83 @@ class _DefinitionIndex:
         )
 
 
+# `check_parent_memory_budget` reads process RSS (~9 us); doing it per query match
+# nearly tripled extraction time. Checking every Nth match still catches runaway
+# growth long before it matters, and the once-per-file checks stay unconditional.
+_BUDGET_CHECK_INTERVAL: Final = 64
+
+
+_active_parents: ContextVar[_ParentMap | None] = ContextVar("extractor_parents", default=None)
+
+
+def _parent_of(node: Node) -> Node | None:
+    """``node.parent`` through the active file's parent map when extraction set one."""
+    parents = _active_parents.get()
+    return parents.parent(node) if parents is not None else node.parent
+
+
+class _ParentMap:
+    """Child-id to parent lookups for one tree, built by a single cursor walk.
+
+    tree-sitter nodes carry no parent pointer, so ``Node.parent`` re-descends from the
+    root on every call (79 us at depth 4,000). Ancestor climbs through it are cubic in
+    nesting depth for a whole file; a dict makes each step O(1).
+    """
+
+    __slots__ = ("_parents",)
+
+    def __init__(self, parents: dict[int, Node]) -> None:
+        self._parents = parents
+
+    @classmethod
+    def build(cls, root: Node) -> _ParentMap:
+        parents: dict[int, Node] = {}
+        cursor = root.walk()
+        stack: list[Node] = [root]  # open ancestors; stack[-1] parents cursor.node
+        if not cursor.goto_first_child():
+            return cls(parents)
+        while True:
+            node = cursor.node
+            assert node is not None
+            parents[node.id] = stack[-1]
+            if cursor.goto_first_child():
+                stack.append(node)
+                continue
+            while not cursor.goto_next_sibling():
+                if not cursor.goto_parent():
+                    return cls(parents)
+                stack.pop()
+
+    def parent(self, node: Node) -> Node | None:
+        return self._parents.get(node.id)
+
+
+# A gap made only of closers (`}`, `)`, `;` ...) has nothing to search for, so it
+# is not worth a chunk of its own.
+_CLOSER_CHARACTERS: Final = frozenset("}])>;, \t\r\n")
+
+
+def _has_text(source: bytes, start: int, end: int) -> bool:
+    """Whether source[start:end] holds anything but Unicode whitespace.
+
+    Chunk content is stripped as decoded text, so the emptiness test must be too:
+    a gap of only NBSP or U+3000 is non-empty bytes but an empty chunk.
+    """
+    return bool(source[start:end].decode("utf-8", errors="replace").strip())
+
+
+def _trim_gap(source: bytes, start: int, end: int) -> tuple[int, int] | None:
+    """Trim a container gap to its first meaningful line, or None when trivial."""
+    text = source[start:end].decode("utf-8", errors="replace")
+    stripped = text.strip()
+    if not stripped or all(character in _CLOSER_CHARACTERS for character in stripped):
+        return None
+    lead = len(text) - len(text.lstrip())
+    position = start + len(text[:lead].encode("utf-8"))
+    newline = source.rfind(b"\n", start, position)
+    return (newline + 1 if newline != -1 else position), end
+
+
 class _LineIndex:
     """Byte offsets of every newline in one file, for O(log n) line lookups.
 
@@ -462,6 +620,25 @@ class TreeSitterExtractor:
         definitions = self._definitions(language, tree.root_node, normalized_source)
         check_parent_memory_budget()
         index = _DefinitionIndex.build(definitions)
+        parents = _ParentMap.build(tree.root_node)
+        token = _active_parents.set(parents)
+        try:
+            return self._extract_parsed(
+                path, language, normalized_source, tree, definitions, index, parents
+            )
+        finally:
+            _active_parents.reset(token)
+
+    def _extract_parsed(
+        self,
+        path: Path,
+        language: str,
+        normalized_source: bytes,
+        tree: Tree,
+        definitions: list[_Definition],
+        index: _DefinitionIndex,
+        parents: _ParentMap,
+    ) -> ExtractionResult:
         line_index = _LineIndex(normalized_source)
         references: list[ExtractedReference] = []
         declarations: list[ExtractedDeclarationShape] = []
@@ -469,18 +646,19 @@ class TreeSitterExtractor:
         if language in STRUCTURAL_LANGUAGES:
             started = time.monotonic_ns()
             references, declarations = self._structural_records(
-                language, tree.root_node, normalized_source, index, line_index
+                language, tree.root_node, normalized_source, index, line_index, parents
             )
             reference_extraction_ns = time.monotonic_ns() - started
         chunks: list[ExtractedChunk] = []
         covered: list[tuple[int, int]] = []
 
-        for definition in definitions:
-            check_parent_memory_budget()
+        for position, definition in enumerate(definitions):
+            if position % _BUDGET_CHECK_INTERVAL == 0:
+                check_parent_memory_budget()
             outer = self._outer_node(definition.node)
-            if not self._has_definition_ancestor(definition.node, index):
+            if not self._has_definition_ancestor(definition.node, index, parents):
                 covered.append((outer.start_byte, outer.end_byte))
-            kind, parent, qualified = self._symbol_context(definition, index)
+            kind, parent, qualified = self._symbol_context(definition, index, parents)
             start, end = self._content_range(outer, definition.node, kind, index)
             chunks.extend(
                 self._chunks_for_range(
@@ -496,6 +674,24 @@ class TreeSitterExtractor:
                     line_index=line_index,
                 )
             )
+            for gap_start, gap_end in self._container_gaps(
+                outer, definition.node, kind, index, normalized_source
+            ):
+                chunks.extend(
+                    self._chunks_for_range(
+                        path=path,
+                        language=language,
+                        kind=kind,
+                        symbol=definition.name,
+                        qualified=qualified,
+                        parent=parent,
+                        source=normalized_source,
+                        start=gap_start,
+                        end=gap_end,
+                        line_index=line_index,
+                        always_part=True,
+                    )
+                )
 
         chunks.extend(self._module_chunks(path, language, normalized_source, covered, line_index))
         check_parent_memory_budget()
@@ -515,6 +711,7 @@ class TreeSitterExtractor:
         source: bytes,
         index: _DefinitionIndex,
         line_index: _LineIndex,
+        parents: _ParentMap,
     ) -> tuple[list[ExtractedReference], list[ExtractedDeclarationShape]]:
         """Extract syntax facts using the already parsed tree and definition index."""
         matches = QueryCursor(self._structural_query(language)).matches(root)
@@ -524,17 +721,20 @@ class TreeSitterExtractor:
         # list. Slot order follows source order (receiver first), which is
         # exactly slot 0 = Python's `self` convention.
         parameter_nodes: dict[int, list[Node]] = {}
-        for _, captures in matches:
-            check_parent_memory_budget()
+        for position, (_, captures) in enumerate(matches):
+            if position % _BUDGET_CHECK_INTERVAL == 0:
+                check_parent_memory_budget()
             for parameter_node in captures.get("declaration.parameters", []):
-                owner = parameter_node.parent
+                owner = parents.parent(parameter_node)
                 while owner is not None and owner.id not in index.by_node_id:
-                    owner = owner.parent
+                    owner = parents.parent(owner)
                 if owner is not None:
                     bucket = parameter_nodes.setdefault(owner.id, [])
                     if all(existing != parameter_node for existing in bucket):
                         bucket.append(parameter_node)
-        declarations = self._declaration_shapes(language, index, line_index, parameter_nodes)
+        declarations = self._declaration_shapes(
+            language, index, line_index, parameter_nodes, parents
+        )
         declaration_by_node = {
             definition.node.id: declaration
             for definition, declaration in zip(index.definitions, declarations, strict=True)
@@ -559,6 +759,9 @@ class TreeSitterExtractor:
             # is not a single grammar node (Java's `receiver . name` spans two
             # siblings); everything else keys off the node itself.
             start_byte, end_byte = span if span is not None else (node.start_byte, node.end_byte)
+            if end_byte <= start_byte or not target_name:
+                # A zero-width span is a MISSING node from mid-edit source.
+                return
             key = (kind, start_byte, end_byte)
             if key in seen:
                 return
@@ -567,13 +770,17 @@ class TreeSitterExtractor:
             references.append(
                 ExtractedReference(
                     kind=kind,
-                    written_name=name,
-                    target_name=target_name,
-                    source_qualified_symbol=self._enclosing_symbol(node, declaration_by_node),
+                    written_name=_bound_reference_name(name),
+                    target_name=_bound_reference_name(target_name),
+                    source_qualified_symbol=self._enclosing_symbol(
+                        node, declaration_by_node, parents
+                    ),
                     module_path=module_path,
                     imported_name=imported_name,
                     alias=alias,
-                    receiver_text=receiver_text,
+                    receiver_text=(
+                        _bound_reference_name(receiver_text) if receiver_text is not None else None
+                    ),
                     start_byte=start_byte,
                     end_byte=end_byte,
                     start_line=line_index.line_at(start_byte),
@@ -583,14 +790,15 @@ class TreeSitterExtractor:
             )
 
         method = self._structural_handlers[language]
-        for _, captures in matches:
-            check_parent_memory_budget()
+        for position, (_, captures) in enumerate(matches):
+            if position % _BUDGET_CHECK_INTERVAL == 0:
+                check_parent_memory_budget()
             for capture, nodes in captures.items():
                 if not capture.startswith("reference."):
                     continue
                 for node in nodes:
                     if capture == "reference.identifier":
-                        self._identifier_record(language, node, source, add)
+                        self._identifier_record(language, node, source, add, parents)
                     else:
                         # Reference-query captures are decorative: every language
                         # handler re-dispatches on `node.type`, so adding a
@@ -601,7 +809,11 @@ class TreeSitterExtractor:
 
     @staticmethod
     def _identifier_record(
-        language: str, node: Node, source: bytes, add_reference: _ReferenceAdder
+        language: str,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap,
     ) -> None:
         """Record identifier values while excluding bindings and richer structural uses."""
         rules = LANGUAGE_RULES.get(language, _DEFAULT)
@@ -614,7 +826,7 @@ class TreeSitterExtractor:
             )
 
         current = node
-        while (parent := current.parent) is not None:
+        while (parent := parents.parent(current)) is not None:
             if (
                 parent.type in _IDENTIFIER_BINDING_PARENTS
                 or parent.type in rules.import_owner_parents
@@ -622,8 +834,8 @@ class TreeSitterExtractor:
                 return
             if parent.type in _PARAMETER_PARENTS:
                 parameter = node
-                while parameter.parent is not None and parameter.parent != parent:
-                    parameter = parameter.parent
+                while (step := parents.parent(parameter)) is not None and step != parent:
+                    parameter = step
                     # TS's `required_parameter`/`optional_parameter` wrapper
                     # exposes a default under a `value` field; bare JS/TS
                     # `assignment_pattern` (untyped `a = LIMIT`) exposes it
@@ -1071,7 +1283,7 @@ class TreeSitterExtractor:
 
     @staticmethod
     def _enclosing_symbol(
-        node: Node, declarations: dict[int, ExtractedDeclarationShape]
+        node: Node, declarations: dict[int, ExtractedDeclarationShape], parents: _ParentMap
     ) -> str | None:
         current: Node | None = node
         while current is not None:
@@ -1094,7 +1306,7 @@ class TreeSitterExtractor:
                     and (declaration := declarations.get(sibling.id)) is not None
                 ):
                     return declaration.qualified_symbol
-            current = current.parent
+            current = parents.parent(current)
         return None
 
     def _declaration_shapes(
@@ -1103,10 +1315,11 @@ class TreeSitterExtractor:
         index: _DefinitionIndex,
         line_index: _LineIndex,
         parameter_nodes: dict[int, list[Node]],
+        parents: _ParentMap,
     ) -> list[ExtractedDeclarationShape]:
         rows: list[ExtractedDeclarationShape] = []
         for definition in index.definitions:
-            kind, _, qualified = self._symbol_context(definition, index)
+            kind, _, qualified = self._symbol_context(definition, index, parents)
             rows.append(
                 ExtractedDeclarationShape(
                     symbol=definition.name,
@@ -1498,30 +1711,30 @@ class TreeSitterExtractor:
         names such as `ns.Base` stay intact as one resolvable leaf. Anything
         else (for example an object type literal) yields nothing.
         """
-        if node is None:
-            return []
-        if node.type in {
-            "type_identifier",
-            "identifier",
-            "predefined_type",
-            "member_expression",
-            "nested_type_identifier",
-        }:
-            return [node]
-        if node.type == "generic_type":
-            names = TreeSitterExtractor._descend_type_names(node.child_by_field_name("name"))
-            names.extend(
-                TreeSitterExtractor._descend_type_names(node.child_by_field_name("type_arguments"))
-            )
-            return names
-        if node.type == "function_type":
-            return TreeSitterExtractor._descend_type_names(node.child_by_field_name("return_type"))
-        if node.type in TreeSitterExtractor._TYPE_WRAPPER_TYPES:
-            names = []
-            for child in node.named_children:
-                names.extend(TreeSitterExtractor._descend_type_names(child))
-            return names
-        return []
+        # Explicit stack, not recursion: a left-nested `union_type` of ~1000
+        # members would otherwise raise RecursionError and fail the whole file.
+        names: list[Node] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current is None:
+                continue
+            if current.type in {
+                "type_identifier",
+                "identifier",
+                "predefined_type",
+                "member_expression",
+                "nested_type_identifier",
+            }:
+                names.append(current)
+            elif current.type == "generic_type":
+                stack.append(current.child_by_field_name("type_arguments"))
+                stack.append(current.child_by_field_name("name"))
+            elif current.type == "function_type":
+                stack.append(current.child_by_field_name("return_type"))
+            elif current.type in TreeSitterExtractor._TYPE_WRAPPER_TYPES:
+                stack.extend(reversed(current.named_children))
+        return names
 
     @staticmethod
     def _emit_type_use_names(
@@ -1803,27 +2016,29 @@ class TreeSitterExtractor:
         (the scope is a namespace spelling); templates contribute their head
         and arguments. Primitive and qualified-wrapper leaves yield nothing.
         """
-        if node is None:
-            return []
-        if node.type == "type_identifier":
-            return [node]
-        if node.type in {"struct_specifier", "enum_specifier", "union_specifier"}:
-            name = node.child_by_field_name("name")
-            return TreeSitterExtractor._c_descend_type_names(name)
-        if node.type == "qualified_identifier":
-            return TreeSitterExtractor._c_descend_type_names(node.child_by_field_name("name"))
-        if node.type in {
-            "template_type",
-            "template_argument_list",
-            "type_descriptor",
-            "type_qualifier",
-        }:
-            names: list[Node] = []
-            for child in node.named_children:
-                if not child.is_extra:
-                    names.extend(TreeSitterExtractor._c_descend_type_names(child))
-            return names
-        return []
+        names: list[Node] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current is None:
+                continue
+            if current.type == "type_identifier":
+                names.append(current)
+            elif current.type in {
+                "struct_specifier",
+                "enum_specifier",
+                "union_specifier",
+                "qualified_identifier",
+            }:
+                stack.append(current.child_by_field_name("name"))
+            elif current.type in {
+                "template_type",
+                "template_argument_list",
+                "type_descriptor",
+                "type_qualifier",
+            }:
+                stack.extend(reversed([c for c in current.named_children if not c.is_extra]))
+        return names
 
     @staticmethod
     def _c_emit_type_uses(node: Node | None, source: bytes, add_reference: _ReferenceAdder) -> None:
@@ -1838,12 +2053,12 @@ class TreeSitterExtractor:
     def _is_assignment_target(node: Node) -> bool:
         """True if `node` is the LHS of a plain or augmented assignment."""
         current = node
-        while current.parent is not None and current.parent.type in {
+        while (up := _parent_of(current)) is not None and up.type in {
             "directly_assignable_expression",
             "ErrorUnionExpr",
         }:
-            current = current.parent
-        parent = current.parent
+            current = up
+        parent = _parent_of(current)
         if parent is None:
             return False
         if parent.type in {
@@ -1910,7 +2125,7 @@ class TreeSitterExtractor:
             while ancestor is not None:
                 if ancestor.type in {"class_heritage", "extends_type_clause"}:
                     return
-                ancestor = ancestor.parent
+                ancestor = _parent_of(ancestor)
             if (
                 parent.type in {"call", "call_expression", "function_call"}
                 and parent.child_by_field_name("function") == node
@@ -2054,7 +2269,6 @@ class TreeSitterExtractor:
                     "call",
                     function,
                     target_name=_capture_name(source, function),
-                    written_name=_capture_name(source, function),
                     receiver_text=_capture_name(source, receiver) if receiver is not None else None,
                     call_shape=self._call_shape(node),
                 )
@@ -2313,7 +2527,6 @@ class TreeSitterExtractor:
                     "call",
                     function,
                     target_name=_capture_name(source, function),
-                    written_name=_capture_name(source, function),
                     receiver_text=_capture_name(source, receiver) if receiver is not None else None,
                     call_shape=self._call_shape(node),
                     module_path=module_path,
@@ -2391,32 +2604,33 @@ class TreeSitterExtractor:
         a symbol). Predeclared types (`string`, `error`, ...) yield nothing:
         they can never be project declarations. Anything else yields nothing.
         """
-        if node is None:
-            return []
-        if node.type == "type_identifier":
-            return [node]
-        if node.type == "qualified_type":
-            # tree-sitter-go names the two sides `package` and `name` -- there
-            # is no `type` field, so descending it silently dropped every
-            # `pkg.Type` annotation. The naming leaf is the `name` field.
-            return TreeSitterExtractor._go_descend_type_names(node.child_by_field_name("name"))
-        if node.type in {
-            "pointer_type",
-            "slice_type",
-            "array_type",
-            "map_type",
-            "channel_type",
-            "parenthesized_type",
-        }:
-            names: list[Node] = []
-            for child in node.named_children:
-                names.extend(TreeSitterExtractor._go_descend_type_names(child))
-            return names
-        if node.type == "function_type":
-            # Parameter/result lists are binding contexts of the function
-            # type itself; its result type still names something.
-            return TreeSitterExtractor._go_descend_type_names(node.child_by_field_name("result"))
-        return []
+        names: list[Node] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current is None:
+                continue
+            if current.type == "type_identifier":
+                names.append(current)
+            elif current.type == "qualified_type":
+                # tree-sitter-go names the two sides `package` and `name` --
+                # there is no `type` field, so descending it silently dropped
+                # every `pkg.Type` annotation. The naming leaf is `name`.
+                stack.append(current.child_by_field_name("name"))
+            elif current.type in {
+                "pointer_type",
+                "slice_type",
+                "array_type",
+                "map_type",
+                "channel_type",
+                "parenthesized_type",
+            }:
+                stack.extend(reversed(current.named_children))
+            elif current.type == "function_type":
+                # Parameter/result lists are binding contexts of the function
+                # type itself; its result type still names something.
+                stack.append(current.child_by_field_name("result"))
+        return names
 
     @staticmethod
     def _go_emit_type_uses(
@@ -2476,7 +2690,6 @@ class TreeSitterExtractor:
                 "call",
                 function,
                 target_name=_capture_name(source, function),
-                written_name=_capture_name(source, function),
                 receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
                 call_shape=self._call_shape(node),
             )
@@ -2838,7 +3051,6 @@ class TreeSitterExtractor:
                 "call",
                 function,
                 target_name=_capture_name(source, function),
-                written_name=_capture_name(source, function),
                 receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
                 call_shape=self._call_shape(node),
             )
@@ -2926,30 +3138,31 @@ class TreeSitterExtractor:
         spelling. Primitive types yield nothing: they can never be project
         declarations.
         """
-        if node is None:
-            return []
-        if node.type == "type_identifier":
-            return [node]
-        if node.type == "scoped_type_identifier":
-            return TreeSitterExtractor._rust_descend_type_names(node.child_by_field_name("name"))
-        if node.type in {
-            "reference_type",
-            "pointer_type",
-            "slice_type",
-            "array_type",
-            "tuple_type",
-            "parenthesized_type",
-            "generic_type",
-            "dynamic_type",
-            "impl_trait_type",
-            "type_arguments",
-            "ordered_field_declaration_list",
-        }:
-            names: list[Node] = []
-            for child in node.named_children:
-                names.extend(TreeSitterExtractor._rust_descend_type_names(child))
-            return names
-        return []
+        names: list[Node] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current is None:
+                continue
+            if current.type == "type_identifier":
+                names.append(current)
+            elif current.type == "scoped_type_identifier":
+                stack.append(current.child_by_field_name("name"))
+            elif current.type in {
+                "reference_type",
+                "pointer_type",
+                "slice_type",
+                "array_type",
+                "tuple_type",
+                "parenthesized_type",
+                "generic_type",
+                "dynamic_type",
+                "impl_trait_type",
+                "type_arguments",
+                "ordered_field_declaration_list",
+            }:
+                stack.extend(reversed(current.named_children))
+        return names
 
     # Java declarations whose `type` field is a use of some project type; the
     # handler descends it to `type_use` leaves (a `void_type`/`integral_type`
@@ -3182,41 +3395,38 @@ class TreeSitterExtractor:
         positional: the head of a `generic_type`/`array_type` is its first
         named child.
         """
-        if node is None:
-            return []
-        if node.type in {"type_identifier", "identifier"}:
-            return [node]
-
-        def named_children(inner: Node) -> list[Node]:
-            return [child for child in inner.named_children if not child.is_extra]
-
-        # Heritage/throws/catch wrappers are pure pass-throughs: every named
-        # child is a type expression (`type_list` under `implements` too).
-        # A `generic_type`'s children are its head name and its type
-        # arguments; `type_arguments`/`type_bound` list their entries the
-        # same positional way.
-        if node.type in {
-            "superclass",
-            "super_interfaces",
-            "extends_interfaces",
-            "throws",
-            "catch_type",
-            "type_list",
-            "generic_type",
-            "type_arguments",
-            "type_bound",
-        }:
-            names: list[Node] = []
-            for child in named_children(node):
-                names.extend(TreeSitterExtractor._java_descend_type_names(child))
-            return names
-        if node.type == "array_type":
-            named = named_children(node)
-            return TreeSitterExtractor._java_descend_type_names(named[0]) if named else []
-        if node.type == "scoped_type_identifier":
-            named = named_children(node)
-            return TreeSitterExtractor._java_descend_type_names(named[-1]) if named else []
-        return []
+        names: list[Node] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current is None:
+                continue
+            if current.type in {"type_identifier", "identifier"}:
+                names.append(current)
+                continue
+            named = [child for child in current.named_children if not child.is_extra]
+            # Heritage/throws/catch wrappers are pure pass-throughs: every named
+            # child is a type expression (`type_list` under `implements` too).
+            # A `generic_type`'s children are its head name and its type
+            # arguments; `type_arguments`/`type_bound` list their entries the
+            # same positional way.
+            if current.type in {
+                "superclass",
+                "super_interfaces",
+                "extends_interfaces",
+                "throws",
+                "catch_type",
+                "type_list",
+                "generic_type",
+                "type_arguments",
+                "type_bound",
+            }:
+                stack.extend(reversed(named))
+            elif current.type == "array_type":
+                stack.extend(named[:1])
+            elif current.type == "scoped_type_identifier":
+                stack.extend(named[-1:])
+        return names
 
     def _csharp_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
         if node.type == "using_directive":
@@ -3280,7 +3490,7 @@ class TreeSitterExtractor:
             # base is owned by the base-list descent.
             current = node.parent
             while current is not None and current.type == "qualified_name":
-                current = current.parent
+                current = _parent_of(current)
             if current is not None and current.type in {
                 "using_directive",
                 "namespace_declaration",
@@ -3363,7 +3573,6 @@ class TreeSitterExtractor:
             "call",
             function,
             target_name=_capture_name(source, function),
-            written_name=_capture_name(source, function),
             receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
             call_shape=self._call_shape(node),
         )
@@ -3428,7 +3637,7 @@ class TreeSitterExtractor:
                 "enum_declaration",
             }:
                 return False
-            current = current.parent
+            current = _parent_of(current)
         return False
 
     @staticmethod
@@ -3453,7 +3662,7 @@ class TreeSitterExtractor:
                         return (
                             _capture_name(source, scoped_name) if scoped_name is not None else None
                         )
-            current = current.parent
+            current = _parent_of(current)
         return None
 
     def _csharp_emit_type_uses(
@@ -3488,32 +3697,30 @@ class TreeSitterExtractor:
         spellings. Keyword types (`string`, `int`) are `predefined_type`
         tokens and yield nothing.
         """
-        if node is None:
-            return []
-        if node.type == "identifier":
-            return [node]
-
-        def named_children(inner: Node) -> list[Node]:
-            return [child for child in inner.named_children if not child.is_extra]
-
-        if node.type == "qualified_name":
-            named = named_children(node)
-            return TreeSitterExtractor._csharp_descend_type_names(named[-1]) if named else []
-        if node.type in {
-            "generic_name",
-            "type_argument_list",
-            "array_type",
-            "nullable_type",
-            # A base list's children are the heritage types themselves; a
-            # constraint wraps its `where` type the same way.
-            "base_list",
-            "type_parameter_constraint",
-        }:
-            names: list[Node] = []
-            for child in named_children(node):
-                names.extend(TreeSitterExtractor._csharp_descend_type_names(child))
-            return names
-        return []
+        names: list[Node] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current is None:
+                continue
+            if current.type == "identifier":
+                names.append(current)
+                continue
+            named = [child for child in current.named_children if not child.is_extra]
+            if current.type == "qualified_name":
+                stack.extend(named[-1:])
+            elif current.type in {
+                "generic_name",
+                "type_argument_list",
+                "array_type",
+                "nullable_type",
+                # A base list's children are the heritage types themselves; a
+                # constraint wraps its `where` type the same way.
+                "base_list",
+                "type_parameter_constraint",
+            }:
+                stack.extend(reversed(named))
+        return names
 
     def _c_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
         if node.type == "preproc_include":
@@ -3548,7 +3755,6 @@ class TreeSitterExtractor:
                 "call",
                 function,
                 target_name=_capture_name(source, function),
-                written_name=_capture_name(source, function),
                 receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
                 call_shape=self._call_shape(node),
             )
@@ -3976,7 +4182,7 @@ class TreeSitterExtractor:
                     # Definitions own their name; `insert` owns its table as
                     # a write; a call owns its callee.
                     return
-                ancestor = ancestor.parent
+                ancestor = _parent_of(ancestor)
             text = _capture_name(source, node)
             add_reference("read", node, target_name=text, written_name=text)
 
@@ -3990,18 +4196,20 @@ class TreeSitterExtractor:
         `add_reference` dedupes any overlap), so descending here only fills
         the gaps.
         """
-        if node.type == "identifier":
-            text = _capture_name(source, node)
-            add_reference("read", node, target_name=text, written_name=text)
-            return
-        if node.type in {"invocation", "object_reference", "relation", "field"}:
-            # Owned spans: nested calls, schema names, relations, and columns
-            # each have a handler row already; descending would re-emit the
-            # callee as a read beside its call.
-            return
-        for child in node.named_children:
-            if not child.is_extra:
-                self._sql_emit_column_uses(child, source, add_reference)
+        # Explicit stack: a 1,000-term `a || b || ...` chain nests that deep.
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.type == "identifier":
+                text = _capture_name(source, current)
+                add_reference("read", current, target_name=text, written_name=text)
+                continue
+            if current.type in {"invocation", "object_reference", "relation", "field"}:
+                # Owned spans: nested calls, schema names, relations, and columns
+                # each have a handler row already; descending would re-emit the
+                # callee as a read beside its call.
+                continue
+            stack.extend(reversed([c for c in current.named_children if not c.is_extra]))
 
     def _gdscript_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
         if node.type == "call":
@@ -4137,7 +4345,6 @@ class TreeSitterExtractor:
                 "call",
                 function,
                 target_name=_capture_name(source, function),
-                written_name=_capture_name(source, function),
                 call_shape=self._call_shape(node),
             )
         elif node.type == "field_expression":
@@ -4460,7 +4667,7 @@ class TreeSitterExtractor:
                 # left, never a single symbol -- mirroring Go package imports.
                 owner: Node | None = parent
                 while owner is not None and owner.type != "VarDecl":
-                    owner = owner.parent
+                    owner = _parent_of(owner)
                 binding_node = (
                     owner.child_by_field_name("variable_type_function")
                     if owner is not None
@@ -4626,12 +4833,19 @@ class TreeSitterExtractor:
     def _definitions(self, language_name: str, root: Node, source: bytes) -> list[_Definition]:
         matches = QueryCursor(self._query(language_name)).matches(root)
         found: dict[tuple[int, int, str], _Definition] = {}
-        for _, captures in matches:
-            check_parent_memory_budget()
+        for position, (_, captures) in enumerate(matches):
+            if position % _BUDGET_CHECK_INTERVAL == 0:
+                check_parent_memory_budget()
             name_nodes = captures.get("name", [])
             if not name_nodes:
                 continue
+            if name_nodes[0].is_missing:
+                continue
             name = _capture_name(source, name_nodes[0])
+            if not name:
+                # Mid-edit source can leave a zero-width MISSING name node; a
+                # definition with no name has no symbol worth indexing.
+                continue
             for capture, nodes in captures.items():
                 if not capture.startswith("definition."):
                     continue
@@ -4645,6 +4859,14 @@ class TreeSitterExtractor:
         outer = node
         if node.parent is not None and node.parent.type == "decorated_definition":
             outer = node.parent
+        if (
+            node.parent is not None
+            and (node.type, node.parent.type) in _SINGLE_ENTRY_WRAPPERS
+            and sum(1 for child in node.parent.named_children if child.type == node.type) == 1
+        ):
+            # `case west`, `const float Z = 1.0;` and `type T struct{}` keep their
+            # keyword when they hold one name; multi-name forms chunk per name.
+            return node.parent
         if outer.parent is not None and outer.parent.type in {
             "export_statement",
             "lexical_declaration",
@@ -4655,20 +4877,20 @@ class TreeSitterExtractor:
         return outer
 
     @staticmethod
-    def _has_definition_ancestor(node: Node, index: _DefinitionIndex) -> bool:
-        parent = node.parent
+    def _has_definition_ancestor(node: Node, index: _DefinitionIndex, parents: _ParentMap) -> bool:
+        parent = parents.parent(node)
         while parent is not None:
             if parent.id in index.by_node_id:
                 return True
-            parent = parent.parent
+            parent = parents.parent(parent)
         return False
 
     @staticmethod
     def _symbol_context(
-        definition: _Definition, index: _DefinitionIndex
+        definition: _Definition, index: _DefinitionIndex, parents: _ParentMap
     ) -> tuple[str, str | None, str]:
         chain: list[_Definition] = []
-        parent = definition.node.parent
+        parent = parents.parent(definition.node)
         while parent is not None:
             candidate = index.by_node_id.get(parent.id)
             if candidate is not None:
@@ -4694,7 +4916,7 @@ class TreeSitterExtractor:
                 name = TreeSitterExtractor._swift_extension_type_name(parent)
                 if name is not None:
                     chain.append(_Definition(parent, "class", name))
-            parent = parent.parent
+            parent = parents.parent(parent)
         chain.reverse()
         if any(item.kind in _CALLABLE_KINDS for item in chain):
             scope = chain
@@ -4744,24 +4966,69 @@ class TreeSitterExtractor:
         return leaves[0].name if leaves else None
 
     @staticmethod
-    def _content_range(
-        outer: Node, node: Node, kind: str, index: _DefinitionIndex
-    ) -> tuple[int, int]:
-        if kind not in _CONTAINER_KINDS:
-            return outer.start_byte, outer.end_byte
-        # The old code scanned every definition to take the minimum qualifying start.
-        # Definitions are start-ascending, so the first qualifying one after
-        # outer.start_byte *is* that minimum. A definition starting at or after
-        # outer.end_byte cannot end inside outer, which bounds the scan.
+    def _direct_children(outer: Node, node: Node, index: _DefinitionIndex) -> list[Node]:
+        """Outer nodes of the definitions nested directly inside a container.
+
+        Definitions are start-ascending, so the scan stops at the first one
+        starting at or after ``outer.end_byte``. A definition inside an earlier
+        child's outer range is that child's own nesting, not a direct child.
+        """
+        children: list[Node] = []
+        previous_end = outer.start_byte
         position = bisect_right(index.starts, outer.start_byte)
         while position < len(index.definitions):
             candidate = index.definitions[position].node
             if candidate.start_byte >= outer.end_byte:
                 break
-            if candidate.id != node.id and candidate.end_byte <= outer.end_byte:
-                return outer.start_byte, candidate.start_byte
             position += 1
+            if candidate.id == node.id or candidate.end_byte > outer.end_byte:
+                continue
+            candidate_outer = TreeSitterExtractor._outer_node(candidate)
+            if candidate_outer.start_byte < previous_end:
+                continue
+            children.append(candidate_outer)
+            previous_end = candidate_outer.end_byte
+        return children
+
+    @staticmethod
+    def _content_range(
+        outer: Node, node: Node, kind: str, index: _DefinitionIndex
+    ) -> tuple[int, int]:
+        if kind not in _CONTAINER_KINDS:
+            return outer.start_byte, outer.end_byte
+        children = TreeSitterExtractor._direct_children(outer, node, index)
+        if children:
+            # Split at the child's outer node so a decorator, `export`, or
+            # `const` keyword stays with the child chunk instead of dangling at
+            # the end of the container's head.
+            return outer.start_byte, children[0].start_byte
         return outer.start_byte, outer.end_byte
+
+    @staticmethod
+    def _container_gaps(
+        outer: Node, node: Node, kind: str, index: _DefinitionIndex, source: bytes
+    ) -> list[tuple[int, int]]:
+        """Source ranges inside a container that no chunk of its members covers.
+
+        A container chunk stops at its first nested definition, so fields,
+        comments, and later siblings between or after the nested definitions
+        would otherwise belong to no chunk at all. Each non-trivial gap becomes
+        an extra part of the container.
+        """
+        if kind not in _CONTAINER_KINDS:
+            return []
+        children = TreeSitterExtractor._direct_children(outer, node, index)
+        gaps: list[tuple[int, int]] = []
+        for position, child in enumerate(children):
+            gap_end = (
+                children[position + 1].start_byte
+                if position + 1 < len(children)
+                else outer.end_byte
+            )
+            trimmed = _trim_gap(source, child.end_byte, gap_end)
+            if trimmed is not None:
+                gaps.append(trimmed)
+        return gaps
 
     def _chunks_for_range(
         self,
@@ -4776,15 +5043,17 @@ class TreeSitterExtractor:
         start: int,
         end: int,
         line_index: _LineIndex,
+        always_part: bool = False,
     ) -> list[ExtractedChunk]:
         content = source[start:end].decode("utf-8").rstrip()
         start_line = line_index.line_at(start)
+        part_kind = f"{kind}_part" if kind != "module" else "module"
         if len(content) <= self.max_chars and content.count("\n") + 1 <= self.max_lines:
             return [
                 self._make_chunk(
                     path,
                     language,
-                    kind,
+                    part_kind if always_part else kind,
                     symbol,
                     qualified,
                     parent,
@@ -4796,13 +5065,14 @@ class TreeSitterExtractor:
                 )
             ]
 
-        lines = content.splitlines(keepends=True)
+        # `str.splitlines` also breaks on FF, VT, FS, NEL, U+2028 and a lone CR, but
+        # line numbers and `_LineIndex` count `\n` only, so split on `\n` alone.
+        lines = re.findall(r"[^\n]*\n|[^\n]+", content)
         # Cumulative UTF-8 byte offset of each line, so chunk offsets stay linear
         # to compute instead of re-encoding every preceding line per part.
         line_offsets = [0]
         for line in lines:
             line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
-        part_kind = f"{kind}_part" if kind != "module" else "module"
         chunks: list[ExtractedChunk] = []
         cursor = 0
         part = 0
@@ -4874,7 +5144,11 @@ class TreeSitterExtractor:
                 # near-duplicate window per line until the cursor crawls there.
                 cursor = end_cursor
             else:
-                cursor = max(cursor + 1, end_cursor - self.overlap_lines)
+                # Bound the overlap by the window actually produced: a char-limited
+                # window holds few lines, and a fixed 20-line overlap then advanced
+                # the cursor one line per chunk (up to ~20x duplication).
+                overlap = min(self.overlap_lines, len(part_lines) // 4)
+                cursor = max(cursor + 1, end_cursor - overlap)
         return chunks
 
     def _line_fragments(self, line: str) -> Iterator[tuple[int, str]]:
@@ -4898,7 +5172,7 @@ class TreeSitterExtractor:
         chunks: list[ExtractedChunk] = []
         cursor = 0
         for start, end in sorted(covered):
-            if cursor < start and source[cursor:start].strip():
+            if cursor < start and _has_text(source, cursor, start):
                 chunks.extend(
                     self._chunks_for_range(
                         path=path,
@@ -4914,7 +5188,7 @@ class TreeSitterExtractor:
                     )
                 )
             cursor = max(cursor, end)
-        if cursor < len(source) and source[cursor:].strip():
+        if cursor < len(source) and _has_text(source, cursor, len(source)):
             chunks.extend(
                 self._chunks_for_range(
                     path=path,
