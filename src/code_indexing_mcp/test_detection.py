@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Final
+from typing import Final, Literal
 
 from tree_sitter import Node
 
@@ -30,6 +30,7 @@ _COMMON_TEST_DIRS: Final = frozenset(
 
 _JAVA_EXTRA_TEST_DIRS: Final = frozenset(
     {
+        "javatests",
         "testfixtures",
         "integrationtest",
         "integrationtests",
@@ -65,7 +66,6 @@ _CSHARP_PASCAL_TEST_DIR_SUFFIXES: Final = (
     "FunctionalTests",
     "AcceptanceTests",
     "Benchmarks",
-    "Specs",
 )
 
 _RUST_TEST_FN_ATTR_TAILS: Final = frozenset(
@@ -73,6 +73,7 @@ _RUST_TEST_FN_ATTR_TAILS: Final = frozenset(
         "test",
         "bench",
         "rstest",
+        "fixture",
         "test_case",
         "wasm_bindgen_test",
         "quickcheck",
@@ -157,6 +158,8 @@ _JAVA_METHOD_TEST_ANNOTATIONS: Final = frozenset(
         "DataProvider",
         # JMH
         "Benchmark",
+        "Setup",
+        "TearDown",
     }
 )
 
@@ -186,6 +189,7 @@ _JAVA_TYPE_TEST_ANNOTATIONS: Final = frozenset(
         "Warmup",
         "Measurement",
         "Fork",
+        "State",
     }
 )
 
@@ -298,7 +302,7 @@ def _pascal_test_name(stem: str, *, allow_it: bool = False, allow_specs: bool = 
         "Benchmarks",
     )
     if allow_specs:
-        exact = {*exact, "Spec", "Specs"}
+        exact = {*exact, "Specs"}
         suffixes = (*suffixes, "Specs")
     if stem in exact or stem.endswith(suffixes):
         return True
@@ -314,18 +318,7 @@ def _pascal_test_name(stem: str, *, allow_it: bool = False, allow_specs: bool = 
     return False
 
 
-def is_test_file_path(language: str, path: Path) -> bool:
-    """Return whether *path* alone identifies a test or benchmark file."""
-    if language not in TEST_DETECTION_LANGUAGES:
-        return False
-    posix = PurePosixPath(path.as_posix())
-    parts = [part for part in posix.parts if part not in {"", "."}]
-    if not parts:
-        return False
-    directories = parts[:-1]
-    filename = parts[-1]
-    stem = posix.stem
-
+def _has_test_directory(language: str, directories: list[str]) -> bool:
     for directory in directories:
         lower_dir = directory.lower()
         if lower_dir in _COMMON_TEST_DIRS:
@@ -333,11 +326,56 @@ def is_test_file_path(language: str, path: Path) -> bool:
         if language == "java" and lower_dir in _JAVA_EXTRA_TEST_DIRS:
             return True
         if language == "csharp" and (
-            lower_dir == "specs"
-            or lower_dir.endswith(_CSHARP_DOT_TEST_DIR_SUFFIXES)
+            lower_dir.endswith(_CSHARP_DOT_TEST_DIR_SUFFIXES)
             or directory.endswith(_CSHARP_PASCAL_TEST_DIR_SUFFIXES)
         ):
             return True
+    return False
+
+
+def _is_unambiguous_test_path(language: str, path: Path) -> bool:
+    """Whether *path* alone guarantees a test/fixture/benchmark file without AST checks.
+
+    Files inside dedicated test/benchmark source sets (``tests/``, ``benches/``,
+    ``src/test/``, ``javatests/``, ``*.Tests/``, ``*.Specs/``), Python
+    ``conftest.py``, and Rust ``tests.rs``/``*_test.rs``/``*_bench.rs`` modules
+    routinely hold shared builders and fixtures with zero test attributes of
+    their own, so they classify whole-file immediately. Filename-only matches
+    outside test directories (such as ``src/pkg/test_detection.py`` or
+    ``src/main/java/acme/TestRunner.java``) require AST confirmation in
+    :func:`classify_test_ranges`.
+    """
+    if language not in TEST_DETECTION_LANGUAGES:
+        return False
+    posix = PurePosixPath(path.as_posix())
+    parts = [part for part in posix.parts if part not in {"", "."}]
+    if not parts:
+        return False
+    if _has_test_directory(language, parts[:-1]):
+        return True
+    filename = parts[-1]
+    if language == "python" and filename.lower() == "conftest.py":
+        return True
+    if language == "rust":
+        lower_stem = posix.stem.lower()
+        return lower_stem in {"tests", "benches"} or lower_stem.endswith(
+            ("_test", "_tests", "_bench", "_benches", "_benchmark", "_benchmarks")
+        )
+    return False
+
+
+def is_test_file_path(language: str, path: Path) -> bool:
+    """Return whether *path* matches a test or benchmark directory or filename convention."""
+    if language not in TEST_DETECTION_LANGUAGES:
+        return False
+    posix = PurePosixPath(path.as_posix())
+    parts = [part for part in posix.parts if part not in {"", "."}]
+    if not parts:
+        return False
+    if _has_test_directory(language, parts[:-1]):
+        return True
+    filename = parts[-1]
+    stem = posix.stem
 
     if language == "python":
         lower_name = filename.lower()
@@ -369,17 +407,25 @@ def classify_test_ranges(
     """Classify whole-file and inline test/benchmark spans for one parsed file."""
     if language not in TEST_DETECTION_LANGUAGES:
         return _NON_TEST
-    if is_test_file_path(language, path):
+    if _is_unambiguous_test_path(language, path):
         return _WHOLE_FILE_TEST
+
     if language == "rust":
-        return _classify_rust(root, source)
-    if language == "python":
-        return _classify_python(root, source)
-    if language == "java":
-        return _classify_java(root, source)
-    if language == "csharp":
-        return _classify_csharp(root, source)
-    return _NON_TEST
+        ast_result = _classify_rust(root, source)
+    elif language == "python":
+        ast_result = _classify_python(root, source)
+    elif language == "java":
+        ast_result = _classify_java(root, source)
+    elif language == "csharp":
+        ast_result = _classify_csharp(root, source)
+    else:
+        return _NON_TEST
+
+    if is_test_file_path(language, path) and (
+        ast_result.file_is_test or bool(ast_result.inline_spans)
+    ):
+        return _WHOLE_FILE_TEST
+    return ast_result
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +439,7 @@ def _rust_cfg_tokens_is_test(tokens: list[Node], source: bytes) -> bool:
     if not meaningful:
         return False
     if len(meaningful) == 1 and meaningful[0].type == "identifier":
-        return _node_str(meaningful[0], source) in {"test", "bench"}
+        return _node_str(meaningful[0], source) in {"test", "bench", "doctest"}
     if (
         len(meaningful) == 2
         and meaningful[0].type == "identifier"
@@ -412,22 +458,31 @@ def _rust_cfg_tokens_is_test(tokens: list[Node], source: bytes) -> bool:
     return False
 
 
-def _split_token_tree_clauses(tree: Node) -> list[list[Node]]:
-    """Split ``(a, b, ...)`` children into top-level comma-delimited token lists."""
+def _split_tokens_by(tokens: list[Node], delimiter: str) -> list[list[Node]]:
     clauses: list[list[Node]] = []
     current: list[Node] = []
-    for child in tree.children:
-        if child.is_extra or child.type in {"(", ")", "[", "]", "{", "}"}:
+    for tok in tokens:
+        if tok.is_extra:
             continue
-        if child.type == ",":
+        if tok.type == delimiter:
             if current:
                 clauses.append(current)
                 current = []
         else:
-            current.append(child)
+            current.append(tok)
     if current:
         clauses.append(current)
     return clauses
+
+
+def _split_token_tree_clauses(tree: Node) -> list[list[Node]]:
+    """Split ``(a, b, ...)`` children into top-level comma-delimited token lists."""
+    inner = [
+        child
+        for child in tree.children
+        if not child.is_extra and child.type not in {"(", ")", "[", "]", "{", "}"}
+    ]
+    return _split_tokens_by(inner, ",")
 
 
 def _rust_attribute_is_cfg_test(attr_item: Node, source: bytes) -> bool:
@@ -464,6 +519,18 @@ def _rust_attribute_is_test_fn(attr_item: Node, source: bytes) -> bool:
     return False
 
 
+def _rust_mod_has_inner_cfg_test(node: Node, source: bytes) -> bool:
+    if node.type != "mod_item":
+        return False
+    body = node.child_by_field_name("body")
+    if body is None:
+        return False
+    return any(
+        c.type == "inner_attribute_item" and _rust_attribute_is_cfg_test(c, source)
+        for c in body.named_children
+    )
+
+
 def _rust_macro_invocation(node: Node) -> Node | None:
     if node.type == "macro_invocation":
         return node
@@ -489,22 +556,67 @@ def _rust_macro_tail_name(invocation: Node, source: bytes) -> str | None:
     return None
 
 
+_RUST_PATH_SEGMENT_TOKENS: Final = frozenset({"identifier", "self", "super", "crate", "::"})
+
+
+def _criterion_clause_target(clause: list[Node], source: bytes) -> str | None:
+    if not clause or any(tok.type == "=" for tok in clause):
+        return None
+    if (
+        all(tok.type in _RUST_PATH_SEGMENT_TOKENS for tok in clause)
+        and clause[-1].type == "identifier"
+    ):
+        return _node_str(clause[-1], source)
+    return None
+
+
 def _criterion_target_functions(invocation: Node, source: bytes) -> set[str]:
     """Extract benchmark function identifiers listed in ``criterion_group!(...)``."""
     tree = next((c for c in invocation.named_children if c.type == "token_tree"), None)
     if tree is None:
         return set()
-    clauses = _split_token_tree_clauses(tree)
-    if len(clauses) < 2:
+    inner = [
+        child
+        for child in tree.children
+        if not child.is_extra and child.type not in {"(", ")", "[", "]", "{", "}"}
+    ]
+    if not inner:
         return set()
     targets: set[str] = set()
+    if any(tok.type == ";" for tok in inner):
+        for stmt in _split_tokens_by(inner, ";"):
+            if (
+                len(stmt) >= 3
+                and stmt[0].type == "identifier"
+                and _node_str(stmt[0], source) == "targets"
+                and stmt[1].type == "="
+            ):
+                for clause in _split_tokens_by(stmt[2:], ","):
+                    if (name := _criterion_clause_target(clause, source)) is not None:
+                        targets.add(name)
+        return targets
+
+    clauses = _split_tokens_by(inner, ",")
+    if len(clauses) < 2:
+        return set()
     for clause in clauses[1:]:
-        # Skip `name = ...` / `config = ...` settings clauses; keep function names.
-        if any(tok.type == "=" for tok in clause):
-            continue
-        if len(clause) == 1 and clause[0].type == "identifier":
-            targets.add(_node_str(clause[0], source))
+        if (name := _criterion_clause_target(clause, source)) is not None:
+            targets.add(name)
     return targets
+
+
+def _collect_criterion_targets(container: Node, source: bytes, out: set[str]) -> None:
+    for child in container.named_children:
+        invocation = _rust_macro_invocation(child)
+        if (
+            invocation is not None
+            and _rust_macro_tail_name(invocation, source) == "criterion_group"
+        ):
+            out.update(_criterion_target_functions(invocation, source))
+        elif child.type == "mod_item":
+            body = child.child_by_field_name("body")
+            if body is not None:
+                _collect_criterion_targets(body, source, out)
 
 
 def _classify_rust(root: Node, source: bytes) -> TestClassification:
@@ -513,13 +625,7 @@ def _classify_rust(root: Node, source: bytes) -> TestClassification:
             return _WHOLE_FILE_TEST
 
     criterion_targets: set[str] = set()
-    for child in root.named_children:
-        invocation = _rust_macro_invocation(child)
-        if (
-            invocation is not None
-            and _rust_macro_tail_name(invocation, source) == "criterion_group"
-        ):
-            criterion_targets.update(_criterion_target_functions(invocation, source))
+    _collect_criterion_targets(root, source, criterion_targets)
 
     spans: list[tuple[int, int]] = []
     top_test_items = 0
@@ -557,7 +663,9 @@ def _classify_rust(root: Node, source: bytes) -> TestClassification:
             pending_attrs = []
             pending_doc_start = None
 
-            is_cfg_test = any(_rust_attribute_is_cfg_test(a, source) for a in attrs)
+            is_cfg_test = any(_rust_attribute_is_cfg_test(a, source) for a in attrs) or (
+                _rust_mod_has_inner_cfg_test(child, source)
+            )
             is_fn_test = child.type == "function_item" and (
                 any(_rust_attribute_is_test_fn(a, source) for a in attrs)
                 or (
@@ -578,7 +686,11 @@ def _classify_rust(root: Node, source: bytes) -> TestClassification:
                     top_test_items += 1
                 continue
 
-            if is_root and child.type not in {"use_declaration", "extern_crate_declaration"}:
+            is_private_import = child.type in {
+                "use_declaration",
+                "extern_crate_declaration",
+            } and not any(c.type == "visibility_modifier" for c in child.named_children)
+            if is_root and not is_private_import:
                 top_prod_items += 1
 
             # Nested inline modules (`mod outer { #[cfg(test)] mod tests { ... } }`).
@@ -614,9 +726,36 @@ def _python_decorator_dotted_name(decorator: Node, source: bytes) -> str | None:
 def _python_decorator_is_test(name: str, *, for_class: bool) -> bool:
     if name in {"fixture", "pytest.fixture", "pytest_asyncio.fixture", "benchmark"}:
         return not for_class
-    if name.startswith("pytest.mark.") or name == "pytest.mark":
+    if name.startswith(("pytest.mark.", "mark.")) or name in {"pytest.mark", "mark"}:
         return True
-    return name.startswith("unittest.skip") or name == "unittest.expectedFailure"
+    return name.startswith("unittest.skip") or name in {
+        "unittest.expectedFailure",
+        "expectedFailure",
+        "skipIf",
+        "skipUnless",
+    }
+
+
+def _python_is_dataclass_decorator(name: str) -> bool:
+    return name == "dataclass" or name.endswith(".dataclass")
+
+
+def _python_class_has_init(body: Node | None, source: bytes) -> bool:
+    if body is None:
+        return False
+    for child in body.named_children:
+        if child.is_extra:
+            continue
+        inner = (
+            child.child_by_field_name("definition")
+            if child.type == "decorated_definition"
+            else child
+        )
+        if inner is not None and inner.type == "function_definition":
+            name_node = inner.child_by_field_name("name")
+            if name_node is not None and _node_str(name_node, source) == "__init__":
+                return True
+    return False
 
 
 def _python_class_is_test_name(name: str) -> bool:
@@ -649,12 +788,54 @@ def _python_class_inherits_testcase(class_node: Node, source: bytes) -> bool:
     return False
 
 
+def _python_is_pytestmark_assignment(stmt: Node, source: bytes) -> bool:
+    if stmt.type != "expression_statement":
+        return False
+    expr_children = [c for c in stmt.named_children if not c.is_extra]
+    if len(expr_children) != 1 or expr_children[0].type != "assignment":
+        return False
+    left = expr_children[0].child_by_field_name("left")
+    return (
+        left is not None and left.type == "identifier" and _node_str(left, source) == "pytestmark"
+    )
+
+
+def _python_is_module_trivia(stmt: Node, source: bytes) -> bool:
+    if stmt.type in {
+        "import_statement",
+        "import_from_statement",
+        "future_import_statement",
+        "comment",
+    }:
+        return True
+    if stmt.type == "expression_statement":
+        expr_children = [c for c in stmt.named_children if not c.is_extra]
+        if len(expr_children) == 1 and expr_children[0].type == "string":
+            return True
+    if stmt.type == "if_statement":
+        cond = stmt.child_by_field_name("condition")
+        if cond is not None:
+            cond_text = _node_str(cond, source).strip()
+            if cond_text == "TYPE_CHECKING" or cond_text.endswith(".TYPE_CHECKING"):
+                return True
+            if (
+                cond.type == "comparison_operator"
+                and "__name__" in cond_text
+                and ('"__main__"' in cond_text or "'__main__'" in cond_text)
+            ):
+                return True
+    return False
+
+
+_PythonScope = Literal["module", "test_class", "prod_class"]
+
+
 def _classify_python(root: Node, source: bytes) -> TestClassification:
     spans: list[tuple[int, int]] = []
     top_test_defs = 0
     top_prod_items = 0
 
-    def inspect_statement(stmt: Node, *, is_root: bool) -> bool:
+    def inspect_statement(stmt: Node, *, scope: _PythonScope) -> bool:
         nonlocal top_test_defs, top_prod_items
         outer = stmt
         decorators: list[str] = []
@@ -673,70 +854,89 @@ def _classify_python(root: Node, source: bytes) -> TestClassification:
         if inner.type == "function_definition":
             name_node = inner.child_by_field_name("name")
             name = _node_str(name_node, source) if name_node is not None else ""
-            is_test = name.startswith(("test_", "bench_", "benchmark_")) or any(
-                _python_decorator_is_test(d, for_class=False) for d in decorators
-            )
+            allow_name_match = scope in {"module", "test_class"}
+            is_test = (
+                allow_name_match and name.startswith(("test_", "bench_", "benchmark_"))
+            ) or any(_python_decorator_is_test(d, for_class=False) for d in decorators)
             if is_test:
                 spans.append((outer.start_byte, outer.end_byte))
-                if is_root:
+                if scope == "module":
                     top_test_defs += 1
                 return True
-            if is_root:
+            if scope == "module":
                 top_prod_items += 1
-            body = inner.child_by_field_name("body")
-            if body is not None:
-                for sub in body.named_children:
-                    if not sub.is_extra:
-                        inspect_statement(sub, is_root=False)
             return False
 
         if inner.type == "class_definition":
             name_node = inner.child_by_field_name("name")
             name = _node_str(name_node, source) if name_node is not None else ""
-            direct_test = (
-                _python_class_is_test_name(name)
-                or _python_class_inherits_testcase(inner, source)
-                or any(_python_decorator_is_test(d, for_class=True) for d in decorators)
-            )
-            if direct_test:
+            if _python_class_inherits_testcase(inner, source) or any(
+                _python_decorator_is_test(d, for_class=True) for d in decorators
+            ):
                 spans.append((outer.start_byte, outer.end_byte))
-                if is_root:
+                if scope == "module":
                     top_test_defs += 1
                 return True
+
             body = inner.child_by_field_name("body")
+            is_pytest_named_class = (
+                _python_class_is_test_name(name)
+                and not any(_python_is_dataclass_decorator(d) for d in decorators)
+                and not _python_class_has_init(body, source)
+            )
+            child_scope: _PythonScope = "test_class" if is_pytest_named_class else "prod_class"
             member_spans_before = len(spans)
-            has_test_member = False
+            has_direct_test_method = False
+            has_non_test_method = False
+            has_nested_test_class = False
+            has_nested_prod_class = False
             if body is not None:
                 for sub in body.named_children:
-                    if not sub.is_extra and inspect_statement(sub, is_root=False):
-                        has_test_member = True
-            if has_test_member:
+                    if sub.is_extra:
+                        continue
+                    sub_inner = (
+                        sub.child_by_field_name("definition")
+                        if sub.type == "decorated_definition"
+                        else sub
+                    )
+                    if sub_inner is not None and sub_inner.type == "function_definition":
+                        if inspect_statement(sub, scope=child_scope):
+                            has_direct_test_method = True
+                        else:
+                            has_non_test_method = True
+                    elif sub_inner is not None and sub_inner.type == "class_definition":
+                        if inspect_statement(sub, scope=child_scope):
+                            has_nested_test_class = True
+                        else:
+                            has_nested_prod_class = True
+
+            promote = has_direct_test_method or (
+                has_nested_test_class
+                and (
+                    is_pytest_named_class or (not has_non_test_method and not has_nested_prod_class)
+                )
+            )
+            if promote:
                 del spans[member_spans_before:]
                 spans.append((outer.start_byte, outer.end_byte))
-                if is_root:
+                if scope == "module":
                     top_test_defs += 1
                 return True
-            if is_root:
+            if scope == "module":
                 top_prod_items += 1
             return False
 
-        if is_root and stmt.type not in {
-            "import_statement",
-            "import_from_statement",
-            "future_import_statement",
-            "comment",
-        }:
-            # Module docstring (`expression_statement` wrapping a single `string`) is trivia.
-            if stmt.type == "expression_statement":
-                expr_children = [c for c in stmt.named_children if not c.is_extra]
-                if len(expr_children) == 1 and expr_children[0].type == "string":
-                    return False
-            top_prod_items += 1
+        if scope == "module":
+            if _python_is_pytestmark_assignment(stmt, source):
+                spans.append((stmt.start_byte, stmt.end_byte))
+                return True
+            if not _python_is_module_trivia(stmt, source):
+                top_prod_items += 1
         return False
 
     for child in root.named_children:
         if not child.is_extra:
-            inspect_statement(child, is_root=True)
+            inspect_statement(child, scope="module")
 
     if top_test_defs > 0 and top_prod_items == 0:
         return _WHOLE_FILE_TEST
@@ -766,6 +966,29 @@ def _java_annotation_names(node: Node, source: bytes) -> list[str]:
     return names
 
 
+def _java_class_inherits_testcase(type_node: Node, source: bytes) -> bool:
+    superclass = type_node.child_by_field_name("superclass")
+    if superclass is None:
+        return False
+    target = next((c for c in superclass.named_children if not c.is_extra), None)
+    if target is None:
+        return False
+    tail = _node_str(target, source).split("<", 1)[0].rsplit(".", 1)[-1]
+    return tail.endswith("TestCase")
+
+
+def _iter_java_type_members(body: Node) -> list[Node]:
+    members: list[Node] = []
+    for child in body.named_children:
+        if child.is_extra:
+            continue
+        if child.type == "enum_body_declarations":
+            members.extend(c for c in child.named_children if not c.is_extra)
+        else:
+            members.append(child)
+    return members
+
+
 def _classify_java(root: Node, source: bytes) -> TestClassification:
     spans: list[tuple[int, int]] = []
     top_test_types = 0
@@ -776,9 +999,9 @@ def _classify_java(root: Node, source: bytes) -> TestClassification:
         annotations = _java_annotation_names(type_node, source)
         name_node = type_node.child_by_field_name("name")
         type_name = _node_str(name_node, source) if name_node is not None else ""
-        if any(a in _JAVA_TYPE_TEST_ANNOTATIONS for a in annotations) or _pascal_test_name(
-            type_name, allow_it=True
-        ):
+        if any(
+            a in _JAVA_TYPE_TEST_ANNOTATIONS for a in annotations
+        ) or _java_class_inherits_testcase(type_node, source):
             spans.append((type_node.start_byte, type_node.end_byte))
             if is_root:
                 top_test_types += 1
@@ -786,18 +1009,32 @@ def _classify_java(root: Node, source: bytes) -> TestClassification:
 
         body = type_node.child_by_field_name("body")
         before = len(spans)
-        has_test_member = False
+        has_direct_test_method = False
+        has_non_test_method = False
+        has_nested_test_type = False
+        has_nested_prod_type = False
         if body is not None:
-            for member in body.named_children:
-                if member.is_extra:
-                    continue
+            for member in _iter_java_type_members(body):
                 if member.type in {"method_declaration", "constructor_declaration"}:
                     member_ann = _java_annotation_names(member, source)
                     if any(a in _JAVA_METHOD_TEST_ANNOTATIONS for a in member_ann):
-                        has_test_member = True
-                elif member.type in _JAVA_TYPE_NODES and inspect_type(member, is_root=False):
-                    has_test_member = True
-        if has_test_member:
+                        has_direct_test_method = True
+                    elif member.type == "method_declaration":
+                        has_non_test_method = True
+                elif member.type in _JAVA_TYPE_NODES:
+                    if inspect_type(member, is_root=False):
+                        has_nested_test_type = True
+                    else:
+                        has_nested_prod_type = True
+
+        promote = has_direct_test_method or (
+            has_nested_test_type
+            and (
+                _pascal_test_name(type_name, allow_it=True)
+                or (not has_non_test_method and not has_nested_prod_type)
+            )
+        )
+        if promote:
             del spans[before:]
             spans.append((type_node.start_byte, type_node.end_byte))
             if is_root:
@@ -838,9 +1075,9 @@ def _csharp_attribute_names(node: Node, source: bytes) -> list[str]:
             if name_node is None:
                 continue
             raw = _node_str(name_node, source)
-            # Strip generic arguments (`Foo<T>` -> `Foo`), namespace qualifiers,
+            # Strip generic arguments (`Foo<T>` -> `Foo`), `.` and `::` qualifiers,
             # and optional `Attribute` suffix (`FactAttribute` -> `Fact`).
-            head = raw.split("<", 1)[0].rsplit(".", 1)[-1]
+            head = raw.split("<", 1)[0].rsplit(".", 1)[-1].rsplit("::", 1)[-1]
             if head.endswith("Attribute") and len(head) > len("Attribute"):
                 head = head[: -len("Attribute")]
             names.append(head)
@@ -857,9 +1094,7 @@ def _classify_csharp(root: Node, source: bytes) -> TestClassification:
         attrs = _csharp_attribute_names(type_node, source)
         name_node = type_node.child_by_field_name("name")
         type_name = _node_str(name_node, source) if name_node is not None else ""
-        if any(a in _CSHARP_TYPE_TEST_ATTRS for a in attrs) or _pascal_test_name(
-            type_name, allow_specs=True
-        ):
+        if any(a in _CSHARP_TYPE_TEST_ATTRS for a in attrs):
             spans.append((type_node.start_byte, type_node.end_byte))
             if is_root:
                 top_test_types += 1
@@ -867,7 +1102,10 @@ def _classify_csharp(root: Node, source: bytes) -> TestClassification:
 
         body = type_node.child_by_field_name("body")
         before = len(spans)
-        has_test_member = False
+        has_direct_test_method = False
+        has_non_test_method = False
+        has_nested_test_type = False
+        has_nested_prod_type = False
         if body is not None:
             for member in body.named_children:
                 if member.is_extra:
@@ -875,10 +1113,23 @@ def _classify_csharp(root: Node, source: bytes) -> TestClassification:
                 if member.type == "method_declaration":
                     member_attrs = _csharp_attribute_names(member, source)
                     if any(a in _CSHARP_METHOD_TEST_ATTRS for a in member_attrs):
-                        has_test_member = True
-                elif member.type in _CSHARP_TYPE_NODES and inspect_type(member, is_root=False):
-                    has_test_member = True
-        if has_test_member:
+                        has_direct_test_method = True
+                    else:
+                        has_non_test_method = True
+                elif member.type in _CSHARP_TYPE_NODES:
+                    if inspect_type(member, is_root=False):
+                        has_nested_test_type = True
+                    else:
+                        has_nested_prod_type = True
+
+        promote = has_direct_test_method or (
+            has_nested_test_type
+            and (
+                _pascal_test_name(type_name, allow_specs=True)
+                or (not has_non_test_method and not has_nested_prod_type)
+            )
+        )
+        if promote:
             del spans[before:]
             spans.append((type_node.start_byte, type_node.end_byte))
             if is_root:

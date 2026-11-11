@@ -681,22 +681,29 @@ class TreeSitterExtractor:
             for gap_start, gap_end in self._container_gaps(
                 outer, definition.node, kind, index, normalized_source
             ):
-                chunks.extend(
-                    self._chunks_for_range(
-                        path=path,
-                        language=language,
-                        kind=kind,
-                        symbol=definition.name,
-                        qualified=qualified,
-                        parent=parent,
-                        source=normalized_source,
-                        start=gap_start,
-                        end=gap_end,
-                        line_index=line_index,
-                        always_part=True,
-                        is_test=definition_is_test,
-                    )
+                gap_segments = (
+                    [(gap_start, gap_end, True)]
+                    if definition_is_test
+                    else test_ranges.split_uncovered_range(gap_start, gap_end)
                 )
+                for seg_start, seg_end, seg_is_test in gap_segments:
+                    if seg_start < seg_end and _has_text(normalized_source, seg_start, seg_end):
+                        chunks.extend(
+                            self._chunks_for_range(
+                                path=path,
+                                language=language,
+                                kind=kind,
+                                symbol=definition.name,
+                                qualified=qualified,
+                                parent=parent,
+                                source=normalized_source,
+                                start=seg_start,
+                                end=seg_end,
+                                line_index=line_index,
+                                always_part=True,
+                                is_test=seg_is_test,
+                            )
+                        )
 
         chunks.extend(
             self._module_chunks(path, language, normalized_source, covered, line_index, test_ranges)
