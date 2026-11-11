@@ -2277,6 +2277,7 @@ class Indexer:
             identifier_terms=chunk.search_suffix,
             part_index=chunk.part_index,
             vector=vector,
+            is_test=chunk.is_test,
             content_hash=file.content_hash,
             source_start_byte=chunk.source_start_byte,
             source_end_byte=chunk.source_end_byte,

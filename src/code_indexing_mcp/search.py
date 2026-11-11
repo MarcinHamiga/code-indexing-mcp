@@ -20,6 +20,7 @@ from .embedding import (
 from .errors import CodeIndexingError, ErrorCode
 from .extractor import _CONTAINER_KINDS, TreeSitterExtractor
 from .models import (
+    SEARCH_SCOPES,
     ChunkPreview,
     CodeChunk,
     ExampleSearchResponse,
@@ -29,6 +30,7 @@ from .models import (
     RankExplanation,
     SearchHit,
     SearchResponse,
+    SearchScope,
     SymbolResponse,
 )
 from .path_filter import (
@@ -285,11 +287,22 @@ class SearchService:
         languages: list[str] | None,
         paths: list[str] | None,
         kinds: list[str] | None,
+        scope: SearchScope = "code",
         limit: int,
         partitions: Mapping[str, PartitionRef | Sequence[PartitionRef]] | None,
     ) -> _SearchPreparation:
+        if scope not in SEARCH_SCOPES:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                f"Invalid search scope: {scope!r}; expected 'code', 'tests', or 'all'",
+                scope=scope,
+            )
         limit = max(1, min(limit, 50))
         conditions: list[str] = []
+        if scope == "code":
+            conditions.append("is_test = false")
+        elif scope == "tests":
+            conditions.append("is_test = true")
         if languages:
             conditions.append(self._in_condition("language", languages))
         if kinds:
@@ -416,6 +429,7 @@ class SearchService:
         languages: list[str] | None = None,
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
+        scope: SearchScope = "code",
         limit: int = 8,
         partitions: Mapping[str, PartitionRef | Sequence[PartitionRef]] | None = None,
     ) -> SearchResponse:
@@ -435,6 +449,7 @@ class SearchService:
             languages=languages,
             paths=paths,
             kinds=kinds,
+            scope=scope,
             limit=limit,
             partitions=partitions,
         )
@@ -486,6 +501,7 @@ class SearchService:
         languages: list[str] | None = None,
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
+        scope: SearchScope = "code",
         limit: int = 8,
         partitions: Mapping[str, PartitionRef | Sequence[PartitionRef]] | None = None,
     ) -> ExampleSearchResponse:
@@ -500,6 +516,7 @@ class SearchService:
             languages=languages,
             paths=paths,
             kinds=kinds,
+            scope=scope,
             limit=limit,
             partitions=partitions,
         )
@@ -531,11 +548,18 @@ class SearchService:
         *,
         match: str = "exact",
         kinds: list[str] | None = None,
+        scope: SearchScope = "code",
         limit: int = 20,
         partition: PartitionRef | None = None,
     ) -> SymbolResponse:
         if match not in {"exact", "prefix", "contains"}:
             raise CodeIndexingError(ErrorCode.INVALID_FILTER, f"Invalid symbol match mode: {match}")
+        if scope not in SEARCH_SCOPES:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                f"Invalid search scope: {scope!r}; expected 'code', 'tests', or 'all'",
+                scope=scope,
+            )
         limit = max(1, min(limit, 50))
         partition = partition or self.store.active_partition(project_id)
         if partition.project_id != project_id:
@@ -546,6 +570,7 @@ class SearchService:
                 project_id,
                 match=match,
                 kinds=kinds,
+                scope=scope,
                 limit=limit,
                 partition_id=partition.partition_id,
             )
@@ -682,4 +707,5 @@ class SearchService:
             score=score,
             snippet=snippet,
             truncated=truncated,
+            is_test=chunk.is_test,
         )

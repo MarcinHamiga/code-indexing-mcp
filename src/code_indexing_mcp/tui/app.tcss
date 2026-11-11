@@ -11,6 +11,7 @@ Screen {
 #project-select { width: 1fr; min-width: 18; margin-right: 1; }
 #mode-select { width: 22; margin-right: 1; }
 #match-select { width: 17; margin-right: 1; }
+#scope-select { width: 18; margin-right: 1; }
 #index-button { width: 14; min-width: 14; margin-right: 1; }
 #activity-button { width: 12; min-width: 12; margin-right: 1; }
 .compact #activity-button { display: none; }

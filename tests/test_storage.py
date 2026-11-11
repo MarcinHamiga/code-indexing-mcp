@@ -1982,6 +1982,7 @@ def _chunk_table(project_id: str, file_id: str, count: int) -> pa.Table:
                 "identifier_terms": "symbol module py",
                 "content_hash": "hash",
                 "part_index": 0,
+                "is_test": False,
                 "vector": [0.0, 0.0, 0.0, 1.0],
             }
             for index in range(count)

@@ -214,8 +214,8 @@ def test_length_prefixed_json_frame_round_trip() -> None:
         right.close()
 
 
-def test_protocol_six_introduces_changed_symbols() -> None:
-    assert daemon.PROTOCOL_VERSION == 6
+def test_protocol_seven_introduces_search_scope() -> None:
+    assert daemon.PROTOCOL_VERSION == 7
 
 
 def test_chunked_response_round_trip_is_transparent(monkeypatch: pytest.MonkeyPatch) -> None:

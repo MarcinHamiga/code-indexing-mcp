@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from rich.syntax import Syntax
 from rich.text import Text
@@ -34,6 +34,7 @@ from ..models import (
     ProjectStatus,
     ReferenceResponse,
     SearchHit,
+    SearchScope,
 )
 from .indexing_panel import IndexingActivityPanel, format_compact_progress_strip
 from .navigation import SourceLocation, SourcePreview, editor_command
@@ -160,6 +161,12 @@ class CodeIndexingApp(App[int]):
                 [("Exact", "exact"), ("Starts with", "prefix"), ("Contains", "contains")],
                 value="exact",
                 id="match-select",
+                allow_blank=False,
+            )
+            yield Select[str](
+                [("Code only", "code"), ("Tests only", "tests"), ("Code + tests", "all")],
+                value="code",
+                id="scope-select",
                 allow_blank=False,
             )
             yield Button("Index F5", id="index-button")
@@ -646,11 +653,21 @@ class CodeIndexingApp(App[int]):
 
         project = self.service.selected_project
         match = str(self.screen_stack[0].query_one("#match-select", Select).value)
-        self._start_search(query, mode, project, match)
+        scope_select = self.screen_stack[0].query_one("#scope-select", Select)
+        raw_scope = str(scope_select.value) if scope_select.value != Select.BLANK else "code"
+        scope = cast(SearchScope, raw_scope if raw_scope in {"code", "tests", "all"} else "code")
+        self._start_search(query, mode, project, match, scope)
 
-    def _start_search(self, query: str, mode: str, project: ProjectInfo | None, match: str) -> None:
+    def _start_search(
+        self,
+        query: str,
+        mode: str,
+        project: ProjectInfo | None,
+        match: str,
+        scope: SearchScope = "code",
+    ) -> None:
         def retry() -> None:
-            self._start_search(query, mode, project, match)
+            self._start_search(query, mode, project, match, scope)
 
         self._clear_error()
         self._search_project = project
@@ -669,6 +686,7 @@ class CodeIndexingApp(App[int]):
             query,
             project,
             match,
+            scope,
             retry,
         )
 
@@ -680,6 +698,7 @@ class CodeIndexingApp(App[int]):
         query: str,
         project: ProjectInfo | None,
         match: str,
+        scope: SearchScope,
         retry: Callable[[], None],
     ) -> None:
         try:
@@ -689,10 +708,12 @@ class CodeIndexingApp(App[int]):
 
             hits = (
                 self.service.find_symbol(
-                    query, project=project, match=match, on_phase=on_phase
+                    query, project=project, match=match, scope=scope, on_phase=on_phase
                 ).hits
                 if mode == "symbol"
-                else self.service.search_code(query, project=project, on_phase=on_phase).hits
+                else self.service.search_code(
+                    query, project=project, scope=scope, on_phase=on_phase
+                ).hits
             )
 
             if request_id == self._search_request_id:
@@ -745,7 +766,8 @@ class CodeIndexingApp(App[int]):
             text = Text()
             text.append(f"{i + 1:2d}. ", style="dim")
             text.append(hit.qualified_symbol or hit.symbol or Path(hit.path).name, style="bold")
-            text.append(f"  {hit.kind}\n", style="dim")
+            badge = " [test]" if hit.is_test else ""
+            text.append(f"  {hit.kind}{badge}\n", style="dim")
             text.append(f"    {hit.path}:{hit.start_line}-{hit.end_line}", style="dim")
             options.append(Option(prompt=text, id=str(i)))
 

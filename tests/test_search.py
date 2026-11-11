@@ -434,7 +434,9 @@ def test_path_filter_uses_gitignore_style_recursive_globs(tmp_path: Path) -> Non
     )
 
     def found(*patterns: str) -> set[str]:
-        response = search.search_code("alpha", [project], paths=list(patterns), limit=50)
+        response = search.search_code(
+            "alpha", [project], paths=list(patterns), scope="all", limit=50
+        )
         return {hit.path for hit in response.hits}
 
     everything = {

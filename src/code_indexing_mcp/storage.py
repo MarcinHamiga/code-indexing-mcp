@@ -48,6 +48,7 @@ from .git_state import (
     slot_id as _git_slot_id,
 )
 from .models import (
+    SEARCH_SCOPES,
     ChunkPreview,
     CodeChunk,
     FragmentLengthStats,
@@ -58,6 +59,7 @@ from .models import (
     ProjectSlot,
     ProjectStorageStats,
     ScanConfig,
+    SearchScope,
     SlotStorageStats,
     StoredChunk,
     StoredFile,
@@ -81,7 +83,9 @@ logger = logging.getLogger(__name__)
 # chunks (EXT-2), C/C++/Go/Swift/GDShader definitions are captured per name, and
 # part line numbers split on `\n` only. Unchanged files keep their stored chunks
 # unless the bump forces a rebuild, so older indexes would stay inconsistent.
-SCHEMA_VERSION = 7
+# Version 8 adds the boolean `is_test` column on chunk rows so search and symbol
+# lookup can filter production code vs. tests/benchmarks before ranking.
+SCHEMA_VERSION = 8
 
 # Symbol lookups page through the SQL prefilter's candidates. These bound each
 # page, not the total scan needed to find the caller's literal matches.
@@ -169,6 +173,7 @@ INDEXED_CHUNK_COLUMNS = [
     "identifier_terms",
     "content_hash",
     "part_index",
+    "is_test",
     "source_start_byte",
     "source_end_byte",
     "source_content_hash",
@@ -2220,6 +2225,7 @@ class LanceStore:
             "end_line",
             "content",
             "part_index",
+            "is_test",
             "source_start_byte",
             "source_end_byte",
             "source_content_hash",
@@ -2296,6 +2302,7 @@ class LanceStore:
             "content",
             "_distance",
             "part_index",
+            "is_test",
             "source_start_byte",
             "source_end_byte",
             "source_content_hash",
@@ -2501,8 +2508,15 @@ class LanceStore:
         match: str,
         kinds: list[str] | None,
         limit: int,
+        scope: SearchScope = "code",
         partition_id: str | None = None,
     ) -> list[ChunkPreview]:
+        if scope not in SEARCH_SCOPES:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                f"Invalid search scope: {scope!r}; expected 'code', 'tests', or 'all'",
+                scope=scope,
+            )
         escaped = _quoted(name)
         if match == "exact":
             symbol = f"(qualified_symbol = {escaped} OR symbol = {escaped})"
@@ -2517,6 +2531,10 @@ class LanceStore:
         if kinds:
             values = ", ".join(_quoted(kind) for kind in kinds)
             conditions.append(f"kind IN ({values})")
+        if scope == "code":
+            conditions.append("is_test = false")
+        elif scope == "tests":
+            conditions.append("is_test = true")
         tables = self._project_existing_tables(project_id, partition_id=partition_id)
         if tables is None:
             return []
@@ -3059,6 +3077,7 @@ class LanceStore:
                 ("identifier_terms", pa.string()),
                 ("content_hash", pa.string()),
                 ("part_index", pa.int32()),
+                ("is_test", pa.bool_()),
                 ("source_start_byte", pa.int64()),
                 ("source_end_byte", pa.int64()),
                 ("source_content_hash", pa.string()),
@@ -3632,6 +3651,7 @@ class LanceStore:
             "start_line",
             "end_line",
             "part_index",
+            "is_test",
             "source_start_byte",
             "source_end_byte",
             "content_hash",

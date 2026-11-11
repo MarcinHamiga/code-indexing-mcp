@@ -2474,6 +2474,7 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "languages",
         "paths",
         "kinds",
+        "scope",
         "limit",
     }
     assert set(cross_project_schema["required"]) == {"projects"}
@@ -2490,6 +2491,7 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "languages",
         "paths",
         "kinds",
+        "scope",
         "limit",
     }
     assert set(example_schema["required"]) == {"example"}
@@ -2503,8 +2505,21 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "languages",
         "paths",
         "kinds",
+        "scope",
         "limit",
     }
+    for scoped_tool in (
+        "search_code",
+        "search_by_example",
+        "search_across_projects",
+        "find_symbol",
+    ):
+        assert tools[scoped_tool].inputSchema["properties"]["scope"]["enum"] == [
+            "code",
+            "tests",
+            "all",
+        ]
+        assert tools[scoped_tool].inputSchema["properties"]["scope"]["default"] == "code"
     assert tools["find_symbol"].inputSchema["properties"]["match"]["enum"] == [
         "exact",
         "prefix",

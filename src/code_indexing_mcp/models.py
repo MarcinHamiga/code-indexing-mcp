@@ -201,6 +201,9 @@ ParameterKind = Literal[
 
 ResolutionLevel = Literal["exact", "likely", "unresolved"]
 
+SearchScope = Literal["code", "tests", "all"]
+SEARCH_SCOPES = frozenset({"code", "tests", "all"})
+
 # Mirrors scanner.LANGUAGES values. Kept here rather than imported from scanner so
 # models stays free of scanner imports.
 LanguageName = Literal[
@@ -329,6 +332,7 @@ class ExtractedChunk(FrozenModel):
     embedding_text: str
     search_text: str
     part_index: int = 0
+    is_test: bool = False
     # The two halves ``embedding_text`` and ``search_text`` are composed from.
     # Keeping them lets a token window be recomposed with the same context
     # header and identifier tail as the whole chunk, instead of the header being
@@ -728,6 +732,7 @@ class IndexedChunk(FrozenModel):
     content: str
     identifier_terms: str
     part_index: int = 0
+    is_test: bool = False
     content_hash: str = ""
     source_start_byte: int | None = None
     source_end_byte: int | None = None
@@ -759,6 +764,7 @@ class ChunkPreview(FrozenModel):
     end_line: int
     content: str = ""
     part_index: int = 0
+    is_test: bool = False
     source_start_byte: int | None = None
     source_end_byte: int | None = None
     source_content_hash: str | None = None
@@ -929,6 +935,7 @@ class SearchHit(FrozenModel):
     score: float
     snippet: str
     truncated: bool = False
+    is_test: bool = False
     explanation: RankExplanation | None = None
 
 

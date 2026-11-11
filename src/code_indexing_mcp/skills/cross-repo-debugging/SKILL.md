@@ -15,7 +15,7 @@ Trace failures as evidence chains across explicit repository boundaries. Ranking
 2. Write the expected chain, such as `producer -> contract -> consumer -> persistence`. Treat each boundary as a first-divergence hypothesis.
 3. Check `mcp__code-indexing-mcp__project_status` when freshness is uncertain. In manual mode, refresh stale indexes with `mcp__code-indexing-mcp__index_project` before trusting missing results.
 4. Call `mcp__code-indexing-mcp__search_across_projects` with explicit selectors. Query separately for stable identifiers, producer serialization, consumer validation, and contract versions, aliases, artifacts, or configuration.
-5. If one repository dominates the global ranking, do not infer absence elsewhere. Filter by `paths`, `languages`, or `kinds`, or search overlapping boundary pairs or smaller shards.
+5. If one repository dominates the global ranking, do not infer absence elsewhere. Filter by `paths`, `languages`, `kinds`, or `scope` (`"code"` default, `"tests"`, or `"all"`), or search overlapping boundary pairs or smaller shards.
 6. Pivot concepts into exact identifiers. Use project-scoped `mcp__code-indexing-mcp__find_symbol` for declarations and semantic search for usages; `find_symbol` does not resolve call sites.
 7. Call `mcp__code-indexing-mcp__file_outline` before `mcp__code-indexing-mcp__get_chunk`. Fetch only the producer, boundary contract/configuration, and consumer code needed to compare names, casing, fields, versions, routes/topics, status handling, defaults, and environment keys.
 8. Record evidence as `project/path:line`. Stop when it proves the first broken boundary and why it breaks, or when static analysis narrows the failure to one boundary and names the missing runtime evidence.
