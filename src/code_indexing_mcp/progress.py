@@ -160,3 +160,28 @@ def read_progress(
     if time.time() - progress.updated_at > stale_after_seconds:
         return None
     return progress
+
+
+def read_all_progress(
+    directory: Path, *, stale_after_seconds: float = STALE_AFTER_SECONDS
+) -> list[IndexProgress]:
+    """Return every live progress snapshot under *directory*, newest run first."""
+
+    if not directory.is_dir():
+        return []
+    snapshots: list[IndexProgress] = []
+    now = time.time()
+    try:
+        entries = list(directory.glob("*.json"))
+    except OSError:
+        return []
+    for path in entries:
+        try:
+            payload = path.read_text()
+            progress = IndexProgress.model_validate_json(payload)
+        except (OSError, ValueError):
+            continue
+        if now - progress.updated_at <= stale_after_seconds:
+            snapshots.append(progress)
+    snapshots.sort(key=lambda item: item.started_at, reverse=True)
+    return snapshots

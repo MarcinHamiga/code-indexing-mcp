@@ -456,10 +456,10 @@ the command wins over the shorthand: open that project with `syndex tui <project
 - **Project selection**: Select a registered project in the top row. The header shows index state and branch; hover over its title for the repository path and project ID.
 - **Describe code**: Ask a natural-language question such as “where are expired tokens rejected?” and press Enter.
 - **Find symbol**: Search declaration names with **Exact**, **Starts with**, or **Contains** matching. Searches return up to 20 matches; refine the query to narrow them.
-- **Responsive layout**: Search keeps a full-width row. At fewer than 100 columns, Results and Details share one pane; use their buttons or Enter/Escape to switch. Wider terminals show both panes, with more space for source. The supported minimum is 80×24.
+- **Responsive layout**: Search keeps a full-width row. At fewer than 100 columns, Results, Details, and Activity share one pane; use their buttons or Enter/Escape to switch. Wider terminals show Results and Details side by side, with more space for source. The supported minimum is 80×24.
 - **Source navigation**: Arrow through search results for automatic previews. Enter opens Details. The Code, Outline, References, and Impact tabs expose structural exploration. Select an outline symbol, reference, or dependent declaration and press Enter to follow it. Escape restores previous views, including selection and scroll position, then returns to Results.
 - **Source freshness**: **Preview** displays indexed source. **Working tree** displays bounded context from the current file, which can differ from the index. Working-tree previews are capped at 400 lines and 2 MiB per file. Use F5 to refresh the index after edits.
-- **Indexing and errors**: Automatic modes prepare stale indexes before searching and show progress separately from action feedback. Manual mode asks you to press F5. Errors remain readable until dismissed and offer Retry for retryable actions. References and impact display returned limitations and incomplete-result notices; impact explores up to two levels.
+- **Real-time indexing and process visibility**: Press `a` (or `F5` when refreshing) to open the **Activity** view, which displays a live 4-stage indexing pipeline (Scan & Parse, Embed, References, Commit), progress bar, file/chunk/cache-reuse counters, I/O throughput, skip reasons, file errors, daemon/backend process state, and the durable run audit trail. Background daemon or watcher runs on the active project also surface automatically in the bottom progress strip. Errors remain readable until dismissed and offer Retry for retryable actions. References and impact display returned limitations and incomplete-result notices; impact explores up to two levels.
 
 | Key | Action |
 | --- | --- |
@@ -467,6 +467,7 @@ the command wins over the shorthand: open that project with `syndex tui <project
 | `Enter` | Submit query or open selected entry |
 | `Tab` / `Shift+Tab` | Move focus between controls and panes |
 | `o` / `r` / `i` | Outline / References / Impact |
+| `a` | Toggle Indexing & Process Activity view |
 | `Esc` | Previous detail view, then Results, then search |
 | `y` | Copy the selected relative `path:line` (requires terminal clipboard support) |
 | `e` | Open the selected location using `VISUAL`, falling back to `EDITOR` |
@@ -497,10 +498,13 @@ syndex storage vacuum --execute
 
 *(From a repository checkout without installing launchers, prefix commands with `uv run syndex ...`)*
 
-`index` reports live progress — the phase, how many files it has walked against the previous run's
-count, and how many chunks it has embedded — on stderr, as a status line on a terminal and as
-periodic lines when redirected. The JSON report stays alone on stdout, so piping is unaffected. The
-same numbers reach an MCP client as tool progress notifications, whether the work runs in this
+When run interactively in a terminal with the `tui` extra installed, `syndex index` opens a live
+Textual progress dashboard showing the phase pipeline, progress bar, file/chunk/cache counters,
+throughput, and any file errors, then prints the JSON report on stdout when finished (pass `--hold`
+or press `p` while running to keep the panel open afterwards, or `--no-tui` to use plain stderr
+progress). When stdout or stderr is piped or redirected, `index` automatically uses single-line or
+periodic stderr status updates and keeps the JSON report alone on stdout, so piping is unaffected.
+The same numbers reach an MCP client as tool progress notifications, whether the work runs in this
 process or in the shared daemon.
 
 History, scan dry-runs, and storage maintenance are also accessible from the CLI: `history` pages

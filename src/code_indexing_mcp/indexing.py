@@ -1391,6 +1391,40 @@ class Indexer:
             )
         )
 
+    def _live_telemetry(
+        self,
+        state: _IndexScanState,
+        timer: _PhaseTimer,
+        passage_embedder: PassageEmbedder,
+        passage_reuse: PassageReuseContext | None,
+    ) -> dict[str, object]:
+        """Collect live runtime counters and backend telemetry for progress snapshots."""
+
+        return {
+            "parsed_files": state.parsed,
+            "failed_files": len(state.errors),
+            "bytes_read": state.bytes_read,
+            "chunks_extracted": state.chunks_extracted,
+            "embedding_backend": str(getattr(passage_embedder, "backend_used", "cpu")),
+            "embedding_fallback_reason": getattr(passage_embedder, "fallback_reason", None),
+            "reused_candidates": (
+                passage_reuse.reused_candidates if passage_reuse is not None else 0
+            ),
+            "reused_segments": passage_reuse.reused_segments if passage_reuse is not None else 0,
+            "peak_memory_bytes": state.peak_memory_bytes or None,
+            "memory_budget_bytes": (
+                self.memory_ceiling_bytes if self.memory_ceiling_bytes > 0 else None
+            ),
+            "phase_durations_ms": {
+                "scan": timer.milliseconds("scan"),
+                "parse": timer.milliseconds("parse"),
+                "embed": timer.milliseconds("embed"),
+                "commit": timer.milliseconds("commit"),
+                "reference_extraction": state.reference_extraction_ns // 1_000_000,
+            },
+            "recent_errors": state.errors[-10:],
+        }
+
     def _flush_pending(
         self,
         project: ProjectInfo,
@@ -1412,7 +1446,12 @@ class Indexer:
         ]
         # Embedding is the longest gap between progress updates, so announce it
         # before starting each pending batch.
-        progress.update(phase="embedding", current_path=None, force=True)
+        progress.update(
+            phase="embedding",
+            current_path=None,
+            force=True,
+            **self._live_telemetry(state, timer, passage_embedder, passage_reuse),
+        )
         if state.partition is None:
             raise RuntimeError("index scan has no pinned partition")
         slot_id = state.partition.slot_id
@@ -1469,6 +1508,7 @@ class Indexer:
                 staged_bytes=state.staged_bytes,
                 current_path=state.pending[active[0].owner].record.path,
                 force=True,
+                **self._live_telemetry(state, timer, passage_embedder, passage_reuse),
             )
 
         with timer.measure("commit"):
@@ -1511,6 +1551,7 @@ class Indexer:
             chunks_staged=state.chunks_staged,
             staged_bytes=state.staged_bytes,
             force=True,
+            **self._live_telemetry(state, timer, passage_embedder, passage_reuse),
         )
         state.clear_pending()
 
@@ -1734,6 +1775,8 @@ class Indexer:
                     eligible_files=len(state.current_paths),
                     unchanged_files=state.unchanged,
                     current_path=path,
+                    force=False,
+                    **self._live_telemetry(state, timer, passage_embedder, passage_reuse),
                 )
                 self._process_scanned_file(
                     project,
@@ -1767,10 +1810,6 @@ class Indexer:
                 eligible_files=len(state.current_paths),
                 unchanged_files=state.unchanged,
                 changed_files=state.indexed,
-                parsed_files=state.parsed,
-                failed_files=len(state.errors),
-                bytes_read=state.bytes_read,
-                chunks_extracted=state.chunks_extracted,
                 chunks_embedded=state.embedded,
                 chunks_staged=state.chunks_staged,
                 staged_bytes=state.staged_bytes,
@@ -1778,6 +1817,7 @@ class Indexer:
                 skipped_by_reason=state.skipped_by_reason,
                 current_path=None,
                 force=True,
+                **self._live_telemetry(state, timer, passage_embedder, passage_reuse),
             )
             with timer.measure("commit"):
                 # The staged rows describe the checkout the guard captured

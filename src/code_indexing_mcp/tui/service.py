@@ -8,7 +8,9 @@ references, and impact analysis.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,14 +22,17 @@ from ..models import (
     ImpactRadiusResponse,
     IndexProgress,
     IndexReport,
+    ModelStatus,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
     ReferenceResponse,
+    RunAudit,
     SearchHit,
     SearchResponse,
     SymbolResponse,
 )
+from ..progress import read_all_progress
 from ..settings import IndexMode
 
 if TYPE_CHECKING:
@@ -37,6 +42,19 @@ if TYPE_CHECKING:
 from .navigation import SourcePreview
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProcessSnapshot:
+    """Point-in-time view of runtime processes, backend state, and run history."""
+
+    mode: str = "direct"
+    daemon_pid: int | None = None
+    client_pid: int = field(default_factory=os.getpid)
+    model_status: ModelStatus | None = None
+    active_runs: list[IndexProgress] = field(default_factory=list)
+    recent_runs: list[RunAudit] = field(default_factory=list)
+    project_status: ProjectStatus | None = None
 
 
 class TuiService:
@@ -59,6 +77,8 @@ class TuiService:
         self.roots = roots if roots is not None else [self.cwd]
         self.index_mode = IndexMode(index_mode) if isinstance(index_mode, str) else index_mode
         self._selected_project: ProjectInfo | None = None
+        self._cached_model_status: ModelStatus | None = None
+        self._model_status_probed = False
 
     @property
     def selected_project(self) -> ProjectInfo | None:
@@ -157,6 +177,77 @@ class TuiService:
         except CodeIndexingError:
             return None
         return self.application.index_progress(target.id)
+
+    def active_runs(self) -> list[IndexProgress]:
+        """List live indexing runs across all projects when runtime paths are available."""
+        paths = getattr(self.application, "paths", None)
+        if paths is None or not hasattr(paths, "data"):
+            return []
+        return read_all_progress(Path(paths.data) / "progress")
+
+    def index_history(
+        self, project: ProjectInfo | None = None, *, limit: int = 8
+    ) -> list[RunAudit]:
+        """Fetch recent indexing audit records for the selected or given project."""
+        if not hasattr(self.application, "index_history"):
+            return []
+        try:
+            target = self._require_project(project)
+            page = self.application.index_history(target.id, roots=[target.root], limit=limit)
+            return list(page.runs)
+        except Exception:
+            return []
+
+    def model_status(self, *, refresh: bool = False) -> ModelStatus | None:
+        """Return resolved embedding backend status, cached across UI refreshes."""
+        if self._model_status_probed and not refresh:
+            return self._cached_model_status
+        probe = getattr(self.application, "model_status", None)
+        if not callable(probe):
+            self._model_status_probed = True
+            return None
+        try:
+            status = probe()
+            if isinstance(status, ModelStatus):
+                self._cached_model_status = status
+        except Exception:
+            pass
+        self._model_status_probed = True
+        return self._cached_model_status
+
+    def process_snapshot(
+        self, project: ProjectInfo | None = None, *, refresh_model: bool = False
+    ) -> ProcessSnapshot:
+        """Collect daemon/process identity, backend status, active jobs, and run history."""
+        ping = getattr(self.application, "ping", None)
+        mode = "direct"
+        daemon_pid: int | None = None
+        if callable(ping):
+            mode = "daemon"
+            try:
+                info = ping()
+                if isinstance(info, dict) and isinstance(info.get("pid"), int):
+                    daemon_pid = info["pid"]
+            except Exception:
+                pass
+        proj_status: ProjectStatus | None = None
+        recent_runs: list[RunAudit] = []
+        target = project or self._selected_project
+        if target is not None:
+            try:
+                proj_status = self.project_status(target)
+            except Exception:
+                proj_status = None
+            recent_runs = self.index_history(target, limit=8)
+        return ProcessSnapshot(
+            mode=mode,
+            daemon_pid=daemon_pid,
+            client_pid=os.getpid(),
+            model_status=self.model_status(refresh=refresh_model),
+            active_runs=self.active_runs(),
+            recent_runs=recent_runs,
+            project_status=proj_status,
+        )
 
     def search_code(
         self,

@@ -74,6 +74,14 @@ def __getattr__(name: str) -> Any:
         from .app import CodeIndexingApp
 
         return CodeIndexingApp
+    if name == "IndexRunApp":
+        from .indexing_panel import IndexRunApp
+
+        return IndexRunApp
+    if name == "IndexingActivityPanel":
+        from .indexing_panel import IndexingActivityPanel
+
+        return IndexingActivityPanel
     if name == "create_tui_service":
         from .service import create_tui_service
 
@@ -81,4 +89,4 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["CodeIndexingApp", "create_tui_service", "main"]
+__all__ = ["CodeIndexingApp", "IndexRunApp", "IndexingActivityPanel", "create_tui_service", "main"]

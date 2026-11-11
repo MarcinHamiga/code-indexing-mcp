@@ -112,6 +112,16 @@ def _parser(prog: str = "code-indexing-mcp") -> argparse.ArgumentParser:
     index = commands.add_parser("index", help="Incrementally index a project")
     index.add_argument("project", nargs="?")
     index.add_argument("--force", action="store_true")
+    index.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="disable the interactive Textual progress panel",
+    )
+    index.add_argument(
+        "--hold",
+        action="store_true",
+        help="keep the Textual progress panel open after indexing finishes",
+    )
     status = commands.add_parser("status", help="Show project index status")
     status.add_argument("project", nargs="?")
     history = commands.add_parser(
@@ -395,6 +405,43 @@ class _ProgressPrinter:
             self._width = 0
 
 
+def _use_index_tui(*, no_tui: bool) -> bool:
+    """Whether `index` should render the interactive Textual panel."""
+
+    if no_tui:
+        return False
+    if not (sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()):
+        return False
+    import importlib.util
+
+    return importlib.util.find_spec("textual") is not None
+
+
+def _run_index_tui(
+    app: Application, project: str | None, *, force: bool, hold: bool
+) -> BaseModel | None:
+    """Run `index_project` inside `IndexRunApp`, keeping stderr logs off the screen."""
+
+    from .tui.indexing_panel import IndexRunApp
+
+    resolved = app.resolve_project(project)
+    runner = IndexRunApp(
+        lambda listener: app.index_project(resolved.id, force=force, on_progress=listener),
+        project_label=resolved.name,
+        hold_open=hold,
+    )
+    root_logger = logging.getLogger()
+    previous_disable = root_logger.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        runner.run()
+    finally:
+        logging.disable(previous_disable)
+    if runner.error is not None:
+        raise runner.error
+    return runner.report
+
+
 def _update_notice(cache_directory: Path) -> str | None:
     """The notice, honouring the disable switch even when a cache lingers."""
 
@@ -575,11 +622,17 @@ def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> 
                 args.path, args.name, args.force_new_id, allow_overlap=args.allow_overlap
             )
         elif args.command == "index":
-            printer = _ProgressPrinter(sys.stderr)
-            try:
-                result = app.index_project(args.project, force=args.force, on_progress=printer)
-            finally:
-                printer.clear()
+            if _use_index_tui(no_tui=args.no_tui):
+                tui_report = _run_index_tui(app, args.project, force=args.force, hold=args.hold)
+                if tui_report is None:
+                    return 130
+                result = tui_report
+            else:
+                printer = _ProgressPrinter(sys.stderr)
+                try:
+                    result = app.index_project(args.project, force=args.force, on_progress=printer)
+                finally:
+                    printer.clear()
         elif args.command == "status":
             result = app.project_status(args.project)
         elif args.command == "history":

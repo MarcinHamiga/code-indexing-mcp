@@ -28,14 +28,16 @@ from ..models import (
     CodeChunk,
     DeclarationSelector,
     ImpactRadiusResponse,
+    IndexProgress,
     OutlineResponse,
     ProjectInfo,
     ProjectStatus,
     ReferenceResponse,
     SearchHit,
 )
+from .indexing_panel import IndexingActivityPanel, format_compact_progress_strip
 from .navigation import SourceLocation, SourcePreview, editor_command
-from .service import TuiService, create_tui_service
+from .service import ProcessSnapshot, TuiService, create_tui_service
 
 
 class HelpScreen(ModalScreen[None]):
@@ -53,10 +55,11 @@ class HelpScreen(ModalScreen[None]):
                 "o  File outline     r  References     i  What depends on this?\n"
                 "Esc  Previous detail view, then results, then search\n"
                 "y  Copy relative path:line     e  Open in VISUAL / EDITOR\n"
-                "F5  Refresh index     q  Quit outside the search field\n"
+                "F5  Refresh index     a  Indexing & process activity\n"
                 "c  Configure this installation (setup wizard, then back here)\n"
-                "Ctrl+Q  Quit from anywhere     ? / Ctrl+H  Help\n\n"
-                "At narrow widths, use Results / Details to switch panes.\n"
+                "q  Quit outside the search field     Ctrl+Q  Quit from anywhere\n"
+                "? / Ctrl+H  Help\n\n"
+                "At narrow widths, use Results / Details / Activity to switch panes.\n"
                 "Preview shows indexed source. Working tree shows current files.\n"
                 "Automatic indexing prepares stale indexes before searching.\n"
                 "Manual indexing mode requires F5 first. Analysis is bounded;\n"
@@ -96,6 +99,7 @@ class CodeIndexingApp(App[int]):
         Binding("r", "show_references", "References", show=False, priority=False),
         Binding("i", "show_impact", "Impact", show=False, priority=False),
         Binding("f5", "trigger_index", "Index", show=True, priority=False),
+        Binding("a", "toggle_activity", "Activity", show=True, priority=False),
         Binding("c", "open_configure", "Configure", show=True, priority=False),
         Binding("escape", "escape_action", "Back", show=False, priority=False),
         Binding("q", "quit_app", "Quit", show=True, priority=False),
@@ -117,7 +121,9 @@ class CodeIndexingApp(App[int]):
         self._is_indexing: bool = False
         self._projects: dict[str, ProjectInfo] = {}
         self._project_request_id = 0
+        self._activity_request_id = 0
         self._detail_visible = False
+        self._activity_visible = False
 
         self._active_target: SourceLocation | None = None
         self._detail_mode = "chunk"
@@ -131,6 +137,9 @@ class CodeIndexingApp(App[int]):
         self._search_started = 0.0
         self._index_project: ProjectInfo | None = None
         self._index_started = 0.0
+        self._live_progress: IndexProgress | None = None
+        self._external_indexing = False
+        self._poll_tick = 0
         self._error_retry: Callable[[], None] | None = None
         self._progress_pending = False
 
@@ -154,6 +163,7 @@ class CodeIndexingApp(App[int]):
                 allow_blank=False,
             )
             yield Button("Index F5", id="index-button")
+            yield Button("Activity", id="activity-button")
             yield Button("Configure", id="configure-button")
 
         with Horizontal(id="query-bar"):
@@ -164,6 +174,7 @@ class CodeIndexingApp(App[int]):
         with Horizontal(id="pane-switch"):
             yield Button("Results", id="results-view")
             yield Button("Details", id="details-view")
+            yield Button("Activity", id="activity-view")
 
         with Horizontal(id="main-container"):
             with Vertical(id="results-pane"):
@@ -188,9 +199,12 @@ class CodeIndexingApp(App[int]):
                         "  r      Find references\n"
                         "  i      Show impact radius\n"
                         "  F5     Index project\n"
+                        "  a      Indexing & process trace\n"
                         "  q      Quit",
                         id="detail-content",
                     )
+
+            yield IndexingActivityPanel(show_actions=True, id="activity-pane")
 
         yield Static("", id="progress-bar", markup=False)
         with Vertical(id="error-panel"):
@@ -206,6 +220,7 @@ class CodeIndexingApp(App[int]):
     def on_mount(self) -> None:
         self.screen_stack[0].query_one("#error-panel").display = False
         self.screen_stack[0].query_one("#progress-bar").display = False
+        self.screen_stack[0].query_one("#activity-pane").display = False
         self._activity_timer = self.set_interval(0.25, self._poll_activity)
         self.screen_stack[0].query_one("#detail-list").display = False
         self._update_search_mode()
@@ -229,6 +244,7 @@ class CodeIndexingApp(App[int]):
         self._search_request_id += 1
         self._detail_request_id += 1
         self._project_request_id += 1
+        self._activity_request_id += 1
         super().exit(result, return_code, message)
 
     def _call_from_worker(self, callback: Callable[..., None], *args: Any, **kwargs: Any) -> None:
@@ -272,6 +288,10 @@ class CodeIndexingApp(App[int]):
         select.set_options(options)
         if selected is not None:
             select.value = selected.id
+            if self._main_screen_has("#activity-pane"):
+                self.screen_stack[0].query_one("#activity-pane", IndexingActivityPanel).set_project(
+                    selected
+                )
             self._update_header(selected, status)
             self._set_status("Ready")
             self.action_focus_query()
@@ -353,6 +373,7 @@ class CodeIndexingApp(App[int]):
             "show_impact",
             "copy_location",
             "open_editor",
+            "toggle_activity",
             "quit_app",
         }:
             return None
@@ -371,9 +392,11 @@ class CodeIndexingApp(App[int]):
         elif event.widget.id == "detail-list":
             hint = "Enter Open source · Esc Back · y Copy path · e Editor"
         elif event.widget.id == "results-list":
-            hint = "Enter Details · o Outline · r References · i Impact · / Search"
+            hint = "Enter Details · o Outline · r References · i Impact · a Activity · / Search"
+        elif self._activity_visible:
+            hint = "F5 Index · Esc Back to search · / Search · ? Help"
         else:
-            hint = "Tab Next control · Shift+Tab Previous · Esc Back · ? Help"
+            hint = "Tab Next control · Shift+Tab Previous · a Activity · Esc Back · ? Help"
         self.screen_stack[0].query_one("#context-help", Static).update(hint)
         self.refresh_bindings()
 
@@ -439,15 +462,45 @@ class CodeIndexingApp(App[int]):
             self._update_layout(event.size.width)
 
     def _update_layout(self, width: int | None = None) -> None:
+        if not self._main_screen_has(
+            "#pane-switch", "#results-pane", "#detail-pane", "#activity-pane"
+        ):
+            return
         compact = (self.size.width if width is None else width) < 100
         self.set_class(compact, "compact")
         self.screen_stack[0].query_one("#pane-switch").display = compact
-        self.screen_stack[0].query_one("#results-pane").display = (
-            not compact or not self._detail_visible
-        )
-        self.screen_stack[0].query_one("#detail-pane").display = not compact or self._detail_visible
+        if self._activity_visible:
+            self.screen_stack[0].query_one("#results-pane").display = False
+            self.screen_stack[0].query_one("#detail-pane").display = False
+            self.screen_stack[0].query_one("#activity-pane").display = True
+        else:
+            self.screen_stack[0].query_one("#activity-pane").display = False
+            self.screen_stack[0].query_one("#results-pane").display = (
+                not compact or not self._detail_visible
+            )
+            self.screen_stack[0].query_one("#detail-pane").display = (
+                not compact or self._detail_visible
+            )
+
+    def _set_activity_visible(self, visible: bool, *, focus_panel: bool = True) -> None:
+        if not self.screen_stack:
+            return
+        self._activity_visible = visible
+        self._update_layout()
+        if visible:
+            self._refresh_process_snapshot()
+            if focus_panel and self._main_screen_has("#activity-scroll"):
+                self.screen_stack[0].query_one("#activity-scroll", VerticalScroll).focus()
+        elif focus_panel:
+            self._show_pane(self._detail_visible)
+
+    def action_toggle_activity(self) -> None:
+        if isinstance(self.focused, Input):
+            return
+        self._set_activity_visible(not self._activity_visible)
 
     def _show_pane(self, details: bool) -> None:
+        self._activity_visible = False
         self._detail_visible = details
         self._update_layout()
         if details:
@@ -479,13 +532,21 @@ class CodeIndexingApp(App[int]):
         if project is None:
             return
         self._detail_visible = False
+        self._activity_visible = False
+        self._live_progress = None
+        self._external_indexing = False
         self._update_layout()
         self.service.select_project(project)
+        if self._main_screen_has("#activity-pane"):
+            self.screen_stack[0].query_one("#activity-pane", IndexingActivityPanel).set_project(
+                project
+            )
         self._search_phase = None
         self._error_retry = None
         self._clear_error()
         self._project_request_id += 1
         self._search_request_id += 1
+        self._activity_request_id += 1
         self._hits = []
         self._highlighted_index = None
         self.screen_stack[0].query_one("#results-list", OptionList).clear_options()
@@ -533,15 +594,29 @@ class CodeIndexingApp(App[int]):
             self._error_retry()
         if event.button.id in {"results-view", "details-view"}:
             self._show_pane(event.button.id == "details-view")
+        if event.button.id == "activity-view":
+            self._set_activity_visible(True)
+        if event.button.id == "activity-button":
+            self.action_toggle_activity()
         if event.button.id == "index-button":
             self.action_trigger_index()
         if event.button.id == "configure-button":
             self.action_open_configure()
 
+    def on_click(self, event: events.Click) -> None:
+        if not self.is_running:
+            return
+        if event.widget and event.widget.id == "progress-bar":
+            self._set_activity_visible(True)
+
     def action_focus_query(self) -> None:
         self.screen_stack[0].query_one("#query-input", Input).focus()
 
     def action_escape_action(self) -> None:
+        if self._activity_visible and not isinstance(self.focused, Input):
+            self._set_activity_visible(False)
+            self._set_status("Returned to search view.")
+            return
         if (self._history or self._pending_detail) and not isinstance(self.focused, Input):
             self.action_detail_back()
             return
@@ -581,6 +656,7 @@ class CodeIndexingApp(App[int]):
         self._search_project = project
         self._search_phase = "Checking index"
         self._search_started = time.monotonic()
+        self._activity_visible = False
         self._detail_visible = False
         self._update_layout()
         self._clear_details("Searching… Select a result to preview its source.")
@@ -1089,8 +1165,65 @@ class CodeIndexingApp(App[int]):
         self._set_detail_entries(entries)
         self._set_status(f"Impact graph loaded: {impact.visited} declaration(s) analyzed.")
 
+    def on_indexing_activity_panel_index_requested(
+        self, event: IndexingActivityPanel.IndexRequested
+    ) -> None:
+        if not self.is_running:
+            return
+        if self._is_indexing:
+            self._set_status("Index already in progress...")
+            return
+        proj = self.service.selected_project
+        if proj is None:
+            self._show_error("No project selected to index.", retry=None)
+            return
+        self._start_index(proj, force=event.force)
+
+    def on_indexing_activity_panel_refresh_requested(
+        self, _event: IndexingActivityPanel.RefreshRequested
+    ) -> None:
+        if self.is_running:
+            self._refresh_process_snapshot(refresh_model=True)
+            self._set_status("Refreshed process and run trace.")
+
+    def on_indexing_activity_panel_close_requested(
+        self, _event: IndexingActivityPanel.CloseRequested
+    ) -> None:
+        if self.is_running:
+            self._set_activity_visible(False)
+            self._set_status("Returned to search view.")
+
+    def _refresh_process_snapshot(self, *, refresh_model: bool = False) -> None:
+        self._activity_request_id += 1
+        self._load_process_snapshot(
+            self._activity_request_id,
+            self.service.selected_project,
+            refresh_model,
+        )
+
+    @work(thread=True, exclusive=True, group="activity-snapshot")
+    def _load_process_snapshot(
+        self, request_id: int, project: ProjectInfo | None, refresh_model: bool
+    ) -> None:
+        try:
+            snapshot = self.service.process_snapshot(project, refresh_model=refresh_model)
+            self._call_from_worker(self._apply_process_snapshot, request_id, snapshot)
+        except Exception:
+            pass
+
+    def _apply_process_snapshot(self, request_id: int, snapshot: ProcessSnapshot) -> None:
+        if (
+            self.screen_stack
+            and request_id == self._activity_request_id
+            and self._main_screen_has("#activity-pane")
+        ):
+            self.screen_stack[0].query_one(
+                "#activity-pane", IndexingActivityPanel
+            ).set_process_snapshot(snapshot)
+
     def action_trigger_index(self) -> None:
         if self._is_indexing:
+            self._set_activity_visible(True)
             self._set_status("Index already in progress...")
             return
         proj = self.service.selected_project
@@ -1150,47 +1283,75 @@ class CodeIndexingApp(App[int]):
         except (OSError, ValueError, CodeIndexingError) as exc:
             self._show_error(str(exc), retry=self.action_open_configure)
 
-    def _start_index(self, proj: ProjectInfo) -> None:
+    def _start_index(self, proj: ProjectInfo, *, force: bool = False) -> None:
         if self._is_indexing:
             self._set_status("Index already in progress...")
             return
 
         def retry() -> None:
-            self._start_index(proj)
+            self._start_index(proj, force=force)
 
         self._clear_error()
         self._index_project = proj
         self._index_started = time.monotonic()
+        self._live_progress = None
         self._is_indexing = True
         self.screen_stack[0].query_one("#index-button", Button).disabled = True
+        if self._main_screen_has("#activity-pane"):
+            panel = self.screen_stack[0].query_one("#activity-pane", IndexingActivityPanel)
+            panel.set_project(proj)
+            panel.mark_starting("Forcing full reindex" if force else "Starting incremental index")
+        self._set_activity_visible(True)
         self._show_activity()
         self._set_status(f"Starting index for {proj.name}...")
-        self._run_index_worker(proj, retry)
+        self._run_index_worker(proj, force, retry)
 
     @work(thread=True, exclusive=True, group="index")
-    def _run_index_worker(self, project: ProjectInfo, retry: Callable[[], None]) -> None:
+    def _run_index_worker(
+        self, project: ProjectInfo, force: bool, retry: Callable[[], None]
+    ) -> None:
         try:
-            report = self.service.index_project(project)
+            report = self.service.index_project(project, force=force)
             status = self.service.project_status(project)
             self._call_from_worker(self._on_index_complete, project, status, report)
         except Exception as exc:
             self._call_from_worker(self._on_index_failed, f"Indexing failed: {exc}", retry)
 
-    def _show_activity(self, detail: str = "") -> None:
-        if not self.screen_stack:
+    def _show_activity(self) -> None:
+        if not self.screen_stack or not self._main_screen_has("#progress-bar"):
             return
         bar = self.screen_stack[0].query_one("#progress-bar", Static)
         if self._is_indexing and self._index_project:
-            label = f"Indexing {self._index_project.name}"
-            started = self._index_started
+            prefix = f"Indexing {self._index_project.name}"
+            elapsed = time.monotonic() - self._index_started
+            progress = self._live_progress
         elif self._search_phase:
-            label = self._search_phase
-            started = self._search_started
+            prefix = self._search_phase
+            elapsed = time.monotonic() - self._search_started
+            progress = self._live_progress if self._search_phase == "Preparing index" else None
+        elif self._external_indexing and self._live_progress is not None:
+            proj = self.service.selected_project
+            name = proj.name if proj is not None else self._live_progress.project_id
+            prefix = f"Background index · {name}"
+            elapsed = (
+                max(0.0, time.time() - self._live_progress.started_at)
+                if self._live_progress.started_at > 0
+                else 0.0
+            )
+            progress = self._live_progress
         else:
             bar.display = False
             return
         bar.display = True
-        bar.update(f"{label} · {time.monotonic() - started:.0f}s{detail}")
+        bar.update(
+            format_compact_progress_strip(
+                progress,
+                prefix=prefix,
+                elapsed_seconds=elapsed,
+                tick=self._poll_tick,
+                include_shortcut=not self._activity_visible,
+            )
+        )
 
     def _poll_activity(self) -> None:
         if (
@@ -1199,38 +1360,89 @@ class CodeIndexingApp(App[int]):
             or not self.screen_stack[0].query("#progress-bar")
         ):
             return
+        self._poll_tick += 1
+        if self._main_screen_has("#activity-pane"):
+            self.screen_stack[0].query_one("#activity-pane", IndexingActivityPanel).tick()
         self._show_activity()
-        project = self._index_project if self._is_indexing else self._search_project
-        if not self._progress_pending and project and (self._is_indexing or self._search_phase):
+        project = (
+            self._index_project
+            if self._is_indexing
+            else self._search_project
+            if self._search_phase
+            else self.service.selected_project
+        )
+        should_probe = (
+            self._is_indexing
+            or bool(self._search_phase)
+            or self._external_indexing
+            or self._activity_visible
+            or self._poll_tick % 4 == 0
+        )
+        if not self._progress_pending and project and should_probe:
             self._progress_pending = True
             self._read_activity(project, self._search_request_id)
 
     @work(thread=True, group="progress")
     def _read_activity(self, project: ProjectInfo, search_id: int) -> None:
-        detail = ""
+        progress: IndexProgress | None = None
         try:
             progress = self.service.index_progress(project)
-            if progress and (self._is_indexing or self._search_phase == "Preparing index"):
-                detail = (
-                    f" · {progress.phase} · {progress.candidates_seen} files"
-                    f" · {progress.chunks_embedded} chunks embedded"
-                )
         except Exception:
             # A progress probe must not hide the outcome of the actual operation.
-            pass
+            progress = None
         finally:
-            self._call_from_worker(self._activity_ready, search_id, detail)
+            self._call_from_worker(self._activity_ready, project, search_id, progress)
 
-    def _activity_ready(self, search_id: int, detail: str) -> None:
+    def _activity_ready(
+        self, project: ProjectInfo, search_id: int, progress: IndexProgress | None
+    ) -> None:
         self._progress_pending = False
-        if search_id == self._search_request_id or self._is_indexing:
-            self._show_activity(detail)
+        if not self.screen_stack:
+            return
+        own_run = self._is_indexing or self._search_phase == "Preparing index"
+        # Cross-process snapshots always stamp updated_at > 0; synthetic test
+        # stubs leave updated_at == 0 when idle.
+        external_run = not own_run and progress is not None and progress.updated_at > 0
+
+        if own_run and (self._is_indexing or search_id == self._search_request_id):
+            self._live_progress = progress
+            self._external_indexing = False
+            if progress is not None and self._main_screen_has("#activity-pane"):
+                self.screen_stack[0].query_one(
+                    "#activity-pane", IndexingActivityPanel
+                ).set_live_progress(progress)
+            self._show_activity()
+            return
+
+        if project != self.service.selected_project:
+            return
+
+        was_external = self._external_indexing
+        self._external_indexing = external_run
+        self._live_progress = progress if external_run else None
+        if self._main_screen_has("#activity-pane"):
+            panel = self.screen_stack[0].query_one("#activity-pane", IndexingActivityPanel)
+            if external_run and progress is not None:
+                panel.set_live_progress(progress)
+            elif was_external and not external_run:
+                panel.set_live_progress(None)
+        if was_external and not external_run:
+            self._project_request_id += 1
+            self._load_project_status(self._project_request_id, project)
+            self._refresh_process_snapshot()
+        self._show_activity()
 
     def _on_index_complete(self, project: ProjectInfo, status: ProjectStatus, report: Any) -> None:
         if not self.screen_stack:
             return
         self._is_indexing = False
+        self._live_progress = None
         self.screen_stack[0].query_one("#index-button", Button).disabled = False
+        if self._main_screen_has("#activity-pane") and self.service.selected_project == project:
+            self.screen_stack[0].query_one(
+                "#activity-pane", IndexingActivityPanel
+            ).set_completed_report(report)
+            self._refresh_process_snapshot()
         self._show_activity()
         if self.service.selected_project == project:
             self._project_request_id += 1
@@ -1245,6 +1457,12 @@ class CodeIndexingApp(App[int]):
         if not self.screen_stack:
             return
         self._is_indexing = False
+        self._live_progress = None
         self.screen_stack[0].query_one("#index-button", Button).disabled = False
+        if self._main_screen_has("#activity-pane"):
+            self.screen_stack[0].query_one("#activity-pane", IndexingActivityPanel).set_failed(
+                error_message
+            )
+            self._refresh_process_snapshot()
         self._show_activity()
         self._show_error(error_message, retry=retry)

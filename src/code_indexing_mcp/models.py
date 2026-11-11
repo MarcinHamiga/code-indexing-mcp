@@ -1177,6 +1177,16 @@ class IndexProgress(BaseModel):
     selector: str | None = None
     expected_head: str | None = None
     activation_epoch: int | None = None
+    # Live backend, cache-reuse, memory, and per-phase telemetry so UIs and
+    # external watchers can trace execution while a run is still in flight.
+    embedding_backend: str | None = None
+    embedding_fallback_reason: str | None = None
+    reused_candidates: int = 0
+    reused_segments: int = 0
+    peak_memory_bytes: int | None = None
+    memory_budget_bytes: int | None = None
+    phase_durations_ms: dict[str, int] = Field(default_factory=dict)
+    recent_errors: list[IndexIssue] = Field(default_factory=list)
 
     @property
     def fraction(self) -> float | None:
