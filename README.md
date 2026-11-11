@@ -132,6 +132,11 @@ if planning falls back, the resolved backend is what gets selected. `--accelerat
 an older runtime override. An explicit `--set CODE_INDEXING_EMBED_ACCELERATOR=...` takes precedence
 when preparing one backend but selecting another is intentional.
 
+Commands run outside a configured harness, such as `code-indexing-mcp index` from a shell, see no
+such setting. When `CODE_INDEXING_EMBED_ACCELERATOR` is unset they use the experimental backend
+the installer prepared, so the CLI and the harnesses index on the same device. Setting the
+variable, even to `auto`, takes precedence.
+
 Detection that finds nothing, an environment that cannot be built, and a probe that does not
 pass all leave the installation on CPU and report why. Nothing here changes system drivers,
 and no package is ever installed while the server is running. See

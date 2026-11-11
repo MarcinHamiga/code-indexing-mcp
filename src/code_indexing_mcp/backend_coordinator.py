@@ -30,6 +30,7 @@ from .backends import (
     Accelerator,
     BackendDescriptor,
     BackendSelection,
+    Stability,
     available_execution_providers,
     backend_for,
     describe_environment,
@@ -144,9 +145,7 @@ class BackendCoordinator:
             prepared = backend_for(record.accelerator)
             if prepared is not None and prepared.provider in record.providers:
                 providers.append(prepared.provider)
-        selection = select_backend(
-            self.settings.embedding_accelerator, available_providers=providers
-        )
+        selection = select_backend(self._requested_accelerator(), available_providers=providers)
         if record is not None and selection.uses_accelerator:
             selection = selection.described_as(apply_environment(selection.descriptor, record))
         rejection = self.accelerator_environment.reason
@@ -155,6 +154,35 @@ class BackendCoordinator:
             # better than "no accelerator is prepared" does.
             selection = selection.diagnosed(rejection)
         return selection
+
+    def _requested_accelerator(self) -> Accelerator:
+        """Return the accelerator to ask selection for.
+
+        The installer writes its ``--accelerator`` choice into every harness it
+        configures, but a process started outside one (``index`` from a shell,
+        or the daemon that shell starts) sees no such variable. ``auto`` passes
+        over a backend below automatic stability, so that process would index on
+        CPU beside a prepared accelerator. Such a backend is only ever prepared
+        by naming it to the installer, so its record is the explicit request
+        when the variable is unset. A variable that is set, even to ``auto``,
+        is the operator's answer and is left alone.
+        """
+        requested = self.settings.embedding_accelerator
+        record = self.accelerator_environment.environment
+        if (
+            requested is not Accelerator.AUTO
+            or self.settings.embedding_accelerator_configured
+            or record is None
+        ):
+            return requested
+        prepared = backend_for(record.accelerator)
+        if (
+            prepared is None
+            or prepared.stability is Stability.AUTOMATIC
+            or prepared.provider not in record.providers
+        ):
+            return requested
+        return record.accelerator
 
     def _runs_externally(self, descriptor: BackendDescriptor) -> bool:
         """Whether a worker for *descriptor* needs the prepared environment.

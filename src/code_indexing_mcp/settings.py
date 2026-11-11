@@ -151,6 +151,11 @@ class IndexSettings:
     index_execution: str
     broker_mode: str
     embedding_accelerator: Accelerator = Accelerator.AUTO
+    # True when CODE_INDEXING_EMBED_ACCELERATOR was set at all, even to ``auto``.
+    # Only an unset variable lets the installer's prepared backend stand in as
+    # the request: a process no harness configured (the CLI run from a shell)
+    # has no other way to learn what the installer was asked for.
+    embedding_accelerator_configured: bool = False
     # True when the batch size was left to the runtime, which lets calibration
     # raise it for a backend that was measured to handle more.
     embedding_batch_auto: bool = True
@@ -228,7 +233,8 @@ class IndexSettings:
         )
         batch_size, batch_auto = _batch_size(environment)
         crossover, crossover_auto = _crossover(environment)
-        accelerator = parse_accelerator(environment.get("CODE_INDEXING_EMBED_ACCELERATOR", "auto"))
+        raw_accelerator = environment.get("CODE_INDEXING_EMBED_ACCELERATOR")
+        accelerator = parse_accelerator("auto" if raw_accelerator is None else raw_accelerator)
 
         return cls(
             mode=mode,
@@ -244,6 +250,7 @@ class IndexSettings:
             embedding_crossover_auto=crossover_auto,
             embedding_calibrate=_boolean(environment, "CODE_INDEXING_EMBED_CALIBRATE", True),
             embedding_accelerator=accelerator,
+            embedding_accelerator_configured=raw_accelerator is not None,
             embedding_strict=_boolean(environment, "CODE_INDEXING_EMBED_STRICT", False),
             # Sequence length, not character count, drives embedding memory:
             # attention is quadratic in tokens. 1,024 keeps the widest window

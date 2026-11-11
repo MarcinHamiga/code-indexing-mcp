@@ -1494,6 +1494,48 @@ def test_a_record_offers_only_the_accelerator_it_was_probed_for(tmp_path: Path) 
     ).backend_selection.accelerator is (Accelerator.CUDA)
 
 
+def test_an_unset_accelerator_follows_the_experimental_backend_the_installer_prepared(
+    tmp_path: Path,
+) -> None:
+    """A shell has no harness environment; the record is the installer's request.
+
+    ``auto`` never selects an experimental backend, so without this the CLI
+    indexes on CPU beside the accelerator every configured harness uses.
+    """
+    _prepared_cuda_environment(
+        tmp_path,
+        accelerator=Accelerator.WEBGPU,
+        providers=("WebGpuExecutionProvider", "CPUExecutionProvider"),
+    )
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    assert app.backend_selection.accelerator is Accelerator.WEBGPU
+    status = app.model_status()
+    assert status.requested_accelerator == "webgpu"
+    assert status.resolved_accelerator == "webgpu"
+    assert status.fallback_reason is None
+
+
+def test_an_accelerator_set_to_auto_keeps_an_experimental_backend_unselected(
+    tmp_path: Path,
+) -> None:
+    """A variable that is set, even to ``auto``, is the operator's own answer."""
+    _prepared_cuda_environment(
+        tmp_path,
+        accelerator=Accelerator.WEBGPU,
+        providers=("WebGpuExecutionProvider", "CPUExecutionProvider"),
+    )
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = IndexSettings.from_environment({"CODE_INDEXING_EMBED_ACCELERATOR": "auto"})
+
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+
+    assert app.backend_selection.accelerator is Accelerator.CPU
+    assert app.model_status().requested_accelerator == "auto"
+
+
 def test_storage_status_reports_registry_project_and_totals(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
