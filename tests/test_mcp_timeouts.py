@@ -457,6 +457,14 @@ async def test_daemon_build_survives_stdio_client_exit_and_reconnect(
                 result = await receive(second, "find")
                 assert not result["result"].get("isError", False)
                 assert result["result"]["structuredContent"]["hits"][0]["symbol"] == "answer"
+                # The slot enters ready during commit, before the background job
+                # finishes its post-run storage snapshot and history write.
+                await _wait_until(
+                    lambda: (
+                        bool(runs := app.index_history(project).runs)
+                        and all(run.state != "running" for run in runs)
+                    )
+                )
                 runs = app.index_history(project).runs
                 assert len(runs) == 1 and runs[0].state == "completed"
             finally:

@@ -101,6 +101,7 @@ class ChunkRow:
     identifier_terms: str
     part_index: int
     vector: bytes
+    is_test: bool = False
     content_hash: str = ""
     source_start_byte: int | None = None
     source_end_byte: int | None = None

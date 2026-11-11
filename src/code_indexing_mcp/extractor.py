@@ -43,6 +43,7 @@ from .models import (
     ParameterShape,
     ReferenceKind,
 )
+from .test_detection import TestClassification, classify_test_ranges
 
 MAX_CONTEXT_FIELD_CHARS: Final = 512
 
@@ -649,6 +650,7 @@ class TreeSitterExtractor:
                 language, tree.root_node, normalized_source, index, line_index, parents
             )
             reference_extraction_ns = time.monotonic_ns() - started
+        test_ranges = classify_test_ranges(path, language, tree.root_node, normalized_source)
         chunks: list[ExtractedChunk] = []
         covered: list[tuple[int, int]] = []
 
@@ -658,6 +660,7 @@ class TreeSitterExtractor:
             outer = self._outer_node(definition.node)
             if not self._has_definition_ancestor(definition.node, index, parents):
                 covered.append((outer.start_byte, outer.end_byte))
+            definition_is_test = test_ranges.contains_range(outer.start_byte, outer.end_byte)
             kind, parent, qualified = self._symbol_context(definition, index, parents)
             start, end = self._content_range(outer, definition.node, kind, index)
             chunks.extend(
@@ -672,28 +675,39 @@ class TreeSitterExtractor:
                     start=start,
                     end=end,
                     line_index=line_index,
+                    is_test=definition_is_test,
                 )
             )
             for gap_start, gap_end in self._container_gaps(
                 outer, definition.node, kind, index, normalized_source
             ):
-                chunks.extend(
-                    self._chunks_for_range(
-                        path=path,
-                        language=language,
-                        kind=kind,
-                        symbol=definition.name,
-                        qualified=qualified,
-                        parent=parent,
-                        source=normalized_source,
-                        start=gap_start,
-                        end=gap_end,
-                        line_index=line_index,
-                        always_part=True,
-                    )
+                gap_segments = (
+                    [(gap_start, gap_end, True)]
+                    if definition_is_test
+                    else test_ranges.split_uncovered_range(gap_start, gap_end)
                 )
+                for seg_start, seg_end, seg_is_test in gap_segments:
+                    if seg_start < seg_end and _has_text(normalized_source, seg_start, seg_end):
+                        chunks.extend(
+                            self._chunks_for_range(
+                                path=path,
+                                language=language,
+                                kind=kind,
+                                symbol=definition.name,
+                                qualified=qualified,
+                                parent=parent,
+                                source=normalized_source,
+                                start=seg_start,
+                                end=seg_end,
+                                line_index=line_index,
+                                always_part=True,
+                                is_test=seg_is_test,
+                            )
+                        )
 
-        chunks.extend(self._module_chunks(path, language, normalized_source, covered, line_index))
+        chunks.extend(
+            self._module_chunks(path, language, normalized_source, covered, line_index, test_ranges)
+        )
         check_parent_memory_budget()
         chunks.sort(key=lambda chunk: (chunk.start_byte, chunk.end_byte, chunk.kind))
         return ExtractionResult(
@@ -5044,6 +5058,7 @@ class TreeSitterExtractor:
         end: int,
         line_index: _LineIndex,
         always_part: bool = False,
+        is_test: bool = False,
     ) -> list[ExtractedChunk]:
         content = source[start:end].decode("utf-8").rstrip()
         start_line = line_index.line_at(start)
@@ -5062,6 +5077,7 @@ class TreeSitterExtractor:
                     start_line,
                     content,
                     0,
+                    is_test=is_test,
                 )
             ]
 
@@ -5111,6 +5127,7 @@ class TreeSitterExtractor:
                             start_line + cursor,
                             fragment_content,
                             part,
+                            is_test=is_test,
                         )
                     )
                     part += 1
@@ -5133,6 +5150,7 @@ class TreeSitterExtractor:
                         start_line + cursor,
                         part_content,
                         part,
+                        is_test=is_test,
                     )
                 )
                 part += 1
@@ -5168,41 +5186,38 @@ class TreeSitterExtractor:
         source: bytes,
         covered: list[tuple[int, int]],
         line_index: _LineIndex,
+        test_ranges: TestClassification,
     ) -> list[ExtractedChunk]:
         chunks: list[ExtractedChunk] = []
+
+        def emit_uncovered(gap_start: int, gap_end: int) -> None:
+            for seg_start, seg_end, seg_is_test in test_ranges.split_uncovered_range(
+                gap_start, gap_end
+            ):
+                if seg_start < seg_end and _has_text(source, seg_start, seg_end):
+                    chunks.extend(
+                        self._chunks_for_range(
+                            path=path,
+                            language=language,
+                            kind="module",
+                            symbol=None,
+                            qualified=None,
+                            parent=None,
+                            source=source,
+                            start=seg_start,
+                            end=seg_end,
+                            line_index=line_index,
+                            is_test=seg_is_test,
+                        )
+                    )
+
         cursor = 0
         for start, end in sorted(covered):
-            if cursor < start and _has_text(source, cursor, start):
-                chunks.extend(
-                    self._chunks_for_range(
-                        path=path,
-                        language=language,
-                        kind="module",
-                        symbol=None,
-                        qualified=None,
-                        parent=None,
-                        source=source,
-                        start=cursor,
-                        end=start,
-                        line_index=line_index,
-                    )
-                )
+            if cursor < start:
+                emit_uncovered(cursor, start)
             cursor = max(cursor, end)
-        if cursor < len(source) and _has_text(source, cursor, len(source)):
-            chunks.extend(
-                self._chunks_for_range(
-                    path=path,
-                    language=language,
-                    kind="module",
-                    symbol=None,
-                    qualified=None,
-                    parent=None,
-                    source=source,
-                    start=cursor,
-                    end=len(source),
-                    line_index=line_index,
-                )
-            )
+        if cursor < len(source):
+            emit_uncovered(cursor, len(source))
         return chunks
 
     @staticmethod
@@ -5218,6 +5233,8 @@ class TreeSitterExtractor:
         start_line: int,
         content: str,
         part_index: int,
+        *,
+        is_test: bool = False,
     ) -> ExtractedChunk:
         check_parent_memory_budget()
         # Identity metadata remains exact; repeated embedding/search context has
@@ -5246,6 +5263,7 @@ class TreeSitterExtractor:
             embedding_text=embedding_text,
             search_text=f"{embedding_text}\n{normalized}",
             part_index=part_index,
+            is_test=is_test,
             embedding_prefix=prefix,
             search_suffix=normalized,
         )

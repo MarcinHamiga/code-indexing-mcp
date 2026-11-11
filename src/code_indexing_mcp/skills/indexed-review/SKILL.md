@@ -34,7 +34,7 @@ Scope is `$scope` (a directory, module, feature, or symbol set). If scope is emp
 
 This is the core rule of this skill: **use the code-indexing-mcp tools as the primary navigation and analysis mechanism. Do not fall back to Grep/Glob for code exploration.**
 
-- `mcp__code-indexing-mcp__search_code` — semantic natural-language queries to find relevant code for the angle (see playbooks below). Issue several targeted queries, not one broad one.
+- `mcp__code-indexing-mcp__search_code` — semantic natural-language queries to find relevant code for the angle (see playbooks below; `scope` defaults to `"code"`, so pass `scope="tests"` or `"all"` when reviewing testing coverage). Issue several targeted queries, not one broad one.
 - `mcp__code-indexing-mcp__file_outline` — get a file's structure before reading it; decide which parts matter instead of dumping whole files.
 - `mcp__code-indexing-mcp__changed_symbols` — when the scope is recent changes, list the declarations touched since a base (`since` a branch or commit, default uncommitted work) instead of reading the diff file by file.
 - `mcp__code-indexing-mcp__find_symbol` — resolve a function/class name to its definitions when evaluating impact or correctness. It matches declaration names only; use `mcp__code-indexing-mcp__find_references` for call sites.

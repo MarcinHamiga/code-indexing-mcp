@@ -35,7 +35,7 @@ The core rule of this skill: **map usages with the index tools, not with grep.**
 
 Semantic search finds what name-based lookup misses:
 
-- `mcp__code-indexing-mcp__search_code` — targeted queries for re-exports and wrappers around the symbol, duck-typed or dynamic call sites, serialization or config that names it, and tests that exercise it indirectly.
+- `mcp__code-indexing-mcp__search_code` — targeted queries for re-exports and wrappers around the symbol, duck-typed or dynamic call sites, serialization or config that names it, and (with `scope="tests"`) tests that exercise it indirectly (`scope` defaults to `"code"`).
 - Grep is allowed only for literal string occurrences of the exact name (reflection, registries, config keys) — say so when you use it.
 
 ## 5. Report

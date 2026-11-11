@@ -148,10 +148,13 @@ class FakeApplication:
         languages: list[str] | None = None,
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
+        scope: str = "code",
         limit: int = 8,
         roots: list[Path] | None = None,
     ) -> SearchResponse:
-        self.search_calls.append({"query": query, "projects": projects, "limit": limit})
+        self.search_calls.append(
+            {"query": query, "projects": projects, "scope": scope, "limit": limit}
+        )
         return SearchResponse(query=query, hits=[_sample_hit()])
 
     def find_symbol(
@@ -161,10 +164,13 @@ class FakeApplication:
         *,
         match: str = "exact",
         kinds: list[str] | None = None,
+        scope: str = "code",
         limit: int = 20,
         roots: list[Path] | None = None,
     ) -> SymbolResponse:
-        self.symbol_calls.append({"name": name, "project": project, "match": match, "limit": limit})
+        self.symbol_calls.append(
+            {"name": name, "project": project, "match": match, "scope": scope, "limit": limit}
+        )
         return SymbolResponse(name=name, hits=[_sample_hit(symbol=name)])
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:

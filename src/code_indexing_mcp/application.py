@@ -40,6 +40,7 @@ from .indexing import Indexer
 from .maintenance import MaintenanceService
 from .models import (
     SCAN_SKIP_REASONS,
+    SEARCH_SCOPES,
     ChangedFile,
     ChangedSymbolsResponse,
     CodeChunk,
@@ -67,6 +68,7 @@ from .models import (
     ScanInspectionPage,
     ScannedFile,
     SearchResponse,
+    SearchScope,
     SkippedFile,
     StorageStatus,
     StoredFile,
@@ -272,6 +274,7 @@ class ApplicationLike(Protocol):
         languages: list[str] | None = None,
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
+        scope: SearchScope = "code",
         limit: int = 8,
         roots: list[Path] | None = None,
     ) -> SearchResponse: ...
@@ -286,6 +289,7 @@ class ApplicationLike(Protocol):
         languages: list[str] | None = None,
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
+        scope: SearchScope = "code",
         limit: int = 8,
         roots: list[Path] | None = None,
     ) -> ExampleSearchResponse: ...
@@ -359,6 +363,7 @@ class ApplicationLike(Protocol):
         *,
         match: str = "exact",
         kinds: list[str] | None = None,
+        scope: SearchScope = "code",
         limit: int = 20,
         roots: list[Path] | None = None,
     ) -> SymbolResponse: ...
@@ -1626,9 +1631,16 @@ class Application:
         languages: list[str] | None = None,
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
+        scope: SearchScope = "code",
         limit: int = 8,
         roots: list[Path] | None = None,
     ) -> SearchResponse:
+        if scope not in SEARCH_SCOPES:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                f"Invalid search scope: {scope!r}; expected 'code', 'tests', or 'all'",
+                scope=scope,
+            )
         resolved = self._scope_checkouts(projects, all_projects, roots)
         project_ids = list(dict.fromkeys(project.id for project in resolved))
 
@@ -1640,6 +1652,7 @@ class Application:
                 languages=languages,
                 paths=paths,
                 kinds=kinds,
+                scope=scope,
                 limit=limit,
                 partitions={
                     project_id: [target.partition for target in targets.get(project_id, ())]
@@ -1662,9 +1675,16 @@ class Application:
         languages: list[str] | None = None,
         paths: list[str] | None = None,
         kinds: list[str] | None = None,
+        scope: SearchScope = "code",
         limit: int = 8,
         roots: list[Path] | None = None,
     ) -> ExampleSearchResponse:
+        if scope not in SEARCH_SCOPES:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                f"Invalid search scope: {scope!r}; expected 'code', 'tests', or 'all'",
+                scope=scope,
+            )
         resolved = self._scope_checkouts(projects, all_projects, roots)
         project_ids = list(dict.fromkeys(project.id for project in resolved))
 
@@ -1677,6 +1697,7 @@ class Application:
                 languages=languages,
                 paths=paths,
                 kinds=kinds,
+                scope=scope,
                 limit=limit,
                 partitions={
                     project_id: [target.partition for target in targets.get(project_id, ())]
@@ -1696,9 +1717,16 @@ class Application:
         *,
         match: str = "exact",
         kinds: list[str] | None = None,
+        scope: SearchScope = "code",
         limit: int = 20,
         roots: list[Path] | None = None,
     ) -> SymbolResponse:
+        if scope not in SEARCH_SCOPES:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                f"Invalid search scope: {scope!r}; expected 'code', 'tests', or 'all'",
+                scope=scope,
+            )
         resolved = self.resolve_project(project, roots)
         return self._run_repository_stable_query(
             [resolved],
@@ -1707,6 +1735,7 @@ class Application:
                 self._primary_target(targets, resolved.id),
                 match=match,
                 kinds=kinds,
+                scope=scope,
                 limit=limit,
             ),
         )
@@ -1718,6 +1747,7 @@ class Application:
         *,
         match: str,
         kinds: list[str] | None,
+        scope: SearchScope,
         limit: int,
     ) -> SymbolResponse:
         self._ensure_query_generations({target.project.id: [target]})
@@ -1726,6 +1756,7 @@ class Application:
             target.project.id,
             match=match,
             kinds=kinds,
+            scope=scope,
             limit=limit,
             partition=target.partition,
         )

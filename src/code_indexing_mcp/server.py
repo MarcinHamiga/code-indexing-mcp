@@ -54,6 +54,7 @@ from .models import (
     ScanInspectionPage,
     SearchAcrossProjectsResponse,
     SearchResponse,
+    SearchScope,
     StorageStatus,
     SymbolResponse,
 )
@@ -74,11 +75,19 @@ SERVER_INSTRUCTIONS = (
     "analyze_refactor (rename or signature impact), file_outline "
     "(file structure before reading), changed_symbols (declarations touched since a commit), "
     "get_chunk (exact code for a "
-    "search hit). When correlating code across explicitly related services, use list_projects "
+    "search hit). Search and symbol tools default to scope='code' (excluding detected C#, Python, "
+    "Java, and Rust tests/benchmarks); pass scope='tests' or scope='all' when inspecting test "
+    "coverage. When correlating code across explicitly related services, use list_projects "
     "to discover them and search_across_projects to search the selected repositories together. "
     "Check list_projects/project_status for index freshness first and run index_project if the "
     "index is missing or stale. If INDEX_BUSY reports background work, poll project_status "
     "and retry when ready; do not restart the server or force another rebuild."
+)
+
+_SCOPE_DESCRIPTION = (
+    "Which indexed chunks to search: 'code' (default) excludes detected tests and benchmarks "
+    "in C#, Python, Java, and Rust; 'tests' returns only detected test/benchmark chunks; "
+    "'all' searches both code and tests."
 )
 
 # Bounds on the retry cadence used while another indexing job holds the global
@@ -1211,6 +1220,7 @@ def create_server(
         languages: list[LanguageName] | None,
         paths: list[str] | None,
         kinds: list[ChunkKind] | None,
+        scope: SearchScope,
         limit: int,
     ) -> SearchResponse:
         await _wait_for_startup_projects(ctx, roots, projects)
@@ -1226,6 +1236,7 @@ def create_server(
             languages=selected_languages,
             paths=paths,
             kinds=selected_kinds,
+            scope=scope,
             limit=limit,
             # Preserve the resolved checkout scope through the ID-based API.
             roots=_unique_project_roots([project.root for project in projects]),
@@ -1240,6 +1251,7 @@ def create_server(
         languages: list[LanguageName] | None,
         paths: list[str] | None,
         kinds: list[ChunkKind] | None,
+        scope: SearchScope,
         limit: int,
     ) -> ExampleSearchResponse:
         await _wait_for_startup_projects(ctx, roots, projects)
@@ -1254,6 +1266,7 @@ def create_server(
             languages=selected_languages,
             paths=paths,
             kinds=selected_kinds,
+            scope=scope,
             limit=limit,
             roots=_unique_project_roots([project.root for project in projects]),
         )
@@ -1710,6 +1723,10 @@ def create_server(
             list[ChunkKind] | None,
             Field(description="Restrict to these chunk kinds."),
         ] = None,
+        scope: Annotated[
+            SearchScope,
+            Field(description=_SCOPE_DESCRIPTION),
+        ] = "code",
         limit: Annotated[
             int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
         ] = 8,
@@ -1726,6 +1743,7 @@ def create_server(
             languages,
             paths,
             kinds,
+            scope,
             limit,
         )
 
@@ -1734,7 +1752,9 @@ def create_server(
         description=(
             "Find indexed code chunks most similar to a pasted code snippet. Extracts declaration "
             "metadata with the production extractor to weight the match, returning ranked code "
-            "snippets with project and path metadata."
+            "snippets with project and path metadata. Defaults to scope='code' (excluding "
+            "detected C#, Python, Java, and Rust tests/benchmarks); pass scope='tests' or 'all' "
+            "to include test chunks."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -1795,6 +1815,10 @@ def create_server(
             list[ChunkKind] | None,
             Field(description="Restrict to these chunk kinds."),
         ] = None,
+        scope: Annotated[
+            SearchScope,
+            Field(description=_SCOPE_DESCRIPTION),
+        ] = "code",
         limit: Annotated[
             int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
         ] = 8,
@@ -1812,6 +1836,7 @@ def create_server(
             languages,
             paths,
             kinds,
+            scope,
             limit,
         )
 
@@ -1821,7 +1846,8 @@ def create_server(
             "Hybrid semantic and keyword search across an explicit set of related projects for "
             "cross-repository debugging. Accepts project ids, unique names, or paths and requires "
             "at least two distinct resolved projects. Returns one globally ranked hit list with "
-            "project metadata; use list_projects first to discover the intended repositories."
+            "project metadata; use list_projects first to discover the intended repositories. "
+            "Defaults to scope='code'; pass scope='tests' or 'all' to include test chunks."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -1889,6 +1915,10 @@ def create_server(
             list[ChunkKind] | None,
             Field(description="Restrict to these chunk kinds across the selected projects."),
         ] = None,
+        scope: Annotated[
+            SearchScope,
+            Field(description=_SCOPE_DESCRIPTION),
+        ] = "code",
         limit: Annotated[
             int,
             Field(
@@ -1925,6 +1955,7 @@ def create_server(
                 languages,
                 paths,
                 kinds,
+                scope,
                 limit,
             )
             return SearchAcrossProjectsResponse(
@@ -1941,6 +1972,7 @@ def create_server(
             languages,
             paths,
             kinds,
+            scope,
             limit,
         )
         return SearchAcrossProjectsResponse(
@@ -1955,7 +1987,9 @@ def create_server(
             "Look up indexed code chunks by symbol name, matching exactly, by prefix, or by "
             "substring. Returns hits ordered by path and line, each with a snippet and a "
             "chunk_id. Matches declaration names only — not call sites, imports, or other "
-            "references. For a conceptual query rather than a known name, search_code applies. A "
+            "references. Defaults to scope='code' (excluding detected C#, Python, Java, and "
+            "Rust tests/benchmarks); pass scope='tests' or 'all' when looking up test symbols. "
+            "For a conceptual query rather than a known name, search_code applies. A "
             "root that is not registered yet is registered and indexed before the first query is "
             "answered; later queries refresh it when source metadata has changed."
         ),
@@ -1995,6 +2029,10 @@ def create_server(
             list[ChunkKind] | None,
             Field(description="Restrict to these chunk kinds."),
         ] = None,
+        scope: Annotated[
+            SearchScope,
+            Field(description=_SCOPE_DESCRIPTION),
+        ] = "code",
         limit: Annotated[
             int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
         ] = 20,
@@ -2009,6 +2047,7 @@ def create_server(
             resolved.id,
             match=match,
             kinds=selected_kinds,
+            scope=scope,
             limit=limit,
             roots=[resolved.root],
         )

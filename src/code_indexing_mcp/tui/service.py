@@ -30,6 +30,7 @@ from ..models import (
     RunAudit,
     SearchHit,
     SearchResponse,
+    SearchScope,
     SymbolResponse,
 )
 from ..progress import read_all_progress
@@ -253,6 +254,7 @@ class TuiService:
         self,
         query: str,
         *,
+        scope: SearchScope = "code",
         limit: int = 20,
         project: ProjectInfo | None = None,
         on_phase: Callable[[str], None] | None = None,
@@ -268,7 +270,7 @@ class TuiService:
         if on_phase:
             on_phase("Searching")
         return self.application.search_code(
-            query, projects=[target.id], limit=limit, roots=[target.root]
+            query, projects=[target.id], scope=scope, limit=limit, roots=[target.root]
         )
 
     def find_symbol(
@@ -276,6 +278,7 @@ class TuiService:
         name: str,
         *,
         match: str = "exact",
+        scope: SearchScope = "code",
         limit: int = 20,
         project: ProjectInfo | None = None,
         on_phase: Callable[[str], None] | None = None,
@@ -291,7 +294,12 @@ class TuiService:
         if on_phase:
             on_phase("Searching")
         return self.application.find_symbol(
-            name, project=target.id, match=match, limit=limit, roots=[target.root]
+            name,
+            project=target.id,
+            match=match,
+            scope=scope,
+            limit=limit,
+            roots=[target.root],
         )
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:

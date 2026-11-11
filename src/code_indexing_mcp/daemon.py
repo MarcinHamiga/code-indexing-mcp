@@ -61,14 +61,15 @@ from .storage import SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
-# Bumped whenever the RPC surface changes shape (version 6 added changed_symbols;
-# version 5 added dead_code_report;
+# Bumped whenever the RPC surface changes shape (version 7 adds `scope` to
+# search_code, search_by_example, and find_symbol; version 6 added
+# changed_symbols; version 5 added dead_code_report;
 # version 4 added impact_radius;
 # version 3 added chunked responses; version 2 added the `trigger`
 # parameter to index_project): a long-lived daemon from a previous release must
 # reject requests it cannot dispatch instead of failing inside them, and the
 # mismatch is what tells ensure_daemon to retire it and start a current one.
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 # The module the daemon process is started from; see ensure_daemon (DMN-5).
 DAEMON_ENTRY_MODULE = "code_indexing_mcp.daemon_entry"
 MAX_FRAME_BYTES = 16 * 1024**2
