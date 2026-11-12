@@ -90,6 +90,13 @@ class CalibrationResult:
     # speed from one that won by being the last that survived -- and so a
     # recommendation is only made where there is a setting behind it.
     limited_by: str = ""
+    # The largest size that ran, when the size after it failed; 0 when the
+    # sweep ended without a failure. It is kept apart from ``limited_by``
+    # because a sweep looking past a size that did not pay can fail above a
+    # size that won on speed: that is not a limit on the winner, and it is
+    # still the only evidence of where this backend stops for anything that
+    # would ask it for more -- an explicit batch size, say.
+    survived: int = 0
 
     @property
     def load_ms(self) -> int:
@@ -151,6 +158,7 @@ def calibrate(
     characters = sum(len(candidate.prefix) + len(candidate.content) for candidate in corpus)
     best: CalibrationResult | None = None
     misses = 0
+    survived = 0
     for size in CANDIDATE_BATCH_SIZES:
         if size > max_items:
             break
@@ -172,18 +180,22 @@ def calibrate(
                 # A size that already ran had stopped paying before this one
                 # failed, so the best size won on speed. Recording it as
                 # limited would recommend more memory for a batch that more
-                # memory was already shown not to help.
-                return best
+                # memory was already shown not to help. Where it failed is kept
+                # all the same, for a caller about to ask for more than that.
+                return replace(best, survived=survived)
             limited_by = LIMITED_BY_MEMORY if exc.code in RESOURCE_CODES else LIMITED_BY_FAILURE
-            return replace(best, limited_by=limited_by)
+            return replace(best, limited_by=limited_by, survived=survived)
         except Exception as exc:  # pragma: no cover - defensive, see module docstring
             logger.debug("Calibration abandoned at max_items=%d: %s", size, exc)
-            if best is None or misses:
-                return best
-            return replace(best, limited_by=LIMITED_BY_FAILURE)
+            if best is None:
+                return None
+            if misses:
+                return replace(best, survived=survived)
+            return replace(best, limited_by=LIMITED_BY_FAILURE, survived=survived)
         # A clock with any granularity at all can report a zero interval for a
         # fast enough backend, and dividing by it would report infinite speed.
         elapsed = max(1, clock() - started)
+        survived = size
         rate = characters * 1_000_000_000 / elapsed
         if best is None:
             best = CalibrationResult(max_items=size, characters_per_second=rate, load_ns=load_ns)

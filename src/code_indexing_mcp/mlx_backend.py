@@ -68,9 +68,11 @@ _TEMPORARY_SUFFIX = ".tmp.safetensors"
 # What the export adds to a masked score is -3.4028235e38; adding a negative
 # ALiBi bias to that overflows to -inf, which can leave a fused attention kernel
 # subtracting -inf from -inf. This has to survive float16 as well, whose largest
-# finite magnitude is 65504: the most negative ALiBi bias a full window produces
-# is a few hundred, so the sum stays finite in half precision, and exp of it is
-# exactly zero in either precision -- the same softmax without the NaN risk.
+# finite magnitude is 65504. The steepest slope in the export is -0.7071, so the
+# most negative ALiBi bias a full 8192-token window produces is about -5800 and
+# the sum about -35800: finite in half precision with some 29000 to spare, and
+# exp of it is exactly zero in either precision -- the same softmax without the
+# NaN risk. A fill much below -5e4 would give that margin away.
 MASK_FILL = -3e4
 
 # The architectural facts this implementation hard-codes. A different value is a

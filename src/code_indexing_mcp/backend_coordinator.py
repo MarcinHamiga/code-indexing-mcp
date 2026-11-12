@@ -237,6 +237,7 @@ class BackendCoordinator:
             platform=platform_fingerprint(),
             device=descriptor.device,
             driver_version=descriptor.driver_version,
+            precision=descriptor.precision.value,
         )
 
     def _cpu_probe_key(self) -> ProbeKey:

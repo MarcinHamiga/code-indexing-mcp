@@ -1241,6 +1241,27 @@ def test_calibration_never_raises_an_explicit_batch_size(
     assert _sizes(cached) == [4]
 
 
+def test_a_sweep_that_failed_below_an_explicit_batch_size_bounds_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2 won on speed, 4 ran, and 8 failed. The winner is not a reduction, but
+    an explicit 16 is more than anything that ran and must not be asked for."""
+    monkeypatch.setattr(
+        "code_indexing_mcp.passage_backend.calibrate",
+        lambda *args, **kwargs: CalibrationResult(
+            max_items=2, characters_per_second=1_000.0, load_ns=1, survived=4
+        ),
+    )
+    with _backend(_plan_recording_worker, calibration_plan=PLAN, batch_ceiling=16) as backend:
+        bounded = backend.plan_and_embed(_candidates(1), SegmentPlan(max_tokens=8, max_items=16))
+    assert _sizes(bounded) == [4]
+
+    # An explicit size at or below what ran is left exactly as the operator set it.
+    with _backend(_plan_recording_worker, calibration_plan=PLAN, batch_ceiling=4) as backend:
+        untouched = backend.plan_and_embed(_candidates(1), SegmentPlan(max_tokens=8, max_items=4))
+    assert _sizes(untouched) == [4]
+
+
 def test_a_recorded_reduction_still_lowers_an_explicit_batch_size(tmp_path: Path) -> None:
     cache = ProbeCache(tmp_path / "probes.json")
     key = _probe_key()

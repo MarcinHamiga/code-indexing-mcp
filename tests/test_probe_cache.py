@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from filelock import Timeout
 from code_indexing_mcp.probe_cache import (
     CACHE_SCHEMA_VERSION,
     MAX_RECORDS,
+    PACKING_POLICY_VERSION,
     ProbeCache,
     ProbeKey,
     ProbeRecord,
@@ -70,6 +72,33 @@ def _key(**overrides: str) -> ProbeKey:
         driver_version="550.54",
     )
     return replace(base, **overrides)
+
+
+def test_a_backend_that_changes_precision_is_measured_again(tmp_path: Path) -> None:
+    """Half precision is a different speed and a different best batch size on
+    the same device and runtime, so the float32 measurement must not answer for
+    it -- while every float32 record written before precision was part of the
+    key has to stay readable."""
+    cache = ProbeCache(tmp_path / "probes.json")
+    cache.store(_key(), batch_size=2, dimension=768, characters_per_second=46_000.0)
+
+    assert cache.load(_key(precision="float16")) is None
+    assert cache.load(_key(precision="float32")) is not None
+    # The fingerprint of a float32 key is the one it had before the field.
+    legacy = "\0".join(
+        (
+            "jinaai/jina-embeddings-v2-base-code",
+            "artifact-a",
+            "cuda",
+            "CUDAExecutionProvider",
+            "1.20.0",
+            "darwin-arm64-25.5.0",
+            "cuda:0",
+            "550.54",
+            str(PACKING_POLICY_VERSION),
+        )
+    )
+    assert _key().fingerprint() == sha256(legacy.encode()).hexdigest()
 
 
 def test_a_stored_probe_is_found_again(tmp_path: Path) -> None:

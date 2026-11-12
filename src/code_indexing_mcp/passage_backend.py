@@ -438,9 +438,15 @@ class PassageBackendSession:
         self._verified_spawn = session.spawn_count
         if self.calibration is not None:
             self._calibrated_batch_size = self.calibration.max_items
-            self._session_max_items = self._bounded(
-                self.calibration.max_items, reduced=bool(self.calibration.limited_by)
-            )
+            size, reduced = self.calibration.max_items, bool(self.calibration.limited_by)
+            if not reduced and 0 < self.calibration.survived < self._batch_ceiling:
+                # The sweep failed above a size that had won on speed, so the
+                # winner is not a reduction -- but the operator's explicit size
+                # is larger than anything that ran, and leaving the plan alone
+                # would ask for it in every group. The largest size that did
+                # run is the bound, exactly as an in-run overrun would set it.
+                size, reduced = self.calibration.survived, True
+            self._session_max_items = self._bounded(size, reduced=reduced)
 
     def _measure_reference(self) -> None:
         """Measure CPU too, so the crossover has both of the rates it needs.

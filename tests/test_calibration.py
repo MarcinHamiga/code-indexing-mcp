@@ -147,7 +147,28 @@ def test_a_size_tried_on_patience_that_overruns_is_not_a_memory_limit() -> None:
     assert result is not None
     assert result.max_items == 2
     assert result.limited_by == ""
+    # Where it stopped is still known: 4 ran, 8 did not.
+    assert result.survived == 4
     assert session.batch_sizes == [1, 2, 4, 8]
+
+
+def test_a_sweep_that_never_failed_reports_no_survivor() -> None:
+    durations = dict.fromkeys(CANDIDATE_BATCH_SIZES, 1_000_000_000)
+    session = FakeSession(durations)
+
+    result = calibrate(session, PLAN, load_ns=0, clock=session.clock, patience=1)
+
+    assert result is not None
+    assert result.survived == 0
+
+
+def test_an_overrun_without_a_miss_survives_at_the_size_it_adopted() -> None:
+    session = ExhaustedSession(_halving(1_000_000_000), fails_above=4)
+
+    result = calibrate(session, PLAN, load_ns=0, clock=session.clock)
+
+    assert result is not None
+    assert (result.max_items, result.limited_by, result.survived) == (4, "memory", 4)
 
 
 def test_a_batch_size_that_overruns_the_ceiling_is_not_calibrated() -> None:

@@ -36,6 +36,9 @@ CACHE_SCHEMA_VERSION = 2
 # requests. Keep that policy version in the key so changing the packing order
 # does not reuse a measurement from the previous workload shape.
 PACKING_POLICY_VERSION = 2
+# The precision every backend ran in before any ran in another. A key at this
+# precision fingerprints exactly as it did before precision was part of it.
+REFERENCE_PRECISION = "float32"
 # A cache that grows without bound would keep every configuration a machine has
 # ever had. Records are small, but the file is read on every start.
 MAX_RECORDS = 32
@@ -70,9 +73,13 @@ class ProbeKey:
     device: str
     driver_version: str = ""
     packing_policy_version: int = PACKING_POLICY_VERSION
+    # The precision the backend executes in. A backend that changes it has a
+    # different speed and a different best batch size, on the same device and
+    # runtime, so a measurement taken at the old precision is not this one's.
+    precision: str = REFERENCE_PRECISION
 
     def fingerprint(self) -> str:
-        parts = (
+        parts: tuple[str, ...] = (
             self.model_id,
             self.model_artifact,
             self.accelerator,
@@ -83,6 +90,10 @@ class ProbeKey:
             self.driver_version,
             str(self.packing_policy_version),
         )
+        if self.precision != REFERENCE_PRECISION:
+            # Left out at the reference precision so every record written before
+            # this field existed -- all of them float32 -- keeps its fingerprint.
+            parts = (*parts, self.precision)
         return sha256("\0".join(parts).encode()).hexdigest()
 
 
