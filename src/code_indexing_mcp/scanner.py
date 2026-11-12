@@ -31,6 +31,7 @@ from pathlib import Path
 
 from pathspec import GitIgnoreSpec
 
+from .git_state import GitProbeOutcome, GitState
 from .models import (
     DEFAULT_INCLUDES,
     ProjectInfo,
@@ -356,6 +357,7 @@ class SourceScanner:
         known_files: dict[str, StoredFile] | None = None,
         *,
         read_contents: bool = True,
+        git_state: GitState | None = None,
     ) -> Iterator[ScannedFile | SkippedFile]:
         """Yield scan results one file at a time.
 
@@ -375,8 +377,17 @@ class SourceScanner:
         root = project.root.resolve()
         config_excludes = self._compile_exclude_spec(project.scan.exclude)
         include_spec = self._compile_include_spec(project.scan.include)
-        in_worktree = self._in_git_worktree(root)
-        root_ignored = in_worktree and self._git_ignores_root(root)
+        if git_state is not None and git_state.probe is GitProbeOutcome.GIT:
+            in_worktree = True
+            # An enclosing repo cannot ignore its own root directory; only a
+            # nested project (non-empty project_prefix) needs check-ignore.
+            root_ignored = bool(git_state.project_prefix) and self._git_ignores_root(root)
+        elif git_state is not None and git_state.probe is GitProbeOutcome.NOT_GIT:
+            in_worktree = False
+            root_ignored = False
+        else:
+            in_worktree = self._in_git_worktree(root)
+            root_ignored = in_worktree and self._git_ignores_root(root)
         if root_ignored:
             in_worktree = False
         git_yielded: set[str] = set()
@@ -981,6 +992,62 @@ class SourceScanner:
         ):
             return None, "ignored"
         return language, None
+
+    @staticmethod
+    def has_supported_or_ambiguous_changes(
+        root: Path,
+        relative_paths: Iterable[Path],
+        *,
+        scan: ScanConfig | None = None,
+    ) -> tuple[bool, list[Path]]:
+        """Filter watcher event paths down to index-relevant candidates.
+
+        Returns ``(always_relevant, candidates)`` where ``always_relevant`` is
+        true if any configuration or ignore file changed (meaning existing files
+        may have changed eligibility without being touched directly), and
+        ``candidates`` holds the subset that still needs Git ignore checking.
+        Existing non-directory files with unsupported extensions or include
+        misses, hard-excluded directories, and scan excludes are rejected here
+        without spawning ``git``; existing directories and missing (deleted or
+        moved) paths stay candidates so deleted dot-named directories are not
+        dropped.
+        """
+        config = scan or ScanConfig()
+        include_spec = SourceScanner._compile_include_spec(config.include)
+        config_excludes = SourceScanner._compile_exclude_spec(config.exclude)
+        candidates: list[Path] = []
+        for relative in relative_paths:
+            if relative.name == ".gitignore" or relative in {
+                Path(".ci-mcp/project.toml"),
+                Path(".git/info/exclude"),
+            }:
+                return True, []
+            if any(part in HARD_EXCLUDED_DIRECTORIES for part in relative.parts):
+                continue
+            if config_excludes is not None and config_excludes.match_file(relative.as_posix()):
+                continue
+            full_path = root / relative
+            suffix = relative.suffix
+            if suffix:
+                if (
+                    (
+                        suffix.lower() not in LANGUAGES
+                        or not SourceScanner._matches_include(relative, suffix, include_spec)
+                    )
+                    and full_path.exists()
+                    and not full_path.is_dir()
+                ):
+                    # Existing non-directory files with unsupported suffixes or
+                    # include misses cannot affect the index; deleted/moved
+                    # paths may have been dot-named directories (such as
+                    # ``Acme.Core`` or ``v1.0``) containing supported files.
+                    continue
+            elif full_path.exists() and not full_path.is_dir():
+                # Existing extensionless regular files are unsupported unless
+                # matched as directories (created or already removed).
+                continue
+            candidates.append(relative)
+        return False, candidates
 
     @staticmethod
     def _git_ignored_paths(root: Path, candidates: list[Path]) -> set[Path]:

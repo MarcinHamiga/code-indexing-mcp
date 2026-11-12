@@ -818,7 +818,13 @@ class LanceStore:
             return
         updates: dict[str, Any] = {"state": state, "last_used_at": time.time_ns()}
         if project is not None:
-            git = probe_git_state(project.root, include_status=True)
+            if scanned_git is not None:
+                try:
+                    git = probe_git_state(project.root, include_status=True, cached=scanned_git)
+                except TypeError:
+                    git = probe_git_state(project.root, include_status=True)
+            else:
+                git = probe_git_state(project.root, include_status=True)
             if git.probe is GitProbeOutcome.GIT and scanned_git is not None:
                 self._stamp_from_scan(updates, scanned_git, git)
             elif git.probe is GitProbeOutcome.GIT:

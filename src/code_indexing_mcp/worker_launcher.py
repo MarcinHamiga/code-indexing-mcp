@@ -39,9 +39,9 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from multiprocessing import AuthenticationError
 from multiprocessing.connection import Client, Connection, answer_challenge, deliver_challenge
 from pathlib import Path
@@ -62,6 +62,7 @@ HANDSHAKE_TIMEOUT_SECONDS = 30.0
 # the child is still running.
 HANDSHAKE_POLL_SECONDS = 0.1
 DEFAULT_WORKER_TARGET = "code_indexing_mcp.embedding_worker:_worker_main"
+INDEX_WORKER_TARGET = "code_indexing_mcp.index_worker:worker_main"
 
 
 class WorkerProcess(Protocol):
@@ -182,7 +183,7 @@ class ExternalInterpreterLauncher:
     def description(self) -> str:
         return f"{self._environment_name} ({self.executable})"
 
-    def launch(self, config: WorkerConfig) -> LaunchedWorker:
+    def launch(self, config: Any) -> LaunchedWorker:
         channel = _Channel.open()
         try:
             popen = self._start(channel)
@@ -199,7 +200,12 @@ class ExternalInterpreterLauncher:
             # depends on neither it nor the directory holding its path.
             channel.close()
         try:
-            connection.send(("configure", asdict(config)))
+            payload = (
+                asdict(config)
+                if is_dataclass(config) and not isinstance(config, type)
+                else dict(config)
+            )
+            connection.send(("configure", payload))
         except BaseException:
             connection.close()
             _reap(popen)
@@ -444,14 +450,14 @@ class _Channel:
 # -- child side ------------------------------------------------------------
 
 
-def _resolve_target(reference: str) -> WorkerTarget:
+def _resolve_target(reference: str) -> Callable[[Any, Any], Any]:
     """Import the ``module:function`` worker body the parent asked for."""
     from importlib import import_module
 
     module_name, _, attribute = reference.partition(":")
     if not module_name or not attribute:
         raise ValueError(f"Malformed worker target: {reference!r}")
-    target: WorkerTarget = getattr(import_module(module_name), attribute)
+    target: Callable[[Any, Any], Any] = getattr(import_module(module_name), attribute)
     return target
 
 
@@ -476,12 +482,16 @@ def child_main(stream: Any = None) -> int:
         if command != "configure":
             logger.error("Expected a configure command from the parent, got %r", command)
             return 2
-        target = _resolve_target(str(payload.get("target") or DEFAULT_WORKER_TARGET))
-        from .embedding_worker import WorkerConfig
+        target_reference = str(payload.get("target") or DEFAULT_WORKER_TARGET)
+        target = _resolve_target(target_reference)
+        if target_reference == INDEX_WORKER_TARGET:
+            target(connection, dict(raw_config))
+        else:
+            from .embedding_worker import WorkerConfig
 
-        settings = dict(raw_config)
-        settings["providers"] = tuple(settings.get("providers") or ())
-        target(connection, WorkerConfig(**settings))
+            settings = dict(raw_config)
+            settings["providers"] = tuple(settings.get("providers") or ())
+            target(connection, WorkerConfig(**settings))
     finally:
         with suppress(OSError):
             connection.close()

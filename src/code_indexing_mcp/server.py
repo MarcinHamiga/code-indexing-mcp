@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
@@ -51,6 +52,7 @@ from .models import (
     ReferenceKind,
     ReferenceResponse,
     RemovalReport,
+    ScanConfig,
     ScanInspectionPage,
     SearchAcrossProjectsResponse,
     SearchResponse,
@@ -58,7 +60,13 @@ from .models import (
     StorageStatus,
     SymbolResponse,
 )
-from .projects import find_project_root, rooted_under, same_project_root
+from .projects import (
+    existing_marker_path,
+    find_project_root,
+    read_project_marker,
+    rooted_under,
+    same_project_root,
+)
 from .reference_service import validate_patch_request
 from .scanner import SourceScanner
 from .settings import IndexMode, IndexSettings
@@ -465,8 +473,11 @@ class StartupCoordinator:
                     retry_seconds = WATCH_RETRY_INITIAL_SECONDS
                     # watchfiles only skips .git, node_modules and the like.
                     # Writes under project-ignored directories (build/, dist/)
-                    # cannot change the index, so they must not start runs.
-                    if not await asyncio.to_thread(_has_indexable_change, root, _changes):
+                    # or non-source files (.md, .lock, excluded paths) cannot
+                    # change the index, so they must not start runs.
+                    if not await asyncio.to_thread(
+                        self._watch_change_is_indexable, root, project_id, _changes
+                    ):
                         continue
                     # Mark the root known-changed before anything is scheduled:
                     # a query arriving now must treat it as stale without paying
@@ -485,6 +496,23 @@ class StartupCoordinator:
                 logger.exception("Filesystem monitor failed for %s; restarting", root)
             await anyio.sleep(retry_seconds)
             retry_seconds = min(retry_seconds * 2, WATCH_RETRY_MAXIMUM_SECONDS)
+
+    def _watch_change_is_indexable(
+        self, root: Path, project_id: str, changes: Iterable[tuple[object, str]]
+    ) -> bool:
+        scan_config: ScanConfig | None = None
+        with suppress(CodeIndexingError, OSError):
+            if existing_marker_path(root) is not None:
+                scan_config = read_project_marker(root).scan
+        if scan_config is None:
+            with suppress(CodeIndexingError, OSError):
+                project = next(
+                    (item for item in self.application.list_projects() if item.id == project_id),
+                    None,
+                )
+                if project is not None:
+                    scan_config = project.scan
+        return _has_indexable_change(root, changes, scan=scan_config)
 
     async def _refresh_dirty_root(
         self, root: Path, project_id: str, dirty: asyncio.Queue[None]
@@ -646,11 +674,18 @@ def _root_path(uri: str) -> Path | None:
 WATCH_FILTER_MAXIMUM_PATHS = 2000
 
 
-def _has_indexable_change(root: Path, changes: Iterable[tuple[object, str]]) -> bool:
-    """Whether any watcher event is for a path Git does not ignore.
+def _has_indexable_change(
+    root: Path,
+    changes: Iterable[tuple[object, str]],
+    *,
+    scan: ScanConfig | None = None,
+) -> bool:
+    """Whether any watcher event is for a path that can affect the index.
 
-    Conservative: a path outside *root*, an oversized batch, or a failed Git
-    probe counts as a relevant change.
+    Conservative: a path outside *root*, an oversized batch, an ignore/config
+    edit, a directory/deletion of unknown type, or a failed Git probe counts as
+    a relevant change. Unsupported file extensions and excluded paths are
+    dropped before consulting ``git check-ignore``.
     """
     relative: list[Path] = []
     for _kind, raw in changes:
@@ -662,8 +697,15 @@ def _has_indexable_change(root: Path, changes: Iterable[tuple[object, str]]) -> 
         return True
     if len(relative) > WATCH_FILTER_MAXIMUM_PATHS:
         return True
-    ignored = SourceScanner._git_ignored_paths(root, [root / path for path in relative])
-    return any(path not in ignored for path in relative)
+    always_relevant, candidates = SourceScanner.has_supported_or_ambiguous_changes(
+        root, relative, scan=scan
+    )
+    if always_relevant:
+        return True
+    if not candidates:
+        return False
+    ignored = SourceScanner._git_ignored_paths(root, [root / path for path in candidates])
+    return any(path not in ignored for path in candidates)
 
 
 class _RootsCache:
@@ -1047,22 +1089,30 @@ class AutoIndexingMCP(FastMCP):
 
     @asynccontextmanager
     async def _lifespan(self, _: FastMCP) -> AsyncIterator[StartupCoordinator]:
-        async with anyio.create_task_group() as task_group:
-            try:
-                coordinator = StartupCoordinator(
-                    self.application,
-                    task_group,
-                    mode=self.mode,
-                    wait_seconds=self.wait_seconds,
-                )
-                if not isinstance(self.application, BrokerApplication):
-                    task_group.start_soon(self._run_startup_maintenance, coordinator)
-                yield coordinator
-            finally:
-                # Lock waiters are cancellable between non-blocking attempts. A worker
-                # that has acquired the index lock remains owned until its write
-                # finishes because run_sync is not abandoned on cancellation.
-                task_group.cancel_scope.cancel()
+        try:
+            async with anyio.create_task_group() as task_group:
+                try:
+                    coordinator = StartupCoordinator(
+                        self.application,
+                        task_group,
+                        mode=self.mode,
+                        wait_seconds=self.wait_seconds,
+                    )
+                    if not isinstance(self.application, BrokerApplication):
+                        task_group.start_soon(self._run_startup_maintenance, coordinator)
+                    yield coordinator
+                finally:
+                    # Lock waiters are cancellable between non-blocking attempts. A worker
+                    # that has acquired the index lock remains owned until its write
+                    # finishes because run_sync is not abandoned on cancellation.
+                    task_group.cancel_scope.cancel()
+        finally:
+            if isinstance(self.application, Application):
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(
+                        self.application.close_index_worker,
+                        abandon_on_cancel=False,
+                    )
 
     async def _run_startup_maintenance(self, coordinator: StartupCoordinator) -> None:
         """Run overdue scheduled maintenance once, after startup indexing settles.
@@ -2406,4 +2456,7 @@ def create_server(
 
 
 def run_server() -> None:
+    # Shorten the thread-switch interval so background CPU work does not
+    # starve concurrent read queries for 5ms slices at a time.
+    sys.setswitchinterval(0.0005)
     create_server().run(transport="stdio")

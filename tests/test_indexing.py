@@ -2809,3 +2809,57 @@ def test_backfill_of_a_syntax_error_file_converges_without_rewriting(tmp_path: P
     assert third == second
     assert store.table_versions(project.id) == versions
     assert len(history.list_runs(project.id).runs) == runs
+
+
+def test_noop_index_on_dirty_git_repo_preserves_files_table_version_and_cuts_git_spawns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3 + F4: unchanged dirty/untracked files skip staging and avoid redundant git spawns."""
+    import os
+    import subprocess
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.test"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+
+    committed = root / "committed.py"
+    committed.write_text("def committed():\n    return 1\n")
+    subprocess.run(["git", "add", "committed.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
+
+    untracked = root / "dirty.py"
+    untracked.write_text("def dirty():\n    return 2\n")
+    # Place mtimes cleanly outside the racy window so a no-op re-scan trusts stat.
+    past = time.time() - 30
+    os.utime(committed, (past, past))
+    os.utime(untracked, (past, past))
+
+    project = initialize_project(root)
+    indexer, store = make_indexer(tmp_path, RecordingEmbedder())
+    first = indexer.index(project)
+    assert first.indexed_files == 2
+    versions_after_first = store.table_versions(project.id)
+
+    git_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def counting_run(
+        args: object, *pos: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[object]:
+        if isinstance(args, (list, tuple)) and args and str(args[0]) == "git":
+            git_calls.append([str(part) for part in args])
+        return real_run(args, *pos, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", counting_run)
+
+    second = indexer.index(project)
+
+    assert second.indexed_files == 0
+    assert second.unchanged_files == 2
+    assert store.table_versions(project.id).files == versions_after_first.files
+    # Direct Indexer.index without a pre-resolved ActiveIndexTarget probes git once
+    # in active_partition and once in _capture_git_guard, plus git ls-files; guard
+    # verification, scan root checks, and set_slot_state add zero extra spawns.
+    assert len(git_calls) <= 8, git_calls

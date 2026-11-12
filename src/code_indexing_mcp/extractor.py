@@ -755,6 +755,8 @@ class TreeSitterExtractor:
         }
         references: list[ExtractedReference] = []
         seen: set[tuple[str, int, int]] = set()
+        enclosing_cache: dict[int, str | None] = {}
+        safe_identifier_nodes: set[int] = set()
 
         def add(
             kind: ReferenceKind,
@@ -782,12 +784,12 @@ class TreeSitterExtractor:
             seen.add(key)
             name = written_name or _capture_name(source, node)
             references.append(
-                ExtractedReference(
+                ExtractedReference.model_construct(
                     kind=kind,
                     written_name=_bound_reference_name(name),
                     target_name=_bound_reference_name(target_name),
                     source_qualified_symbol=self._enclosing_symbol(
-                        node, declaration_by_node, parents
+                        node, declaration_by_node, parents, enclosing_cache
                     ),
                     module_path=module_path,
                     imported_name=imported_name,
@@ -812,7 +814,9 @@ class TreeSitterExtractor:
                     continue
                 for node in nodes:
                     if capture == "reference.identifier":
-                        self._identifier_record(language, node, source, add, parents)
+                        self._identifier_record(
+                            language, node, source, add, parents, safe_identifier_nodes
+                        )
                     else:
                         # Reference-query captures are decorative: every language
                         # handler re-dispatches on `node.type`, so adding a
@@ -828,27 +832,49 @@ class TreeSitterExtractor:
         source: bytes,
         add_reference: _ReferenceAdder,
         parents: _ParentMap,
+        safe_nodes: set[int] | None = None,
     ) -> None:
         """Record identifier values while excluding bindings and richer structural uses."""
         rules = LANGUAGE_RULES.get(language, _DEFAULT)
+        parents_get = parents._parents.get
+        node_start = node.start_byte
+        node_end = node.end_byte
+        node_type = node.type
+        import_owner_parents = rules.import_owner_parents
+        declarator_parents = rules.declarator_parents
+        name_and_type_parents = rules.name_and_type_parents
+        name_and_field_parents = rules.name_and_field_parents
+        type_only_parents = rules.type_only_parents
+        parameters_parents = rules.parameters_parents
+        name_only_parents = rules.name_only_parents
+        left_and_type_parents = rules.left_and_type_parents
+        function_and_type_parents = rules.function_and_type_parents
+        pair_parents = rules.pair_parents
+        handler_owned_type_parents = rules.handler_owned_type_parents
+        method_name_field_excluded = rules.method_name_field_excluded
+        is_kotlin_swift = language in {"kotlin", "swift"}
+        is_swift = language == "swift"
+        is_zig = language == "zig"
+        is_gdshader = language == "gdshader"
+        is_gdscript = language == "gdscript"
+        can_cache = safe_nodes is not None and node_start < node_end
+        trail: list[int] | None = [] if can_cache else None
 
         def contains(outer: Node | None) -> bool:
             return bool(
-                outer is not None
-                and outer.start_byte <= node.start_byte
-                and node.end_byte <= outer.end_byte
+                outer is not None and outer.start_byte <= node_start and node_end <= outer.end_byte
             )
 
         current = node
-        while (parent := parents.parent(current)) is not None:
-            if (
-                parent.type in _IDENTIFIER_BINDING_PARENTS
-                or parent.type in rules.import_owner_parents
-            ):
+        while (parent := parents_get(current.id)) is not None:
+            ptype = parent.type
+            if ptype in _IDENTIFIER_BINDING_PARENTS or ptype in import_owner_parents:
                 return
-            if parent.type in _PARAMETER_PARENTS:
+            step_safe = trail is not None and current is not node
+            if ptype in _PARAMETER_PARENTS:
+                step_safe = False
                 parameter = node
-                while (step := parents.parent(parameter)) is not None and step != parent:
+                while (step := parents_get(parameter.id)) is not None and step != parent:
                     parameter = step
                     # TS's `required_parameter`/`optional_parameter` wrapper
                     # exposes a default under a `value` field; bare JS/TS
@@ -866,9 +892,9 @@ class TreeSitterExtractor:
                     return
             excluded_fields: tuple[str, ...] = ()
             if (
-                rules.method_name_field_excluded
+                method_name_field_excluded
                 and current is node
-                and parent.type == "method_declaration"
+                and ptype == "method_declaration"
                 and parent.child_by_field_name("name") != node
             ):
                 # Must win over the shared `method_declaration` owner branch
@@ -880,7 +906,8 @@ class TreeSitterExtractor:
                 # parent -- the climb revisits ancestors for deeper reads,
                 # which must survive.
                 return
-            if parent.type in rules.declarator_parents:
+            if ptype in declarator_parents:
+                step_safe = False
                 if contains(parent.child_by_field_name("type")):
                     excluded_fields = ("type",)
                 else:
@@ -894,24 +921,21 @@ class TreeSitterExtractor:
                     if name_leaf is not None and contains(name_leaf):
                         return
                     excluded_fields = ()
-            elif (
-                parent.type == "function_definition"
-                and language == "gdshader"
-                and node.type == "identifier"
-            ):
+            elif ptype == "function_definition" and is_gdshader and node_type == "identifier":
                 # Fieldless definition (`float brightness(...)`): the name is
                 # the identifier between the return type and the parameter
                 # list. Other grammars cut definition names through the
                 # `name` field in the shared branch below and never reach
                 # here.
+                step_safe = False
                 siblings = [child for child in parent.named_children if not child.is_extra]
                 if len(siblings) >= 2 and siblings[1] == node:
                     return
                 excluded_fields = ()
             elif (
-                language in {"kotlin", "swift"}
+                is_kotlin_swift
                 and current is node
-                and parent.type
+                and ptype
                 in {
                     "function_declaration",
                     "protocol_function_declaration",
@@ -936,50 +960,34 @@ class TreeSitterExtractor:
                 # climb revisits ancestors for deeper reads, which must
                 # survive (the method_name_field_excluded branch above
                 # needs the same guard for the same reason).
-                if node.type in {"simple_identifier", "type_identifier"}:
+                if node_type in {"simple_identifier", "type_identifier"}:
                     return
                 excluded_fields = ()
-            elif language == "swift" and current is node and parent.type == "pattern":
+            elif is_swift and current is node and ptype == "pattern":
                 # `let name: String`: the bound name is the first name in
                 # the pattern. (Later names in a tuple pattern stay reads;
                 # destructuring is not modeled for Swift.)
                 if _first_named_child(parent) == node:
                     return
                 excluded_fields = ()
-            elif (
-                language in {"kotlin", "swift"}
-                and current is node
-                and parent.type == "class_parameter"
-            ):
+            elif is_kotlin_swift and current is node and ptype == "class_parameter":
                 # `class Greeter(val name: String)`: the property name is
                 # the `simple_identifier` beside the type, with the
                 # `val`/`var` marker first so the gate above cannot see it.
-                if node.type == "simple_identifier":
+                if node_type == "simple_identifier":
                     return
                 excluded_fields = ()
-            elif (
-                language in {"kotlin", "swift"}
-                and current is node
-                and parent.type == "navigation_suffix"
-            ):
+            elif is_kotlin_swift and current is node and ptype == "navigation_suffix":
                 # `foo.bar`: the member is owned by the handler's
                 # whole-span member row; the base keeps its read.
                 if _last_named_child(parent) == node:
                     return
                 excluded_fields = ()
-            elif (
-                language in {"kotlin", "swift"}
-                and current is node
-                and parent.type == "value_argument_label"
-            ):
+            elif is_kotlin_swift and current is node and ptype == "value_argument_label":
                 # A call-site argument label (`name:` in `Greeter(name:)`)
                 # is owned by the call shape's keyword row, never a read.
                 return
-            elif (
-                language == "zig"
-                and current is node
-                and parent.type in {"VarDecl", "ContainerField"}
-            ):
+            elif is_zig and current is node and ptype in {"VarDecl", "ContainerField"}:
                 # `const Point = ...` / `x: i32`: the declared name is the
                 # first named child. (FnProto names cut through the
                 # `function` field in function_and_type_parents; parameter
@@ -988,21 +996,16 @@ class TreeSitterExtractor:
                     return
                 excluded_fields = ()
             elif (
-                language == "zig"
+                is_zig
                 and current is node
-                and parent.type == "FieldOrFnCall"
-                and node.type == "IDENTIFIER"
+                and ptype == "FieldOrFnCall"
+                and node_type == "IDENTIFIER"
             ):
                 # `.debug` in `std.debug`: the member is owned by the
                 # handler's whole-span member row (or the call row); the
                 # base keeps its read.
                 return
-            elif (
-                language == "zig"
-                and current is node
-                and parent.type == "FieldInit"
-                and node.type == "IDENTIFIER"
-            ):
+            elif is_zig and current is node and ptype == "FieldInit" and node_type == "IDENTIFIER":
                 # `Store{ .limit = value }`: the field key is a binding,
                 # not a read -- the `field_initializer` branch's rule for
                 # other grammars. The value keeps its read.
@@ -1010,10 +1013,10 @@ class TreeSitterExtractor:
                     return
                 excluded_fields = ()
             elif (
-                language == "zig"
+                is_zig
                 and current is node
-                and parent.type == "SuffixExpr"
-                and node.type == "IDENTIFIER"
+                and ptype == "SuffixExpr"
+                and node_type == "IDENTIFIER"
                 and _first_named_child(parent) == node
                 and any(
                     child.type == "FnCallArguments"
@@ -1025,39 +1028,40 @@ class TreeSitterExtractor:
                 # the handler's call row, mirroring the fieldless-call cut
                 # in the shared `call_expression` branch below.
                 return
-            elif parent.type in _POSITIONAL_CLIMB_PARENTS:
-                if parent.type == "type_definition":
+            elif ptype in _POSITIONAL_CLIMB_PARENTS:
+                step_safe = False
+                if ptype == "type_definition":
                     # C `typedef int myint`: the alias is the trailing name;
                     # the aliased type stays eligible for the handler.
                     if not (
-                        node.type in {"type_identifier", "identifier"}
+                        node_type in {"type_identifier", "identifier"}
                         and _last_named_child(parent) == node
                     ):
                         excluded_fields = ()
                     else:
                         return
-                elif parent.type == "parameter_declaration":
+                elif ptype == "parameter_declaration":
                     # Fieldless parameters (GDShader `vec3 c`): the trailing
                     # identifier is the binding. Fieldful grammars (C, C++)
                     # cut through `declarator` above and never reach here.
-                    if not (node.type == "identifier" and _last_named_child(parent) == node):
+                    if not (node_type == "identifier" and _last_named_child(parent) == node):
                         excluded_fields = ()
                     else:
                         return
-                elif parent.type == "for_statement":
+                elif ptype == "for_statement":
                     # GDScript `for i in items`: the leading identifier is the
                     # loop binding; the iterable keeps its reads. Language-
                     # gated so C/Python loops (whose bindings hang off fields
                     # or follow different shapes) never reach here.
                     if (
-                        language != "gdscript"
-                        or node.type != "identifier"
+                        not is_gdscript
+                        or node_type != "identifier"
                         or _first_named_child(parent) != node
                     ):
                         excluded_fields = ()
                     else:
                         return
-                elif parent.type in _PURE_BINDING_PARENTS:
+                elif ptype in _PURE_BINDING_PARENTS:
                     # Lua assignment targets and loop variables, C macro
                     # parameters, GDScript superclass spellings (the handler
                     # owns the inheritance/import row), C++ base lists
@@ -1069,28 +1073,28 @@ class TreeSitterExtractor:
                     # can carry explicit values (`A = B`) whose reads must
                     # survive, and they already cut through their `name`
                     # field instead.
-                    if parent.type == "enumerator" and language != "gdscript":
+                    if ptype == "enumerator" and not is_gdscript:
                         excluded_fields = ()
                     else:
                         return
-                elif parent.type == "attribute_call":
+                elif ptype == "attribute_call":
                     # GDScript `items.append(item)`: the callee is the call
                     # row's span; the arguments stay eligible reads.
                     if _first_named_child(parent) == node:
                         return
                     excluded_fields = ()
-                elif parent.type == "new_expression":
+                elif ptype == "new_expression":
                     # Fieldless construction (C++ `new Widget(1)`): the call
                     # row owns the type. Fieldful `new` (JS) applies the
                     # constructor exclusion to the function and constructor.
                     if parent.child_by_field_name("constructor") is None:
                         return
                     excluded_fields = ("function", "constructor")
-                elif parent.type == "uniform_declaration":
+                elif ptype == "uniform_declaration":
                     # GDShader `uniform vec4 tint : hint = ...`: identifiers
                     # before the `=` (the name, the hint) are bindings; a
                     # default after it (`= PI`) stays a real read.
-                    if node.type != "identifier":
+                    if node_type != "identifier":
                         excluded_fields = ()
                     else:
                         for child in parent.children:
@@ -1099,7 +1103,7 @@ class TreeSitterExtractor:
                             if child == node:
                                 return
                         excluded_fields = ()
-                elif parent.type == "field":
+                elif ptype == "field":
                     # Lua `{ x = 1 }`: the key is a binding, the value stays
                     # eligible. A computed key (`{ [k] = v }`) reads `k`,
                     # which the brackets betray. (SQL's `field` never reaches
@@ -1110,7 +1114,7 @@ class TreeSitterExtractor:
                         excluded_fields = ("name",)
                 else:
                     excluded_fields = ()
-            elif parent.type in {
+            elif ptype in {
                 "function_definition",
                 "function_expression",
                 "generator_function_declaration",
@@ -1167,7 +1171,7 @@ class TreeSitterExtractor:
                 # wrong kind. Parameters are cut by the parameter_list walk
                 # above; parenthesized results by it too.
                 excluded_fields = ("name", "type", "result", "return_type", "trait")
-            elif parent.type in {
+            elif ptype in {
                 "assignment",
                 "assignment_expression",
                 "augmented_assignment",
@@ -1188,43 +1192,43 @@ class TreeSitterExtractor:
                 "compound_assignment_expr",
             }:
                 excluded_fields = ("left", "name")
-            elif parent.type in {"let_declaration", "for_expression"}:
+            elif ptype in {"let_declaration", "for_expression"}:
                 # Rust `let x = ...` / `for x in ...`: the pattern names a new
                 # binding; the optional `: Type` annotation is the handler's
                 # `type_use` and the value stays a plain read.
                 excluded_fields = ("pattern",)
-            elif parent.type in rules.name_and_type_parents:
+            elif ptype in name_and_type_parents:
                 excluded_fields = ("name", "type")
-            elif parent.type in rules.name_and_field_parents:
+            elif ptype in name_and_field_parents:
                 excluded_fields = ("name", "field")
-            elif parent.type in rules.type_only_parents:
+            elif ptype in type_only_parents:
                 excluded_fields = ("type",)
-            elif parent.type in rules.parameters_parents:
+            elif ptype in parameters_parents:
                 excluded_fields = ("parameters",)
-            elif parent.type in rules.name_only_parents:
+            elif ptype in name_only_parents:
                 excluded_fields = ("name",)
-            elif parent.type in rules.left_and_type_parents:
+            elif ptype in left_and_type_parents:
                 excluded_fields = ("left", "type")
-            elif parent.type in rules.function_and_type_parents:
+            elif ptype in function_and_type_parents:
                 excluded_fields = ("function", "type")
-            elif parent.type == "scoped_identifier":
+            elif ptype == "scoped_identifier":
                 # Path segments are namespace spellings; the final `name` may
                 # be a real value read (`State::Ready`) and stays eligible.
                 # Inside a `use` tree the climb above still cuts the leaf.
                 excluded_fields = ("path",)
-            elif parent.type == "field_initializer":
+            elif ptype == "field_initializer":
                 # `Widget { label: text }` -- the field key is a binding, not
                 # a read of a `label` symbol (a shorthand `Widget { label }`
                 # keeps its read: the identifier is the initializer there).
                 excluded_fields = ("field",)
-            elif parent.type in {"inc_statement", "dec_statement"}:
+            elif ptype in {"inc_statement", "dec_statement"}:
                 # Go `x++`: the bare operand is mutated in place, and the
                 # selector handler owns the write row for `p.x++` -- the same
                 # single-representation rule as the assignment LHS above (the
                 # statement has no named field to exclude, hence the direct
                 # return).
                 return
-            elif parent.type in {"arrow_function", "lambda"}:
+            elif ptype in {"arrow_function", "lambda"}:
                 # `parameter` covers a parenless single-identifier arrow param
                 # (`x => x`), which has no `formal_parameters` wrapper of its
                 # own to be caught by the block above. `parameters` is
@@ -1237,7 +1241,7 @@ class TreeSitterExtractor:
                 # every arrow-function/lambda default (`(a = LIMIT) => a`,
                 # `lambda a=LIMIT: a`).
                 excluded_fields = ("parameter",)
-            elif parent.type in {"attribute", "member_expression"}:
+            elif ptype in {"attribute", "member_expression"}:
                 if (
                     parent.child_by_field_name("attribute") is None
                     and parent.child_by_field_name("property") is None
@@ -1245,27 +1249,28 @@ class TreeSitterExtractor:
                     # Fieldless member access (GDScript `node.hp`): the
                     # trailing segment is the member name owned by the
                     # handler's whole-span row; the base stays a read.
+                    step_safe = False
                     if _last_named_child(parent) == node:
                         return
                     excluded_fields = ()
                 else:
                     excluded_fields = ("attribute", "property")
-            elif parent.type == "dot_index_expression":
+            elif ptype == "dot_index_expression":
                 # Lua `M.add`: the field is owned by the call/member row.
                 excluded_fields = ("field",)
-            elif parent.type == "method_index_expression":
+            elif ptype == "method_index_expression":
                 # Lua `obj:method`: same ownership as `.` access.
                 excluded_fields = ("method",)
-            elif parent.type == "field_expression":
+            elif ptype == "field_expression":
                 # C `s->field` / GDShader `COLOR.rgb`: the field is owned by
                 # the member row; the base stays a read.
                 excluded_fields = ("field",)
-            elif parent.type == "qualified_identifier":
+            elif ptype == "qualified_identifier":
                 # C++ `A::create`: the call row owns the span in calls and
                 # the type descent owns it in types; the qualifier is a
                 # namespace spelling, never a symbol.
                 excluded_fields = ("scope", "name")
-            elif parent.type in {"call", "call_expression", "new_expression", "function_call"}:
+            elif ptype in {"call", "call_expression", "new_expression", "function_call"}:
                 if (
                     parent.child_by_field_name("function") is None
                     and parent.child_by_field_name("constructor") is None
@@ -1273,42 +1278,80 @@ class TreeSitterExtractor:
                     # Fieldless call (GDScript, Lua): the callee is the first
                     # operand and the call row owns it; anything else rides a
                     # deeper node. Fieldful grammars keep the field cut below.
+                    step_safe = False
                     if _first_named_child(parent) == node:
                         return
                     excluded_fields = ()
                 else:
                     excluded_fields = ("function", "constructor")
-            elif parent.type == "keyword_argument":
+            elif ptype == "keyword_argument":
                 excluded_fields = ("name",)
-            elif parent.type in {"as_pattern", "catch_clause"}:
+            elif ptype in {"as_pattern", "catch_clause"}:
                 excluded_fields = ("alias", "parameter")
-            elif parent.type == "export_statement":
+            elif ptype == "export_statement":
                 excluded_fields = ("value",)
-            elif parent.type in rules.pair_parents:
+            elif ptype in pair_parents:
                 excluded_fields = ("key",)
-            elif parent.type in rules.handler_owned_type_parents:
+            elif ptype in handler_owned_type_parents:
                 return
-            if any(contains(parent.child_by_field_name(field)) for field in excluded_fields):
-                return
+            if excluded_fields:
+                cstart = current.start_byte
+                cend = current.end_byte
+                cid = current.id
+                for field in excluded_fields:
+                    outer = parent.child_by_field_name(field)
+                    if outer is not None:
+                        ostart = outer.start_byte
+                        oend = outer.end_byte
+                        if ostart <= node_start and node_end <= oend:
+                            return
+                        if step_safe and not (
+                            cstart < cend and outer.id != cid and (oend <= cstart or cend <= ostart)
+                        ):
+                            step_safe = False
+            if trail is not None:
+                if step_safe:
+                    trail.append(current.id)
+                else:
+                    trail.clear()
             current = parent
+            if can_cache and safe_nodes is not None and current.id in safe_nodes:
+                break
 
+        if safe_nodes is not None and trail:
+            safe_nodes.update(trail)
         name = _capture_name(source, node)
         add_reference("read", node, target_name=name, written_name=name)
 
     @staticmethod
     def _enclosing_symbol(
-        node: Node, declarations: dict[int, ExtractedDeclarationShape], parents: _ParentMap
+        node: Node,
+        declarations: dict[int, ExtractedDeclarationShape],
+        parents: _ParentMap,
+        cache: dict[int, str | None] | None = None,
     ) -> str | None:
+        parents_get = parents._parents.get
+        trail: list[int] | None = [] if cache is not None else None
         current: Node | None = node
+        result: str | None = None
         while current is not None:
-            declaration = declarations.get(current.id)
+            cid = current.id
+            if cache is not None and cid in cache:
+                result = cache[cid]
+                break
+            if trail is not None:
+                trail.append(cid)
+            declaration = declarations.get(cid)
             if declaration is not None:
-                return declaration.qualified_symbol
-            if current.type == "decorated_definition":
+                result = declaration.qualified_symbol
+                break
+            ctype = current.type
+            if ctype == "decorated_definition":
                 child = current.child_by_field_name("definition")
                 if child is not None and (declaration := declarations.get(child.id)) is not None:
-                    return declaration.qualified_symbol
-            if current.type == "decorator":
+                    result = declaration.qualified_symbol
+                    break
+            if ctype == "decorator":
                 # JS/TS: a method/field decorator is a preceding sibling of the
                 # `method_definition`/`public_field_definition` it decorates, not
                 # its parent (unlike Python's `decorated_definition` wrapper, and
@@ -1319,9 +1362,13 @@ class TreeSitterExtractor:
                     sibling is not None
                     and (declaration := declarations.get(sibling.id)) is not None
                 ):
-                    return declaration.qualified_symbol
-            current = parents.parent(current)
-        return None
+                    result = declaration.qualified_symbol
+                    break
+            current = parents_get(cid)
+        if cache is not None and trail:
+            for tid in trail:
+                cache[tid] = result
+        return result
 
     def _declaration_shapes(
         self,
