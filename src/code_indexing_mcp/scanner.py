@@ -1006,8 +1006,11 @@ class SourceScanner:
         true if any configuration or ignore file changed (meaning existing files
         may have changed eligibility without being touched directly), and
         ``candidates`` holds the subset that still needs Git ignore checking.
-        Unsupported file extensions, hard-excluded directories, and scan
-        excludes/include misses are rejected here without spawning ``git``.
+        Existing non-directory files with unsupported extensions or include
+        misses, hard-excluded directories, and scan excludes are rejected here
+        without spawning ``git``; existing directories and missing (deleted or
+        moved) paths stay candidates so deleted dot-named directories are not
+        dropped.
         """
         config = scan or ScanConfig()
         include_spec = SourceScanner._compile_include_spec(config.include)
@@ -1027,11 +1030,19 @@ class SourceScanner:
             suffix = relative.suffix
             if suffix:
                 if (
-                    suffix.lower() not in LANGUAGES
-                    or not SourceScanner._matches_include(relative, suffix, include_spec)
-                ) and not full_path.is_dir():
+                    (
+                        suffix.lower() not in LANGUAGES
+                        or not SourceScanner._matches_include(relative, suffix, include_spec)
+                    )
+                    and full_path.exists()
+                    and not full_path.is_dir()
+                ):
+                    # Existing non-directory files with unsupported suffixes or
+                    # include misses cannot affect the index; deleted/moved
+                    # paths may have been dot-named directories (such as
+                    # ``Acme.Core`` or ``v1.0``) containing supported files.
                     continue
-            elif not full_path.is_dir() and full_path.exists():
+            elif full_path.exists() and not full_path.is_dir():
                 # Existing extensionless regular files are unsupported unless
                 # matched as directories (created or already removed).
                 continue

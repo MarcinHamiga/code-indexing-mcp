@@ -60,7 +60,13 @@ from .models import (
     StorageStatus,
     SymbolResponse,
 )
-from .projects import find_project_root, rooted_under, same_project_root
+from .projects import (
+    existing_marker_path,
+    find_project_root,
+    read_project_marker,
+    rooted_under,
+    same_project_root,
+)
 from .reference_service import validate_patch_request
 from .scanner import SourceScanner
 from .settings import IndexMode, IndexSettings
@@ -494,14 +500,18 @@ class StartupCoordinator:
     def _watch_change_is_indexable(
         self, root: Path, project_id: str, changes: Iterable[tuple[object, str]]
     ) -> bool:
-        scan_config = None
-        if isinstance(self.application, Application):
-            project = next(
-                (item for item in self.application.store.list_projects() if item.id == project_id),
-                None,
-            )
-            if project is not None:
-                scan_config = project.scan
+        scan_config: ScanConfig | None = None
+        with suppress(CodeIndexingError, OSError):
+            if existing_marker_path(root) is not None:
+                scan_config = read_project_marker(root).scan
+        if scan_config is None:
+            with suppress(CodeIndexingError, OSError):
+                project = next(
+                    (item for item in self.application.list_projects() if item.id == project_id),
+                    None,
+                )
+                if project is not None:
+                    scan_config = project.scan
         return _has_indexable_change(root, changes, scan=scan_config)
 
     async def _refresh_dirty_root(
@@ -1079,24 +1089,30 @@ class AutoIndexingMCP(FastMCP):
 
     @asynccontextmanager
     async def _lifespan(self, _: FastMCP) -> AsyncIterator[StartupCoordinator]:
-        async with anyio.create_task_group() as task_group:
-            try:
-                coordinator = StartupCoordinator(
-                    self.application,
-                    task_group,
-                    mode=self.mode,
-                    wait_seconds=self.wait_seconds,
-                )
-                if not isinstance(self.application, BrokerApplication):
-                    task_group.start_soon(self._run_startup_maintenance, coordinator)
-                yield coordinator
-            finally:
-                # Lock waiters are cancellable between non-blocking attempts. A worker
-                # that has acquired the index lock remains owned until its write
-                # finishes because run_sync is not abandoned on cancellation.
-                task_group.cancel_scope.cancel()
-                if isinstance(self.application, Application):
-                    self.application.close_index_worker()
+        try:
+            async with anyio.create_task_group() as task_group:
+                try:
+                    coordinator = StartupCoordinator(
+                        self.application,
+                        task_group,
+                        mode=self.mode,
+                        wait_seconds=self.wait_seconds,
+                    )
+                    if not isinstance(self.application, BrokerApplication):
+                        task_group.start_soon(self._run_startup_maintenance, coordinator)
+                    yield coordinator
+                finally:
+                    # Lock waiters are cancellable between non-blocking attempts. A worker
+                    # that has acquired the index lock remains owned until its write
+                    # finishes because run_sync is not abandoned on cancellation.
+                    task_group.cancel_scope.cancel()
+        finally:
+            if isinstance(self.application, Application):
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(
+                        self.application.close_index_worker,
+                        abandon_on_cancel=False,
+                    )
 
     async def _run_startup_maintenance(self, coordinator: StartupCoordinator) -> None:
         """Run overdue scheduled maintenance once, after startup indexing settles.

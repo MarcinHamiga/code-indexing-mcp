@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 
 import anyio
@@ -3461,3 +3462,232 @@ def test_has_indexable_change_filters_non_source_paths_without_spawning_git(
     )
     assert server_module._has_indexable_change(root, [(2, str(root / "src"))], scan=scan)
     assert server_module._has_indexable_change(root, [(3, str(root / "deleted_no_ext"))], scan=scan)
+
+
+def test_has_indexable_change_keeps_deleted_dot_named_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F5a: deleted dot-named directories stay candidates; existing non-source files filter out."""
+    from code_indexing_mcp.models import ScanConfig
+
+    root = tmp_path / "repo"
+    (root / "docs").mkdir(parents=True)
+    (root / "node_modules").mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / "README.md").write_text("# readme\n")
+    (root / "docs" / "helper.py").write_text("x = 1\n")
+
+    git_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def counting_run(
+        args: object, *pos: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[object]:
+        if isinstance(args, (list, tuple)) and args and str(args[0]) == "git":
+            git_calls.append([str(part) for part in args])
+        return real_run(args, *pos, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", counting_run)
+
+    scan = ScanConfig(exclude=["docs/**"])
+    assert not server_module._has_indexable_change(
+        root,
+        [
+            (2, str(root / "README.md")),
+            (2, str(root / "node_modules" / "dep.py")),
+            (2, str(root / "docs" / "helper.py")),
+            (2, str(root / ".git" / "index")),
+        ],
+        scan=scan,
+    )
+    assert git_calls == []
+
+    # Non-existent (deleted/moved) dot-named directories must remain indexable candidates.
+    assert server_module._has_indexable_change(root, [(3, str(root / "Acme.Core"))], scan=scan)
+    assert server_module._has_indexable_change(root, [(3, str(root / "v1.0"))], scan=scan)
+
+
+@pytest.mark.asyncio
+async def test_watch_change_is_indexable_under_broker_honors_local_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F5b: Broker watcher pre-filter reads .ci-mcp/project.toml and falls back to list_projects."""
+    import tomli_w
+
+    from code_indexing_mcp.daemon import BrokerApplication
+    from code_indexing_mcp.models import ProjectInfo, ScanConfig
+
+    root = tmp_path / "repo"
+    (root / "generated").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / "LEGACY.PY").write_text("def legacy():\n    return 1\n")
+    (root / "generated" / "out.py").write_text("x = 1\n")
+
+    project_id = "00000000-0000-0000-0000-000000000042"
+    marker = root / ".ci-mcp" / "project.toml"
+    marker.parent.mkdir()
+    marker.write_text(
+        tomli_w.dumps(
+            {
+                "version": 1,
+                "id": project_id,
+                "name": "repo",
+                "scan": {
+                    "include": ["**/*.py", "**/*.PY"],
+                    "exclude": ["generated/**"],
+                },
+            }
+        )
+    )
+
+    git_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def counting_run(
+        args: object, *pos: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[object]:
+        if isinstance(args, (list, tuple)) and args and str(args[0]) == "git":
+            git_calls.append([str(part) for part in args])
+        return real_run(args, *pos, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", counting_run)
+
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    broker = BrokerApplication(paths, cwd=root)
+
+    def fail_list_projects() -> list[ProjectInfo]:
+        raise AssertionError("list_projects should not be called when local marker exists")
+
+    monkeypatch.setattr(broker, "list_projects", fail_list_projects)
+
+    async with anyio.create_task_group() as task_group:
+        coordinator = server_module.StartupCoordinator(
+            broker, task_group, mode=server_module.IndexMode.EAGER
+        )
+        assert not coordinator._watch_change_is_indexable(
+            root, project_id, [(2, str(root / "generated" / "out.py"))]
+        )
+        assert git_calls == []
+        assert coordinator._watch_change_is_indexable(
+            root, project_id, [(2, str(root / "LEGACY.PY"))]
+        )
+
+        # Without a local marker, fall back to application.list_projects().
+        unmarked = tmp_path / "unmarked"
+        (unmarked / "generated").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(unmarked)], check=True)
+        (unmarked / "LEGACY.PY").write_text("def legacy():\n    return 1\n")
+        (unmarked / "generated" / "out.py").write_text("x = 1\n")
+        unmarked_id = "00000000-0000-0000-0000-000000000043"
+        monkeypatch.setattr(
+            broker,
+            "list_projects",
+            lambda: [
+                ProjectInfo(
+                    id=unmarked_id,
+                    name="unmarked",
+                    root=unmarked,
+                    scan=ScanConfig(include=["**/*.py", "**/*.PY"], exclude=["generated/**"]),
+                )
+            ],
+        )
+        git_calls.clear()
+        assert not coordinator._watch_change_is_indexable(
+            unmarked, unmarked_id, [(2, str(unmarked / "generated" / "out.py"))]
+        )
+        assert git_calls == []
+        assert coordinator._watch_change_is_indexable(
+            unmarked, unmarked_id, [(2, str(unmarked / "LEGACY.PY"))]
+        )
+
+
+@pytest.mark.asyncio
+async def test_lifespan_teardown_drains_task_group_and_closes_worker_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4: AutoIndexingMCP._lifespan drains task_group and closes worker off the event loop."""
+    from code_indexing_mcp.models import IndexReport
+
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "main.py").write_text("def answer():\n    return 42\n")
+
+    app = _tiny_application(tmp_path)
+    real_close = app.close_index_worker
+    loop_thread = threading.current_thread()
+
+    index_started = threading.Event()
+    release_index = threading.Event()
+    index_finished = threading.Event()
+    close_started = threading.Event()
+    release_close = threading.Event()
+
+    close_on_worker_thread = False
+    drained_before_close = False
+
+    def slow_index_project(project_id: str, *args: object, **kwargs: object) -> IndexReport:
+        index_started.set()
+        assert release_index.wait(timeout=10)
+        index_finished.set()
+        return IndexReport(project_id=project_id)
+
+    def slow_close_index_worker() -> None:
+        nonlocal close_on_worker_thread, drained_before_close
+        close_on_worker_thread = threading.current_thread() is not loop_thread
+        drained_before_close = index_finished.is_set()
+        close_started.set()
+        assert release_close.wait(timeout=10)
+        real_close()
+
+    monkeypatch.setattr(app, "index_project", slow_index_project)
+    monkeypatch.setattr(app, "close_index_worker", slow_close_index_worker)
+
+    mcp = server_module.AutoIndexingMCP(app, mode=server_module.IndexMode.LAZY)
+    ticks = 0
+    keep_ticking = True
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while keep_ticking:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    async def run_lifespan() -> None:
+        async with mcp._lifespan(mcp) as coordinator:
+            await coordinator.schedule([root], indexes=True)
+            await asyncio.to_thread(index_started.wait, 5)
+            # Exiting the context initiates lifespan teardown while index_project is in flight.
+
+    ticker_task = asyncio.create_task(ticker())
+    lifespan_task = asyncio.create_task(run_lifespan())
+    try:
+        await asyncio.to_thread(index_started.wait, 5)
+        await asyncio.sleep(0.03)
+        assert not close_started.is_set()
+
+        ticks_during_drain = ticks
+        await asyncio.sleep(0.05)
+        assert ticks > ticks_during_drain
+
+        release_index.set()
+        await asyncio.to_thread(close_started.wait, 5)
+        assert close_on_worker_thread
+        assert drained_before_close
+
+        ticks_during_close = ticks
+        await asyncio.sleep(0.05)
+        assert ticks > ticks_during_close
+
+        release_close.set()
+        await asyncio.wait_for(lifespan_task, timeout=5)
+    finally:
+        release_index.set()
+        release_close.set()
+        keep_ticking = False
+        await ticker_task
+        if not lifespan_task.done():
+            lifespan_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await lifespan_task
+        app.close()
