@@ -10,7 +10,12 @@ import pytest
 
 from code_indexing_mcp.errors import CodeIndexingError
 from code_indexing_mcp.reference_service import ReferenceService
-from code_indexing_mcp.source_io import SourceReadError, checked_source_stat, read_source
+from code_indexing_mcp.source_io import (
+    PinnedDirectoryCache,
+    SourceReadError,
+    checked_source_stat,
+    read_source,
+)
 
 
 def test_reader_preserves_bytes_and_enforces_exact_size(tmp_path: Path) -> None:
@@ -166,3 +171,86 @@ def test_vetted_directory_cache_never_hides_a_symlinked_component(tmp_path: Path
     (tmp_path / "real" / "sub").symlink_to(tmp_path / "real" / "sub_moved")
     with pytest.raises(SourceReadError, match="symlink"):
         checked_source_stat(tmp_path, Path("real/sub/f.py"), vetted_directories=vetted)
+
+
+@pytest.mark.skipif(os.open not in os.supports_dir_fd, reason="POSIX dir_fd cache")
+def test_pinned_directory_cache_reuses_ancestor_descriptors_and_closes_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    (tmp_path / "a" / "c").mkdir(parents=True)
+    (tmp_path / "a" / "b" / "one.py").write_bytes(b"one = 1\n")
+    (tmp_path / "a" / "b" / "two.py").write_bytes(b"two = 2\n")
+    (tmp_path / "a" / "c" / "three.py").write_bytes(b"three = 3\n")
+
+    real_open = os.open
+    real_close = os.close
+    dir_opens: list[str] = []
+    live_fds: set[int] = set()
+
+    def tracking_open(
+        path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        fd = (
+            real_open(path, flags, mode)
+            if dir_fd is None
+            else real_open(path, flags, mode, dir_fd=dir_fd)
+        )
+        live_fds.add(fd)
+        if flags & getattr(os, "O_DIRECTORY", 0):
+            dir_opens.append(Path(path).name if path != tmp_path else "<root>")
+        return fd
+
+    def tracking_close(fd: int) -> None:
+        live_fds.discard(fd)
+        real_close(fd)
+
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.open", tracking_open)
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.close", tracking_close)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, tracking_open})
+
+    vetted: set[Path] = set()
+    with PinnedDirectoryCache(tmp_path) as cache:
+        for rel_str, expected in (
+            ("a/b/one.py", b"one = 1\n"),
+            ("a/b/two.py", b"two = 2\n"),
+            ("a/c/three.py", b"three = 3\n"),
+        ):
+            rel = Path(rel_str)
+            st = checked_source_stat(tmp_path, rel, vetted_directories=vetted)
+            data, _ = read_source(tmp_path, rel, 1024, expected_stat=st, directory_cache=cache)
+            assert data == expected
+
+    # <root>, a, b opened once for one.py + two.py; only c opened when switching to a/c/three.py.
+    assert dir_opens == ["<root>", "a", "b", "c"]
+    assert live_fds == set()
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.open not in os.supports_dir_fd,
+    reason="POSIX symlink + dir_fd race check",
+)
+def test_pinned_directory_cache_rejects_mid_scan_directory_symlink_swap(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "one.py").write_bytes(b"inside_one = 1\n")
+    (root / "sub" / "two.py").write_bytes(b"inside_two = 2\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "two.py").write_bytes(b"OUTSIDE_SECRET = 99\n")
+
+    vetted: set[Path] = set()
+    with PinnedDirectoryCache(root) as cache:
+        st_one = checked_source_stat(root, Path("sub/one.py"), vetted_directories=vetted)
+        data_one, _ = read_source(
+            root, Path("sub/one.py"), 1024, expected_stat=st_one, directory_cache=cache
+        )
+        assert data_one == b"inside_one = 1\n"
+
+        # Swap `sub` for a symlink to `outside` while `sub` is already vetted and pinned.
+        (root / "sub").rename(tmp_path / "sub_moved")
+        (root / "sub").symlink_to(outside, target_is_directory=True)
+
+        st_two = checked_source_stat(root, Path("sub/two.py"), vetted_directories=vetted)
+        with pytest.raises(SourceReadError, match="changed_during_open"):
+            read_source(root, Path("sub/two.py"), 1024, expected_stat=st_two, directory_cache=cache)

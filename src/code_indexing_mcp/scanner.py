@@ -11,7 +11,7 @@ Two enumeration strategies share one classification pipeline:
   Tracked-but-ignored files stay eligible because Git's own rule is that the
   index wins. Submodules and nested repositories appear as single non-file
   entries and are not descended into.
-- Outside Git, ``os.walk`` streams per-directory, sorted, with nested
+- Outside Git, ``os.scandir`` streams per-directory, sorted, with nested
   ``.gitignore`` files loaded incrementally and candidate batches bounded in
   memory. ``git check-ignore`` runs only on a rare fallback path (a worktree
   whose ``ls-files`` enumeration failed) and only over pre-filtered batches.
@@ -25,14 +25,29 @@ import stat as stat_module
 import subprocess
 import threading
 import time
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator, Sequence
 from contextlib import suppress
 from pathlib import Path
 
 from pathspec import GitIgnoreSpec
 
-from .models import ProjectInfo, ScanConfig, ScannedFile, ScanResult, SkippedFile, StoredFile
-from .source_io import SourceReadError, checked_source_stat, read_source
+from .models import (
+    DEFAULT_INCLUDES,
+    ProjectInfo,
+    ScanConfig,
+    ScannedFile,
+    ScanResult,
+    SkippedFile,
+    StoredFile,
+)
+from .source_io import (
+    PinnedDirectoryCache,
+    SourceReadError,
+    checked_source_stat,
+    read_source,
+)
+
+_default_read_source = read_source
 
 LANGUAGES = {
     ".py": "python",
@@ -113,6 +128,9 @@ SCAN_STREAM_READ_SIZE = 65536
 # chunks plus the current batch even while the consumer is busy.
 GIT_LS_FILES_QUEUE_CHUNKS = 8
 
+_IgnoreEntry = tuple[Path, GitIgnoreSpec]
+_CandidateEntry = tuple[Path, Path, list[_IgnoreEntry]]
+
 
 class _GitEnumerationError(Exception):
     """Git enumeration failed or timed out; the walk path takes over."""
@@ -127,33 +145,94 @@ class SourceScanner:
         finally:
             candidates.close()
 
+    @staticmethod
+    def _compile_include_spec(include: Sequence[str]) -> GitIgnoreSpec | None:
+        """Compile custom include patterns, or return ``None`` for ``DEFAULT_INCLUDES``.
+
+        ``DEFAULT_INCLUDES`` carries one ``**/*.<ext>`` pattern per entry in
+        :data:`LANGUAGES`, so a case-sensitive suffix membership check against
+        ``LANGUAGES`` answers the exact same question without evaluating 44
+        compiled regular expressions per candidate.
+        """
+        if list(include) == DEFAULT_INCLUDES:
+            return None
+        return GitIgnoreSpec.from_lines(include)
+
+    @staticmethod
+    def _compile_exclude_spec(exclude: Sequence[str]) -> GitIgnoreSpec | None:
+        if not exclude:
+            return None
+        return GitIgnoreSpec.from_lines(exclude)
+
+    @staticmethod
+    def _matches_include(relative: Path, suffix: str, include_spec: GitIgnoreSpec | None) -> bool:
+        if include_spec is None:
+            return suffix in LANGUAGES
+        return include_spec.match_file(relative.as_posix())
+
+    def _uses_default_git_batches(self) -> bool:
+        return (
+            "_iter_git_batches" not in self.__dict__
+            and getattr(type(self), "_iter_git_batches", None) is _DEFAULT_ITER_GIT_BATCHES
+        )
+
+    def _uses_default_walk_batches(self) -> bool:
+        return (
+            "_iter_walk_batches" not in self.__dict__
+            and getattr(type(self), "_iter_walk_batches", None) is _DEFAULT_ITER_WALK_BATCHES
+        )
+
     def _iter_eligible_paths(self, root: Path, scan: ScanConfig) -> Generator[Path, None, None]:
         """Yield stat-only candidates using the same filters as ``iter_scan``."""
         root = root.expanduser().resolve()
-        config_excludes = GitIgnoreSpec.from_lines(scan.exclude)
-        include_spec = GitIgnoreSpec.from_lines(scan.include)
+        config_excludes = self._compile_exclude_spec(scan.exclude)
+        include_spec = self._compile_include_spec(scan.include)
         in_worktree = self._in_git_worktree(root)
         root_ignored = in_worktree and self._git_ignores_root(root)
         if root_ignored:
             in_worktree = False
+        vetted_directories: set[Path] = set()
         if in_worktree:
             try:
-                for batch in self._iter_git_batches(root):
-                    for item in self._prefilter_git_batch(batch, root, include_spec):
-                        if isinstance(item, SkippedFile):
-                            continue
-                        for scanned in self._scan_candidates(
-                            item,
-                            root=root,
-                            include_spec=include_spec,
-                            config_excludes=config_excludes,
-                            max_file_bytes=scan.max_file_bytes,
-                            known_files={},
-                            read_contents=False,
-                            run_check_ignore=False,
+                if self._uses_default_git_batches():
+                    for rel_batch in self._iter_git_relative_batches(root):
+                        for prefiltered in self._prefilter_git_relative_batch(
+                            rel_batch, root, include_spec
                         ):
-                            if isinstance(scanned, ScannedFile):
-                                yield scanned.path
+                            if isinstance(prefiltered, SkippedFile):
+                                continue
+                            for scanned in self._scan_candidate_entries(
+                                prefiltered,
+                                root=root,
+                                include_spec=include_spec,
+                                config_excludes=config_excludes,
+                                max_file_bytes=scan.max_file_bytes,
+                                known_files={},
+                                read_contents=False,
+                                run_check_ignore=False,
+                                already_included=True,
+                                vetted_directories=vetted_directories,
+                            ):
+                                if isinstance(scanned, ScannedFile):
+                                    yield scanned.path
+                else:
+                    for batch in self._iter_git_batches(root):
+                        for item in self._prefilter_git_batch(batch, root, include_spec):
+                            if isinstance(item, SkippedFile):
+                                continue
+                            for scanned in self._scan_candidates(
+                                item,
+                                root=root,
+                                include_spec=include_spec,
+                                config_excludes=config_excludes,
+                                max_file_bytes=scan.max_file_bytes,
+                                known_files={},
+                                read_contents=False,
+                                run_check_ignore=False,
+                                vetted_directories=vetted_directories,
+                            ):
+                                if isinstance(scanned, ScannedFile):
+                                    yield scanned.path
                 return
             except _GitEnumerationError:
                 # Match ``iter_scan``'s walk fallback after a failed Git
@@ -161,11 +240,23 @@ class SourceScanner:
                 # opaque and asks Git for authoritative ignore state.
                 pass
         pending: list[Path] = []
-        for item in self._iter_walk_batches(root, include_spec):
-            if isinstance(item, SkippedFile):
+        walk_stream: Iterator[SkippedFile | list[_CandidateEntry]]
+        if self._uses_default_walk_batches():
+            walk_stream = self._iter_walk_candidate_batches(root, include_spec)
+        else:
+            walk_stream = (
+                item
+                if isinstance(item, SkippedFile)
+                else [(absolute, absolute.relative_to(root), specs) for absolute, specs in item]
+                for item in self._iter_walk_batches(
+                    root, include_spec or GitIgnoreSpec.from_lines(scan.include)
+                )
+            )
+        for walk_item in walk_stream:
+            if isinstance(walk_item, SkippedFile):
                 continue
-            for scanned in self._scan_candidates(
-                item,
+            for scanned in self._scan_candidate_entries(
+                walk_item,
                 root=root,
                 include_spec=include_spec,
                 config_excludes=config_excludes,
@@ -173,6 +264,8 @@ class SourceScanner:
                 known_files={},
                 read_contents=False,
                 run_check_ignore=in_worktree,
+                already_included=True,
+                vetted_directories=vetted_directories,
             ):
                 if isinstance(scanned, ScannedFile):
                     pending.append(scanned.path)
@@ -228,13 +321,15 @@ class SourceScanner:
         """
         known_files = known_files or {}
         root = project.root.resolve()
-        config_excludes = GitIgnoreSpec.from_lines(project.scan.exclude)
-        include_spec = GitIgnoreSpec.from_lines(project.scan.include)
-        items: list[tuple[Path, list[tuple[Path, GitIgnoreSpec]]]] = [
-            (root / relative, []) for relative in relative_paths
-        ]
-        yield from self._scan_candidates(
-            items,
+        config_excludes = self._compile_exclude_spec(project.scan.exclude)
+        include_spec = self._compile_include_spec(project.scan.include)
+        entries: list[_CandidateEntry] = []
+        for raw_relative in relative_paths:
+            relative = Path(raw_relative)
+            entries.append((root / relative, relative, []))
+        vetted_directories: set[Path] = set()
+        yield from self._scan_candidate_entries(
+            entries,
             root=root,
             include_spec=include_spec,
             config_excludes=config_excludes,
@@ -242,6 +337,8 @@ class SourceScanner:
             known_files=known_files,
             read_contents=False,
             run_check_ignore=False,
+            already_included=False,
+            vetted_directories=vetted_directories,
         )
 
     def iter_scan(
@@ -260,76 +357,148 @@ class SourceScanner:
         any moment.
 
         Git worktrees are enumerated with ``git ls-files``, which applies every
-        ignore rule in one pass; everything else streams ``os.walk`` with
+        ignore rule in one pass; everything else streams ``os.scandir`` with
         incremental nested ignore rules. Either way only files whose suffix and
         include pattern already admit them are ever statted or passed to Git,
         and candidate batches stay bounded in memory.
         """
         known_files = known_files or {}
         root = project.root.resolve()
-        config_excludes = GitIgnoreSpec.from_lines(project.scan.exclude)
-        include_spec = GitIgnoreSpec.from_lines(project.scan.include)
+        config_excludes = self._compile_exclude_spec(project.scan.exclude)
+        include_spec = self._compile_include_spec(project.scan.include)
         in_worktree = self._in_git_worktree(root)
         root_ignored = in_worktree and self._git_ignores_root(root)
         if root_ignored:
             in_worktree = False
         git_yielded: set[str] = set()
         fallback = False
-        if in_worktree:
-            try:
-                for batch in self._iter_git_batches(root):
-                    for item in self._prefilter_git_batch(batch, root, include_spec):
-                        if isinstance(item, SkippedFile):
-                            git_yielded.add(item.path.as_posix())
-                            yield item
-                            continue
-                        for scanned in self._scan_candidates(
-                            item,
-                            root=root,
-                            include_spec=include_spec,
-                            config_excludes=config_excludes,
-                            max_file_bytes=project.scan.max_file_bytes,
-                            known_files=known_files,
-                            read_contents=read_contents,
-                            run_check_ignore=False,
-                        ):
-                            git_yielded.add(scanned.path.as_posix())
-                            yield scanned
-                return
-            except _GitEnumerationError:
-                # A failed or timed-out git process must not silently produce
-                # an empty index: the streaming walk covers the same tree.
-                # Batches streamed before the failure already reached the
-                # consumer, so the walk must skip those paths: an indexer that
-                # sees one file twice queues it under two pending owners and
-                # stages its chunk rows non-contiguously, which crashes the
-                # staging invariant (or silently duplicates the rows).
-                fallback = True
-        for walk_batch in self._iter_walk_batches(root, include_spec):
-            if isinstance(walk_batch, SkippedFile):
-                if not fallback or walk_batch.path.as_posix() not in git_yielded:
-                    yield walk_batch
-                continue
-            for scanned in self._scan_candidates(
-                walk_batch,
-                root=root,
-                include_spec=include_spec,
-                config_excludes=config_excludes,
-                max_file_bytes=project.scan.max_file_bytes,
-                known_files=known_files,
-                read_contents=read_contents,
-                run_check_ignore=in_worktree,
-            ):
-                if fallback and scanned.path.as_posix() in git_yielded:
+        vetted_directories: set[Path] = set()
+        directory_cache = PinnedDirectoryCache(root) if read_contents else None
+        try:
+            if in_worktree:
+                try:
+                    if self._uses_default_git_batches():
+                        for rel_batch in self._iter_git_relative_batches(root):
+                            for prefiltered in self._prefilter_git_relative_batch(
+                                rel_batch, root, include_spec
+                            ):
+                                if isinstance(prefiltered, SkippedFile):
+                                    git_yielded.add(prefiltered.path.as_posix())
+                                    yield prefiltered
+                                    continue
+                                for scanned in self._scan_candidate_entries(
+                                    prefiltered,
+                                    root=root,
+                                    include_spec=include_spec,
+                                    config_excludes=config_excludes,
+                                    max_file_bytes=project.scan.max_file_bytes,
+                                    known_files=known_files,
+                                    read_contents=read_contents,
+                                    run_check_ignore=False,
+                                    already_included=True,
+                                    vetted_directories=vetted_directories,
+                                    directory_cache=directory_cache,
+                                ):
+                                    git_yielded.add(scanned.path.as_posix())
+                                    yield scanned
+                    else:
+                        for batch in self._iter_git_batches(root):
+                            for item in self._prefilter_git_batch(batch, root, include_spec):
+                                if isinstance(item, SkippedFile):
+                                    git_yielded.add(item.path.as_posix())
+                                    yield item
+                                    continue
+                                for scanned in self._scan_candidates(
+                                    item,
+                                    root=root,
+                                    include_spec=include_spec,
+                                    config_excludes=config_excludes,
+                                    max_file_bytes=project.scan.max_file_bytes,
+                                    known_files=known_files,
+                                    read_contents=read_contents,
+                                    run_check_ignore=False,
+                                    vetted_directories=vetted_directories,
+                                    directory_cache=directory_cache,
+                                ):
+                                    git_yielded.add(scanned.path.as_posix())
+                                    yield scanned
+                    return
+                except _GitEnumerationError:
+                    # A failed or timed-out git process must not silently produce
+                    # an empty index: the streaming walk covers the same tree.
+                    # Batches streamed before the failure already reached the
+                    # consumer, so the walk must skip those paths: an indexer that
+                    # sees one file twice queues it under two pending owners and
+                    # stages its chunk rows non-contiguously, which crashes the
+                    # staging invariant (or silently duplicates the rows).
+                    fallback = True
+            walk_stream: Iterator[SkippedFile | list[_CandidateEntry]]
+            if self._uses_default_walk_batches():
+                walk_stream = self._iter_walk_candidate_batches(root, include_spec)
+            else:
+                walk_stream = (
+                    walk_batch
+                    if isinstance(walk_batch, SkippedFile)
+                    else [
+                        (absolute, absolute.relative_to(root), specs)
+                        for absolute, specs in walk_batch
+                    ]
+                    for walk_batch in self._iter_walk_batches(
+                        root, include_spec or GitIgnoreSpec.from_lines(project.scan.include)
+                    )
+                )
+            for walk_entry in walk_stream:
+                if isinstance(walk_entry, SkippedFile):
+                    if not fallback or walk_entry.path.as_posix() not in git_yielded:
+                        yield walk_entry
                     continue
-                yield scanned
+                for scanned in self._scan_candidate_entries(
+                    walk_entry,
+                    root=root,
+                    include_spec=include_spec,
+                    config_excludes=config_excludes,
+                    max_file_bytes=project.scan.max_file_bytes,
+                    known_files=known_files,
+                    read_contents=read_contents,
+                    run_check_ignore=in_worktree,
+                    already_included=True,
+                    vetted_directories=vetted_directories,
+                    directory_cache=directory_cache,
+                ):
+                    if fallback and scanned.path.as_posix() in git_yielded:
+                        continue
+                    yield scanned
+        finally:
+            if directory_cache is not None:
+                directory_cache.close()
+
+    def _prefilter_git_relative_batch(
+        self,
+        batch: list[Path],
+        root: Path,
+        include_spec: GitIgnoreSpec | None,
+    ) -> Iterator[SkippedFile | list[_CandidateEntry]]:
+        """Split a relative git-enumerated batch into skips and candidate entries."""
+        items: list[_CandidateEntry] = []
+        for relative in batch:
+            if SourceScanner._in_hard_excluded_directory(relative):
+                continue
+            suffix = relative.suffix
+            if LANGUAGES.get(suffix.lower()) is None or not SourceScanner._matches_include(
+                relative, suffix, include_spec
+            ):
+                yield SkippedFile(path=relative, reason="unsupported")
+                continue
+            items.append((root / relative, relative, []))
+        if items:
+            yield items
 
     def _prefilter_git_batch(
         self,
         batch: list[Path],
         root: Path,
-        include_spec: GitIgnoreSpec,
-    ) -> Iterator[SkippedFile | list[tuple[Path, list[tuple[Path, GitIgnoreSpec]]]]]:
+        include_spec: GitIgnoreSpec | None = None,
+    ) -> Iterator[SkippedFile | list[tuple[Path, list[_IgnoreEntry]]]]:
         """Split one git-enumerated batch into recordable skips and candidates.
 
         Git already applied every ignore rule, but the scanner's own safety and
@@ -337,13 +506,14 @@ class SourceScanner:
         are dropped silently and unsupported suffixes are recorded as skips,
         so ``_classify`` (and its stat calls) never see them.
         """
-        items: list[tuple[Path, list[tuple[Path, GitIgnoreSpec]]]] = []
+        items: list[tuple[Path, list[_IgnoreEntry]]] = []
         for absolute in batch:
             relative = absolute.relative_to(root)
             if SourceScanner._in_hard_excluded_directory(relative):
                 continue
-            if LANGUAGES.get(absolute.suffix.lower()) is None or not include_spec.match_file(
-                relative.as_posix()
+            suffix = relative.suffix
+            if LANGUAGES.get(suffix.lower()) is None or not SourceScanner._matches_include(
+                relative, suffix, include_spec
             ):
                 yield SkippedFile(path=relative, reason="unsupported")
                 continue
@@ -351,9 +521,82 @@ class SourceScanner:
         if items:
             yield items
 
+    def _iter_walk_candidate_batches(
+        self, root: Path, include_spec: GitIgnoreSpec | None = None
+    ) -> Iterator[SkippedFile | list[_CandidateEntry]]:
+        """Stream the non-Git tree in deterministic per-directory order via ``os.scandir``.
+
+        Nested ``.gitignore`` files are loaded as the walk reaches their
+        directory; a visited directory's entry dies with its stack frame, so
+        memory stays proportional to the traversal depth rather than the whole
+        tree. ``DirEntry.is_symlink`` and ``DirEntry.is_dir(follow_symlinks=False)``
+        use directory-entry metadata without extra ``lstat`` calls on ordinary
+        entries. Directories that are their own repository (submodules, nested
+        repositories) are opaque, matching what ``git ls-files`` reports for
+        the git path.
+        """
+        batch: list[_CandidateEntry] = []
+        stack: list[tuple[Path, Path | None, list[_IgnoreEntry]]] = [(root, None, [])]
+        while stack:
+            base, rel_base, ignore_specs = stack.pop()
+            try:
+                with os.scandir(base) as it:
+                    entries = list(it)
+            except OSError:
+                continue
+            dir_names: list[str] = []
+            file_names: list[str] = []
+            has_gitignore = False
+            for entry in entries:
+                name = entry.name
+                try:
+                    is_symlink = entry.is_symlink()
+                    is_dir = entry.is_dir() if is_symlink else entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    is_symlink = False
+                    is_dir = False
+                if is_dir:
+                    if (
+                        not is_symlink
+                        and name not in HARD_EXCLUDED_DIRECTORIES
+                        and not SourceScanner._is_repository_worktree(base / name)
+                    ):
+                        dir_names.append(name)
+                else:
+                    if name == ".gitignore":
+                        has_gitignore = True
+                    file_names.append(name)
+
+            if has_gitignore:
+                loaded = self._load_ignore_spec_at(base / ".gitignore", rel_base or Path("."))
+                if loaded is not None:
+                    ignore_specs = [*ignore_specs, loaded]
+
+            file_names.sort()
+            for name in file_names:
+                relative = Path(name) if rel_base is None else rel_base / name
+                suffix = relative.suffix
+                if LANGUAGES.get(suffix.lower()) is None or not SourceScanner._matches_include(
+                    relative, suffix, include_spec
+                ):
+                    yield SkippedFile(path=relative, reason="unsupported")
+                    continue
+                batch.append((base / name, relative, ignore_specs))
+                if len(batch) >= GIT_IGNORE_DISCOVERY_BATCH_SIZE:
+                    yield batch
+                    batch = []
+
+            dir_names.sort(reverse=True)
+            for name in dir_names:
+                child_rel = Path(name) if rel_base is None else rel_base / name
+                stack.append((base / name, child_rel, ignore_specs))
+
+        if batch:
+            yield batch
+
     def _iter_walk_batches(
-        self, root: Path, include_spec: GitIgnoreSpec
-    ) -> Iterator[SkippedFile | list[tuple[Path, list[tuple[Path, GitIgnoreSpec]]]]]:
+        self, root: Path, include_spec: GitIgnoreSpec | None = None
+    ) -> Iterator[SkippedFile | list[tuple[Path, list[_IgnoreEntry]]]]:
         """Stream the non-Git tree in deterministic per-directory order.
 
         Nested ``.gitignore`` files are loaded as the walk reaches their
@@ -365,43 +608,11 @@ class SourceScanner:
         by suffix and include pattern before any stat or ignore work; batches
         stay bounded in memory.
         """
-        inherited_specs: dict[Path, list[tuple[Path, GitIgnoreSpec]]] = {root: []}
-        batch: list[tuple[Path, list[tuple[Path, GitIgnoreSpec]]]] = []
-        for dirpath, dirnames, filenames in os.walk(root):
-            base = Path(dirpath)
-            dirnames[:] = sorted(
-                name
-                for name in dirnames
-                if name not in HARD_EXCLUDED_DIRECTORIES
-                and not (base / name).is_symlink()
-                and not SourceScanner._is_repository_worktree(base / name)
-            )
-            ignore_specs = inherited_specs.get(base, [])
-            if ".gitignore" in filenames:
-                ignore_specs = [
-                    *ignore_specs,
-                    *self._load_ignore_specs(root, [base / ".gitignore"]),
-                ]
-            for name in dirnames:
-                inherited_specs[base / name] = ignore_specs
-
-            for name in sorted(filenames):
-                absolute = base / name
-                relative = absolute.relative_to(root)
-                if SourceScanner._in_hard_excluded_directory(relative):
-                    continue
-                if LANGUAGES.get(absolute.suffix.lower()) is None or not include_spec.match_file(
-                    relative.as_posix()
-                ):
-                    yield SkippedFile(path=relative, reason="unsupported")
-                    continue
-                batch.append((absolute, ignore_specs))
-                if len(batch) >= GIT_IGNORE_DISCOVERY_BATCH_SIZE:
-                    yield batch
-                    batch = []
-            inherited_specs.pop(base, None)
-        if batch:
-            yield batch
+        for item in self._iter_walk_candidate_batches(root, include_spec):
+            if isinstance(item, SkippedFile):
+                yield item
+            else:
+                yield [(absolute, specs) for absolute, _, specs in item]
 
     @staticmethod
     def _is_repository_worktree(path: Path) -> bool:
@@ -459,17 +670,8 @@ class SourceScanner:
         return ignored.returncode == 0
 
     @staticmethod
-    def _iter_git_batches(root: Path) -> Iterator[list[Path]]:
-        """Stream ``git ls-files`` output in bounded, sorted batches.
-
-        A daemon reader thread drains stdout into a staging queue so the hard
-        deadline is enforceable on every platform: ``select`` cannot wait on a
-        pipe on Windows, so a blocking read with a select-driven timeout would
-        make every Windows scan fall back to the streaming walk. Reads are
-        chunked so candidate memory stays proportional to one batch, and a hung
-        git process cannot wedge a scan. A non-zero exit (which cannot normally
-        happen for a worktree the probe just accepted) falls back to the walk.
-        """
+    def _iter_git_relative_batches(root: Path) -> Iterator[list[Path]]:
+        """Stream ``git ls-files`` output as bounded, sorted relative ``Path`` batches."""
         try:
             process = subprocess.Popen(
                 [
@@ -539,7 +741,7 @@ class SourceScanner:
                     raw = bytes(buffer[start:separator])
                     start = separator + 1
                     if raw and raw != previous_raw:
-                        batch.append(root / os.fsdecode(raw))
+                        batch.append(Path(os.fsdecode(raw)))
                     previous_raw = raw
                     if len(batch) >= GIT_IGNORE_DISCOVERY_BATCH_SIZE:
                         batch.sort()
@@ -572,17 +774,34 @@ class SourceScanner:
             batch.sort()
             yield batch
 
+    @staticmethod
+    def _iter_git_batches(root: Path) -> Iterator[list[Path]]:
+        """Stream ``git ls-files`` output in bounded, sorted batches.
+
+        A daemon reader thread drains stdout into a staging queue so the hard
+        deadline is enforceable on every platform: ``select`` cannot wait on a
+        pipe on Windows, so a blocking read with a select-driven timeout would
+        make every Windows scan fall back to the streaming walk. Reads are
+        chunked so candidate memory stays proportional to one batch, and a hung
+        git process cannot wedge a scan. A non-zero exit (which cannot normally
+        happen for a worktree the probe just accepted) falls back to the walk.
+        """
+        for batch in SourceScanner._iter_git_relative_batches(root):
+            yield [root / relative for relative in batch]
+
     def _scan_candidates(
         self,
-        items: Iterable[tuple[Path, list[tuple[Path, GitIgnoreSpec]]]],
+        items: Iterable[tuple[Path, list[_IgnoreEntry]]],
         *,
         root: Path,
-        include_spec: GitIgnoreSpec,
-        config_excludes: GitIgnoreSpec,
+        include_spec: GitIgnoreSpec | None,
+        config_excludes: GitIgnoreSpec | None,
         max_file_bytes: int,
         known_files: dict[str, StoredFile],
         read_contents: bool,
         run_check_ignore: bool,
+        vetted_directories: set[Path] | None = None,
+        directory_cache: PinnedDirectoryCache | None = None,
     ) -> Iterator[ScannedFile | SkippedFile]:
         """Classify, stat, and optionally read one pre-filtered candidate batch.
 
@@ -590,45 +809,91 @@ class SourceScanner:
         ``ls-files`` enumeration failed; regular walks outside Git skip the
         subprocess entirely because there is nothing for it to apply.
         """
+        entries = [(absolute, absolute.relative_to(root), specs) for absolute, specs in items]
+        yield from self._scan_candidate_entries(
+            entries,
+            root=root,
+            include_spec=include_spec,
+            config_excludes=config_excludes,
+            max_file_bytes=max_file_bytes,
+            known_files=known_files,
+            read_contents=read_contents,
+            run_check_ignore=run_check_ignore,
+            already_included=False,
+            vetted_directories=vetted_directories,
+            directory_cache=directory_cache,
+        )
+
+    def _scan_candidate_entries(
+        self,
+        entries: Sequence[_CandidateEntry],
+        *,
+        root: Path,
+        include_spec: GitIgnoreSpec | None,
+        config_excludes: GitIgnoreSpec | None,
+        max_file_bytes: int,
+        known_files: dict[str, StoredFile],
+        read_contents: bool,
+        run_check_ignore: bool,
+        already_included: bool,
+        vetted_directories: set[Path] | None = None,
+        directory_cache: PinnedDirectoryCache | None = None,
+    ) -> Iterator[ScannedFile | SkippedFile]:
         ignored_paths: set[Path] = set()
-        # Ancestor directories already vetted during this batch; the content
-        # read below re-vets the full chain per file, so this only spares the
-        # repeated stat-only lstat of shared directories.
-        vetted_directories: set[Path] = set()
-        if run_check_ignore and items:
-            ignored_paths = self._git_ignored_paths(root, [absolute for absolute, _ in items])
-        for absolute, ignore_specs in items:
-            relative = absolute.relative_to(root)
-            language, skip_reason = self._classify(
-                relative,
-                absolute,
-                include_spec=include_spec,
-                config_excludes=config_excludes,
-                # On the worktree fallback, ``git check-ignore`` is the
-                # authoritative ignore source (it applies ``.gitignore``,
-                # ``info/exclude``, and global excludes) and knows the index:
-                # the in-process ``.gitignore`` specs must not second-guess it,
-                # or a tracked-but-ignored file would be dropped as "ignored"
-                # instead of staying eligible (the index wins).
-                ignore_specs=[] if run_check_ignore else ignore_specs,
-                standard_ignored=relative in ignored_paths,
-            )
+        if vetted_directories is None:
+            vetted_directories = set()
+        if run_check_ignore and entries:
+            ignored_paths = self._git_ignored_paths(root, [absolute for absolute, _, _ in entries])
+        for absolute, relative, ignore_specs in entries:
+            if not already_included and SourceScanner._in_hard_excluded_directory(relative):
+                continue
+            suffix = relative.suffix
+            language = LANGUAGES.get(suffix.lower())
             if language is None:
-                if skip_reason is not None:
-                    yield SkippedFile(path=relative, reason=skip_reason)
+                try:
+                    mode = absolute.lstat().st_mode
+                except OSError:
+                    continue
+                if stat_module.S_ISREG(mode):
+                    yield SkippedFile(path=relative, reason="unsupported")
                 continue
             try:
-                stat = checked_source_stat(root, relative, vetted_directories=vetted_directories)
-                if stat.st_size > max_file_bytes:
-                    yield SkippedFile(path=relative, reason="oversized")
-                    continue
+                stat = checked_source_stat(
+                    root,
+                    relative,
+                    vetted_directories=vetted_directories,
+                    leaf_path=absolute,
+                )
             except SourceReadError as exc:
+                if exc.reason in {"not_regular", "not_directory"}:
+                    continue
                 yield SkippedFile(path=relative, reason=exc.reason, detail=str(exc))
                 continue
-            except OSError as exc:
-                yield SkippedFile(path=relative, reason="unreadable", detail=str(exc))
+            except OSError:
                 continue
-            previous = known_files.get(relative.as_posix())
+            if not already_included and not SourceScanner._matches_include(
+                relative, suffix, include_spec
+            ):
+                yield SkippedFile(path=relative, reason="unsupported")
+                continue
+            # On the worktree fallback, ``git check-ignore`` is the
+            # authoritative ignore source (it applies ``.gitignore``,
+            # ``info/exclude``, and global excludes) and knows the index:
+            # the in-process ``.gitignore`` specs must not second-guess it,
+            # or a tracked-but-ignored file would be dropped as "ignored"
+            # instead of staying eligible (the index wins).
+            effective_specs = [] if run_check_ignore else ignore_specs
+            if (
+                (bool(ignored_paths) and relative in ignored_paths)
+                or (config_excludes is not None and config_excludes.match_file(relative.as_posix()))
+                or (bool(effective_specs) and SourceScanner._is_ignored(relative, effective_specs))
+            ):
+                yield SkippedFile(path=relative, reason="ignored")
+                continue
+            if stat.st_size > max_file_bytes:
+                yield SkippedFile(path=relative, reason="oversized")
+                continue
+            previous = known_files.get(relative.as_posix()) if known_files else None
             content: bytes | None = None
             if read_contents and (
                 previous is None
@@ -636,7 +901,16 @@ class SourceScanner:
                 or previous.mtime_ns != stat.st_mtime_ns
             ):
                 try:
-                    content, stat = read_source(root, relative, max_file_bytes)
+                    if read_source is _default_read_source:
+                        content, stat = read_source(
+                            root,
+                            relative,
+                            max_file_bytes,
+                            expected_stat=stat,
+                            directory_cache=directory_cache,
+                        )
+                    else:
+                        content, stat = read_source(root, relative, max_file_bytes)
                 except SourceReadError as exc:
                     yield SkippedFile(path=relative, reason=exc.reason, detail=str(exc))
                     continue
@@ -657,9 +931,9 @@ class SourceScanner:
         relative: Path,
         absolute: Path,
         *,
-        include_spec: GitIgnoreSpec,
-        config_excludes: GitIgnoreSpec,
-        ignore_specs: list[tuple[Path, GitIgnoreSpec]],
+        include_spec: GitIgnoreSpec | None,
+        config_excludes: GitIgnoreSpec | None,
+        ignore_specs: list[_IgnoreEntry],
         standard_ignored: bool = False,
     ) -> tuple[str | None, str | None]:
         """Decide whether a candidate file is eligible for indexing.
@@ -677,28 +951,23 @@ class SourceScanner:
         """
         if SourceScanner._in_hard_excluded_directory(relative):
             return None, None
-        # A single lstat replaces the separate is_symlink() and is_file()
-        # calls Path would otherwise make on the same path (D8): once a path
-        # is known not to be a symlink, lstat and stat agree, so one syscall
-        # answers both questions. Any error (missing path, permission) is
-        # treated exactly as Path.is_symlink()/is_file() would: not eligible,
-        # with no recorded skip reason.
         try:
             mode = os.lstat(absolute).st_mode
         except OSError:
             return None, None
+        suffix = absolute.suffix
         if stat_module.S_ISLNK(mode):
-            if absolute.suffix.lower() in LANGUAGES:
+            if suffix.lower() in LANGUAGES:
                 return None, "symlink"
             return None, None
         if not stat_module.S_ISREG(mode):
             return None, None
-        language = LANGUAGES.get(absolute.suffix.lower())
-        if language is None or not include_spec.match_file(relative.as_posix()):
+        language = LANGUAGES.get(suffix.lower())
+        if language is None or not SourceScanner._matches_include(relative, suffix, include_spec):
             return None, "unsupported"
         if (
             standard_ignored
-            or config_excludes.match_file(relative.as_posix())
+            or (config_excludes is not None and config_excludes.match_file(relative.as_posix()))
             or SourceScanner._is_ignored(relative, ignore_specs)
         ):
             return None, "ignored"
@@ -740,25 +1009,29 @@ class SourceScanner:
         return any(part in HARD_EXCLUDED_DIRECTORIES for part in path.parts[:-1])
 
     @staticmethod
-    def _load_ignore_specs(root: Path, gitignores: list[Path]) -> list[tuple[Path, GitIgnoreSpec]]:
-        specs: list[tuple[Path, GitIgnoreSpec]] = []
+    def _load_ignore_spec_at(gitignore_path: Path, relative_parent: Path) -> _IgnoreEntry | None:
+        try:
+            return (
+                relative_parent,
+                GitIgnoreSpec.from_lines(gitignore_path.read_text(encoding="utf-8").splitlines()),
+            )
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    @staticmethod
+    def _load_ignore_specs(root: Path, gitignores: list[Path]) -> list[_IgnoreEntry]:
+        specs: list[_IgnoreEntry] = []
         for path in gitignores:
             relative = path.relative_to(root)
             if SourceScanner._in_hard_excluded_directory(relative):
                 continue
-            try:
-                specs.append(
-                    (
-                        path.parent.relative_to(root),
-                        GitIgnoreSpec.from_lines(path.read_text(encoding="utf-8").splitlines()),
-                    )
-                )
-            except (OSError, UnicodeDecodeError):
-                continue
+            loaded = SourceScanner._load_ignore_spec_at(path, path.parent.relative_to(root))
+            if loaded is not None:
+                specs.append(loaded)
         return specs
 
     @staticmethod
-    def _is_ignored(path: Path, specs: list[tuple[Path, GitIgnoreSpec]]) -> bool:
+    def _is_ignored(path: Path, specs: list[_IgnoreEntry]) -> bool:
         ignored = False
         for base, spec in specs:
             try:
@@ -769,3 +1042,7 @@ class SourceScanner:
             except ValueError:
                 continue
         return ignored
+
+
+_DEFAULT_ITER_GIT_BATCHES = SourceScanner._iter_git_batches
+_DEFAULT_ITER_WALK_BATCHES = SourceScanner._iter_walk_batches

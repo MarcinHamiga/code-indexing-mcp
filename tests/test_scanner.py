@@ -845,3 +845,107 @@ def test_git_enumeration_yields_unmerged_path_once(tmp_path: Path) -> None:
     paths = [path.name for batch in SourceScanner._iter_git_batches(root) for path in batch]
 
     assert sorted(paths) == ["a.py", "b.py"]
+
+
+@pytest.mark.parametrize("use_git", [False, True])
+def test_scan_vets_shared_ancestors_once_across_batches_and_lstats_each_leaf_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_git: bool
+) -> None:
+    root = tmp_path / "repo"
+    deep = root / "a" / "b" / "c"
+    deep.mkdir(parents=True)
+    if use_git:
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+    project = initialize_project(root)
+    for index in range(300):
+        (deep / f"mod_{index:03d}.py").write_text("x = 1\n")
+    if use_git:
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+
+    calls: list[Path] = []
+    real_lstat = Path.lstat
+
+    def counting_lstat(self: Path) -> object:
+        calls.append(self)
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", counting_lstat)
+
+    result = SourceScanner().scan(project)
+
+    assert len(result.files) == 300
+    # 3 shared ancestor directories (a, a/b, a/b/c) vetted once across both batches + 300 leaves.
+    assert len(calls) == 303
+
+
+def test_default_includes_fast_path_preserves_case_sensitivity_and_custom_globs(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    project = initialize_project(root)
+    (root / "ok.py").write_text("x = 1\n")
+    (root / "UPPER.PY").write_text("x = 2\n")
+    (root / "sub" / "nested.py").write_text("x = 3\n")
+
+    default_result = SourceScanner().scan(project)
+    assert [item.path.as_posix() for item in default_result.files] == ["ok.py", "sub/nested.py"]
+    assert any(
+        skip.path.as_posix() == "UPPER.PY" and skip.reason == "unsupported"
+        for skip in default_result.skipped
+    )
+
+    custom_project = project.model_copy(
+        update={"scan": project.scan.model_copy(update={"include": ["sub/*.py"]})}
+    )
+    custom_result = SourceScanner().scan(custom_project)
+    assert [item.path.as_posix() for item in custom_result.files] == ["sub/nested.py"]
+    assert {
+        skip.path.as_posix() for skip in custom_result.skipped if skip.reason == "unsupported"
+    } >= {"ok.py", "UPPER.PY"}
+
+
+def test_early_iter_scan_close_releases_pinned_directory_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    if os.open not in os.supports_dir_fd:
+        pytest.skip("POSIX dir_fd cache")
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "a.py").write_bytes(b"a = 1\n")
+    (root / "sub" / "b.py").write_bytes(b"b = 2\n")
+    project = initialize_project(root)
+
+    real_open = os.open
+    real_close = os.close
+    live_fds: set[int] = set()
+
+    def tracking_open(
+        path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        fd = (
+            real_open(path, flags, mode)
+            if dir_fd is None
+            else real_open(path, flags, mode, dir_fd=dir_fd)
+        )
+        live_fds.add(fd)
+        return fd
+
+    def tracking_close(fd: int) -> None:
+        live_fds.discard(fd)
+        real_close(fd)
+
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.open", tracking_open)
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.close", tracking_close)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, tracking_open})
+
+    stream = SourceScanner().iter_scan(project, read_contents=True)
+    first = next(stream)
+    assert isinstance(first, ScannedFile) and first.content == b"a = 1\n"
+    assert live_fds  # root + sub stay pinned while the stream is active
+    close = getattr(stream, "close", None)
+    assert close is not None
+    close()
+    assert live_fds == set()
