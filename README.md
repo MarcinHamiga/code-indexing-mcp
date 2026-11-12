@@ -176,6 +176,9 @@ no checkout, or an origin that is not this repository.
 runtime, so the previously prepared accelerator keeps serving the *old* locked runtime until you
 rebuild it; the command prints the exact repair command.
 
+`update` expects `origin` to be the canonical repository. If your checkout came from a fork or
+mirror, set `CODE_INDEXING_MCP_REPO_URL` to that remote so `update` and the daily check accept it.
+
 Once a day, in the background, the CLI compares your checkout against the tip of `main` and prints
 one line on stderr when an update is available. It never updates anything by itself, it is silent
 on a development checkout, and `CODE_INDEXING_UPDATE_CHECK=off` turns it off entirely.
@@ -472,6 +475,7 @@ the command wins over the shorthand: open that project with `syndex tui <project
 | `y` | Copy the selected relative `path:line` (requires terminal clipboard support) |
 | `e` | Open the selected location using `VISUAL`, falling back to `EDITOR` |
 | `F5` | Incrementally refresh the selected project’s index |
+| `c` | Open the configure wizard (requires the `tui` extra) |
 | `?` / `Ctrl+H` | Help (`Ctrl+H` also works in the search field) |
 | `q` / `Ctrl+Q` | Quit (`Ctrl+Q` also works in the search field) |
 
@@ -494,6 +498,8 @@ syndex dead-code-report
 syndex changed-symbols --since main
 syndex storage status
 syndex storage vacuum --execute
+syndex projects list
+syndex projects remove <project>
 ```
 
 *(From a repository checkout without installing launchers, prefix commands with `uv run syndex ...`)*
@@ -509,7 +515,8 @@ process or in the shared daemon.
 
 History, scan dry-runs, and storage maintenance are also accessible from the CLI: `history` pages
 through durable indexing run records, `scan` inspects what would be indexed or skipped without
-touching storage, `storage status` reports logical/physical bytes and slot states, and `storage vacuum`
+touching storage (a `history` cursor that does not match a stored run is rejected with
+`INVALID_CURSOR`), `storage status` reports logical/physical bytes and slot states, and `storage vacuum`
 estimates or (`--execute`) executes table compaction and version pruning.
 
 Indexing also keeps a bounded passage embedding cache at
@@ -586,7 +593,14 @@ each branch maps to exactly one slot no matter which checkout has it, and every 
 keeps its own active-slot pointer. A request answered through a worktree scans, probes, and
 freshens that worktree; when a scope contains several checkouts of one project at once, their
 slots are searched together and merged into one ranking. Register a worktree with `init_project`
-or let root discovery do it; pass `force_new_id` to deliberately keep it separate.
+or let root discovery do it; pass `force_new_id` to deliberately keep it separate. A linked
+worktree whose marker carries only default scan settings inherits the registered project's
+scan configuration; a marker you customized keeps its own. A `chunk_id`, reference selector, or
+refactor target resolves across every live checkout of the registration, and
+`project_status` reports `rebuild_required` and `branch_build_pending` if any of those
+checkouts' slots needs it. When several MCP roots are checkouts of one project and a
+single-project call cannot tell which is meant, it returns `AMBIGUOUS_PROJECT` listing the
+`checkouts`; pass an explicit checkout path.
 
 An explicit filesystem path selects that checkout even when the client's roots or working
 directory point to another worktree. Searches with multiple explicit paths include each selected
@@ -739,10 +753,9 @@ usually keeps a large generated `package-lock.json` or similar out of the index;
 
 Existing project markers whose `scan.include` still holds an older default list are upgraded to the
 current one at runtime, so a project created before a language was supported picks it up without
-being re-initialized. A customized `scan.include` list is never rewritten — add the patterns you
-want (`**/*.cs`, `**/*.gd`, `**/*.gdshader`, `**/*.tscn`, `**/*.tres`, `**/*.sql`, `**/*.yaml`,
-`**/*.yml`, `**/*.json`, `**/*.go`, `**/*.tf`, `**/*.tfvars`, `**/*.rs`, `**/*.c`, `**/*.h`,
-`**/*.cc`, `**/*.cpp`, `**/*.cxx`, `**/*.hh`, `**/*.hpp`, `**/*.hxx`, `**/*.lua`) explicitly.
+being re-initialized. A customized `scan.include` list is never rewritten — add a `**/*<ext>`
+pattern for each extension in the table above that you want (for example `**/*.kt`, `**/*.swift`,
+`**/*.svelte`, `**/*.prisma`) explicitly.
 
 ## Branch-aware indexing
 
@@ -1315,12 +1328,14 @@ no telemetry.
 
 ```bash
 uv sync --all-groups --extra cpu --locked
-uv run pytest
-uv run pytest --cov=code_indexing_mcp
+uv run ruff format .                          # CI rejects unformatted code before any test runs
 uv run ruff check .
-uv run ruff format --check .
 uv run mypy src
+uv run pytest -n auto --dist worksteal        # the exact CI invocation
+uv run pytest --cov=code_indexing_mcp         # serial, with coverage
 ```
+
+CI enforces `ruff format --check .`, `ruff check .`, `mypy src`, and the parallel `pytest` run, in that order.
 
 A version bump in `src/code_indexing_mcp/__init__.py` must ship with a regenerated `uv.lock`
 (`uv lock`), or every user's `update` fails at the locked sync; CI's `--locked` sync gates it.
