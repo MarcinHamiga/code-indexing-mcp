@@ -162,6 +162,16 @@ MLX_PROVIDER = "MlxMetalBackend"
 DIRECT_MODEL_ACCELERATORS = frozenset({Accelerator.WEBGPU, Accelerator.MIGRAPHX, Accelerator.MLX})
 
 
+def passage_producer(descriptor: BackendDescriptor) -> str:
+    """Name what produced a passage vector, for the cache that reuses them.
+
+    Device and executing precision together: two producers whose vectors differ
+    at all must never answer for each other, and a backend that changes
+    precision is a different producer from the one it was.
+    """
+    return f"{descriptor.accelerator.value}-{descriptor.precision.value}"
+
+
 def provider_resolution_error(descriptor: BackendDescriptor, resolved: Sequence[str]) -> str | None:
     """Return the shared validation failure for a loaded backend session."""
 
@@ -210,7 +220,12 @@ ACCELERATOR_BACKENDS: tuple[BackendDescriptor, ...] = (
         # which only makes it eligible -- ``auto`` still passes over it on a
         # machine whose installation never prepared it.
         stability=Stability.AUTOMATIC,
-        precision=Precision.FLOAT32,
+        # Half precision is what this backend executes in, not what it stores:
+        # the rows it returns are float32. It is declared because it is part of
+        # what produced them -- vectors that agree with CPU's to cosine 0.999998
+        # rather than to the last bit -- so the probe record and the passage
+        # cache both keep them apart from a float32 producer's.
+        precision=Precision.FLOAT16,
         runtime=Runtime.MLX,
     ),
     BackendDescriptor(

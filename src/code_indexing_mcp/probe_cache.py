@@ -36,6 +36,9 @@ CACHE_SCHEMA_VERSION = 2
 # requests. Keep that policy version in the key so changing the packing order
 # does not reuse a measurement from the previous workload shape.
 PACKING_POLICY_VERSION = 2
+# The precision every backend ran in before any ran in another. A key at this
+# precision fingerprints exactly as it did before precision was part of it.
+REFERENCE_PRECISION = "float32"
 # A cache that grows without bound would keep every configuration a machine has
 # ever had. Records are small, but the file is read on every start.
 MAX_RECORDS = 32
@@ -70,9 +73,13 @@ class ProbeKey:
     device: str
     driver_version: str = ""
     packing_policy_version: int = PACKING_POLICY_VERSION
+    # The precision the backend executes in. A backend that changes it has a
+    # different speed and a different best batch size, on the same device and
+    # runtime, so a measurement taken at the old precision is not this one's.
+    precision: str = REFERENCE_PRECISION
 
     def fingerprint(self) -> str:
-        parts = (
+        parts: tuple[str, ...] = (
             self.model_id,
             self.model_artifact,
             self.accelerator,
@@ -83,6 +90,10 @@ class ProbeKey:
             self.driver_version,
             str(self.packing_policy_version),
         )
+        if self.precision != REFERENCE_PRECISION:
+            # Left out at the reference precision so every record written before
+            # this field existed -- all of them float32 -- keeps its fingerprint.
+            parts = (*parts, self.precision)
         return sha256("\0".join(parts).encode()).hexdigest()
 
 
@@ -106,6 +117,12 @@ class ProbeRecord:
     # "memory" when the batch size above is the last one that fit rather than
     # the fastest one measured.
     limited_by: str = ""
+    # The largest batch size that completed when calibration failed above it;
+    # 0 when calibration finished without a failure. Kept distinct from
+    # limited_by because a sweep looking past a size that did not pay can fail
+    # above a size that won on speed, and an explicit batch size above it still
+    # needs this failure ceiling across runs.
+    survived: int = 0
     # Inputs the key does not carry (memory ceiling, token budget, thread
     # count), so a record written under other settings is re-measured instead of
     # trusted. Empty for records written before this field existed; those stay
@@ -130,7 +147,8 @@ class ProbeRecord:
                 value.get("characters_per_second", 0.0), "characters_per_second"
             )
             load_ns = _nonnegative_int(value.get("load_ns", 0), "load_ns")
-            if batch_size == 0 and (characters_per_second > 0 or load_ns > 0):
+            survived = _nonnegative_int(value.get("survived", 0), "survived")
+            if batch_size == 0 and (characters_per_second > 0 or load_ns > 0 or survived > 0):
                 raise ValueError("measured probe records must have a positive batch_size")
             return cls(
                 fingerprint=str(value["fingerprint"]),
@@ -141,6 +159,7 @@ class ProbeRecord:
                 characters_per_second=characters_per_second,
                 load_ns=load_ns,
                 limited_by=str(value.get("limited_by", "")),
+                survived=survived,
                 context=str(value.get("context", "")),
             )
         except (KeyError, TypeError, ValueError):
@@ -236,7 +255,7 @@ class ProbeCache:
             if context:
                 if record.context and record.context != context:
                     return None
-                if not record.context and record.limited_by:
+                if not record.context and (record.limited_by or record.survived):
                     return None
             return record
         return None
@@ -251,6 +270,7 @@ class ProbeCache:
         characters_per_second: float = 0.0,
         load_ns: int = 0,
         limited_by: str = "",
+        survived: int = 0,
         context: str = "",
     ) -> None:
         """Record a successful probe, replacing any earlier one for *key*.
@@ -268,6 +288,7 @@ class ProbeCache:
             characters_per_second=characters_per_second,
             load_ns=load_ns,
             limited_by=limited_by,
+            survived=survived,
             context=context,
         )
         lock = self._acquire()

@@ -34,6 +34,7 @@ from .backends import (
     available_execution_providers,
     backend_for,
     describe_environment,
+    passage_producer,
     platform_fingerprint,
     runtime_version,
     select_backend,
@@ -117,6 +118,9 @@ class BackendCoordinator:
                     self.batch_calibration = "reduced" if cached.limited_by else "measured"
                 elif cached.limited_by and cached.batch_size < self.embedding_batch_size:
                     self.embedding_batch_size = cached.batch_size
+                    self.batch_calibration = "reduced"
+                elif 0 < cached.survived < self.embedding_batch_size:
+                    self.embedding_batch_size = cached.survived
                     self.batch_calibration = "reduced"
 
     def _probe_context(self) -> str:
@@ -236,6 +240,7 @@ class BackendCoordinator:
             platform=platform_fingerprint(),
             device=descriptor.device,
             driver_version=descriptor.driver_version,
+            precision=descriptor.precision.value,
         )
 
     def _cpu_probe_key(self) -> ProbeKey:
@@ -270,9 +275,14 @@ class BackendCoordinator:
         if record is None:
             return 0
         if not self.settings.embedding_batch_auto:
-            # Only a size an overrun forced down may lower an explicit one; the
+            # Only a size an overrun forced down, or the largest size that
+            # completed before a sweep failure, may lower an explicit one; the
             # session bounds it by the explicit size.
-            return record.batch_size if record.limited_by else 0
+            if record.limited_by:
+                return record.batch_size
+            return (
+                record.survived if 0 < record.survived < self.settings.embedding_batch_size else 0
+            )
         return record.batch_size
 
     def passage_cache_namespace(self, project_id: str) -> PassageCacheNamespace | None:
@@ -321,14 +331,13 @@ class BackendCoordinator:
             model_digest = sha256(
                 f"{digest}:{weights_digest}:{WEIGHT_LAYOUT_VERSION}".encode()
             ).hexdigest()
-        producer = "mlx-float32" if descriptor.accelerator is Accelerator.MLX else "cpu-float32"
         return PassageCacheNamespace(
             project_id=project_id,
             artifact_digest=model_digest,
             # The source snapshot includes tokenizer and configuration files;
             # MLX additionally depends on its separately stored conversion.
             tokenizer_digest=digest,
-            producer=producer,
+            producer=passage_producer(descriptor),
             runtime_version=descriptor.runtime_version or runtime_version(descriptor.runtime),
             dimension=self.embedder.dimension,
             precision=descriptor.precision.value,

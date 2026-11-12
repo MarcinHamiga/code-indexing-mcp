@@ -20,7 +20,7 @@ from platformdirs import user_cache_path, user_data_path
 
 from .accelerator_env import EnvironmentStatus
 from .backend_coordinator import BackendCoordinator
-from .backends import BackendSelection
+from .backends import CPU_BACKEND, Accelerator, BackendSelection, backend_for, passage_producer
 from .changes import collect_changes, resolve_base, source_lines
 from .embedding import Embedder, FastEmbedder, SegmentPlan
 from .errors import CodeIndexingError, ErrorCode
@@ -524,6 +524,14 @@ class Application:
 
             def passage_cache(current_project: ProjectInfo, force: bool) -> PassageReuseContext:
                 namespace = self.backends.passage_cache_namespace(current_project.id)
+                cpu_producer = passage_producer(CPU_BACKEND)
+                # What a session reports having embedded on, mapped to the
+                # identity its vectors are cached under.
+                producers = {
+                    descriptor.accelerator.value: passage_producer(descriptor)
+                    for descriptor in (CPU_BACKEND, backend_for(Accelerator.MLX))
+                    if descriptor is not None
+                }
 
                 # A run that selected an accelerator may still embed on CPU
                 # (below the crossover, or after a degradation). Those are CPU
@@ -533,7 +541,7 @@ class Application:
                 # accelerator's namespace, so neither producer is mislabelled.
                 cpu_namespace = (
                     self.backends.cpu_passage_cache_namespace(current_project.id)
-                    if namespace is not None and namespace.producer != "cpu-float32"
+                    if namespace is not None and namespace.producer != cpu_producer
                     else None
                 )
                 by_producer = {
@@ -544,13 +552,7 @@ class Application:
 
                 def producer_namespace(producer: object) -> PassageCacheNamespace | None:
                     backend = getattr(producer, "backend_used", None)
-                    actual = (
-                        "mlx-float32"
-                        if backend == "mlx"
-                        else "cpu-float32"
-                        if backend == "cpu"
-                        else None
-                    )
+                    actual = producers.get(backend) if isinstance(backend, str) else None
                     return by_producer.get(actual) if actual is not None else None
 
                 return PassageReuseContext(

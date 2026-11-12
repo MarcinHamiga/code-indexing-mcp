@@ -523,7 +523,7 @@ Indexing also keeps a bounded passage embedding cache at
 `<cache-directory>/passage-embeddings.sqlite3`. It reuses complete token-window results for
 unchanged candidates inside changed files, while parsing and staging current source metadata on
 every run. The cache is capped at 256 MiB of logical payload and 64 KiB per entry, uses only
-verified CPU float32 or MLX float32 model identities, and is disposable: delete it while no index
+verified CPU float32 or MLX float16 model identities, and is disposable: delete it while no index
 run is active to clear the reuse history. A report's `embedding_cache_status` is `active`,
 `disabled`, `bypassed`, or `error`; `reused_candidates` and `reused_segments` count replayed
 results, while `embedded_segments` and `embedded_tokens` count work sent to the embedding worker.
@@ -1024,7 +1024,12 @@ and says why. WebGPU and MIGraphX are not considered by `auto` while experimenta
 MLX is the Metal path because WebGPU lost on Apple Silicon. On an M4 Pro, WebGPU indexed 1,000
 chunks at 1.11× of CPU against a 1.25× promotion threshold; MLX reached 1.52–1.56× on the same
 corpus, with vectors matching CPU to cosine 1.0 and identical top-5 rankings, so `auto` prepares it
-there.
+there. Those figures are for float32 execution. MLX now executes in float16, which measured a
+further 1.21× at the same batch size of 2 and 1.38× at a batch size of 8, on 600
+chunks of this repository on the same machine. Its vectors are close to the float32 ones rather
+than identical: cosine similarity never fell below 0.999998, and float32 queries against float16
+passages returned the same top-5 as against float32 passages. Stored and returned vectors are
+float32 either way; only the model's weights and activations are half precision.
 
 #### The accelerator environment
 
@@ -1050,13 +1055,16 @@ configuration, attention-mask mean pooling, float32 normalization, and 768-vecto
 reports the providers the session actually resolved.
 
 MLX cannot execute ONNX at all, so it reproduces that model instead of running it: the float32
-initializers are lifted out of the same ONNX artifact and the JinaBERT v2 graph they belong to —
-ALiBi, post-norm query and key projections, a GEGLU feed-forward — is written out again in MLX. The
+initializers are lifted out of the same ONNX artifact, narrowed to float16, and the JinaBERT v2
+graph they belong to — ALiBi, post-norm query and key projections, a GEGLU feed-forward — is
+written out again in MLX. The
 tokenizer, pooling, normalization, and vector shape are shared with the direct ONNX model, and the
 configuration and every tensor name and shape are checked on load, so an artifact whose graph moved
 fails rather than returning vectors that no longer retrieve. The one-time conversion is written to
-`<cache>/models/mlx/<revision>-jina-v1-f32.safetensors` and memory-mapped afterwards; it is keyed by
-model revision, so a model that moves is converted again rather than read from a stale file.
+`<cache>/models/mlx/<revision>-jina-v2-f16.safetensors` and memory-mapped afterwards; it is keyed by
+model revision, so a model that moves is converted again rather than read from a stale file. A
+conversion left by another revision or by the earlier float32 layout is deleted when the current
+one is written.
 
 A passage worker for an accelerator runs from that environment's own interpreter, dialling back to
 the serving process over an authenticated local socket. `multiprocessing` cannot cross that

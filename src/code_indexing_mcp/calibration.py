@@ -51,6 +51,15 @@ REPRESENTATIVE_CHARACTERS = (384, 1536)
 # A larger batch has to beat the best rate by this much to justify the memory it
 # holds. Anything smaller is noise being paid for in resident bytes.
 IMPROVEMENT_RATIO = 1.05
+# How many sizes an accelerator's sweep looks past one that did not pay. A GPU
+# that is bound by compute rather than by dispatch gains from batching a little
+# at every doubling instead of a lot at one: float16 MLX on an M4 Pro measured
+# 58.8k, 62.3k, and 65.0k characters per second at 2, 4, and 8, so each step sat
+# on the threshold while the three together were worth 10%, and a sweep that
+# stopped at the first miss settled on 2 or 8 depending on noise. One more size
+# is enough to see the trend; CPU keeps the strict rule, because its sweep is a
+# reference measurement and every extra size is one more chance to overrun.
+ACCELERATOR_SWEEP_PATIENCE = 1
 # Overrunning the ceiling is the ceiling being reported; a device allocation
 # that kills the worker outright is not, and arrives as a worker failure. Both
 # say the same thing about the size that provoked them, so they are told apart
@@ -81,6 +90,13 @@ class CalibrationResult:
     # speed from one that won by being the last that survived -- and so a
     # recommendation is only made where there is a setting behind it.
     limited_by: str = ""
+    # The largest size that ran, when the size after it failed; 0 when the
+    # sweep ended without a failure. It is kept apart from ``limited_by``
+    # because a sweep looking past a size that did not pay can fail above a
+    # size that won on speed: that is not a limit on the winner, and it is
+    # still the only evidence of where this backend stops for anything that
+    # would ask it for more -- an explicit batch size, say.
+    survived: int = 0
 
     @property
     def load_ms(self) -> int:
@@ -121,8 +137,14 @@ def calibrate(
     max_items: int = MAX_BATCH_SIZE,
     candidates: Sequence[PassageCandidate] | None = None,
     clock: Callable[[], int] = time.monotonic_ns,
+    patience: int = 0,
 ) -> CalibrationResult | None:
     """Measure *session*'s throughput and settle on a batch size.
+
+    *patience* is how many consecutive sizes may fail to beat the best rate
+    before the sweep stops. A size tried on patience is adopted only if it beats
+    the best by the usual margin, so patience can find a later gain but never
+    lowers the bar for accepting one.
 
     Returns ``None`` when nothing could be measured, which is the honest answer
     for a backend whose first measurement failed: there is no smaller size to
@@ -135,6 +157,8 @@ def calibrate(
     # counted in content plus prefix, and cross fractionally early.
     characters = sum(len(candidate.prefix) + len(candidate.content) for candidate in corpus)
     best: CalibrationResult | None = None
+    misses = 0
+    survived = 0
     for size in CANDIDATE_BATCH_SIZES:
         if size > max_items:
             break
@@ -152,22 +176,39 @@ def calibrate(
             # a calibrated backend and none at all on a machine whose device
             # allocations die rather than trip the ceiling.
             logger.debug("Calibration stopped at max_items=%d: %s", size, exc.code.value)
+            if misses:
+                # A size that already ran had stopped paying before this one
+                # failed, so the best size won on speed. Recording it as
+                # limited would recommend more memory for a batch that more
+                # memory was already shown not to help. Where it failed is kept
+                # all the same, for a caller about to ask for more than that.
+                return replace(best, survived=survived)
             limited_by = LIMITED_BY_MEMORY if exc.code in RESOURCE_CODES else LIMITED_BY_FAILURE
-            return replace(best, limited_by=limited_by)
+            return replace(best, limited_by=limited_by, survived=survived)
         except Exception as exc:  # pragma: no cover - defensive, see module docstring
             logger.debug("Calibration abandoned at max_items=%d: %s", size, exc)
-            return None if best is None else replace(best, limited_by=LIMITED_BY_FAILURE)
+            if best is None:
+                return None
+            if misses:
+                return replace(best, survived=survived)
+            return replace(best, limited_by=LIMITED_BY_FAILURE, survived=survived)
         # A clock with any granularity at all can report a zero interval for a
         # fast enough backend, and dividing by it would report infinite speed.
         elapsed = max(1, clock() - started)
+        survived = size
         rate = characters * 1_000_000_000 / elapsed
         if best is None:
             best = CalibrationResult(max_items=size, characters_per_second=rate, load_ns=load_ns)
             continue
         if rate <= best.characters_per_second * IMPROVEMENT_RATIO:
-            # This size is not paying for the memory it holds, and neither will
-            # the ones above it: doubling again only widens the padded matrix.
-            break
+            # This size is not paying for the memory it holds. Without patience
+            # neither will the ones above it be asked to: doubling again only
+            # widens the padded matrix.
+            misses += 1
+            if misses > patience:
+                break
+            continue
+        misses = 0
         best = CalibrationResult(max_items=size, characters_per_second=rate, load_ns=load_ns)
     return best
 
