@@ -1191,6 +1191,35 @@ def test_an_explicit_batch_size_is_not_overridden_by_calibration(tmp_path: Path)
     assert app.model_status().batch_calibration == "explicit"
 
 
+def test_a_cached_survived_bound_lowers_an_explicit_batch_size(tmp_path: Path) -> None:
+    _prepared_cuda_environment(tmp_path)
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    settings = replace(
+        IndexSettings.from_environment({}),
+        embedding_batch_size=16,
+        embedding_batch_auto=False,
+    )
+    bootstrap = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+    bootstrap.probe_cache.store(
+        bootstrap.backends._build_probe_key(bootstrap.embedder),
+        batch_size=2,
+        dimension=bootstrap.embedder.dimension,
+        characters_per_second=1_000.0,
+        load_ns=1,
+        survived=4,
+        context=bootstrap.backends._probe_context(),
+    )
+
+    reloaded = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
+    assert reloaded.model_status().batch_size == 4
+    assert reloaded.model_status().batch_calibration == "reduced"
+
+    below_bound = replace(settings, embedding_batch_size=4)
+    untouched = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=below_bound)
+    assert untouched.model_status().batch_size == 4
+    assert untouched.model_status().batch_calibration == "explicit"
+
+
 def test_the_microbatch_token_budget_follows_the_memory_ceiling(tmp_path: Path) -> None:
     """The padded matrix a microbatch materializes is charged to the same
     ceiling the operator configured, so it has to move with it."""

@@ -119,6 +119,9 @@ class BackendCoordinator:
                 elif cached.limited_by and cached.batch_size < self.embedding_batch_size:
                     self.embedding_batch_size = cached.batch_size
                     self.batch_calibration = "reduced"
+                elif 0 < cached.survived < self.embedding_batch_size:
+                    self.embedding_batch_size = cached.survived
+                    self.batch_calibration = "reduced"
 
     def _probe_context(self) -> str:
         """The settings a stored measurement depends on and the probe key omits.
@@ -272,9 +275,14 @@ class BackendCoordinator:
         if record is None:
             return 0
         if not self.settings.embedding_batch_auto:
-            # Only a size an overrun forced down may lower an explicit one; the
+            # Only a size an overrun forced down, or the largest size that
+            # completed before a sweep failure, may lower an explicit one; the
             # session bounds it by the explicit size.
-            return record.batch_size if record.limited_by else 0
+            if record.limited_by:
+                return record.batch_size
+            return (
+                record.survived if 0 < record.survived < self.settings.embedding_batch_size else 0
+            )
         return record.batch_size
 
     def passage_cache_namespace(self, project_id: str) -> PassageCacheNamespace | None:

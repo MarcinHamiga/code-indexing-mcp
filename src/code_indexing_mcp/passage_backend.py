@@ -72,6 +72,7 @@ def _recorded_calibration(record: ProbeRecord) -> CalibrationResult | None:
         characters_per_second=record.characters_per_second,
         load_ns=record.load_ns,
         limited_by=record.limited_by,
+        survived=record.survived,
     )
 
 
@@ -258,6 +259,18 @@ class PassageBackendSession:
             return replace(plan, max_items=self._session_max_items)
         return plan
 
+    def _resolved_max_items(self, size: int, *, limited_by: str, survived: int) -> int:
+        """Apply calibration speed/failure limits while respecting any explicit ceiling."""
+        resolved_size, reduced = size, bool(limited_by)
+        if not reduced and 0 < survived < self._batch_ceiling:
+            # The sweep failed above a size that had won on speed, so the
+            # winner is not a reduction -- but the operator's explicit size
+            # is larger than anything that ran, and leaving the plan alone
+            # would ask for it in every group. The largest size that did
+            # run is the bound, exactly as an in-run overrun would set it.
+            resolved_size, reduced = survived, True
+        return self._bounded(resolved_size, reduced=reduced)
+
     def _bounded(self, size: int, *, reduced: bool) -> int:
         """Return the size to apply for a calibrated or recorded *size*.
 
@@ -392,8 +405,10 @@ class PassageBackendSession:
                 # existed use the measured size, and a persisted reduction
                 # reach the runs after it.
                 self._calibrated_batch_size = cached.batch_size
-                self._session_max_items = self._bounded(
-                    cached.batch_size, reduced=bool(cached.limited_by)
+                self._session_max_items = self._resolved_max_items(
+                    cached.batch_size,
+                    limited_by=cached.limited_by,
+                    survived=cached.survived,
                 )
             elif self._calibration_plan is not None:
                 # Verified but never measured (calibration was off, or its first
@@ -438,15 +453,11 @@ class PassageBackendSession:
         self._verified_spawn = session.spawn_count
         if self.calibration is not None:
             self._calibrated_batch_size = self.calibration.max_items
-            size, reduced = self.calibration.max_items, bool(self.calibration.limited_by)
-            if not reduced and 0 < self.calibration.survived < self._batch_ceiling:
-                # The sweep failed above a size that had won on speed, so the
-                # winner is not a reduction -- but the operator's explicit size
-                # is larger than anything that ran, and leaving the plan alone
-                # would ask for it in every group. The largest size that did
-                # run is the bound, exactly as an in-run overrun would set it.
-                size, reduced = self.calibration.survived, True
-            self._session_max_items = self._bounded(size, reduced=reduced)
+            self._session_max_items = self._resolved_max_items(
+                self.calibration.max_items,
+                limited_by=self.calibration.limited_by,
+                survived=self.calibration.survived,
+            )
 
     def _measure_reference(self) -> None:
         """Measure CPU too, so the crossover has both of the rates it needs.
@@ -492,11 +503,19 @@ class PassageBackendSession:
                 session.close()
         if measured is None:
             return
-        batch_size, limited_by = measured.max_items, measured.limited_by
+        batch_size, limited_by, survived = (
+            measured.max_items,
+            measured.limited_by,
+            measured.survived,
+        )
         if existing is not None and existing.limited_by and existing.batch_size > 0:
             # An overrun on CPU recorded a smaller size before any rate existed.
             # The sweep must not undo what a real overrun taught.
-            batch_size, limited_by = min(batch_size, existing.batch_size), existing.limited_by
+            batch_size, limited_by, survived = (
+                min(batch_size, existing.batch_size),
+                existing.limited_by,
+                existing.survived,
+            )
         self._probe_cache.store(
             key,
             batch_size=batch_size,
@@ -505,6 +524,7 @@ class PassageBackendSession:
             characters_per_second=measured.characters_per_second,
             load_ns=measured.load_ns,
             limited_by=limited_by,
+            survived=survived,
             context=self._probe_context,
         )
 
@@ -579,6 +599,7 @@ class PassageBackendSession:
             characters_per_second=0.0 if measured is None else measured.characters_per_second,
             load_ns=0 if measured is None else measured.load_ns,
             limited_by=limited_by or (measured.limited_by if measured else ""),
+            survived=0 if measured is None else measured.survived,
             context=self._probe_context,
         )
 

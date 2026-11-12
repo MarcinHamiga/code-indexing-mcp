@@ -117,6 +117,12 @@ class ProbeRecord:
     # "memory" when the batch size above is the last one that fit rather than
     # the fastest one measured.
     limited_by: str = ""
+    # The largest batch size that completed when calibration failed above it;
+    # 0 when calibration finished without a failure. Kept distinct from
+    # limited_by because a sweep looking past a size that did not pay can fail
+    # above a size that won on speed, and an explicit batch size above it still
+    # needs this failure ceiling across runs.
+    survived: int = 0
     # Inputs the key does not carry (memory ceiling, token budget, thread
     # count), so a record written under other settings is re-measured instead of
     # trusted. Empty for records written before this field existed; those stay
@@ -141,7 +147,8 @@ class ProbeRecord:
                 value.get("characters_per_second", 0.0), "characters_per_second"
             )
             load_ns = _nonnegative_int(value.get("load_ns", 0), "load_ns")
-            if batch_size == 0 and (characters_per_second > 0 or load_ns > 0):
+            survived = _nonnegative_int(value.get("survived", 0), "survived")
+            if batch_size == 0 and (characters_per_second > 0 or load_ns > 0 or survived > 0):
                 raise ValueError("measured probe records must have a positive batch_size")
             return cls(
                 fingerprint=str(value["fingerprint"]),
@@ -152,6 +159,7 @@ class ProbeRecord:
                 characters_per_second=characters_per_second,
                 load_ns=load_ns,
                 limited_by=str(value.get("limited_by", "")),
+                survived=survived,
                 context=str(value.get("context", "")),
             )
         except (KeyError, TypeError, ValueError):
@@ -247,7 +255,7 @@ class ProbeCache:
             if context:
                 if record.context and record.context != context:
                     return None
-                if not record.context and record.limited_by:
+                if not record.context and (record.limited_by or record.survived):
                     return None
             return record
         return None
@@ -262,6 +270,7 @@ class ProbeCache:
         characters_per_second: float = 0.0,
         load_ns: int = 0,
         limited_by: str = "",
+        survived: int = 0,
         context: str = "",
     ) -> None:
         """Record a successful probe, replacing any earlier one for *key*.
@@ -279,6 +288,7 @@ class ProbeCache:
             characters_per_second=characters_per_second,
             load_ns=load_ns,
             limited_by=limited_by,
+            survived=survived,
             context=context,
         )
         lock = self._acquire()

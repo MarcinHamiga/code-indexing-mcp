@@ -386,3 +386,50 @@ def test_a_record_without_a_context_stays_readable_but_an_old_reduction_does_not
     assert cache.load(key, context="mem=1") is not None
     assert cache.load(other, context="mem=1") is None
     assert cache.load(other) is not None
+
+
+def test_survived_round_trips_and_gates_contextless_records(tmp_path: Path) -> None:
+    from code_indexing_mcp.probe_cache import CACHE_SCHEMA_VERSION, ProbeCache, ProbeKey
+
+    key = ProbeKey("m", "a", "cuda", "p", "1", "plat", "d")
+    legacy_key = ProbeKey("m", "a", "webgpu", "p", "1", "plat", "d")
+    path = tmp_path / "probes.json"
+    cache = ProbeCache(path)
+    cache.store(
+        key,
+        batch_size=2,
+        dimension=4,
+        characters_per_second=100.0,
+        load_ns=5,
+        survived=4,
+        context="mem=1",
+    )
+
+    loaded = cache.load(key, context="mem=1")
+    assert loaded is not None
+    assert loaded.survived == 4
+    assert loaded.limited_by == ""
+
+    # Legacy records lacking a context are rejected under context validation if they
+    # carry a survived ceiling, just like limited_by reductions.
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": CACHE_SCHEMA_VERSION,
+                "records": [
+                    {
+                        "fingerprint": legacy_key.fingerprint(),
+                        "batch_size": 2,
+                        "dimension": 4,
+                        "recorded_at_ns": 1,
+                        "characters_per_second": 5.0,
+                        "load_ns": 2,
+                        "survived": 4,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert cache.load(legacy_key, context="mem=1") is None
+    assert cache.load(legacy_key) is not None
