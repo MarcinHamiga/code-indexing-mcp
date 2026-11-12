@@ -43,27 +43,19 @@ def test_plugin_provider_is_discovered_by_loading_the_direct_model(
     assert report["providers"] == [CPU_PROVIDER, "WebGpuExecutionProvider"]
 
 
-class _OpaqueFastEmbedModel:
-    """A FastEmbed-shaped model whose private layout resolution cannot read."""
-
-    def passage_embed(self, texts: list[str]) -> list[np.ndarray]:
-        row = np.zeros(DEFAULT_DIMENSION, dtype=np.float32)
-        row[0] = 1.0
-        return [row.copy() for _ in texts]
+class _CudaDirectModel(_WebGpuModel):
+    resolved_providers = ("CUDAExecutionProvider", CPU_PROVIDER)
 
 
-def test_unknown_fastembed_providers_are_tolerated_rather_than_failed(
+def test_cuda_direct_model_reports_authoritative_session_providers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Provider resolution walks FastEmbed's private layout, so an empty result
-    means "unknown", and a FastEmbed refactor must not fail a working CUDA
-    probe. Only the direct backends report their sessions authoritatively."""
     monkeypatch.setattr(
         accelerator_probe,
         "available_execution_providers",
         lambda: ("CUDAExecutionProvider", CPU_PROVIDER),
     )
-    monkeypatch.setattr(embedding_worker, "_load_model", lambda config: _OpaqueFastEmbedModel())
+    monkeypatch.setattr(embedding_worker, "_load_model", lambda config: _CudaDirectModel())
 
     report = accelerator_probe.probe(
         Accelerator.CUDA,
@@ -73,7 +65,7 @@ def test_unknown_fastembed_providers_are_tolerated_rather_than_failed(
     )
 
     assert report["ok"] is True
-    assert report["resolved_providers"] == []
+    assert report["resolved_providers"] == ["CUDAExecutionProvider", CPU_PROVIDER]
     assert report["providers"] == ["CUDAExecutionProvider", CPU_PROVIDER]
 
 

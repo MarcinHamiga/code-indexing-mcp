@@ -1,4 +1,4 @@
-"""Local FastEmbed adapter and embedding protocol."""
+"""Local ONNX embedding adapter and embedding protocols."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 import numpy as np
 
 if TYPE_CHECKING:
-    from fastembed import TextEmbedding as _TextEmbedding
+    from .direct_onnx import DirectOnnxEmbedding as _OnnxModel
 else:
-    _TextEmbedding = object
+    _OnnxModel = object
 
 from .errors import CodeIndexingError, ErrorCode
 from .token_batching import (
@@ -28,13 +28,15 @@ from .token_batching import (
     plan_microbatches,
 )
 
-# Kept as a patchable module attribute for the in-process model tests, but
-# loaded only when CPU query embedding is actually requested. Direct accelerator
-# environments intentionally do not install FastEmbed.
+# Patchable factory hook for in-process unit tests, loaded lazily when an
+# in-process embedder or worker requests an ONNX model.
 TextEmbedding: Any = None
 
-DEFAULT_MODEL = "jinaai/jina-embeddings-v2-base-code"
-DEFAULT_DIMENSION = 768
+DEFAULT_MODEL = "codefuse-ai/F2LLM-v2-160M"
+DEFAULT_DIMENSION = 640
+DEFAULT_QUERY_PROMPT = (
+    "Instruct: Given a question, retrieve passages that can help answer the question.\nQuery: "
+)
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +183,7 @@ def validate_probe_vectors(vectors: Sequence[bytes], *, dimension: int, count: i
             raise ValueError(f"probe vector {index} has norm {norm:.4f}, expected ~1.0")
 
 
-def load_fastembed_model(
+def load_onnx_model(
     cache_directory: Path,
     *,
     model_id: str = DEFAULT_MODEL,
@@ -189,24 +191,31 @@ def load_fastembed_model(
     threads: int | None = None,
     enable_cpu_mem_arena: bool = False,
     providers: Sequence[str] = (),
-) -> _TextEmbedding:
-    """Load the optional FastEmbed model with one lazy, shared construction path."""
+    accelerator: str = "",
+) -> _OnnxModel:
+    """Load the direct ONNX embedding model through one lazy, shared path."""
     cache_directory.mkdir(parents=True, exist_ok=True)
     global TextEmbedding
     if TextEmbedding is None:
-        from fastembed import TextEmbedding as implementation
+        from .direct_onnx import DirectOnnxEmbedding as implementation
 
         TextEmbedding = implementation
-    options: dict[str, Any] = {
-        "model_name": model_id,
-        "cache_dir": str(cache_directory),
-        "local_files_only": offline,
-        "threads": threads,
-        "enable_cpu_mem_arena": enable_cpu_mem_arena,
-    }
-    if providers:
-        options["providers"] = list(providers)
-    return cast(_TextEmbedding, TextEmbedding(**options))
+    return cast(
+        _OnnxModel,
+        TextEmbedding(
+            cache_directory=cache_directory,
+            offline=offline,
+            threads=threads,
+            enable_cpu_mem_arena=enable_cpu_mem_arena,
+            providers=tuple(providers),
+            model_id=model_id,
+            accelerator=accelerator,
+        ),
+    )
+
+
+# Backwards-compatible alias for callers importing the historical helper name.
+load_fastembed_model = load_onnx_model
 
 
 def plan_passages(
@@ -361,7 +370,7 @@ class FastEmbedder:
         self.offline = offline
         self.threads = threads
         self.enable_cpu_mem_arena = enable_cpu_mem_arena
-        self._model: _TextEmbedding | None = None
+        self._model: _OnnxModel | None = None
         # The daemon serves each client connection on its own thread, so the
         # lazy load must not be able to build two ONNX sessions concurrently.
         self._model_lock = threading.Lock()
@@ -407,31 +416,36 @@ class FastEmbedder:
         vectors = self._vectors(model.query_embed(self._bounded_query(model, text)))
         return vectors[0]
 
-    def _bounded_query(self, model: _TextEmbedding, text: str) -> str:
+    def _bounded_query(self, model: _OnnxModel, text: str) -> str:
         """Truncate *text* to the token budget; shorter text is returned as is.
 
         A query is a retrieval key, so its tail past the budget is dropped
-        rather than windowed.
+        rather than windowed. Both model-added special tokens (such as Qwen3's
+        trailing ``<|im_end|>``) and any asymmetric query instruction prefix
+        count against the budget before content tokens are admitted.
         """
         tokenizer = resolve_tokenizer(model)
         if tokenizer is None:
             return text
-        # Model-added special tokens count against the budget but are not in
-        # the content offsets.
-        budget = max(1, self.max_input_tokens - 2)
+        prompt = getattr(model, "query_prompt", None)
+        if isinstance(prompt, str) and prompt:
+            overhead = len(tokenizer.encode(prompt).offsets)
+        else:
+            overhead = max(2, len(tokenizer.encode("").offsets))
+        budget = max(1, self.max_input_tokens - overhead)
         offsets = content_token_offsets(tokenizer.encode(text))
         if len(offsets) <= budget:
             return text
         return text[: offsets[budget][0]]
 
-    def _get_model(self) -> _TextEmbedding:
+    def _get_model(self) -> _OnnxModel:
         if self._model is not None:
             return self._model
         with self._model_lock:
             if self._model is not None:
                 return self._model
             try:
-                self._model = load_fastembed_model(
+                self._model = load_onnx_model(
                     self.cache_directory,
                     model_id=self.model_id,
                     offline=self.offline,

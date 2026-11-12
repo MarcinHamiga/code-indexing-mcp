@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import platform
-import re
 import shutil
 import subprocess
 import sys
@@ -20,13 +19,15 @@ from .config_files import InstallerError, _atomic_write
 # Accelerators this release can prepare, and the runtime extra each installs
 # into an environment of its own. Core ML is still reached by explicit override
 # inside the serving environment, so it needs no separate locked installation.
+# Vulkan shares the locked WebGPU plugin extra and configures Dawn's Vulkan
+# backend explicitly at session creation time.
 ACCELERATOR_EXTRAS = {
     "cuda": "cuda",
     "mlx": "mlx",
     "webgpu": "webgpu",
-    "migraphx": "migraphx",
+    "vulkan": "webgpu",
 }
-ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml")
+ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "mlx", "webgpu", "vulkan", "coreml")
 ACCELERATOR_ENVIRONMENT_DIRECTORY = ".venv-accel"
 # Bumped in lockstep with code_indexing_mcp.accelerator_env.RECORD_SCHEMA_VERSION.
 ACCELERATOR_RECORD_SCHEMA_VERSION = 1
@@ -53,6 +54,12 @@ WEBGPU_PLATFORMS = {
     "linux": {"x86_64"},
     "win32": {"amd64"},
 }
+# Dawn's native Vulkan backend is compiled into the Linux and Windows WebGPU
+# plugin wheels; on macOS Dawn targets Metal only.
+VULKAN_PLATFORMS = {
+    "linux": {"x86_64"},
+    "win32": {"amd64"},
+}
 MINIMUM_WEBGPU_MACOS = (14, 0)
 # MLX's Metal backend needs Apple Silicon, and its published wheels start at
 # macOS 14. It also ships CPU-only Linux and Windows wheels, which are excluded
@@ -60,21 +67,6 @@ MINIMUM_WEBGPU_MACOS = (14, 0)
 # probe and then lose to the CPU it really is.
 MLX_PLATFORMS = {"darwin": {"arm64"}}
 MINIMUM_MLX_MACOS = (14, 0)
-# AMD publishes this ONNX Runtime/MIGraphX combination as a single wheel rather
-# than on PyPI, so the Python version stays exact: the installer never assembles
-# an untested interpreter around it. ROCm is a floor within its major instead,
-# because AMD ships compatible point releases far faster than this pin moves and
-# an exact match refused every stock install that was newer than the wheel.
-MIGRAPHX_PLATFORM = ("linux", "x86_64")
-MIGRAPHX_PYTHON_VERSION = "3.12"
-MINIMUM_MIGRAPHX_ROCM = (7, 2, 1)
-# The root ROCm installs itself under, and the component directories the version
-# file has lived in across packagings. ROCm 7's packages put it under the
-# versioned `core` component, reached through the `core` alternatives symlink,
-# so checking `/opt/rocm/.info/version` alone misses a stock 7.x install
-# entirely and reports a machine with a working ROCm as having none.
-ROCM_ROOT = Path("/opt/rocm")
-ROCM_VERSION_FILES = (".info/version", ".info/version-dev")
 
 
 def _run_command(
@@ -179,72 +171,6 @@ def _nvidia_smi_report() -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def _rocm_version_directories(root: Path) -> list[Path]:
-    """Return the directories a ROCm version file has been installed into."""
-
-    directories = []
-    override = os.environ.get("ROCM_PATH", "").strip()
-    if override:
-        directories.append(Path(override))
-    # `core` is the alternatives symlink to the active component; the sorted
-    # glob is what is left when a packaging never registered that alternative.
-    directories.extend((root, root / "core"))
-    directories.extend(sorted(root.glob("core-*")))
-    return directories
-
-
-def _rocm_version(root: Path) -> str:
-    for directory in _rocm_version_directories(root):
-        for name in ROCM_VERSION_FILES:
-            try:
-                contents = (directory / name).read_text(encoding="utf-8")
-            except OSError:
-                continue
-            match = re.search(r"\d+\.\d+(?:\.\d+)?", contents)
-            if match is not None:
-                return match.group()
-    return ""
-
-
-def _rocminfo_device_name(output: str) -> str:
-    """Return the first GPU agent's marketing name from rocminfo's output."""
-
-    # rocminfo lists the host processor as agent 1, so the first marketing name
-    # in the output names a CPU rather than anything MIGraphX could run on. Only
-    # an agent reporting `Device Type: GPU` describes a card.
-    for block in re.split(r"(?m)^Agent \d+", output)[1:]:
-        if re.search(r"(?m)^\s*Device Type:\s*GPU\s*$", block) is None:
-            continue
-        match = re.search(r"(?m)^\s*Marketing Name:\s*(.+?)\s*$", block)
-        if match is not None and match.group(1).strip().lower() != "unknown":
-            return match.group(1).strip()
-    return ""
-
-
-def _rocm_report(*, root: Path = ROCM_ROOT) -> str | None:
-    """Return the installed ROCm version and, when available, an AMD device."""
-
-    version = _rocm_version(root)
-    if not version:
-        return None
-
-    device = ""
-    executable = shutil.which("rocminfo")
-    if executable is not None:
-        try:
-            result = subprocess.run(
-                [executable],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError):
-            result = None
-        if result is not None and result.returncode == 0:
-            device = _rocminfo_device_name(result.stdout)
-    return f"{version}, {device or 'AMD GPU'}"
-
-
 def _driver_components(version: str) -> tuple[int, ...]:
     components: list[int] = []
     for part in version.strip().split("."):
@@ -263,7 +189,6 @@ def _webgpu_plan(
     platform_name: str,
     machine: str,
     platform_version: str,
-    reason_prefix: str = "",
 ) -> AcceleratorPlan:
     supported = WEBGPU_PLATFORMS.get(platform_name)
     problem = ""
@@ -278,14 +203,34 @@ def _webgpu_plan(
             )
 
     if problem:
-        prefix = f"{reason_prefix}; " if reason_prefix else "WebGPU was requested but "
-        return AcceleratorPlan("cpu", f"{prefix}{problem}", honored=False)
-    reason = (
-        f"the locked WebGPU plugin is available for {platform_name}/{machine}"
-        if not reason_prefix
-        else f"{reason_prefix}; falling back to WebGPU with the locked plugin"
+        return AcceleratorPlan("cpu", f"WebGPU was requested but {problem}", honored=False)
+    return AcceleratorPlan(
+        "webgpu",
+        f"the locked WebGPU plugin is available for {platform_name}/{machine}",
     )
-    return AcceleratorPlan("webgpu", reason, honored=not reason_prefix)
+
+
+def _vulkan_plan(
+    *,
+    platform_name: str,
+    machine: str,
+) -> AcceleratorPlan:
+    supported = VULKAN_PLATFORMS.get(platform_name)
+    if supported is None or machine not in supported:
+        if platform_name == "darwin":
+            problem = (
+                "Dawn's Vulkan backend is only available on Linux and Windows; "
+                "use mlx or webgpu on macOS"
+            )
+        else:
+            problem = (
+                f"no native Vulkan/WebGPU plugin wheel is published for {platform_name}/{machine}"
+            )
+        return AcceleratorPlan("cpu", f"Vulkan was requested but {problem}", honored=False)
+    return AcceleratorPlan(
+        "vulkan",
+        f"the locked Vulkan (Dawn/WebGPU) plugin is available for {platform_name}/{machine}",
+    )
 
 
 def _mlx_problem(*, platform_name: str, machine: str, platform_version: str) -> str:
@@ -308,10 +253,8 @@ def _mlx_plan(*, platform_name: str, machine: str, platform_version: str) -> Acc
         platform_name=platform_name, machine=machine, platform_version=platform_version
     )
     if problem:
-        # MIGraphX degrades to WebGPU because both are cross-vendor GPU paths on
-        # the same machine. A request for Metal where there is no Metal is not a
-        # request for Vulkan or D3D12, so this reports CPU rather than
-        # substituting one.
+        # A request for Metal where there is no Metal is not a request for
+        # Vulkan or D3D12, so this reports CPU rather than substituting one.
         return AcceleratorPlan("cpu", f"MLX was requested but {problem}", honored=False)
     return AcceleratorPlan(
         "mlx",
@@ -329,7 +272,6 @@ def plan_accelerator(
     platform_name: str | None = None,
     machine: str | None = None,
     nvidia_report: Callable[[], str | None] = _nvidia_smi_report,
-    rocm_report: Callable[[], str | None] = _rocm_report,
     python_version: str | None = None,
     platform_version: str | None = None,
 ) -> AcceleratorPlan:
@@ -339,9 +281,9 @@ def plan_accelerator(
     inference probe before anything offers the backend to the server.
     """
 
+    del python_version  # kept in signature for caller compatibility
     platform_name = _normalized_platform((platform_name or sys.platform).lower())
     machine = (machine or platform.machine()).lower()
-    python_version = python_version or f"{sys.version_info.major}.{sys.version_info.minor}"
     if platform_version is None:
         platform_version = platform.mac_ver()[0] if platform_name == "darwin" else ""
     requested = requested.strip().lower()
@@ -368,50 +310,10 @@ def plan_accelerator(
             machine=machine,
             platform_version=platform_version,
         )
-    if requested == "migraphx":
-        problem = ""
-        if (platform_name, machine) != MIGRAPHX_PLATFORM:
-            problem = (
-                f"the pinned MIGraphX wheel is published only for "
-                f"{MIGRAPHX_PLATFORM[0]}/{MIGRAPHX_PLATFORM[1]}"
-            )
-        elif python_version != MIGRAPHX_PYTHON_VERSION:
-            problem = (
-                f"the pinned MIGraphX wheel requires Python {MIGRAPHX_PYTHON_VERSION}, "
-                f"not {python_version}"
-            )
-        else:
-            report = rocm_report()
-            if not report or not report.strip():
-                problem = "ROCm was not detected"
-            else:
-                first = report.strip().splitlines()[0]
-                rocm_version, _, device_name = (part.strip() for part in first.partition(","))
-                components = _driver_components(rocm_version)
-                minimum = ".".join(str(part) for part in MINIMUM_MIGRAPHX_ROCM)
-                if (
-                    not components
-                    or components[0] != MINIMUM_MIGRAPHX_ROCM[0]
-                    or components < MINIMUM_MIGRAPHX_ROCM
-                ):
-                    problem = (
-                        f"ROCm {rocm_version or 'unknown'} is outside the {minimum}+ "
-                        f"support window this release's MIGraphX runtime was built "
-                        f"against (ROCm {MINIMUM_MIGRAPHX_ROCM[0]} only)"
-                    )
-                else:
-                    return AcceleratorPlan(
-                        "migraphx",
-                        f"ROCm {rocm_version} on {device_name or 'an AMD device'} is "
-                        "within this release's MIGraphX support window",
-                        driver_version=rocm_version,
-                        device_name=device_name,
-                    )
-        return _webgpu_plan(
+    if requested == "vulkan":
+        return _vulkan_plan(
             platform_name=platform_name,
             machine=machine,
-            platform_version=platform_version,
-            reason_prefix=f"MIGraphX was requested but {problem}",
         )
 
     if requested != "cuda" and not _mlx_problem(
@@ -690,7 +592,6 @@ def configure_accelerator(
     platform_name: str | None = None,
     machine: str | None = None,
     nvidia_report: Callable[[], str | None] = _nvidia_smi_report,
-    rocm_report: Callable[[], str | None] = _rocm_report,
     python_version: str | None = None,
     platform_version: str | None = None,
     offline: bool = False,
@@ -703,32 +604,20 @@ def configure_accelerator(
     """
 
     serving_python = environment_python(install_directory / ".venv", platform_name=platform_name)
-    detected_python_version: str | None = None
-    planning_python_version = python_version
-    planning_error: InstallerError | None = None
-    if requested.strip().lower() == "migraphx" and planning_python_version is None:
+    detected_python_version = python_version
+    if detected_python_version is None:
         try:
             detected_python_version = interpreter_version(serving_python)
-            planning_python_version = detected_python_version
-        except InstallerError as exc:
-            planning_error = exc
-    if planning_error is None:
-        plan = plan_accelerator(
-            requested,
-            platform_name=platform_name,
-            machine=machine,
-            nvidia_report=nvidia_report,
-            rocm_report=rocm_report,
-            python_version=planning_python_version,
-            platform_version=platform_version,
-        )
-    else:
-        plan = AcceleratorPlan(
-            "cpu",
-            f"MIGraphX was requested but the serving Python version could not be resolved: "
-            f"{planning_error}",
-            honored=False,
-        )
+        except InstallerError:
+            detected_python_version = None
+    plan = plan_accelerator(
+        requested,
+        platform_name=platform_name,
+        machine=machine,
+        nvidia_report=nvidia_report,
+        python_version=detected_python_version,
+        platform_version=platform_version,
+    )
     try:
         record = accelerator_record_path(install_directory, platform_name=platform_name)
     except InstallerError as exc:
@@ -750,7 +639,7 @@ def configure_accelerator(
         return plan
 
     try:
-        serving_python_version = detected_python_version or interpreter_version(serving_python)
+        serving_python_version = python_version or interpreter_version(serving_python)
         plan = plan._replace(
             lock_fingerprint=accelerator_lock_fingerprint(
                 install_directory,
@@ -813,8 +702,6 @@ def detection_report() -> list[str]:
         "NVIDIA: "
         + (nvidia.strip().splitlines()[0] if nvidia and nvidia.strip() else "not detected")
     )
-    rocm = _rocm_report()
-    facts.append(f"ROCm: {rocm or 'not detected'}")
     if platform_name == "darwin":
         version = platform.mac_ver()[0]
         facts.append(f"macOS: {version}")
@@ -829,6 +716,15 @@ def detection_report() -> list[str]:
             "available"
             if webgpu_supported and machine in webgpu_supported
             else f"not published for {platform_name}/{machine}"
+        )
+    )
+    vulkan_supported = VULKAN_PLATFORMS.get(platform_name)
+    facts.append(
+        "Vulkan (Dawn/WebGPU): "
+        + (
+            "available"
+            if vulkan_supported and machine in vulkan_supported
+            else f"unavailable on {platform_name}/{machine}"
         )
     )
     cuda_supported = CUDA_PLATFORMS.get(platform_name)

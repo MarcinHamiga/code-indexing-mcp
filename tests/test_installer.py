@@ -10,7 +10,6 @@ from types import ModuleType
 import pytest
 from conftest import create_test_remote, run_git
 
-from code_indexing_mcp.installer import accelerator as accelerator_module
 from code_indexing_mcp.installer.accelerator import (
     ACCELERATOR_ENVIRONMENT_DIRECTORY,
     ACCELERATOR_EXTRAS,
@@ -1255,7 +1254,7 @@ def _fake_uv(tmp_path: Path) -> Path:
         ("cuda", "darwin", "arm64", None, "cpu", "CUDA was requested but"),
         ("coreml", "darwin", "arm64", None, "cpu", "CODE_INDEXING_EMBED_ACCELERATOR=coreml"),
         ("webgpu", "linux", "x86_64", None, "webgpu", "locked WebGPU"),
-        ("migraphx", "linux", "x86_64", None, "webgpu", "falling back to WebGPU"),
+        ("vulkan", "linux", "x86_64", None, "vulkan", "Vulkan (Dawn/WebGPU)"),
     ],
 )
 def test_accelerator_detection_nominates_only_a_supported_pinned_combination(
@@ -1272,7 +1271,6 @@ def test_accelerator_detection_nominates_only_a_supported_pinned_combination(
         platform_name=platform_name,
         machine=machine,
         nvidia_report=lambda: report,
-        rocm_report=lambda: None,
         python_version="3.12",
         platform_version="14.0",
     )
@@ -1306,7 +1304,6 @@ def test_webgpu_is_prepared_only_where_the_locked_plugin_has_a_wheel(
         platform_version=platform_version,
         python_version="3.12",
         nvidia_report=lambda: None,
-        rocm_report=lambda: None,
     )
 
     assert plan.accelerator == expected
@@ -1314,121 +1311,33 @@ def test_webgpu_is_prepared_only_where_the_locked_plugin_has_a_wheel(
 
 
 @pytest.mark.parametrize(
-    ("platform_name", "machine", "python_version", "rocm", "expected", "honored"),
+    ("platform_name", "machine", "expected", "honored"),
     [
-        ("linux", "x86_64", "3.12", "7.2.1, AMD Radeon PRO W7900", "migraphx", True),
-        # A point release above the floor is what a stock ROCm install actually
-        # is; refusing it left working AMD machines on WebGPU.
-        ("linux", "x86_64", "3.12", "7.14.0, AMD Radeon RX 7900 XT", "migraphx", True),
-        ("linux", "x86_64", "3.12", "7.3, AMD Radeon PRO W7900", "migraphx", True),
-        ("linux", "x86_64", "3.12", "7.2, AMD Radeon PRO W7900", "webgpu", False),
-        ("linux", "x86_64", "3.12", "6.4.1, AMD Radeon PRO W7900", "webgpu", False),
-        # The floor is a floor within ROCm 7 only: the next major is a runtime
-        # this release's wheel was never built against.
-        ("linux", "x86_64", "3.12", "8.0.0, AMD Radeon PRO W7900", "webgpu", False),
-        ("linux", "x86_64", "3.12", "unknown, AMD Radeon PRO W7900", "webgpu", False),
-        ("linux", "x86_64", "3.13", "7.2.1, AMD Radeon PRO W7900", "webgpu", False),
-        ("linux", "aarch64", "3.12", "7.2.1, AMD GPU", "cpu", False),
+        ("linux", "x86_64", "vulkan", True),
+        ("win32", "AMD64", "vulkan", True),
+        ("darwin", "arm64", "cpu", False),
+        ("linux", "aarch64", "cpu", False),
     ],
 )
-def test_migraphx_uses_only_the_supported_rocm_python_matrix_then_falls_back(
+def test_vulkan_is_prepared_only_on_linux_and_windows_x86_64_dawn_builds(
     platform_name: str,
     machine: str,
-    python_version: str,
-    rocm: str,
     expected: str,
     honored: bool,
 ) -> None:
-
     plan = plan_accelerator(
-        "migraphx",
+        "vulkan",
         platform_name=platform_name,
         machine=machine,
-        platform_version="",
-        python_version=python_version,
+        platform_version="14.0",
+        python_version="3.12",
         nvidia_report=lambda: None,
-        rocm_report=lambda: rocm,
     )
 
     assert plan.accelerator == expected
     assert plan.honored is honored
-    if expected == "migraphx":
-        assert plan.driver_version == rocm.split(",")[0]
-        assert plan.device_name == rocm.split(", ")[1]
-    else:
-        assert "MIGraphX was requested but" in plan.reason
-
-
-@pytest.mark.parametrize(
-    "relative",
-    [
-        # Where ROCm 6 and earlier put it, and where the detection used to look.
-        ".info/version",
-        ".info/version-dev",
-        # Where ROCm 7's packages put it: under the versioned `core` component,
-        # normally reached through the `core` alternatives symlink.
-        "core-7.14/.info/version",
-        "core/.info/version",
-    ],
-)
-def test_rocm_is_detected_wherever_the_packaging_put_its_version_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str
-) -> None:
-    monkeypatch.delenv("ROCM_PATH", raising=False)
-    monkeypatch.setattr(accelerator_module.shutil, "which", lambda name: None)
-    version_file = tmp_path / relative
-    version_file.parent.mkdir(parents=True)
-    version_file.write_text("7.14.0\n", encoding="utf-8")
-
-    assert accelerator_module._rocm_report(root=tmp_path) == "7.14.0, AMD GPU"
-
-
-def test_a_machine_without_rocm_reports_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("ROCM_PATH", raising=False)
-
-    assert accelerator_module._rocm_report(root=tmp_path / "missing") is None
-
-
-def test_rocm_path_overrides_the_default_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(accelerator_module.shutil, "which", lambda name: None)
-    override = tmp_path / "rocm-7.2.1"
-    (override / ".info").mkdir(parents=True)
-    (override / ".info" / "version").write_text("7.2.1\n", encoding="utf-8")
-    monkeypatch.setenv("ROCM_PATH", str(override))
-
-    assert accelerator_module._rocm_report(root=tmp_path / "missing") == "7.2.1, AMD GPU"
-
-
-def test_the_reported_device_is_a_gpu_agent_and_not_the_host_processor() -> None:
-    """rocminfo lists the CPU as agent 1, so the first name in it is not a card."""
-    output = """\
-Agent 1
-  Name:                    AMD Ryzen 7 9800X3D 8-Core Processor
-  Marketing Name:          AMD Ryzen 7 9800X3D 8-Core Processor
-  Device Type:             CPU
-Agent 2
-  Name:                    gfx1100
-  Marketing Name:          AMD Radeon RX 7900 XT
-  Device Type:             GPU
-"""
-
-    assert accelerator_module._rocminfo_device_name(output) == "AMD Radeon RX 7900 XT"
-
-
-@pytest.mark.parametrize(
-    "output",
-    [
-        "",
-        "Agent 1\n  Marketing Name:          AMD Ryzen 7 9800X3D\n  Device Type:  CPU\n",
-        "Agent 1\n  Marketing Name:          Unknown\n  Device Type:             GPU\n",
-    ],
-)
-def test_an_unnameable_device_falls_back_rather_than_naming_a_cpu(output: str) -> None:
-    assert accelerator_module._rocminfo_device_name(output) == ""
+    if not honored:
+        assert "Vulkan was requested but" in plan.reason
 
 
 @pytest.mark.parametrize(
@@ -1461,7 +1370,6 @@ def test_mlx_is_prepared_only_on_apple_silicon_with_a_published_wheel(
         platform_version=platform_version,
         python_version="3.12",
         nvidia_report=lambda: None,
-        rocm_report=lambda: None,
     )
 
     assert plan.accelerator == expected
@@ -1475,11 +1383,7 @@ def test_mlx_is_prepared_only_on_apple_silicon_with_a_published_wheel(
 
 
 def test_an_unsupported_mlx_request_does_not_fall_through_to_webgpu() -> None:
-    """MIGraphX degrades to WebGPU because both are cross-vendor GPU paths.
-
-    A request for Metal on a machine with no Metal is not a request for Vulkan,
-    so this reports CPU and says why instead.
-    """
+    """A request for Metal on a machine with no Metal reports CPU and says why."""
 
     plan = plan_accelerator(
         "mlx",
@@ -1488,7 +1392,6 @@ def test_an_unsupported_mlx_request_does_not_fall_through_to_webgpu() -> None:
         platform_version="",
         python_version="3.12",
         nvidia_report=lambda: None,
-        rocm_report=lambda: None,
     )
 
     assert plan.accelerator == "cpu"
@@ -1505,7 +1408,6 @@ def test_auto_prepares_mlx_on_apple_silicon() -> None:
         platform_version="26.5.2",
         python_version="3.12",
         nvidia_report=lambda: None,
-        rocm_report=lambda: None,
     )
 
     assert plan.accelerator == "mlx"
@@ -1522,7 +1424,6 @@ def test_auto_on_an_unsupported_mac_reports_the_same_reason_it_always_did() -> N
         platform_version="15.1",
         python_version="3.12",
         nvidia_report=lambda: None,
-        rocm_report=lambda: None,
     )
 
     assert plan.accelerator == "cpu"
@@ -1540,7 +1441,6 @@ def test_an_explicit_cuda_request_is_never_answered_with_mlx() -> None:
         platform_version="26.5.2",
         python_version="3.12",
         nvidia_report=lambda: None,
-        rocm_report=lambda: None,
     )
 
     assert plan.accelerator == "cpu"
@@ -1553,7 +1453,7 @@ def test_all_accelerator_environments_have_a_locked_extra() -> None:
         "cuda": "cuda",
         "mlx": "mlx",
         "webgpu": "webgpu",
-        "migraphx": "migraphx",
+        "vulkan": "webgpu",
     }
 
 
@@ -1568,7 +1468,7 @@ def test_all_accelerator_environments_have_a_locked_extra() -> None:
         # These named something this installation cannot give them.
         ("cuda", "darwin", False),
         ("webgpu", "linux", False),
-        ("migraphx", "linux", False),
+        ("vulkan", "darwin", False),
     ],
 )
 def test_only_a_denied_request_is_reported_as_a_problem(
@@ -1660,19 +1560,19 @@ def test_a_prepared_accelerator_is_recorded_only_after_its_probe_passes(
 
 
 @pytest.mark.parametrize(
-    ("requested", "rocm", "expected", "platform_name", "machine"),
+    ("requested", "expected", "expected_extra", "platform_name", "machine"),
     [
-        ("webgpu", None, "webgpu", "linux", "x86_64"),
-        ("migraphx", "7.2.1, AMD Radeon PRO W7900", "migraphx", "linux", "x86_64"),
-        ("mlx", None, "mlx", "darwin", "arm64"),
+        ("webgpu", "webgpu", "webgpu", "linux", "x86_64"),
+        ("vulkan", "vulkan", "webgpu", "linux", "x86_64"),
+        ("mlx", "mlx", "mlx", "darwin", "arm64"),
     ],
 )
 def test_experimental_accelerators_sync_their_own_locked_extra(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     requested: str,
-    rocm: str | None,
     expected: str,
+    expected_extra: str,
     platform_name: str,
     machine: str,
 ) -> None:
@@ -1722,11 +1622,10 @@ def test_experimental_accelerators_sync_their_own_locked_extra(
         machine=machine,
         python_version="3.12",
         platform_version="14.0",
-        rocm_report=lambda: rocm,
     )
 
     assert plan.accelerator == expected
-    assert synced == [expected]
+    assert synced == [expected_extra]
     assert json.loads(record.read_text(encoding="utf-8"))["accelerator"] == expected
 
 
@@ -2016,7 +1915,7 @@ def test_a_checkout_without_a_lockfile_cannot_fingerprint_an_accelerator(
         accelerator_lock_fingerprint(tmp_path, "cuda")
 
 
-def test_migraphx_detection_uses_the_serving_interpreter_version(
+def test_accelerator_detection_passes_the_serving_interpreter_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     checkout = tmp_path / "checkout"
@@ -2037,7 +1936,7 @@ def test_migraphx_detection_uses_the_serving_interpreter_version(
 
     configure_accelerator(
         checkout,
-        "migraphx",
+        "vulkan",
         platform_name="linux",
         machine="x86_64",
     )

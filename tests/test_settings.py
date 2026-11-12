@@ -141,7 +141,7 @@ def test_the_accelerator_defaults_to_automatic_selection() -> None:
         ("cpu", Accelerator.CPU),
         ("CUDA", Accelerator.CUDA),
         ("webgpu", Accelerator.WEBGPU),
-        ("migraphx", Accelerator.MIGRAPHX),
+        ("vulkan", Accelerator.VULKAN),
         ("coreml", Accelerator.COREML),
     ],
 )

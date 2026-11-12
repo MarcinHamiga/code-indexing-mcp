@@ -1,0 +1,808 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-12",
+  "baseline_model": {
+    "model_id": "jinaai/jina-embeddings-v2-base-code",
+    "dimension": 768,
+    "total_params_m": 161.0,
+    "active_trunk_params_m": 113.2,
+    "onnx_fp32_mib": 611.8
+  },
+  "selected_model": {
+    "model_id": "codefuse-ai/F2LLM-v2-160M",
+    "license": "Apache-2.0",
+    "architecture": "Qwen3Model",
+    "dimension": 640,
+    "num_hidden_layers": 9,
+    "hidden_size": 640,
+    "intermediate_size": 1536,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "vocab_size": 151936,
+    "max_position_embeddings": 40960,
+    "total_params_m": 160.0,
+    "active_trunk_params_m": 61.9,
+    "safetensors_bf16_mib": 303.6,
+    "converted_onnx_fp32_mib": 609.3,
+    "converted_mlx_fp16_mib": 303.6,
+    "pooling": "last_token_eos",
+    "query_prompt": "Instruct: Given a question, retrieve passages that can help answer the question.\nQuery: ",
+    "document_prompt": ""
+  },
+  "cpu_onnx_candidates": {
+    "initial_sweep": [
+      {
+        "name": "jinaai/jina-embeddings-v2-base-code (CURRENT)",
+        "dim": 768,
+        "onnx_fp32_mib": 611.8,
+        "avg_tokens_per_chunk": 189.6,
+        "microbatches": 13,
+        "threads_2": {
+          "passage_s_for_96": 4.524,
+          "chunks_per_sec": 21.22,
+          "query_p50_ms": 7.17
+        },
+        "threads_all": {
+          "passage_s_for_96": 6.218,
+          "chunks_per_sec": 15.44,
+          "query_p50_ms": 7.26
+        },
+        "eval_recall_at_1": 0.929,
+        "eval_recall_at_5": 1.0,
+        "eval_mrr": 0.952
+      },
+      {
+        "name": "MongoDB/mdbr-leaf-ir (23M)",
+        "dim": 768,
+        "onnx_fp32_mib": 87.3,
+        "avg_tokens_per_chunk": 224.5,
+        "microbatches": 12,
+        "threads_2": {
+          "passage_s_for_96": 0.646,
+          "chunks_per_sec": 148.61,
+          "query_p50_ms": 0.89
+        },
+        "threads_all": {
+          "passage_s_for_96": 0.536,
+          "chunks_per_sec": 178.96,
+          "query_p50_ms": 1.22
+        },
+        "eval_recall_at_1": 0.857,
+        "eval_recall_at_5": 0.929,
+        "eval_mrr": 0.905
+      },
+      {
+        "name": "Snowflake/snowflake-arctic-embed-s (33M)",
+        "dim": 384,
+        "onnx_fp32_mib": 126.9,
+        "avg_tokens_per_chunk": 512.0,
+        "microbatches": 12,
+        "threads_2": {
+          "passage_s_for_96": 3.476,
+          "chunks_per_sec": 27.62,
+          "query_p50_ms": 2.37
+        },
+        "threads_all": {
+          "passage_s_for_96": 3.183,
+          "chunks_per_sec": 30.16,
+          "query_p50_ms": 3.0
+        },
+        "eval_recall_at_1": 0.929,
+        "eval_recall_at_5": 0.929,
+        "eval_mrr": 0.938
+      },
+      {
+        "name": "ibm-granite/granite-embedding-small-english-r2 (47M / 28.3M active)",
+        "dim": 384,
+        "onnx_fp32_mib": 186.0,
+        "avg_tokens_per_chunk": 211.7,
+        "microbatches": 13,
+        "threads_2": {
+          "passage_s_for_96": 4.809,
+          "chunks_per_sec": 19.96,
+          "query_p50_ms": 2.85
+        },
+        "threads_all": {
+          "passage_s_for_96": 5.328,
+          "chunks_per_sec": 18.02,
+          "query_p50_ms": 2.87
+        },
+        "eval_recall_at_1": 0.929,
+        "eval_recall_at_5": 1.0,
+        "eval_mrr": 0.946
+      },
+      {
+        "name": "hotchpotch/bekko-embedding-v1-a25m (24.9M active, FP32)",
+        "dim": 384,
+        "onnx_fp32_mib": 470.3,
+        "avg_tokens_per_chunk": 980.0,
+        "microbatches": 24,
+        "threads_2": {
+          "passage_s_for_96": 7.726,
+          "chunks_per_sec": 12.43,
+          "query_p50_ms": 3.15
+        },
+        "threads_all": {
+          "passage_s_for_96": 10.102,
+          "chunks_per_sec": 9.5,
+          "query_p50_ms": 4.28
+        },
+        "eval_recall_at_1": 0.929,
+        "eval_recall_at_5": 1.0,
+        "eval_mrr": 0.964
+      },
+      {
+        "name": "codefuse-ai/F2LLM-v2-80M (80M / 31.5M active)",
+        "dim": 320,
+        "onnx_fp32_mib": 305.8,
+        "avg_tokens_per_chunk": 171.2,
+        "microbatches": 13,
+        "threads_2": {
+          "passage_s_for_96": 2.163,
+          "chunks_per_sec": 44.37,
+          "query_p50_ms": 3.9
+        },
+        "threads_all": {
+          "passage_s_for_96": 2.43,
+          "chunks_per_sec": 39.51,
+          "query_p50_ms": 4.18
+        },
+        "eval_recall_at_1": 0.929,
+        "eval_recall_at_5": 1.0,
+        "eval_mrr": 0.952
+      },
+      {
+        "name": "nomic-ai/CodeRankEmbed (137M)",
+        "dim": 768,
+        "onnx_fp32_mib": 522.3,
+        "avg_tokens_per_chunk": 933.0,
+        "microbatches": 24,
+        "threads_2": {
+          "passage_s_for_96": 7.188,
+          "chunks_per_sec": 13.36,
+          "query_p50_ms": 7.41
+        },
+        "threads_all": {
+          "passage_s_for_96": 10.498,
+          "chunks_per_sec": 9.14,
+          "query_p50_ms": 6.07
+        },
+        "eval_recall_at_1": 0.929,
+        "eval_recall_at_5": 1.0,
+        "eval_mrr": 0.964
+      },
+      {
+        "name": "Alibaba-NLP/gte-modernbert-base (149M)",
+        "dim": 768,
+        "onnx_fp32_mib": 568.8,
+        "avg_tokens_per_chunk": 211.7,
+        "microbatches": 13,
+        "threads_2": {
+          "passage_s_for_96": 4.745,
+          "chunks_per_sec": 20.23,
+          "query_p50_ms": 6.28
+        },
+        "threads_all": {
+          "passage_s_for_96": 6.727,
+          "chunks_per_sec": 14.27,
+          "query_p50_ms": 6.61
+        },
+        "eval_recall_at_1": 0.929,
+        "eval_recall_at_5": 1.0,
+        "eval_mrr": 0.964
+      },
+      {
+        "name": "dmis-lab/UltraBERT-Embed-150M (150M)",
+        "dim": 768,
+        "onnx_fp32_mib": 576.6,
+        "avg_tokens_per_chunk": 195.1,
+        "microbatches": 13,
+        "threads_2": {
+          "passage_s_for_96": 3.33,
+          "chunks_per_sec": 28.83,
+          "query_p50_ms": 8.07
+        },
+        "threads_all": {
+          "passage_s_for_96": 5.023,
+          "chunks_per_sec": 19.11,
+          "query_p50_ms": 8.93
+        },
+        "eval_recall_at_1": 0.929,
+        "eval_recall_at_5": 1.0,
+        "eval_mrr": 0.964
+      },
+      {
+        "name": "google/embeddinggemma-2 (270M text/code / 130M trunk)",
+        "error": "ValueError: Required inputs (['image_features', 'video_features', 'audio_features']) are missing from input feed (['input_ids', 'attention_mask'])."
+      }
+    ],
+    "dynamic_padding_rerun": [
+      {
+        "name": "Snowflake/snowflake-arctic-embed-s (33M)",
+        "avg_tokens_per_chunk": 192.6,
+        "microbatches": 12,
+        "threads_2": {
+          "passage_s_for_96": 1.523,
+          "chunks_per_sec": 63.02,
+          "query_p50_ms": 2.35
+        },
+        "threads_all": {
+          "passage_s_for_96": 1.323,
+          "chunks_per_sec": 72.55,
+          "query_p50_ms": 2.48
+        }
+      },
+      {
+        "name": "hotchpotch/bekko-embedding-v1-a25m (24.9M active, FP32)",
+        "avg_tokens_per_chunk": 252.9,
+        "microbatches": 14,
+        "threads_2": {
+          "passage_s_for_96": 2.221,
+          "chunks_per_sec": 43.23,
+          "query_p50_ms": 2.35
+        },
+        "threads_all": {
+          "passage_s_for_96": 2.057,
+          "chunks_per_sec": 46.67,
+          "query_p50_ms": 2.29
+        }
+      },
+      {
+        "name": "nomic-ai/CodeRankEmbed (137M)",
+        "avg_tokens_per_chunk": 198.1,
+        "microbatches": 13,
+        "threads_2": {
+          "passage_s_for_96": 3.835,
+          "chunks_per_sec": 25.03,
+          "query_p50_ms": 7.95
+        },
+        "threads_all": {
+          "passage_s_for_96": 5.652,
+          "chunks_per_sec": 16.99,
+          "query_p50_ms": 5.96
+        }
+      }
+    ]
+  },
+  "mlx_metal_candidates": [
+    {
+      "name": "jinaai/jina-embeddings-v2-base-code (CURRENT)",
+      "b8_seq256": {
+        "ms_per_batch": 102.32,
+        "chunks_per_sec": 78.2,
+        "tokens_per_sec": 20016.0
+      },
+      "b4_seq1024": {
+        "ms_per_batch": 234.06,
+        "chunks_per_sec": 17.1,
+        "tokens_per_sec": 17500.0
+      },
+      "speedup_seq256": 1.0,
+      "speedup_seq1024": 1.0
+    },
+    {
+      "name": "hotchpotch/bekko-embedding-v1-a25m (24.9M active)",
+      "b8_seq256": {
+        "ms_per_batch": 28.57,
+        "chunks_per_sec": 280.0,
+        "tokens_per_sec": 71685.0
+      },
+      "b4_seq1024": {
+        "ms_per_batch": 68.49,
+        "chunks_per_sec": 58.4,
+        "tokens_per_sec": 59803.0
+      },
+      "speedup_seq256": 3.58,
+      "speedup_seq1024": 3.42
+    },
+    {
+      "name": "ibm-granite/granite-embedding-small-english-r2 (28.3M active)",
+      "b8_seq256": {
+        "ms_per_batch": 34.97,
+        "chunks_per_sec": 228.8,
+        "tokens_per_sec": 58563.0
+      },
+      "b4_seq1024": {
+        "ms_per_batch": 103.36,
+        "chunks_per_sec": 38.7,
+        "tokens_per_sec": 39627.0
+      },
+      "speedup_seq256": 2.93,
+      "speedup_seq1024": 2.26
+    },
+    {
+      "name": "codefuse-ai/F2LLM-v2-80M (31.5M active)",
+      "b8_seq256": {
+        "ms_per_batch": 31.25,
+        "chunks_per_sec": 256.0,
+        "tokens_per_sec": 65545.0
+      },
+      "b4_seq1024": {
+        "ms_per_batch": 82.59,
+        "chunks_per_sec": 48.4,
+        "tokens_per_sec": 49597.0
+      },
+      "speedup_seq256": 3.27,
+      "speedup_seq1024": 2.83
+    },
+    {
+      "name": "nomic-ai/CodeRankEmbed (113M active)",
+      "b8_seq256": {
+        "ms_per_batch": 90.92,
+        "chunks_per_sec": 88.0,
+        "tokens_per_sec": 22525.0
+      },
+      "b4_seq1024": {
+        "ms_per_batch": 205.64,
+        "chunks_per_sec": 19.5,
+        "tokens_per_sec": 19918.0
+      },
+      "speedup_seq256": 1.13,
+      "speedup_seq1024": 1.14
+    },
+    {
+      "name": "Alibaba-NLP/gte-modernbert-base (110.6M active)",
+      "b8_seq256": {
+        "ms_per_batch": 98.94,
+        "chunks_per_sec": 80.9,
+        "tokens_per_sec": 20699.0
+      },
+      "b4_seq1024": {
+        "ms_per_batch": 239.37,
+        "chunks_per_sec": 16.7,
+        "tokens_per_sec": 17111.0
+      },
+      "speedup_seq256": 1.03,
+      "speedup_seq1024": 0.98
+    },
+    {
+      "name": "dmis-lab/UltraBERT-Embed-150M (113M active)",
+      "b8_seq256": {
+        "ms_per_batch": 96.49,
+        "chunks_per_sec": 82.9,
+        "tokens_per_sec": 21226.0
+      },
+      "b4_seq1024": {
+        "ms_per_batch": 232.61,
+        "chunks_per_sec": 17.2,
+        "tokens_per_sec": 17609.0
+      },
+      "speedup_seq256": 1.06,
+      "speedup_seq1024": 1.01
+    }
+  ],
+  "coir_head_to_head": [
+    {
+      "model": "jinaai/jina-embeddings-v2-base-code (CURRENT)",
+      "codetrans-dl": {
+        "ndcg_at_10": 27.88,
+        "sec": 27.3
+      },
+      "codetrans-contest": {
+        "ndcg_at_10": 95.11,
+        "sec": 28.5
+      },
+      "cosqa": {
+        "ndcg_at_10": 39.55,
+        "sec": 75.3
+      },
+      "apps": {
+        "ndcg_at_10": 17.59,
+        "sec": 95.4
+      }
+    },
+    {
+      "model": "codefuse-ai/F2LLM-v2-80M",
+      "codetrans-dl": {
+        "ndcg_at_10": 33.43,
+        "sec": 8.8
+      },
+      "codetrans-dl_raw_search_by_example": 31.31,
+      "codetrans-contest": {
+        "ndcg_at_10": 82.64,
+        "sec": 9.9
+      },
+      "codetrans-contest_raw_search_by_example": 91.08,
+      "cosqa": {
+        "ndcg_at_10": 30.26,
+        "sec": 23.7
+      },
+      "apps": {
+        "ndcg_at_10": 55.2,
+        "sec": 31.7
+      },
+      "meta": {
+        "needs_manual_eos": false,
+        "mlx_real_chunks_per_s": {
+          "b8_seq256": 237.5,
+          "b4_seq1024": 46.0
+        }
+      }
+    },
+    {
+      "model": "codefuse-ai/F2LLM-v2-160M",
+      "codetrans-dl": {
+        "ndcg_at_10": 32.07,
+        "sec": 13.7
+      },
+      "codetrans-dl_raw_search_by_example": 31.93,
+      "codetrans-contest": {
+        "ndcg_at_10": 84.18,
+        "sec": 15.5
+      },
+      "codetrans-contest_raw_search_by_example": 91.83,
+      "cosqa": {
+        "ndcg_at_10": 31.98,
+        "sec": 38.7
+      },
+      "apps": {
+        "ndcg_at_10": 61.45,
+        "sec": 50.1
+      },
+      "meta": {
+        "needs_manual_eos": false,
+        "mlx_real_chunks_per_s": {
+          "b8_seq256": 140.1,
+          "b4_seq1024": 30.1
+        }
+      }
+    }
+  ],
+  "f2llm_160m_quantization_audit": {
+    "mlx_and_onnx_sweep": {
+      "mlx": {
+        "mlx_fp16": {
+          "speed": {
+            "repo_96_s": 0.525,
+            "repo_96_chunks_per_s": 182.9,
+            "b8_seq256": 140.5,
+            "b4_seq1024": 29.2
+          },
+          "cosine_to_fp32_min": 0.999998,
+          "cosine_to_fp32_mean": 0.999999,
+          "top5_overlap_vs_fp32": 1.0
+        },
+        "mlx_q8": {
+          "speed": {
+            "repo_96_s": 0.529,
+            "repo_96_chunks_per_s": 181.3,
+            "b8_seq256": 135.3,
+            "b4_seq1024": 28.3
+          },
+          "cosine_to_fp32_min": 0.999648,
+          "cosine_to_fp32_mean": 0.999764,
+          "top5_overlap_vs_fp32": 1.0
+        },
+        "mlx_q8_coir": {
+          "codetrans-dl": {
+            "ndcg_at_10": 30.68,
+            "sec": 14.5
+          },
+          "codetrans-dl_raw_search_by_example": 31.17,
+          "codetrans-contest": {
+            "ndcg_at_10": 84.09,
+            "sec": 16.5
+          },
+          "codetrans-contest_raw_search_by_example": 91.8,
+          "cosqa": {
+            "ndcg_at_10": 30.63,
+            "sec": 40.4
+          },
+          "apps": {
+            "ndcg_at_10": 61.26,
+            "sec": 52.8
+          }
+        }
+      },
+      "cpu_onnx": {
+        "onnx_fp32": {
+          "onnx_mib": 609.3,
+          "threads_2": {
+            "passage_s_for_96": 1.84,
+            "chunks_per_sec": 52.17,
+            "query_p50_ms": 4.77
+          },
+          "threads_all": {
+            "passage_s_for_96": 2.607,
+            "chunks_per_sec": 36.82,
+            "query_p50_ms": 5.26
+          },
+          "cosine_to_mlx_fp32_min": 1.0,
+          "cosine_to_mlx_fp32_mean": 1.0,
+          "self_top5_overlap_vs_fp32": 1.0
+        },
+        "onnx_q8_matmul": {
+          "onnx_mib": 432.1,
+          "threads_2": {
+            "passage_s_for_96": 3.894,
+            "chunks_per_sec": 24.65,
+            "query_p50_ms": 7.65
+          },
+          "threads_all": {
+            "passage_s_for_96": 2.157,
+            "chunks_per_sec": 44.51,
+            "query_p50_ms": 4.42
+          },
+          "cosine_to_mlx_fp32_min": 0.879931,
+          "cosine_to_mlx_fp32_mean": 0.932232,
+          "self_top5_overlap_vs_fp32": 0.9143
+        },
+        "onnx_q8_full": {
+          "onnx_mib": 153.9,
+          "threads_2": {
+            "passage_s_for_96": 3.848,
+            "chunks_per_sec": 24.95,
+            "query_p50_ms": 7.6
+          },
+          "threads_all": {
+            "passage_s_for_96": 2.133,
+            "chunks_per_sec": 45.0,
+            "query_p50_ms": 4.5
+          },
+          "cosine_to_mlx_fp32_min": 0.885688,
+          "cosine_to_mlx_fp32_mean": 0.932241,
+          "self_top5_overlap_vs_fp32": 0.9
+        }
+      },
+      "cross_backend_overlap_vs_exact_fp32": {
+        "cpu_fp32_query__vs__mlx_fp16_passages": {
+          "top5": 1.0,
+          "top10": 1.0
+        },
+        "cpu_fp32_query__vs__mlx_q8_passages": {
+          "top5": 1.0,
+          "top10": 0.9786
+        },
+        "cpu_q8_query__vs__mlx_fp16_passages": {
+          "top5": 0.8857,
+          "top10": 0.9286
+        },
+        "cpu_q8_query__vs__mlx_q8_passages": {
+          "top5": 0.9,
+          "top10": 0.9214
+        },
+        "cpu_q8_query__vs__cpu_q8_passages": {
+          "top5": 0.8286,
+          "top10": 0.8714
+        }
+      }
+    },
+    "onnx_per_channel_linear_only": {
+      "qint8_per_channel_linear_only": {
+        "onnx_mib": 432.5,
+        "threads_2": {
+          "passage_s_for_96": 2.866,
+          "chunks_per_sec": 33.49,
+          "query_p50_ms": 5.76
+        },
+        "threads_all": {
+          "passage_s_for_96": 2.282,
+          "chunks_per_sec": 42.07,
+          "query_p50_ms": 4.37
+        },
+        "cosine_min": 0.985478,
+        "cosine_mean": 0.990202,
+        "self_top5_overlap": 0.9571,
+        "self_top10_overlap": 0.95,
+        "q8_query_vs_mlx_fp16_passages_top5": 0.9857,
+        "q8_query_vs_mlx_fp16_passages_top10": 0.9429
+      },
+      "qint8_per_channel_linear_and_gather": {
+        "onnx_mib": 154.3,
+        "threads_2": {
+          "passage_s_for_96": 2.878,
+          "chunks_per_sec": 33.35,
+          "query_p50_ms": 5.88
+        },
+        "threads_all": {
+          "passage_s_for_96": 2.307,
+          "chunks_per_sec": 41.6,
+          "query_p50_ms": 4.33
+        },
+        "cosine_min": 0.985572,
+        "cosine_mean": 0.990298,
+        "self_top5_overlap": 0.9,
+        "self_top10_overlap": 0.9571,
+        "q8_query_vs_mlx_fp16_passages_top5": 0.9286,
+        "q8_query_vs_mlx_fp16_passages_top10": 0.9643
+      }
+    }
+  },
+  "f2llm_160m_mrl_dimension_audit": {
+    "coir_accuracy_by_dim": {
+      "codetrans-dl": {
+        "640d": {
+          "ndcg_at_10": 32.07,
+          "top10_overlap_vs_640d": 1.0,
+          "raw_search_by_example_ndcg10": 31.93
+        },
+        "512d": {
+          "ndcg_at_10": 31.5,
+          "top10_overlap_vs_640d": 0.9367,
+          "raw_search_by_example_ndcg10": 30.65
+        },
+        "384d": {
+          "ndcg_at_10": 32.83,
+          "top10_overlap_vs_640d": 0.9289,
+          "raw_search_by_example_ndcg10": 31.88
+        },
+        "256d": {
+          "ndcg_at_10": 33.13,
+          "top10_overlap_vs_640d": 0.9144,
+          "raw_search_by_example_ndcg10": 31.71
+        }
+      },
+      "codetrans-contest": {
+        "640d": {
+          "ndcg_at_10": 84.18,
+          "top10_overlap_vs_640d": 1.0,
+          "raw_search_by_example_ndcg10": 91.83
+        },
+        "512d": {
+          "ndcg_at_10": 83.72,
+          "top10_overlap_vs_640d": 0.8647,
+          "raw_search_by_example_ndcg10": 92.12
+        },
+        "384d": {
+          "ndcg_at_10": 82.92,
+          "top10_overlap_vs_640d": 0.7833,
+          "raw_search_by_example_ndcg10": 91.42
+        },
+        "256d": {
+          "ndcg_at_10": 82.93,
+          "top10_overlap_vs_640d": 0.7077,
+          "raw_search_by_example_ndcg10": 90.68
+        }
+      },
+      "cosqa": {
+        "640d": {
+          "ndcg_at_10": 34.14,
+          "top10_overlap_vs_640d": 1.0
+        },
+        "512d": {
+          "ndcg_at_10": 33.31,
+          "top10_overlap_vs_640d": 0.8443
+        },
+        "384d": {
+          "ndcg_at_10": 32.56,
+          "top10_overlap_vs_640d": 0.8093
+        },
+        "256d": {
+          "ndcg_at_10": 33.68,
+          "top10_overlap_vs_640d": 0.7807
+        }
+      },
+      "apps": {
+        "640d": {
+          "ndcg_at_10": 61.45,
+          "top10_overlap_vs_640d": 1.0
+        },
+        "512d": {
+          "ndcg_at_10": 61.26,
+          "top10_overlap_vs_640d": 0.889
+        },
+        "384d": {
+          "ndcg_at_10": 60.66,
+          "top10_overlap_vs_640d": 0.814
+        },
+        "256d": {
+          "ndcg_at_10": 59.93,
+          "top10_overlap_vs_640d": 0.772
+        }
+      },
+      "summary_4task_mean": {
+        "640d_mean_ndcg10": 52.96,
+        "512d_mean_ndcg10": 52.45,
+        "384d_mean_ndcg10": 52.24,
+        "256d_mean_ndcg10": 52.42
+      }
+    },
+    "lancedb_latency_and_storage_by_dim": [
+      {
+        "rows": 7000,
+        "dim": 768,
+        "commit_ms": 21.0,
+        "vector_mib": 10.31,
+        "exact_scan_p50_ms": 1.867,
+        "exact_scan_mean_ms": 1.908
+      },
+      {
+        "rows": 7000,
+        "dim": 640,
+        "commit_ms": 16.6,
+        "vector_mib": 8.6,
+        "exact_scan_p50_ms": 1.651,
+        "exact_scan_mean_ms": 1.673
+      },
+      {
+        "rows": 7000,
+        "dim": 512,
+        "commit_ms": 11.5,
+        "vector_mib": 6.89,
+        "exact_scan_p50_ms": 1.267,
+        "exact_scan_mean_ms": 1.288
+      },
+      {
+        "rows": 7000,
+        "dim": 384,
+        "commit_ms": 9.2,
+        "vector_mib": 5.18,
+        "exact_scan_p50_ms": 1.129,
+        "exact_scan_mean_ms": 1.508
+      },
+      {
+        "rows": 56000,
+        "dim": 768,
+        "commit_ms": 120.9,
+        "vector_mib": 82.47,
+        "exact_scan_p50_ms": 6.36,
+        "exact_scan_mean_ms": 6.382,
+        "hnsw_build_s": 9.68,
+        "hnsw_p50_ms": 2.27
+      },
+      {
+        "rows": 56000,
+        "dim": 640,
+        "commit_ms": 115.5,
+        "vector_mib": 68.79,
+        "exact_scan_p50_ms": 5.899,
+        "exact_scan_mean_ms": 5.928,
+        "hnsw_build_s": 8.5,
+        "hnsw_p50_ms": 1.887
+      },
+      {
+        "rows": 56000,
+        "dim": 512,
+        "commit_ms": 80.9,
+        "vector_mib": 55.12,
+        "exact_scan_p50_ms": 4.812,
+        "exact_scan_mean_ms": 4.85,
+        "hnsw_build_s": 6.89,
+        "hnsw_p50_ms": 1.769
+      },
+      {
+        "rows": 56000,
+        "dim": 384,
+        "commit_ms": 57.6,
+        "vector_mib": 41.45,
+        "exact_scan_p50_ms": 3.857,
+        "exact_scan_mean_ms": 3.873,
+        "hnsw_build_s": 5.55,
+        "hnsw_p50_ms": 1.65
+      },
+      {
+        "rows": 150000,
+        "dim": 768,
+        "commit_ms": 302.9,
+        "vector_mib": 220.88,
+        "exact_scan_p50_ms": 12.363,
+        "exact_scan_mean_ms": 12.416
+      },
+      {
+        "rows": 150000,
+        "dim": 640,
+        "commit_ms": 252.1,
+        "vector_mib": 184.26,
+        "exact_scan_p50_ms": 12.384,
+        "exact_scan_mean_ms": 12.488
+      },
+      {
+        "rows": 150000,
+        "dim": 512,
+        "commit_ms": 223.6,
+        "vector_mib": 147.64,
+        "exact_scan_p50_ms": 10.641,
+        "exact_scan_mean_ms": 10.674
+      },
+      {
+        "rows": 150000,
+        "dim": 384,
+        "commit_ms": 162.9,
+        "vector_mib": 111.02,
+        "exact_scan_p50_ms": 7.483,
+        "exact_scan_mean_ms": 7.489
+      }
+    ]
+  }
+}

@@ -129,7 +129,7 @@ jobs:
     timeout-minutes: 40
     steps: *test-steps
 
-  # The real-model memory gate downloads ~640 MB and takes minutes, so it is
+  # The real-model memory gate downloads ~310 MB and takes minutes, so it is
   # manually dispatched rather than run on every push. Normal CI still checks
   # the acceptance criteria through the pure evaluate_result tests above.
   memory:
@@ -149,7 +149,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.model-cache
-          key: code-indexing-mcp-model-jina-v2-base-code
+          key: code-indexing-mcp-model-f2llm-v2-160m-v1
       - name: Populate the model cache
         env:
           CODE_INDEXING_CACHE_DIR: ${{ github.workspace }}/.model-cache

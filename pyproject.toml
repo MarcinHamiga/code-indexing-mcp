@@ -47,30 +47,37 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Exactly one runtime extra belongs in any one environment. `fastembed` and
-# `fastembed-gpu` install the same `fastembed` module over two different ONNX
-# Runtime distributions that both own the `onnxruntime` import, so an
-# environment holding both runs whichever landed last -- which is why uv is
-# told below that they conflict, and why the accelerator gets an environment of
-# its own rather than being added to the serving one.
-cpu = ["fastembed>=0.7,<1"]
-# The pinned CUDA support window for this release: ONNX Runtime 1.22-1.23,
-# which builds against CUDA 12.x and cuDNN 9. onnxruntime-gpu is named
-# explicitly rather than left to fastembed-gpu's much wider range so that the
-# combination the installer probes is the combination this release was tested
-# against. Wheels exist only for 64-bit Linux and Windows; every other platform
-# resolves the extra to nothing and stays on CPU.
-cuda = [
-    "fastembed-gpu>=0.7,<1; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
-    "onnxruntime-gpu>=1.22,<1.24; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+# Exactly one runtime extra belongs in any one environment. The CPU, CUDA, and
+# WebGPU distributions all own the `onnxruntime` import, so an environment
+# holding more than one runs whichever landed last -- which is why uv is told
+# below that they conflict, and why an accelerator gets an environment of its
+# own rather than being added to the serving one.
+cpu = [
+    "huggingface-hub>=1,<2",
+    "numpy>=2,<3",
+    "onnx>=1.22,<2",
+    "onnxruntime>=1.22,<2",
+    "tokenizers>=0.22,<1",
 ]
-# ONNX Runtime's native WebGPU execution-provider plugin uses Metal on macOS,
-# Vulkan on Linux, and Direct3D 12/Vulkan on Windows. Keep its runtime and
-# plugin versions exact: this is the pair the installer probes before recording
-# the environment as usable.
+# The pinned CUDA support window for this release: ONNX Runtime 1.22-1.23,
+# which builds against CUDA 12.x and cuDNN 9. Wheels exist only for 64-bit
+# Linux and Windows; every other platform resolves the extra to nothing and
+# stays on CPU.
+cuda = [
+    "huggingface-hub>=1,<2; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "numpy>=2,<3; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "onnx>=1.22,<2; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "onnxruntime-gpu>=1.22,<1.24; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "tokenizers>=0.22,<1; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+]
+# ONNX Runtime's native WebGPU execution-provider plugin uses Dawn to target
+# Metal on macOS, Vulkan on Linux, and Direct3D 12 or Vulkan on Windows. Both
+# the `webgpu` and `vulkan` accelerators share this locked extra; `vulkan`
+# explicitly selects Dawn's Vulkan backend on Linux and Windows.
 webgpu = [
     "huggingface-hub>=1,<2; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     "numpy>=2,<3; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "onnx>=1.22,<2; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     "onnxruntime==1.24.4; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     "onnxruntime-ep-webgpu==0.1.0; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     "tokenizers>=0.22,<1; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
@@ -79,22 +86,13 @@ webgpu = [
 # Silicon. `mlx` pulls `mlx-metal` on Darwin; its published wheels start at
 # macOS 14 arm64. MLX also ships CPU-only Linux and Windows wheels, which are
 # excluded here because installing them would prepare a "Metal" backend with no
-# Metal in it. `onnx` is here to read the float32 initializers out of the same
-# ONNX artifact the CPU model uses, once, and is unused after that conversion.
+# Metal in it.
 mlx = [
     "huggingface-hub>=1,<2; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx==0.32.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy>=2,<3; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "onnx>=1.22,<2; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "tokenizers>=0.22,<1; sys_platform == 'darwin' and platform_machine == 'arm64'",
-]
-# AMD publishes the tested MIGraphX build from its ROCm repository rather than
-# PyPI. The installer nominates it only for this exact Python/ROCm matrix.
-migraphx = [
-    "huggingface-hub>=1,<2; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
-    "numpy>=2,<3; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
-    "onnxruntime-migraphx @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
-    "tokenizers>=0.22,<1; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
 ]
 # The interactive installer's only dependency. It is not part of the conflicts
 # list: it combines with the serving environment's cpu extra and is lazily
@@ -108,20 +106,15 @@ syndex = "code_indexing_mcp.tui:main"
 [tool.hatch.version]
 path = "src/code_indexing_mcp/__init__.py"
 
-[tool.hatch.metadata]
-# MIGraphX is distributed as a versioned ROCm wheel URL rather than through a
-# package index. The URL and its platform marker are locked above.
-allow-direct-references = true
-
 [tool.uv]
 # One lockfile, four mutually exclusive resolutions. Each runtime distribution
-# owns the same `onnxruntime` import, so no environment may combine them.
+# owns the same `onnxruntime` import (or executes without it on MLX), so no
+# environment may combine them.
 conflicts = [
     [
         { extra = "cpu" },
         { extra = "cuda" },
         { extra = "webgpu" },
-        { extra = "migraphx" },
         { extra = "mlx" },
     ],
 ]

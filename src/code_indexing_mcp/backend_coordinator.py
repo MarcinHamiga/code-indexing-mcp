@@ -139,17 +139,21 @@ class BackendCoordinator:
     def _select_backend(self) -> BackendSelection:
         """Choose a backend from everything this machine can actually execute."""
         record = self.accelerator_environment.environment
+        requested = self._requested_accelerator()
         providers = list(self.serving_providers)
         if record is not None:
             # The prepared environment vouches for the one accelerator it was
-            # probed for, not for every provider its runtime happens to ship.
-            # Widening any further would offer a backend on the strength of a
-            # record that never exercised it -- and would let selection land on
-            # an accelerator whose device and driver this record cannot describe.
+            # probed for, not for every provider its runtime happens to ship
+            # (nor for another accelerator sharing the same plugin provider,
+            # such as webgpu vs vulkan).
             prepared = backend_for(record.accelerator)
-            if prepared is not None and prepared.provider in record.providers:
+            if (
+                prepared is not None
+                and prepared.provider in record.providers
+                and requested in {Accelerator.AUTO, record.accelerator}
+            ):
                 providers.append(prepared.provider)
-        selection = select_backend(self._requested_accelerator(), available_providers=providers)
+        selection = select_backend(requested, available_providers=providers)
         if record is not None and selection.uses_accelerator:
             selection = selection.described_as(apply_environment(selection.descriptor, record))
         rejection = self.accelerator_environment.reason
@@ -312,19 +316,29 @@ class BackendCoordinator:
         digest = artifact_digest(model_root)
         if digest is None:
             return None
-        model_digest = digest
-        if descriptor.accelerator is Accelerator.MLX:
-            from .direct_onnx import resolve_model_snapshot
-            from .mlx_backend import WEIGHT_LAYOUT_VERSION, converted_weights_path
+        from .direct_onnx import (
+            ONNX_LAYOUT_VERSION,
+            converted_onnx_path,
+            resolve_model_snapshot,
+        )
+        from .mlx_backend import WEIGHT_LAYOUT_VERSION, converted_weights_path
 
-            try:
-                # Cache identity must never download or convert a model. Until
-                # the exact conversion exists locally, reuse remains disabled.
-                snapshot = resolve_model_snapshot(
-                    cache_directory, model_id=self.embedder.model_id, offline=True
-                )
-            except (OSError, ValueError):
+        try:
+            # Cache identity must never download or convert a model. Until
+            # the exact conversion exists locally, reuse remains disabled.
+            snapshot = resolve_model_snapshot(
+                cache_directory, model_id=self.embedder.model_id, offline=True
+            )
+        except (OSError, ValueError):
+            return None
+        if descriptor.accelerator is Accelerator.CPU:
+            onnx_digest = artifact_digest(converted_onnx_path(cache_directory, snapshot))
+            if onnx_digest is None:
                 return None
+            model_digest = sha256(
+                f"{digest}:{onnx_digest}:{ONNX_LAYOUT_VERSION}".encode()
+            ).hexdigest()
+        else:
             weights_digest = artifact_digest(converted_weights_path(cache_directory, snapshot))
             if weights_digest is None:
                 return None
@@ -335,7 +349,7 @@ class BackendCoordinator:
             project_id=project_id,
             artifact_digest=model_digest,
             # The source snapshot includes tokenizer and configuration files;
-            # MLX additionally depends on its separately stored conversion.
+            # CPU and MLX additionally depend on their local converted artifacts.
             tokenizer_digest=digest,
             producer=passage_producer(descriptor),
             runtime_version=descriptor.runtime_version or runtime_version(descriptor.runtime),

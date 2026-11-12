@@ -558,7 +558,7 @@ def test_mlx_loads_its_own_model_and_not_fastembed(
         offline=True,
         threads=2,
         enable_cpu_mem_arena=False,
-        dimension=768,
+        dimension=640,
         providers=("MlxMetalBackend",),
         accelerator="mlx",
     )
@@ -573,7 +573,7 @@ def test_mlx_loads_its_own_model_and_not_fastembed(
     ]
 
 
-@pytest.mark.parametrize("accelerator", ["webgpu", "migraphx"])
+@pytest.mark.parametrize("accelerator", ["webgpu", "vulkan"])
 def test_direct_accelerators_do_not_load_fastembed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -589,8 +589,6 @@ def test_direct_accelerators_do_not_load_fastembed(
         return direct_model
 
     monkeypatch.setattr(direct_onnx, "DirectOnnxEmbedding", direct)
-    # _load_model imports FastEmbed locally, so the tripwire has to be the
-    # module itself: a module attribute would never be consulted.
     monkeypatch.setitem(
         sys.modules,
         "fastembed",
@@ -603,9 +601,9 @@ def test_direct_accelerators_do_not_load_fastembed(
         offline=True,
         threads=2,
         enable_cpu_mem_arena=False,
-        dimension=768,
+        dimension=640,
         providers=(
-            "WebGpuExecutionProvider" if accelerator == "webgpu" else "MIGraphXExecutionProvider",
+            "WebGpuExecutionProvider",
             "CPUExecutionProvider",
         ),
         accelerator=accelerator,

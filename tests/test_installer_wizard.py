@@ -40,11 +40,10 @@ def test_prepared_accelerator_reads_the_record(
 
 def test_detection_report_mentions_platform_and_devices(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(accelerator, "_nvidia_smi_report", lambda: "555.42, GeForce RTX")
-    monkeypatch.setattr(accelerator, "_rocm_report", lambda: None)
     facts = accelerator.detection_report()
     assert any(line.startswith("Platform:") for line in facts)
     assert any("555.42" in line for line in facts)
-    assert any(line == "ROCm: not detected" for line in facts)
+    assert any(line.startswith("Vulkan (Dawn/WebGPU):") for line in facts)
 
 
 def test_load_prefill_collects_values_and_configured_harnesses(tmp_path: Path) -> None:
