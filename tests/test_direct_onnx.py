@@ -309,6 +309,11 @@ def test_last_token_and_mean_pooling_ignore_padding_and_normalize_float32_rows()
     np.testing.assert_allclose(mean_pooled[1], [0.0, 0.0])
     assert mean_pooled.dtype == np.float32
 
+    with pytest.raises(ValueError, match="empty token sequence"):
+        last_token_pool_and_normalize(
+            np.zeros((1, 0, 2), dtype=np.float32), np.zeros((1, 0), dtype=np.int64)
+        )
+
 
 def test_export_and_ensure_converted_onnx_caches_reuses_and_executes_dynamic_rope(
     tmp_path: Path,
@@ -561,3 +566,43 @@ def test_webgpu_and_vulkan_models_report_only_providers_the_session_resolved(
 
     assert model.resolved_providers == ("CPUExecutionProvider",)
     assert captured_dawn == ["Vulkan" if accelerator == "vulkan" else None]
+
+
+def test_direct_model_refuses_empty_token_sequences(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_directory = _write_synthetic_snapshot(tmp_path / "snapshot")
+    onnx_file = tmp_path / "models" / "onnx" / "cached.onnx"
+    onnx_file.parent.mkdir(parents=True)
+    onnx_file.write_bytes(b"onnx")
+    tokenizer = _Tokenizer()
+    monkeypatch.setattr(
+        tokenizer,
+        "encode_batch",
+        lambda documents: [_Encoding([], []) for _ in documents],
+    )
+    monkeypatch.setattr(
+        "code_indexing_mcp.direct_onnx.resolve_model_snapshot",
+        lambda *args, **kwargs: model_directory,
+    )
+    monkeypatch.setattr(
+        "code_indexing_mcp.direct_onnx.ensure_converted_onnx",
+        lambda *args, **kwargs: onnx_file,
+    )
+    monkeypatch.setattr(
+        "code_indexing_mcp.direct_onnx.load_tokenizer",
+        lambda path: tokenizer,
+    )
+    monkeypatch.setattr(
+        "code_indexing_mcp.direct_onnx.create_session",
+        lambda *args, **kwargs: _Session(),
+    )
+
+    model = DirectOnnxEmbedding(
+        cache_directory=tmp_path / "models",
+        offline=True,
+        threads=1,
+        enable_cpu_mem_arena=False,
+    )
+    with pytest.raises(ValueError, match="empty token sequence"):
+        list(model.passage_embed([""]))

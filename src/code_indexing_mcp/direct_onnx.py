@@ -286,6 +286,8 @@ def last_token_pool_and_normalize(
 
     output = np.asarray(model_output, dtype=np.float32)
     mask = np.asarray(attention_mask, dtype=np.int64)
+    if output.ndim != 3 or output.shape[1] == 0:
+        raise ValueError("Cannot pool an empty token sequence")
     lengths = np.sum(mask, axis=1)
     eos_positions = np.maximum(lengths - 1, 0)
     batch_indices = np.arange(output.shape[0], dtype=np.int64)
@@ -823,6 +825,8 @@ class DirectOnnxEmbedding:
         encoded = self.tokenizer.encode_batch(texts)
         input_ids = np.asarray([row.ids for row in encoded], dtype=np.int64)
         attention_mask = np.asarray([row.attention_mask for row in encoded], dtype=np.int64)
+        if input_ids.ndim != 2 or input_ids.shape[1] == 0:
+            raise ValueError("Tokenizer produced an empty token sequence")
         input_names = {item.name for item in self.model.get_inputs()}
         inputs: dict[str, NDArray[Any]] = {"input_ids": input_ids}
         if "attention_mask" in input_names:

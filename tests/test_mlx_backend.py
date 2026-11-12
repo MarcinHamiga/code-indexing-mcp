@@ -381,3 +381,8 @@ def test_right_padding_and_single_token_sequence_stay_invariant_and_finite(tmp_p
     zero_mask = mx.zeros((1, 3), dtype=mx.int64)
     hidden = mx.ones((1, 3, HIDDEN), dtype=mx.float32)
     assert np.all(np.isfinite(np.asarray(last_token_normalize(hidden, zero_mask))))
+
+    with pytest.raises(ValueError, match="empty token sequence"):
+        last_token_normalize(
+            mx.zeros((1, 0, HIDDEN), dtype=mx.float32), mx.zeros((1, 0), dtype=mx.int64)
+        )

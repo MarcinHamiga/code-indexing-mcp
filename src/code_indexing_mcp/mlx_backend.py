@@ -211,6 +211,8 @@ def last_token_normalize(hidden: mx.array, attention_mask: mx.array) -> mx.array
 
     import mlx.core as mx
 
+    if hidden.ndim != 3 or hidden.shape[1] == 0:
+        raise ValueError("Cannot pool an empty token sequence")
     lengths = mx.sum(attention_mask.astype(mx.int64), axis=1)
     eos_positions = mx.maximum(lengths - 1, 0)
     batch_indices = mx.arange(hidden.shape[0])
@@ -327,6 +329,8 @@ class MlxEmbedding:
             return
         encoded = self.tokenizer.encode_batch(texts)
         input_ids = mx.array(np.asarray([row.ids for row in encoded], dtype=np.int64))
+        if input_ids.ndim != 2 or input_ids.shape[1] == 0:
+            raise ValueError("Tokenizer produced an empty token sequence")
         attention_mask = mx.array(
             np.asarray([row.attention_mask for row in encoded], dtype=np.int64)
         )
