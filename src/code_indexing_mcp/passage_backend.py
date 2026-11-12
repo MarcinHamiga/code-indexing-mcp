@@ -27,7 +27,12 @@ from dataclasses import replace
 from types import TracebackType
 
 from .backends import CPU_BACKEND, BackendSelection, provider_resolution_error
-from .calibration import LIMITED_BY_MEMORY, CalibrationResult, calibrate
+from .calibration import (
+    ACCELERATOR_SWEEP_PATIENCE,
+    LIMITED_BY_MEMORY,
+    CalibrationResult,
+    calibrate,
+)
 from .embedding import EmbeddedSegment, PassageCandidate, SegmentPlan
 from .embedding_worker import (
     EmbeddingWorkerSession,
@@ -421,7 +426,10 @@ class PassageBackendSession:
             return
         with session.measurement_scope():
             self.calibration = calibrate(
-                session, self._calibration_plan, load_ns=session.load_duration_ns
+                session,
+                self._calibration_plan,
+                load_ns=session.load_duration_ns,
+                patience=ACCELERATOR_SWEEP_PATIENCE,
             )
         # A sweep that overran respawned the worker, and the successor is the
         # process this verification covers. Without this the first real request

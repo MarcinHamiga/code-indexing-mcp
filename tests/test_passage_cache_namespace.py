@@ -5,7 +5,7 @@ import pytest
 
 from code_indexing_mcp.application import RuntimePaths
 from code_indexing_mcp.backend_coordinator import BackendCoordinator
-from code_indexing_mcp.backends import CPU_BACKEND, Accelerator, BackendSelection, Runtime
+from code_indexing_mcp.backends import Accelerator, BackendSelection, backend_for
 from code_indexing_mcp.embedding import DEFAULT_MODEL, FastEmbedder
 from code_indexing_mcp.mlx_backend import converted_weights_path
 
@@ -20,15 +20,15 @@ def _coordinator(tmp_path: Path) -> tuple[BackendCoordinator, Path]:
     (refs / "main").write_text("revision")
     weights = converted_weights_path(cache, snapshot)
     weights.parent.mkdir()
+    mlx = backend_for(Accelerator.MLX)
+    assert mlx is not None
     coordinator = object.__new__(BackendCoordinator)
     coordinator.paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
     coordinator.embedder = FastEmbedder(cache_directory=cache, offline=True)
     coordinator._runtime_fallback = None
     coordinator.backend_selection = BackendSelection(
         requested=Accelerator.MLX,
-        descriptor=replace(
-            CPU_BACKEND, accelerator=Accelerator.MLX, runtime=Runtime.MLX, runtime_version="test"
-        ),
+        descriptor=replace(mlx, runtime_version="test"),
         available_providers=(),
     )
     return coordinator, weights
@@ -81,7 +81,11 @@ def test_cpu_namespace_is_distinct_from_the_mlx_one(tmp_path: Path) -> None:
     mlx = coordinator.passage_cache_namespace("project")
     cpu = coordinator.cpu_passage_cache_namespace("project")
     assert mlx is not None and cpu is not None
-    assert mlx.producer == "mlx-float32"
+    # Half precision is part of what produced an MLX vector, so it is part of
+    # the name: entries written by the float32 backend this replaced are never
+    # served as though the current one had embedded them.
+    assert mlx.producer == "mlx-float16"
+    assert mlx.precision == "float16"
     assert cpu.producer == "cpu-float32"
     assert cpu.artifact_digest == mlx.tokenizer_digest != mlx.artifact_digest
     assert cpu.project_id == mlx.project_id

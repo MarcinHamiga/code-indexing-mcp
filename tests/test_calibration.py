@@ -105,6 +105,51 @@ def test_the_sweep_stops_once_a_larger_batch_stops_paying() -> None:
     assert session.batch_sizes == [1, 2, 4]
 
 
+def test_patience_finds_a_gain_that_arrives_over_two_doublings() -> None:
+    """A compute-bound GPU gains a little at each doubling: 4 misses the margin
+    against 2 on its own, and 8 clears it. Stopping at the first miss would
+    leave that on the table, or take it only when noise happened to allow."""
+    durations = {1: 1_000_000_000, 2: 800_000_000, 4: 770_000_000, 8: 740_000_000}
+    durations.update({16: 740_000_000, 32: 740_000_000})
+    session = FakeSession(durations)
+
+    result = calibrate(session, PLAN, load_ns=0, clock=session.clock, patience=1)
+
+    assert result is not None
+    assert result.max_items == 8
+    # 16 and 32 both fail to beat 8, and two misses in a row end the sweep.
+    assert session.batch_sizes == [1, 2, 4, 8, 16, 32]
+
+
+def test_patience_does_not_adopt_a_size_that_never_pays() -> None:
+    """Patience buys one more look, not a lower bar: a plateau stays where the
+    last real gain left it, one measurement later than it would have."""
+    durations = dict.fromkeys(CANDIDATE_BATCH_SIZES, 1_000_000_000)
+    durations[2] = 400_000_000
+    session = FakeSession(durations)
+
+    result = calibrate(session, PLAN, load_ns=0, clock=session.clock, patience=1)
+
+    assert result is not None
+    assert result.max_items == 2
+    assert session.batch_sizes == [1, 2, 4, 8]
+
+
+def test_a_size_tried_on_patience_that_overruns_is_not_a_memory_limit() -> None:
+    """4 ran and was slower, so 2 won on speed. That 8 then overran says nothing
+    about 2, and must not turn into advice to raise the ceiling."""
+    durations = dict.fromkeys(CANDIDATE_BATCH_SIZES, 1_000_000_000)
+    durations[2] = 400_000_000
+    session = ExhaustedSession(durations, fails_above=4)
+
+    result = calibrate(session, PLAN, load_ns=0, clock=session.clock, patience=1)
+
+    assert result is not None
+    assert result.max_items == 2
+    assert result.limited_by == ""
+    assert session.batch_sizes == [1, 2, 4, 8]
+
+
 def test_a_batch_size_that_overruns_the_ceiling_is_not_calibrated() -> None:
     session = ExhaustedSession(_halving(1_000_000_000), fails_above=4)
 

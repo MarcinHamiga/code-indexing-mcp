@@ -34,6 +34,7 @@ from .backends import (
     available_execution_providers,
     backend_for,
     describe_environment,
+    passage_producer,
     platform_fingerprint,
     runtime_version,
     select_backend,
@@ -321,14 +322,13 @@ class BackendCoordinator:
             model_digest = sha256(
                 f"{digest}:{weights_digest}:{WEIGHT_LAYOUT_VERSION}".encode()
             ).hexdigest()
-        producer = "mlx-float32" if descriptor.accelerator is Accelerator.MLX else "cpu-float32"
         return PassageCacheNamespace(
             project_id=project_id,
             artifact_digest=model_digest,
             # The source snapshot includes tokenizer and configuration files;
             # MLX additionally depends on its separately stored conversion.
             tokenizer_digest=digest,
-            producer=producer,
+            producer=passage_producer(descriptor),
             runtime_version=descriptor.runtime_version or runtime_version(descriptor.runtime),
             dimension=self.embedder.dimension,
             precision=descriptor.precision.value,

@@ -29,6 +29,7 @@ onnx = pytest.importorskip("onnx", reason="the mlx extra's environment is requir
 from onnx import helper, numpy_helper  # noqa: E402
 
 from code_indexing_mcp.mlx_backend import (  # noqa: E402
+    FULL_PRECISION_TENSORS,
     MASK_FILL,
     JinaBertMlx,
     ModelConfig,
@@ -327,13 +328,13 @@ def test_conversion_runs_once_and_is_reused_by_revision(tmp_path: Path) -> None:
 
 
 def test_a_conversion_of_another_revision_is_discarded(tmp_path: Path) -> None:
-    """Each conversion is 600 MB, and nothing else ever revisits the one this
-    installation stopped resolving to."""
+    """Each conversion is hundreds of megabytes, and nothing else ever revisits
+    the one this installation stopped resolving to."""
     cache = tmp_path / "cache"
     superseded = converted_weights_path(cache, tmp_path / "0a1b2c3")
     superseded.parent.mkdir(parents=True, exist_ok=True)
     superseded.write_bytes(b"an earlier revision")
-    in_flight = superseded.with_name("4d5e6f7-jina-v1-f32.999999.tmp.safetensors")
+    in_flight = superseded.with_name("4d5e6f7-jina-v2-f16.999999.tmp.safetensors")
     in_flight.write_bytes(b"another process, mid-conversion")
 
     path = ensure_converted_weights(_snapshot(tmp_path / "4d5e6f7"), cache, CONFIG)
@@ -342,6 +343,23 @@ def test_a_conversion_of_another_revision_is_discarded(tmp_path: Path) -> None:
     assert not superseded.exists()
     # Another process's unfinished write is not this one's to remove.
     assert in_flight.is_file()
+
+
+def test_the_float32_conversion_this_replaced_is_discarded(tmp_path: Path) -> None:
+    """The float32 layout is the same revision under another name, so nothing
+    but this would ever reclaim the 600 MB it holds."""
+    cache = tmp_path / "cache"
+    directory = _snapshot(tmp_path / "0a1b2c3")
+    target = converted_weights_path(cache, directory)
+    legacy = target.with_name("0a1b2c3-jina-v1-f32.safetensors")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_bytes(b"the float32 conversion")
+
+    path = ensure_converted_weights(directory, cache, CONFIG)
+
+    assert path == target != legacy
+    assert path.name.endswith("-f16.safetensors")
+    assert not legacy.exists()
 
 
 def test_a_converted_file_holds_every_extracted_tensor(tmp_path: Path) -> None:
@@ -353,7 +371,15 @@ def test_a_converted_file_holds_every_extracted_tensor(tmp_path: Path) -> None:
     expected = extract_weights(directory / "onnx" / "model.onnx", CONFIG)
     assert set(loaded) == set(expected)
     for name, value in expected.items():
-        assert np.allclose(np.asarray(loaded[name]), value)
+        stored = loaded[name]
+        if name in FULL_PRECISION_TENSORS:
+            assert stored.dtype == mx.float32
+            assert np.array_equal(np.asarray(stored), value)
+        else:
+            # Half precision keeps 11 bits of mantissa, so every value survives
+            # to within one part in two thousand -- and no closer.
+            assert stored.dtype == mx.float16
+            assert np.allclose(np.asarray(stored), value, rtol=1e-3, atol=1e-6)
 
 
 # -- a NumPy statement of the same graph -----------------------------------
@@ -459,6 +485,55 @@ def test_the_mlx_forward_pass_reproduces_the_graph(tmp_path: Path) -> None:
     assert hidden.shape == expected.shape == (2, 6, HIDDEN)
     assert np.all(np.isfinite(hidden))
     assert np.allclose(hidden, expected, atol=2e-4)
+
+
+def _converted(tmp_path: Path) -> tuple[JinaBertMlx, dict[str, NDArray[np.float32]]]:
+    """The model as production loads it, beside the float32 weights it came from."""
+    directory = _snapshot(tmp_path / "snapshot")
+    path = ensure_converted_weights(directory, tmp_path / "cache", CONFIG)
+    weights = extract_weights(directory / "onnx" / "model.onnx", CONFIG)
+    return JinaBertMlx(CONFIG, mx.load(str(path))), weights
+
+
+def test_the_converted_model_runs_in_half_precision(tmp_path: Path) -> None:
+    model, _weights = _converted(tmp_path)
+    ids, mask = _inputs()
+
+    hidden = model(mx.array(ids), mx.array(mask))
+
+    assert hidden.dtype == mx.float16
+    assert np.all(np.isfinite(np.asarray(hidden)))
+
+
+def test_half_precision_vectors_stay_beside_the_float32_ones(tmp_path: Path) -> None:
+    """What the index stores is the pooled row, and that is what has to agree:
+    float32 out, unit length, and pointing where the float32 graph points."""
+    model, weights = _converted(tmp_path)
+    ids, mask = _inputs()
+
+    pooled = np.asarray(mask_mean_normalize(model(mx.array(ids), mx.array(mask)), mx.array(mask)))
+
+    expected = _reference_pooled(_reference_forward(weights, ids, mask), mask)
+    assert pooled.dtype == np.float32
+    assert np.allclose(np.linalg.norm(pooled, axis=1), 1.0, atol=1e-6)
+    assert np.all(np.sum(pooled * expected, axis=1) > 0.9999)
+
+
+def test_half_precision_padding_stays_finite_and_inert(tmp_path: Path) -> None:
+    """The mask fill has to fit in float16 -- a fill that overflowed there would
+    turn every padded batch into NaN rather than into a slightly different row."""
+    model, _weights = _converted(tmp_path)
+    ids, mask = _inputs()
+
+    padded = np.asarray(mask_mean_normalize(model(mx.array(ids), mx.array(mask)), mx.array(mask)))
+    alone = np.asarray(
+        mask_mean_normalize(
+            model(mx.array(ids[:1, :4]), mx.array(mask[:1, :4])), mx.array(mask[:1, :4])
+        )
+    )
+
+    assert np.all(np.isfinite(padded))
+    assert float(np.sum(padded[0] * alone[0])) > 0.9999
 
 
 def test_padding_does_not_change_the_rows_that_are_not_padding(tmp_path: Path) -> None:

@@ -8,6 +8,13 @@ FastEmbed loads, and the JinaBERT v2 graph they belong to is written out again i
 MLX. That keeps the one thing an index depends on -- the vectors -- identical in
 origin, while the execution changes.
 
+The reproduction runs in half precision. The M4 Pro's GPU is compute-bound on
+this model at every batch size, so nothing about packing made it faster; float16
+weights and activations did, by 21% at the same batch of 2 and 38% at 8,
+against vectors whose cosine to the float32 ones never fell below 0.999998 and
+whose nearest neighbour never changed. What reaches the index is still float32:
+pooling and normalization run at full precision over the float16 hidden states.
+
 Like ``direct_onnx``, this is deliberately model-specific. The configuration is
 checked against the architecture reproduced here and the extraction refuses an
 artifact whose tensors have moved, because a backend that guesses at a changed
@@ -44,7 +51,14 @@ logger = logging.getLogger(__name__)
 
 # Bumped whenever the set or meaning of the converted tensors changes, so an
 # existing conversion is rebuilt rather than read under new expectations.
-WEIGHT_LAYOUT_VERSION = 1
+WEIGHT_LAYOUT_VERSION = 2
+
+# The precision the converted projections are stored and executed in. The ALiBi
+# slopes are the exception and stay float32: they are a dozen numbers multiplied
+# by distances of up to a full window, where half precision's 11-bit mantissa
+# would cost real bias for no speed at all.
+WEIGHT_PRECISION = "f16"
+FULL_PRECISION_TENSORS = frozenset({"alibi_slopes"})
 
 # What a conversion in flight is called. It stays ``.safetensors`` because MLX
 # appends that to a name that lacks it, and would write somewhere this never
@@ -53,9 +67,11 @@ _TEMPORARY_SUFFIX = ".tmp.safetensors"
 
 # What the export adds to a masked score is -3.4028235e38; adding a negative
 # ALiBi bias to that overflows to -inf, which can leave a fused attention kernel
-# subtracting -inf from -inf. This underflows to exactly zero through exp in
-# float32 and cannot overflow, so it is the same softmax without the NaN risk.
-MASK_FILL = -1e9
+# subtracting -inf from -inf. This has to survive float16 as well, whose largest
+# finite magnitude is 65504: the most negative ALiBi bias a full window produces
+# is a few hundred, so the sum stays finite in half precision, and exp of it is
+# exactly zero in either precision -- the same softmax without the NaN risk.
+MASK_FILL = -3e4
 
 # The architectural facts this implementation hard-codes. A different value is a
 # different model, and reproducing it would need different code.
@@ -307,7 +323,11 @@ def converted_weights_path(cache_directory: Path, model_directory: Path) -> Path
     again instead of being read out of a file describing the old one.
     """
     revision = model_directory.name or "unknown"
-    return cache_directory / "mlx" / f"{revision}-jina-v{WEIGHT_LAYOUT_VERSION}-f32.safetensors"
+    return (
+        cache_directory
+        / "mlx"
+        / f"{revision}-jina-v{WEIGHT_LAYOUT_VERSION}-{WEIGHT_PRECISION}.safetensors"
+    )
 
 
 def ensure_converted_weights(
@@ -320,8 +340,8 @@ def ensure_converted_weights(
     """Return the converted weights for *model_directory*, building them once.
 
     Building them is local file work over a snapshot already on disk, not a
-    package installation, so it stays allowed in a worker -- but it reads and
-    rewrites 600 MB, so it is logged rather than done quietly.
+    package installation, so it stays allowed in a worker -- but it reads 600 MB
+    and writes half of that, so it is logged rather than done quietly.
 
     It also peaks around 1.9 GB, because parsing the artifact and holding the
     converted tensors cannot share pages. That fits under the default indexing
@@ -342,7 +362,10 @@ def ensure_converted_weights(
     # than kept alongside a second complete set of MLX arrays.
     weights = {}
     for name in list(extracted):
-        weights[name] = mx.array(extracted.pop(name))
+        tensor = extracted.pop(name)
+        if name not in FULL_PRECISION_TENSORS:
+            tensor = tensor.astype(np.float16)
+        weights[name] = mx.array(tensor)
     # Written aside and moved into place: a conversion interrupted halfway must
     # not leave a truncated file that later loads read as complete.
     temporary = target.with_name(f"{target.stem}.{os.getpid()}{_TEMPORARY_SUFFIX}")
@@ -367,7 +390,8 @@ def ensure_converted_weights(
 def _discard_superseded_conversions(target: Path) -> None:
     """Remove conversions of other revisions or layouts left beside *target*.
 
-    Each of these is 600 MB of a model this installation no longer resolves to,
+    Each of these is hundreds of megabytes of a model, or of a precision, this
+    installation no longer resolves to,
     and nothing else ever revisits them. A file another process is reading stays
     readable through its open handle, and one still being written is skipped by
     its suffix.
@@ -384,11 +408,16 @@ def _discard_superseded_conversions(target: Path) -> None:
 
 
 def mask_mean_normalize(hidden: mx.array, attention_mask: mx.array) -> mx.array:
-    """Attention-mask mean pool and L2-normalize rows, as the CPU model does."""
+    """Attention-mask mean pool and L2-normalize rows, as the CPU model does.
+
+    Always in float32, whatever precision produced *hidden*: a sum over a full
+    window of half-precision states loses the low bits of every term after the
+    first few, and the row this returns is what the index stores.
+    """
     import mlx.core as mx
 
     mask = attention_mask.astype(mx.float32)[..., None]
-    summed = mx.sum(hidden * mask, axis=1)
+    summed = mx.sum(hidden.astype(mx.float32) * mask, axis=1)
     counts = mx.maximum(mx.sum(mask, axis=1), 1e-9)
     pooled = summed / counts
     norms = mx.maximum(mx.linalg.norm(pooled, axis=1, keepdims=True), 1e-12)
@@ -430,6 +459,9 @@ class JinaBertMlx:
             + weights["embeddings.token_type"][0]
         )
         hidden = normalize(hidden, "embeddings.norm")
+        # The weights decide the precision of everything downstream, so the same
+        # graph runs the float16 conversion and a float32 reference alike.
+        precision = hidden.dtype
 
         positions = mx.arange(sequence)
         distance = mx.abs(positions[:, None] - positions[None, :]).astype(mx.float32)
@@ -440,11 +472,16 @@ class JinaBertMlx:
         # ALiBi makes this dense: the bias differs per head and per position
         # pair, so it cannot be expressed as the boolean mask a memory-efficient
         # attention kernel would keep implicit. It costs one
-        # ``batch x heads x sequence^2`` float32 array, built once here rather
+        # ``batch x heads x sequence^2`` array, built once here rather
         # than per layer, and it grows quadratically with the longest passage in
         # the batch -- which is where MLX's advantage over CPU will run out.
         keys_masked = (1.0 - attention_mask.astype(mx.float32))[:, None, None, :] * MASK_FILL
-        bias = weights["alibi_slopes"] * distance + keys_masked
+        #
+        # Composed in float32 and only then narrowed: the slopes are kept at
+        # full precision for exactly this product.
+        bias = (weights["alibi_slopes"].astype(mx.float32) * distance + keys_masked).astype(
+            precision
+        )
 
         def project(name: str, source: mx.array) -> mx.array:
             return source @ weights[f"{name}.weight"] + weights[f"{name}.bias"]
