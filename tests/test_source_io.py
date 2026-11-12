@@ -1,6 +1,7 @@
 """Source access rejects unsafe live paths before reading their contents."""
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -10,7 +11,12 @@ import pytest
 
 from code_indexing_mcp.errors import CodeIndexingError
 from code_indexing_mcp.reference_service import ReferenceService
-from code_indexing_mcp.source_io import SourceReadError, checked_source_stat, read_source
+from code_indexing_mcp.source_io import (
+    PinnedDirectoryCache,
+    SourceReadError,
+    checked_source_stat,
+    read_source,
+)
 
 
 def test_reader_preserves_bytes_and_enforces_exact_size(tmp_path: Path) -> None:
@@ -166,3 +172,161 @@ def test_vetted_directory_cache_never_hides_a_symlinked_component(tmp_path: Path
     (tmp_path / "real" / "sub").symlink_to(tmp_path / "real" / "sub_moved")
     with pytest.raises(SourceReadError, match="symlink"):
         checked_source_stat(tmp_path, Path("real/sub/f.py"), vetted_directories=vetted)
+
+
+@pytest.mark.skipif(os.open not in os.supports_dir_fd, reason="POSIX dir_fd cache")
+def test_pinned_directory_cache_reuses_ancestor_descriptors_and_closes_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    (tmp_path / "a" / "c").mkdir(parents=True)
+    (tmp_path / "a" / "b" / "one.py").write_bytes(b"one = 1\n")
+    (tmp_path / "a" / "b" / "two.py").write_bytes(b"two = 2\n")
+    (tmp_path / "a" / "c" / "three.py").write_bytes(b"three = 3\n")
+
+    real_open = os.open
+    real_close = os.close
+    dir_opens: list[str] = []
+    live_fds: set[int] = set()
+
+    def tracking_open(
+        path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        fd = (
+            real_open(path, flags, mode)
+            if dir_fd is None
+            else real_open(path, flags, mode, dir_fd=dir_fd)
+        )
+        live_fds.add(fd)
+        if flags & getattr(os, "O_DIRECTORY", 0):
+            dir_opens.append(Path(path).name if path != tmp_path else "<root>")
+        return fd
+
+    def tracking_close(fd: int) -> None:
+        live_fds.discard(fd)
+        real_close(fd)
+
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.open", tracking_open)
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.close", tracking_close)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, tracking_open})
+
+    vetted: set[Path] = set()
+    with PinnedDirectoryCache(tmp_path) as cache:
+        for rel_str, expected in (
+            ("a/b/one.py", b"one = 1\n"),
+            ("a/b/two.py", b"two = 2\n"),
+            ("a/c/three.py", b"three = 3\n"),
+        ):
+            rel = Path(rel_str)
+            st = checked_source_stat(tmp_path, rel, vetted_directories=vetted)
+            data, _ = read_source(tmp_path, rel, 1024, expected_stat=st, directory_cache=cache)
+            assert data == expected
+
+    # <root>, a, b opened once for one.py + two.py; only c opened when switching to a/c/three.py.
+    assert dir_opens == ["<root>", "a", "b", "c"]
+    assert live_fds == set()
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.open not in os.supports_dir_fd,
+    reason="POSIX symlink + dir_fd race check",
+)
+def test_pinned_directory_cache_rejects_mid_scan_directory_symlink_swap(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "one.py").write_bytes(b"inside_one = 1\n")
+    (root / "sub" / "two.py").write_bytes(b"inside_two = 2\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "two.py").write_bytes(b"OUTSIDE_SECRET = 99\n")
+
+    vetted: set[Path] = set()
+    with PinnedDirectoryCache(root) as cache:
+        st_one = checked_source_stat(root, Path("sub/one.py"), vetted_directories=vetted)
+        data_one, _ = read_source(
+            root, Path("sub/one.py"), 1024, expected_stat=st_one, directory_cache=cache
+        )
+        assert data_one == b"inside_one = 1\n"
+
+        # Swap `sub` for a symlink to `outside` while `sub` is already vetted and pinned.
+        (root / "sub").rename(tmp_path / "sub_moved")
+        (root / "sub").symlink_to(outside, target_is_directory=True)
+
+        # The vetted set is not re-checked, so the stat follows the new link...
+        st_two = checked_source_stat(root, Path("sub/two.py"), vetted_directories=vetted)
+        assert st_two.st_ino == (outside / "two.py").stat().st_ino
+        # ...but the read does not: the pinned descriptor yields a different
+        # inode, and the fresh chain walked on retry refuses the symlink.
+        with pytest.raises(SourceReadError, match="symlink") as raised:
+            read_source(root, Path("sub/two.py"), 1024, expected_stat=st_two, directory_cache=cache)
+        assert raised.value.reason == "symlink"
+        assert not cache.pinned
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.open not in os.supports_dir_fd,
+    reason="POSIX symlink + dir_fd race check",
+)
+def test_pinned_directory_cache_reports_unpinned_symlinked_directory_as_symlink(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "one.py").write_bytes(b"inside_one = 1\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "one.py").write_bytes(b"OUTSIDE_SECRET = 99\n")
+
+    vetted: set[Path] = set()
+    with PinnedDirectoryCache(root) as cache:
+        # Vetted by a stat that never read, so `sub` is trusted but not pinned.
+        checked_source_stat(root, Path("sub/one.py"), vetted_directories=vetted)
+        (root / "sub").rename(tmp_path / "sub_moved")
+        (root / "sub").symlink_to(outside, target_is_directory=True)
+
+        st = checked_source_stat(root, Path("sub/one.py"), vetted_directories=vetted)
+        # O_DIRECTORY | O_NOFOLLOW answers ENOTDIR here; the reason must still say symlink.
+        with pytest.raises(SourceReadError) as raised:
+            read_source(root, Path("sub/one.py"), 1024, expected_stat=st, directory_cache=cache)
+        assert raised.value.reason == "symlink"
+
+    (tmp_path / "plain").write_bytes(b"not a directory\n")
+    with PinnedDirectoryCache(tmp_path) as cache:
+        with pytest.raises(SourceReadError) as raised:
+            cache.open_parent(("plain",), Path("plain/x.py"))
+        assert raised.value.reason == "not_directory"
+
+
+@pytest.mark.skipif(os.open not in os.supports_dir_fd, reason="POSIX dir_fd cache")
+@pytest.mark.parametrize("replace", ["delete", "rename"])
+def test_pinned_directory_cache_recovers_when_a_pinned_directory_is_recreated(
+    tmp_path: Path, replace: str
+) -> None:
+    root = tmp_path / "repo"
+    (root / "gen").mkdir(parents=True)
+    (root / "gen" / "one.py").write_bytes(b"one = 1\n")
+    (root / "gen" / "two.py").write_bytes(b"two = 1\n")
+
+    vetted: set[Path] = set()
+    with PinnedDirectoryCache(root) as cache:
+        st_one = checked_source_stat(root, Path("gen/one.py"), vetted_directories=vetted)
+        read_source(root, Path("gen/one.py"), 1024, expected_stat=st_one, directory_cache=cache)
+
+        # A generator or checkout replaces the pinned directory between two reads.
+        if replace == "delete":
+            shutil.rmtree(root / "gen")
+        else:
+            (root / "gen").rename(tmp_path / "gen_old")
+        (root / "gen").mkdir()
+        (root / "gen" / "two.py").write_bytes(b"two = 2\n")
+
+        st_two = checked_source_stat(root, Path("gen/two.py"), vetted_directories=vetted)
+        data, _ = read_source(
+            root, Path("gen/two.py"), 1024, expected_stat=st_two, directory_cache=cache
+        )
+        assert data == b"two = 2\n"
+
+        # A file that is genuinely gone still fails, and only after one retry.
+        (root / "gen" / "two.py").unlink()
+        with pytest.raises(FileNotFoundError):
+            read_source(root, Path("gen/two.py"), 1024, expected_stat=st_two, directory_cache=cache)

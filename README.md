@@ -757,6 +757,14 @@ being re-initialized. A customized `scan.include` list is never rewritten — ad
 pattern for each extension in the table above that you want (for example `**/*.kt`, `**/*.swift`,
 `**/*.svelte`, `**/*.prisma`) explicitly.
 
+With the default `scan.include` list a file is indexed when its own extension is one of the
+supported extensions in exactly that lower-case spelling: `app.js` is indexed, `APP.JS` is reported
+as `unsupported`, and the name of the directory it sits in never matters. (Earlier versions
+evaluated the default list as gitignore patterns, where `**/*.js` also matches everything below a
+directory named like `chart.js/`, so an upper-case `chart.js/Legacy.JS` used to be indexed; it no
+longer is.) A customized list is still evaluated with full gitignore semantics, so add a pattern
+such as `**/*.JS` there to index upper-case extensions.
+
 ## Branch-aware indexing
 
 Only the checked-out working tree is ever indexed. Git metadata and commit objects may be consulted
