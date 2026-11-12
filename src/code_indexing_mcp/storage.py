@@ -31,6 +31,7 @@ from lancedb.index import FTS, BTree, HnswSq
 from lancedb.query import ColumnOrdering, FullTextOperator, MultiMatchQuery
 from lancedb.table import LanceTable
 
+from .embedding import DEFAULT_DIMENSION
 from .errors import CodeIndexingError, ErrorCode
 from .git_state import (
     GitProbeOutcome,
@@ -575,7 +576,7 @@ class LanceStore:
         self,
         directory: Path,
         *,
-        vector_dimension: int = 768,
+        vector_dimension: int = DEFAULT_DIMENSION,
         vector_index: str = "exact",
         vector_storage: str = "float16",
         branch_cache_limit: int = 4,

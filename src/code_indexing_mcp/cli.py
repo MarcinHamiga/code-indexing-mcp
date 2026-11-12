@@ -244,7 +244,7 @@ def _parser(prog: str = "code-indexing-mcp") -> argparse.ArgumentParser:
     configure.add_argument("--install-dir", help="checkout location of the installation")
     configure.add_argument(
         "--accelerator",
-        choices=["auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml"],
+        choices=["auto", "cpu", "cuda", "mlx", "webgpu", "vulkan", "coreml"],
         default=None,
         help="prepare a different accelerator; omit to keep the prepared backend",
     )

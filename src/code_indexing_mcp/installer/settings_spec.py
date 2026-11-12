@@ -238,7 +238,7 @@ SETTINGS: tuple[Setting, ...] = (
         "(plain CPU when nothing was prepared). Default: auto.",
         "choice",
         "auto",
-        choices=("auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml"),
+        choices=("auto", "cpu", "cuda", "mlx", "webgpu", "vulkan", "coreml"),
     ),
     Setting(
         "CODE_INDEXING_AUTO_MAINTENANCE",

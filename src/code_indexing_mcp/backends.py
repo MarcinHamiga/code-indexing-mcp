@@ -26,7 +26,7 @@ class Accelerator(StrEnum):
     CUDA = "cuda"
     MLX = "mlx"
     WEBGPU = "webgpu"
-    MIGRAPHX = "migraphx"
+    VULKAN = "vulkan"
     COREML = "coreml"
 
 
@@ -156,10 +156,19 @@ CPU_PROVIDER = "CPUExecutionProvider"
 # resolved target per backend.
 MLX_PROVIDER = "MlxMetalBackend"
 
-# The accelerators whose passage model this project loads and executes itself,
-# rather than through FastEmbed. FastEmbed cannot configure these runtimes, and
-# for two of them its ONNX Runtime distribution would conflict with theirs.
-DIRECT_MODEL_ACCELERATORS = frozenset({Accelerator.WEBGPU, Accelerator.MIGRAPHX, Accelerator.MLX})
+# Every backend now executes through this project's own direct ONNX or MLX
+# model adapter, so every loaded model reports the providers its session
+# actually resolved.
+DIRECT_MODEL_ACCELERATORS = frozenset(
+    {
+        Accelerator.CPU,
+        Accelerator.CUDA,
+        Accelerator.WEBGPU,
+        Accelerator.VULKAN,
+        Accelerator.COREML,
+        Accelerator.MLX,
+    }
+)
 
 
 def passage_producer(descriptor: BackendDescriptor) -> str:
@@ -237,11 +246,12 @@ ACCELERATOR_BACKENDS: tuple[BackendDescriptor, ...] = (
         runtime=Runtime.ONNX_PLUGIN,
     ),
     BackendDescriptor(
-        accelerator=Accelerator.MIGRAPHX,
-        provider="MIGraphXExecutionProvider",
-        device="gpu",
+        accelerator=Accelerator.VULKAN,
+        provider="WebGpuExecutionProvider",
+        device="vulkan",
         stability=Stability.EXPERIMENTAL,
         precision=Precision.FLOAT32,
+        runtime=Runtime.ONNX_PLUGIN,
     ),
     BackendDescriptor(
         accelerator=Accelerator.COREML,
@@ -340,8 +350,7 @@ def available_execution_providers() -> tuple[str, ...]:
     runtime cannot be interrogated still indexes on CPU.
     """
     try:
-        # Untyped third-party module; fastembed already depends on it, so this
-        # import costs nothing that has not been paid for by the time it runs.
+        # Untyped third-party module; the cpu/cuda/webgpu extras depend on it.
         import onnxruntime
     except Exception:  # pragma: no cover - exercised only where onnxruntime is absent
         logger.debug("ONNX Runtime is not importable; assuming CPU-only providers")

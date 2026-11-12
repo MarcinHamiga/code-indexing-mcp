@@ -24,7 +24,7 @@ from .embedding import (
     PassageCandidate,
     SegmentPlan,
     embed_windows,
-    load_fastembed_model,
+    load_onnx_model,
     plan_passages,
     resolve_session_providers,
     resolve_tokenizer,
@@ -198,7 +198,7 @@ def _load_model(config: WorkerConfig) -> Any:
         )
     if config.accelerator in {
         Accelerator.WEBGPU.value,
-        Accelerator.MIGRAPHX.value,
+        Accelerator.VULKAN.value,
     }:
         from .direct_onnx import DirectOnnxEmbedding
 
@@ -211,13 +211,14 @@ def _load_model(config: WorkerConfig) -> Any:
             model_id=config.model_id,
             accelerator=config.accelerator,
         )
-    return load_fastembed_model(
+    return load_onnx_model(
         Path(config.cache_directory),
         model_id=config.model_id,
         offline=config.offline,
         threads=config.threads,
         enable_cpu_mem_arena=config.enable_cpu_mem_arena,
         providers=() if config.is_cpu else config.providers,
+        accelerator=config.accelerator,
     )
 
 

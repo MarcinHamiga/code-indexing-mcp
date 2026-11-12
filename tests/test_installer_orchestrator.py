@@ -108,7 +108,7 @@ def test_run_install_emits_step_events_in_order(
     ("requested", "resolved", "expected"),
     [
         ("webgpu", "webgpu", "webgpu"),
-        ("migraphx", "webgpu", "webgpu"),
+        ("vulkan", "vulkan", "vulkan"),
         ("auto", "cuda", None),
     ],
 )

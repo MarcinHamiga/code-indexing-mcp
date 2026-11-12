@@ -27,13 +27,15 @@ WEBGPU_PROVIDER = "WebGpuExecutionProvider"
 @pytest.mark.parametrize(
     ("runtime", "accelerator", "resolved", "valid"),
     [
-        (Runtime.ONNX, Accelerator.CUDA, (), True),
+        (Runtime.ONNX, Accelerator.CUDA, (), False),
+        (Runtime.ONNX, Accelerator.CUDA, (CUDA_PROVIDER, CPU_PROVIDER), True),
         (Runtime.ONNX, Accelerator.CUDA, (CPU_PROVIDER,), False),
         (Runtime.ONNX_PLUGIN, Accelerator.WEBGPU, (), False),
         (Runtime.ONNX_PLUGIN, Accelerator.WEBGPU, (WEBGPU_PROVIDER,), True),
+        (Runtime.ONNX_PLUGIN, Accelerator.VULKAN, (WEBGPU_PROVIDER,), True),
     ],
 )
-def test_provider_resolution_contract_is_shared_for_direct_and_fastembed_backends(
+def test_provider_resolution_contract_is_shared_for_all_direct_backends(
     runtime: Runtime, accelerator: Accelerator, resolved: tuple[str, ...], valid: bool
 ) -> None:
     descriptor = BackendDescriptor(

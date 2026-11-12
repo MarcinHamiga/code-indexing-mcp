@@ -1,9 +1,8 @@
 """How an embedding worker is started, and which environment its code runs in.
 
 The CPU worker is a child of this interpreter and keeps using ``multiprocessing``
-spawn. An accelerator worker cannot: ``fastembed`` and ``fastembed-gpu`` install
-the same module over two ONNX Runtime distributions that both own the
-``onnxruntime`` import, so the accelerator lives in an environment of its own and
+spawn. An accelerator worker cannot: ``onnxruntime`` and ``onnxruntime-gpu``
+own the same ``onnxruntime`` import, so the accelerator lives in an environment of its own and
 its worker has to be started from *that* interpreter.
 
 ``multiprocessing`` cannot cross that boundary even with ``set_executable``,

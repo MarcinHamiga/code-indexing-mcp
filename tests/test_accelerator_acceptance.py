@@ -21,7 +21,7 @@ from code_indexing_mcp.embedding_worker import EmbeddingWorkerSession, WorkerCon
 from code_indexing_mcp.settings import IndexSettings
 from code_indexing_mcp.worker_launcher import ExternalInterpreterLauncher
 
-GATED_ACCELERATORS = (Accelerator.MLX, Accelerator.WEBGPU, Accelerator.MIGRAPHX)
+GATED_ACCELERATORS = (Accelerator.MLX, Accelerator.WEBGPU, Accelerator.VULKAN)
 _NAMES = ", ".join(accelerator.value for accelerator in GATED_ACCELERATORS)
 
 

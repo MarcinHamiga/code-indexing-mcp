@@ -1,13 +1,12 @@
 # Syndex
 
 Syndex (formerly `code-indexing-mcp`) is a local-only codebase indexer and search engine for MCP clients and developers. It uses Tree-sitter to extract
-syntax-aware chunks, FastEmbed for CPU embeddings, a direct ONNX path for selected passage
-accelerators, and LanceDB for persistent vector and full-text search.
+syntax-aware chunks, a unified direct ONNX Runtime / MLX embedding pipeline for `codefuse-ai/F2LLM-v2-160M`, and LanceDB for persistent vector and full-text search.
 
 It does not require a hosted database, embedding API, or network service. A private per-user
 daemon is started on demand so all connected MCP clients and CLI sessions share one scheduler and model. The only
 network access is the initial download of the default
-`jinaai/jina-embeddings-v2-base-code` model (approximately 640 MB). Once cached, indexing and
+`codefuse-ai/F2LLM-v2-160M` model (approximately 310 MB). Once cached and locally converted, indexing and
 search work offline.
 
 ## Trust boundary
@@ -124,7 +123,7 @@ explicitly:
 python3 install.py --accelerator auto      # CPU, a supported CUDA installation, or Metal via MLX
 python3 install.py --accelerator mlx       # Metal on Apple Silicon through MLX
 python3 install.py --accelerator webgpu   # experimental Metal, Vulkan, or D3D12 path
-python3 install.py --accelerator migraphx # experimental pinned AMD/ROCm path
+python3 install.py --accelerator vulkan   # experimental Dawn Vulkan path on Linux/Windows x86-64
 ```
 
 An explicit installer choice also selects the backend at runtime in every configured harness;
@@ -990,17 +989,16 @@ Acceleration targets passage indexing only. The query model stays in the serving
 a search never waits on a worker spawning or a model loading onto a device.
 
 ```bash
-export CODE_INDEXING_EMBED_ACCELERATOR=auto  # auto, cpu, cuda, mlx, webgpu, migraphx, coreml
+export CODE_INDEXING_EMBED_ACCELERATOR=auto  # auto, cpu, cuda, mlx, webgpu, vulkan, coreml
 export CODE_INDEXING_EMBED_STRICT=0          # 1 disables the CPU fallback and the crossover
 export CODE_INDEXING_EMBED_CROSSOVER=auto    # auto, off, or a character count
 export CODE_INDEXING_EMBED_CALIBRATE=1       # 0 declines the one-time measurement
 ```
 
 `auto` selects the best backend that has passed its promotion gates *and* that this installation
-actually offers. CUDA is the first backend promoted to automatic selection; WebGPU and MIGraphX are
-still experimental and Core ML stays manual-only, because on this model it offloaded only part of
-the graph and lost to CPU. Naming a backend explicitly overrides its stability, and is how one earns
-the benchmark evidence its own promotion needs.
+actually offers. CUDA and MLX are promoted to automatic selection; WebGPU and Vulkan are
+experimental, and Core ML stays manual-only. Naming a backend explicitly overrides its stability,
+and is how one earns the benchmark evidence its own promotion needs.
 
 Promotion makes CUDA *eligible*, not present. `auto` still resolves to CPU on a machine where the
 installer never prepared it, which is every machine without a supported NVIDIA driver.
@@ -1009,37 +1007,29 @@ The locked installation matrix is:
 
 | Backend | Installer support | Pinned runtime | Low-level route | Selection |
 | --- | --- | --- | --- | --- |
-| CPU | Python 3.12/3.13 on every supported OS | `fastembed` | CPU | automatic fallback |
-| CUDA | Linux x86-64 or Windows x86-64; NVIDIA driver 525.60+ or 527.41+ | ONNX Runtime GPU 1.22–1.23, CUDA 12, cuDNN 9 | CUDA | automatic |
+| CPU | Python 3.12/3.13 on every supported OS | ONNX Runtime 1.24+ | CPU | automatic fallback |
+| CUDA | Linux x86-64 or Windows x86-64; NVIDIA driver 525.60+ or 527.41+ | ONNX Runtime GPU 1.22–1.24, CUDA 12, cuDNN 9 | CUDA | automatic |
 | MLX | macOS 14+ Apple Silicon | MLX 0.32.0 | Metal | automatic |
 | WebGPU | macOS 14+ Apple Silicon, Linux x86-64 with glibc 2.27+, or Windows x86-64 | ONNX Runtime 1.24.4 + WebGPU plugin 0.1.0 | Metal, Vulkan, or D3D12/Vulkan | experimental, explicit only |
-| MIGraphX | Linux x86-64, Python 3.12, ROCm 7.2.1+ (ROCm 7 only) | AMD ONNX Runtime/MIGraphX 1.23.2 | ROCm/MIGraphX | experimental, explicit only |
+| Vulkan | Linux x86-64 or Windows x86-64 | ONNX Runtime 1.24.4 + WebGPU plugin 0.1.0 | Dawn Vulkan | experimental, explicit only |
 | Core ML | macOS, when the serving runtime exposes it | serving CPU environment | Core ML | manual only |
 
-An unsupported explicit MIGraphX request tries the locked WebGPU path when that platform has the
-complete plugin/core wheel pair, then falls back to CPU. An unsupported explicit MLX request does
-not: a request for Metal on a machine with no Metal is not a request for Vulkan, so it reports CPU
-and says why. WebGPU and MIGraphX are not considered by `auto` while experimental.
+An unsupported explicit MLX or Vulkan request reports CPU and says why rather than silently choosing
+a different GPU backend. WebGPU and Vulkan are not considered by `auto` while experimental.
 
-MLX is the Metal path because WebGPU lost on Apple Silicon. On an M4 Pro, WebGPU indexed 1,000
-chunks at 1.11× of CPU against a 1.25× promotion threshold; MLX reached 1.52–1.56× on the same
-corpus, with vectors matching CPU to cosine 1.0 and identical top-5 rankings, so `auto` prepares it
-there. Those figures are for float32 execution. MLX now executes in float16, which measured a
-further 1.21× at the same batch size of 2 and 1.38× at a batch size of 8, on 600
-chunks of this repository on the same machine. Its vectors are close to the float32 ones rather
-than identical: cosine similarity never fell below 0.999998, and float32 queries against float16
-passages returned the same top-5 as against float32 passages. Stored and returned vectors are
-float32 either way; only the model's weights and activations are half precision.
+MLX is the designated Metal path on Apple Silicon, executing weights and activations in float16 while
+performing `<|im_end|>` last-token pooling and L2 normalization in float32. Cosine similarity to CPU
+float32 vectors stays above 0.999998 with identical top-5 and top-10 retrieval rankings. Stored and
+returned vectors are float32 across every backend.
 
 #### The accelerator environment
 
-`fastembed` and `fastembed-gpu` install the same module over two different ONNX Runtime
-distributions that both own the `onnxruntime` import. The direct WebGPU and MIGraphX runtimes own
-that import too, so none can share an environment. The serving environment is therefore pinned to
-the `cpu` extra — it embeds queries in-process and is what every accelerator falls back to — and an
-accelerator gets a second locked environment of its own under the install directory, sharing the
-same model cache. All five runtime extras are resolved from one lockfile that declares them
-mutually exclusive.
+`onnxruntime` and `onnxruntime-gpu` own the same `onnxruntime` import, and the pinned WebGPU/Vulkan
+plugin build pins its own core `onnxruntime` version, so none can share an environment. The serving
+environment is therefore pinned to the `cpu` extra — it embeds queries in-process and is what every
+accelerator falls back to — and an accelerator gets a second locked environment of its own under the
+install directory, sharing the same model cache. All four runtime extras (`cpu`, `cuda`, `webgpu`,
+`mlx`) are resolved from one lockfile that declares them mutually exclusive.
 
 The installer prepares that environment and records it at `accelerator.json` in the runtime data
 directory. It is written only after a real inference passes in the environment it describes:
@@ -1048,22 +1038,20 @@ start — a missing interpreter or a server upgraded past the Python the environ
 retires it with a reason rather than being repaired, since repairing it would mean installing
 something while serving.
 
-CUDA continues through FastEmbed. WebGPU and MIGraphX instead use the project-owned direct ONNX
-passage model because FastEmbed cannot configure those providers. It resolves the same
-`jinaai/jina-embeddings-v2-base-code` snapshot and ONNX artifact as CPU, applies the same tokenizer
-configuration, attention-mask mean pooling, float32 normalization, and 768-vector shape, and
-reports the providers the session actually resolved.
+Every ONNX backend (`cpu`, `cuda`, `webgpu`, `vulkan`, `coreml`) runs through the project-owned
+direct ONNX embedding module (`direct_onnx`). It downloads the official `codefuse-ai/F2LLM-v2-160M`
+snapshot (`model.safetensors`), builds and caches a local self-contained float32 ONNX graph at
+`<cache>/models/onnx/<revision>-f2llm-v1-f32.onnx` once per snapshot revision, applies dynamic
+right-padding, asymmetric query instruction prompting, `<|im_end|>` last-token pooling, float32
+normalization, and 640-vector output, and reports the providers the session actually resolved.
 
-MLX cannot execute ONNX at all, so it reproduces that model instead of running it: the float32
-initializers are lifted out of the same ONNX artifact, narrowed to float16, and the JinaBERT v2
-graph they belong to — ALiBi, post-norm query and key projections, a GEGLU feed-forward — is
-written out again in MLX. The
-tokenizer, pooling, normalization, and vector shape are shared with the direct ONNX model, and the
-configuration and every tensor name and shape are checked on load, so an artifact whose graph moved
-fails rather than returning vectors that no longer retrieve. The one-time conversion is written to
-`<cache>/models/mlx/<revision>-jina-v2-f16.safetensors` and memory-mapped afterwards; it is keyed by
-model revision, so a model that moves is converted again rather than read from a stale file. A
-conversion left by another revision or by the earlier float32 layout is deleted when the current
+MLX cannot execute ONNX directly, so it reproduces the same `codefuse-ai/F2LLM-v2-160M` Qwen3
+architecture in MLX over weights extracted from the same `model.safetensors` snapshot, narrowed to
+float16. The tokenizer, last-token pooling, float32 normalization, and 640-vector shape match the
+direct ONNX path, and the configuration and every tensor name and shape are checked on load, so an
+artifact whose graph moved fails rather than returning vectors that no longer retrieve. The one-time
+conversion is written to `<cache>/models/mlx/<revision>-f2llm-v3-f16.safetensors` and memory-mapped
+afterwards; conversions left by superseded revisions or earlier layouts are deleted when the current
 one is written.
 
 A passage worker for an accelerator runs from that environment's own interpreter, dialling back to
@@ -1185,9 +1173,9 @@ $ syndex model status
   "cpu_characters_per_second": null,
   "crossover_characters": null,
   "device": "cpu",
-  "dimension": 768,
+  "dimension": 640,
   "driver_version": "",
-  "embedding_model": "jinaai/jina-embeddings-v2-base-code",
+  "embedding_model": "codefuse-ai/F2LLM-v2-160M",
   "execution_provider": "CPUExecutionProvider",
   "fallback_reason": "no accelerator is prepared and eligible on this machine; reinstall with --accelerator to prepare one, or set CODE_INDEXING_EMBED_ACCELERATOR to force a backend this installation already offers",
   "precision": "float32",

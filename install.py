@@ -21,7 +21,7 @@ DEFAULT_REPOSITORY_URL = "https://github.com/MarcinHamiga/code-indexing-mcp.git"
 # The serving environment always gets the CPU extra (it is the fallback every
 # accelerator degrades to) plus the TUI extra for the interactive wizard.
 SERVING_EXTRAS = ("cpu", "tui")
-ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "mlx", "webgpu", "migraphx", "coreml")
+ACCELERATOR_CHOICES = ("auto", "cpu", "cuda", "mlx", "webgpu", "vulkan", "coreml")
 
 
 class InstallerError(RuntimeError):

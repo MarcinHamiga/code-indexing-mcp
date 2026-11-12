@@ -1,3 +1,4 @@
+import json
 import shutil
 import stat
 import sys
@@ -1145,6 +1146,64 @@ def test_reregistering_a_known_project_preserves_state_and_still_validates_compa
     assert other_app.project_status(project.id).state == "ready"
 
 
+def test_jina_768d_multi_branch_store_upgrades_cleanly_to_f2llm_640d(tmp_path: Path) -> None:
+    """Upgrading from 768d Jina to 640d F2LLM marks all branch slots rebuild_required."""
+
+    class LegacyJina768Embedder:
+        model_id = "jinaai/jina-embeddings-v2-base-code"
+        dimension = 768
+
+        def embed_passages(self, texts: list[str]) -> list[list[float]]:
+            return [[1.0] + [0.0] * 767 for _ in texts]
+
+        def embed_query(self, text: str) -> list[float]:
+            return [1.0] + [0.0] * 767
+
+    class NewF2llm640Embedder:
+        model_id = "codefuse-ai/F2LLM-v2-160M"
+        dimension = 640
+
+        def embed_passages(self, texts: list[str]) -> list[list[float]]:
+            return [[1.0] + [0.0] * 639 for _ in texts]
+
+        def embed_query(self, text: str) -> list[float]:
+            return [1.0] + [0.0] * 639
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    run_git("init", "-b", "main", cwd=root)
+    run_git("config", "user.email", "test@example.com", cwd=root)
+    run_git("config", "user.name", "Test", cwd=root)
+    (root / "main.py").write_text("def alpha():\n    return 1\n")
+    run_git("add", "main.py", cwd=root)
+    run_git("commit", "-m", "initial", cwd=root)
+
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    legacy = Application(paths, embedder=LegacyJina768Embedder(), cwd=root)
+    project = legacy.init_project(root)
+    legacy.index_project(project.id)
+
+    run_git("checkout", "-b", "feature", cwd=root)
+    (root / "main.py").write_text("def beta():\n    return 2\n")
+    run_git("commit", "-am", "feature", cwd=root)
+    legacy.index_project(project.id)
+    branch_slots = [s for s in legacy.store.list_slots(project.id) if s.selector_kind == "ref"]
+    assert len(branch_slots) == 2
+    assert all(slot.state == "ready" for slot in branch_slots)
+
+    upgraded = Application(paths, embedder=NewF2llm640Embedder(), cwd=root)
+    upgraded.init_project(root)
+    upgraded_branch_slots = [
+        s for s in upgraded.store.list_slots(project.id) if s.selector_kind == "ref"
+    ]
+    assert len(upgraded_branch_slots) == 2
+    assert {slot.state for slot in upgraded_branch_slots} == {"rebuild_required"}
+
+    response = upgraded.search_code("beta", projects=[project.id])
+    assert response.hits
+    assert upgraded.project_status(project.id).state == "ready"
+
+
 def test_query_rebuilds_an_incompatible_project_before_serving_results(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
@@ -1500,17 +1559,16 @@ def test_a_refused_record_explains_the_cpu_outcome(tmp_path: Path) -> None:
 def test_a_record_offers_only_the_accelerator_it_was_probed_for(tmp_path: Path) -> None:
     """A provider the prepared runtime happens to ship is not evidence of anything.
 
-    A CUDA environment's ONNX Runtime lists more providers than CUDA. Offering
-    all of them would select a backend no probe ever exercised there, and then
-    describe it with a record that cannot say which device or driver it ran on.
+    A CUDA environment's ONNX Runtime lists more providers than CUDA (and a
+    WebGPU environment's plugin also underpins Vulkan). Offering all of them
+    would select a backend no probe ever exercised there, and then describe it
+    with a record that cannot say which device or driver it ran on.
     """
     _prepared_cuda_environment(
-        tmp_path, providers=("CUDAExecutionProvider", "MIGraphXExecutionProvider")
+        tmp_path, providers=("CUDAExecutionProvider", "WebGpuExecutionProvider")
     )
     paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
-    settings = replace(
-        IndexSettings.from_environment({}), embedding_accelerator=Accelerator.MIGRAPHX
-    )
+    settings = replace(IndexSettings.from_environment({}), embedding_accelerator=Accelerator.VULKAN)
 
     app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path, settings=settings)
 
@@ -1521,6 +1579,21 @@ def test_a_record_offers_only_the_accelerator_it_was_probed_for(tmp_path: Path) 
     assert Application(
         paths, embedder=TinyEmbedder(), cwd=tmp_path
     ).backend_selection.accelerator is (Accelerator.CUDA)
+
+
+def test_a_legacy_migraphx_record_is_rejected_cleanly_to_cpu(tmp_path: Path) -> None:
+    _prepared_cuda_environment(tmp_path)
+    record_path = tmp_path / "data" / "accelerator.json"
+    raw = json.loads(record_path.read_text(encoding="utf-8"))
+    raw["accelerator"] = "migraphx"
+    raw["providers"] = ["MIGraphXExecutionProvider", "CPUExecutionProvider"]
+    record_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    app = Application(paths, embedder=TinyEmbedder(), cwd=tmp_path)
+
+    assert app.backend_selection.accelerator is Accelerator.CPU
+    assert "unusable" in (app.model_status().fallback_reason or "")
 
 
 def test_an_unset_accelerator_follows_the_experimental_backend_the_installer_prepared(

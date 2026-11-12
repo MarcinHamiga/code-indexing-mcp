@@ -209,8 +209,13 @@ def model_artifact_fingerprint(cache_directory: Path, model_id: str) -> str:
 
     Names and sizes are enough to notice a re-download, a partially written
     cache, or a switch between model revisions, and unlike hashing contents it
-    stays cheap on a multi-hundred-megabyte ONNX graph.
+    stays cheap on a multi-hundred-megabyte weight file. Including the ONNX and
+    MLX layout versions also re-probes automatically whenever a local conversion
+    contract changes.
     """
+    from .direct_onnx import ONNX_LAYOUT_VERSION
+    from .mlx_backend import WEIGHT_LAYOUT_VERSION
+
     root = model_directory(cache_directory, model_id)
     entries: list[str] = []
     try:
@@ -227,7 +232,9 @@ def model_artifact_fingerprint(cache_directory: Path, model_id: str) -> str:
         # simply never matches a record written when it was readable.
         logger.debug("Could not enumerate the model cache at %s", cache_directory)
         return sha256(f"{model_id}\0unreadable".encode()).hexdigest()
-    digest = sha256(model_id.encode())
+    digest = sha256(
+        f"{model_id}\0onnx-v{ONNX_LAYOUT_VERSION}\0mlx-v{WEIGHT_LAYOUT_VERSION}".encode()
+    )
     for entry in entries:
         digest.update(b"\0")
         digest.update(entry.encode())

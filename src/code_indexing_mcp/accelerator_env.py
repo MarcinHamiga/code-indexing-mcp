@@ -1,7 +1,7 @@
 """The accelerator environment the installer prepared, as the runtime sees it.
 
-Passage acceleration needs a second, locked environment: ``fastembed`` and
-``fastembed-gpu`` cannot share one. Preparing that environment is installation
+Passage acceleration needs a second, locked environment: ``onnxruntime`` and
+``onnxruntime-gpu`` (or ``mlx``) cannot share one. Preparing that environment is installation
 work -- it resolves wheels, downloads them, and probes the result -- and none of
 it may happen while the server is answering requests. So the installer does it
 once and leaves behind this record: which accelerator it prepared, which
