@@ -148,6 +148,7 @@ class IndexWorkerSession:
         *,
         embedder_pickle: bytes | None = None,
         extra_environment: Mapping[str, str] | None = None,
+        on_worker_crash: Callable[[], None] | None = None,
     ) -> None:
         self._config = IndexWorkerConfig(
             data_directory=str(paths.data),
@@ -157,9 +158,18 @@ class IndexWorkerSession:
             embedder_pickle=embedder_pickle,
         )
         self._extra_environment = dict(extra_environment or {})
+        self._on_worker_crash = on_worker_crash
         self._lock = threading.Lock()
         self._launched: LaunchedWorker | None = None
         self._closed = False
+        self._active_project_id: str | None = None
+        self._next_request_id = 1
+
+    @property
+    def active_project_id(self) -> str | None:
+        """Return the project ID currently executing in the worker, if any."""
+
+        return self._active_project_id
 
     @property
     def pid(self) -> int | None:
@@ -190,6 +200,8 @@ class IndexWorkerSession:
                 "stream_progress": on_progress is not None,
                 "trigger": trigger,
             },
+            wait_for_lock=wait_for_lock,
+            busy_project=target.project,
             on_progress=on_progress,
         )
         return IndexReport.model_validate(payload)
@@ -212,6 +224,9 @@ class IndexWorkerSession:
                 "lock_timeout": lock_timeout,
                 "trigger": trigger,
             },
+            wait_for_lock=wait_for_lock,
+            lock_timeout=lock_timeout,
+            busy_project=target.project,
         )
         return ReferenceBackfillReport.model_validate(payload)
 
@@ -262,7 +277,7 @@ class IndexWorkerSession:
         try:
             if launched.process.is_alive():
                 with suppress(OSError, EOFError, BrokenPipeError):
-                    launched.connection.send(("shutdown", None))
+                    launched.connection.send((0, "shutdown", None))
                     if launched.connection.poll(_SHUTDOWN_TIMEOUT_SECONDS):
                         launched.connection.recv()
                 launched.process.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS)
@@ -281,29 +296,65 @@ class IndexWorkerSession:
         command: str,
         payload: Any,
         *,
+        wait_for_lock: bool = True,
+        lock_timeout: float | None = None,
+        busy_project: ProjectInfo | None = None,
         on_progress: Callable[[IndexProgress], None] | None = None,
     ) -> Any:
-        with self._lock:
+        if not wait_for_lock:
+            acquired = self._lock.acquire(blocking=False)
+        elif lock_timeout is not None:
+            acquired = self._lock.acquire(blocking=True, timeout=max(0.0, lock_timeout))
+        else:
+            acquired = self._lock.acquire(blocking=True)
+        if not acquired:
+            raise CodeIndexingError(
+                ErrorCode.INDEX_BUSY,
+                "Another indexing job is already active: "
+                f"{busy_project.name if busy_project is not None else 'indexing worker'}",
+                **({"project": busy_project.id} if busy_project is not None else {}),
+            )
+        previous_active_project = self._active_project_id
+        if command in {"index", "backfill_references"} and busy_project is not None:
+            self._active_project_id = busy_project.id
+        try:
             launched = self._ensure_started_locked()
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            completed = False
             try:
-                launched.connection.send((command, payload))
+                launched.connection.send((request_id, command, payload))
                 while True:
-                    kind, response = launched.connection.recv()
+                    resp_id, kind, response = launched.connection.recv()
+                    if resp_id != request_id:
+                        raise RuntimeError(
+                            f"Mismatched index worker response id {resp_id!r} "
+                            f"(expected {request_id!r}, kind={kind!r})"
+                        )
                     if kind == "progress":
                         if on_progress is not None:
                             on_progress(IndexProgress.model_validate(response))
                         continue
                     if kind in {"result", "pong"}:
+                        completed = True
                         return response
                     if kind == "error":
+                        completed = True
                         raise _error_from_payload(response)
                     raise RuntimeError(f"Unexpected index worker response {kind!r}")
             except (EOFError, BrokenPipeError, OSError) as exc:
-                self._teardown_locked()
                 raise CodeIndexingError(
                     ErrorCode.INTERNAL_ERROR,
                     f"The indexing worker exited unexpectedly during {command}: {exc}",
                 ) from exc
+            finally:
+                if not completed:
+                    self._teardown_locked()
+                    if self._on_worker_crash is not None:
+                        self._on_worker_crash()
+        finally:
+            self._active_project_id = previous_active_project
+            self._lock.release()
 
 
 def worker_main(connection: Any, raw_config: Mapping[str, Any]) -> None:
@@ -329,15 +380,15 @@ def worker_main(connection: Any, raw_config: Mapping[str, Any]) -> None:
     try:
         while True:
             try:
-                command, payload = connection.recv()
+                request_id, command, payload = connection.recv()
             except EOFError:
                 break
             if command == "shutdown":
                 with suppress(OSError):
-                    connection.send(("stopped", None))
+                    connection.send((request_id, "stopped", None))
                 break
             if command == "ping":
-                connection.send(("pong", os.getpid()))
+                connection.send((request_id, "pong", os.getpid()))
                 continue
             try:
                 if command == "index":
@@ -345,8 +396,8 @@ def worker_main(connection: Any, raw_config: Mapping[str, Any]) -> None:
                     progress_callback: Callable[[IndexProgress], None] | None = None
                     if payload.get("stream_progress"):
 
-                        def emit(progress: IndexProgress) -> None:
-                            connection.send(("progress", progress.model_dump(mode="json")))
+                        def emit(progress: IndexProgress, *, _req_id: int = request_id) -> None:
+                            connection.send((_req_id, "progress", progress.model_dump(mode="json")))
 
                         progress_callback = emit
                     report = app.indexer.index(
@@ -357,7 +408,7 @@ def worker_main(connection: Any, raw_config: Mapping[str, Any]) -> None:
                         on_progress=progress_callback,
                         trigger=payload["trigger"],
                     )
-                    connection.send(("result", report.model_dump(mode="json")))
+                    connection.send((request_id, "result", report.model_dump(mode="json")))
                 elif command == "backfill_references":
                     target = target_from_payload(payload["target"])
                     backfill = app.indexer.backfill_references(
@@ -367,12 +418,13 @@ def worker_main(connection: Any, raw_config: Mapping[str, Any]) -> None:
                         lock_timeout=payload["lock_timeout"],
                         trigger=payload["trigger"],
                     )
-                    connection.send(("result", backfill.model_dump(mode="json")))
+                    connection.send((request_id, "result", backfill.model_dump(mode="json")))
                 else:
                     raise ValueError(f"Unknown index worker command: {command!r}")
             except CodeIndexingError as exc:
                 connection.send(
                     (
+                        request_id,
                         "error",
                         {
                             "kind": "code_indexing",
@@ -386,6 +438,7 @@ def worker_main(connection: Any, raw_config: Mapping[str, Any]) -> None:
                 logger.exception("Indexing worker command %s failed", command)
                 connection.send(
                     (
+                        request_id,
                         "error",
                         {
                             "kind": "exception",

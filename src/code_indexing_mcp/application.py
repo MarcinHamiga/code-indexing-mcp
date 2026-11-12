@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import pickle
@@ -1058,24 +1059,36 @@ class Application:
                 ) from error
         raise AssertionError("repository query retry loop did not return")
 
+    def _recover_after_worker_crash(self) -> None:
+        self.history.mark_interrupted()
+        lock_directory = self.paths.data / "locks"
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        recover_staged_commits(
+            self.paths.data / "staging", self.store, lock_directory=lock_directory
+        )
+
+    def _create_index_worker_session(self) -> IndexWorkerSession:
+        embedder_pickle = (
+            None if isinstance(self.embedder, FastEmbedder) else pickle.dumps(self.embedder)
+        )
+        extra_env = (
+            {}
+            if isinstance(self.embedder, FastEmbedder)
+            else _worker_pythonpath_extension(self.embedder)
+        )
+        return IndexWorkerSession(
+            self.paths,
+            self.cwd,
+            self.settings,
+            embedder_pickle=embedder_pickle,
+            extra_environment=extra_env,
+            on_worker_crash=self._recover_after_worker_crash,
+        )
+
     def _get_index_worker(self) -> IndexWorkerSession:
         with self._index_worker_lock:
             if self._index_worker is None:
-                embedder_pickle = (
-                    None if isinstance(self.embedder, FastEmbedder) else pickle.dumps(self.embedder)
-                )
-                extra_env = (
-                    {}
-                    if isinstance(self.embedder, FastEmbedder)
-                    else _worker_pythonpath_extension(self.embedder)
-                )
-                session = IndexWorkerSession(
-                    self.paths,
-                    self.cwd,
-                    self.settings,
-                    embedder_pickle=embedder_pickle,
-                    extra_environment=extra_env,
-                )
+                session = self._create_index_worker_session()
                 self._index_worker = session
                 self._index_worker_finalizer = weakref.finalize(self, session.close)
             return self._index_worker
@@ -1187,7 +1200,31 @@ class Application:
         trigger: IndexTrigger = "reference-backfill",
     ) -> ReferenceBackfillReport:
         if self._use_index_worker:
-            return self._get_index_worker().backfill_references(
+            if (
+                self.store.incompatibility_reason(
+                    target.project.id, self.embedder.model_id, partition_id=target.partition_id
+                )
+                is None
+            ):
+                with contextlib.suppress(CodeIndexingError):
+                    early = self.indexer._reference_gap(target.project, target.partition).settled
+                    if early is not None:
+                        return early
+                worker = self._get_index_worker()
+                if worker.active_project_id not in {None, target.project.id}:
+                    disposable = self._create_index_worker_session()
+                    try:
+                        return disposable.backfill_references(
+                            target,
+                            wait_for_lock=wait_for_lock,
+                            lock_timeout=lock_timeout,
+                            trigger=trigger,
+                        )
+                    finally:
+                        disposable.close()
+            else:
+                worker = self._get_index_worker()
+            return worker.backfill_references(
                 target,
                 wait_for_lock=wait_for_lock,
                 lock_timeout=lock_timeout,
@@ -2063,9 +2100,8 @@ class Application:
                     )
                     is not None
                 ):
-                    self.indexer.index(
-                        target.project,
-                        partition=target.partition,
+                    self._run_index_for_target(
+                        target,
                         wait_for_lock=True,
                         trigger="lazy-query",
                     )

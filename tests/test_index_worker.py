@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import os
+import signal
 import statistics
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
+import pyarrow as pa
 import pytest
 from support import DeterministicEmbedder
 
 from code_indexing_mcp.application import Application, RuntimePaths
 from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
-from code_indexing_mcp.models import IndexProgress
+from code_indexing_mcp.models import DeclarationSelector, IndexProgress
+from code_indexing_mcp.staging import StagingJob
+from code_indexing_mcp.storage import LanceStore
 
 
 def _make_paths(tmp_path: Path) -> RuntimePaths:
@@ -152,3 +157,320 @@ def test_search_and_find_symbol_stay_responsive_during_worker_index_run(tmp_path
         )
     finally:
         app.close()
+
+
+def _remove_reference_generation(store: LanceStore, project_id: str) -> None:
+    for record in store.list_files(project_id):
+        store.replace_files_from_arrow(
+            project_id,
+            files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+            chunk_batches=(),
+            reference_batches=[
+                (
+                    [record.file_id],
+                    pa.Table.from_batches([], schema=LanceStore.reference_arrow_schema()),
+                )
+            ],
+        )
+
+
+def test_index_worker_wait_for_lock_false_raises_index_busy_immediately(tmp_path: Path) -> None:
+    """Finding 1a: concurrent wait_for_lock=False fails immediately with INDEX_BUSY."""
+    root_a = tmp_path / "project_a"
+    root_b = tmp_path / "project_b"
+    _write_python_corpus(root_a, file_count=4, functions_per_file=3)
+    _write_python_corpus(root_b, file_count=2, functions_per_file=2)
+
+    app = Application(
+        _make_paths(tmp_path),
+        embedder=DeterministicEmbedder(),
+        cwd=tmp_path,
+        _enable_index_worker=True,
+    )
+    try:
+        project_a = app.init_project(root_a)
+        project_b = app.init_project(root_b)
+        started = threading.Event()
+        release = threading.Event()
+
+        def hold_worker(_progress: IndexProgress) -> None:
+            started.set()
+            assert release.wait(timeout=10.0)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                app.index_project,
+                project_a.id,
+                on_progress=hold_worker,
+            )
+            assert started.wait(timeout=10.0)
+            worker = app._get_index_worker()
+            assert worker.active_project_id == project_a.id
+
+            t0 = time.monotonic()
+            with pytest.raises(CodeIndexingError) as exc_info:
+                app.index_project(project_b.id, wait_for_lock=False)
+            elapsed = time.monotonic() - t0
+            assert exc_info.value.code is ErrorCode.INDEX_BUSY
+            assert elapsed < 2.0
+
+            target_b = app._resolve_active_target(project_b)
+            t0 = time.monotonic()
+            with pytest.raises(CodeIndexingError) as backfill_exc:
+                worker.backfill_references(target_b, wait_for_lock=True, lock_timeout=0.05)
+            assert backfill_exc.value.code is ErrorCode.INDEX_BUSY
+            assert time.monotonic() - t0 < 2.0
+
+            release.set()
+            report = future.result(timeout=10.0)
+            assert report.indexed_files == 4
+            assert worker.active_project_id is None
+    finally:
+        app.close()
+
+
+def test_settled_references_and_cross_project_backfill_do_not_stall_on_worker(
+    tmp_path: Path,
+) -> None:
+    """Finding 1b: settled queries skip worker and cross-project backfill uses disposable worker."""
+    root_a = tmp_path / "project_a"
+    root_b = tmp_path / "project_b"
+    _write_python_corpus(root_a, file_count=3, functions_per_file=2)
+    _write_python_corpus(root_b, file_count=3, functions_per_file=2)
+
+    app = Application(
+        _make_paths(tmp_path),
+        embedder=DeterministicEmbedder(),
+        cwd=tmp_path,
+        _enable_index_worker=True,
+    )
+    try:
+        project_a = app.init_project(root_a)
+        project_b = app.init_project(root_b)
+        app.index_project(project_a.id)
+        helper_hit = app.find_symbol("helper_step_0", project_a.id).hits[0]
+        selector = DeclarationSelector(chunk_id=helper_hit.chunk_id)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def hold_worker(_progress: IndexProgress) -> None:
+            started.set()
+            assert release.wait(timeout=10.0)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                app.index_project,
+                project_b.id,
+                force=True,
+                on_progress=hold_worker,
+            )
+            assert started.wait(timeout=10.0)
+            worker = app._get_index_worker()
+            assert worker.active_project_id == project_b.id
+
+            # Settled references never touch the busy worker.
+            with patch.object(
+                worker,
+                "backfill_references",
+                side_effect=AssertionError("settled query touched busy worker"),
+            ):
+                refs = app.find_references(selector)
+                assert len(refs.hits) >= 2
+
+            # Unsettled parse-only backfill on Project A runs in a disposable worker
+            # instead of queueing behind Project B's active index run.
+            _remove_reference_generation(app.store, project_a.id)
+            backfill = app.ensure_reference_index(project_a.id)
+            assert backfill.files_backfilled == 3
+            assert backfill.complete is True
+            assert app.find_references(selector).hits
+
+            release.set()
+            assert future.result(timeout=10.0).indexed_files == 3
+    finally:
+        app.close()
+
+
+def test_worker_sigkill_mid_run_rolls_back_committing_journal_and_marks_history_interrupted(
+    tmp_path: Path,
+) -> None:
+    """Finding 2: SIGKILL mid-run rolls back PHASE_COMMITTING and marks history interrupted."""
+    root = tmp_path / "project"
+    root.mkdir()
+    target_file = root / "main.py"
+    target_file.write_text("def before_crash() -> int:\n    return 1\n")
+
+    paths = _make_paths(tmp_path)
+    app = Application(
+        paths,
+        embedder=DeterministicEmbedder(),
+        cwd=tmp_path,
+        _enable_index_worker=True,
+    )
+    try:
+        project = app.init_project(root)
+        app.index_project(project.id)
+        assert len(app.find_symbol("before_crash", project.id).hits) == 1
+
+        target = app._resolve_active_target(project)
+        target_file.write_text("def after_crash() -> int:\n    return 2\n")
+        killed = False
+
+        def simulate_mid_commit_crash(_progress: IndexProgress) -> None:
+            nonlocal killed
+            if killed:
+                return
+            runs = app.history.list_runs(project.id).runs
+            if not runs or runs[0].state != "running":
+                return
+            worker_pid = app._get_index_worker().pid
+            assert worker_pid is not None
+
+            versions = app.store.table_versions(project.id, partition_id=target.partition_id)
+            file_ids = [
+                record.file_id
+                for record in app.store.list_files(project.id, partition_id=target.partition_id)
+            ]
+            # Write a PHASE_COMMITTING journal and corrupt live rows to simulate a torn commit.
+            writer = StagingJob(
+                paths.data / "staging",
+                project.id,
+                file_schema=LanceStore.file_arrow_schema(),
+                chunk_schema=LanceStore.chunk_arrow_schema(
+                    app.store.vector_dimension, app.store.vector_dtype
+                ),
+                reference_schema=LanceStore.reference_arrow_schema(),
+                partition=target.partition,
+                job_id="torn-commit",
+            )
+            writer.begin()
+            writer.begin_commit(versions)
+            app.store.replace_files_from_arrow(
+                project.id,
+                files=pa.Table.from_batches([], schema=LanceStore.file_arrow_schema()),
+                chunk_batches=(),
+                removed_file_ids=file_ids,
+                partition_id=target.partition_id,
+            )
+            killed = True
+            os.kill(worker_pid, signal.SIGKILL)
+
+        with pytest.raises(CodeIndexingError) as exc_info:
+            app.index_project(project.id, on_progress=simulate_mid_commit_crash)
+        assert killed
+        assert exc_info.value.code is ErrorCode.INTERNAL_ERROR
+
+        # Recovery ran before returning: history is interrupted, journal is rolled back,
+        # and the pre-crash generation remains searchable.
+        runs = app.history.list_runs(project.id).runs
+        assert runs[0].state == "interrupted"
+        assert not list((paths.data / "staging").rglob("journal.json"))
+        assert len(app.find_symbol("before_crash", project.id).hits) == 1
+        assert app._get_index_worker().ping() != os.getpid()
+    finally:
+        app.close()
+
+
+def test_on_progress_exception_tears_down_worker_and_request_id_prevents_stale_frames(
+    tmp_path: Path,
+) -> None:
+    """Finding 3: exception in on_progress tears down worker cleanly with no pipe desync."""
+    root = tmp_path / "project"
+    _write_python_corpus(root, file_count=4, functions_per_file=3)
+
+    app = Application(
+        _make_paths(tmp_path),
+        embedder=DeterministicEmbedder(),
+        cwd=tmp_path,
+        _enable_index_worker=True,
+    )
+    try:
+        project = app.init_project(root)
+        first_pid = app._get_index_worker().ping()
+
+        def failing_progress(_progress: IndexProgress) -> None:
+            raise ValueError("progress listener exploded")
+
+        with pytest.raises(ValueError, match="progress listener exploded"):
+            app.index_project(project.id, on_progress=failing_progress)
+
+        worker = app._get_index_worker()
+        assert worker.pid is None
+        next_pid = worker.ping()
+        assert next_pid != first_pid
+
+        report = app.index_project(project.id, force=True)
+        assert report.indexed_files == 4
+        assert app.find_symbol("compute_0_0", project.id).hits
+    finally:
+        app.close()
+
+
+def test_request_id_mismatch_tears_down_worker_and_recovers(tmp_path: Path) -> None:
+    """Finding 3: mismatched response request_id raises RuntimeError and tears down worker."""
+    from unittest.mock import MagicMock
+
+    from code_indexing_mcp.index_worker import IndexWorkerSession
+    from code_indexing_mcp.settings import IndexSettings
+    from code_indexing_mcp.worker_launcher import LaunchedWorker
+
+    crashes: list[str] = []
+    session = IndexWorkerSession(
+        _make_paths(tmp_path),
+        tmp_path,
+        IndexSettings.from_environment(),
+        on_worker_crash=lambda: crashes.append("crashed"),
+    )
+    fake_conn = MagicMock()
+    fake_conn.recv.return_value = (999, "pong", 12345)
+    fake_proc = MagicMock()
+    fake_proc.is_alive.side_effect = [True, False, False, False]
+    session._launched = LaunchedWorker(process=fake_proc, connection=fake_conn)
+
+    with pytest.raises(RuntimeError, match="Mismatched index worker response id"):
+        session.ping()
+
+    assert session._launched is None
+    assert crashes == ["crashed"]
+    fake_conn.close.assert_called_once()
+
+
+def test_ensure_query_generations_rebuilds_in_worker_process(tmp_path: Path) -> None:
+    """Finding 6: _ensure_query_generations delegates schema-rebuild to the worker process."""
+    root = tmp_path / "project"
+    _write_python_corpus(root, file_count=2, functions_per_file=2)
+    paths = _make_paths(tmp_path)
+
+    app_v1 = Application(
+        paths,
+        embedder=DeterministicEmbedder(),
+        cwd=tmp_path,
+        _enable_index_worker=True,
+    )
+    try:
+        project = app_v1.init_project(root)
+        app_v1.index_project(project.id)
+    finally:
+        app_v1.close()
+
+    embedder_v2 = DeterministicEmbedder()
+    embedder_v2.model_id = "test/tiny-v2"
+    app_v2 = Application(
+        paths,
+        embedder=embedder_v2,
+        cwd=tmp_path,
+        _enable_index_worker=True,
+    )
+    try:
+        hits = app_v2.search_code("compute_0_0", projects=[project.id])
+        assert hits.hits
+        worker_pid = app_v2._get_index_worker().pid
+        assert worker_pid is not None
+        assert worker_pid != os.getpid()
+
+        latest_run = app_v2.history.list_runs(project.id).runs[0]
+        assert latest_run.trigger == "schema-rebuild"
+        assert latest_run.pid == worker_pid
+    finally:
+        app_v2.close()
