@@ -508,6 +508,9 @@ class DaemonServer:
         self._stop.set()
 
     def serve(self) -> None:
+        # Shorten the thread-switch interval so a CPU-bound request handler cannot
+        # starve concurrent read queries for 5ms slices at a time.
+        sys.setswitchinterval(0.0005)
         self.paths.ensure_private()
         lock_directory = self.paths.data / "locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
@@ -636,7 +639,10 @@ class DaemonServer:
             # Buffered slot touches (touch_slot) must not be lost when the
             # daemon exits: the next process's LRU retention decision reads
             # last_used_at from disk.
-            self.application.store.close()
+            if hasattr(self.application, "close"):
+                self.application.close()
+            else:
+                self.application.store.close()
             lifetime_lock.release()
             self.ready.set()
 

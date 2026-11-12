@@ -488,7 +488,11 @@ class Indexer:
                 # verified again immediately before the staged commit, so a
                 # branch that moved mid-scan can never publish rows into the
                 # slot of a branch that no longer exists in the worktree.
-                guard = self._capture_git_guard(project, partition)
+                guard = self._capture_git_guard(
+                    project,
+                    partition,
+                    cached_git=target.git_state if target is not None else None,
+                )
                 progress = ProgressPublisher(
                     project.id,
                     run_id=run_id,
@@ -654,7 +658,11 @@ class Indexer:
                 # Same contract as index(): capture the checkout identity
                 # under the lock so a branch switch while waiting cannot
                 # publish progress or staged rows for the wrong selector.
-                guard = self._capture_git_guard(project, partition)
+                guard = self._capture_git_guard(
+                    project,
+                    partition,
+                    cached_git=target.git_state if target is not None else None,
+                )
                 progress = ProgressPublisher(
                     project.id,
                     run_id=run_id,
@@ -973,7 +981,7 @@ class Indexer:
             return job
 
         try:
-            for item in self.scanner.iter_scan(project, existing, read_contents=False):
+            for item in self._iter_scan(project, existing, read_contents=False, guard=guard):
                 if not isinstance(item, ScannedFile):
                     continue
                 record = existing.get(item.path.as_posix())
@@ -1131,7 +1139,34 @@ class Indexer:
                 job.discard()
             raise
 
-    def _capture_git_guard(self, project: ProjectInfo, partition: PartitionRef) -> _GitGuard | None:
+    def _iter_scan(
+        self,
+        project: ProjectInfo,
+        known_files: dict[str, StoredFile],
+        *,
+        read_contents: bool = True,
+        guard: _GitGuard | None = None,
+    ) -> Iterator[ScannedFile | SkippedFile]:
+        git_state = guard.state if guard is not None else None
+        if git_state is None:
+            return self.scanner.iter_scan(project, known_files, read_contents=read_contents)
+        try:
+            return self.scanner.iter_scan(
+                project,
+                known_files,
+                read_contents=read_contents,
+                git_state=git_state,
+            )
+        except TypeError:
+            return self.scanner.iter_scan(project, known_files, read_contents=read_contents)
+
+    def _capture_git_guard(
+        self,
+        project: ProjectInfo,
+        partition: PartitionRef,
+        *,
+        cached_git: GitState | None = None,
+    ) -> _GitGuard | None:
         """Snapshot the checkout identity this run will be verified against.
 
         Raises :class:`CodeIndexingError` with ``REPOSITORY_CHANGED`` when the
@@ -1139,7 +1174,13 @@ class Indexer:
         would stage the wrong branch's rows, and the caller's retry re-resolves
         the target against the new selector.
         """
-        state = probe_git_state(project.root, include_status=True)
+        if cached_git is not None:
+            try:
+                state = probe_git_state(project.root, include_status=True, cached=cached_git)
+            except TypeError:
+                state = probe_git_state(project.root, include_status=True)
+        else:
+            state = probe_git_state(project.root, include_status=True)
         if state.probe is not GitProbeOutcome.GIT:
             return None
         if git_slot_id(project.id, state) != partition.slot_id:
@@ -1155,6 +1196,12 @@ class Indexer:
     ) -> None:
         """Refuse to publish rows the captured checkout no longer describes."""
         if guard is None:
+            return
+        if head_snapshot(guard.state) == (
+            guard.state.selector_kind,
+            guard.state.selector_value,
+            guard.state.head_oid,
+        ):
             return
         state = probe_git_state(project.root)
         if state.probe is not GitProbeOutcome.GIT:
@@ -1639,10 +1686,17 @@ class Indexer:
                 and previous.content_hash == content_hash
                 and previous.language == item.language
             ):
+                racy = _is_racy(previous)
+                if previous.size == item.size and previous.mtime_ns == item.mtime_ns and not racy:
+                    # Content, stat metadata, and raciness status are already
+                    # identical to the stored row: skip StagingJob creation so
+                    # no-op runs on dirty/untracked files never bump table versions.
+                    state.unchanged += 1
+                    return
                 with timer.measure("commit"):
                     # A racy row is restamped so it stops being racy once the
                     # window has passed, instead of being re-hashed forever.
-                    restamp = {"indexed_at": time.time_ns()} if _is_racy(previous) else {}
+                    restamp = {"indexed_at": time.time_ns()} if racy else {}
                     self._staging_job(project, state).stage_file(
                         previous.model_copy(
                             update={"size": item.size, "mtime_ns": item.mtime_ns, **restamp}
@@ -1749,7 +1803,7 @@ class Indexer:
         state = _IndexScanState(partition=partition, guard=guard)
         process = psutil.Process()
         state.sample_memory(process)
-        stream = self.scanner.iter_scan(project, existing)
+        stream = self._iter_scan(project, existing, guard=guard)
         try:
             while True:
                 with timer.measure("scan"):

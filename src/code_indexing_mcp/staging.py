@@ -24,6 +24,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from functools import partial
+from operator import attrgetter
 from pathlib import Path
 from typing import Any, cast
 
@@ -315,6 +316,13 @@ class StagingJob:
         self._file_schema = file_schema
         self._chunk_schema = chunk_schema
         self._reference_schema = reference_schema
+        self._chunk_getters = [
+            (field.name, attrgetter(field.name) if field.name != "vector" else None, field.type)
+            for field in chunk_schema
+        ]
+        self._reference_getters = [
+            (attrgetter(field.name), field.type) for field in reference_schema
+        ]
         self.replace_file_ids: list[str] = []
         self.replace_reference_file_ids: list[str] = []
         self._reference_file_ids: set[str] = set()
@@ -391,8 +399,8 @@ class StagingJob:
         vector_type = self._chunk_schema.field("vector").type
         dimension = vector_type.list_size
         columns: list[pa.Array] = []
-        for field in self._chunk_schema:
-            if field.name == "vector":
+        for name, getter, field_type in self._chunk_getters:
+            if name == "vector":
                 packed = b"".join(row.vector for row in rows)
                 flat = np.frombuffer(packed, dtype="<f4")
                 # The embedding worker always emits float32; the storage dtype
@@ -402,9 +410,8 @@ class StagingJob:
                 values = pa.array(flat, type=vector_type.value_type)
                 columns.append(pa.FixedSizeListArray.from_arrays(values, dimension))
             else:
-                columns.append(
-                    pa.array([getattr(row, field.name) for row in rows], type=field.type)
-                )
+                assert getter is not None
+                columns.append(pa.array(list(map(getter, rows)), type=field_type))
         self._chunks_writer.write_batch(pa.record_batch(columns, schema=self._chunk_schema))
 
     def stage_references(self, rows: list[ReferenceRow]) -> None:
@@ -426,8 +433,8 @@ class StagingJob:
         self._reference_file_ids.add(file_id)
         self._last_reference_file_id = file_id
         columns = [
-            pa.array([getattr(row, field.name) for row in rows], type=field.type)
-            for field in self._reference_schema
+            pa.array(list(map(getter, rows)), type=field_type)
+            for getter, field_type in self._reference_getters
         ]
         self._references_writer.write_batch(pa.record_batch(columns, schema=self._reference_schema))
 

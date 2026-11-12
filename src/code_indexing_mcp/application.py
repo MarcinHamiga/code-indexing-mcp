@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import logging
 import os
+import pickle
 import shutil
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import NamedTuple, Protocol, TypeVar, cast
+from typing import Any, NamedTuple, Protocol, TypeVar, cast
 
 from filelock import FileLock, Timeout
 from platformdirs import user_cache_path, user_data_path
@@ -36,6 +38,7 @@ from .git_state import (
 )
 from .git_state import slot_id as git_slot_id
 from .history import HistoryStore
+from .index_worker import IndexWorkerSession, _worker_pythonpath_extension
 from .indexing import Indexer
 from .maintenance import MaintenanceService
 from .models import (
@@ -440,6 +443,8 @@ class Application:
         embedder: Embedder | None = None,
         cwd: Path | None = None,
         settings: IndexSettings | None = None,
+        _enable_index_worker: bool | None = None,
+        _recover_on_start: bool = True,
     ) -> None:
         self.paths = paths
         paths.ensure_private()
@@ -456,6 +461,14 @@ class Application:
                 enable_cpu_mem_arena=self.settings.embedding_cpu_arena,
             )
         self.embedder = embedder
+        self._use_index_worker = (
+            isinstance(embedder, FastEmbedder) and self.settings.index_execution == "worker"
+            if _enable_index_worker is None
+            else _enable_index_worker
+        )
+        self._index_worker: IndexWorkerSession | None = None
+        self._index_worker_lock = threading.Lock()
+        self._index_worker_finalizer: weakref.finalize[Any, Any] | None = None
         self.store = LanceStore(
             paths.data / "lancedb",
             vector_dimension=embedder.dimension,
@@ -467,31 +480,32 @@ class Application:
         # mid-run left its row in "running"; every new process start is the
         # moment history learns that run never finished.
         self.history = HistoryStore(paths.data / "history")
-        self.history.mark_interrupted()
-        # Roll back any commit interrupted by a crash before queries are
-        # accepted, so a half-written project never becomes searchable. The
-        # global index lock keeps recovery from running underneath a commit
-        # another process is legitimately writing right now.
-        #
-        # Waiting that lock out is not an option: it is held for the length of
-        # an index run, and every CLI invocation and daemon start builds an
-        # Application. If a run is in flight, skip recovery -- that run commits
-        # or rolls back on its own, and anything left by an older crash is
-        # picked up by the next start that finds the lock free.
-        lock_directory = paths.data / "locks"
-        lock_directory.mkdir(parents=True, exist_ok=True)
-        try:
-            with FileLock(
-                lock_directory / "index-global.lock", timeout=RECOVERY_LOCK_TIMEOUT_SECONDS
-            ):
-                recover_staged_commits(
-                    paths.data / "staging", self.store, lock_directory=lock_directory
+        if _recover_on_start:
+            self.history.mark_interrupted()
+            # Roll back any commit interrupted by a crash before queries are
+            # accepted, so a half-written project never becomes searchable. The
+            # global index lock keeps recovery from running underneath a commit
+            # another process is legitimately writing right now.
+            #
+            # Waiting that lock out is not an option: it is held for the length of
+            # an index run, and every CLI invocation and daemon start builds an
+            # Application. If a run is in flight, skip recovery -- that run commits
+            # or rolls back on its own, and anything left by an older crash is
+            # picked up by the next start that finds the lock free.
+            lock_directory = paths.data / "locks"
+            lock_directory.mkdir(parents=True, exist_ok=True)
+            try:
+                with FileLock(
+                    lock_directory / "index-global.lock", timeout=RECOVERY_LOCK_TIMEOUT_SECONDS
+                ):
+                    recover_staged_commits(
+                        paths.data / "staging", self.store, lock_directory=lock_directory
+                    )
+            except Timeout:
+                logger.warning(
+                    "Skipping staged-commit recovery: an index run holds the global lock. "
+                    "Any commit interrupted earlier is rolled back on a later start."
                 )
-        except Timeout:
-            logger.warning(
-                "Skipping staged-commit recovery: an index run holds the global lock. "
-                "Any commit interrupted earlier is rolled back on a later start."
-            )
         # Backend and accelerator selection, with batch-size and crossover
         # calibration, is owned by BackendCoordinator (D1 in the split plan).
         # `self.backends` is the collaborator; the properties and methods
@@ -1044,6 +1058,47 @@ class Application:
                 ) from error
         raise AssertionError("repository query retry loop did not return")
 
+    def _get_index_worker(self) -> IndexWorkerSession:
+        with self._index_worker_lock:
+            if self._index_worker is None:
+                embedder_pickle = (
+                    None if isinstance(self.embedder, FastEmbedder) else pickle.dumps(self.embedder)
+                )
+                extra_env = (
+                    {}
+                    if isinstance(self.embedder, FastEmbedder)
+                    else _worker_pythonpath_extension(self.embedder)
+                )
+                session = IndexWorkerSession(
+                    self.paths,
+                    self.cwd,
+                    self.settings,
+                    embedder_pickle=embedder_pickle,
+                    extra_environment=extra_env,
+                )
+                self._index_worker = session
+                self._index_worker_finalizer = weakref.finalize(self, session.close)
+            return self._index_worker
+
+    def close_index_worker(self) -> None:
+        """Stop the persistent indexing worker subprocess, if started."""
+
+        with self._index_worker_lock:
+            session = self._index_worker
+            finalizer = self._index_worker_finalizer
+            self._index_worker = None
+            self._index_worker_finalizer = None
+        if finalizer is not None:
+            finalizer.detach()
+        if session is not None:
+            session.close()
+
+    def close(self) -> None:
+        """Shut down background worker subprocesses and flush storage state."""
+
+        self.close_index_worker()
+        self.store.close()
+
     def index_project(
         self,
         project: str | None = None,
@@ -1057,6 +1112,14 @@ class Application:
         resolved = self._resolve(project, roots)
         target = self._resolve_active_target(resolved)
         try:
+            if self._use_index_worker:
+                return self._get_index_worker().index(
+                    target,
+                    force=force,
+                    wait_for_lock=wait_for_lock,
+                    on_progress=on_progress,
+                    trigger=trigger,
+                )
             return self.indexer.index(
                 resolved,
                 target=target,
@@ -1100,35 +1163,61 @@ class Application:
             raise ValueError("reference target does not belong to project")
         return self._ensure_reference_target(target)
 
+    def _run_index_for_target(
+        self,
+        target: ActiveIndexTarget,
+        *,
+        wait_for_lock: bool = False,
+        trigger: IndexTrigger = "manual",
+    ) -> IndexReport:
+        if self._use_index_worker:
+            return self._get_index_worker().index(
+                target, wait_for_lock=wait_for_lock, trigger=trigger
+            )
+        return self.indexer.index(
+            target.project, target=target, wait_for_lock=wait_for_lock, trigger=trigger
+        )
+
+    def _run_backfill_for_target(
+        self,
+        target: ActiveIndexTarget,
+        *,
+        wait_for_lock: bool = False,
+        lock_timeout: float | None = None,
+        trigger: IndexTrigger = "reference-backfill",
+    ) -> ReferenceBackfillReport:
+        if self._use_index_worker:
+            return self._get_index_worker().backfill_references(
+                target,
+                wait_for_lock=wait_for_lock,
+                lock_timeout=lock_timeout,
+                trigger=trigger,
+            )
+        return self.indexer.backfill_references(
+            target.project,
+            target=target,
+            wait_for_lock=wait_for_lock,
+            lock_timeout=lock_timeout,
+            trigger=trigger,
+        )
+
     def _ensure_reference_target(self, target: ActiveIndexTarget) -> ReferenceBackfillReport:
         resolved = target.project
         changed = False
         if self._reference_target_is_stale(target):
             changed = True
-            self.indexer.index(
-                resolved,
-                target=target,
-                wait_for_lock=True,
-                trigger="lazy-query",
-            )
-        report = self.indexer.backfill_references(
-            resolved,
-            target=target,
+            self._run_index_for_target(target, wait_for_lock=True, trigger="lazy-query")
+        report = self._run_backfill_for_target(
+            target,
             wait_for_lock=True,
             lock_timeout=REFERENCE_LOCK_WAIT_SECONDS,
             trigger="reference-backfill",
         )
         if report.stale_paths:
             changed = True
-            self.indexer.index(
-                resolved,
-                target=target,
-                wait_for_lock=True,
-                trigger="lazy-query",
-            )
-            report = self.indexer.backfill_references(
-                resolved,
-                target=target,
+            self._run_index_for_target(target, wait_for_lock=True, trigger="lazy-query")
+            report = self._run_backfill_for_target(
+                target,
                 wait_for_lock=True,
                 lock_timeout=REFERENCE_LOCK_WAIT_SECONDS,
                 trigger="reference-backfill",

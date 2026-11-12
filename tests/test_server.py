@@ -3406,3 +3406,58 @@ async def test_schedule_does_not_hold_the_coordinator_lock_during_a_freshness_wa
         finally:
             release.set()
             await scheduling
+
+
+def test_has_indexable_change_filters_non_source_paths_without_spawning_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3: watcher pre-filter skips unsupported/excluded extensions before git check-ignore."""
+    import subprocess
+
+    from code_indexing_mcp.models import ScanConfig
+
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "docs").mkdir()
+    (root / "node_modules").mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / ".gitignore").write_text("*.tmp\n")
+    (root / "README.md").write_text("# readme\n")
+    (root / "docs" / "helper.py").write_text("x = 1\n")
+    (root / "src" / "main.py").write_text("def main():\n    return 1\n")
+
+    git_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def counting_run(
+        args: object, *pos: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[object]:
+        if isinstance(args, (list, tuple)) and args and str(args[0]) == "git":
+            git_calls.append([str(part) for part in args])
+        return real_run(args, *pos, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", counting_run)
+
+    scan = ScanConfig(exclude=["docs/**"])
+    assert not server_module._has_indexable_change(
+        root,
+        [
+            (2, str(root / "README.md")),
+            (2, str(root / "node_modules" / "dep.py")),
+            (2, str(root / "docs" / "helper.py")),
+            (2, str(root / ".git" / "index")),
+        ],
+        scan=scan,
+    )
+    assert git_calls == []
+
+    # Config / ignore files and supported non-excluded source files remain indexable.
+    assert server_module._has_indexable_change(root, [(2, str(root / ".gitignore"))], scan=scan)
+    assert server_module._has_indexable_change(
+        root, [(2, str(root / ".ci-mcp" / "project.toml"))], scan=scan
+    )
+    assert server_module._has_indexable_change(
+        root, [(2, str(root / "src" / "main.py"))], scan=scan
+    )
+    assert server_module._has_indexable_change(root, [(2, str(root / "src"))], scan=scan)
+    assert server_module._has_indexable_change(root, [(3, str(root / "deleted_no_ext"))], scan=scan)
