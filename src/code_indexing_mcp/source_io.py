@@ -16,6 +16,9 @@ _CHECK_JUNCTIONS = os.name == "nt"
 _SYMLINK_ERRNOS = frozenset(
     code for code in (getattr(errno, "ELOOP", None), getattr(errno, "EMLINK", None)) if code
 )
+# A pinned descriptor whose directory was deleted or replaced on disk fails
+# lookups with one of these; the path itself may be perfectly healthy.
+_STALE_ERRNOS = frozenset(code for code in (errno.ENOENT, getattr(errno, "ESTALE", None)) if code)
 
 
 class SourceReadError(OSError):
@@ -33,6 +36,11 @@ class PinnedDirectoryCache:
     ancestor chain pinned avoids reopening every directory component from
     *root* on each file. Descriptors outside the shared prefix are closed as
     soon as traversal moves elsewhere, and :meth:`close` releases the rest.
+
+    Pinned ancestors are matched by name only, so a directory that is deleted
+    and recreated (or renamed and replaced) while a scan is suspended leaves a
+    stale descriptor behind. ``open_source`` detects that and retries once from
+    a freshly walked chain; see ``_open_through_cache``.
     """
 
     def __init__(self, root: Path) -> None:
@@ -50,6 +58,11 @@ class PinnedDirectoryCache:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+    @property
+    def pinned(self) -> bool:
+        """Whether any descriptor from an earlier open is still held."""
+        return self._root_fd is not None
 
     def open_parent(self, parts: tuple[str, ...], relative: Path) -> int:
         """Return an open descriptor for *parts* under *root* without following symlinks."""
@@ -71,8 +84,14 @@ class PinnedDirectoryCache:
             try:
                 child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
             except OSError as exc:
+                # O_DIRECTORY | O_NOFOLLOW reports a symlinked directory as
+                # ENOTDIR rather than ELOOP, so ask the still-open parent what
+                # the component really is before the chain is released.
+                is_symlink = exc.errno in _SYMLINK_ERRNOS or (
+                    exc.errno == errno.ENOTDIR and _is_symlink_at(part, parent_fd)
+                )
                 self.close()
-                if exc.errno in _SYMLINK_ERRNOS:
+                if is_symlink:
                     raise SourceReadError("symlink", relative) from exc
                 if exc.errno == errno.ENOTDIR:
                     raise SourceReadError("not_directory", relative) from exc
@@ -97,6 +116,60 @@ class PinnedDirectoryCache:
                 os.close(root_fd)
 
 
+def _is_symlink_at(name: str, dir_fd: int) -> bool:
+    try:
+        return stat.S_ISLNK(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def _open_through_cache(
+    directory_cache: PinnedDirectoryCache,
+    relative: Path,
+    flags: int,
+    before: os.stat_result,
+) -> tuple[int, os.stat_result]:
+    """Open *relative* below the pinned chain, retrying once if the chain went stale.
+
+    A directory deleted and recreated, or renamed and replaced, between two
+    reads of one scan leaves the cache holding a descriptor for the old
+    directory: the leaf is then missing or is a different inode than the path
+    lstat just reported. Neither is evidence of tampering, so the chain is
+    dropped and walked again from *root* with the same O_NOFOLLOW checks. A
+    path that really was redirected fails that second, uncached attempt too.
+    """
+    for attempt in range(2):
+        may_be_stale = attempt == 0 and directory_cache.pinned
+        try:
+            parent_fd = directory_cache.open_parent(relative.parts[:-1], relative)
+            descriptor = os.open(relative.name, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            directory_cache.close()
+            if isinstance(exc, SourceReadError):
+                raise
+            if may_be_stale and exc.errno in _STALE_ERRNOS:
+                continue
+            if exc.errno in _SYMLINK_ERRNOS:
+                raise SourceReadError("symlink", relative) from exc
+            raise
+        try:
+            opened = os.fstat(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        if stat.S_ISREG(opened.st_mode) and (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
+            os.close(descriptor)
+            directory_cache.close()
+            if may_be_stale:
+                continue
+            raise SourceReadError("changed_during_open", relative)
+        return descriptor, opened
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def checked_source_stat(
     root: Path,
     relative: Path,
@@ -112,6 +185,14 @@ def checked_source_stat(
     rather than once per file. The final component is always lstat'd. Standalone
     reads never pass the set: ``open_source`` re-vets the whole chain unless
     paired with a scan's fresh stat and pinned directory cache.
+
+    The set trades freshness for speed, and callers keep it for a whole scan:
+    a vetted directory is not re-checked, so if it is swapped for a symlink
+    later in the same scan the returned metadata describes whatever the link
+    points at. That is acceptable only because the result is advisory. It may
+    feed size/mtime comparisons, but it must never authorize a read by path:
+    bytes are only ever returned through ``open_source``, whose O_NOFOLLOW
+    descriptor walk and ``(st_dev, st_ino)`` check do not trust this set.
     """
     if relative.is_absolute() or relative.drive or not relative.parts or ".." in relative.parts:
         raise SourceReadError("path_escapes_root", relative)
@@ -181,33 +262,28 @@ def open_source(
     directory: int | None = None
     descriptor: int | None = None
     try:
-        if os.open in os.supports_dir_fd:
-            if directory_cache is not None:
-                parent_fd = directory_cache.open_parent(relative.parts[:-1], relative)
-            else:
-                directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-                directory = os.open(root, directory_flags)
-                for part in relative.parts[:-1]:
-                    child = os.open(part, directory_flags, dir_fd=directory)
-                    os.close(directory)
-                    directory = child
-                parent_fd = directory
+        if os.open not in os.supports_dir_fd:
+            descriptor = windows_source_io.open_source(root, relative)
+            opened = os.fstat(descriptor)
+        elif directory_cache is not None:
+            descriptor, opened = _open_through_cache(directory_cache, relative, flags, before)
+        else:
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            directory = os.open(root, directory_flags)
+            for part in relative.parts[:-1]:
+                child = os.open(part, directory_flags, dir_fd=directory)
+                os.close(directory)
+                directory = child
             try:
-                descriptor = os.open(relative.name, flags, dir_fd=parent_fd)
+                descriptor = os.open(relative.name, flags, dir_fd=directory)
             except OSError as exc:
-                if directory_cache is not None:
-                    directory_cache.close()
                 if exc.errno in _SYMLINK_ERRNOS:
                     raise SourceReadError("symlink", relative) from exc
                 raise
-        else:
-            descriptor = windows_source_io.open_source(root, relative)
-        opened = os.fstat(descriptor)
+            opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise SourceReadError("not_regular", relative)
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-            if directory_cache is not None:
-                directory_cache.close()
             raise SourceReadError("changed_during_open", relative)
         if opened.st_size > max_bytes:
             raise SourceReadError("oversized", relative)

@@ -1,6 +1,7 @@
 """Source access rejects unsafe live paths before reading their contents."""
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -251,6 +252,81 @@ def test_pinned_directory_cache_rejects_mid_scan_directory_symlink_swap(tmp_path
         (root / "sub").rename(tmp_path / "sub_moved")
         (root / "sub").symlink_to(outside, target_is_directory=True)
 
+        # The vetted set is not re-checked, so the stat follows the new link...
         st_two = checked_source_stat(root, Path("sub/two.py"), vetted_directories=vetted)
-        with pytest.raises(SourceReadError, match="changed_during_open"):
+        assert st_two.st_ino == (outside / "two.py").stat().st_ino
+        # ...but the read does not: the pinned descriptor yields a different
+        # inode, and the fresh chain walked on retry refuses the symlink.
+        with pytest.raises(SourceReadError, match="symlink") as raised:
             read_source(root, Path("sub/two.py"), 1024, expected_stat=st_two, directory_cache=cache)
+        assert raised.value.reason == "symlink"
+        assert not cache.pinned
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.open not in os.supports_dir_fd,
+    reason="POSIX symlink + dir_fd race check",
+)
+def test_pinned_directory_cache_reports_unpinned_symlinked_directory_as_symlink(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "one.py").write_bytes(b"inside_one = 1\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "one.py").write_bytes(b"OUTSIDE_SECRET = 99\n")
+
+    vetted: set[Path] = set()
+    with PinnedDirectoryCache(root) as cache:
+        # Vetted by a stat that never read, so `sub` is trusted but not pinned.
+        checked_source_stat(root, Path("sub/one.py"), vetted_directories=vetted)
+        (root / "sub").rename(tmp_path / "sub_moved")
+        (root / "sub").symlink_to(outside, target_is_directory=True)
+
+        st = checked_source_stat(root, Path("sub/one.py"), vetted_directories=vetted)
+        # O_DIRECTORY | O_NOFOLLOW answers ENOTDIR here; the reason must still say symlink.
+        with pytest.raises(SourceReadError) as raised:
+            read_source(root, Path("sub/one.py"), 1024, expected_stat=st, directory_cache=cache)
+        assert raised.value.reason == "symlink"
+
+    (tmp_path / "plain").write_bytes(b"not a directory\n")
+    with PinnedDirectoryCache(tmp_path) as cache:
+        with pytest.raises(SourceReadError) as raised:
+            cache.open_parent(("plain",), Path("plain/x.py"))
+        assert raised.value.reason == "not_directory"
+
+
+@pytest.mark.skipif(os.open not in os.supports_dir_fd, reason="POSIX dir_fd cache")
+@pytest.mark.parametrize("replace", ["delete", "rename"])
+def test_pinned_directory_cache_recovers_when_a_pinned_directory_is_recreated(
+    tmp_path: Path, replace: str
+) -> None:
+    root = tmp_path / "repo"
+    (root / "gen").mkdir(parents=True)
+    (root / "gen" / "one.py").write_bytes(b"one = 1\n")
+    (root / "gen" / "two.py").write_bytes(b"two = 1\n")
+
+    vetted: set[Path] = set()
+    with PinnedDirectoryCache(root) as cache:
+        st_one = checked_source_stat(root, Path("gen/one.py"), vetted_directories=vetted)
+        read_source(root, Path("gen/one.py"), 1024, expected_stat=st_one, directory_cache=cache)
+
+        # A generator or checkout replaces the pinned directory between two reads.
+        if replace == "delete":
+            shutil.rmtree(root / "gen")
+        else:
+            (root / "gen").rename(tmp_path / "gen_old")
+        (root / "gen").mkdir()
+        (root / "gen" / "two.py").write_bytes(b"two = 2\n")
+
+        st_two = checked_source_stat(root, Path("gen/two.py"), vetted_directories=vetted)
+        data, _ = read_source(
+            root, Path("gen/two.py"), 1024, expected_stat=st_two, directory_cache=cache
+        )
+        assert data == b"two = 2\n"
+
+        # A file that is genuinely gone still fails, and only after one retry.
+        (root / "gen" / "two.py").unlink()
+        with pytest.raises(FileNotFoundError):
+            read_source(root, Path("gen/two.py"), 1024, expected_stat=st_two, directory_cache=cache)

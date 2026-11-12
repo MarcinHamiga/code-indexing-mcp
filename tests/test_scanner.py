@@ -949,3 +949,62 @@ def test_early_iter_scan_close_releases_pinned_directory_descriptors(
     assert close is not None
     close()
     assert live_fds == set()
+
+
+def test_default_includes_ignore_directory_names_that_look_like_extensions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    (root / "chart.js").mkdir(parents=True)
+    project = initialize_project(root)
+    (root / "chart.js" / "index.js").write_text("var a = 1;\n")
+    (root / "chart.js" / "Legacy.JS").write_text("var b = 1;\n")
+
+    # Default list: only the file's own exact-case extension counts. As a
+    # gitignore pattern `**/*.js` would match everything below `chart.js/`.
+    result = SourceScanner().scan(project)
+    assert [item.path.as_posix() for item in result.files] == ["chart.js/index.js"]
+    assert ("chart.js/Legacy.JS", "unsupported") in {
+        (skip.path.as_posix(), skip.reason) for skip in result.skipped
+    }
+
+    # A customized list keeps gitignore semantics and can opt upper case back in.
+    custom = project.model_copy(
+        update={"scan": project.scan.model_copy(update={"include": ["**/*.js", "**/*.JS"]})}
+    )
+    assert [item.path.as_posix() for item in SourceScanner().scan(custom).files] == [
+        "chart.js/Legacy.JS",
+        "chart.js/index.js",
+    ]
+
+
+@pytest.mark.parametrize("replace", ["delete", "rename"])
+def test_iter_scan_keeps_files_of_a_directory_recreated_mid_scan(
+    tmp_path: Path, replace: str
+) -> None:
+    import os
+    import shutil
+
+    if os.open not in os.supports_dir_fd:
+        pytest.skip("POSIX dir_fd cache")
+    root = tmp_path / "repo"
+    (root / "gen").mkdir(parents=True)
+    names = ("a.py", "b.py", "c.py")
+    for name in names:
+        (root / "gen" / name).write_bytes(b"x = 1\n")
+    project = initialize_project(root)
+
+    seen: list[tuple[str, bytes | None]] = []
+    for index, item in enumerate(SourceScanner().iter_scan(project, read_contents=True)):
+        assert isinstance(item, ScannedFile), item
+        seen.append((item.path.as_posix(), item.content))
+        if index == 0:
+            if replace == "delete":
+                shutil.rmtree(root / "gen")
+            else:
+                (root / "gen").rename(tmp_path / "gen_old")
+            (root / "gen").mkdir()
+            for name in names:
+                (root / "gen" / name).write_bytes(b"x = 2\n")
+
+    assert seen == [("gen/a.py", b"x = 1\n"), ("gen/b.py", b"x = 2\n"), ("gen/c.py", b"x = 2\n")]

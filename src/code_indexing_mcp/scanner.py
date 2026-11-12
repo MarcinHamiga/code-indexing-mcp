@@ -151,8 +151,17 @@ class SourceScanner:
 
         ``DEFAULT_INCLUDES`` carries one ``**/*.<ext>`` pattern per entry in
         :data:`LANGUAGES`, so a case-sensitive suffix membership check against
-        ``LANGUAGES`` answers the exact same question without evaluating 44
-        compiled regular expressions per candidate.
+        ``LANGUAGES`` replaces 44 compiled regular expressions per candidate.
+
+        The two are deliberately not identical. A gitignore-style pattern such
+        as ``**/*.js`` also matches every file *below a directory* whose name
+        ends in ``.js``, so the compiled default list used to admit
+        ``chart.js/Legacy.JS`` while rejecting a top-level ``Legacy.JS``. The
+        suffix check looks at the file's own name only: with the default list
+        a file is included exactly when its extension is a ``LANGUAGES`` key
+        in the same (lower) case, wherever it sits. A customized list is still
+        compiled and keeps full gitignore semantics, so an explicit
+        ``**/*.JS`` pattern opts upper-case extensions back in.
         """
         if list(include) == DEFAULT_INCLUDES:
             return None
