@@ -29,7 +29,8 @@ def standalone() -> None:
     assert ("function", "standalone") in symbols
     class_chunk = next(chunk for chunk in result.chunks if chunk.kind == "class")
     assert class_chunk.content.startswith("@registered\nclass Greeter:")
-    assert "def hello" not in class_chunk.content
+    assert "def hello(self, name: str) -> str: ..." in class_chunk.content
+    assert 'return f"Hello {name}"' not in class_chunk.content
     assert any(chunk.kind == "module" and "import os" in chunk.content for chunk in result.chunks)
 
 
@@ -468,7 +469,8 @@ class Outer {
     } <= symbols
     record_chunk = next(chunk for chunk in result.chunks if chunk.kind == "record")
     assert record_chunk.content.startswith("record User(String name)")
-    assert "String value()" not in record_chunk.content
+    assert "String value() { ... }" in record_chunk.content
+    assert "return name;" not in record_chunk.content
 
 
 def test_extracts_csharp_symbols_with_precise_kinds_and_nested_qualification() -> None:
@@ -895,8 +897,11 @@ def test_container_chunks_stop_before_nested_type_declarations() -> None:
 
     outer = next(chunk for chunk in result.chunks if chunk.qualified_symbol == "Outer")
     inner = next(chunk for chunk in result.chunks if chunk.qualified_symbol == "Outer.Inner")
-    assert outer.content == "class Outer {"
-    assert inner.content == "class Inner {"
+    assert outer.content == "class Outer {\n    class Inner { ... }\n}"
+    assert "void work()" not in outer.content
+    assert (outer.start_line, outer.end_line) == (1, 1)
+    assert inner.content == "class Inner {\n        void work() { ... }\n    }"
+    assert (inner.start_line, inner.end_line) == (2, 2)
 
 
 def test_python_closures_are_qualified_through_the_enclosing_callable() -> None:
@@ -1175,3 +1180,165 @@ def test_a_missing_pack_grammar_only_fails_its_own_language() -> None:
     with pytest.raises(OSError):
         extractor.extract(Path("a.vue"), "vue", b"<template></template>")
     assert extractor.extract(Path("a.py"), "python", b"def f():\n    pass\n").chunks
+
+
+def test_typescript_nestjs_class_attaches_trivia_and_emits_compact_skeleton() -> None:
+    source = b"""// File license header
+
+/** Auth service JSDoc */
+@Injectable()
+export class AuthService {
+  constructor(private readonly repo: UserRepo) {}
+
+  /**
+   * Fetch user by id.
+   */
+  @ApiResponse({
+    status: 200,
+    description: 'User found',
+  })
+  @Get(':id')
+  @UseGuards(AuthGuard)
+  async findOne(id: string): Promise<User> {
+    return this.repo.find(id);
+  }
+
+  private readonly timeout = 5000;
+
+  @Post('create')
+  create(name: string) {
+    return { name };
+  }
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("auth.service.ts"), "typescript", source)
+
+    # Blank-line-separated file header stays a separate module chunk.
+    modules = [chunk for chunk in result.chunks if chunk.kind == "module"]
+    assert [chunk.content for chunk in modules] == ["// File license header"]
+
+    # Zero decorator-only or JSDoc-only class_part chunks; only the field gap remains.
+    parts = [chunk for chunk in result.chunks if chunk.kind == "class_part"]
+    assert len(parts) == 1
+    assert parts[0].content.strip() == "private readonly timeout = 5000;"
+
+    cls = next(chunk for chunk in result.chunks if chunk.kind == "class")
+    assert (cls.start_line, cls.end_line) == (3, 5)
+    assert cls.content.startswith(
+        "/** Auth service JSDoc */\n@Injectable()\nexport class AuthService {"
+    )
+    assert "constructor(private readonly repo: UserRepo) { ... }" in cls.content
+    assert (
+        "@Get(':id') @UseGuards(AuthGuard) async findOne(id: string): Promise<User> { ... }"
+        in cls.content
+    )
+    assert "@Post('create') create(name: string) { ... }" in cls.content
+    assert "@ApiResponse" not in cls.content
+    assert "Fetch user by id." not in cls.content
+    assert "this.repo.find" not in cls.content
+    assert cls.content.endswith("\n}")
+
+    find_one = next(
+        chunk for chunk in result.chunks if chunk.qualified_symbol == "AuthService.findOne"
+    )
+    assert find_one.content.startswith("/**\n   * Fetch user by id.\n   */")
+    assert "@ApiResponse" in find_one.content
+    assert "@Get(':id')" in find_one.content
+    assert "@UseGuards(AuthGuard)" in find_one.content
+
+    create = next(
+        chunk for chunk in result.chunks if chunk.qualified_symbol == "AuthService.create"
+    )
+    assert create.content.startswith("@Post('create')")
+
+
+def test_top_level_leading_trivia_attachment_and_boundaries() -> None:
+    source = b"""// File license header
+
+/** Documented helper. */
+export function helper(x: number): number {
+  return x + 1;
+}
+
+const a = 1; // inline trailing note
+function b() {
+  return a;
+}
+"""
+
+    result = TreeSitterExtractor().extract(Path("utils.ts"), "typescript", source)
+
+    modules = [chunk for chunk in result.chunks if chunk.kind == "module"]
+    assert [chunk.content.strip() for chunk in modules] == [
+        "// File license header",
+        "const a = 1; // inline trailing note",
+    ]
+    helper = next(chunk for chunk in result.chunks if chunk.qualified_symbol == "helper")
+    assert helper.content.startswith("/** Documented helper. */\nexport function helper")
+    func_b = next(chunk for chunk in result.chunks if chunk.qualified_symbol == "b")
+    assert func_b.content.startswith("function b()")
+    assert "inline trailing note" not in func_b.content
+
+
+def test_python_shebang_and_rust_test_attributes_with_comments() -> None:
+    py_source = b"""#!/usr/bin/env python3
+def main():
+    return 1
+"""
+    py_result = TreeSitterExtractor().extract(Path("cli.py"), "python", py_source)
+    assert [chunk.kind for chunk in py_result.chunks] == ["module", "function"]
+    py_fn = next(chunk for chunk in py_result.chunks if chunk.kind == "function")
+    assert py_fn.content.startswith("def main():")
+
+    rs_source = b"""#![allow(dead_code)]
+
+pub fn prod() {}
+
+// plain note before test
+#[test]
+fn handles_case() {}
+"""
+    rs_result = TreeSitterExtractor().extract(Path("lib.rs"), "rust", rs_source)
+    mod_chunk = next(chunk for chunk in rs_result.chunks if chunk.kind == "module")
+    assert mod_chunk.content == "#![allow(dead_code)]"
+    assert mod_chunk.is_test is False
+    prod_chunk = next(chunk for chunk in rs_result.chunks if chunk.qualified_symbol == "prod")
+    assert prod_chunk.is_test is False
+    test_chunk = next(
+        chunk for chunk in rs_result.chunks if chunk.qualified_symbol == "handles_case"
+    )
+    assert test_chunk.is_test is True
+    assert test_chunk.content.startswith("// plain note before test\n#[test]\nfn handles_case()")
+
+
+def test_compact_skeleton_caps_large_classes_and_leaves_config_containers_unchanged() -> None:
+    methods = "\n".join(f"  m{i}() {{ return {i}; }}" for i in range(80))
+    ts_source = f"export class Big {{\n{methods}\n}}\n".encode()
+    ts_result = TreeSitterExtractor().extract(Path("big.ts"), "typescript", ts_source)
+    big = next(chunk for chunk in ts_result.chunks if chunk.kind == "class")
+    assert len(big.content) <= 2_000
+    assert big.content.count("\n") + 1 <= 60
+    assert "// ... (+23 more members)" in big.content
+    assert big.content.endswith("\n}")
+    assert (big.start_line, big.end_line) == (1, 1)
+
+    py_methods = "\n".join(f"    def m{i}(self):\n        return {i}" for i in range(80))
+    py_source = f"class BigPy:\n{py_methods}\n".encode()
+    py_result = TreeSitterExtractor().extract(Path("big.py"), "python", py_source)
+    big_py = next(chunk for chunk in py_result.chunks if chunk.kind == "class")
+    assert len(big_py.content) <= 2_000
+    assert big_py.content.count("\n") + 1 <= 60
+    assert "# ... (+22 more members)" in big_py.content
+
+    yaml_source = b'services:\n  web:\n    ports:\n      - "80:80"\n'
+    yaml_result = TreeSitterExtractor().extract(Path("compose.yaml"), "yaml", yaml_source)
+    services = next(chunk for chunk in yaml_result.chunks if chunk.qualified_symbol == "services")
+    assert services.content == "services:"
+
+    json_source = b'{"services": {"web": {"ports": ["80:80"]}}}\n'
+    json_result = TreeSitterExtractor().extract(Path("pkg.json"), "json", json_source)
+    json_services = next(
+        chunk for chunk in json_result.chunks if chunk.qualified_symbol == "services"
+    )
+    assert json_services.content == '"services": {'

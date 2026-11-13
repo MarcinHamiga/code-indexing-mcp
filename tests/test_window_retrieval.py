@@ -68,7 +68,7 @@ class AdaptiveEmbedder(SemanticEmbedder):
 
 
 SOURCE = (
-    "# π and 世界 before the declaration\n"
+    "# π and 世界 before the declaration\n\n"
     "def process_data(user):\n"
     "    beginning_marker = 'héllo 世界'\n"
     + "".join(f"    stage_{i} = user.value + {i}\n" for i in range(8))

@@ -195,7 +195,7 @@ def test_multi_project_search_is_deterministic_across_concurrent_runs(
 
     assert len(baseline.hits) == 5
     assert {hit.project_id for hit in baseline.hits} == set(project_ids)
-    assert [hit.score for hit in baseline.hits] == pytest.approx([1 / 61] * 5)
+    assert [hit.score for hit in baseline.hits] == pytest.approx([0.85 / 61] * 5)
 
 
 def test_multi_project_vector_relevance_is_independent_of_project_order(tmp_path: Path) -> None:
@@ -206,7 +206,7 @@ def test_multi_project_vector_relevance_is_independent_of_project_order(tmp_path
         assert [hit.symbol for hit in hits] == ["enforce_permissions"]
         rows = store.hybrid_search("authorization", [1.0, 0.0, 0.0, 0.0], order, None, 2)
         assert [row["symbol"] for row in rows] == ["enforce_permissions", "create_invoice"]
-        assert [row["_relevance_score"] for row in rows] == pytest.approx([1 / 61, 1 / 62])
+        assert [row["_relevance_score"] for row in rows] == pytest.approx([0.85 / 61, 0.85 / 62])
 
 
 def test_partition_lexical_winners_share_rank_before_global_fusion(tmp_path: Path) -> None:
@@ -216,7 +216,9 @@ def test_partition_lexical_winners_share_rank_before_global_fusion(tmp_path: Pat
     for order in (projects, list(reversed(projects))):
         rows = store.hybrid_search("return", [1.0, 0.0, 0.0, 0.0], order, None, 2)
         assert [row["symbol"] for row in rows] == ["enforce_permissions", "create_invoice"]
-        assert [row["_relevance_score"] for row in rows] == pytest.approx([2 / 61, 1 / 61 + 1 / 62])
+        assert [row["_relevance_score"] for row in rows] == pytest.approx(
+            [(0.85 + 1.15) / 61, 1.15 / 61 + 0.85 / 62]
+        )
 
 
 def test_symbol_lookup_and_outline_use_indexed_metadata(tmp_path: Path) -> None:
@@ -871,3 +873,24 @@ def test_path_pushdown_adds_the_literal_prefix_conjunct(tmp_path: Path) -> None:
     assert conditions[0] is not None
     assert "starts_with(path, 'src/pkg7/')" in conditions[0]
     assert "regexp_like(path," in conditions[0]
+
+
+def test_search_code_ranks_identifier_match_ahead_of_short_comment_chunk(tmp_path: Path) -> None:
+    search, project = _indexed_tree(
+        tmp_path,
+        {
+            "src/notes.py": "# totp\n",
+            "src/auth.py": "def verify_totp(secret, code):\n    return secret == code\n",
+        },
+    )
+
+    response = search.search_code("totp", [project])
+
+    assert len(response.hits) == 2
+    assert response.hits[0].symbol == "verify_totp"
+    assert response.hits[0].explanation is not None
+    assert response.hits[1].explanation is not None
+    assert response.hits[0].explanation.fts_rank == 1
+    assert (response.hits[0].explanation.fts_score or 0.0) > (
+        response.hits[1].explanation.fts_score or 0.0
+    )

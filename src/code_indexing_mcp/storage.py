@@ -88,7 +88,11 @@ logger = logging.getLogger(__name__)
 # lookup can filter production code vs. tests/benchmarks before ranking.
 # Version 9 invalidates v8 partitions so TypeScript and TSX files populate
 # `is_test` on re-index.
-SCHEMA_VERSION = 9
+# Version 10 updates chunk boundaries and code container skeletons so
+# declarations include preceding sibling decorators/adjacent doc comments and
+# code containers carry compact member signatures, forcing stale partitions to
+# rebuild cleanly.
+SCHEMA_VERSION = 10
 
 # Symbol lookups page through the SQL prefilter's candidates. These bound each
 # page, not the total scan needed to find the caller's literal matches.
@@ -131,6 +135,16 @@ VECTOR_INDEX_MIN_ROWS = 20_000
 # constants rather than settings: CODE_INDEXING_VECTOR_INDEX is enough surface.
 VECTOR_INDEX_EF = 100
 VECTOR_INDEX_REFINE_FACTOR = 2
+
+# Hybrid search ranking tuning. Boosting identifier_terms over content keeps
+# symbol/path matches ahead of short comments or i18n prose dictionaries; mild
+# lexical tilt and anonymous-module damping reinforce named code declarations
+# without suppressing module-level chunks when queried directly.
+FTS_CONTENT_BOOST = 1.0
+FTS_IDENTIFIER_BOOST = 2.0
+RRF_VECTOR_WEIGHT = 0.85
+RRF_FTS_WEIGHT = 1.15
+RRF_MODULE_DAMPING = 0.85
 
 # Columns get_chunk reads. The vector and the identifier-terms column are
 # excluded: nothing outside indexing and ranking can use them, and reading them
@@ -2147,7 +2161,11 @@ class LanceStore:
             for signal in ("_distance", "_fts_local_rank"):
                 if signal in row:
                     existing[signal] = min(row[signal], existing.get(signal, float("inf")))
-        for signal in ("_distance", "_fts_local_rank"):
+        signal_weights = (
+            ("_distance", RRF_VECTOR_WEIGHT),
+            ("_fts_local_rank", RRF_FTS_WEIGHT),
+        )
+        for signal, weight in signal_weights:
             candidates = sorted(
                 (row for row in merged.values() if signal in row),
                 key=lambda row: (row[signal], row["chunk_id"]),
@@ -2158,7 +2176,10 @@ class LanceStore:
                 if row[signal] != previous:
                     rank = position
                     previous = row[signal]
-                row["_relevance_score"] += 1.0 / (60 + rank)
+                row["_relevance_score"] += weight / (60 + rank)
+        for row in merged.values():
+            if row.get("kind") == "module" and not row.get("symbol"):
+                row["_relevance_score"] *= RRF_MODULE_DAMPING
         return sorted(
             merged.values(),
             key=lambda row: (
@@ -2259,7 +2280,7 @@ class LanceStore:
             MultiMatchQuery(
                 query_text,
                 ["content", "identifier_terms"],
-                boosts=None,
+                boosts=[FTS_CONTENT_BOOST, FTS_IDENTIFIER_BOOST],
                 operator=FullTextOperator.OR,
             ),
             query_type="fts",
@@ -2445,6 +2466,10 @@ class LanceStore:
             return []
         scoped = f"chunk_id IN ({', '.join(_quoted(chunk_id) for chunk_id in wanted)})"
         combined = f"({condition}) AND {scoped}" if condition else scoped
+        fts_boosts = {
+            "content": FTS_CONTENT_BOOST,
+            "identifier_terms": FTS_IDENTIFIER_BOOST,
+        }
         fts_best: dict[str, float] = {}
         for column in _FTS_PROBE_COLUMNS:
             try:
@@ -2464,9 +2489,10 @@ class LanceStore:
                     exc_info=True,
                 )
                 continue
+            boost = fts_boosts[column]
             for probe_row in probe_rows:
                 chunk_id = str(probe_row["chunk_id"])
-                score = float(probe_row.get("_score", 0.0))
+                score = float(probe_row.get("_score", 0.0)) * boost
                 if score > fts_best.get(chunk_id, float("-inf")):
                     fts_best[chunk_id] = score
         precomputed = known_vector_scores or {}
