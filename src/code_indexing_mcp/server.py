@@ -84,9 +84,10 @@ SERVER_INSTRUCTIONS = (
     "(file structure before reading), changed_symbols (declarations touched since a commit), "
     "get_chunk (exact code for a "
     "search hit). Search and symbol tools default to scope='code' (excluding detected C#, Python, "
-    "Java, and Rust tests/benchmarks); pass scope='tests' or scope='all' when inspecting test "
-    "coverage. When correlating code across explicitly related services, use list_projects "
-    "to discover them and search_across_projects to search the selected repositories together. "
+    "Java, Rust, and TypeScript/TSX tests/benchmarks); pass scope='tests' or scope='all' when "
+    "inspecting test coverage. When correlating code across explicitly related services, use "
+    "list_projects to discover them and search_across_projects to search the selected repositories "
+    "together. "
     "Check list_projects/project_status for index freshness first and run index_project if the "
     "index is missing or stale. If INDEX_BUSY reports background work, poll project_status "
     "and retry when ready; do not restart the server or force another rebuild."
@@ -94,8 +95,8 @@ SERVER_INSTRUCTIONS = (
 
 _SCOPE_DESCRIPTION = (
     "Which indexed chunks to search: 'code' (default) excludes detected tests and benchmarks "
-    "in C#, Python, Java, and Rust; 'tests' returns only detected test/benchmark chunks; "
-    "'all' searches both code and tests."
+    "in C#, Python, Java, Rust, and TypeScript/TSX; 'tests' returns only detected test/benchmark "
+    "chunks; 'all' searches both code and tests."
 )
 
 # Bounds on the retry cadence used while another indexing job holds the global
@@ -1803,8 +1804,8 @@ def create_server(
             "Find indexed code chunks most similar to a pasted code snippet. Extracts declaration "
             "metadata with the production extractor to weight the match, returning ranked code "
             "snippets with project and path metadata. Defaults to scope='code' (excluding "
-            "detected C#, Python, Java, and Rust tests/benchmarks); pass scope='tests' or 'all' "
-            "to include test chunks."
+            "detected C#, Python, Java, Rust, and TypeScript/TSX tests/benchmarks); pass "
+            "scope='tests' or 'all' to include test chunks."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -2037,9 +2038,9 @@ def create_server(
             "Look up indexed code chunks by symbol name, matching exactly, by prefix, or by "
             "substring. Returns hits ordered by path and line, each with a snippet and a "
             "chunk_id. Matches declaration names only — not call sites, imports, or other "
-            "references. Defaults to scope='code' (excluding detected C#, Python, Java, and "
-            "Rust tests/benchmarks); pass scope='tests' or 'all' when looking up test symbols. "
-            "For a conceptual query rather than a known name, search_code applies. A "
+            "references. Defaults to scope='code' (excluding detected C#, Python, Java, Rust, and "
+            "TypeScript/TSX tests/benchmarks); pass scope='tests' or 'all' when looking up test "
+            "symbols. For a conceptual query rather than a known name, search_code applies. A "
             "root that is not registered yet is registered and indexed before the first query is "
             "answered; later queries refresh it when source metadata has changed."
         ),
