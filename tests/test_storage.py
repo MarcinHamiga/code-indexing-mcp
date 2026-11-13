@@ -23,7 +23,7 @@ from lancedb.query import LanceVectorQueryBuilder
 from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
-from code_indexing_mcp.errors import ErrorCode
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.git_state import (
     GitProbeOutcome,
     GitState,
@@ -3694,3 +3694,53 @@ def test_find_symbol_chunks_treats_backslashes_and_wildcards_literally(tmp_path:
     assert found("_b", "contains") == ["a_b"]
     assert found("%", "contains") == ["50%off"]
     assert found("50%", "prefix") == ["50%off"]
+
+
+def test_chunk_schema_includes_original_end_byte_and_validates_siblings(tmp_path: Path) -> None:
+    from code_indexing_mcp.models import CodeChunk, IndexedChunk
+
+    schema = LanceStore.chunk_arrow_schema(4, pa.float16())
+    assert "original_end_byte" in schema.names
+    assert schema.field("original_end_byte").type == pa.int64()
+    assert "original_end_byte" in IndexedChunk.model_fields
+    assert "original_end_byte" not in CodeChunk.model_fields
+
+    row = {
+        "chunk_id": "p:0",
+        "file_id": "f:0",
+        "path": "compact.ts",
+        "language": "typescript",
+        "kind": "class",
+        "symbol": "CompactRepo",
+        "qualified_symbol": "CompactRepo",
+        "parent_symbol": None,
+        "start_byte": 10,
+        "end_byte": 15,
+        "start_line": 2,
+        "end_line": 2,
+        "content": "hello",
+        "content_hash": "h",
+        "part_index": 0,
+        "source_start_byte": 10,
+        "source_end_byte": 20,
+        "original_end_byte": 12,
+    }
+    sibling = {
+        **row,
+        "chunk_id": "p:1",
+        "start_byte": 15,
+        "end_byte": 20,
+        "content": "world",
+        "original_end_byte": 12,
+    }
+    reconstructed = LanceStore._reconstruct_source_chunk(row, [row, sibling])
+    assert reconstructed["content"] == "helloworld"
+    assert (reconstructed["start_byte"], reconstructed["end_byte"]) == (10, 12)
+    assert (reconstructed["start_line"], reconstructed["end_line"]) == (2, 2)
+
+    with pytest.raises(CodeIndexingError) as invalid:
+        LanceStore._reconstruct_source_chunk(
+            row,
+            [{**row, "original_end_byte": 5}, {**sibling, "original_end_byte": 5}],
+        )
+    assert invalid.value.code is ErrorCode.INDEX_INCOMPATIBLE

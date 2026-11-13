@@ -2119,17 +2119,31 @@ class Indexer:
         return windowed
 
     @staticmethod
+    def _is_synthetic_chunk(chunk: ExtractedChunk) -> bool:
+        """Whether *chunk.content* was synthesized rather than sliced verbatim from source."""
+        return (
+            chunk.end_line < chunk.start_line + chunk.content.count("\n")
+            or len(chunk.content.encode("utf-8")) > chunk.end_byte - chunk.start_byte
+        )
+
+    @staticmethod
     def _window_chunk(chunk: ExtractedChunk, segment: EmbeddedSegment) -> ExtractedChunk:
         """Rebuild a chunk around one token window of its content.
 
-        Byte and line offsets are derived from the window's character offsets
-        against the chunk's own content, so they stay anchored to the source
-        without re-decoding the file.
+        Byte offsets derive from the window's character offsets against the
+        chunk's own content so coverage can be checked and each window keeps a
+        distinct id. Verbatim source chunks also derive line offsets from
+        ``head`` and ``content``; synthesized container skeletons keep the
+        extracted header's true source line span and preserve ``chunk.end_byte``
+        in ``original_end_byte`` so retrieval and outline queries stay anchored
+        to the header rather than synthetic skeleton lines.
         """
         head = chunk.content[: segment.start_char]
         content = chunk.content[segment.start_char : segment.end_char]
         start_byte = chunk.start_byte + len(head.encode("utf-8"))
-        start_line = chunk.start_line + head.count("\n")
+        synthetic = Indexer._is_synthetic_chunk(chunk)
+        start_line = chunk.start_line if synthetic else chunk.start_line + head.count("\n")
+        end_line = chunk.end_line if synthetic else start_line + content.count("\n")
         embedding_text = compose_passage(chunk.embedding_prefix, content)
         # search_suffix (the normalized identifier terms) is deliberately not
         # recomputed per window: it derives from the path and qualified name,
@@ -2139,7 +2153,7 @@ class Indexer:
                 "start_byte": start_byte,
                 "end_byte": start_byte + len(content.encode("utf-8")),
                 "start_line": start_line,
-                "end_line": start_line + content.count("\n"),
+                "end_line": end_line,
                 "content": content,
                 "embedding_text": embedding_text,
                 "source_start_byte": chunk.start_byte,
@@ -2147,6 +2161,7 @@ class Indexer:
                 # while keeping a wider syntax span. Retrieval bounds describe
                 # the actual stored text so coverage can be checked exactly.
                 "source_end_byte": chunk.start_byte + len(chunk.content.encode("utf-8")),
+                "original_end_byte": chunk.end_byte if synthetic else None,
                 # The file hash scopes sibling windows to one generation; this
                 # identifies the source chunk itself, so equal code in pinned
                 # checkouts that differ elsewhere in the file stays one result.
@@ -2335,5 +2350,6 @@ class Indexer:
             content_hash=file.content_hash,
             source_start_byte=chunk.source_start_byte,
             source_end_byte=chunk.source_end_byte,
+            original_end_byte=chunk.original_end_byte,
             source_content_hash=chunk.source_content_hash,
         )

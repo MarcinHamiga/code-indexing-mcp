@@ -169,6 +169,7 @@ CHUNK_PAYLOAD_COLUMNS = [
     "part_index",
     "source_start_byte",
     "source_end_byte",
+    "original_end_byte",
 ]
 
 # Every chunk column except the vector. list_chunks has no production caller and its
@@ -193,6 +194,7 @@ INDEXED_CHUNK_COLUMNS = [
     "is_test",
     "source_start_byte",
     "source_end_byte",
+    "original_end_byte",
     "source_content_hash",
 ]
 
@@ -2030,11 +2032,29 @@ class LanceStore:
                 "Stored embedding windows leave a gap in the source chunk; reindex",
                 chunk_id=row["chunk_id"],
             )
+        original_ends = {
+            None if window.get("original_end_byte") is None else int(window["original_end_byte"])
+            for window in ordered
+        }
+        if len(original_ends) != 1:
+            raise CodeIndexingError(
+                ErrorCode.INDEX_INCOMPATIBLE,
+                "Stored embedding windows disagree on original end byte; reindex",
+                chunk_id=row["chunk_id"],
+            )
+        original_end = next(iter(original_ends))
+        resolved_end = end if original_end is None else original_end
+        if resolved_end < start:
+            raise CodeIndexingError(
+                ErrorCode.INDEX_INCOMPATIBLE,
+                "Stored embedding windows have an invalid original end byte; reindex",
+                chunk_id=row["chunk_id"],
+            )
         return {
             **row,
             "content": content.decode("utf-8"),
             "start_byte": start,
-            "end_byte": end,
+            "end_byte": resolved_end,
             "start_line": ordered[0]["start_line"],
             "end_line": ordered[-1]["end_line"],
         }
@@ -3115,6 +3135,7 @@ class LanceStore:
                 ("is_test", pa.bool_()),
                 ("source_start_byte", pa.int64()),
                 ("source_end_byte", pa.int64()),
+                ("original_end_byte", pa.int64()),
                 ("source_content_hash", pa.string()),
                 (
                     "vector",
