@@ -1371,10 +1371,19 @@ def _ts_unwrap_parens(node: Node | None) -> Node | None:
     return node
 
 
-def _ts_unwrap_expr_statement(node: Node) -> Node | None:
+def _ts_unwrap_expr_statement(node: Node, source: bytes) -> Node | None:
     inner = next((c for c in node.named_children if not c.is_extra), None)
-    while inner is not None and inner.type in {"await_expression", "parenthesized_expression"}:
-        inner = next((c for c in inner.named_children if not c.is_extra), None)
+    while inner is not None:
+        if inner.type in {"await_expression", "parenthesized_expression"}:
+            inner = next((c for c in inner.named_children if not c.is_extra), None)
+        elif inner.type == "unary_expression":
+            op = inner.child_by_field_name("operator")
+            if op is not None and _node_str(op, source) == "void":
+                inner = inner.child_by_field_name("argument")
+            else:
+                break
+        else:
+            break
     return inner
 
 
@@ -1424,13 +1433,36 @@ def _ts_binary_operator(node: Node, source: bytes) -> str | None:
     return None
 
 
-def _ts_eval_vitest_condition(node: Node | None, source: bytes) -> bool | None:
-    """Return True for positive ``import.meta.vitest`` checks, False for negated, else None."""
+_KleeneVal = bool | None
+
+
+def _kleene_not(val: _KleeneVal) -> _KleeneVal:
+    return None if val is None else (not val)
+
+
+def _kleene_and(left: _KleeneVal, right: _KleeneVal) -> _KleeneVal:
+    if left is False or right is False:
+        return False
+    if left is True and right is True:
+        return True
+    return None
+
+
+def _kleene_or(left: _KleeneVal, right: _KleeneVal) -> _KleeneVal:
+    if left is True or right is True:
+        return True
+    if left is False and right is False:
+        return False
+    return None
+
+
+def _ts_eval_vitest_condition(node: Node | None, source: bytes) -> tuple[_KleeneVal, _KleeneVal]:
+    """Evaluate a condition in ``(vitest_world, prod_world)`` using 3-valued Kleene logic."""
     node = _ts_unwrap_parens(node)
     if node is None:
-        return None
+        return (None, None)
     if _ts_is_import_meta_vitest(node, source):
-        return True
+        return (True, False)
     if node.type == "call_expression":
         func = _ts_unwrap_parens(node.child_by_field_name("function"))
         args_node = node.child_by_field_name("arguments")
@@ -1441,15 +1473,15 @@ def _ts_eval_vitest_condition(node: Node | None, source: bytes) -> bool | None:
             and args_node is not None
         ):
             args = [c for c in args_node.named_children if not c.is_extra]
-            if len(args) == 1 and _ts_is_import_meta_vitest(args[0], source):
-                return True
-        return None
+            if len(args) == 1:
+                return _ts_eval_vitest_condition(args[0], source)
+        return (None, None)
     if node.type == "unary_expression":
         op = node.child_by_field_name("operator")
         if op is not None and _node_str(op, source) == "!":
-            inner = _ts_eval_vitest_condition(node.child_by_field_name("argument"), source)
-            return None if inner is None else (not inner)
-        return None
+            vt, pr = _ts_eval_vitest_condition(node.child_by_field_name("argument"), source)
+            return (_kleene_not(vt), _kleene_not(pr))
+        return (None, None)
     if node.type == "binary_expression":
         op_str = _ts_binary_operator(node, source)
         left = node.child_by_field_name("left")
@@ -1461,27 +1493,23 @@ def _ts_eval_vitest_condition(node: Node | None, source: bytes) -> bool | None:
             ) or (
                 _ts_is_import_meta_vitest(right, source) and _ts_is_undefined_or_null(left, source)
             ):
-                return is_neq
+                return (True, False) if is_neq else (False, True)
             for typeof_side, str_side in ((left, right), (right, left)):
                 if _ts_is_typeof_vitest(typeof_side, source):
                     val = _ts_string_value(_ts_unwrap_parens(str_side), source)
                     if val == "undefined":
-                        return is_neq
+                        return (True, False) if is_neq else (False, True)
                     if val == "object":
-                        return not is_neq
+                        return (False, True) if is_neq else (True, False)
         elif op_str == "&&":
-            l_val = _ts_eval_vitest_condition(left, source)
-            r_val = _ts_eval_vitest_condition(right, source)
-            if l_val is False or r_val is False:
-                return False
-            if l_val is True or r_val is True:
-                return True
+            l_vt, l_pr = _ts_eval_vitest_condition(left, source)
+            r_vt, r_pr = _ts_eval_vitest_condition(right, source)
+            return (_kleene_and(l_vt, r_vt), _kleene_and(l_pr, r_pr))
         elif op_str == "||":
-            l_val = _ts_eval_vitest_condition(left, source)
-            r_val = _ts_eval_vitest_condition(right, source)
-            if l_val is True and r_val is True:
-                return True
-    return None
+            l_vt, l_pr = _ts_eval_vitest_condition(left, source)
+            r_vt, r_pr = _ts_eval_vitest_condition(right, source)
+            return (_kleene_or(l_vt, r_vt), _kleene_or(l_pr, r_pr))
+    return (None, None)
 
 
 def _ts_decorator_tail_name(decorator: Node, source: bytes) -> str | None:
@@ -1606,15 +1634,35 @@ def _ts_is_require_test_pkg(node: Node | None, source: bytes) -> str | None:
     return None
 
 
+def _ts_extract_pattern_names(target: Node | None, source: bytes) -> list[str]:
+    if target is None:
+        return []
+    if target.type in {"identifier", "shorthand_property_identifier_pattern"}:
+        return [_node_str(target, source)]
+    if target.type in {"object_pattern", "array_pattern", "rest_pattern"}:
+        names: list[str] = []
+        for child in target.named_children:
+            names.extend(_ts_extract_pattern_names(child, source))
+        return names
+    if target.type == "pair_pattern":
+        return _ts_extract_pattern_names(target.child_by_field_name("value"), source)
+    if target.type in {"object_assignment_pattern", "assignment_pattern"}:
+        return _ts_extract_pattern_names(target.child_by_field_name("left"), source)
+    return []
+
+
 def _ts_record_pattern_binding(
     target: Node | None,
     pkg: str,
     source: bytes,
     imported_aliases: dict[str, str],
     imported_namespaces: set[str],
+    test_bound_names: set[str] | None = None,
 ) -> None:
     if target is None:
         return
+    if test_bound_names is not None:
+        test_bound_names.update(_ts_extract_pattern_names(target, source))
     if target.type == "identifier":
         local = _node_str(target, source)
         imported_namespaces.add(local)
@@ -1640,12 +1688,20 @@ def _ts_is_extend_call(
     imported_aliases: dict[str, str],
     imported_namespaces: set[str],
     source: bytes,
+    shadowed_globals: set[str] | None = None,
 ) -> bool:
     value = _ts_unwrap_parens(value)
     if value is None or value.type != "call_expression":
         return False
     root, members, is_type_assert = _ts_unwrap_call_chain(value, source)
     if is_type_assert or root is None or not members:
+        return False
+    if (
+        shadowed_globals is not None
+        and root in shadowed_globals
+        and root not in imported_aliases
+        and root not in imported_namespaces
+    ):
         return False
     if (root == "test" or imported_aliases.get(root) == "test") and all(
         m == "extend" for m in members
@@ -1663,15 +1719,24 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
     spans: list[tuple[int, int]] = []
     top_test_items = 0
     top_prod_items = 0
+    top_private_decl_items = 0
     has_test_import = False
     has_unambiguous_test_item = False
     imported_aliases: dict[str, str] = {}
     imported_namespaces: set[str] = set()
+    shadowed_globals: set[str] = set()
+    test_bound_names: set[str] = set()
     conditional_hooks: list[tuple[int, int, bool]] = []
 
     def classify_call(call_node: Node) -> Literal["unambiguous", "conditional_hook", "none"]:
         call_root, members, is_type_assert = _ts_unwrap_call_chain(call_node, source)
         if call_root is None:
+            return "none"
+        if (
+            call_root in shadowed_globals
+            and call_root not in imported_aliases
+            and call_root not in imported_namespaces
+        ):
             return "none"
         if is_type_assert:
             canonical = imported_aliases.get(call_root, call_root)
@@ -1686,11 +1751,16 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
             return "unambiguous"
 
         if call_root in imported_namespaces:
-            if not members or members[0] not in _TS_ALL_CALL_ROOTS:
+            if members and members[0] in _TS_ALL_CALL_ROOTS:
+                if not all(m in _TS_RUNNER_MODIFIERS for m in members[1:]):
+                    return "none"
+                return (
+                    "conditional_hook"
+                    if members[0] in _TS_CONDITIONAL_HOOK_ROOTS
+                    else "unambiguous"
+                )
+            if call_root not in imported_aliases:
                 return "none"
-            if not all(m in _TS_RUNNER_MODIFIERS for m in members[1:]):
-                return "none"
-            return "conditional_hook" if members[0] in _TS_CONDITIONAL_HOOK_ROOTS else "unambiguous"
 
         canonical = imported_aliases.get(call_root, call_root)
         if canonical not in _TS_ALL_CALL_ROOTS:
@@ -1708,6 +1778,7 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
 
     def record_import(stmt: Node) -> None:
         nonlocal has_test_import
+        is_type_stmt = any(not c.is_named and c.type == "type" for c in stmt.children)
         source_node = stmt.child_by_field_name("source")
         if source_node is None:
             req_clause = next(
@@ -1718,41 +1789,162 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
                 return
             str_node = next((c for c in req_clause.named_children if c.type == "string"), None)
             pkg = _ts_string_value(str_node, source)
-            if pkg is None or not _ts_is_test_package(pkg):
-                return
-            has_test_import = True
             ident = next((c for c in req_clause.named_children if c.type == "identifier"), None)
-            _ts_record_pattern_binding(ident, pkg, source, imported_aliases, imported_namespaces)
+            if pkg is not None and _ts_is_test_package(pkg):
+                if ident is not None:
+                    test_bound_names.add(_node_str(ident, source))
+                if is_type_stmt:
+                    return
+                has_test_import = True
+                _ts_record_pattern_binding(
+                    ident, pkg, source, imported_aliases, imported_namespaces, test_bound_names
+                )
+            elif not is_type_stmt and ident is not None:
+                shadowed_globals.add(_node_str(ident, source))
             return
 
         pkg = _ts_string_value(source_node, source)
-        if pkg is None or not _ts_is_test_package(pkg):
-            return
-        has_test_import = True
         clause = next((c for c in stmt.named_children if c.type == "import_clause"), None)
-        if clause is None:
+        if pkg is not None and _ts_is_test_package(pkg):
+            if clause is None:
+                if not is_type_stmt:
+                    has_test_import = True
+                return
+            has_runtime_binding = False
+            for child in clause.named_children:
+                if child.type == "identifier":
+                    test_bound_names.add(_node_str(child, source))
+                    if not is_type_stmt:
+                        has_runtime_binding = True
+                        _ts_record_pattern_binding(
+                            child,
+                            pkg,
+                            source,
+                            imported_aliases,
+                            imported_namespaces,
+                            test_bound_names,
+                        )
+                elif child.type == "namespace_import":
+                    ident = next((c for c in child.named_children if c.type == "identifier"), None)
+                    if ident is not None:
+                        local = _node_str(ident, source)
+                        test_bound_names.add(local)
+                        if not is_type_stmt:
+                            has_runtime_binding = True
+                            imported_namespaces.add(local)
+                elif child.type == "named_imports":
+                    for spec in child.named_children:
+                        if spec.type != "import_specifier":
+                            continue
+                        orig_node = spec.child_by_field_name("name")
+                        if orig_node is None:
+                            continue
+                        orig = _node_str(orig_node, source)
+                        alias_node = spec.child_by_field_name("alias")
+                        local = _node_str(alias_node, source) if alias_node is not None else orig
+                        test_bound_names.add(local)
+                        is_type_spec = is_type_stmt or any(
+                            not c.is_named and c.type == "type" for c in spec.children
+                        )
+                        if not is_type_spec:
+                            has_runtime_binding = True
+                            if orig in _TS_ALL_CALL_ROOTS:
+                                imported_aliases[local] = orig
+            if not is_type_stmt and has_runtime_binding:
+                has_test_import = True
+            return
+
+        if is_type_stmt or clause is None:
             return
         for child in clause.named_children:
             if child.type == "identifier":
-                _ts_record_pattern_binding(
-                    child, pkg, source, imported_aliases, imported_namespaces
-                )
+                shadowed_globals.add(_node_str(child, source))
             elif child.type == "namespace_import":
                 ident = next((c for c in child.named_children if c.type == "identifier"), None)
                 if ident is not None:
-                    imported_namespaces.add(_node_str(ident, source))
+                    shadowed_globals.add(_node_str(ident, source))
             elif child.type == "named_imports":
                 for spec in child.named_children:
                     if spec.type != "import_specifier":
                         continue
+                    if any(not c.is_named and c.type == "type" for c in spec.children):
+                        continue
                     orig_node = spec.child_by_field_name("name")
                     if orig_node is None:
                         continue
-                    orig = _node_str(orig_node, source)
                     alias_node = spec.child_by_field_name("alias")
-                    local = _node_str(alias_node, source) if alias_node is not None else orig
-                    if orig in _TS_ALL_CALL_ROOTS:
-                        imported_aliases[local] = orig
+                    local = (
+                        _node_str(alias_node, source)
+                        if alias_node is not None
+                        else _node_str(orig_node, source)
+                    )
+                    shadowed_globals.add(local)
+
+    def prescan_top_level_bindings() -> None:
+        nonlocal has_test_import
+        for child in root.named_children:
+            if child.type == "import_statement":
+                record_import(child)
+        for child in root.named_children:
+            if child.type in {"import_statement", "empty_statement", "comment"} or child.is_extra:
+                continue
+            target = child
+            if child.type == "export_statement":
+                decl = child.child_by_field_name("declaration") or child.child_by_field_name(
+                    "value"
+                )
+                if decl is None:
+                    continue
+                target = decl
+            if target.type in {
+                "function_declaration",
+                "generator_function_declaration",
+                "class_declaration",
+                "abstract_class_declaration",
+                "enum_declaration",
+                "module",
+                "internal_module",
+            }:
+                name_node = target.child_by_field_name("name")
+                if name_node is not None:
+                    shadowed_globals.add(_node_str(name_node, source))
+            elif target.type in {"lexical_declaration", "variable_declaration"}:
+                for dtor in target.named_children:
+                    if dtor.type != "variable_declarator":
+                        continue
+                    value = dtor.child_by_field_name("value")
+                    name_node = dtor.child_by_field_name("name")
+                    pkg = _ts_is_require_test_pkg(value, source)
+                    if pkg is not None:
+                        has_test_import = True
+                        _ts_record_pattern_binding(
+                            name_node,
+                            pkg,
+                            source,
+                            imported_aliases,
+                            imported_namespaces,
+                            test_bound_names,
+                        )
+                        continue
+                    if _ts_is_extend_call(
+                        value,
+                        imported_aliases,
+                        imported_namespaces,
+                        source,
+                        shadowed_globals,
+                    ):
+                        if name_node is not None:
+                            test_bound_names.update(_ts_extract_pattern_names(name_node, source))
+                            if name_node.type == "identifier":
+                                imported_aliases[_node_str(name_node, source)] = "test"
+                        continue
+                    shadowed_globals.update(_ts_extract_pattern_names(name_node, source))
+            elif target.type == "expression_statement":
+                inner = next((c for c in target.named_children if not c.is_extra), None)
+                if inner is not None and inner.type == "internal_module":
+                    name_node = inner.child_by_field_name("name")
+                    if name_node is not None:
+                        shadowed_globals.add(_node_str(name_node, source))
 
     def callback_contains_unambiguous_test(call_node: Node) -> bool:
         args_node = call_node.child_by_field_name("arguments")
@@ -1766,7 +1958,7 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
                 continue
             for stmt in body.named_children:
                 if stmt.type == "expression_statement":
-                    expr = _ts_unwrap_expr_statement(stmt)
+                    expr = _ts_unwrap_expr_statement(stmt, source)
                     if (
                         expr is not None
                         and expr.type == "call_expression"
@@ -1899,11 +2091,16 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
     def inspect_var_declaration(
         decl: Node, *, outer: Node, span_start: int, is_top_scope: bool
     ) -> None:
-        nonlocal top_test_items, top_prod_items, has_test_import, has_unambiguous_test_item
+        nonlocal top_test_items, top_prod_items, top_private_decl_items
+        nonlocal has_test_import, has_unambiguous_test_item
+        is_exported = outer is not decl
         declarators = [c for c in decl.named_children if c.type == "variable_declarator"]
         if not declarators:
             if is_top_scope:
-                top_prod_items += 1
+                if is_exported:
+                    top_prod_items += 1
+                else:
+                    top_private_decl_items += 1
             return
         all_require = True
         all_extend = True
@@ -1914,13 +2111,22 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
             if pkg is not None:
                 has_test_import = True
                 _ts_record_pattern_binding(
-                    name_node, pkg, source, imported_aliases, imported_namespaces
+                    name_node,
+                    pkg,
+                    source,
+                    imported_aliases,
+                    imported_namespaces,
+                    test_bound_names,
                 )
             else:
                 all_require = False
-            if _ts_is_extend_call(value, imported_aliases, imported_namespaces, source):
-                if name_node is not None and name_node.type == "identifier":
-                    imported_aliases[_node_str(name_node, source)] = "test"
+            if _ts_is_extend_call(
+                value, imported_aliases, imported_namespaces, source, shadowed_globals
+            ):
+                if name_node is not None:
+                    test_bound_names.update(_ts_extract_pattern_names(name_node, source))
+                    if name_node.type == "identifier":
+                        imported_aliases[_node_str(name_node, source)] = "test"
             else:
                 all_extend = False
         if all_require:
@@ -1932,10 +2138,14 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
                 top_test_items += 1
             return
         if is_top_scope:
-            top_prod_items += 1
+            if is_exported:
+                top_prod_items += 1
+            else:
+                top_private_decl_items += 1
 
     def walk_block(container: Node, *, is_top_scope: bool) -> None:
-        nonlocal top_test_items, top_prod_items, has_test_import, has_unambiguous_test_item
+        nonlocal top_test_items, top_prod_items, top_private_decl_items
+        nonlocal has_test_import, has_unambiguous_test_item
         pending_doc_start: int | None = None
 
         for child in container.named_children:
@@ -1991,6 +2201,21 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
                         if body is not None:
                             walk_block(body, is_top_scope=False)
                         continue
+                elif export_source is None:
+                    export_clause = next(
+                        (c for c in child.named_children if c.type == "export_clause"),
+                        None,
+                    )
+                    if export_clause is not None:
+                        specifiers = [
+                            c for c in export_clause.named_children if c.type == "export_specifier"
+                        ]
+                        if specifiers and all(
+                            (name_node := spec.child_by_field_name("name")) is not None
+                            and _node_str(name_node, source) in test_bound_names
+                            for spec in specifiers
+                        ):
+                            continue
                 if is_top_scope:
                     top_prod_items += 1
                 continue
@@ -2007,18 +2232,40 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
 
             if child.type == "if_statement":
                 cond = child.child_by_field_name("condition")
-                if _ts_eval_vitest_condition(cond, source) is True:
-                    spans.append((span_start, child.end_byte))
-                    has_unambiguous_test_item = True
-                    if is_top_scope:
-                        top_test_items += 1
+                val_vt, val_pr = _ts_eval_vitest_condition(cond, source)
+                consequence = child.child_by_field_name("consequence")
+                alternative = child.child_by_field_name("alternative")
+                if val_pr is False and val_vt is not False:
+                    if alternative is None:
+                        spans.append((span_start, child.end_byte))
+                        has_unambiguous_test_item = True
+                        if is_top_scope:
+                            top_test_items += 1
+                    else:
+                        if consequence is not None:
+                            spans.append((span_start, consequence.end_byte))
+                            has_unambiguous_test_item = True
+                        if is_top_scope:
+                            top_prod_items += 1
+                        walk_block(alternative, is_top_scope=False)
                     continue
+                if alternative is not None and val_pr is True and val_vt is not True:
+                    alt_inner = next(
+                        (c for c in alternative.named_children if not c.is_extra),
+                        None,
+                    )
+                    if alt_inner is not None and alt_inner.type == "statement_block":
+                        if is_top_scope:
+                            top_prod_items += 1
+                        if consequence is not None:
+                            walk_block(consequence, is_top_scope=False)
+                        spans.append((alternative.start_byte, child.end_byte))
+                        has_unambiguous_test_item = True
+                        continue
                 if is_top_scope:
                     top_prod_items += 1
-                consequence = child.child_by_field_name("consequence")
                 if consequence is not None:
                     walk_block(consequence, is_top_scope=False)
-                alternative = child.child_by_field_name("alternative")
                 if alternative is not None:
                     walk_block(alternative, is_top_scope=False)
                 continue
@@ -2036,7 +2283,7 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
                     if body is not None:
                         walk_block(body, is_top_scope=is_top_scope)
                         continue
-                expr = _ts_unwrap_expr_statement(child)
+                expr = _ts_unwrap_expr_statement(child, source)
                 if expr is not None and expr.type == "call_expression":
                     if _ts_is_require_test_pkg(expr, source) is not None:
                         has_test_import = True
@@ -2059,10 +2306,13 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
 
             if child.type in {"function_declaration", "generator_function_declaration"}:
                 if is_top_scope:
-                    top_prod_items += 1
+                    top_private_decl_items += 1
                 body = child.child_by_field_name("body")
                 if body is not None:
                     walk_block(body, is_top_scope=False)
+                continue
+
+            if child.type in {"type_alias_declaration", "interface_declaration"}:
                 continue
 
             if child.type == "statement_block":
@@ -2072,6 +2322,7 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
             if is_top_scope:
                 top_prod_items += 1
 
+    prescan_top_level_bindings()
     walk_block(root, is_top_scope=True)
 
     if has_test_import or has_unambiguous_test_item:
@@ -2084,6 +2335,10 @@ def _classify_typescript(root: Node, source: bytes) -> TestClassification:
             if hook_is_top:
                 top_prod_items += 1
 
-    if top_test_items > 0 and top_prod_items == 0:
+    if (
+        top_test_items > 0
+        and top_prod_items == 0
+        and (top_private_decl_items == 0 or has_test_import)
+    ):
         return _WHOLE_FILE_TEST
     return TestClassification(file_is_test=False, inline_spans=_merge_spans(spans))
