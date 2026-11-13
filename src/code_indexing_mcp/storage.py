@@ -86,9 +86,7 @@ logger = logging.getLogger(__name__)
 # unless the bump forces a rebuild, so older indexes would stay inconsistent.
 # Version 8 adds the boolean `is_test` column on chunk rows so search and symbol
 # lookup can filter production code vs. tests/benchmarks before ranking.
-# Version 9 invalidates v8 partitions so TypeScript and TSX files populate
-# `is_test` on re-index.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 8
 
 # Symbol lookups page through the SQL prefilter's candidates. These bound each
 # page, not the total scan needed to find the caller's literal matches.
