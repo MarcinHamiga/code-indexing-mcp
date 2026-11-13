@@ -344,6 +344,7 @@ class ExtractedChunk(FrozenModel):
     # keep their existing shape.
     source_start_byte: int | None = Field(default=None, exclude=True)
     source_end_byte: int | None = Field(default=None, exclude=True)
+    original_end_byte: int | None = Field(default=None, exclude=True)
     source_content_hash: str | None = Field(default=None, exclude=True)
 
 
@@ -736,6 +737,7 @@ class IndexedChunk(FrozenModel):
     content_hash: str = ""
     source_start_byte: int | None = None
     source_end_byte: int | None = None
+    original_end_byte: int | None = None
     source_content_hash: str | None = None
 
 

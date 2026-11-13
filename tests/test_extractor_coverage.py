@@ -158,8 +158,10 @@ def test_python_class_chunk_does_not_end_with_the_next_methods_decorator() -> No
 
     head = next(chunk for chunk in chunks if chunk.kind == "class")
 
-    assert "@property" not in head.content
     method = next(chunk for chunk in chunks if chunk.qualified_symbol == "Client.first")
+    assert not head.content.rstrip().endswith("@property")
+    assert head.end_byte <= method.start_byte
+    assert (head.start_line, head.end_line) == (1, 2)
     assert method.content.startswith("@property")
 
 

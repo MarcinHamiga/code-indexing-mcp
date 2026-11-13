@@ -23,7 +23,7 @@ from lancedb.query import LanceVectorQueryBuilder
 from lancedb.table import LanceTable
 
 from code_indexing_mcp import storage as storage_module
-from code_indexing_mcp.errors import ErrorCode
+from code_indexing_mcp.errors import CodeIndexingError, ErrorCode
 from code_indexing_mcp.git_state import (
     GitProbeOutcome,
     GitState,
@@ -749,6 +749,158 @@ def test_hybrid_search_spans_content_and_identifier_terms(tmp_path: Path) -> Non
     # miss would leave the FTS-matched chunk behind. It must rank first.
     assert terms_hit[0]["chunk_id"] == chunk_terms_only.chunk_id
     assert content_hit[0]["chunk_id"] == chunk_content_only.chunk_id
+
+
+def test_hybrid_search_boosts_identifier_terms_over_content(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    named_code = StoredChunk(
+        chunk_id=f"{project.id}:code",
+        file_id="file-code",
+        path="auth.py",
+        language="python",
+        kind="function",
+        symbol="verify_totp",
+        qualified_symbol="verify_totp",
+        parent_symbol=None,
+        start_byte=0,
+        end_byte=1,
+        start_line=1,
+        end_line=3,
+        content="def verify(secret, code):\n    return secret == code",
+        identifier_terms="verify totp",
+        part_index=0,
+        vector=[1.0, 0.0, 0.0, 0.0],
+    )
+    short_prose = StoredChunk(
+        chunk_id=f"{project.id}:prose",
+        file_id="file-prose",
+        path="i18n.py",
+        language="python",
+        kind="function",
+        symbol="messages",
+        qualified_symbol="messages",
+        parent_symbol=None,
+        start_byte=0,
+        end_byte=1,
+        start_line=1,
+        end_line=1,
+        content="totp",
+        identifier_terms="en locale",
+        part_index=0,
+        vector=[1.0, 0.0, 0.0, 0.0],
+    )
+    store.replace_file(stored_file(project.id, file_id="file-code"), [named_code])
+    store.replace_file(stored_file(project.id, file_id="file-prose"), [short_prose])
+    store.ensure_indexes(project.id)
+
+    raw_rows = store._hybrid_search_rows(project.id, "totp", [1.0, 0.0, 0.0, 0.0], None, 5)
+    lexical_by_id = {row["chunk_id"]: row for row in raw_rows if "_fts_local_rank" in row}
+    assert lexical_by_id[named_code.chunk_id]["_fts_local_rank"] == 1
+    assert (
+        lexical_by_id[named_code.chunk_id]["_score"] > lexical_by_id[short_prose.chunk_id]["_score"]
+    )
+
+    hits = store.hybrid_search("totp", [1.0, 0.0, 0.0, 0.0], [project.id], None, 5)
+    assert [hit["chunk_id"] for hit in hits] == [named_code.chunk_id, short_prose.chunk_id]
+
+    explained = store.explain_hits(
+        "totp",
+        [1.0, 0.0, 0.0, 0.0],
+        {project.id: [named_code.chunk_id, short_prose.chunk_id]},
+        None,
+    )
+    assert explained[named_code.chunk_id]["fts_rank"] == 1
+    assert (explained[named_code.chunk_id]["fts_score"] or 0.0) > (
+        explained[short_prose.chunk_id]["fts_score"] or 0.0
+    )
+
+
+def test_hybrid_search_damps_anonymous_module_chunks(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    named_fn = StoredChunk(
+        chunk_id=f"{project.id}:fn",
+        file_id="file-fn",
+        path="auth.py",
+        language="python",
+        kind="function",
+        symbol="verify_totp",
+        qualified_symbol="verify_totp",
+        parent_symbol=None,
+        start_byte=0,
+        end_byte=1,
+        start_line=1,
+        end_line=2,
+        content="def verify_totp():\n    return True",
+        identifier_terms="verify totp",
+        part_index=0,
+        vector=[1.0, 0.0, 0.0, 0.0],
+    )
+    anon_module = StoredChunk(
+        chunk_id=f"{project.id}:mod",
+        file_id="file-mod",
+        path="banner.py",
+        language="python",
+        kind="module",
+        symbol=None,
+        qualified_symbol=None,
+        parent_symbol=None,
+        start_byte=0,
+        end_byte=1,
+        start_line=1,
+        end_line=2,
+        content="def verify_totp():\n    return True",
+        identifier_terms="verify totp",
+        part_index=0,
+        vector=[1.0, 0.0, 0.0, 0.0],
+    )
+    direct_module = StoredChunk(
+        chunk_id=f"{project.id}:direct",
+        file_id="file-direct",
+        path="locale.py",
+        language="python",
+        kind="module",
+        symbol=None,
+        qualified_symbol=None,
+        parent_symbol=None,
+        start_byte=0,
+        end_byte=1,
+        start_line=1,
+        end_line=1,
+        content="unique_banner_marker = True",
+        identifier_terms="unique banner marker",
+        part_index=0,
+        vector=[0.0, 1.0, 0.0, 0.0],
+    )
+    store.replace_file(stored_file(project.id, file_id="file-fn"), [named_fn])
+    store.replace_file(stored_file(project.id, file_id="file-mod"), [anon_module])
+    store.replace_file(stored_file(project.id, file_id="file-direct"), [direct_module])
+    store.ensure_indexes(project.id)
+
+    hits = store.hybrid_search("verify_totp", [1.0, 0.0, 0.0, 0.0], [project.id], None, 5)
+    top_two = [hit for hit in hits if hit["chunk_id"] in {named_fn.chunk_id, anon_module.chunk_id}]
+    assert [hit["chunk_id"] for hit in top_two] == [named_fn.chunk_id, anon_module.chunk_id]
+    expected_undamped = (storage_module.RRF_VECTOR_WEIGHT + storage_module.RRF_FTS_WEIGHT) / 61
+    assert top_two[0]["_relevance_score"] == pytest.approx(expected_undamped)
+    assert top_two[1]["_relevance_score"] == pytest.approx(
+        expected_undamped * storage_module.RRF_MODULE_DAMPING
+    )
+
+    direct_hits = store.hybrid_search(
+        "unique_banner_marker", [0.0, 1.0, 0.0, 0.0], [project.id], None, 5
+    )
+    assert direct_hits[0]["chunk_id"] == direct_module.chunk_id
+
+
+def test_schema_version_is_bumped_to_10() -> None:
+    assert storage_module.SCHEMA_VERSION == 10
 
 
 def _seed_hybrid_target(store: LanceStore, root: Path) -> ProjectInfo:
@@ -3542,3 +3694,53 @@ def test_find_symbol_chunks_treats_backslashes_and_wildcards_literally(tmp_path:
     assert found("_b", "contains") == ["a_b"]
     assert found("%", "contains") == ["50%off"]
     assert found("50%", "prefix") == ["50%off"]
+
+
+def test_chunk_schema_includes_original_end_byte_and_validates_siblings(tmp_path: Path) -> None:
+    from code_indexing_mcp.models import CodeChunk, IndexedChunk
+
+    schema = LanceStore.chunk_arrow_schema(4, pa.float16())
+    assert "original_end_byte" in schema.names
+    assert schema.field("original_end_byte").type == pa.int64()
+    assert "original_end_byte" in IndexedChunk.model_fields
+    assert "original_end_byte" not in CodeChunk.model_fields
+
+    row = {
+        "chunk_id": "p:0",
+        "file_id": "f:0",
+        "path": "compact.ts",
+        "language": "typescript",
+        "kind": "class",
+        "symbol": "CompactRepo",
+        "qualified_symbol": "CompactRepo",
+        "parent_symbol": None,
+        "start_byte": 10,
+        "end_byte": 15,
+        "start_line": 2,
+        "end_line": 2,
+        "content": "hello",
+        "content_hash": "h",
+        "part_index": 0,
+        "source_start_byte": 10,
+        "source_end_byte": 20,
+        "original_end_byte": 12,
+    }
+    sibling = {
+        **row,
+        "chunk_id": "p:1",
+        "start_byte": 15,
+        "end_byte": 20,
+        "content": "world",
+        "original_end_byte": 12,
+    }
+    reconstructed = LanceStore._reconstruct_source_chunk(row, [row, sibling])
+    assert reconstructed["content"] == "helloworld"
+    assert (reconstructed["start_byte"], reconstructed["end_byte"]) == (10, 12)
+    assert (reconstructed["start_line"], reconstructed["end_line"]) == (2, 2)
+
+    with pytest.raises(CodeIndexingError) as invalid:
+        LanceStore._reconstruct_source_chunk(
+            row,
+            [{**row, "original_end_byte": 5}, {**sibling, "original_end_byte": 5}],
+        )
+    assert invalid.value.code is ErrorCode.INDEX_INCOMPATIBLE

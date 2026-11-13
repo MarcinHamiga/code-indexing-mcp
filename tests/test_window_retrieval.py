@@ -11,6 +11,7 @@ import pytest
 from test_search import SemanticEmbedder
 from test_token_batching import FakeEncoding, fake_encode
 
+from code_indexing_mcp.changes import FileChange
 from code_indexing_mcp.embedding import (
     EmbeddedSegment,
     PassageCandidate,
@@ -68,7 +69,7 @@ class AdaptiveEmbedder(SemanticEmbedder):
 
 
 SOURCE = (
-    "# π and 世界 before the declaration\n"
+    "# π and 世界 before the declaration\n\n"
     "def process_data(user):\n"
     "    beginning_marker = 'héllo 世界'\n"
     + "".join(f"    stage_{i} = user.value + {i}\n" for i in range(8))
@@ -81,13 +82,15 @@ def indexed_windows(
     tmp_path: Path,
     source: str = SOURCE,
     *,
+    filename: str = "main.py",
+    language: str = "python",
     cache: bool = False,
     max_tokens: int = 48,
     embedder: AdaptiveEmbedder | None = None,
 ) -> tuple[Indexer, LanceStore, SearchService, ProjectInfo, list[ExtractedChunk]]:
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "main.py").write_bytes(source.encode("utf-8"))
+    (root / filename).write_bytes(source.encode("utf-8"))
     project = initialize_project(root)
     embedder = embedder or AdaptiveEmbedder()
     extractor = TreeSitterExtractor()
@@ -118,7 +121,7 @@ def indexed_windows(
     )
     report = indexer.index(project)
     assert report.errors == []
-    original = extractor.extract(Path("main.py"), "python", source.encode("utf-8")).chunks
+    original = extractor.extract(Path(filename), language, source.encode("utf-8")).chunks
     return indexer, store, SearchService(store, embedder), project, original
 
 
@@ -422,7 +425,12 @@ def test_sibling_slot_without_window_columns_is_rebuilt_before_queries(tmp_path:
     source = store._project_tables(project.id)
     database = lancedb.connect(store.directory / "projects" / second.partition_id)
     database.create_table("files", source.files.to_arrow())
-    window_columns = ["source_start_byte", "source_end_byte", "source_content_hash"]
+    window_columns = [
+        "source_start_byte",
+        "source_end_byte",
+        "original_end_byte",
+        "source_content_hash",
+    ]
     database.create_table("chunks", source.chunks.to_arrow().drop_columns(window_columns))
     database.create_table("references", source.references.to_arrow())
 
@@ -510,3 +518,183 @@ def test_identical_windows_in_pinned_checkouts_do_not_exhaust_search_results(
 
     assert len(response.hits) == 8
     assert len({hit.qualified_symbol for hit in response.hits}) == 8
+
+
+COMPACT_TS = (
+    "export class CompactRepo {\n  "
+    + " ".join(f"method{i}(arg: number): number {{ return arg + {i}; }}" for i in range(18))
+    + "\n}\n"
+    "export function innocentNeighbor(): number {\n"
+    "  return 42;\n"
+    "}\n"
+)
+
+
+def _compact_repo_windows(
+    tmp_path: Path, *, cache: bool = False, embedder: AdaptiveEmbedder | None = None
+) -> tuple[Indexer, LanceStore, SearchService, ProjectInfo, ExtractedChunk]:
+    indexer, store, search, project, original = indexed_windows(
+        tmp_path,
+        COMPACT_TS,
+        filename="compact.ts",
+        language="typescript",
+        cache=cache,
+        max_tokens=48,
+        embedder=embedder,
+    )
+    expected = next(chunk for chunk in original if chunk.symbol == "CompactRepo")
+    assert expected.end_line == 1
+    assert expected.content.count("\n") > 6
+    windows = [chunk for chunk in store.list_chunks([project.id]) if chunk.symbol == "CompactRepo"]
+    assert len(windows) >= 2
+    return indexer, store, search, project, expected
+
+
+def test_windowed_container_skeleton_preserves_exact_chunk_bounds_and_lines(
+    tmp_path: Path,
+) -> None:
+    _, store, search, project, expected = _compact_repo_windows(tmp_path)
+    windows = [chunk for chunk in store.list_chunks([project.id]) if chunk.symbol == "CompactRepo"]
+    for window in windows:
+        assert (window.start_line, window.end_line) == (expected.start_line, expected.end_line)
+        assert window.original_end_byte == expected.end_byte
+
+    (project.root / "compact.ts").unlink()
+
+    for window in windows:
+        retrieved = search.get_chunk(window.chunk_id)
+        assert retrieved.chunk_id == window.chunk_id
+        assert retrieved.content == expected.content
+        assert (retrieved.start_byte, retrieved.end_byte) == (
+            expected.start_byte,
+            expected.end_byte,
+        )
+        assert (retrieved.start_line, retrieved.end_line) == (
+            expected.start_line,
+            expected.end_line,
+        )
+
+
+def test_windowed_container_skeleton_search_outline_and_changed_symbols(tmp_path: Path) -> None:
+    _, store, search, project, expected = _compact_repo_windows(tmp_path)
+    total_lines = len(COMPACT_TS.splitlines())
+    assert total_lines == 6
+
+    response = search.search_code("method17", [project.id])
+    repo_hits = [hit for hit in response.hits if hit.symbol == "CompactRepo"]
+    assert len(repo_hits) == 1
+    assert repo_hits[0].truncated
+    assert (repo_hits[0].start_line, repo_hits[0].end_line) == (
+        expected.start_line,
+        expected.end_line,
+    )
+    assert repo_hits[0].end_line <= total_lines
+    assert search.get_chunk(repo_hits[0].chunk_id).content == expected.content
+
+    found = search.find_symbol("CompactRepo", project.id)
+    assert len(found.hits) == 1
+    symbol_hit = found.hits[0]
+    assert symbol_hit.truncated
+    assert (symbol_hit.start_line, symbol_hit.end_line) == (
+        expected.start_line,
+        expected.end_line,
+    )
+    assert expected.content.startswith(symbol_hit.snippet)
+
+    selected = (
+        ReferenceService(store)
+        .find_references(
+            DeclarationSelector(
+                project=project.id, path="compact.ts", qualified_symbol="CompactRepo"
+            )
+        )
+        .selected
+    )
+    assert (selected.start_line, selected.end_line) == (expected.start_line, expected.end_line)
+
+    outline_items = search.file_outline("compact.ts", project.id).items
+    repo_outline = next(item for item in outline_items if item.symbol == "CompactRepo")
+    assert (repo_outline.start_line, repo_outline.end_line) == (
+        expected.start_line,
+        expected.end_line,
+    )
+
+    partition = store.active_partition(project.id)
+    outlines = search.file_outlines(["compact.ts"], project.id, partition=partition)
+    touched = FileChange(path="compact.ts", change="modified", ranges=((5, 5),)).touched(
+        outlines["compact.ts"]
+    )
+    assert [item.qualified_symbol for item in touched] == ["innocentNeighbor"]
+
+
+@pytest.mark.parametrize("removed", [0, 1, -1])
+def test_windowed_container_skeleton_missing_window_raises(tmp_path: Path, removed: int) -> None:
+    _, store, search, project, _ = _compact_repo_windows(tmp_path)
+    windows = sorted(
+        (chunk for chunk in store.list_chunks([project.id]) if chunk.symbol == "CompactRepo"),
+        key=lambda chunk: chunk.start_byte,
+    )
+    discarded = windows.pop(removed)
+    store._project_tables(project.id).chunks.delete(f"chunk_id = '{discarded.chunk_id}'")
+
+    with pytest.raises(CodeIndexingError) as caught:
+        search.get_chunk(windows[0].chunk_id)
+    assert caught.value.code is ErrorCode.INDEX_INCOMPATIBLE
+
+
+@pytest.mark.parametrize("field", ["content", "original_end_byte"])
+def test_windowed_container_skeleton_corrupted_window_raises(tmp_path: Path, field: str) -> None:
+    _, store, search, project, _ = _compact_repo_windows(tmp_path)
+    windows = sorted(
+        (chunk for chunk in store.list_chunks([project.id]) if chunk.symbol == "CompactRepo"),
+        key=lambda chunk: chunk.start_byte,
+    )
+    target = windows[1]
+    value: object = "X" + target.content[1:] if field == "content" else target.end_byte + 7
+    store._project_tables(project.id).chunks.update(
+        where=f"chunk_id = '{target.chunk_id}'", values={field: value}
+    )
+
+    with pytest.raises(CodeIndexingError) as caught:
+        search.get_chunk(windows[0].chunk_id)
+    assert caught.value.code is ErrorCode.INDEX_INCOMPATIBLE
+
+
+def test_cached_windowed_container_skeleton_shifts_offsets_with_utf8_prefix(
+    tmp_path: Path,
+) -> None:
+    embedder = AdaptiveEmbedder()
+    indexer, store, search, project, expected = _compact_repo_windows(
+        tmp_path, cache=True, embedder=embedder
+    )
+    before = len(embedder.embedded_texts)
+    insertion = "// π 世界 prefix\n\n"
+    shift = len(insertion.encode("utf-8"))
+    (project.root / "compact.ts").write_bytes((insertion + COMPACT_TS).encode("utf-8"))
+
+    report = indexer.index(project)
+
+    assert report.errors == []
+    assert report.reused_segments > 1
+    assert all("symbol: CompactRepo" not in text for text in embedder.embedded_texts[before:])
+    for window in store.list_chunks([project.id]):
+        if window.symbol == "CompactRepo":
+            retrieved = search.get_chunk(window.chunk_id)
+            assert retrieved.content == expected.content
+            assert (retrieved.start_byte, retrieved.end_byte) == (
+                expected.start_byte + shift,
+                expected.end_byte + shift,
+            )
+            assert (retrieved.start_line, retrieved.end_line) == (
+                expected.start_line + 2,
+                expected.end_line + 2,
+            )
+    repo_outline = next(
+        item
+        for item in search.file_outline("compact.ts", project.id).items
+        if item.symbol == "CompactRepo"
+    )
+    assert (repo_outline.start_line, repo_outline.end_line) == (
+        expected.start_line + 2,
+        expected.end_line + 2,
+    )

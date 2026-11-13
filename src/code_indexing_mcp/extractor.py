@@ -63,6 +63,39 @@ _CONTAINER_KINDS: Final = frozenset(
         "struct",
     }
 )
+_CODE_CONTAINER_KINDS: Final = frozenset(
+    {
+        "annotation",
+        "class",
+        "enum",
+        "interface",
+        "record",
+        "struct",
+    }
+)
+_SKELETON_MAX_CHARS: Final = 2_000
+_SKELETON_MAX_LINES: Final = 60
+_SKELETON_MAX_DECORATOR_CHARS: Final = 60
+_SKELETON_BODY_TYPES: Final = frozenset(
+    {
+        "accessor_list",
+        "annotation_type_body",
+        "block",
+        "body",
+        "class_body",
+        "compound_statement",
+        "declaration_list",
+        "enum_body",
+        "enum_class_body",
+        "enum_variant_list",
+        "field_declaration_list",
+        "function_body",
+        "interface_body",
+        "object_type",
+        "statement_block",
+    }
+)
+_HASH_COMMENT_LANGUAGES: Final = frozenset({"gdscript", "python", "ruby", "toml", "yaml"})
 # (definition node type, parent type) pairs where one parent can hold several
 # named definitions: Swift `case a, b`, GDShader `const float A = 1, B = 2;`,
 # Go `type ( A struct{}; B struct{} )`.
@@ -407,6 +440,13 @@ class _Definition:
     name: str
 
 
+class _ChildSpan(NamedTuple):
+    effective_start: int
+    end_byte: int
+    outer: Node
+    definition: _Definition
+
+
 @dataclass(frozen=True)
 class _DefinitionIndex:
     """Per-file lookups the definition walk needs, built once instead of per definition.
@@ -507,6 +547,192 @@ def _trim_gap(source: bytes, start: int, end: int) -> tuple[int, int] | None:
     position = start + len(text[:lead].encode("utf-8"))
     newline = source.rfind(b"\n", start, position)
     return (newline + 1 if newline != -1 else position), end
+
+
+def _line_indent(source: bytes, offset: int) -> str:
+    """Leading horizontal whitespace on the line containing *offset*."""
+    line_start = source.rfind(b"\n", 0, offset) + 1
+    pos = line_start
+    while pos < len(source) and source[pos] in (32, 9):
+        pos += 1
+    return source[line_start:pos].decode("utf-8", errors="replace")
+
+
+def _member_body_node(defn_node: Node, source: bytes) -> Node | None:
+    """Locate the body block or multi-line initializer of a nested container member."""
+    body = defn_node.child_by_field_name("body")
+    if body is not None:
+        return body
+    for child in defn_node.children:
+        if child.type in _SKELETON_BODY_TYPES or child.type == "arrow_expression_clause":
+            return child
+    # TS/JS `public_field_definition` / `variable_declarator` holding an
+    # arrow_function or function_expression (braced or expression body), or
+    # fields/properties with multi-line initializers.
+    value = defn_node.child_by_field_name("value")
+    if value is not None:
+        if value.type in {"arrow_function", "function_expression", "function"}:
+            value_body = value.child_by_field_name("body")
+            if value_body is not None:
+                return value_body
+        if b"\n" in source[value.start_byte : value.end_byte]:
+            return value
+    seen_equals = False
+    for child in defn_node.children:
+        if child.type == "equals_value_clause":
+            if b"\n" in source[child.start_byte : child.end_byte]:
+                return child
+        elif child.type == "=":
+            seen_equals = True
+        elif seen_equals and child.is_named and not child.is_extra:
+            if child.type in {"arrow_function", "function_expression", "function"}:
+                value_body = child.child_by_field_name("body")
+                if value_body is not None:
+                    return value_body
+            if b"\n" in source[child.start_byte : child.end_byte]:
+                return child
+            break
+    return None
+
+
+def _excluded_comment_spans(node: Node, start: int, end: int) -> list[tuple[int, int]]:
+    """Collect comment byte ranges inside *node* intersecting [start, end)."""
+    spans: list[tuple[int, int]] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.end_byte <= start or current.start_byte >= end:
+            continue
+        if "comment" in current.type:
+            spans.append((max(current.start_byte, start), min(current.end_byte, end)))
+            continue
+        stack.extend(current.children)
+    return spans
+
+
+def _text_without_spans(
+    source: bytes, start: int, end: int, spans: Sequence[tuple[int, int]]
+) -> str:
+    """Decode source[start:end] while replacing excluded byte spans with spaces."""
+    if not spans:
+        return source[start:end].decode("utf-8", errors="replace")
+    parts: list[bytes] = []
+    pos = start
+    for span_start, span_end in sorted(spans):
+        if span_end <= pos:
+            continue
+        if span_start > pos:
+            parts.append(source[pos:span_start])
+        parts.append(b" ")
+        pos = max(pos, span_end)
+    if pos < end:
+        parts.append(source[pos:end])
+    return b"".join(parts).decode("utf-8", errors="replace")
+
+
+def _short_decorator_text(node: Node, source: bytes) -> str | None:
+    """Return single-line decorator text when compact enough for a skeleton."""
+    spans = _excluded_comment_spans(node, node.start_byte, node.end_byte)
+    text = _text_without_spans(source, node.start_byte, node.end_byte, spans).strip()
+    if "\n" not in text and len(text) <= _SKELETON_MAX_DECORATOR_CHARS:
+        return text
+    return None
+
+
+def _member_header_text(child: _ChildSpan, source: bytes, decl_start: int, limit_end: int) -> str:
+    """Collapse a member header slice while stripping comments and oversize annotations."""
+    excluded = _excluded_comment_spans(child.outer, decl_start, limit_end)
+    containers = (
+        (child.outer,)
+        if child.outer.id == child.definition.node.id
+        else (child.outer, child.definition.node)
+    )
+    for container in containers:
+        for node_child in container.children:
+            if node_child.end_byte <= decl_start or node_child.start_byte >= limit_end:
+                continue
+            if (
+                node_child.type == "attribute_list"
+                and _short_decorator_text(node_child, source) is None
+            ):
+                excluded.append(
+                    (
+                        max(node_child.start_byte, decl_start),
+                        min(node_child.end_byte, limit_end),
+                    )
+                )
+            elif node_child.type == "modifiers":
+                for mod_child in node_child.children:
+                    if mod_child.end_byte <= decl_start or mod_child.start_byte >= limit_end:
+                        continue
+                    if (
+                        "annotation" in mod_child.type or mod_child.type == "attribute"
+                    ) and _short_decorator_text(mod_child, source) is None:
+                        excluded.append(
+                            (
+                                max(mod_child.start_byte, decl_start),
+                                min(mod_child.end_byte, limit_end),
+                            )
+                        )
+    return " ".join(_text_without_spans(source, decl_start, limit_end, excluded).split())
+
+
+def _member_signature(child: _ChildSpan, source: bytes, language: str) -> str:
+    """Build a compact single-line signature for one direct container child."""
+    member_indent = _line_indent(source, child.outer.start_byte)
+    prefix_decorators: list[str] = []
+    prev = child.outer.prev_sibling
+    while prev is not None and prev.start_byte >= child.effective_start:
+        if prev.type in {"decorator", "attribute_item"}:
+            dec_text = _short_decorator_text(prev, source)
+            if dec_text is not None:
+                prefix_decorators.append(dec_text)
+        prev = prev.prev_sibling
+    prefix_decorators.reverse()
+
+    if child.outer.type == "decorated_definition":
+        for node_child in child.outer.children:
+            if node_child.type == "decorator":
+                dec_text = _short_decorator_text(node_child, source)
+                if dec_text is not None:
+                    prefix_decorators.append(dec_text)
+        decl_start = child.definition.node.start_byte
+    elif child.outer.children and child.outer.children[0].type == "decorator":
+        decl_start = child.outer.start_byte
+        for node_child in child.outer.children:
+            if node_child.type == "decorator":
+                dec_text = _short_decorator_text(node_child, source)
+                if dec_text is not None:
+                    prefix_decorators.append(dec_text)
+            elif "comment" in node_child.type or node_child.is_extra:
+                continue
+            else:
+                decl_start = node_child.start_byte
+                break
+    else:
+        decl_start = child.outer.start_byte
+
+    body = _member_body_node(child.definition.node, source)
+    if body is not None and body.start_byte >= decl_start:
+        collapsed = _member_header_text(child, source, decl_start, body.start_byte)
+        body_head = source[body.start_byte : body.start_byte + 2]
+        if body_head[:1] == b"{":
+            sig = f"{collapsed} {{ ... }}" if collapsed else "{ ... }"
+        elif body.type == "arrow_expression_clause" or body_head == b"=>":
+            sig = f"{collapsed} => ..." if collapsed else "=> ..."
+        elif body_head[:1] == b"=":
+            sig = f"{collapsed} = ..." if collapsed else "= ..."
+        elif collapsed.endswith(("=>", "=", ":")):
+            sig = f"{collapsed} ..."
+        elif language in {"python", "gdscript"}:
+            sig = f"{collapsed}: ..."
+        else:
+            sig = f"{collapsed} {{ ... }}"
+    else:
+        sig = _member_header_text(child, source, decl_start, child.end_byte)
+
+    full_sig = " ".join([*prefix_decorators, sig]) if prefix_decorators else sig
+    return f"{member_indent}{full_sig}"
 
 
 class _LineIndex:
@@ -653,34 +879,106 @@ class TreeSitterExtractor:
         test_ranges = classify_test_ranges(path, language, tree.root_node, normalized_source)
         chunks: list[ExtractedChunk] = []
         covered: list[tuple[int, int]] = []
+        child_effective_starts: dict[int, int] = {}
+        last_end_by_ancestor: dict[int, int] = {}
+        top_level_end = 0
+        budget_chars = min(_SKELETON_MAX_CHARS, self.max_chars)
+        budget_lines = min(_SKELETON_MAX_LINES, self.max_lines)
 
         for position, definition in enumerate(definitions):
             if position % _BUDGET_CHECK_INTERVAL == 0:
                 check_parent_memory_budget()
             outer = self._outer_node(definition.node)
-            if not self._has_definition_ancestor(definition.node, index, parents):
-                covered.append((outer.start_byte, outer.end_byte))
+            ancestor = self._nearest_definition_ancestor(definition.node, index, parents)
+            if ancestor is None:
+                effective_start = self._effective_start_byte(
+                    outer, normalized_source, top_level_end, language=language
+                )
+                covered.append((effective_start, outer.end_byte))
+                top_level_end = max(top_level_end, outer.end_byte)
+            else:
+                cached_start = child_effective_starts.get(definition.node.id)
+                if cached_start is not None:
+                    effective_start = cached_start
+                else:
+                    min_start = max(
+                        self._container_body_start(ancestor),
+                        last_end_by_ancestor.get(ancestor.id, 0),
+                    )
+                    effective_start = self._effective_start_byte(
+                        outer, normalized_source, min_start, language=language
+                    )
+                last_end_by_ancestor[ancestor.id] = max(
+                    last_end_by_ancestor.get(ancestor.id, 0), outer.end_byte
+                )
             definition_is_test = test_ranges.contains_range(outer.start_byte, outer.end_byte)
             kind, parent, qualified = self._symbol_context(definition, index, parents)
-            start, end = self._content_range(outer, definition.node, kind, index)
-            chunks.extend(
-                self._chunks_for_range(
-                    path=path,
-                    language=language,
-                    kind=kind,
-                    symbol=definition.name,
-                    qualified=qualified,
-                    parent=parent,
-                    source=normalized_source,
-                    start=start,
-                    end=end,
-                    line_index=line_index,
-                    is_test=definition_is_test,
+            children = (
+                self._direct_children(
+                    outer, definition.node, index, normalized_source, language=language
                 )
+                if kind in _CONTAINER_KINDS
+                else []
             )
-            for gap_start, gap_end in self._container_gaps(
-                outer, definition.node, kind, index, normalized_source
+            for child in children:
+                child_effective_starts[child.definition.node.id] = child.effective_start
+            start = effective_start
+            end = children[0].effective_start if children else outer.end_byte
+            header_raw = (
+                normalized_source[start:end].decode("utf-8").rstrip() if start < end else ""
+            )
+            skeleton: str | None = None
+            if (
+                kind in _CODE_CONTAINER_KINDS
+                and children
+                and header_raw
+                and len(header_raw) <= budget_chars
+                and header_raw.count("\n") + 1 <= budget_lines
             ):
+                skeleton = self._container_skeleton(
+                    language=language,
+                    source=normalized_source,
+                    definition_node=definition.node,
+                    outer=outer,
+                    header_raw=header_raw,
+                    children=children,
+                )
+            if skeleton is not None:
+                start_line = line_index.line_at(start)
+                chunks.append(
+                    self._make_chunk(
+                        path,
+                        language,
+                        kind,
+                        definition.name,
+                        qualified,
+                        parent,
+                        start,
+                        end,
+                        start_line,
+                        skeleton,
+                        0,
+                        is_test=definition_is_test,
+                        end_line=start_line + header_raw.count("\n"),
+                    )
+                )
+            else:
+                chunks.extend(
+                    self._chunks_for_range(
+                        path=path,
+                        language=language,
+                        kind=kind,
+                        symbol=definition.name,
+                        qualified=qualified,
+                        parent=parent,
+                        source=normalized_source,
+                        start=start,
+                        end=end,
+                        line_index=line_index,
+                        is_test=definition_is_test,
+                    )
+                )
+            for gap_start, gap_end in self._container_gaps(outer, children, normalized_source):
                 gap_segments = (
                     [(gap_start, gap_end, True)]
                     if definition_is_test
@@ -4938,12 +5236,145 @@ class TreeSitterExtractor:
         return outer
 
     @staticmethod
-    def _has_definition_ancestor(node: Node, index: _DefinitionIndex, parents: _ParentMap) -> bool:
+    def _nearest_definition_ancestor(
+        node: Node, index: _DefinitionIndex, parents: _ParentMap
+    ) -> Node | None:
         parent = parents.parent(node)
         while parent is not None:
             if parent.id in index.by_node_id:
-                return True
+                return parent
             parent = parents.parent(parent)
+        return None
+
+    @staticmethod
+    def _has_definition_ancestor(node: Node, index: _DefinitionIndex, parents: _ParentMap) -> bool:
+        return TreeSitterExtractor._nearest_definition_ancestor(node, index, parents) is not None
+
+    @staticmethod
+    def _is_non_attachable_comment(node: Node, source: bytes, language: str) -> bool:
+        prefix3 = source[node.start_byte : node.start_byte + 3]
+        return prefix3[:2] == b"#!" or (language == "rust" and prefix3 in {b"//!", b"/*!"})
+
+    @staticmethod
+    def _same_line_decorator_run_start(
+        comment_node: Node,
+        source: bytes,
+        min_start_byte: int,
+        language: str,
+    ) -> Node | None:
+        """Return the leading own-line decorator/attribute when *comment_node* trails it."""
+        right = comment_node
+        cur_line_start = source.rfind(b"\n", 0, comment_node.start_byte) + 1
+        probe = comment_node.prev_sibling
+        seen_decorator = False
+        while probe is not None and probe.start_byte >= min_start_byte:
+            if probe.end_byte < cur_line_start:
+                break
+            if source[probe.end_byte : right.start_byte].strip(b" \t\r") != b"":
+                break
+            if probe.type in {"decorator", "attribute_item"}:
+                seen_decorator = True
+                probe_line_start = source.rfind(b"\n", 0, probe.start_byte) + 1
+                if source[probe_line_start : probe.start_byte].strip(b" \t\r") == b"":
+                    return probe
+                cur_line_start = probe_line_start
+                right = probe
+                probe = probe.prev_sibling
+                continue
+            if "comment" in probe.type and not TreeSitterExtractor._is_non_attachable_comment(
+                probe, source, language
+            ):
+                if seen_decorator:
+                    cur_line_start = source.rfind(b"\n", 0, probe.start_byte) + 1
+                right = probe
+                probe = probe.prev_sibling
+                continue
+            break
+        return None
+
+    @staticmethod
+    def _effective_start_byte(
+        outer: Node, source: bytes, min_start_byte: int = 0, *, language: str = ""
+    ) -> int:
+        """Attach preceding own-line decorators, attributes, and adjacent comments."""
+        cursor = outer.start_byte
+        prev = outer.prev_sibling
+        while prev is not None and prev.start_byte >= min_start_byte:
+            line_start = source.rfind(b"\n", 0, prev.start_byte) + 1
+            gap = source[prev.end_byte : cursor]
+            if prev.type in {"decorator", "attribute_item"}:
+                if (
+                    source[line_start : prev.start_byte].strip(b" \t\r") == b""
+                    and gap.strip(b" \t\r\n") == b""
+                    and gap.count(b"\n") <= 2
+                ):
+                    cursor = prev.start_byte
+                    prev = prev.prev_sibling
+                    continue
+                break
+            if "comment" in prev.type:
+                if TreeSitterExtractor._is_non_attachable_comment(prev, source, language):
+                    break
+                if source[line_start : prev.start_byte].strip(b" \t\r") == b"":
+                    if gap.strip(b" \t\r\n") == b"" and gap.count(b"\n") <= 1:
+                        cursor = prev.start_byte
+                        prev = prev.prev_sibling
+                        continue
+                    break
+                dec_start_node = TreeSitterExtractor._same_line_decorator_run_start(
+                    prev, source, min_start_byte, language
+                )
+                if (
+                    dec_start_node is not None
+                    and gap.strip(b" \t\r\n") == b""
+                    and gap.count(b"\n") <= 2
+                ):
+                    cursor = dec_start_node.start_byte
+                    prev = dec_start_node.prev_sibling
+                    continue
+                break
+            break
+        return cursor
+
+    @staticmethod
+    def _container_body_node(node: Node) -> Node | None:
+        """Locate the primary body node of a container definition, if any."""
+        body = node.child_by_field_name("body")
+        if body is not None:
+            return body
+        for child in node.children:
+            if child.type in _SKELETON_BODY_TYPES:
+                return child
+            if child.type in {"struct_type", "interface_type"}:
+                for grandchild in child.children:
+                    if grandchild.type in _SKELETON_BODY_TYPES:
+                        return grandchild
+        return None
+
+    @staticmethod
+    def _container_body_start(node: Node) -> int:
+        """Byte offset right after a container's opening body delimiter."""
+        body = TreeSitterExtractor._container_body_node(node)
+        if body is not None:
+            if body.children and body.children[0].type in {"{", ":", "["}:
+                return body.children[0].end_byte
+            return body.start_byte
+        for child in node.children:
+            if child.type in {"{", ":", "[", "block_start", "start_tag"}:
+                return child.end_byte
+        return node.start_byte
+
+    @staticmethod
+    def _is_brace_closed_container(language: str, definition_node: Node) -> bool:
+        """Whether a container is closed by a trailing AST ``}`` token."""
+        if language in {"python", "gdscript"}:
+            return False
+        body = TreeSitterExtractor._container_body_node(definition_node)
+        target = body if body is not None else definition_node
+        for child in reversed(target.children):
+            if child.is_extra or "comment" in child.type or child.type == ";":
+                continue
+            return child.type == "}"
         return False
 
     @staticmethod
@@ -5027,18 +5458,27 @@ class TreeSitterExtractor:
         return leaves[0].name if leaves else None
 
     @staticmethod
-    def _direct_children(outer: Node, node: Node, index: _DefinitionIndex) -> list[Node]:
-        """Outer nodes of the definitions nested directly inside a container.
+    def _direct_children(
+        outer: Node,
+        node: Node,
+        index: _DefinitionIndex,
+        source: bytes,
+        *,
+        language: str = "",
+    ) -> list[_ChildSpan]:
+        """Spans of the definitions nested directly inside a container.
 
         Definitions are start-ascending, so the scan stops at the first one
         starting at or after ``outer.end_byte``. A definition inside an earlier
         child's outer range is that child's own nesting, not a direct child.
         """
-        children: list[Node] = []
+        children: list[_ChildSpan] = []
         previous_end = outer.start_byte
+        body_start = TreeSitterExtractor._container_body_start(node)
         position = bisect_right(index.starts, outer.start_byte)
         while position < len(index.definitions):
-            candidate = index.definitions[position].node
+            definition = index.definitions[position]
+            candidate = definition.node
             if candidate.start_byte >= outer.end_byte:
                 break
             position += 1
@@ -5047,27 +5487,87 @@ class TreeSitterExtractor:
             candidate_outer = TreeSitterExtractor._outer_node(candidate)
             if candidate_outer.start_byte < previous_end:
                 continue
-            children.append(candidate_outer)
+            min_start = max(body_start, previous_end)
+            effective_start = TreeSitterExtractor._effective_start_byte(
+                candidate_outer, source, min_start, language=language
+            )
+            children.append(
+                _ChildSpan(effective_start, candidate_outer.end_byte, candidate_outer, definition)
+            )
             previous_end = candidate_outer.end_byte
         return children
 
-    @staticmethod
-    def _content_range(
-        outer: Node, node: Node, kind: str, index: _DefinitionIndex
-    ) -> tuple[int, int]:
-        if kind not in _CONTAINER_KINDS:
-            return outer.start_byte, outer.end_byte
-        children = TreeSitterExtractor._direct_children(outer, node, index)
-        if children:
-            # Split at the child's outer node so a decorator, `export`, or
-            # `const` keyword stays with the child chunk instead of dangling at
-            # the end of the container's head.
-            return outer.start_byte, children[0].start_byte
-        return outer.start_byte, outer.end_byte
+    def _container_skeleton(
+        self,
+        *,
+        language: str,
+        source: bytes,
+        definition_node: Node,
+        outer: Node,
+        header_raw: str,
+        children: Sequence[_ChildSpan],
+    ) -> str | None:
+        """Synthesize a compact container skeleton while keeping header bounds."""
+        budget_chars = min(_SKELETON_MAX_CHARS, self.max_chars)
+        budget_lines = min(_SKELETON_MAX_LINES, self.max_lines)
+        closing_line: str | None = None
+        if self._is_brace_closed_container(language, definition_node):
+            closing_line = f"{_line_indent(source, outer.start_byte)}}}"
+        closing_lines = 1 if closing_line is not None else 0
+        closing_chars = (1 + len(closing_line)) if closing_line is not None else 0
+
+        lines = header_raw.split("\n")
+        total_chars = len(header_raw)
+        summary_prefix = "#" if language in _HASH_COMMENT_LANGUAGES else "//"
+        fallback_indent = f"{_line_indent(source, outer.start_byte)}  "
+        emitted_member_or_summary = False
+
+        total_children = len(children)
+        for idx, child in enumerate(children):
+            remaining = total_children - idx
+            member_line = _member_signature(child, source, language)
+            member_indent = _line_indent(source, child.outer.start_byte) or fallback_indent
+            if remaining == 1:
+                fits = (
+                    len(lines) + 1 + closing_lines <= budget_lines
+                    and total_chars + 1 + len(member_line) + closing_chars <= budget_chars
+                )
+            else:
+                after_summary = (
+                    f"{member_indent}{summary_prefix} ... (+{remaining - 1} more members)"
+                )
+                fits = (
+                    len(lines) + 2 + closing_lines <= budget_lines
+                    and total_chars + 1 + len(member_line) + 1 + len(after_summary) + closing_chars
+                    <= budget_chars
+                )
+            if not fits:
+                truncation = f"{member_indent}{summary_prefix} ... (+{remaining} more members)"
+                if (
+                    len(lines) + 1 + closing_lines <= budget_lines
+                    and total_chars + 1 + len(truncation) + closing_chars <= budget_chars
+                ):
+                    lines.append(truncation)
+                    emitted_member_or_summary = True
+                break
+            lines.append(member_line)
+            total_chars += 1 + len(member_line)
+            emitted_member_or_summary = True
+
+        if not emitted_member_or_summary:
+            return None
+
+        if closing_line is not None and (
+            len(lines) + 1 <= budget_lines and total_chars + 1 + len(closing_line) <= budget_chars
+        ):
+            lines.append(closing_line)
+        return "\n".join(lines)
 
     @staticmethod
     def _container_gaps(
-        outer: Node, node: Node, kind: str, index: _DefinitionIndex, source: bytes
+        outer: Node,
+        children: Sequence[_ChildSpan],
+        source: bytes,
     ) -> list[tuple[int, int]]:
         """Source ranges inside a container that no chunk of its members covers.
 
@@ -5076,13 +5576,10 @@ class TreeSitterExtractor:
         would otherwise belong to no chunk at all. Each non-trivial gap becomes
         an extra part of the container.
         """
-        if kind not in _CONTAINER_KINDS:
-            return []
-        children = TreeSitterExtractor._direct_children(outer, node, index)
         gaps: list[tuple[int, int]] = []
         for position, child in enumerate(children):
             gap_end = (
-                children[position + 1].start_byte
+                children[position + 1].effective_start
                 if position + 1 < len(children)
                 else outer.end_byte
             )
@@ -5282,6 +5779,7 @@ class TreeSitterExtractor:
         part_index: int,
         *,
         is_test: bool = False,
+        end_line: int | None = None,
     ) -> ExtractedChunk:
         check_parent_memory_budget()
         # Identity metadata remains exact; repeated embedding/search context has
@@ -5305,7 +5803,7 @@ class TreeSitterExtractor:
             start_byte=start_byte,
             end_byte=end_byte,
             start_line=start_line,
-            end_line=start_line + content.count("\n"),
+            end_line=(start_line + content.count("\n") if end_line is None else end_line),
             content=content,
             embedding_text=embedding_text,
             search_text=f"{embedding_text}\n{normalized}",
