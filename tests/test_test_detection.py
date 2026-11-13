@@ -1327,3 +1327,347 @@ mod tests {
     assert inner_syms["Fixture"] is True
     assert inner_syms["make_fixture"] is True
     assert inner_syms["check"] is True
+
+
+def test_typescript_default_and_commonjs_single_fn_runner_imports() -> None:
+    extractor = TreeSitterExtractor()
+
+    ava_src = b"""import test from "ava";
+
+const buildPayload = () => ({ ok: true });
+
+test("accepts payload", (t) => {
+    t.truthy(buildPayload());
+});
+
+test.serial("runs serially", (t) => {
+    t.truthy(buildPayload());
+});
+"""
+    for rel_path in ("src/avaChecks.ts", "src/orders/test.ts"):
+        ava_res = extractor.extract(Path(rel_path), "typescript", ava_src)
+        assert ava_res.chunks
+        assert all(chunk.is_test for chunk in ava_res.chunks), rel_path
+
+    node_test_src = b"""import test from "node:test";
+
+test("basic", () => {});
+test.only("focused", () => {});
+test.describe("nested suite", () => {
+    test("inner", () => {});
+});
+"""
+    for rel_path in ("src/nodeChecks.ts", "src/orders/test.ts"):
+        node_res = extractor.extract(Path(rel_path), "typescript", node_test_src)
+        assert node_res.chunks
+        assert all(chunk.is_test for chunk in node_res.chunks), rel_path
+
+    tape_src = b"""import tape from "tape";
+
+tape("tape assertion", (t) => {
+    t.end();
+});
+"""
+    tape_res = extractor.extract(Path("src/tapeChecks.ts"), "typescript", tape_src)
+    assert tape_res.chunks
+    assert all(chunk.is_test for chunk in tape_res.chunks)
+
+    cjs_node_src = b"""const test = require("node:test");
+
+test("cjs node test", () => {});
+"""
+    cjs_res = extractor.extract(Path("src/cjsNodeChecks.ts"), "typescript", cjs_node_src)
+    assert cjs_res.chunks
+    assert all(chunk.is_test for chunk in cjs_res.chunks)
+
+    ts_require_ava_src = b"""import test = require("ava");
+
+test("ts import-require ava", (t) => {
+    t.pass();
+});
+"""
+    ts_req_res = extractor.extract(Path("src/orders/test.ts"), "typescript", ts_require_ava_src)
+    assert ts_req_res.chunks
+    assert all(chunk.is_test for chunk in ts_req_res.chunks)
+
+    # Negative guard: namespace-only default import called directly is NOT a test runner
+    playwright_neg_src = b"""import playwright from "@playwright/test";
+
+playwright("not a runner");
+"""
+    for rel_path in ("src/playwrightCaller.ts", "src/orders/test.ts"):
+        neg_res = extractor.extract(Path(rel_path), "typescript", playwright_neg_src)
+        assert neg_res.chunks
+        assert all(not chunk.is_test for chunk in neg_res.chunks), rel_path
+
+
+def test_typescript_type_only_imports_do_not_trigger_test_classification() -> None:
+    extractor = TreeSitterExtractor()
+
+    pw_type_src = b"""import type { Page, BrowserContext } from "@playwright/test";
+
+export function currentUrl(page: Page, defaultBrowser: BrowserContext): string {
+    context(defaultBrowser);
+    return page.url();
+}
+"""
+    pw_type_res = extractor.extract(Path("src/pageHelpers.ts"), "typescript", pw_type_src)
+    assert pw_type_res.chunks
+    assert all(not chunk.is_test for chunk in pw_type_res.chunks)
+
+    pw_tsx_res = extractor.extract(Path("src/PageHelpers.tsx"), "tsx", pw_type_src)
+    assert pw_tsx_res.chunks
+    assert all(not chunk.is_test for chunk in pw_tsx_res.chunks)
+
+    vitest_type_src = b"""import type { Mock } from "vitest";
+
+export function validateSpec(mockFn: Mock, defaultInput: string): boolean {
+    return Boolean(mockFn) && test(defaultInput);
+}
+"""
+    spec_res = extractor.extract(Path("src/orders/spec.ts"), "typescript", vitest_type_src)
+    assert spec_res.chunks
+    assert all(not chunk.is_test for chunk in spec_res.chunks)
+
+    inline_type_alias_src = b"""import { type test as TestFn } from "vitest";
+
+TestFn(123);
+"""
+    inline_res = extractor.extract(
+        Path("src/typeAliasHelper.ts"), "typescript", inline_type_alias_src
+    )
+    assert inline_res.chunks
+    assert all(not chunk.is_test for chunk in inline_res.chunks)
+
+    type_default_and_ns_src = b"""import type test from "ava";
+import type * as vt from "vitest";
+import type avaReq = require("ava");
+
+export type RunnerAlias = typeof test | typeof avaReq | vt.Suite;
+context(defaultInput);
+"""
+    type_ns_res = extractor.extract(
+        Path("src/typeOnlyVariants.ts"), "typescript", type_default_and_ns_src
+    )
+    assert type_ns_res.chunks
+    assert all(not chunk.is_test for chunk in type_ns_res.chunks)
+
+    # Mixed value + type import still detects runtime test bindings and sets has_test_import=True
+    mixed_src = b"""import { type Suite, describe, it } from "vitest";
+
+const makeSuiteName = (s?: Suite) => (s ? "named" : "default");
+
+describe(makeSuiteName(), () => {
+    it("runs with mixed import", () => {});
+});
+"""
+    mixed_res = extractor.extract(Path("src/mixedVitest.ts"), "typescript", mixed_src)
+    assert mixed_res.chunks
+    assert all(chunk.is_test for chunk in mixed_res.chunks)
+
+    mixed_hook_src = b"""import { type Suite, expect } from "vitest";
+
+const label = (_s?: Suite) => "suite";
+
+context(label(), () => {
+    expect(1).toBe(1);
+});
+"""
+    mixed_hook_res = extractor.extract(Path("src/mixedVitestHook.ts"), "typescript", mixed_hook_src)
+    assert mixed_hook_res.chunks
+    assert all(chunk.is_test for chunk in mixed_hook_res.chunks)
+
+
+def test_typescript_vitest_else_branches_and_demorgan_guards() -> None:
+    extractor = TreeSitterExtractor()
+
+    if_else_src = b"""if (import.meta.vitest) {
+    const sample = () => "sample";
+    it("runs inline vitest", () => {
+        sample();
+    });
+} else {
+    function bootstrapCli() {
+        return "cli";
+    }
+    bootstrapCli();
+}
+"""
+    if_else_res = extractor.extract(Path("src/cliEntry.ts"), "typescript", if_else_src)
+    if_else_syms = {c.qualified_symbol: c.is_test for c in if_else_res.chunks if c.qualified_symbol}
+    assert if_else_syms["sample"] is True
+    assert if_else_syms["bootstrapCli"] is False
+
+    if_else_prod_mods = [c for c in if_else_res.chunks if c.kind == "module" and not c.is_test]
+    if_else_test_mods = [c for c in if_else_res.chunks if c.kind == "module" and c.is_test]
+    assert if_else_test_mods
+    assert any("runs inline vitest" in c.content for c in if_else_test_mods)
+    assert all("runs inline vitest" not in c.content for c in if_else_prod_mods)
+    assert any("bootstrapCli" in c.content for c in if_else_prod_mods)
+    assert all("bootstrapCli" not in c.content for c in if_else_test_mods)
+
+    neg_if_else_src = b"""if (!import.meta.vitest) {
+    function bootstrapProd() {
+        return "prod";
+    }
+    bootstrapProd();
+} else {
+    function makeVitestSample() {
+        return "vitest";
+    }
+    it("runs in else branch", () => {
+        makeVitestSample();
+    });
+}
+"""
+    neg_res = extractor.extract(Path("src/prodBootstrap.ts"), "typescript", neg_if_else_src)
+    neg_syms = {c.qualified_symbol: c.is_test for c in neg_res.chunks if c.qualified_symbol}
+    assert neg_syms["bootstrapProd"] is False
+    assert neg_syms["makeVitestSample"] is True
+
+    neg_prod_mods = [c for c in neg_res.chunks if c.kind == "module" and not c.is_test]
+    neg_test_mods = [c for c in neg_res.chunks if c.kind == "module" and c.is_test]
+    assert neg_test_mods
+    assert any("runs in else branch" in c.content for c in neg_test_mods)
+    assert all("runs in else branch" not in c.content for c in neg_prod_mods)
+    assert any("bootstrapProd" in c.content for c in neg_prod_mods)
+    assert all("bootstrapProd" not in c.content for c in neg_test_mods)
+
+    # De Morgan false-positive guards must keep all chunks as production code
+    demorgan_not_src = b"""declare const strictMode: boolean;
+
+if (!(!import.meta.vitest && strictMode)) {
+    function devFallback() {
+        return "fallback";
+    }
+    devFallback();
+}
+"""
+    dm_not_res = extractor.extract(Path("src/orders/test.ts"), "typescript", demorgan_not_src)
+    assert dm_not_res.chunks
+    assert all(not chunk.is_test for chunk in dm_not_res.chunks)
+
+    demorgan_typeof_src = b"""declare const isProd: boolean;
+
+if (!(typeof import.meta.vitest === "undefined" && isProd)) {
+    function enableDebugTelemetry() {
+        return true;
+    }
+    enableDebugTelemetry();
+}
+"""
+    dm_typeof_res = extractor.extract(Path("src/runtimeInit.ts"), "typescript", demorgan_typeof_src)
+    assert dm_typeof_res.chunks
+    assert all(not chunk.is_test for chunk in dm_typeof_res.chunks)
+
+
+def test_typescript_shadowed_ambient_globals_and_local_declarations() -> None:
+    extractor = TreeSitterExtractor()
+
+    router_hook_src = b"""import { beforeEach } from "./router";
+
+beforeEach((to, from) => {
+    return Boolean(to && from);
+});
+"""
+    router_res = extractor.extract(Path("src/navigation.ts"), "typescript", router_hook_src)
+    assert router_res.chunks
+    assert all(not chunk.is_test for chunk in router_res.chunks)
+
+    validator_import_src = b"""import { test } from "./schemaValidator";
+
+test("order-id", (v: string) => v.length > 0);
+"""
+    validator_res = extractor.extract(
+        Path("src/orders/test.ts"), "typescript", validator_import_src
+    )
+    assert validator_res.chunks
+    assert all(not chunk.is_test for chunk in validator_res.chunks)
+
+    hoisted_local_decl_src = b"""test("before-declaration", () => true);
+
+export function test(rule: string, fn: () => boolean): boolean {
+    return Boolean(rule) && fn();
+}
+
+test("non-empty", () => true);
+"""
+    hoisted_res = extractor.extract(
+        Path("src/orders/test.ts"), "typescript", hoisted_local_decl_src
+    )
+    assert hoisted_res.chunks
+    assert all(not chunk.is_test for chunk in hoisted_res.chunks)
+
+    # Extended test fixture binding via base.extend(...) must still classify as test
+    extended_src = b"""import { test as base } from "@playwright/test";
+
+const test = base.extend<{ api: string }>({
+    api: async ({}, use) => {
+        await use("https://api.example.test");
+    },
+});
+
+test("uses extended fixture", async ({ api }) => {
+    return api;
+});
+"""
+    extended_res = extractor.extract(Path("src/extendedChecks.ts"), "typescript", extended_src)
+    assert extended_res.chunks
+    assert all(chunk.is_test for chunk in extended_res.chunks)
+
+
+def test_typescript_void_floating_promise_runner_calls() -> None:
+    extractor = TreeSitterExtractor()
+
+    nested_void_src = b"""import { describe, test } from "node:test";
+
+const makeOrder = () => ({ id: 1 });
+
+void describe("suite", () => {
+    void test("case", async () => {
+        makeOrder();
+    });
+});
+"""
+    for rel_path, lang in (
+        ("src/ordersVoid.ts", "typescript"),
+        ("src/orders/test.ts", "typescript"),
+        ("src/OrderVoid.tsx", "tsx"),
+    ):
+        res = extractor.extract(Path(rel_path), lang, nested_void_src)
+        assert res.chunks
+        assert all(chunk.is_test for chunk in res.chunks), rel_path
+
+    standalone_void_src = b"""import { test } from "node:test";
+
+void test("standalone async check", async () => {});
+"""
+    standalone_res = extractor.extract(
+        Path("src/orders/test.ts"), "typescript", standalone_void_src
+    )
+    assert standalone_res.chunks
+    assert all(chunk.is_test for chunk in standalone_res.chunks)
+
+
+def test_typescript_playwright_fixture_module_with_local_export_expect() -> None:
+    extractor = TreeSitterExtractor()
+
+    fixtures_src = b"""import { test as base, expect } from "@playwright/test";
+
+function createTestUser() {
+    return { id: "user-1" };
+}
+
+export const test = base.extend<{ user: { id: string } }>({
+    user: async ({}, use) => {
+        await use(createTestUser());
+    },
+});
+
+export { expect };
+"""
+    fixtures_res = extractor.extract(Path("src/fixtures.ts"), "typescript", fixtures_src)
+    assert fixtures_res.chunks
+    assert all(chunk.is_test for chunk in fixtures_res.chunks)
+    syms = {c.qualified_symbol: c.is_test for c in fixtures_res.chunks if c.qualified_symbol}
+    assert syms["createTestUser"] is True
