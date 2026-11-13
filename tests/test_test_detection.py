@@ -1,4 +1,7 @@
-"""Tests for test/benchmark detection and search scoping in C#, Java, Python, and Rust."""
+"""Tests for test/benchmark detection and search scoping.
+
+Covers C#, Java, Python, Rust, and TypeScript/TSX.
+"""
 
 from __future__ import annotations
 
@@ -71,8 +74,34 @@ from code_indexing_mcp.test_detection import is_test_file_path
         ("csharp", "src/Acme.Domain/Specs/ActiveOrder.cs", False),
         ("csharp", "src/Acme.Domain/OrderSpecs/ByDate.cs", False),
         ("csharp", "src/Acme.Domain/Spec.cs", False),
+        # TypeScript / TSX
+        ("typescript", "tests/helpers/factory.ts", True),
+        ("tsx", "__tests__/Button.tsx", True),
+        ("typescript", "src/components/__mocks__/api.ts", True),
+        ("typescript", "src/__fixtures__/users.ts", True),
+        ("typescript", "e2e/checkout.ts", True),
+        ("typescript", "playwright/login.ts", True),
+        ("typescript", "cypress/support/commands.ts", True),
+        ("typescript", "src/auth.test.ts", True),
+        ("tsx", "src/Button.spec.tsx", True),
+        ("typescript", "src/hash.bench.mts", True),
+        ("typescript", "src/orders.integration.test.cts", True),
+        ("typescript", "src/api.e2e-spec.ts", True),
+        ("typescript", "src/schema.test-d.ts", True),
+        ("typescript", "src/parser_test.ts", True),
+        ("typescript", "src/hash_bench.ts", True),
+        ("typescript", "src/orders/spec.ts", True),
+        ("typescript", "src/orders/test.ts", True),
+        ("typescript", "src/contest.ts", False),
+        ("tsx", "src/latest.tsx", False),
+        ("typescript", "src/testable.ts", False),
+        ("typescript", "src/testRunner.ts", False),
+        ("typescript", "src/testing/runner.ts", False),
+        ("typescript", "src/domain/specs/activeOrder.ts", False),
+        ("typescript", "src/types/jest.d.ts", False),
+        ("typescript", "src/types/test.d.ts", False),
         # Non-target languages stay False
-        ("typescript", "tests/auth.test.ts", False),
+        ("javascript", "tests/auth.test.js", False),
         ("go", "pkg/auth_test.go", False),
     ],
 )
@@ -282,6 +311,247 @@ public class InvoiceThroughput
     assert all(chunk.is_test for chunk in result.chunks)
 
 
+def test_typescript_and_tsx_suites_fixtures_type_tests_and_colocated_specs() -> None:
+    extractor = TreeSitterExtractor()
+
+    # Vitest / Jest / Mocha / Bun / node:test suites in a non-test path promote whole file
+    suite_src = b"""import {
+    assertType,
+    bench,
+    beforeEach,
+    describe,
+    expectTypeOf,
+    it,
+    test,
+} from "vitest";
+
+describe("orderSuite", () => {
+    const buildOrder = (qty: number) => ({ qty });
+
+    beforeEach(() => {
+        buildOrder(1);
+    });
+
+    it.each([1, 2])("creates order %i", (qty) => {
+        const order = buildOrder(qty);
+        expectTypeOf(order.qty).toEqualTypeOf<number>();
+        assertType<{ qty: number }>(order);
+    });
+
+    test.only("single order", () => {
+        buildOrder(3);
+    });
+
+    bench("buildOrder", () => {
+        buildOrder(10);
+    });
+});
+"""
+    suite_res = extractor.extract(Path("src/orderSuite.ts"), "typescript", suite_src)
+    assert suite_res.chunks
+    assert all(chunk.is_test for chunk in suite_res.chunks)
+
+    # TSX component tests in both unambiguous test path and non-test path
+    tsx_test_path_src = b"""import { Button } from "./Button";
+
+const renderDefault = () => <Button label="ok" />;
+"""
+    tsx_test_res = extractor.extract(
+        Path("src/components/Button.test.tsx"), "tsx", tsx_test_path_src
+    )
+    assert tsx_test_res.chunks
+    assert all(chunk.is_test for chunk in tsx_test_res.chunks)
+
+    tsx_colocated_src = b"""import { render } from "@testing-library/react";
+import { describe, it } from "vitest";
+import { Button } from "./Button";
+
+describe("Button", () => {
+    const renderButton = () => <Button label="ok" />;
+
+    it("renders label", () => {
+        render(renderButton());
+    });
+});
+"""
+    tsx_colocated_res = extractor.extract(
+        Path("src/components/ButtonChecks.tsx"), "tsx", tsx_colocated_src
+    )
+    assert tsx_colocated_res.chunks
+    assert all(chunk.is_test for chunk in tsx_colocated_res.chunks)
+    tsx_syms = {
+        c.qualified_symbol: c.is_test for c in tsx_colocated_res.chunks if c.qualified_symbol
+    }
+    assert tsx_syms["renderButton"] is True
+
+    # Playwright / Vitest custom fixture file using base.extend(...)
+    fixtures_src = b"""import { test as base } from "@playwright/test";
+
+export const test = base.extend<{ api: string }>({
+    api: async ({}, use) => {
+        await use("https://api.example.test");
+    },
+});
+"""
+    fixtures_res = extractor.extract(Path("src/fixtures.ts"), "typescript", fixtures_src)
+    assert fixtures_res.chunks
+    assert all(chunk.is_test for chunk in fixtures_res.chunks)
+
+    # Co-located spec.ts: production OpenAPI spec stays code, AST-confirmed orders/spec.ts promotes
+    openapi_spec_src = b"""export interface OpenApiSpec {
+    openapi: string;
+}
+
+export function loadSpec(): OpenApiSpec {
+    return { openapi: "3.1.0" };
+}
+"""
+    openapi_res = extractor.extract(Path("src/openapi/spec.ts"), "typescript", openapi_spec_src)
+    assert openapi_res.chunks
+    assert all(not chunk.is_test for chunk in openapi_res.chunks)
+
+    orders_spec_src = b"""function makeOrder() {
+    return { id: 1 };
+}
+
+describe("orders", () => {
+    it("creates order", () => {
+        makeOrder();
+    });
+});
+"""
+    orders_spec_res = extractor.extract(Path("src/orders/spec.ts"), "typescript", orders_spec_src)
+    assert orders_spec_res.chunks
+    assert all(chunk.is_test for chunk in orders_spec_res.chunks)
+
+    # Ambient .d.ts stays code while pure-type .test-d.ts classifies whole file as test
+    ambient_dts_src = b"""export interface TestEnv {
+    retries: number;
+}
+"""
+    ambient_res = extractor.extract(Path("src/types/test.d.ts"), "typescript", ambient_dts_src)
+    assert ambient_res.chunks
+    assert all(not chunk.is_test for chunk in ambient_res.chunks)
+
+    type_test_src = b"""export type OrderId = string;
+type AssertOrderIdIsString = OrderId extends string ? true : false;
+"""
+    type_test_res = extractor.extract(
+        Path("src/types/order.test-d.ts"), "typescript", type_test_src
+    )
+    assert type_test_res.chunks
+    assert all(chunk.is_test for chunk in type_test_res.chunks)
+
+
+def test_typescript_inline_vitest_deno_and_decorated_suites_separate_prod_from_tests() -> None:
+    extractor = TreeSitterExtractor()
+
+    # Mixed production + Vitest in-source if (import.meta.vitest) + false-positive guards
+    validator_src = b"""export class RegexValidator {
+    test(input: string): boolean {
+        return /^ok$/.test(input);
+    }
+}
+
+export function validateOrder(s: string): boolean {
+    if (!import.meta.vitest) {
+        return s.length > 0;
+    }
+    return true;
+}
+
+if (import.meta.vitest) {
+    const makeSample = () => "ok";
+    it("validates sample", () => {
+        validateOrder(makeSample());
+    });
+}
+"""
+    val_res = extractor.extract(Path("src/validator.ts"), "typescript", validator_src)
+    val_syms = {c.qualified_symbol: c.is_test for c in val_res.chunks if c.qualified_symbol}
+    assert val_syms["RegexValidator"] is False
+    assert val_syms["RegexValidator.test"] is False
+    assert val_syms["validateOrder"] is False
+    assert val_syms["makeSample"] is True
+
+    val_prod_modules = [c for c in val_res.chunks if c.kind == "module" and not c.is_test]
+    val_test_modules = [c for c in val_res.chunks if c.kind == "module" and c.is_test]
+    assert val_test_modules
+    assert any("validates sample" in c.content for c in val_test_modules)
+    assert all("validates sample" not in c.content for c in val_prod_modules)
+    assert all("makeSample" not in c.content for c in val_prod_modules)
+
+    # Mixed production + inline Deno.test / Deno.bench
+    deno_src = b"""export function add(a: number, b: number): number {
+    return a + b;
+}
+
+Deno.test("adds numbers", () => {
+    add(1, 2);
+});
+
+Deno.bench("add throughput", () => {
+    add(10, 20);
+});
+"""
+    deno_res = extractor.extract(Path("src/deno_math.ts"), "typescript", deno_src)
+    deno_syms = {c.qualified_symbol: c.is_test for c in deno_res.chunks if c.qualified_symbol}
+    assert deno_syms["add"] is False
+
+    deno_prod_modules = [c for c in deno_res.chunks if c.kind == "module" and not c.is_test]
+    deno_test_modules = [c for c in deno_res.chunks if c.kind == "module" and c.is_test]
+    assert any("Deno.test" in c.content for c in deno_test_modules)
+    assert any("Deno.bench" in c.content for c in deno_test_modules)
+    assert all("Deno.test" not in c.content for c in deno_prod_modules)
+    assert all("Deno.bench" not in c.content for c in deno_prod_modules)
+
+    # Decorated @Suite / @Test class promotes whole class & helper methods
+    decorated_src = b"""@Suite()
+export class OrderSuite {
+    helper() {}
+
+    @Test()
+    createsOrder() {
+        this.helper();
+    }
+}
+"""
+    dec_res = extractor.extract(Path("src/orderDecorated.ts"), "typescript", decorated_src)
+    assert dec_res.chunks
+    assert all(chunk.is_test for chunk in dec_res.chunks)
+    dec_syms = {c.qualified_symbol: c.is_test for c in dec_res.chunks if c.qualified_symbol}
+    assert dec_syms["OrderSuite"] is True
+    assert dec_syms["OrderSuite.helper"] is True
+    assert dec_syms["OrderSuite.createsOrder"] is True
+
+    # Outer production class + nested @Suite class in namespace keeps outer prod code False
+    nested_src = b"""export class OrderService {
+    placeOrder() {
+        return 1;
+    }
+}
+
+export namespace OrderService {
+    @Suite()
+    export class SanitySuite {
+        helper() {}
+
+        @Test()
+        ok() {
+            this.helper();
+        }
+    }
+}
+"""
+    nested_res = extractor.extract(Path("src/orderServiceNested.ts"), "typescript", nested_src)
+    nested_syms = {c.qualified_symbol: c.is_test for c in nested_res.chunks if c.qualified_symbol}
+    assert nested_syms["OrderService"] is False
+    assert nested_syms["OrderService.placeOrder"] is False
+    assert nested_syms["SanitySuite"] is True
+    assert nested_syms["SanitySuite.helper"] is True
+    assert nested_syms["SanitySuite.ok"] is True
+
+
 def _build_app(tmp_path: Path) -> tuple[Application, Path]:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -365,6 +635,43 @@ def _build_app(tmp_path: Path) -> tuple[Application, Path]:
         encoding="utf-8",
     )
 
+    # TypeScript inline if (import.meta.vitest) + TSX production & test components
+    (repo / "src" / "checkout.ts").write_text(
+        "export function computeOrderTotal(price: number, qty: number): number {\n"
+        "    if (!import.meta.vitest) {\n"
+        "        return price * qty;\n"
+        "    }\n"
+        "    return price * qty;\n"
+        "}\n\n"
+        "if (import.meta.vitest) {\n"
+        "    const makeCartSample = () => computeOrderTotal(10, 2);\n"
+        '    it("computes total", () => {\n'
+        "        makeCartSample();\n"
+        "    });\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "Widget.tsx").write_text(
+        'import { computeOrderTotal } from "./checkout";\n\n'
+        "export function WidgetSummary({ qty }: { qty: number }) {\n"
+        "    const total = computeOrderTotal(5, qty);\n"
+        "    return <span>{total}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (repo / "__tests__").mkdir()
+    (repo / "__tests__" / "Widget.test.tsx").write_text(
+        'import { WidgetSummary } from "../src/Widget";\n'
+        'import { computeOrderTotal } from "../src/checkout";\n\n'
+        "const makeWidgetProps = () => ({ qty: computeOrderTotal(2, 3) });\n\n"
+        'describe("WidgetSummary", () => {\n'
+        '    it("renders total", () => {\n'
+        "        return <WidgetSummary qty={makeWidgetProps().qty} />;\n"
+        "    });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
     app = Application(
         RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
         embedder=DeterministicEmbedder(),
@@ -380,8 +687,9 @@ def test_search_code_example_and_find_symbol_respect_scope_while_refactor_stays_
 ) -> None:
     app, _ = _build_app(tmp_path)
 
-    # Default scope="code" excludes Python tests/, Rust #[cfg(test)], C# *.Tests/, Java src/test/
-    code_hits = app.search_code("verify_session_token", limit=20).hits
+    # Default scope="code" excludes Python tests/, Rust #[cfg(test)], C# *.Tests/, Java src/test/,
+    # TS inline import.meta.vitest, and TSX __tests__/
+    code_hits = app.search_code("verify_session_token", limit=50).hits
     assert code_hits[0].path == "src/auth.py"
     assert all(not hit.is_test for hit in code_hits)
     assert {hit.path for hit in code_hits} == {
@@ -389,10 +697,13 @@ def test_search_code_example_and_find_symbol_respect_scope_while_refactor_stays_
         "src/lib.rs",
         "src/Billing.cs",
         "src/main/java/demo/Inventory.java",
+        "src/checkout.ts",
+        "src/Widget.tsx",
     }
     assert all("order_fixture" not in hit.snippet for hit in code_hits)
+    assert all("makeCartSample" not in hit.snippet for hit in code_hits)
 
-    test_hits = app.search_code("verify_session_token", scope="tests", limit=20).hits
+    test_hits = app.search_code("verify_session_token", scope="tests", limit=50).hits
     assert test_hits[0].path == "tests/test_auth.py"
     assert all(hit.is_test for hit in test_hits)
     assert {hit.path for hit in test_hits} == {
@@ -400,6 +711,8 @@ def test_search_code_example_and_find_symbol_respect_scope_while_refactor_stays_
         "src/lib.rs",
         "Demo.Tests/LedgerBuilder.cs",
         "src/test/java/demo/InventoryTest.java",
+        "src/checkout.ts",
+        "__tests__/Widget.test.tsx",
     }
 
     all_hits = app.search_code("verify_session_token", scope="all", limit=50).hits
@@ -407,6 +720,8 @@ def test_search_code_example_and_find_symbol_respect_scope_while_refactor_stays_
     assert any(not hit.is_test for hit in all_hits)
     assert "tests/test_auth.py" in {hit.path for hit in all_hits}
     assert "src/auth.py" in {hit.path for hit in all_hits}
+    assert "__tests__/Widget.test.tsx" in {hit.path for hit in all_hits}
+    assert "src/Widget.tsx" in {hit.path for hit in all_hits}
 
     # Rust inline #[cfg(test)] helpers are excluded from code symbol lookup, included in tests/all
     assert app.find_symbol("dispatch_order").hits
@@ -414,6 +729,25 @@ def test_search_code_example_and_find_symbol_respect_scope_while_refactor_stays_
     rust_test_sym = app.find_symbol("order_fixture", scope="tests").hits
     assert len(rust_test_sym) == 1
     assert rust_test_sym[0].is_test is True
+
+    # TS inline import.meta.vitest and TSX test symbols obey scope
+    ts_code_sym = app.find_symbol("computeOrderTotal").hits
+    assert [hit.path for hit in ts_code_sym] == ["src/checkout.ts"]
+    assert ts_code_sym[0].is_test is False
+    assert app.find_symbol("makeCartSample").hits == []
+    ts_test_sym = app.find_symbol("makeCartSample", scope="tests").hits
+    assert len(ts_test_sym) == 1
+    assert ts_test_sym[0].path == "src/checkout.ts"
+    assert ts_test_sym[0].is_test is True
+
+    assert [hit.path for hit in app.find_symbol("WidgetSummary").hits] == ["src/Widget.tsx"]
+    assert app.find_symbol("makeWidgetProps").hits == []
+    tsx_test_sym = app.find_symbol("makeWidgetProps", scope="tests").hits
+    assert [hit.path for hit in tsx_test_sym] == ["__tests__/Widget.test.tsx"]
+    assert tsx_test_sym[0].is_test is True
+    assert [hit.path for hit in app.find_symbol("makeWidgetProps", scope="all").hits] == [
+        "__tests__/Widget.test.tsx"
+    ]
 
     # C# & Java duplicate method names in test helpers vs production classes
     cs_code = app.find_symbol("ComputeBalance").hits
@@ -432,9 +766,9 @@ def test_search_code_example_and_find_symbol_respect_scope_while_refactor_stays_
     snippet = (
         "def verify_session_token(token: str) -> bool:\n    return token.startswith('valid_')\n"
     )
-    ex_code = app.search_by_example(snippet, limit=20).hits
+    ex_code = app.search_by_example(snippet, limit=50).hits
     assert all(not hit.is_test for hit in ex_code)
-    ex_tests = app.search_by_example(snippet, scope="tests", limit=20).hits
+    ex_tests = app.search_by_example(snippet, scope="tests", limit=50).hits
     assert ex_tests
     assert all(hit.is_test for hit in ex_tests)
 
@@ -459,6 +793,21 @@ def test_search_code_example_and_find_symbol_respect_scope_while_refactor_stays_
         RenameOperation(new_name="check_session_token"),
     )
     assert "tests/test_auth.py" in {finding.path for finding in py_analysis.must_change}
+
+    ts_chunk_id = ts_code_sym[0].chunk_id
+    ts_analysis = app.analyze_refactor(
+        DeclarationSelector(chunk_id=ts_chunk_id),
+        RenameOperation(new_name="calculateOrderTotal"),
+    )
+    ts_finding_paths = {finding.path for finding in ts_analysis.findings}
+    assert "src/checkout.ts" in ts_finding_paths
+    assert "src/Widget.tsx" in ts_finding_paths
+    assert "__tests__/Widget.test.tsx" in ts_finding_paths
+    ts_checkout_lines = {
+        finding.start_line for finding in ts_analysis.findings if finding.path == "src/checkout.ts"
+    }
+    assert 1 in ts_checkout_lines
+    assert 9 in ts_checkout_lines
 
 
 @pytest.mark.asyncio
@@ -488,12 +837,37 @@ async def test_mcp_search_across_projects_and_find_symbol_scope_filtering(tmp_pa
         "def test_settle_ledger_entry() -> None:\n    assert True\n",
         encoding="utf-8",
     )
+    (alpha_root / "src" / "ledger.ts").write_text(
+        "export function settleLedgerEntry(amount: number): number {\n"
+        "    return amount;\n"
+        "}\n\n"
+        "if (import.meta.vitest) {\n"
+        "    const settle_ledger_entry_sample = () => settleLedgerEntry(1);\n"
+        '    it("checks ledger", () => {\n'
+        "        settle_ledger_entry_sample();\n"
+        "    });\n"
+        "}\n",
+        encoding="utf-8",
+    )
     (beta_root / "src" / "lib.rs").write_text(
         "pub fn settle_ledger_entry(amount: i64) -> i64 { amount }\n",
         encoding="utf-8",
     )
     (beta_root / "benches" / "ledger_bench.rs").write_text(
         "pub fn bench_settle_ledger_entry() {}\n",
+        encoding="utf-8",
+    )
+    (beta_root / "src" / "LedgerView.tsx").write_text(
+        "export function LedgerView({ amount }: { amount: number }) {\n"
+        "    return <span>{amount}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (beta_root / "src" / "LedgerView.test.tsx").write_text(
+        'import { LedgerView } from "./LedgerView";\n'
+        "export function renderLedgerTest() {\n"
+        "    return <LedgerView amount={1} />;\n"
+        "}\n",
         encoding="utf-8",
     )
 
@@ -512,12 +886,19 @@ async def test_mcp_search_across_projects_and_find_symbol_scope_filtering(tmp_pa
     ) as client:
         default_res = await client.call_tool(
             "search_across_projects",
-            {"projects": [alpha.id, beta.id], "query": "settle_ledger_entry", "limit": 10},
+            {"projects": [alpha.id, beta.id], "query": "settle_ledger_entry", "limit": 20},
         )
         assert not default_res.isError
         assert default_res.structuredContent is not None
-        default_paths = {hit["path"] for hit in default_res.structuredContent["hits"]}
-        assert default_paths == {"src/payment.py", "src/lib.rs"}
+        default_hits = default_res.structuredContent["hits"]
+        assert all(hit["is_test"] is False for hit in default_hits)
+        default_paths = {hit["path"] for hit in default_hits}
+        assert default_paths == {
+            "src/payment.py",
+            "src/ledger.ts",
+            "src/lib.rs",
+            "src/LedgerView.tsx",
+        }
 
         tests_res = await client.call_tool(
             "search_across_projects",
@@ -525,13 +906,37 @@ async def test_mcp_search_across_projects_and_find_symbol_scope_filtering(tmp_pa
                 "projects": [alpha.id, beta.id],
                 "query": "settle_ledger_entry",
                 "scope": "tests",
-                "limit": 10,
+                "limit": 20,
             },
         )
         assert not tests_res.isError
         assert tests_res.structuredContent is not None
-        test_paths = {hit["path"] for hit in tests_res.structuredContent["hits"]}
-        assert test_paths == {"tests/test_payment.py", "benches/ledger_bench.rs"}
+        test_hits = tests_res.structuredContent["hits"]
+        assert all(hit["is_test"] is True for hit in test_hits)
+        test_paths = {hit["path"] for hit in test_hits}
+        assert test_paths == {
+            "tests/test_payment.py",
+            "src/ledger.ts",
+            "benches/ledger_bench.rs",
+            "src/LedgerView.test.tsx",
+        }
+
+        all_res = await client.call_tool(
+            "search_across_projects",
+            {
+                "projects": [alpha.id, beta.id],
+                "query": "settle_ledger_entry",
+                "scope": "all",
+                "limit": 30,
+            },
+        )
+        assert not all_res.isError
+        assert all_res.structuredContent is not None
+        all_hits = all_res.structuredContent["hits"]
+        assert any(hit["is_test"] is False for hit in all_hits)
+        assert any(hit["is_test"] is True for hit in all_hits)
+        assert "src/LedgerView.tsx" in {hit["path"] for hit in all_hits}
+        assert "src/LedgerView.test.tsx" in {hit["path"] for hit in all_hits}
 
         sym_code = await client.call_tool(
             "find_symbol",
@@ -546,6 +951,39 @@ async def test_mcp_search_across_projects_and_find_symbol_scope_filtering(tmp_pa
         )
         assert sym_tests.structuredContent is not None
         assert len(sym_tests.structuredContent["hits"]) == 1
+        assert sym_tests.structuredContent["hits"][0]["is_test"] is True
+
+        ts_sym_code = await client.call_tool(
+            "find_symbol",
+            {"name": "settle_ledger_entry_sample", "project": alpha.id},
+        )
+        assert ts_sym_code.structuredContent is not None
+        assert ts_sym_code.structuredContent["hits"] == []
+
+        ts_sym_tests = await client.call_tool(
+            "find_symbol",
+            {"name": "settle_ledger_entry_sample", "project": alpha.id, "scope": "tests"},
+        )
+        assert ts_sym_tests.structuredContent is not None
+        assert len(ts_sym_tests.structuredContent["hits"]) == 1
+        assert ts_sym_tests.structuredContent["hits"][0]["path"] == "src/ledger.ts"
+        assert ts_sym_tests.structuredContent["hits"][0]["is_test"] is True
+
+        tsx_sym_code = await client.call_tool(
+            "find_symbol",
+            {"name": "renderLedgerTest", "project": beta.id},
+        )
+        assert tsx_sym_code.structuredContent is not None
+        assert tsx_sym_code.structuredContent["hits"] == []
+
+        tsx_sym_tests = await client.call_tool(
+            "find_symbol",
+            {"name": "renderLedgerTest", "project": beta.id, "scope": "tests"},
+        )
+        assert tsx_sym_tests.structuredContent is not None
+        assert len(tsx_sym_tests.structuredContent["hits"]) == 1
+        assert tsx_sym_tests.structuredContent["hits"][0]["path"] == "src/LedgerView.test.tsx"
+        assert tsx_sym_tests.structuredContent["hits"][0]["is_test"] is True
 
 
 @pytest.mark.asyncio
