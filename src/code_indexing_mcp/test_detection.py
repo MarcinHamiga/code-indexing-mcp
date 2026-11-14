@@ -21,14 +21,14 @@ TEST_DETECTION_LANGUAGES: Final = frozenset(
     {"csharp", "java", "python", "rust", "typescript", "tsx"}
 )
 
-_COMMON_TEST_DIRS: Final = frozenset(
+_UNAMBIGUOUS_TEST_DIRS: Final = frozenset(
     {
-        "test",
         "tests",
-        "bench",
         "benches",
-        "benchmark",
         "benchmarks",
+        "testdata",
+        "testfixtures",
+        "javatests",
         "__tests__",
         "__test__",
         "__specs__",
@@ -36,13 +36,6 @@ _COMMON_TEST_DIRS: Final = frozenset(
         "__benchmarks__",
         "__mocks__",
         "__fixtures__",
-        "javatests",
-        "testfixtures",
-    }
-)
-
-_JAVA_EXTRA_TEST_DIRS: Final = frozenset(
-    {
         "integrationtest",
         "integrationtests",
         "inttest",
@@ -52,15 +45,36 @@ _JAVA_EXTRA_TEST_DIRS: Final = frozenset(
         "acceptancetest",
         "acceptancetests",
         "jmh",
+        "cypress",
+        "playwright",
+        "e2e-tests",
     }
 )
 
-_TS_EXTRA_TEST_DIRS: Final = frozenset(
+_CONTEXTUAL_TEST_DIRS: Final = frozenset(
     {
+        "test",
+        "bench",
+        "benchmark",
         "e2e",
-        "e2e-tests",
-        "cypress",
-        "playwright",
+    }
+)
+
+_NON_AST_PROD_NAMESPACE_DIRS: Final = frozenset(
+    {
+        "cmd",
+        "internal",
+        "pkg",
+        "lib",
+        "deploy",
+        "deployments",
+        "k8s",
+        "helm",
+        "charts",
+        "infra",
+        "terraform",
+        "config",
+        "configs",
     }
 )
 
@@ -206,8 +220,7 @@ _TS_RUNNER_MODIFIERS: Final = frozenset(
 _TS_CLASS_TEST_DECORATORS: Final = frozenset({"Suite", "suite", "TestSuite"})
 _TS_METHOD_TEST_DECORATORS: Final = frozenset({"Test", "test", "Benchmark", "benchmark"})
 
-_CSHARP_DOT_TEST_DIR_SUFFIXES: Final = (
-    ".test",
+_CROSS_LANG_DOT_TEST_DIR_SUFFIXES: Final = (
     ".tests",
     ".unittests",
     ".integrationtests",
@@ -221,7 +234,7 @@ _CSHARP_DOT_TEST_DIR_SUFFIXES: Final = (
     ".benchmarks",
 )
 
-_CSHARP_PASCAL_TEST_DIR_SUFFIXES: Final = (
+_PASCAL_TEST_DIR_SUFFIXES: Final = (
     "Tests",
     "UnitTests",
     "IntegrationTests",
@@ -480,18 +493,41 @@ def _pascal_test_name(stem: str, *, allow_it: bool = False, allow_specs: bool = 
     return False
 
 
+def _has_dot_test_dir_suffix(lower_dir: str, *, allow_singular_test: bool) -> bool:
+    if any(
+        lower_dir.endswith(suffix) and len(lower_dir) > len(suffix)
+        for suffix in _CROSS_LANG_DOT_TEST_DIR_SUFFIXES
+    ):
+        return True
+    return allow_singular_test and lower_dir.endswith(".test") and len(lower_dir) > len(".test")
+
+
+def _is_contextual_test_dir(language: str, lower_dir: str, lower_ancestors: list[str]) -> bool:
+    if language in TEST_DETECTION_LANGUAGES:
+        if lower_dir in {"test", "bench", "benchmark"}:
+            return True
+        if lower_dir == "e2e" and language in {"typescript", "tsx"}:
+            return True
+    if any(ancestor in _NON_AST_PROD_NAMESPACE_DIRS for ancestor in lower_ancestors):
+        return False
+    if "src" in lower_ancestors:
+        return lower_dir == "test" and lower_ancestors[-1] == "src"
+    return True
+
+
 def _has_test_directory(language: str, directories: list[str]) -> bool:
-    for directory in directories:
-        lower_dir = directory.lower()
-        if lower_dir in _COMMON_TEST_DIRS:
+    lower_dirs = [directory.lower() for directory in directories]
+    allow_singular_dot_test = language == "csharp"
+    for idx, directory in enumerate(directories):
+        lower_dir = lower_dirs[idx]
+        if lower_dir in _UNAMBIGUOUS_TEST_DIRS:
             return True
-        if language == "java" and lower_dir in _JAVA_EXTRA_TEST_DIRS:
+        if directory.endswith(_PASCAL_TEST_DIR_SUFFIXES):
             return True
-        if language in {"typescript", "tsx"} and lower_dir in _TS_EXTRA_TEST_DIRS:
+        if _has_dot_test_dir_suffix(lower_dir, allow_singular_test=allow_singular_dot_test):
             return True
-        if language == "csharp" and (
-            lower_dir.endswith(_CSHARP_DOT_TEST_DIR_SUFFIXES)
-            or directory.endswith(_CSHARP_PASCAL_TEST_DIR_SUFFIXES)
+        if lower_dir in _CONTEXTUAL_TEST_DIRS and _is_contextual_test_dir(
+            language, lower_dir, lower_dirs[:idx]
         ):
             return True
     return False
@@ -508,9 +544,24 @@ def _ts_base_stem(filename: str) -> str | None:
     return None
 
 
+def _has_windows_drive(text: str) -> bool:
+    return len(text) >= 2 and text[0].isalpha() and text[1] == ":"
+
+
 def _path_parts(path: Path) -> tuple[PurePosixPath, list[str]]:
-    posix = PurePosixPath(path.as_posix())
-    parts = [part for part in posix.parts if part not in {"", "."}]
+    raw = path.as_posix().replace("\\", "/")
+    posix = PurePosixPath(raw)
+    if not posix.parts:
+        return PurePosixPath(), []
+    is_rooted = path.is_absolute() or raw.startswith("/") or _has_windows_drive(raw)
+    parts = [part for part in posix.parts if part not in {"", "/", "//", "."}]
+    if is_rooted or ".." in parts:
+        if not parts or parts[-1] == "..":
+            return PurePosixPath(), []
+        last = parts[-1][2:] if _has_windows_drive(parts[-1]) else parts[-1]
+        if not last:
+            return PurePosixPath(), []
+        return PurePosixPath(last), [last]
     return posix, parts
 
 
