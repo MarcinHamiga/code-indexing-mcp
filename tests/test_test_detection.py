@@ -1,6 +1,7 @@
 """Tests for test/benchmark detection and search scoping.
 
-Covers C#, Java, Python, Rust, and TypeScript/TSX.
+Covers unambiguous test/benchmark directories across all indexed languages plus
+filename and AST rules for C#, Java, Python, Rust, and TypeScript/TSX.
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ from code_indexing_mcp.test_detection import is_test_file_path
         ("java", "src/main/java/com/acme/BIT.java", False),
         # C#
         ("csharp", "tests/Acme.Core/FakeClock.cs", True),
+        ("csharp", "src/Acme.Orders.Test/UserBuilder.cs", True),
         ("csharp", "src/Acme.Orders.Tests/UserBuilder.cs", True),
         ("csharp", "src/Acme.Orders.UnitTests/Helper.cs", True),
         ("csharp", "src/Acme.Orders.IntegrationTests/Fixture.cs", True),
@@ -100,9 +102,58 @@ from code_indexing_mcp.test_detection import is_test_file_path
         ("typescript", "src/domain/specs/activeOrder.ts", False),
         ("typescript", "src/types/jest.d.ts", False),
         ("typescript", "src/types/test.d.ts", False),
-        # Non-target languages stay False
-        ("javascript", "tests/auth.test.js", False),
+        # Cross-language test/benchmark/fixture directories vs production false-positive guards
+        ("javascript", "tests/auth.test.js", True),
+        ("javascript", "test/helper.js", True),
+        ("javascript", "__tests__/widget.js", True),
+        ("javascript", "__mocks__/api.js", True),
+        ("javascript", "e2e/checkout.js", True),
+        ("javascript", "packages/web/e2e/checkout.js", True),
+        ("javascript", "cypress/e2e/login.cy.js", True),
+        ("javascript", "playwright/smoke.spec.js", True),
+        ("javascript", "src/auth.test.js", False),
+        ("javascript", "src/crypto/e2e/cipher.js", False),
+        ("json", "tests/fixtures/extractor_snapshot.json", True),
+        ("json", "src/__fixtures__/users.json", True),
+        ("json", "cypress/fixtures/users.json", True),
+        ("json", "src/Acme.Orders.Tests/Fixtures/order.json", True),
+        ("json", "internal/auth/testdata/snapshot.json", True),
+        ("json", "package.json", False),
+        ("json", "certs/api.example.test/cert.json", False),
+        ("json", ".bench/cache.json", False),
+        ("yaml", "tests/fixtures/compose.yaml", True),
+        ("yaml", "Acme.Benchmarks/config.yaml", True),
+        ("yaml", ".github/workflows/ci.yml", False),
+        ("yaml", "deploy/benchmark/values.yaml", False),
+        ("terraform", "infra/benchmark/main.tf", False),
+        ("go", "tests/fixtures/resolver_corpus/go/sample.go", True),
+        ("go", "pkg/parser/testdata/sample.go", True),
+        ("go", "pkg/parser/tests/case.go", True),
+        ("go", "bench/runner.go", True),
         ("go", "pkg/auth_test.go", False),
+        ("go", "cmd/bench/main.go", False),
+        ("go", "internal/test/clock.go", False),
+        ("go", "pkg/test/harness.go", False),
+        ("go", "src/cli/bench/runner.go", False),
+        ("go", "src/orders/test/fake.go", False),
+        ("kotlin", "app/src/test/kotlin/FooTest.kt", True),
+        ("kotlin", "src/integrationTest/kotlin/OrderIT.kt", True),
+        ("kotlin", "src/jmh/kotlin/OrderBench.kt", True),
+        ("kotlin", "app/src/main/kotlin/Foo.kt", False),
+        ("swift", "MyAppTests/LoginTests.swift", True),
+        ("swift", "Sources/MyApp/Contests/Leaderboard.swift", False),
+        ("lua", "packages/core/test/helper.lua", True),
+        ("sql", "benches/query.sql", True),
+        ("sql", "Acme.IntegrationTests/seed.sql", True),
+        ("sql", "src/integrationTest/resources/seed.sql", True),
+        ("sql", "src/schema.sql", False),
+        # Path normalization & non-relative path guards
+        ("json", "tests\\fixtures\\sample.json", True),
+        ("go", "/home/test/workspace/src/main.go", False),
+        ("python", "/home/test/workspace/src/main.py", False),
+        ("python", "/home/test/workspace/src/conftest.py", True),
+        ("go", "C:\\Users\\test\\repo\\src\\main.go", False),
+        ("go", "../tests/repo/src/main.go", False),
     ],
 )
 def test_is_test_file_path_conventions_and_false_positive_guards(
@@ -1671,3 +1722,249 @@ export { expect };
     assert all(chunk.is_test for chunk in fixtures_res.chunks)
     syms = {c.qualified_symbol: c.is_test for c in fixtures_res.chunks if c.qualified_symbol}
     assert syms["createTestUser"] is True
+
+
+def test_non_ast_languages_in_test_and_benchmark_directories_are_classified_and_scoped(
+    tmp_path: Path,
+) -> None:
+    extractor = TreeSitterExtractor()
+
+    fixture_cases: list[tuple[str, str, bytes]] = [
+        ("tests/fixtures/extractor_snapshot.json", "json", b'{"verifyFixtureToken": true}\n'),
+        (
+            "src/Acme.Orders.Tests/Fixtures/order.json",
+            "json",
+            b'{"verifyFixtureToken": true}\n',
+        ),
+        (
+            "cypress/fixtures/users.json",
+            "json",
+            b'{"verifyFixtureToken": true}\n',
+        ),
+        (
+            "pkg/parser/testdata/snapshot.json",
+            "json",
+            b'{"verifyFixtureToken": true}\n',
+        ),
+        (
+            "tests/fixtures/compose.yaml",
+            "yaml",
+            b"services:\n  verify_fixture_token:\n    image: alpine\n",
+        ),
+        (
+            "__tests__/widget.js",
+            "javascript",
+            b"export function verifyFixtureToken() { return true; }\n",
+        ),
+        (
+            "cypress/e2e/login.cy.js",
+            "javascript",
+            b"export function verifyFixtureToken() { return true; }\n",
+        ),
+        (
+            "playwright/smoke.spec.js",
+            "javascript",
+            b"export function verifyFixtureToken() { return true; }\n",
+        ),
+        (
+            "e2e/checkout.js",
+            "javascript",
+            b"export function verifyFixtureToken() { return true; }\n",
+        ),
+        (
+            "app/src/test/kotlin/FixtureToken.kt",
+            "kotlin",
+            b"package demo\nfun verifyFixtureToken(): Boolean = true\n",
+        ),
+        (
+            "src/integrationTest/kotlin/OrderIT.kt",
+            "kotlin",
+            b"package demo\nfun verifyFixtureToken(): Boolean = true\n",
+        ),
+        (
+            "src/jmh/kotlin/OrderBench.kt",
+            "kotlin",
+            b"package demo\nfun verifyFixtureToken(): Boolean = true\n",
+        ),
+        (
+            "pkg/parser/testdata/sample.go",
+            "go",
+            b"package sample\nfunc verifyFixtureToken() bool { return true }\n",
+        ),
+        ("benches/query.sql", "sql", b"CREATE VIEW verify_fixture_token AS SELECT 1;\n"),
+        (
+            "Acme.IntegrationTests/seed.sql",
+            "sql",
+            b"CREATE VIEW verify_fixture_token AS SELECT 1;\n",
+        ),
+        (
+            "src/integrationTest/resources/seed.sql",
+            "sql",
+            b"CREATE VIEW verify_fixture_token AS SELECT 1;\n",
+        ),
+    ]
+    for rel_path, language, source in fixture_cases:
+        res = extractor.extract(Path(rel_path), language, source)
+        assert res.chunks, rel_path
+        assert all(chunk.is_test for chunk in res.chunks), rel_path
+
+    prod_cases: list[tuple[str, str, bytes]] = [
+        ("package.json", "json", b'{"verifyFixtureToken": false}\n'),
+        (".github/workflows/ci.yml", "yaml", b"name: ci\n"),
+        ("deploy/benchmark/values.yaml", "yaml", b"service: bench\n"),
+        (
+            "src/auth.test.js",
+            "javascript",
+            b"export function verifyFixtureToken() { return false; }\n",
+        ),
+        (
+            "src/crypto/e2e/cipher.js",
+            "javascript",
+            b"export function verifyFixtureToken() { return false; }\n",
+        ),
+        (
+            "pkg/auth_test.go",
+            "go",
+            b"package auth\nfunc VerifyFixtureToken() bool { return false }\n",
+        ),
+        (
+            "cmd/bench/main.go",
+            "go",
+            b"package main\nfunc RunBenchCommand() bool { return true }\n",
+        ),
+        (
+            "internal/test/clock.go",
+            "go",
+            b"package test\nfunc NewFakeClock() bool { return true }\n",
+        ),
+        (
+            "/home/test/workspace/src/main.go",
+            "go",
+            b"package main\nfunc RunProdServer() bool { return true }\n",
+        ),
+        ("src/schema.sql", "sql", b"CREATE TABLE prod_tokens (id INT);\n"),
+    ]
+    for rel_path, language, source in prod_cases:
+        res = extractor.extract(Path(rel_path), language, source)
+        assert res.chunks, rel_path
+        assert all(not chunk.is_test for chunk in res.chunks), rel_path
+
+    # End-to-end indexing and search/symbol scoping on non-AST fixture vs production files.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "token.js").write_text(
+        "export function verifyFixtureToken() { return true; }\n",
+        encoding="utf-8",
+    )
+    (repo / "package.json").write_text(
+        '{"name": "demo", "verifyFixtureToken": "prod"}\n',
+        encoding="utf-8",
+    )
+    (repo / "cmd" / "bench").mkdir(parents=True)
+    (repo / "cmd" / "bench" / "main.go").write_text(
+        "package main\nfunc verifyFixtureToken() bool { return true }\n",
+        encoding="utf-8",
+    )
+    (repo / "internal" / "test").mkdir(parents=True)
+    (repo / "internal" / "test" / "clock.go").write_text(
+        "package test\nfunc verifyFixtureClock() bool { return true }\n",
+        encoding="utf-8",
+    )
+    (repo / "tests" / "fixtures").mkdir(parents=True)
+    (repo / "tests" / "fixtures" / "snapshot.json").write_text(
+        '{"verifyFixtureToken": "fixture"}\n',
+        encoding="utf-8",
+    )
+    (repo / "tests" / "fixtures" / "helper.go").write_text(
+        "package fixtures\nfunc verifyFixtureToken() bool { return true }\n",
+        encoding="utf-8",
+    )
+    (repo / "__tests__").mkdir()
+    (repo / "__tests__" / "token.js").write_text(
+        "export function verifyFixtureToken() { return true; }\n",
+        encoding="utf-8",
+    )
+    (repo / "Acme.Orders.Tests" / "Fixtures").mkdir(parents=True)
+    (repo / "Acme.Orders.Tests" / "Fixtures" / "order.json").write_text(
+        '{"verifyFixtureToken": "dotnet-fixture"}\n',
+        encoding="utf-8",
+    )
+    (repo / "src" / "integrationTest" / "kotlin").mkdir(parents=True)
+    (repo / "src" / "integrationTest" / "kotlin" / "OrderIT.kt").write_text(
+        "package demo\nfun verifyFixtureToken(): Boolean = true\n",
+        encoding="utf-8",
+    )
+    (repo / "cypress" / "e2e").mkdir(parents=True)
+    (repo / "cypress" / "e2e" / "login.cy.js").write_text(
+        "export function verifyFixtureToken() { return true; }\n",
+        encoding="utf-8",
+    )
+    (repo / "pkg" / "parser" / "testdata").mkdir(parents=True)
+    (repo / "pkg" / "parser" / "testdata" / "sample.go").write_text(
+        "package sample\nfunc verifyFixtureToken() bool { return true }\n",
+        encoding="utf-8",
+    )
+
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=DeterministicEmbedder(),
+        cwd=repo,
+    )
+    project = app.init_project(repo)
+    app.index_project(project.id)
+
+    expected_code_paths = {
+        "src/token.js",
+        "package.json",
+        "cmd/bench/main.go",
+        "internal/test/clock.go",
+    }
+    expected_test_paths = {
+        "tests/fixtures/snapshot.json",
+        "tests/fixtures/helper.go",
+        "__tests__/token.js",
+        "Acme.Orders.Tests/Fixtures/order.json",
+        "src/integrationTest/kotlin/OrderIT.kt",
+        "cypress/e2e/login.cy.js",
+        "pkg/parser/testdata/sample.go",
+    }
+
+    code_hits = app.search_code("verifyFixtureToken", limit=50).hits
+    assert code_hits
+    assert all(not hit.is_test for hit in code_hits)
+    assert {hit.path for hit in code_hits} == expected_code_paths
+
+    test_hits = app.search_code("verifyFixtureToken", scope="tests", limit=50).hits
+    assert all(hit.is_test for hit in test_hits)
+    assert {hit.path for hit in test_hits} == expected_test_paths
+
+    all_hits = app.search_code("verifyFixtureToken", scope="all", limit=50).hits
+    assert {hit.path for hit in all_hits} == expected_code_paths | expected_test_paths
+
+    code_syms = app.find_symbol("verifyFixtureToken").hits
+    assert {hit.path for hit in code_syms} == {"src/token.js", "cmd/bench/main.go"}
+    assert all(not hit.is_test for hit in code_syms)
+    assert [hit.path for hit in app.find_symbol("verifyFixtureClock").hits] == [
+        "internal/test/clock.go"
+    ]
+
+    test_syms = app.find_symbol("verifyFixtureToken", scope="tests").hits
+    assert {hit.path for hit in test_syms} == {
+        "tests/fixtures/helper.go",
+        "__tests__/token.js",
+        "src/integrationTest/kotlin/OrderIT.kt",
+        "cypress/e2e/login.cy.js",
+        "pkg/parser/testdata/sample.go",
+    }
+    assert all(hit.is_test for hit in test_syms)
+
+    example_snippet = "export function verifyFixtureToken() { return true; }\n"
+    ex_code = app.search_by_example(example_snippet, language="javascript", limit=50).hits
+    assert all(not hit.is_test for hit in ex_code)
+    assert {hit.path for hit in ex_code}.isdisjoint(expected_test_paths)
+    ex_tests = app.search_by_example(
+        example_snippet, language="javascript", scope="tests", limit=50
+    ).hits
+    assert ex_tests
+    assert all(hit.is_test for hit in ex_tests)

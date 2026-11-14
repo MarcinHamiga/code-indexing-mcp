@@ -92,7 +92,10 @@ logger = logging.getLogger(__name__)
 # declarations include preceding sibling decorators/adjacent doc comments and
 # code containers carry compact member signatures, forcing stale partitions to
 # rebuild cleanly.
-SCHEMA_VERSION = 10
+# Version 11 invalidates v10 partitions so files inside unambiguous
+# test/benchmark directories across all indexed languages populate `is_test`
+# on re-index.
+SCHEMA_VERSION = 11
 
 # Symbol lookups page through the SQL prefilter's candidates. These bound each
 # page, not the total scan needed to find the caller's literal matches.
