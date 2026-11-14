@@ -18,7 +18,7 @@ The core rule of this skill: **narrow down with the index first; read files last
 
 ## 2. Narrow down semantically
 
-- `mcp__code-indexing-mcp__search_code` — issue several targeted natural-language queries derived from the question (the concept, the mechanism, the data it touches). Not one broad query. Defaults to `scope="code"` (excluding detected C#, Python, Java, Rust, and TypeScript/TSX tests/benchmarks); pass `scope="tests"` or `scope="all"` when the question is about test suites or benchmarks.
+- `mcp__code-indexing-mcp__search_code` — issue several targeted natural-language queries derived from the question (the concept, the mechanism, the data it touches). Not one broad query. Defaults to `scope="code"` (excluding files in test/benchmark directories and detected C#, Python, Java, Rust, and TypeScript/TSX tests/benchmarks); pass `scope="tests"` or `scope="all"` when the question is about test suites or benchmarks.
 - `mcp__code-indexing-mcp__find_symbol` — once you have a concrete function/class/module name, jump straight to its definitions instead of more searching (also accepts `scope="tests"` or `"all"`).
 
 Keep a shortlist of candidate files and symbols; discard paths the results rule out.

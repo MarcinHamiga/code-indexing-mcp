@@ -1,10 +1,12 @@
-"""Test and benchmark chunk classification for C#, Java, Python, Rust, and TypeScript/TSX.
+"""Test and benchmark chunk classification across indexed languages.
 
-Combines repository-relative path conventions with Tree-sitter AST inspection so
-whole test/benchmark files (including helpers, fixtures, and builders) and
-inline test scopes (such as Rust ``#[cfg(test)] mod tests`` or Vitest
-``if (import.meta.vitest)`` blocks) are tagged at extraction time without
-altering chunk boundaries or embeddings on ordinary production code.
+Combines repository-relative directory conventions (for all indexed languages)
+with filename and Tree-sitter AST inspection (for C#, Java, Python, Rust, and
+TypeScript/TSX) so whole test/benchmark files (including fixtures, data files,
+helpers, and builders) and inline test scopes (such as Rust
+``#[cfg(test)] mod tests`` or Vitest ``if (import.meta.vitest)`` blocks) are
+tagged at extraction time without altering chunk boundaries or embeddings on
+ordinary production code.
 """
 
 from __future__ import annotations
@@ -27,13 +29,20 @@ _COMMON_TEST_DIRS: Final = frozenset(
         "benches",
         "benchmark",
         "benchmarks",
+        "__tests__",
+        "__test__",
+        "__specs__",
+        "__spec__",
+        "__benchmarks__",
+        "__mocks__",
+        "__fixtures__",
+        "javatests",
+        "testfixtures",
     }
 )
 
 _JAVA_EXTRA_TEST_DIRS: Final = frozenset(
     {
-        "javatests",
-        "testfixtures",
         "integrationtest",
         "integrationtests",
         "inttest",
@@ -48,13 +57,6 @@ _JAVA_EXTRA_TEST_DIRS: Final = frozenset(
 
 _TS_EXTRA_TEST_DIRS: Final = frozenset(
     {
-        "__tests__",
-        "__test__",
-        "__specs__",
-        "__spec__",
-        "__benchmarks__",
-        "__mocks__",
-        "__fixtures__",
         "e2e",
         "e2e-tests",
         "cypress",
@@ -506,27 +508,35 @@ def _ts_base_stem(filename: str) -> str | None:
     return None
 
 
+def _path_parts(path: Path) -> tuple[PurePosixPath, list[str]]:
+    posix = PurePosixPath(path.as_posix())
+    parts = [part for part in posix.parts if part not in {"", "."}]
+    return posix, parts
+
+
 def _is_unambiguous_test_path(language: str, path: Path) -> bool:
     """Whether *path* alone guarantees a test/fixture/benchmark file without AST checks.
 
-    Files inside dedicated test/benchmark source sets (``tests/``, ``benches/``,
-    ``src/test/``, ``javatests/``, ``*.Tests/``, ``*.Specs/``, ``__tests__/``),
-    Python ``conftest.py``, Rust ``tests.rs``/``*_test.rs``/``*_bench.rs``, and
-    TypeScript/TSX ``*.test.*``/``*.spec.*``/``*.bench.*``/``*_test.*`` modules
-    routinely hold shared builders and fixtures with zero test attributes of
-    their own, so they classify whole-file immediately. Filename-only matches
-    outside test directories (such as ``src/pkg/test_detection.py``,
-    ``src/main/java/acme/TestRunner.java``, or ``src/orders/spec.ts``) require
-    AST confirmation in :func:`classify_test_ranges`.
+    Files inside unambiguous test/benchmark directories (such as ``tests/``,
+    ``benches/``, ``src/test/``, ``__tests__/``, ``__fixtures__/``,
+    ``javatests/``) classify whole-file as tests across every indexed language,
+    so non-target fixtures (JSON, YAML, SQL, JS, Go, etc.) and shared helpers
+    do not pollute ``scope='code'``. Outside test directories, only
+    AST-supported conventions—Python ``conftest.py``, Rust
+    ``tests.rs``/``*_test.rs``/``*_bench.rs``, and TypeScript/TSX
+    ``*.test.*``/``*.spec.*``/``*.bench.*``/``*_test.*``—classify whole-file
+    immediately; filename-only matches outside test directories (such as
+    ``src/pkg/test_detection.py``, ``src/main/java/acme/TestRunner.java``, or
+    ``src/orders/spec.ts``) require AST confirmation in
+    :func:`classify_test_ranges`.
     """
-    if language not in TEST_DETECTION_LANGUAGES:
-        return False
-    posix = PurePosixPath(path.as_posix())
-    parts = [part for part in posix.parts if part not in {"", "."}]
+    posix, parts = _path_parts(path)
     if not parts:
         return False
     if _has_test_directory(language, parts[:-1]):
         return True
+    if language not in TEST_DETECTION_LANGUAGES:
+        return False
     filename = parts[-1]
     if language == "python" and filename.lower() == "conftest.py":
         return True
@@ -543,14 +553,13 @@ def _is_unambiguous_test_path(language: str, path: Path) -> bool:
 
 def is_test_file_path(language: str, path: Path) -> bool:
     """Return whether *path* matches a test or benchmark directory or filename convention."""
-    if language not in TEST_DETECTION_LANGUAGES:
-        return False
-    posix = PurePosixPath(path.as_posix())
-    parts = [part for part in posix.parts if part not in {"", "."}]
+    posix, parts = _path_parts(path)
     if not parts:
         return False
     if _has_test_directory(language, parts[:-1]):
         return True
+    if language not in TEST_DETECTION_LANGUAGES:
+        return False
     filename = parts[-1]
     stem = posix.stem
 
@@ -590,10 +599,10 @@ def classify_test_ranges(
     path: Path, language: str, root: Node, source: bytes
 ) -> TestClassification:
     """Classify whole-file and inline test/benchmark spans for one parsed file."""
-    if language not in TEST_DETECTION_LANGUAGES:
-        return _NON_TEST
     if _is_unambiguous_test_path(language, path):
         return _WHOLE_FILE_TEST
+    if language not in TEST_DETECTION_LANGUAGES:
+        return _NON_TEST
 
     if language == "rust":
         ast_result = _classify_rust(root, source)
