@@ -13,6 +13,7 @@ from code_indexing_mcp.models import (
     CodeChunk,
     CompletenessReport,
     DeclarationSelector,
+    ImpactDirection,
     ImpactLayer,
     ImpactRadiusResponse,
     IndexProgress,
@@ -26,6 +27,8 @@ from code_indexing_mcp.models import (
     SearchHit,
     SearchResponse,
     SelectedDeclaration,
+    SubgraphNode,
+    SubgraphResponse,
     SymbolResponse,
 )
 from code_indexing_mcp.settings import IndexMode, IndexSettings
@@ -76,6 +79,9 @@ class FakeApplication:
         self.symbol_calls: list[dict[str, Any]] = []
         self.references_calls: list[dict[str, Any]] = []
         self.impact_calls: list[dict[str, Any]] = []
+        self.subgraph_calls: list[dict[str, Any]] = []
+        self.chunks: dict[str, CodeChunk] = {}
+        self.search_hits: list[SearchHit] | None = None
 
     def discover_project(self, root: Path) -> ProjectInfo | None:
         for p in self.projects:
@@ -150,12 +156,20 @@ class FakeApplication:
         kinds: list[str] | None = None,
         scope: str = "code",
         limit: int = 8,
+        include_graph_context: bool = False,
         roots: list[Path] | None = None,
     ) -> SearchResponse:
         self.search_calls.append(
-            {"query": query, "projects": projects, "scope": scope, "limit": limit}
+            {
+                "query": query,
+                "projects": projects,
+                "scope": scope,
+                "limit": limit,
+                "include_graph_context": include_graph_context,
+            }
         )
-        return SearchResponse(query=query, hits=[_sample_hit()])
+        hits = self.search_hits if self.search_hits is not None else [_sample_hit()]
+        return SearchResponse(query=query, hits=list(hits))
 
     def find_symbol(
         self,
@@ -174,6 +188,8 @@ class FakeApplication:
         return SymbolResponse(name=name, hits=[_sample_hit(symbol=name)])
 
     def get_chunk(self, chunk_id: str) -> CodeChunk:
+        if chunk_id in self.chunks:
+            return self.chunks[chunk_id]
         return CodeChunk(
             chunk_id=chunk_id,
             file_id="file-1",
@@ -254,6 +270,8 @@ class FakeApplication:
         self,
         selector: DeclarationSelector,
         *,
+        direction: ImpactDirection = "dependents",
+        focus_query: str | None = None,
         max_depth: int = 2,
         include_likely: bool = False,
         kinds: set[str] | None = None,
@@ -262,7 +280,14 @@ class FakeApplication:
         cursor: str | None = None,
         roots: list[Path] | None = None,
     ) -> ImpactRadiusResponse:
-        self.impact_calls.append({"selector": selector, "max_depth": max_depth})
+        self.impact_calls.append(
+            {
+                "selector": selector,
+                "direction": direction,
+                "focus_query": focus_query,
+                "max_depth": max_depth,
+            }
+        )
         decl = SelectedDeclaration(
             project_id="proj-1",
             file_id="file-1",
@@ -276,9 +301,54 @@ class FakeApplication:
         )
         return ImpactRadiusResponse(
             selected=decl,
+            direction=direction,
+            focus_query=focus_query,
             layers=[ImpactLayer(depth=1, edges=[], review=[])],
             visited=3,
             completeness=CompletenessReport(),
+        )
+
+    def explore_subgraph(
+        self,
+        *,
+        query: str | None = None,
+        selectors: list[DeclarationSelector] | None = None,
+        project: str | None = None,
+        max_nodes: int = 15,
+        max_hops: int = 3,
+        include_likely: bool = True,
+        scope: str = "code",
+        roots: list[Path] | None = None,
+    ) -> SubgraphResponse:
+        self.subgraph_calls.append(
+            {
+                "query": query,
+                "selectors": selectors,
+                "project": project,
+                "max_nodes": max_nodes,
+                "max_hops": max_hops,
+                "include_likely": include_likely,
+                "scope": scope,
+            }
+        )
+        return SubgraphResponse(
+            project_id=project or "proj-1",
+            query=query,
+            nodes=[
+                SubgraphNode(
+                    chunk_id="chk-1",
+                    project_id=project or "proj-1",
+                    path="src/main.py",
+                    language="python",
+                    kind="function",
+                    symbol="main",
+                    qualified_symbol="main",
+                    start_line=1,
+                    end_line=10,
+                    score=1.0,
+                    is_seed=True,
+                )
+            ],
         )
 
 
@@ -493,3 +563,45 @@ def test_editor_command_quotes_paths_without_a_shell(tmp_path: Path) -> None:
         f"{path}:12",
     ]
     assert editor_command("nvim", path, 12) == ["nvim", "+12", str(path)]
+
+
+def test_tui_service_impact_direction_focus_and_explore_subgraph() -> None:
+    app = FakeApplication()
+    service = _service(app)
+    service.discover_current_project()
+
+    hit = _sample_hit(chunk_id="chunk-graph")
+    impact = service.impact_radius(
+        hit,
+        direction="dependencies",
+        focus_query="token validation",
+        max_depth=2,
+    )
+    assert impact.direction == "dependencies"
+    assert impact.focus_query == "token validation"
+    assert app.impact_calls[-1] == {
+        "selector": app.impact_calls[-1]["selector"],
+        "direction": "dependencies",
+        "focus_query": "token validation",
+        "max_depth": 2,
+    }
+    assert app.impact_calls[-1]["selector"].chunk_id == "chunk-graph"
+
+    selector = DeclarationSelector(chunk_id="chunk-graph")
+    subgraph = service.explore_subgraph(
+        selectors=[selector],
+        query="token validation",
+        max_hops=2,
+        max_nodes=12,
+    )
+    assert subgraph.project_id == "proj-1"
+    assert subgraph.query == "token validation"
+    assert app.subgraph_calls[-1] == {
+        "query": "token validation",
+        "selectors": [selector],
+        "project": "proj-1",
+        "max_nodes": 12,
+        "max_hops": 2,
+        "include_likely": True,
+        "scope": "code",
+    }

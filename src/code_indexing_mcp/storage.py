@@ -144,7 +144,10 @@ FTS_CONTENT_BOOST = 1.0
 FTS_IDENTIFIER_BOOST = 2.0
 RRF_VECTOR_WEIGHT = 0.85
 RRF_FTS_WEIGHT = 1.15
+RRF_GRAPH_WEIGHT = 0.55
+RRF_GRAPH_CORROBORATED_WEIGHT = 0.14
 RRF_MODULE_DAMPING = 0.85
+RRF_BARREL_DAMPING = 0.75
 
 # Columns get_chunk reads. The vector and the identifier-terms column are
 # excluded: nothing outside indexing and ranking can use them, and reading them
@@ -1751,6 +1754,212 @@ class LanceStore:
             partition_id=partition_id,
         )
 
+    def partition_graph_identity(
+        self, project_id: str, *, partition_id: str | None = None
+    ) -> tuple[str, str, int, int] | None:
+        """Return ``(physical_partition_id, nonce, chunks_version, references_version)`` or None."""
+        physical = self._partition_id_for(project_id) if partition_id is None else partition_id
+        tables = self._existing_tables(physical)
+        if tables is None or tables.references is None:
+            return None
+        return (
+            physical,
+            tables.nonce,
+            int(tables.chunks.version),
+            int(tables.references.version),
+        )
+
+    def list_partition_chunk_metadata(
+        self,
+        project_id: str,
+        *,
+        partition_id: str | None = None,
+        version: int | None = None,
+    ) -> tuple[list[ChunkPreview], dict[str, str]]:
+        """Read metadata-only chunk rows for one partition, coalescing split embedding windows.
+
+        Returns ``(coalesced_previews, window_chunk_id_to_canonical_chunk_id)`` without
+        decoding embedding vectors or chunk text.
+        """
+        physical = self._partition_id_for(project_id) if partition_id is None else partition_id
+        tables = self._existing_tables(physical)
+        if tables is None:
+            return [], {}
+        chunks_table = tables.chunks
+        if version is not None and version != int(chunks_table.version):
+            database = tables.database or lancedb.connect(
+                self.directory / "projects" / physical,
+                read_consistency_interval=timedelta(0),
+            )
+            chunks_table = cast(LanceTable, database.open_table("chunks", version=version))
+        columns = [
+            "chunk_id",
+            "file_id",
+            "path",
+            "language",
+            "kind",
+            "symbol",
+            "qualified_symbol",
+            "parent_symbol",
+            "start_byte",
+            "start_line",
+            "end_line",
+            "part_index",
+            "is_test",
+            "source_start_byte",
+            "source_end_byte",
+            "content_hash",
+        ]
+        rows = cast(
+            list[dict[str, Any]],
+            chunks_table.search().select(columns).to_list(),
+        )
+        rows.sort(
+            key=lambda item: (
+                str(item["path"]),
+                int(item["start_byte"]),
+                str(item["chunk_id"]),
+            )
+        )
+        raw_previews: list[ChunkPreview] = []
+        for row in rows:
+            row["project_id"] = project_id
+            raw_previews.append(ChunkPreview.model_validate(row))
+        grouped: dict[tuple[object, ...], ChunkPreview] = {}
+        window_to_canonical: dict[str, str] = {}
+        for preview in raw_previews:
+            key = self._source_preview_key(preview)
+            previous = grouped.get(key)
+            if previous is None:
+                grouped[key] = preview
+                window_to_canonical[preview.chunk_id] = preview.chunk_id
+            else:
+                grouped[key] = previous.model_copy(
+                    update={
+                        "start_line": min(previous.start_line, preview.start_line),
+                        "end_line": max(previous.end_line, preview.end_line),
+                    }
+                )
+                window_to_canonical[preview.chunk_id] = previous.chunk_id
+        return list(grouped.values()), window_to_canonical
+
+    def fetch_search_rows_by_ids(
+        self,
+        project_id: str,
+        chunk_ids: Sequence[str],
+        *,
+        condition: str | None = None,
+        partition_id: str | None = None,
+        probe_vectors: Sequence[list[float]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Hydrate search candidate rows for graph-discovered chunk ids under *condition*."""
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return []
+        wanted = list(dict.fromkeys(chunk_ids))
+        if not wanted:
+            return []
+        columns = [
+            "chunk_id",
+            "file_id",
+            "path",
+            "language",
+            "kind",
+            "symbol",
+            "qualified_symbol",
+            "parent_symbol",
+            "start_line",
+            "end_line",
+            "content",
+            "part_index",
+            "is_test",
+            "source_start_byte",
+            "source_end_byte",
+            "source_content_hash",
+            "content_hash",
+        ]
+        result: list[dict[str, Any]] = []
+        for offset in range(0, len(wanted), 256):
+            batch = wanted[offset : offset + 256]
+            scoped = f"chunk_id IN ({', '.join(_quoted(cid) for cid in batch)})"
+            combined = f"({condition}) AND ({scoped})" if condition else scoped
+            if probe_vectors:
+                best_by_cid: dict[str, dict[str, Any]] = {}
+                for vec in probe_vectors:
+                    vrows = cast(
+                        list[dict[str, Any]],
+                        tables.chunks.search(vec, vector_column_name="vector", query_type="vector")
+                        .distance_type("cosine")
+                        .where(combined, prefilter=True)
+                        .limit(len(batch))
+                        .select([*columns, "_distance"])
+                        .bypass_vector_index()
+                        .to_list(),
+                    )
+                    for row in vrows:
+                        row["project_id"] = project_id
+                        cid = str(row["chunk_id"])
+                        dist = float(row["_distance"])
+                        score = 1.0 - dist
+                        row["score"] = score
+                        row["_relevance_score"] = score
+                        prev = best_by_cid.get(cid)
+                        if prev is None or dist < float(prev.get("_distance", float("inf"))):
+                            best_by_cid[cid] = row
+                result.extend(best_by_cid.values())
+            else:
+                rows = cast(
+                    list[dict[str, Any]],
+                    tables.chunks.search().where(combined).select(columns).to_list(),
+                )
+                for row in rows:
+                    row["project_id"] = project_id
+                    result.append(row)
+        return result
+
+    def score_chunks_for_query(
+        self,
+        project_id: str,
+        chunk_ids: Sequence[str],
+        query_text: str,
+        vector: list[float] | None = None,
+        *,
+        partition_id: str | None = None,
+    ) -> dict[str, float]:
+        """Compute normalized [0, 1] hybrid relevance scores for specific chunk ids."""
+        wanted = list(dict.fromkeys(chunk_ids))
+        if not wanted:
+            return {}
+        skip_vec = {cid: 0.0 for cid in wanted} if vector is None else None
+        probe_vec = vector if vector is not None else [0.0] * self.vector_dimension
+        probe_rows = self._explanation_probe_rows(
+            project_id,
+            query_text,
+            probe_vec,
+            None,
+            wanted,
+            partition_id=partition_id,
+            known_vector_scores=skip_vec,
+        )
+        fts_map: dict[str, float] = {}
+        vec_map: dict[str, float] = {}
+        for row in probe_rows:
+            cid = str(row["chunk_id"])
+            if row.get("fts_score") is not None:
+                fts_map[cid] = float(row["fts_score"])
+            if vector is not None and row.get("vector_score") is not None:
+                vec_map[cid] = max(0.0, min(1.0, float(row["vector_score"])))
+        max_fts = max(fts_map.values(), default=0.0)
+        scores: dict[str, float] = {}
+        for cid in wanted:
+            f_score = (fts_map[cid] / max_fts) if (cid in fts_map and max_fts > 0.0) else 0.0
+            if vector is None:
+                scores[cid] = round(f_score, 4)
+            else:
+                v_score = vec_map.get(cid, 0.0)
+                scores[cid] = round(0.55 * v_score + 0.45 * f_score, 4)
+        return scores
+
     def reference_version(self, project_id: str, *, partition_id: str | None = None) -> int:
         """Return the current structural snapshot without creating a partition."""
         tables = self._project_existing_tables(project_id, partition_id=partition_id)
@@ -2150,40 +2359,64 @@ class LanceStore:
         limit: int,
         *,
         partition_ids: Mapping[str, str | Sequence[str]] | None = None,
+        graph_expander: Callable[
+            [str, str | None, str, list[dict[str, Any]], str | None, int],
+            list[dict[str, Any]],
+        ]
+        | None = None,
     ) -> list[dict[str, Any]]:
         """Fuse modality candidates across every pinned physical partition.
 
         A project may pin several partitions -- one per live checkout of a
         shared registration -- so each project's entry may be one partition id
         or a sequence of them. Cosine distances share one global scale. BM25
-        statistics are partition-local, so lexical evidence uses the local
-        score's competition rank instead of comparing absolute BM25 scores.
-        Those ordinal values are ranked across the combined candidates before
-        fusion; tied evidence gets equal rank and equal contribution. Candidate
-        retrieval remains bounded to limit rows per modality per partition.
+        and GraphRAG Personalized PageRank statistics are partition-local, so
+        lexical and structural evidence use their local competition ranks
+        instead of comparing raw scores across partitions. Those ordinal values
+        are ranked across the combined candidates before fusion; tied evidence
+        gets equal rank and equal contribution.
         """
-        rows = self._fan_out_partitions(
-            project_ids,
-            partition_ids,
-            lambda project_id, partition_id: self._hybrid_search_rows(
+
+        def search_partition(project_id: str, partition_id: str | None) -> list[dict[str, Any]]:
+            part_rows = self._hybrid_search_rows(
                 project_id,
                 query_text,
                 vector,
                 condition,
                 limit,
                 partition_id=partition_id,
-            ),
+            )
+            if graph_expander is not None and part_rows:
+                return graph_expander(
+                    project_id, partition_id, query_text, part_rows, condition, limit
+                )
+            return part_rows
+
+        rows = self._fan_out_partitions(
+            project_ids,
+            partition_ids,
+            search_partition,
         )
         merged: dict[str, dict[str, Any]] = {}
         for row in rows:
             chunk_id = str(row["chunk_id"])
             existing = merged.setdefault(chunk_id, {**row, "_relevance_score": 0.0})
-            for signal in ("_distance", "_fts_local_rank"):
+            for signal in ("_distance", "_fts_local_rank", "_graph_local_rank"):
                 if signal in row:
                     existing[signal] = min(row[signal], existing.get(signal, float("inf")))
+            if "_graph_score" in row and (
+                "_graph_score" not in existing
+                or float(row["_graph_score"]) > float(existing["_graph_score"])
+            ):
+                existing["_graph_score"] = float(row["_graph_score"])
+                if "_graph_via" in row:
+                    existing["_graph_via"] = row["_graph_via"]
+            if row.get("_barrel_damped"):
+                existing["_barrel_damped"] = True
         signal_weights = (
             ("_distance", RRF_VECTOR_WEIGHT),
             ("_fts_local_rank", RRF_FTS_WEIGHT),
+            ("_graph_local_rank", RRF_GRAPH_WEIGHT),
         )
         for signal, weight in signal_weights:
             candidates = sorted(
@@ -2196,10 +2429,17 @@ class LanceStore:
                 if row[signal] != previous:
                     rank = position
                     previous = row[signal]
-                row["_relevance_score"] += weight / (60 + rank)
+                effective_weight = (
+                    RRF_GRAPH_CORROBORATED_WEIGHT
+                    if signal == "_graph_local_rank" and "_fts_local_rank" in row
+                    else weight
+                )
+                row["_relevance_score"] += effective_weight / (60 + rank)
         for row in merged.values():
             if row.get("kind") == "module" and not row.get("symbol"):
                 row["_relevance_score"] *= RRF_MODULE_DAMPING
+            if row.get("_barrel_damped"):
+                row["_relevance_score"] *= RRF_BARREL_DAMPING
         return sorted(
             merged.values(),
             key=lambda row: (
@@ -2219,23 +2459,41 @@ class LanceStore:
         limit: int,
         *,
         partition_ids: Mapping[str, str | Sequence[str]] | None = None,
+        graph_expander: Callable[
+            [str, str | None, list[dict[str, Any]], str | None, int],
+            list[dict[str, Any]],
+        ]
+        | None = None,
     ) -> list[dict[str, Any]]:
-        """Run vector-only searches per snippet vector across partitions and merge."""
+        """Run vector searches per snippet vector across partitions and merge."""
         vec_list = list(vectors)
         if not vec_list:
             return []
-        rows = self._fan_out_partitions(
-            project_ids,
-            partition_ids,
-            lambda project_id, partition_id: self._example_search_rows(
+
+        def search_partition(project_id: str, partition_id: str | None) -> list[dict[str, Any]]:
+            part_rows = self._example_search_rows(
                 project_id,
                 vec_list,
                 condition,
                 limit,
                 partition_id=partition_id,
-            ),
+            )
+            if graph_expander is not None:
+                return graph_expander(project_id, partition_id, part_rows, condition, limit)
+            return part_rows
+
+        rows = self._fan_out_partitions(
+            project_ids,
+            partition_ids,
+            search_partition,
         )
-        rows.sort(key=lambda row: float(row.get("_relevance_score", 0.0)), reverse=True)
+        rows.sort(
+            key=lambda row: (
+                -float(row.get("_relevance_score", 0.0)),
+                float(row.get("_distance", float("inf"))),
+                str(row["chunk_id"]),
+            )
+        )
         return rows[:limit]
 
     @staticmethod
@@ -2948,6 +3206,13 @@ class LanceStore:
                 tables.chunks.optimize(cleanup_older_than=cleanup_older_than)
                 if tables.references is not None:
                     tables.references.optimize(cleanup_older_than=cleanup_older_than)
+                self._prune_graph_cache(
+                    slot.partition_id,
+                    keep_stem=(
+                        f"{tables.nonce}-{int(tables.chunks.version)}-"
+                        f"{0 if tables.references is None else int(tables.references.version)}"
+                    ),
+                )
             ran = True
         return ran or bool(slots)
 
@@ -3390,6 +3655,20 @@ class LanceStore:
             marker = directory / "partition-generations" / name
             if marker.exists():
                 marker.unlink()
+        graph_dir = directory / "graph-cache" / partition_id
+        if graph_dir.exists():
+            shutil.rmtree(graph_dir, ignore_errors=True)
+
+    def _prune_graph_cache(self, partition_id: str, *, keep_stem: str) -> None:
+        graph_dir = self.directory / "graph-cache" / partition_id
+        if not graph_dir.is_dir():
+            return
+        keep_name = f"{keep_stem}.bin"
+        with contextlib.suppress(OSError):
+            for entry in graph_dir.iterdir():
+                if entry.name != keep_name:
+                    with contextlib.suppress(OSError):
+                        entry.unlink()
 
     def _advance_partition_generation(self, partition_id: str) -> None:
         path = self.directory / "partition-generations" / partition_id

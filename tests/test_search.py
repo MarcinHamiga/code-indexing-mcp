@@ -502,6 +502,7 @@ CHUNK_PAYLOAD_FIELDS = {
     "content",
     "content_hash",
     "part_index",
+    "graph_context",
 }
 
 
@@ -894,3 +895,163 @@ def test_search_code_ranks_identifier_match_ahead_of_short_comment_chunk(tmp_pat
     assert (response.hits[0].explanation.fts_score or 0.0) > (
         response.hits[1].explanation.fts_score or 0.0
     )
+
+
+def test_graphrag_hybrid_search_discovers_vocabulary_split_callee_and_respects_filters(
+    tmp_path: Path,
+) -> None:
+    sources: dict[str, str] = {
+        "src/entry.py": (
+            "from src.z_crypto_core import compute_merkle_digest\n\n"
+            "def enforce_archive_permission(blob: bytes) -> str:\n"
+            "    return compute_merkle_digest(blob)\n"
+        ),
+        "src/z_crypto_core.py": (
+            "def compute_merkle_digest(raw: bytes) -> str:\n    return raw.hex()\n"
+        ),
+        "tests/test_entry.py": (
+            "from src.z_crypto_core import compute_merkle_digest\n\n"
+            "def test_permission_digest() -> None:\n"
+            "    assert compute_merkle_digest(b'x') == '78'\n"
+        ),
+    }
+    # Add 60 unrelated neutral distractors ahead alphabetically so `compute_merkle_digest`
+    # falls completely outside the initial fetch=50 candidate window without GraphRAG.
+    for idx in range(60):
+        sources[f"src/a_noise_{idx:02d}.py"] = (
+            f"def helper_{idx}(val: int) -> int:\n    return val\n"
+        )
+
+    search, project = _indexed_tree(tmp_path, sources)
+
+    # With GraphRAG enabled, querying for "archive permission" seeds `enforce_archive_permission`
+    # and propagates along the exact call edge to surface `compute_merkle_digest` in top-3!
+    hybrid = search.search_code(
+        "archive permission", [project], limit=5, include_graph_context=True
+    )
+    symbols = [hit.symbol for hit in hybrid.hits]
+    assert symbols[0] == "enforce_archive_permission"
+    assert "compute_merkle_digest" in symbols[:3]
+
+    callee_hit = next(h for h in hybrid.hits if h.symbol == "compute_merkle_digest")
+    assert callee_hit.explanation is not None
+    assert callee_hit.explanation.graph_rank == 1
+    assert callee_hit.explanation.graph_score is not None and callee_hit.explanation.graph_score > 0
+    assert callee_hit.explanation.graph_via == "called_by:enforce_archive_permission"
+    assert callee_hit.graph_context is not None
+    assert any(
+        c.qualified_symbol == "enforce_archive_permission" for c in callee_hit.graph_context.callers
+    )
+
+    # `scope="code"` excludes `tests/test_entry.py`, and `paths` excludes `crypto_core.py`
+    assert all(not h.is_test for h in hybrid.hits)
+    entry_only = search.search_code("archive permission", [project], paths=["src/entry.py"])
+    assert {h.path for h in entry_only.hits} == {"src/entry.py"}
+
+    # Ablation: disabling graph_service drops the vocabulary-split callee out of top-5
+    search.graph_service.enabled = False
+    baseline = search.search_code("archive permission", [project], limit=5)
+    assert "compute_merkle_digest" not in [h.symbol for h in baseline.hits]
+
+
+def test_graphrag_transfers_barrel_reexport_authority_and_populates_get_chunk_context(
+    tmp_path: Path,
+) -> None:
+    search, project = _indexed_tree(
+        tmp_path,
+        {
+            "web/index.ts": "export { BillingGateway } from './impl';\n",
+            "web/impl.ts": (
+                "export interface PaymentPort {\n"
+                "  charge(amount: number): boolean;\n"
+                "}\n\n"
+                "export class BillingGateway implements PaymentPort {\n"
+                "  charge(amount: number): boolean {\n"
+                "    return validateAmount(amount);\n"
+                "  }\n"
+                "}\n\n"
+                "export function validateAmount(n: number): boolean {\n"
+                "  return n > 0;\n"
+                "}\n"
+            ),
+        },
+    )
+
+    res = search.search_code("BillingGateway", [project], limit=5)
+    assert res.hits[0].path == "web/impl.ts"
+    assert res.hits[0].symbol == "BillingGateway"
+
+    chunk = search.get_chunk(res.hits[0].chunk_id)
+    assert chunk.graph_context is not None
+    assert [s.symbol for s in chunk.graph_context.supertypes] == ["PaymentPort"]
+
+
+def test_search_by_example_uses_ast_structural_cocitation(tmp_path: Path) -> None:
+    class _GradedEmbedder:
+        model_id = "test/graded-code"
+        dimension = 4
+
+        @staticmethod
+        def _vec(text: str) -> list[float]:
+            if "sync_snapshot" in text:
+                return [1.0, 0.0, 0.0, 0.0]
+            if "distractor_" in text:
+                # Cosine ~0.80 with query snippet
+                return [0.8, 0.6, 0.0, 0.0]
+            # Cosine ~0.64 with query snippet (lower than all 20 distractors on vector alone!)
+            return [0.64, 0.0, 0.768, 0.0]
+
+        def embed_passages(self, texts: list[str]) -> list[list[float]]:
+            return [self._vec(t) for t in texts]
+
+        def embed_query(self, text: str) -> list[float]:
+            return self._vec(text)
+
+    embedder = _GradedEmbedder()
+    store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
+    indexer = Indexer(
+        store=store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=embedder,
+        lock_directory=tmp_path / "locks",
+    )
+    root = tmp_path / "tree"
+    root.mkdir()
+    sources: dict[str, str] = {
+        "src/ledger.py": ("def append_merkle_leaf(payload: bytes) -> str:\n    return 'leaf'\n"),
+        "src/audit_flow.py": (
+            "from src.ledger import append_merkle_leaf\n\n"
+            "def record_compliance_entry(raw: bytes) -> str:\n"
+            "    digest = append_merkle_leaf(raw)\n"
+            "    return digest\n"
+        ),
+    }
+    for idx in range(20):
+        sources[f"src/other_{idx}.py"] = (
+            f"def distractor_{idx}(order: object) -> int:\n    return {idx}\n"
+        )
+    for rel, content in sources.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    project = initialize_project(root)
+    indexer.index(project)
+    search = SearchService(store, embedder)
+
+    snippet = (
+        "def sync_snapshot(data: bytes) -> str:\n"
+        "    leaf = append_merkle_leaf(data)\n"
+        "    return leaf\n"
+    )
+    res = search.search_by_example(snippet, [project.id], limit=5)
+    symbols = [h.symbol for h in res.hits]
+    assert symbols[0] == "record_compliance_entry"
+    cocited = res.hits[0]
+    assert cocited.explanation is not None
+    assert cocited.explanation.graph_via == "shares_ref:append_merkle_leaf"
+
+    # Without GraphRAG, all 20 distractors outrank `record_compliance_entry`
+    search.graph_service.enabled = False
+    vec_only = search.search_by_example(snippet, [project.id], limit=5)
+    assert "record_compliance_entry" not in [h.symbol for h in vec_only.hits]

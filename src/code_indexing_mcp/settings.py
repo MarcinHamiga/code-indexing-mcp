@@ -188,6 +188,11 @@ class IndexSettings:
     # docs/plans/2026-09-02-review-remediation-5-application-split-plan.md) so
     # every indexing-affecting environment variable is read in one place.
     offline: bool = False
+    # Enable GraphRAG hybrid activation propagation (Specificity-Adjusted PPR +
+    # barrel authority transfer) alongside vector and BM25 search.
+    graph_search: bool = True
+    # Maximum number of compiled PartitionGraph snapshots kept warm in memory.
+    graph_cache_limit: int = 8
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> IndexSettings:
@@ -295,4 +300,6 @@ class IndexSettings:
             # False rather than raising, matching the check this replaces
             # (`Application.__init__` read `CODE_INDEXING_OFFLINE` directly).
             offline=legacy_offline_value(environment.get("CODE_INDEXING_OFFLINE")),
+            graph_search=_boolean(environment, "CODE_INDEXING_GRAPH_SEARCH", True),
+            graph_cache_limit=_integer(environment, "CODE_INDEXING_GRAPH_CACHE_LIMIT", 8, 1, 64),
         )

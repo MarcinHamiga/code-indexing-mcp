@@ -53,6 +53,7 @@ from .models import (
     ScanInspectionPage,
     SearchResponse,
     StorageStatus,
+    SubgraphResponse,
     SymbolResponse,
 )
 from .progress import IndexProgress, read_progress
@@ -61,7 +62,9 @@ from .storage import SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
-# Bumped whenever the RPC surface changes shape (version 7 adds `scope` to
+# Bumped whenever the RPC surface changes shape (version 8 adds GraphRAG
+# explore_subgraph, include_graph_context, and bidirectional/query-focused
+# impact_radius; version 7 added `scope` to
 # search_code, search_by_example, and find_symbol; version 6 added
 # changed_symbols; version 5 added dead_code_report;
 # version 4 added impact_radius;
@@ -69,7 +72,7 @@ logger = logging.getLogger(__name__)
 # parameter to index_project): a long-lived daemon from a previous release must
 # reject requests it cannot dispatch instead of failing inside them, and the
 # mismatch is what tells ensure_daemon to retire it and start a current one.
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 # The module the daemon process is started from; see ensure_daemon (DMN-5).
 DAEMON_ENTRY_MODULE = "code_indexing_mcp.daemon_entry"
 MAX_FRAME_BYTES = 16 * 1024**2
@@ -895,6 +898,14 @@ class DaemonServer:
             return app.impact_radius(
                 selector, kinds=set(kinds) if kinds is not None else None, roots=roots, **params
             )
+        if method == "explore_subgraph":
+            raw_selectors = params.pop("selectors", None)
+            selectors = (
+                [DeclarationSelector.model_validate(item) for item in raw_selectors]
+                if raw_selectors is not None
+                else None
+            )
+            return app.explore_subgraph(selectors=selectors, roots=roots, **params)
         if method == "analyze_refactor":
             selector = DeclarationSelector.model_validate(params.pop("selector"))
             operation = _REFACTOR_OPERATION.validate_python(params.pop("operation"))
@@ -1312,6 +1323,9 @@ class BrokerApplication:
         return ImpactRadiusResponse.model_validate(
             self._call("impact_radius", selector=selector, **params)
         )
+
+    def explore_subgraph(self, **params: Any) -> SubgraphResponse:
+        return SubgraphResponse.model_validate(self._call("explore_subgraph", **params))
 
     def analyze_refactor(
         self, selector: DeclarationSelector, operation: RefactorOperation, **params: Any

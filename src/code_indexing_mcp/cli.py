@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from . import __version__, update_check
 from .application import Application, RuntimePaths
 from .benchmark import (
+    run_graphrag_benchmark_command,
     run_index_benchmark_command,
     run_precision_benchmark_command,
     run_search_benchmark_command,
@@ -33,7 +34,8 @@ from .daemon import (
     require_daemon_support,
     stop_daemon_and_wait,
 )
-from .errors import CodeIndexingError
+from .errors import CodeIndexingError, ErrorCode
+from .models import DeclarationSelector
 from .progress import IndexProgress
 from .server import create_server
 from .settings import IndexSettings
@@ -52,6 +54,9 @@ COMMAND_NAMES = (
     "status",
     "history",
     "scan",
+    "search",
+    "impact-radius",
+    "subgraph",
     "dead-code-report",
     "changed-symbols",
     "storage",
@@ -142,6 +147,93 @@ def _parser(prog: str = "code-indexing-mcp") -> argparse.ArgumentParser:
     )
     scan.add_argument("--limit", type=int, default=50)
     scan.add_argument("--cursor", default=None)
+    search_cmd = commands.add_parser(
+        "search",
+        help="Run tri-modal hybrid code search (JSON report)",
+    )
+    search_cmd.add_argument("query", help="Natural-language or keyword search query")
+    search_cmd.add_argument(
+        "--project",
+        dest="projects",
+        action="append",
+        default=None,
+        help="Restrict to project id, name, or path; repeatable",
+    )
+    search_cmd.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="Search across every registered project",
+    )
+    search_cmd.add_argument(
+        "--scope",
+        choices=["code", "tests", "all"],
+        default="code",
+        help="Chunk scope filter (default: code)",
+    )
+    search_cmd.add_argument("--limit", type=int, default=8)
+    search_cmd.add_argument(
+        "--graph-context",
+        dest="include_graph_context",
+        action="store_true",
+        help="Attach 1-hop callers/callees/type neighborhood to each hit",
+    )
+    impact_cmd = commands.add_parser(
+        "impact-radius",
+        help="Traverse transitive dependents, dependencies, or both (JSON report)",
+    )
+    impact_cmd.add_argument("--chunk-id", default=None, help="Select declaration by chunk_id")
+    impact_cmd.add_argument("--project", default=None, help="Project id, name, or path")
+    impact_cmd.add_argument("--path", default=None, help="Repository-relative file path")
+    impact_cmd.add_argument("--symbol", default=None, help="Qualified declaration symbol")
+    impact_cmd.add_argument(
+        "--direction",
+        choices=["dependents", "dependencies", "both"],
+        default="dependents",
+        help="Traversal direction (default: dependents)",
+    )
+    impact_cmd.add_argument(
+        "--focus-query",
+        default=None,
+        help="Optional query to score edge relevance and steer node budget",
+    )
+    impact_cmd.add_argument("--max-depth", type=int, default=2)
+    impact_cmd.add_argument("--max-nodes", type=int, default=500)
+    impact_cmd.add_argument("--include-likely", action="store_true")
+    impact_cmd.add_argument("--limit", type=int, default=100)
+    subgraph_cmd = commands.add_parser(
+        "subgraph",
+        help="Extract a connected multi-hop symbol subgraph and shortest paths (JSON report)",
+    )
+    subgraph_cmd.add_argument("--query", default=None, help="Query to seed and focus the subgraph")
+    subgraph_cmd.add_argument(
+        "--chunk-id",
+        dest="chunk_ids",
+        action="append",
+        default=None,
+        help="Seed chunk_id; repeatable",
+    )
+    subgraph_cmd.add_argument(
+        "--symbol",
+        dest="symbols",
+        action="append",
+        default=None,
+        help="Seed declaration as path:qualified_symbol; repeatable",
+    )
+    subgraph_cmd.add_argument("--project", default=None, help="Project id, name, or path")
+    subgraph_cmd.add_argument("--max-nodes", type=int, default=15)
+    subgraph_cmd.add_argument("--max-hops", type=int, default=3)
+    subgraph_cmd.add_argument(
+        "--no-likely",
+        dest="include_likely",
+        action="store_false",
+        help="Exclude heuristic likely edges",
+    )
+    subgraph_cmd.add_argument(
+        "--scope",
+        choices=["code", "tests", "all"],
+        default="code",
+        help="Chunk scope filter (default: code)",
+    )
     dead_code = commands.add_parser(
         "dead-code-report", help="Review exported declarations with no exact uses (JSON report)"
     )
@@ -232,6 +324,18 @@ def _parser(prog: str = "code-indexing-mcp") -> argparse.ArgumentParser:
         help="Adoption-gate rank-correlation floor evaluated in the report",
     )
     benchmark_precision.add_argument("--work-dir", type=Path, default=None)
+    benchmark_graphrag = benchmark_commands.add_parser(
+        "graphrag",
+        help="Compare baseline hybrid retrieval against Hybrid Code GraphRAG (A/B report)",
+    )
+    benchmark_graphrag.add_argument(
+        "--noise-files",
+        type=int,
+        default=60,
+        help="Number of hub-connected distractor modules in the judged corpus",
+    )
+    benchmark_graphrag.add_argument("--iterations", type=int, default=3)
+    benchmark_graphrag.add_argument("--work-dir", type=Path, default=None)
     daemon = commands.add_parser("daemon", help="Manage the shared indexing daemon")
     daemon_commands = daemon.add_subparsers(dest="daemon_command", required=True)
     daemon_commands.add_parser("run", help=argparse.SUPPRESS)
@@ -543,6 +647,15 @@ def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> 
             )
             print(_json(benchmark_result))
             return 0
+        if args.command == "benchmark" and args.benchmark_command == "graphrag":
+            benchmark_result = run_graphrag_benchmark_command(
+                paths=paths,
+                noise_files=args.noise_files,
+                iterations=args.iterations,
+                work_dir=args.work_dir,
+            )
+            print(_json(benchmark_result))
+            return 0
         if args.command == "configure":
             # Lazy import: the installer package is never on the serve path, and
             # Textual is only imported when the wizard actually opens.
@@ -637,6 +750,73 @@ def main(argv: Sequence[str] | None = None, prog: str = "code-indexing-mcp") -> 
             result = app.project_status(args.project)
         elif args.command == "history":
             result = app.index_history(args.project, cursor=args.cursor, limit=args.limit)
+        elif args.command == "search":
+            result = app.search_code(
+                args.query,
+                projects=args.projects,
+                all_projects=args.all_projects,
+                scope=args.scope,
+                limit=args.limit,
+                include_graph_context=args.include_graph_context,
+            )
+        elif args.command == "impact-radius":
+            if args.chunk_id is not None:
+                if args.path is not None or args.symbol is not None:
+                    raise CodeIndexingError(
+                        ErrorCode.INVALID_FILTER,
+                        "impact-radius accepts either --chunk-id or --path with --symbol, not both",
+                    )
+                selector = DeclarationSelector(chunk_id=args.chunk_id)
+            else:
+                if not args.path or not args.symbol:
+                    raise CodeIndexingError(
+                        ErrorCode.INVALID_FILTER,
+                        "impact-radius requires --chunk-id or both --path and --symbol",
+                    )
+                resolved_proj = app.resolve_project(args.project)
+                selector = DeclarationSelector(
+                    project=resolved_proj.id,
+                    path=args.path,
+                    qualified_symbol=args.symbol,
+                )
+            result = app.impact_radius(
+                selector,
+                max_depth=args.max_depth,
+                include_likely=args.include_likely,
+                max_nodes=args.max_nodes,
+                limit=args.limit,
+                direction=args.direction,
+                focus_query=args.focus_query,
+            )
+        elif args.command == "subgraph":
+            selectors: list[DeclarationSelector] = []
+            for cid in args.chunk_ids or ():
+                selectors.append(DeclarationSelector(chunk_id=cid))
+            if args.symbols:
+                resolved_proj = app.resolve_project(args.project)
+                for raw_sym in args.symbols:
+                    sym_path, sep, qual = raw_sym.partition(":")
+                    if not sep or not sym_path or not qual:
+                        raise CodeIndexingError(
+                            ErrorCode.INVALID_FILTER,
+                            f"Invalid --symbol {raw_sym!r}; expected 'path:qualified_symbol'",
+                        )
+                    selectors.append(
+                        DeclarationSelector(
+                            project=resolved_proj.id,
+                            path=sym_path,
+                            qualified_symbol=qual,
+                        )
+                    )
+            result = app.explore_subgraph(
+                query=args.query,
+                selectors=selectors or None,
+                project=args.project,
+                max_nodes=args.max_nodes,
+                max_hops=args.max_hops,
+                include_likely=args.include_likely,
+                scope=args.scope,
+            )
         elif args.command == "dead-code-report":
             result = app.dead_code_report(args.project)
         elif args.command == "changed-symbols":

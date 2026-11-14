@@ -33,6 +33,7 @@ from .models import (
     DeadCodeReport,
     DeclarationSelector,
     ImpactBudgetExhaustion,
+    ImpactDirection,
     ImpactEdge,
     ImpactLayer,
     ImpactRadiusResponse,
@@ -392,6 +393,9 @@ _ImpactTraversalKey = tuple[
     bool,  # include_likely
     tuple[str, ...],  # sorted kinds
     int,  # max_nodes
+    str,  # direction
+    str | None,  # focus_query
+    bool,  # has_focus_vector
 ]
 
 # Small on purpose: this only needs to survive the handful of cursor pages
@@ -444,6 +448,8 @@ class _ImpactCursor(TypedDict):
     limit: int
     slot_id: str
     activation_epoch: int
+    direction: str
+    focus_query: str | None
 
 
 class _ClassifiedFindings(NamedTuple):
@@ -464,6 +470,7 @@ class _ImpactEdgeAccumulator:
     possible: bool
     tainted: bool
     cycle_to_depth: int | None
+    direction: Literal["dependents", "dependencies"] = "dependents"
 
 
 _Classification = tuple[ResolutionLevel, str, str]
@@ -472,6 +479,46 @@ _Classification = tuple[ResolutionLevel, str, str]
 class _PatchVerification(NamedTuple):
     edit: ByteEdit | None
     conflict: RefactorFinding | None
+
+
+class ResolvedGraphEdge(NamedTuple):
+    """One resolved structural edge from a source scope/file to a target declaration."""
+
+    source_file_id: str
+    source_path: str
+    source_qualified_symbol: str | None
+    target_file_id: str
+    target_path: str
+    target_qualified_symbol: str
+    kind: ReferenceKind
+    resolution: Literal["exact", "likely"]
+    reason_code: str
+    reference_id: str = ""
+    start_line: int = 1
+    end_line: int = 1
+    target_symbol: str = ""
+
+
+class BarrelReexportEdge(NamedTuple):
+    """Pass-through re-export edge from a barrel module to an authoritative declaration."""
+
+    barrel_file_id: str
+    barrel_path: str
+    exported_name: str
+    target_file_id: str
+    target_path: str
+    target_qualified_symbol: str
+
+
+class CompiledReferenceGraph(NamedTuple):
+    """Snapshot-pinned bulk structural graph inputs compiled in O(R + D) time."""
+
+    version: int
+    declarations: list[SelectedDeclaration]
+    edges: list[ResolvedGraphEdge]
+    barrel_files: frozenset[str]
+    barrel_reexports: list[BarrelReexportEdge]
+    coverage_limitations: list[ReferenceLimitation]
 
 
 def _dedupe_edit_spans(
@@ -506,6 +553,529 @@ class ReferenceService:
             OrderedDict()
         )
         self._impact_traversal_cache_lock = threading.Lock()
+
+    def compile_partition_graph(
+        self,
+        project_id: str,
+        *,
+        partition_id: str | None = None,
+        snapshot_version: int | None = None,
+        max_ambiguous_targets: int = 4,
+    ) -> CompiledReferenceGraph | None:
+        """Compile all resolved structural edges and barrel re-exports for one partition snapshot.
+
+        Runs in O(R + D) time by generating only the declarations reachable from each
+        reference row's lexical scope, imports, re-export chains, package/namespace,
+        enclosing owner, or low-ambiguity project-wide name table, and classifying each
+        candidate with ``_classify`` so all 18-language binding rules remain identical.
+        """
+        physical = (
+            self.store.active_partition(project_id).partition_id
+            if partition_id is None
+            else partition_id
+        )
+        if not self.store.has_reference_table(project_id, partition_id=physical):
+            return None
+        version = (
+            snapshot_version
+            if snapshot_version is not None
+            else self.store.reference_version(project_id, partition_id=physical)
+        )
+        context = self._load_reference_context(project_id, partition_id=physical, version=version)
+        raw_declarations = self.store.list_reference_records(
+            project_id,
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+            record_kinds=("declaration",),
+            partition_id=physical,
+        )
+        reference_rows = self.store.list_reference_records(
+            project_id,
+            version=version,
+            schema_version=REFERENCE_SCHEMA_VERSION,
+            record_kinds=("reference",),
+            partition_id=physical,
+        )
+        full_receiver_index = self._build_module_index([], raw_declarations)
+        module_index = context.module_index._replace(
+            receiver_names=full_receiver_index.receiver_names
+        )
+        known_paths = context.known_paths
+        imports_by_file = context.imports_by_file
+        reexport_rows_by_path = context.reexport_rows_by_path
+        declarations_by_file_target = self._declarations_by_file_target(raw_declarations)
+
+        declarations: list[SelectedDeclaration] = []
+        seen_decls: set[tuple[str, str]] = set()
+        decls_by_file: dict[str, list[SelectedDeclaration]] = {}
+        decls_by_path: dict[str, list[SelectedDeclaration]] = {}
+        decls_by_path_sym: dict[tuple[str, str], list[SelectedDeclaration]] = {}
+        decls_by_sym: dict[str, list[SelectedDeclaration]] = {}
+        raw_decls_by_sym: dict[str, list[ReferenceRecord]] = {}
+        decls_by_dir_sym: dict[tuple[str, str], list[SelectedDeclaration]] = {}
+        decls_by_ns_sym: dict[tuple[str, str], list[SelectedDeclaration]] = {}
+        decls_by_owner_sym: dict[tuple[str, str], list[SelectedDeclaration]] = {}
+        type_owner_counts: dict[str, int] = {}
+        raw_types_by_file: dict[str, set[str]] = {}
+        class_scopes: set[str] = set()
+
+        for raw in raw_declarations:
+            target_name = raw["target_name"]
+            if target_name is not None:
+                raw_decls_by_sym.setdefault(target_name, []).append(raw)
+            qualified = raw["source_qualified_symbol"]
+            raw_kind = (raw["kind"] or "").removesuffix("_part")
+            if raw_kind == "class" and qualified:
+                class_scopes.add(qualified)
+            if raw_kind in _TYPE_KINDS and qualified:
+                raw_types_by_file.setdefault(raw["file_id"], set()).add(qualified)
+                type_owner_counts[qualified] = type_owner_counts.get(qualified, 0) + 1
+            if (
+                target_name is None
+                or qualified is None
+                or raw["kind"] is None
+                or raw["start_line"] is None
+                or raw["end_line"] is None
+            ):
+                continue
+            decl_key = (raw["file_id"], qualified)
+            if decl_key in seen_decls:
+                continue
+            seen_decls.add(decl_key)
+            decl = SelectedDeclaration(
+                project_id=project_id,
+                file_id=raw["file_id"],
+                path=raw["path"],
+                language=raw["language"],
+                symbol=target_name,
+                qualified_symbol=qualified,
+                kind=raw_kind,
+                start_line=raw["start_line"],
+                end_line=raw["end_line"],
+            )
+            declarations.append(decl)
+            decls_by_file.setdefault(decl.file_id, []).append(decl)
+            decls_by_path.setdefault(decl.path, []).append(decl)
+            decls_by_path_sym.setdefault((decl.path, decl.symbol), []).append(decl)
+            decls_by_sym.setdefault(decl.symbol, []).append(decl)
+            parent_dir = str(PurePosixPath(decl.path).parent)
+            decls_by_dir_sym.setdefault((parent_dir, decl.symbol), []).append(decl)
+            ns = module_index.namespace_by_path.get(decl.path)
+            if ns:
+                decls_by_ns_sym.setdefault((ns, decl.symbol), []).append(decl)
+            owner = qualified.rpartition(".")[0]
+            if owner:
+                decls_by_owner_sym.setdefault((owner, decl.symbol), []).append(decl)
+
+        types_by_file = {fid: frozenset(names) for fid, names in raw_types_by_file.items()}
+        owner_scopes_cache: dict[str, _OwnerScopes] = {}
+
+        def get_owner_scopes(owner_name: str) -> _OwnerScopes:
+            cached = owner_scopes_cache.get(owner_name)
+            if cached is None:
+                is_unique = type_owner_counts.get(owner_name, 0) == 1
+                cached = _OwnerScopes(
+                    types_by_file=types_by_file,
+                    unique_probe=lambda u=is_unique: u,  # type: ignore[misc]
+                    csharp_parts_probe=None,
+                )
+                owner_scopes_cache[owner_name] = cached
+            return cached
+
+        paths_by_namespace: dict[str, list[str]] = {}
+        for path_str, ns in module_index.namespace_by_path.items():
+            paths_by_namespace.setdefault(ns, []).append(path_str)
+
+        mod_candidates_cache: dict[tuple[str, str, str], list[str]] = {}
+
+        def module_targets(item: ReferenceRecord) -> list[str]:
+            mod_path = item["module_path"]
+            if mod_path is None:
+                return []
+            key = (item["path"], item["language"], mod_path)
+            found = mod_candidates_cache.get(key)
+            if found is None:
+                modules = [mod_path]
+                submod = self._submodule_module_path(item)
+                if submod is not None:
+                    modules.append(submod)
+                resolved: list[str] = [
+                    str(candidate)
+                    for mod in modules
+                    for candidate in self._module_candidates(
+                        item["path"], item["language"], mod, known_paths, module_index
+                    )
+                ]
+                if item["language"] == "java" and item["imported_name"] == "*":
+                    resolved.extend(self._java_package_files(item["path"], mod_path, module_index))
+                if item["language"] == "csharp" and item["imported_name"] == "*":
+                    resolved.extend(paths_by_namespace.get(mod_path, ()))
+                    owner_ns = mod_path.rpartition(".")[0]
+                    if owner_ns:
+                        resolved.extend(paths_by_namespace.get(owner_ns, ()))
+                found = list(dict.fromkeys(resolved))
+                mod_candidates_cache[key] = found
+            return found
+
+        reach_cache: dict[str, frozenset[str]] = {}
+
+        def reach_paths(start_path: str) -> frozenset[str]:
+            cached_reach = reach_cache.get(start_path)
+            if cached_reach is not None:
+                return cached_reach
+            seen = {start_path}
+            stack = [start_path]
+            while stack:
+                current = stack.pop()
+                for hop in reexport_rows_by_path.get(current, ()):
+                    for nxt in module_targets(hop):
+                        if nxt not in seen:
+                            seen.add(nxt)
+                            stack.append(nxt)
+            res = frozenset(seen)
+            reach_cache[start_path] = res
+            return res
+
+        reachable_paths_by_file: dict[str, frozenset[str]] = {}
+        aliased_names_by_file_binding: dict[tuple[str, str], set[str]] = {}
+        default_import_paths_by_file_binding: dict[tuple[str, str], set[str]] = {}
+
+        def trace_reexport_names(start_path: str, lookup_name: str, depth: int = 0) -> set[str]:
+            names = {lookup_name}
+            if depth >= _MAX_REEXPORT_DEPTH:
+                return names
+            for hop in reexport_rows_by_path.get(start_path, ()):
+                binding = hop["alias"] or hop["written_name"] or hop["imported_name"]
+                if binding != lookup_name:
+                    continue
+                hop_imported = hop["imported_name"]
+                if hop_imported and hop_imported not in {"*", "default"}:
+                    names.add(hop_imported)
+                    for nxt in module_targets(hop):
+                        names.update(trace_reexport_names(nxt, hop_imported, depth + 1))
+            return names
+
+        for file_id, file_imports in imports_by_file.items():
+            file_reach: set[str] = set()
+            for item in file_imports:
+                direct_targets = module_targets(item)
+                for start in direct_targets:
+                    file_reach |= reach_paths(start)
+                binding = item["alias"] or item["written_name"] or item["imported_name"]
+                imported = item["imported_name"]
+                if binding:
+                    if imported in {"default", None} and not self._is_namespace_import(item):
+                        for start in direct_targets:
+                            default_import_paths_by_file_binding.setdefault(
+                                (file_id, binding), set()
+                            ).update(reach_paths(start))
+                    elif imported and imported != "*":
+                        traced = {imported}
+                        for start in direct_targets:
+                            traced.update(trace_reexport_names(start, imported))
+                        aliased_names_by_file_binding.setdefault((file_id, binding), set()).update(
+                            traced
+                        )
+            reachable_paths_by_file[file_id] = frozenset(file_reach)
+
+        # Aggregate resolved edges per (source_fid, source_qual, target_fid, target_qual, kind)
+        edge_map: dict[
+            tuple[str, str | None, str, str, ReferenceKind],
+            tuple[str, str, Literal["exact", "likely"], str, str, int, int, str],
+        ] = {}
+
+        def _merge_candidates(
+            cmap: dict[tuple[str, str], SelectedDeclaration],
+            items: list[SelectedDeclaration] | tuple[SelectedDeclaration, ...],
+        ) -> None:
+            for cand in items:
+                cmap.setdefault((cand.file_id, cand.qualified_symbol), cand)
+
+        for row in reference_rows:
+            file_id = row["file_id"]
+            source_imports = imports_by_file.get(file_id, [])
+            if self._bound_to_external_import(row, source_imports, known_paths):
+                continue
+            if row["kind"] == "import" and self._is_namespace_import(row):
+                continue
+
+            target_name = row["target_name"] or ""
+            written_name = row["written_name"] or ""
+            target_tail = target_name.rsplit(".", 1)[-1]
+            written_tail = written_name.rsplit(".", 1)[-1]
+            receiver_text = row["receiver_text"]
+
+            possible_symbols: set[str] = {
+                s for s in (target_name, target_tail, written_name, written_tail) if s
+            }
+            if row["language"] == "python" and row["kind"] == "decorator" and "." in written_name:
+                head = written_name.split(".", 1)[0]
+                if head:
+                    possible_symbols.add(head)
+            for spelling in (receiver_text, written_name, written_tail):
+                if spelling:
+                    possible_symbols.update(
+                        aliased_names_by_file_binding.get((file_id, spelling), ())
+                    )
+
+            candidate_map: dict[tuple[str, str], SelectedDeclaration] = {}
+
+            for sym in possible_symbols:
+                for local_decl in decls_by_file.get(file_id, ()):
+                    if local_decl.symbol == sym:
+                        candidate_map.setdefault(
+                            (local_decl.file_id, local_decl.qualified_symbol), local_decl
+                        )
+                for reach_path in reachable_paths_by_file.get(file_id, ()):
+                    _merge_candidates(candidate_map, decls_by_path_sym.get((reach_path, sym), ()))
+
+            for spelling in (receiver_text, written_name, written_tail):
+                if spelling:
+                    for def_path in default_import_paths_by_file_binding.get(
+                        (file_id, spelling), ()
+                    ):
+                        _merge_candidates(candidate_map, decls_by_path.get(def_path, ()))
+
+            source_qual = row["source_qualified_symbol"]
+            if source_qual:
+                prefix = source_qual
+                while prefix:
+                    for sym in possible_symbols:
+                        _merge_candidates(candidate_map, decls_by_owner_sym.get((prefix, sym), ()))
+                    prefix = prefix.rpartition(".")[0]
+
+            if row["language"] in {"go", "java"}:
+                row_dir = str(PurePosixPath(row["path"]).parent)
+                for sym in possible_symbols:
+                    _merge_candidates(candidate_map, decls_by_dir_sym.get((row_dir, sym), ()))
+            elif row["language"] == "csharp":
+                row_ns = module_index.namespace_by_path.get(row["path"])
+                if row_ns:
+                    for sym in possible_symbols:
+                        _merge_candidates(candidate_map, decls_by_ns_sym.get((row_ns, sym), ()))
+
+            for sym in (target_tail, written_tail):
+                if sym:
+                    global_cands = decls_by_sym.get(sym, ())
+                    if 1 <= len(global_cands) <= max_ambiguous_targets:
+                        _merge_candidates(candidate_map, global_cands)
+
+            if not candidate_map:
+                continue
+
+            lexical = self._lexical_declaration(row, declarations_by_file_target, class_scopes)
+            exact_matches: list[tuple[SelectedDeclaration, str]] = []
+            likely_matches: list[tuple[SelectedDeclaration, str]] = []
+
+            for selected in candidate_map.values():
+                # Avoid self-loop inside the exact same declaration unless recursive call
+                if (
+                    selected.file_id == file_id
+                    and selected.qualified_symbol == source_qual
+                    and row["kind"] in {"import", "export"}
+                ):
+                    continue
+                selected_owner = selected.qualified_symbol.rpartition(".")[0]
+                selected_is_member = selected.kind.removesuffix("_part") in _MEMBER_KINDS
+                if (
+                    receiver_text is None
+                    and row["language"] in _NO_IMPLICIT_RECEIVER
+                    and selected_is_member
+                    and source_qual != selected_owner
+                    and not self._is_accessor_decorator(row, selected)
+                ):
+                    continue
+                if (
+                    lexical is not None
+                    and file_id == selected.file_id
+                    and lexical["source_qualified_symbol"] != selected.qualified_symbol
+                ):
+                    continue
+                if not self._may_refer(
+                    row,
+                    selected,
+                    imports_by_file,
+                    reexport_rows_by_path,
+                    known_paths,
+                    module_index,
+                ):
+                    continue
+                resolution, reason, _ = self._classify(
+                    row,
+                    selected,
+                    raw_decls_by_sym.get(selected.symbol, []),
+                    imports_by_file,
+                    reexport_rows_by_path,
+                    known_paths,
+                    module_index,
+                    get_owner_scopes(selected_owner),
+                )
+                if resolution == "exact":
+                    exact_matches.append((selected, reason))
+                elif resolution == "likely":
+                    # When receiver is `self`/`cls`/`this`, never emit `unknown_receiver`
+                    # to an unrelated owner if `self` could not match `selected`.
+                    if receiver_text in {"self", "cls", "this"} and reason == "unknown_receiver":
+                        continue
+                    likely_matches.append((selected, reason))
+
+            chosen: list[tuple[SelectedDeclaration, Literal["exact", "likely"], str]] = (
+                [(sel, "exact", rsn) for sel, rsn in exact_matches]
+                if exact_matches
+                else [(sel, "likely", rsn) for sel, rsn in likely_matches]
+            )
+            ref_kind = cast(ReferenceKind, row["kind"])
+            for selected, res_level, rsn in chosen:
+                ekey = (
+                    file_id,
+                    source_qual,
+                    selected.file_id,
+                    selected.qualified_symbol,
+                    ref_kind,
+                )
+                prev = edge_map.get(ekey)
+                if prev is None or (prev[2] == "likely" and res_level == "exact"):
+                    edge_map[ekey] = (
+                        row["path"],
+                        selected.path,
+                        res_level,
+                        rsn,
+                        row["reference_id"],
+                        row["start_line"] or 1,
+                        row["end_line"] or 1,
+                        selected.symbol,
+                    )
+
+        edges = [
+            ResolvedGraphEdge(
+                source_file_id=s_fid,
+                source_path=s_path,
+                source_qualified_symbol=s_qual,
+                target_file_id=t_fid,
+                target_path=t_path,
+                target_qualified_symbol=t_qual,
+                kind=r_kind,
+                resolution=res_lvl,
+                reason_code=rsn_code,
+                reference_id=ref_id,
+                start_line=s_line,
+                end_line=e_line,
+                target_symbol=t_sym,
+            )
+            for (s_fid, s_qual, t_fid, t_qual, r_kind), (
+                s_path,
+                t_path,
+                res_lvl,
+                rsn_code,
+                ref_id,
+                s_line,
+                e_line,
+                t_sym,
+            ) in sorted(
+                edge_map.items(),
+                key=lambda item: (
+                    item[1][0],
+                    item[0][1] or "",
+                    item[1][1],
+                    item[0][3],
+                    item[0][4],
+                ),
+            )
+        ]
+
+        # Identify barrel files & explicit pass-through re-export edges
+        file_id_by_path = {row["path"]: row["file_id"] for row in context.coverage_rows}
+        barrel_paths: set[str] = set()
+        barrel_reexports: list[BarrelReexportEdge] = []
+        seen_barrel_edges: set[tuple[str, str, str, str]] = set()
+        barrel_basenames = frozenset(
+            {"__init__.py", "index.ts", "index.tsx", "index.js", "index.jsx", "mod.rs"}
+        )
+
+        for b_path, b_rows in reexport_rows_by_path.items():
+            has_local_decls = bool(decls_by_path.get(b_path))
+            is_named_barrel = PurePosixPath(b_path).name in barrel_basenames
+            has_reexport_stmt = any(
+                r["kind"] == "export" and r["module_path"] is not None for r in b_rows
+            )
+            if not has_local_decls and (is_named_barrel or has_reexport_stmt or bool(b_rows)):
+                barrel_paths.add(b_path)
+            if not (b_path in barrel_paths or has_reexport_stmt or is_named_barrel):
+                continue
+            b_fid = file_id_by_path.get(b_path)
+            if not b_fid:
+                continue
+            for hop in b_rows:
+                if hop["module_path"] is None:
+                    continue
+                if hop["kind"] == "import" and not (b_path in barrel_paths or is_named_barrel):
+                    continue
+                target_paths: set[str] = set()
+                for start in module_targets(hop):
+                    target_paths |= reach_paths(start)
+                target_paths.discard(b_path)
+                imported = hop["imported_name"]
+                exported_name = hop["alias"] or hop["written_name"] or imported or "*"
+                if imported in {None, "*"}:
+                    added = 0
+                    for t_path in sorted(target_paths):
+                        for t_decl in decls_by_path.get(t_path, ()):
+                            if "." in t_decl.qualified_symbol:
+                                continue
+                            bkey = (b_fid, t_decl.symbol, t_decl.file_id, t_decl.qualified_symbol)
+                            if bkey not in seen_barrel_edges:
+                                seen_barrel_edges.add(bkey)
+                                barrel_reexports.append(
+                                    BarrelReexportEdge(
+                                        barrel_file_id=b_fid,
+                                        barrel_path=b_path,
+                                        exported_name=t_decl.symbol,
+                                        target_file_id=t_decl.file_id,
+                                        target_path=t_decl.path,
+                                        target_qualified_symbol=t_decl.qualified_symbol,
+                                    )
+                                )
+                                added += 1
+                                if added >= 64:
+                                    break
+                        if added >= 64:
+                            break
+                else:
+                    assert imported is not None
+                    names_to_match: set[str] = {imported}
+                    for start in module_targets(hop):
+                        names_to_match.update(trace_reexport_names(start, imported))
+                    for t_path in sorted(target_paths):
+                        for match_sym in names_to_match:
+                            for t_decl in decls_by_path_sym.get((t_path, match_sym), ()):
+                                bkey = (
+                                    b_fid,
+                                    exported_name,
+                                    t_decl.file_id,
+                                    t_decl.qualified_symbol,
+                                )
+                                if bkey not in seen_barrel_edges:
+                                    seen_barrel_edges.add(bkey)
+                                    barrel_reexports.append(
+                                        BarrelReexportEdge(
+                                            barrel_file_id=b_fid,
+                                            barrel_path=b_path,
+                                            exported_name=exported_name,
+                                            target_file_id=t_decl.file_id,
+                                            target_path=t_decl.path,
+                                            target_qualified_symbol=t_decl.qualified_symbol,
+                                        )
+                                    )
+
+        coverage_limitations = self._coverage_limitations(context.coverage_rows, None)
+        return CompiledReferenceGraph(
+            version=version,
+            declarations=declarations,
+            edges=edges,
+            barrel_files=frozenset(barrel_paths),
+            barrel_reexports=barrel_reexports,
+            coverage_limitations=coverage_limitations,
+        )
 
     def dead_code_report(
         self,
@@ -1255,11 +1825,23 @@ class ReferenceService:
         max_nodes: int = 500,
         limit: int = 100,
         cursor: str | None = None,
+        direction: ImpactDirection = "dependents",
+        focus_query: str | None = None,
+        focus_vector: list[float] | None = None,
         backfill: ReferenceBackfillReport | None = None,
         partition: PartitionRef | None = None,
         root: Path | None = None,
     ) -> ImpactRadiusResponse:
-        """Return the bounded transitive dependents of one declaration."""
+        """Return bounded transitive dependents and/or dependencies of one declaration."""
+        if direction not in {"dependents", "dependencies", "both"}:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                (
+                    f"Invalid impact direction: {direction!r}; "
+                    "expected 'dependents', 'dependencies', or 'both'"
+                ),
+            )
+        normalized_focus = focus_query.strip() or None if focus_query is not None else None
         for value, lower, upper, name in (
             (max_depth, 1, 10, "max_depth"),
             (max_nodes, 1, 2000, "max_nodes"),
@@ -1311,6 +1893,8 @@ class ReferenceService:
                 "kinds": sorted(kinds or set()),
                 "max_nodes": max_nodes,
                 "limit": limit,
+                "direction": direction,
+                "focus_query": normalized_focus,
             }
             if (
                 payload["project_id"] != expected["project_id"]
@@ -1321,6 +1905,8 @@ class ReferenceService:
                 or payload["kinds"] != expected["kinds"]
                 or payload["max_nodes"] != expected["max_nodes"]
                 or payload["limit"] != expected["limit"]
+                or payload["direction"] != expected["direction"]
+                or payload["focus_query"] != expected["focus_query"]
             ):
                 raise CodeIndexingError(
                     ErrorCode.INVALID_CURSOR, "cursor does not match the impact-radius request"
@@ -1358,6 +1944,9 @@ class ReferenceService:
             include_likely,
             tuple(sorted(kinds or ())),
             max_nodes,
+            direction,
+            normalized_focus,
+            focus_vector is not None,
         )
         traversal = self._impact_traversal_cache_get(cache_key)
         if traversal is None:
@@ -1374,6 +1963,9 @@ class ReferenceService:
                 include_likely=include_likely,
                 kinds=kinds,
                 max_nodes=max_nodes,
+                direction=direction,
+                focus_query=normalized_focus,
+                focus_vector=focus_vector,
                 backfill=backfill,
                 root=root,
             )
@@ -1417,6 +2009,8 @@ class ReferenceService:
                     "limit": limit,
                     "slot_id": partition.slot_id,
                     "activation_epoch": partition.activation_epoch,
+                    "direction": direction,
+                    "focus_query": normalized_focus,
                 }
             )
 
@@ -1480,6 +2074,8 @@ class ReferenceService:
             cursor=next_cursor,
             snapshot_version=version,
             completeness=completeness,
+            direction=direction,
+            focus_query=normalized_focus,
         )
 
     def _impact_traversal_cache_get(self, key: _ImpactTraversalKey) -> _ImpactTraversal | None:
@@ -1511,62 +2107,135 @@ class ReferenceService:
         include_likely: bool,
         kinds: set[str] | None,
         max_nodes: int,
+        direction: ImpactDirection = "dependents",
+        focus_query: str | None = None,
+        focus_vector: list[float] | None = None,
         backfill: ReferenceBackfillReport | None,
         root: Path | None,
     ) -> _ImpactTraversal:
-        """Run one full, unpaginated impact-radius traversal (every depth).
-
-        Split out of `impact_radius` so its page cache (D4) serves later cursor
-        pages without re-running the traversal or touching pagination.
-
-        Loads one `_ReferenceContext` up front and passes it to every
-        frontier node's `_find_references_with_records` call (D4): the
-        The coverage/import/export context is loaded once per traversal, and
-        each node's own fetch narrows to `_candidate_records`'s SQL-pushed-down
-        superset (D1/D2) rather than the whole reference table.
-        """
+        """Run one full, unpaginated impact-radius traversal (every depth)."""
+        if selected.language not in STRUCTURAL_LANGUAGES:
+            raise CodeIndexingError(
+                ErrorCode.UNSUPPORTED_LANGUAGE,
+                f"Structural references are not extracted for {selected.language}. "
+                f"Supported languages are {', '.join(sorted(STRUCTURAL_LANGUAGES))}.",
+                project=selected.project_id,
+                path=selected.path,
+                language=selected.language,
+            )
         try:
             context = self._load_reference_context(
                 selected.project_id, partition_id=partition.partition_id, version=version
             )
         except (FileNotFoundError, ValueError) as error:
-            # A cursor's pinned snapshot that has since been cleaned up, as
-            # `find_references` reports it, not a raw storage error.
             raise CodeIndexingError(
                 ErrorCode.STALE_CURSOR, "Reference cursor snapshot expired"
             ) from error
+
+        want_dependents = direction in {"dependents", "both"}
+        want_dependencies = direction in {"dependencies", "both"}
+
         caches = _SourceCaches()
-        first_query = self._find_references_with_records(
-            selector,
-            kinds=kinds,
-            limit=500,
-            backfill=backfill,
-            partition=partition,
-            root=root,
-            snapshot_version=version,
-            preselected=selected,
-            context=context,
-            caches=caches,
-        )
-        root = first_query.root
+        first_query: _ReferenceQuery | None = None
+        if want_dependents:
+            first_query = self._find_references_with_records(
+                selector,
+                kinds=kinds,
+                limit=500,
+                backfill=backfill,
+                partition=partition,
+                root=root,
+                snapshot_version=version,
+                preselected=selected,
+                context=context,
+                caches=caches,
+            )
+            root = first_query.root
+        else:
+            root = root or self._project_root(selected.project_id)
+
+        outbound_by_src: dict[tuple[str, str], list[ResolvedGraphEdge]] = {}
+        decl_by_file_qual: dict[tuple[str, str], SelectedDeclaration] = {}
+        limitations: list[ReferenceLimitation] = []
+        if want_dependencies:
+            compiled = self.compile_partition_graph(
+                selected.project_id,
+                partition_id=partition.partition_id,
+                snapshot_version=version,
+            )
+            if compiled is not None:
+                limitations.extend(compiled.coverage_limitations)
+                for decl in compiled.declarations:
+                    decl_by_file_qual[(decl.file_id, decl.qualified_symbol)] = decl
+                for c_edge in compiled.edges:
+                    if c_edge.source_qualified_symbol is None:
+                        continue
+                    if kinds is not None and c_edge.kind not in kinds:
+                        continue
+                    outbound_by_src.setdefault(
+                        (c_edge.source_file_id, c_edge.source_qualified_symbol), []
+                    ).append(c_edge)
+
+        chunk_id_by_file_qual: dict[tuple[str, str], str] = {}
+        score_by_chunk_id: dict[str, float] = {}
+        if focus_query is not None:
+            previews, _ = self.store.list_partition_chunk_metadata(
+                selected.project_id, partition_id=partition.partition_id
+            )
+            for p in previews:
+                if p.file_id and p.qualified_symbol and p.symbol:
+                    chunk_id_by_file_qual.setdefault((p.file_id, p.qualified_symbol), p.chunk_id)
+            if chunk_id_by_file_qual:
+                score_by_chunk_id = self.store.score_chunks_for_query(
+                    selected.project_id,
+                    list(chunk_id_by_file_qual.values()),
+                    focus_query,
+                    focus_vector,
+                    partition_id=partition.partition_id,
+                )
 
         def node_key(node: SelectedDeclaration) -> _ImpactNodeKey:
             return (node.project_id, node.path, node.qualified_symbol)
 
+        def attach_chunk(node: SelectedDeclaration) -> SelectedDeclaration:
+            if node.chunk_id is not None or not chunk_id_by_file_qual:
+                return node
+            cid = chunk_id_by_file_qual.get((node.file_id, node.qualified_symbol))
+            return node if cid is None else node.model_copy(update={"chunk_id": cid})
+
+        def node_relevance(node: SelectedDeclaration) -> float | None:
+            if focus_query is None:
+                return None
+            cid = node.chunk_id or chunk_id_by_file_qual.get((node.file_id, node.qualified_symbol))
+            if cid is None:
+                return 0.0
+            return score_by_chunk_id.get(cid, 0.0)
+
         visited: dict[_ImpactNodeKey, int] = {node_key(selected): 0}
-        frontier: list[tuple[SelectedDeclaration, bool]] = [(selected, False)]
+        in_frontier: list[tuple[SelectedDeclaration, bool]] = (
+            [(selected, False)] if want_dependents else []
+        )
+        out_frontier: list[tuple[SelectedDeclaration, bool]] = (
+            [(selected, False)] if want_dependencies else []
+        )
         all_layers: list[ImpactLayer] = []
-        limitations: list[ReferenceLimitation] = []
         exhaustion: ImpactBudgetExhaustion | None = None
 
         for depth in range(1, max_depth + 1):
-            grouped_edges: dict[tuple[_ImpactNodeKey, _ImpactNodeKey], _ImpactEdgeAccumulator] = {}
+            grouped_edges: dict[
+                tuple[_ImpactNodeKey, _ImpactNodeKey, str], _ImpactEdgeAccumulator
+            ] = {}
             review: list[ImpactReview] = []
-            candidates: dict[_ImpactNodeKey, tuple[SelectedDeclaration, bool]] = {}
-            for source, source_tainted in sorted(frontier, key=lambda item: node_key(item[0])):
+            in_candidates: dict[_ImpactNodeKey, tuple[SelectedDeclaration, bool]] = {}
+            out_candidates: dict[_ImpactNodeKey, tuple[SelectedDeclaration, bool]] = {}
+
+            # 1. Inbound dependents step (what depends on `source`)
+            for source, source_tainted in sorted(in_frontier, key=lambda item: node_key(item[0])):
                 query = (
                     first_query
-                    if depth == 1 and node_key(source) == node_key(selected)
+                    if depth == 1
+                    and first_query is not None
+                    and node_key(source) == node_key(selected)
                     else self._find_references_with_records(
                         DeclarationSelector(
                             project=source.project_id,
@@ -1641,31 +2310,107 @@ class ReferenceService:
                     possible = hit.resolution == "likely"
                     tainted = source_tainted or possible
                     cycle_to_depth = visited.get(target_key)
-                    edge_key = (source_key, target_key)
+                    edge_key = (source_key, target_key, "dependents")
                     edge = grouped_edges.get(edge_key)
                     if edge is None:
                         grouped_edges[edge_key] = _ImpactEdgeAccumulator(
-                            source=source,
-                            target=target,
+                            source=attach_chunk(source),
+                            target=attach_chunk(target),
                             kinds={hit.kind},
                             possible=possible,
                             tainted=tainted,
                             cycle_to_depth=cycle_to_depth,
+                            direction="dependents",
                         )
                     else:
                         edge.kinds.add(hit.kind)
                         edge.possible = edge.possible and possible
                         edge.tainted = edge.tainted and tainted
                     if cycle_to_depth is None:
-                        prior = candidates.get(target_key)
+                        prior = in_candidates.get(target_key)
                         if prior is None or (prior[1] and not tainted):
-                            candidates[target_key] = (target, tainted)
+                            in_candidates[target_key] = (target, tainted)
 
-            candidate_keys = sorted(candidates)
+            # 2. Outbound dependencies step (what `source` itself calls/inherits/uses)
+            for source, source_tainted in sorted(out_frontier, key=lambda item: node_key(item[0])):
+                out_edges = outbound_by_src.get((source.file_id, source.qualified_symbol), [])
+                for c_edge in out_edges:
+                    target = decl_by_file_qual.get(
+                        (c_edge.target_file_id, c_edge.target_qualified_symbol)
+                    )
+                    traversable = c_edge.resolution == "exact" or (
+                        include_likely and c_edge.resolution == "likely"
+                    )
+                    if target is None or not traversable:
+                        review.append(
+                            ImpactReview(
+                                source=source,
+                                hit=ReferenceHit(
+                                    reference_id=c_edge.reference_id,
+                                    project_id=selected.project_id,
+                                    path=c_edge.source_path,
+                                    language=source.language,
+                                    kind=c_edge.kind,
+                                    start_line=c_edge.start_line,
+                                    end_line=c_edge.end_line,
+                                    start_byte=0,
+                                    end_byte=0,
+                                    written_name=c_edge.target_symbol,
+                                    resolution=c_edge.resolution,
+                                    reason_code=c_edge.reason_code,
+                                    explanation=(
+                                        f"Outbound {c_edge.kind} reference to "
+                                        f"{c_edge.target_qualified_symbol}."
+                                    ),
+                                ),
+                            )
+                        )
+                        continue
+                    source_key = node_key(source)
+                    target_key = node_key(target)
+                    possible = c_edge.resolution == "likely"
+                    tainted = source_tainted or possible
+                    cycle_to_depth = visited.get(target_key)
+                    edge_key = (source_key, target_key, "dependencies")
+                    edge = grouped_edges.get(edge_key)
+                    if edge is None:
+                        grouped_edges[edge_key] = _ImpactEdgeAccumulator(
+                            source=attach_chunk(source),
+                            target=attach_chunk(target),
+                            kinds={c_edge.kind},
+                            possible=possible,
+                            tainted=tainted,
+                            cycle_to_depth=cycle_to_depth,
+                            direction="dependencies",
+                        )
+                    else:
+                        edge.kinds.add(c_edge.kind)
+                        edge.possible = edge.possible and possible
+                        edge.tainted = edge.tainted and tainted
+                    if cycle_to_depth is None:
+                        prior = out_candidates.get(target_key)
+                        if prior is None or (prior[1] and not tainted):
+                            out_candidates[target_key] = (target, tainted)
+
+            merged_candidates: dict[_ImpactNodeKey, tuple[SelectedDeclaration, bool]] = {}
+            for c_map in (in_candidates, out_candidates):
+                for key, val in c_map.items():
+                    prev = merged_candidates.get(key)
+                    if prev is None or (prev[1] and not val[1]):
+                        merged_candidates[key] = val
+
+            if focus_query is not None:
+                candidate_keys = sorted(
+                    merged_candidates,
+                    key=lambda k: (-(node_relevance(merged_candidates[k][0]) or 0.0), k),
+                )
+            else:
+                candidate_keys = sorted(merged_candidates)
+
             available = max_nodes - len(visited)
             allowed_keys = set(candidate_keys[:available])
             if len(candidate_keys) > available:
-                first_unvisited = candidates[candidate_keys[available]][0]
+                first_unvisited = merged_candidates[candidate_keys[available]][0]
                 exhaustion = ImpactBudgetExhaustion(
                     depth=depth,
                     node=first_unvisited,
@@ -1685,9 +2430,20 @@ class ReferenceService:
                     possible=edge.possible,
                     tainted=edge.tainted,
                     cycle_to_depth=edge.cycle_to_depth,
+                    direction=edge.direction,
+                    relevance_score=node_relevance(edge.target),
                 )
                 for _, edge in sorted(grouped_edges.items())
             ]
+            if focus_query is not None:
+                edges.sort(
+                    key=lambda item: (
+                        -(item.relevance_score or 0.0),
+                        node_key(item.source),
+                        node_key(item.target),
+                        item.direction,
+                    )
+                )
             review.sort(
                 key=lambda item: (
                     node_key(item.source),
@@ -1702,8 +2458,9 @@ class ReferenceService:
                 visited[key] = depth
             if exhaustion is not None:
                 break
-            frontier = [candidates[key] for key in candidate_keys]
-            if not frontier:
+            in_frontier = [in_candidates[k] for k in candidate_keys if k in in_candidates]
+            out_frontier = [out_candidates[k] for k in candidate_keys if k in out_candidates]
+            if not in_frontier and not out_frontier:
                 break
 
         return _ImpactTraversal(
@@ -4833,8 +5590,12 @@ class ReferenceService:
             "limit",
             "slot_id",
             "activation_epoch",
+            "direction",
+            "focus_query",
         }
     )
+
+    _LEGACY_IMPACT_CURSOR_FIELDS: Final = _IMPACT_CURSOR_FIELDS - {"direction", "focus_query"}
 
     @staticmethod
     def _decode_cursor_payload(
@@ -4858,14 +5619,22 @@ class ReferenceService:
 
     @staticmethod
     def _decode_impact_cursor(cursor: str) -> _ImpactCursor:
-        payload = ReferenceService._decode_cursor_payload(
-            cursor,
-            fields=ReferenceService._IMPACT_CURSOR_FIELDS,
-            description="impact",
-        )
-
         def invalid() -> CodeIndexingError:
             return CodeIndexingError(ErrorCode.INVALID_CURSOR, "invalid impact cursor")
+
+        try:
+            payload = ReferenceService._decode_cursor_payload(
+                cursor,
+                fields=ReferenceService._IMPACT_CURSOR_FIELDS,
+                description="impact",
+            )
+        except CodeIndexingError:
+            payload = ReferenceService._decode_cursor_payload(
+                cursor,
+                fields=ReferenceService._LEGACY_IMPACT_CURSOR_FIELDS,
+                description="impact",
+            )
+            payload = {**payload, "direction": "dependents", "focus_query": None}
 
         for int_field in (
             "version",
@@ -4878,9 +5647,14 @@ class ReferenceService:
             value = payload[int_field]
             if isinstance(value, bool) or not isinstance(value, int):
                 raise invalid()
-        for str_field in ("project_id", "path", "qualified_symbol", "slot_id"):
+        for str_field in ("project_id", "path", "qualified_symbol", "slot_id", "direction"):
             if not isinstance(payload[str_field], str):
                 raise invalid()
+        if payload["direction"] not in {"dependents", "dependencies", "both"}:
+            raise invalid()
+        fq = payload["focus_query"]
+        if fq is not None and not isinstance(fq, str):
+            raise invalid()
         if not isinstance(payload["include_likely"], bool):
             raise invalid()
         kinds = payload["kinds"]

@@ -38,6 +38,7 @@ from .models import (
     DeclarationSelector,
     ExampleSearchResponse,
     HistoryPage,
+    ImpactDirection,
     ImpactRadiusResponse,
     IndexReport,
     IndexTrigger,
@@ -58,6 +59,7 @@ from .models import (
     SearchResponse,
     SearchScope,
     StorageStatus,
+    SubgraphResponse,
     SymbolResponse,
 )
 from .projects import (
@@ -74,15 +76,17 @@ from .settings import IndexMode, IndexSettings
 logger = logging.getLogger(__name__)
 
 SERVER_INSTRUCTIONS = (
-    "Local Tree-sitter code indexing and hybrid search. "
+    "Local Tree-sitter code indexing and hybrid GraphRAG search. "
     "When exploring code, prefer these index tools over grep-style file reading: "
-    "search_code (semantic natural-language queries), search_by_example "
-    "(code snippet similarity), find_symbol (definitions), "
-    "find_references (structural uses of a selected declaration), impact_radius "
-    "(transitive dependents), dead_code_report (exports with no exact uses, for review), "
+    "search_code (tri-modal semantic + FTS + symbol-graph search), search_by_example "
+    "(code snippet + AST co-citation similarity), explore_subgraph (connected multi-hop "
+    "architecture subgraphs and shortest structural paths around a query or seed symbols), "
+    "find_symbol (definitions), find_references (structural uses of a selected declaration), "
+    "impact_radius (transitive dependents, dependencies, or both, with optional query focus), "
+    "dead_code_report (exports with no exact uses, for review), "
     "analyze_refactor (rename or signature impact), file_outline "
     "(file structure before reading), changed_symbols (declarations touched since a commit), "
-    "get_chunk (exact code for a "
+    "get_chunk (exact code plus 1-hop callers/callees/type neighborhood for a "
     "search hit). Search and symbol tools default to scope='code' (excluding detected C#, Python, "
     "Java, Rust, and TypeScript/TSX tests/benchmarks); pass scope='tests' or scope='all' when "
     "inspecting test coverage. When correlating code across explicitly related services, use "
@@ -1273,6 +1277,7 @@ def create_server(
         kinds: list[ChunkKind] | None,
         scope: SearchScope,
         limit: int,
+        include_graph_context: bool = False,
     ) -> SearchResponse:
         await _wait_for_startup_projects(ctx, roots, projects)
         # The service layer takes open list[str]; the closed Literal lists exist to
@@ -1289,6 +1294,7 @@ def create_server(
             kinds=selected_kinds,
             scope=scope,
             limit=limit,
+            include_graph_context=include_graph_context,
             # Preserve the resolved checkout scope through the ID-based API.
             roots=_unique_project_roots([project.root for project in projects]),
         )
@@ -1304,6 +1310,7 @@ def create_server(
         kinds: list[ChunkKind] | None,
         scope: SearchScope,
         limit: int,
+        include_graph_context: bool = False,
     ) -> ExampleSearchResponse:
         await _wait_for_startup_projects(ctx, roots, projects)
         selected_languages: list[str] | None = list(languages) if languages else None
@@ -1319,6 +1326,7 @@ def create_server(
             kinds=selected_kinds,
             scope=scope,
             limit=limit,
+            include_graph_context=include_graph_context,
             roots=_unique_project_roots([project.root for project in projects]),
         )
 
@@ -1781,6 +1789,15 @@ def create_server(
         limit: Annotated[
             int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
         ] = 8,
+        include_graph_context: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Attach compact 1-hop structural neighborhood (callers, callees, supertypes, "
+                    "subtypes, related) to each returned hit."
+                )
+            ),
+        ] = False,
     ) -> SearchResponse:
         roots = await scoped_roots(ctx, projects=projects, all_projects=all_projects)
         checkouts = await asyncio.to_thread(
@@ -1796,6 +1813,7 @@ def create_server(
             kinds,
             scope,
             limit,
+            include_graph_context=include_graph_context,
         )
 
     @mcp.tool(
@@ -1873,6 +1891,15 @@ def create_server(
         limit: Annotated[
             int, Field(ge=1, le=50, description="Maximum hits to return. Hard cap of 50.")
         ] = 8,
+        include_graph_context: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Attach compact 1-hop structural neighborhood (callers, callees, supertypes, "
+                    "subtypes, related) to each returned hit."
+                )
+            ),
+        ] = False,
     ) -> ExampleSearchResponse:
         roots = await scoped_roots(ctx, projects=projects, all_projects=all_projects)
         checkouts = await asyncio.to_thread(
@@ -1889,6 +1916,7 @@ def create_server(
             kinds,
             scope,
             limit,
+            include_graph_context=include_graph_context,
         )
 
     @mcp.tool(
@@ -1978,6 +2006,15 @@ def create_server(
                 description="Maximum globally ranked hits to return. Hard cap of 50.",
             ),
         ] = 8,
+        include_graph_context: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Attach compact 1-hop structural neighborhood (callers, callees, supertypes, "
+                    "subtypes, related) to each returned hit."
+                )
+            ),
+        ] = False,
     ) -> SearchAcrossProjectsResponse:
         if (query is None and example is None) or (query is not None and example is not None):
             raise CodeIndexingError(
@@ -2008,6 +2045,7 @@ def create_server(
                 kinds,
                 scope,
                 limit,
+                include_graph_context=include_graph_context,
             )
             return SearchAcrossProjectsResponse(
                 hits=query_res.hits,
@@ -2025,6 +2063,7 @@ def create_server(
             kinds,
             scope,
             limit,
+            include_graph_context=include_graph_context,
         )
         return SearchAcrossProjectsResponse(
             hits=example_res.hits,
@@ -2175,13 +2214,14 @@ def create_server(
     @mcp.tool(
         title="Find transitive impact radius",
         description=(
-            "Find the bounded transitive dependents of one structural declaration, grouped into "
-            "layers by hop depth. Exact edges are traversed by default; include_likely also "
-            "traverses possible edges and taints every downstream result reached through one. "
-            "Unresolved or unattributable uses stay in review rather than becoming graph edges. "
-            "The traversal is pinned to one structural snapshot, deduplicates cycles, and reports "
-            "node-budget exhaustion explicitly. Always inspect completeness and limitations "
-            "before treating the radius as exhaustive."
+            "Find the bounded transitive dependents ('dependents', default), outbound callees/"
+            "types ('dependencies'), or both ('both') of one structural declaration, grouped into "
+            "layers by hop depth. Pass focus_query to rank edges and steer node-budget priority "
+            "toward declarations semantically relevant to a question. Exact edges are traversed "
+            "by default; include_likely also traverses possible edges and taints every downstream "
+            "result reached through one. Unresolved or unattributable uses stay in review rather "
+            "than becoming graph edges. Always inspect completeness and limitations before "
+            "treating the radius as exhaustive."
         ),
         annotations=_READS_AND_REGISTERS,
     )
@@ -2218,6 +2258,24 @@ def create_server(
         cursor: Annotated[
             str | None, Field(description="Opaque impact-radius page cursor.")
         ] = None,
+        direction: Annotated[
+            ImpactDirection,
+            Field(
+                description=(
+                    "Traversal direction: 'dependents' (default, inbound callers/importers), "
+                    "'dependencies' (outbound callees/types), or 'both'."
+                )
+            ),
+        ] = "dependents",
+        focus_query: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional natural-language or keyword query to score edge relevance and "
+                    "prioritize the node budget toward relevant branches."
+                )
+            ),
+        ] = None,
     ) -> ImpactRadiusResponse:
         roots = await scoped_roots(ctx, selector=selector)
         await _wait_for_reference_project(ctx, app, roots, selector=selector)
@@ -2230,6 +2288,93 @@ def create_server(
             max_nodes=max_nodes,
             limit=limit,
             cursor=cursor,
+            direction=direction,
+            focus_query=focus_query,
+            roots=roots,
+        )
+
+    @mcp.tool(
+        title="Explore structural subgraph",
+        description=(
+            "Extract a connected, high-signal multi-hop symbol subgraph and shortest typed "
+            "paths around a natural-language query, explicit declaration selectors, or both. "
+            "Use this to trace how components connect across files (for example how an entry "
+            "point reaches a storage or auth primitive) in one compact call without manually "
+            "chasing hop-by-hop references. Combines hybrid retrieval seeds with Specificity-"
+            "Adjusted Personalized PageRank over the compiled Tree-sitter symbol graph."
+        ),
+        annotations=_READS_AND_REGISTERS,
+    )
+    @_with_error_details
+    async def explore_subgraph(
+        ctx: ServerContext,
+        query: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Natural-language or keyword query used to seed and focus the subgraph. "
+                    "At least one of query or selectors is required."
+                )
+            ),
+        ] = None,
+        selectors: Annotated[
+            list[DeclarationSelector] | None,
+            Field(
+                description=(
+                    "Optional seed declarations (by chunk_id or project/path/qualified_symbol). "
+                    "When two or more seeds are given, shortest structural paths between them "
+                    "are traced automatically."
+                )
+            ),
+        ] = None,
+        project: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Project id, name, or path. Defaults to the selector's project, active MCP "
+                    "root, or nearest .ci-mcp/project.toml."
+                )
+            ),
+        ] = None,
+        max_nodes: Annotated[
+            int,
+            Field(ge=1, le=100, description="Maximum declaration nodes in the returned subgraph."),
+        ] = 15,
+        max_hops: Annotated[
+            int,
+            Field(ge=1, le=6, description="Maximum structural hops from seed declarations."),
+        ] = 3,
+        include_likely: Annotated[
+            bool,
+            Field(description="Include heuristic likely edges alongside exact syntax bindings."),
+        ] = True,
+        scope: Annotated[
+            SearchScope,
+            Field(description=_SCOPE_DESCRIPTION),
+        ] = "code",
+    ) -> SubgraphResponse:
+        first_selector = selectors[0] if selectors else None
+        roots = await scoped_roots(
+            ctx,
+            project=project,
+            selector=first_selector if project is None else None,
+        )
+        await _wait_for_reference_project(
+            ctx,
+            app,
+            roots,
+            project=project,
+            selector=first_selector if project is None else None,
+        )
+        return await asyncio.to_thread(
+            app.explore_subgraph,
+            query=query,
+            selectors=selectors,
+            project=project,
+            max_nodes=max_nodes,
+            max_hops=max_hops,
+            include_likely=include_likely,
+            scope=scope,
             roots=roots,
         )
 

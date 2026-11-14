@@ -19,6 +19,7 @@ from ..errors import CodeIndexingError, ErrorCode
 from ..models import (
     CodeChunk,
     DeclarationSelector,
+    ImpactDirection,
     ImpactRadiusResponse,
     IndexProgress,
     IndexReport,
@@ -31,6 +32,7 @@ from ..models import (
     SearchHit,
     SearchResponse,
     SearchScope,
+    SubgraphResponse,
     SymbolResponse,
 )
 from ..progress import read_all_progress
@@ -386,6 +388,8 @@ class TuiService:
         project: ProjectInfo | None = None,
         max_depth: int = 2,
         limit: int = 100,
+        direction: ImpactDirection = "dependents",
+        focus_query: str | None = None,
     ) -> ImpactRadiusResponse:
         """Compute impact radius for a selected hit or selector."""
         selector = (
@@ -396,7 +400,34 @@ class TuiService:
         target = self._require_project(project)
         roots = [target.root]
         return self.application.impact_radius(
-            selector, max_depth=max_depth, limit=limit, roots=roots
+            selector,
+            max_depth=max_depth,
+            limit=limit,
+            direction=direction,
+            focus_query=focus_query,
+            roots=roots,
+        )
+
+    def explore_subgraph(
+        self,
+        *,
+        query: str | None = None,
+        selectors: list[DeclarationSelector] | None = None,
+        project: ProjectInfo | None = None,
+        max_nodes: int = 15,
+        max_hops: int = 3,
+        scope: SearchScope = "code",
+    ) -> SubgraphResponse:
+        """Extract a connected multi-hop symbol subgraph for the active project."""
+        target = self._require_project(project)
+        return self.application.explore_subgraph(
+            query=query,
+            selectors=selectors,
+            project=target.id,
+            max_nodes=max_nodes,
+            max_hops=max_hops,
+            scope=scope,
+            roots=[target.root],
         )
 
 

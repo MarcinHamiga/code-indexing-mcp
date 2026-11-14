@@ -1733,3 +1733,92 @@ def test_impact_radius_coverage_gaps_degrade_completeness(tmp_path: Path) -> Non
 
     assert any(item.code == "unsupported_language" for item in result.limitations)
     assert result.completeness.state == "incomplete"
+
+
+def test_impact_radius_supports_dependencies_both_and_query_focus(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "pipeline.py": (
+                "def audit_logger():\n"
+                "    return 'audit'\n\n"
+                "def verify_jwt_signature():\n"
+                "    return 'ed25519'\n\n"
+                "def decode_bearer_token():\n"
+                "    return verify_jwt_signature()\n\n"
+                "def sibling_caller():\n"
+                "    return decode_bearer_token()\n\n"
+                "def authenticate_request():\n"
+                "    audit_logger()\n"
+                "    return decode_bearer_token()\n\n"
+                "def handle_http():\n"
+                "    return authenticate_request()\n"
+            ),
+        },
+    )
+    selector = DeclarationSelector(
+        project=project_id, path="pipeline.py", qualified_symbol="authenticate_request"
+    )
+
+    deps = service.impact_radius(selector, direction="dependencies", max_depth=2)
+    assert deps.direction == "dependencies"
+    hop1_targets = {e.target.qualified_symbol for e in deps.layers[0].edges}
+    assert hop1_targets == {"audit_logger", "decode_bearer_token"}
+    assert all(e.direction == "dependencies" for e in deps.layers[0].edges)
+    hop2_targets = {e.target.qualified_symbol for e in deps.layers[1].edges}
+    assert hop2_targets == {"verify_jwt_signature"}
+
+    both = service.impact_radius(selector, direction="both", max_depth=2)
+    assert both.direction == "both"
+    both_hop1 = {(e.target.qualified_symbol, e.direction) for e in both.layers[0].edges}
+    assert both_hop1 == {
+        ("handle_http", "dependents"),
+        ("audit_logger", "dependencies"),
+        ("decode_bearer_token", "dependencies"),
+    }
+    # Direction="both" must NOT zigzag laterally from decode_bearer_token back to sibling_caller
+    both_hop2 = {e.target.qualified_symbol for e in both.layers[1].edges}
+    assert both_hop2 == {"verify_jwt_signature"}
+    assert "sibling_caller" not in both_hop2
+
+    # Query focus scores relevance and steers max_nodes toward matching branches
+    focused_budget2 = service.impact_radius(
+        selector,
+        direction="dependencies",
+        max_depth=2,
+        max_nodes=2,
+        focus_query="decode_bearer_token verify_jwt_signature",
+    )
+    # Budget=2: root (1) + 1 hop-1 node -> decode_bearer_token beats alphabetical audit_logger
+    assert [e.target.qualified_symbol for e in focused_budget2.layers[0].edges] == [
+        "decode_bearer_token"
+    ]
+
+    focused = service.impact_radius(
+        selector,
+        direction="dependencies",
+        max_depth=2,
+        max_nodes=10,
+        focus_query="decode_bearer_token verify_jwt_signature",
+    )
+    assert focused.focus_query == "decode_bearer_token verify_jwt_signature"
+    visited_hop1 = [e.target.qualified_symbol for e in focused.layers[0].edges]
+    assert visited_hop1 == ["decode_bearer_token", "audit_logger"]
+    assert focused.layers[0].edges[0].relevance_score is not None
+    assert focused.layers[0].edges[1].relevance_score is not None
+    assert focused.layers[0].edges[0].relevance_score > focused.layers[0].edges[1].relevance_score
+    assert [e.target.qualified_symbol for e in focused.layers[1].edges] == ["verify_jwt_signature"]
+
+    # Cursor binds direction and focus_query
+    paged = service.impact_radius(selector, direction="dependencies", focus_query="audit", limit=1)
+    assert paged.cursor is not None
+    with pytest.raises(CodeIndexingError) as excinfo:
+        service.impact_radius(
+            selector, direction="dependents", focus_query="audit", limit=1, cursor=paged.cursor
+        )
+    assert excinfo.value.code is ErrorCode.INVALID_CURSOR
+    with pytest.raises(CodeIndexingError) as excinfo2:
+        service.impact_radius(
+            selector, direction="dependencies", focus_query="other", limit=1, cursor=paged.cursor
+        )
+    assert excinfo2.value.code is ErrorCode.INVALID_CURSOR

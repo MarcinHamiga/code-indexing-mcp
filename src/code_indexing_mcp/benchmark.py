@@ -856,3 +856,464 @@ def run_precision_benchmark_command(
         return _run(workspace)
     with tempfile.TemporaryDirectory(prefix="code-indexing-mcp-precision-benchmark-") as temporary:
         return _run(Path(temporary))
+
+
+GRAPHRAG_ITERATIONS = 3
+GRAPHRAG_NOISE_FILES = 60
+
+
+@dataclass(frozen=True)
+class GraphRagQueryCase:
+    """One judged retrieval query for the Hybrid GraphRAG A/B benchmark."""
+
+    category: str
+    query: str
+    relevant_targets: tuple[tuple[str, str], ...]
+
+
+def write_graphrag_benchmark_corpus(
+    root: Path,
+    *,
+    noise_files: int = GRAPHRAG_NOISE_FILES,
+) -> tuple[int, list[GraphRagQueryCase]]:
+    """Write a multi-language judged repository testing GraphRAG retrieval cases.
+
+    Categories:
+      - ``multi_hop``: user-facing entrypoint vocabulary calls low-level systems
+        callees whose implementations share zero lexical terms with the query.
+      - ``barrel_reexport``: TypeScript barrel ``index.ts`` re-exports concrete
+        implementations imported through the barrel by callers; ground truth is
+        the concrete definition rather than the empty re-export stub.
+      - ``hub_resistance``: a shared telemetry hub is called by every module,
+        testing that specificity-adjusted PPR promotes domain callees rather
+        than the global utility hub.
+      - ``exact_symbol``: exact identifier lookups ensuring zero rank regression.
+    """
+    if noise_files < 0:
+        raise ValueError("noise_files must be non-negative")
+    src = root / "src"
+    ts_pkg = root / "web" / "ledger"
+    src.mkdir(parents=True, exist_ok=False)
+    ts_pkg.mkdir(parents=True, exist_ok=False)
+
+    files_to_write: dict[Path, str] = {
+        src / "telemetry_hub.py": (
+            "def emit_global_span(operation: str) -> None:\n    _ = operation\n"
+        ),
+        # Multi-hop pair 1: OAuth bearer header rotation -> Ed25519 curve + HKDF ratchet
+        src / "crypto_ed25519.py": (
+            "def ed25519_curve_point_verify(wire_bytes: bytes, pub_scalar: bytes) -> bool:\n"
+            "    return wire_bytes[:4] == pub_scalar[:4]\n\n"
+            "def hkdf_sha512_subkey_derive(master_seed: bytes, epoch: int) -> bytes:\n"
+            "    return master_seed + epoch.to_bytes(4, 'big')\n"
+        ),
+        src / "auth_gateway.py": (
+            "from .crypto_ed25519 import ed25519_curve_point_verify, hkdf_sha512_subkey_derive\n"
+            "from .telemetry_hub import emit_global_span\n\n"
+            "def validate_oauth_bearer_rotation("
+            "header_value: bytes, root_material: bytes) -> bool:\n"
+            "    emit_global_span('oauth_bearer')\n"
+            "    derived = hkdf_sha512_subkey_derive(root_material, 1)\n"
+            "    return ed25519_curve_point_verify(header_value, derived)\n"
+        ),
+        # Multi-hop pair 2: Stripe webhook replay protection -> HMAC constant-time digest
+        src / "mac_primitives.py": (
+            "def constant_time_xor_compare(digest_a: bytes, digest_b: bytes) -> bool:\n"
+            "    acc = 0\n"
+            "    for left, right in zip(digest_a, digest_b, strict=False):\n"
+            "        acc |= left ^ right\n"
+            "    return acc == 0\n"
+        ),
+        src / "webhook_ingress.py": (
+            "from .mac_primitives import constant_time_xor_compare\n"
+            "from .telemetry_hub import emit_global_span\n\n"
+            "def handle_stripe_webhook_replay(body_mac: bytes, expected_mac: bytes) -> bool:\n"
+            "    emit_global_span('stripe_webhook')\n"
+            "    return constant_time_xor_compare(body_mac, expected_mac)\n"
+        ),
+        # Multi-hop pair 3: Tenant API rate limit burst -> Atomic CAS token bucket
+        src / "cas_counter.py": (
+            "def atomic_compare_and_swap_slots(slot_ring: list[int], cost: int) -> bool:\n"
+            "    if slot_ring[0] < cost:\n"
+            "        return False\n"
+            "    slot_ring[0] -= cost\n"
+            "    return True\n"
+        ),
+        src / "quota_middleware.py": (
+            "from .cas_counter import atomic_compare_and_swap_slots\n"
+            "from .telemetry_hub import emit_global_span\n\n"
+            "def enforce_tenant_rate_limit_burst(bucket_state: list[int]) -> bool:\n"
+            "    emit_global_span('tenant_quota')\n"
+            "    return atomic_compare_and_swap_slots(bucket_state, 1)\n"
+        ),
+        # Multi-hop pair 4: Encrypted disaster recovery backup -> AES-GCM envelope seal
+        src / "aead_envelope.py": (
+            "def chacha20_poly1305_seal_block(plaintext_frame: bytes, nonce_iv: bytes) -> bytes:\n"
+            "    return nonce_iv + plaintext_frame\n"
+        ),
+        src / "backup_coordinator.py": (
+            "from .aead_envelope import chacha20_poly1305_seal_block\n"
+            "from .telemetry_hub import emit_global_span\n\n"
+            "def archive_disaster_recovery_snapshot(archive_blob: bytes, iv: bytes) -> bytes:\n"
+            "    emit_global_span('disaster_backup')\n"
+            "    return chacha20_poly1305_seal_block(archive_blob, iv)\n"
+        ),
+        # TypeScript barrel re-export cluster
+        ts_pkg / "journal_writer.ts": (
+            "export function commitDoubleEntryPosting("
+            "debitCents: number, creditCents: number): boolean {\n"
+            "    return debitCents === creditCents && debitCents > 0;\n"
+            "}\n"
+        ),
+        ts_pkg / "fx_revaluation.ts": (
+            "export function computeSpotRateBasisPoints("
+            "notionalMinor: number, pipSpread: number): number {\n"
+            "    return Math.trunc((notionalMinor * pipSpread) / 10000);\n"
+            "}\n"
+        ),
+        ts_pkg / "index.ts": (
+            "export { commitDoubleEntryPosting } from './journal_writer';\n"
+            "export { computeSpotRateBasisPoints } from './fx_revaluation';\n"
+        ),
+        ts_pkg / "checkout_settlement.ts": (
+            "import { commitDoubleEntryPosting, computeSpotRateBasisPoints } from './index';\n\n"
+            "export function settleMerchantInvoicePayout(amount: number): boolean {\n"
+            "    const fee = computeSpotRateBasisPoints(amount, 25);\n"
+            "    return commitDoubleEntryPosting(amount - fee, amount - fee);\n"
+            "}\n"
+        ),
+    }
+
+    for idx in range(noise_files):
+        files_to_write[src / f"a_distractor_{idx:03d}.py"] = (
+            "from .telemetry_hub import emit_global_span\n\n"
+            f"def background_worker_task_{idx:03d}(payload: dict[str, str]) -> str:\n"
+            f"    emit_global_span('worker_{idx:03d}')\n"
+            f"    return payload.get('status', 'idle_{idx:03d}')\n"
+        )
+
+    total_bytes = 0
+    for path, content in sorted(files_to_write.items()):
+        encoded = content.encode("utf-8")
+        path.write_bytes(encoded)
+        total_bytes += len(encoded)
+
+    queries = [
+        GraphRagQueryCase(
+            category="multi_hop",
+            query="validate oauth bearer rotation header",
+            relevant_targets=(
+                ("src/auth_gateway.py", "validate_oauth_bearer_rotation"),
+                ("src/crypto_ed25519.py", "ed25519_curve_point_verify"),
+                ("src/crypto_ed25519.py", "hkdf_sha512_subkey_derive"),
+            ),
+        ),
+        GraphRagQueryCase(
+            category="multi_hop",
+            query="handle stripe webhook replay verification",
+            relevant_targets=(
+                ("src/webhook_ingress.py", "handle_stripe_webhook_replay"),
+                ("src/mac_primitives.py", "constant_time_xor_compare"),
+            ),
+        ),
+        GraphRagQueryCase(
+            category="multi_hop",
+            query="enforce tenant rate limit burst middleware",
+            relevant_targets=(
+                ("src/quota_middleware.py", "enforce_tenant_rate_limit_burst"),
+                ("src/cas_counter.py", "atomic_compare_and_swap_slots"),
+            ),
+        ),
+        GraphRagQueryCase(
+            category="multi_hop",
+            query="archive disaster recovery snapshot coordinator",
+            relevant_targets=(
+                ("src/backup_coordinator.py", "archive_disaster_recovery_snapshot"),
+                ("src/aead_envelope.py", "chacha20_poly1305_seal_block"),
+            ),
+        ),
+        GraphRagQueryCase(
+            category="barrel_reexport",
+            query="settle merchant invoice payout ledger",
+            relevant_targets=(
+                ("web/ledger/checkout_settlement.ts", "settleMerchantInvoicePayout"),
+                ("web/ledger/journal_writer.ts", "commitDoubleEntryPosting"),
+                ("web/ledger/fx_revaluation.ts", "computeSpotRateBasisPoints"),
+            ),
+        ),
+        GraphRagQueryCase(
+            category="hub_resistance",
+            query="stripe webhook replay mac check",
+            relevant_targets=(
+                ("src/webhook_ingress.py", "handle_stripe_webhook_replay"),
+                ("src/mac_primitives.py", "constant_time_xor_compare"),
+            ),
+        ),
+        GraphRagQueryCase(
+            category="exact_symbol",
+            query="ed25519_curve_point_verify",
+            relevant_targets=(("src/crypto_ed25519.py", "ed25519_curve_point_verify"),),
+        ),
+        GraphRagQueryCase(
+            category="exact_symbol",
+            query="commitDoubleEntryPosting",
+            relevant_targets=(("web/ledger/journal_writer.ts", "commitDoubleEntryPosting"),),
+        ),
+        GraphRagQueryCase(
+            category="exact_symbol",
+            query="atomic_compare_and_swap_slots",
+            relevant_targets=(("src/cas_counter.py", "atomic_compare_and_swap_slots"),),
+        ),
+        GraphRagQueryCase(
+            category="exact_symbol",
+            query="chacha20_poly1305_seal_block",
+            relevant_targets=(("src/aead_envelope.py", "chacha20_poly1305_seal_block"),),
+        ),
+    ]
+    return total_bytes, queries
+
+
+def _score_graphrag_queries(
+    app: Application,
+    project_id: str,
+    queries: Sequence[GraphRagQueryCase],
+    *,
+    iterations: int,
+    limit: int = 10,
+) -> dict[str, Any]:
+    latency_samples: list[float] = []
+    latest_responses: list[SearchResponse] = []
+    for iteration in range(iterations):
+        run_responses: list[SearchResponse] = []
+        for case in queries:
+            started = time.monotonic_ns()
+            resp = app.search_code(case.query, projects=[project_id], limit=limit)
+            elapsed_ms = (time.monotonic_ns() - started) / 1_000_000
+            latency_samples.append(elapsed_ms)
+            run_responses.append(resp)
+        if iteration == iterations - 1:
+            latest_responses = run_responses
+
+    def _summarize_subset(
+        pairs: Sequence[tuple[GraphRagQueryCase, SearchResponse]],
+    ) -> dict[str, Any]:
+        rr_scores: list[float] = []
+        recalls_5: list[float] = []
+        recalls_10: list[float] = []
+        hub_contaminations_5: list[int] = []
+        for case, resp in pairs:
+            targets = set(case.relevant_targets)
+            ranked = [(hit.path, hit.symbol or "") for hit in resp.hits]
+            rr = 0.0
+            for idx, key in enumerate(ranked[:10], start=1):
+                if key in targets:
+                    rr = 1.0 / idx
+                    break
+            rr_scores.append(rr)
+            hits_5 = sum(1 for key in set(ranked[:5]) if key in targets)
+            hits_10 = sum(1 for key in set(ranked[:10]) if key in targets)
+            recalls_5.append(hits_5 / len(targets))
+            recalls_10.append(hits_10 / len(targets))
+            hub_in_top5 = any(sym == "emit_global_span" for _p, sym in ranked[:5])
+            hub_contaminations_5.append(1 if hub_in_top5 else 0)
+        return {
+            "queries": len(pairs),
+            "mrr_at_10": round(statistics.fmean(rr_scores), 4) if rr_scores else 0.0,
+            "recall_at_5": round(statistics.fmean(recalls_5), 4) if recalls_5 else 0.0,
+            "recall_at_10": round(statistics.fmean(recalls_10), 4) if recalls_10 else 0.0,
+            "hub_in_top_5_rate": (
+                round(statistics.fmean(hub_contaminations_5), 4) if hub_contaminations_5 else 0.0
+            ),
+        }
+
+    paired = list(zip(queries, latest_responses, strict=True))
+    categories: dict[str, dict[str, Any]] = {}
+    for category in ("multi_hop", "barrel_reexport", "hub_resistance", "exact_symbol"):
+        subset = [item for item in paired if item[0].category == category]
+        if subset:
+            categories[category] = _summarize_subset(subset)
+
+    return {
+        "overall": _summarize_subset(paired),
+        "by_category": categories,
+        "latency_ms": _duration_summary(latency_samples),
+    }
+
+
+def run_graphrag_benchmark(
+    paths: RuntimePaths,
+    workspace: Path,
+    *,
+    noise_files: int = GRAPHRAG_NOISE_FILES,
+    iterations: int = GRAPHRAG_ITERATIONS,
+    embedder: Any | None = None,
+) -> dict[str, Any]:
+    """Run an A/B retrieval and latency evaluation of Hybrid Code GraphRAG."""
+    corpus_root = workspace / "corpus"
+    source_bytes, queries = write_graphrag_benchmark_corpus(corpus_root, noise_files=noise_files)
+
+    digest = hashlib.sha256()
+    for file_path in sorted(corpus_root.rglob("*")):
+        if file_path.is_file():
+            digest.update(file_path.relative_to(corpus_root).as_posix().encode("utf-8"))
+            digest.update(file_path.read_bytes())
+    for case in queries:
+        digest.update(case.query.encode("utf-8"))
+
+    base_settings = IndexSettings.from_environment()
+    runtime_paths = RuntimePaths(data=workspace / "data", cache=paths.cache)
+
+    graph_settings = replace(
+        base_settings,
+        graph_search=True,
+        index_execution="in-process",
+        broker_mode="off",
+    )
+    baseline_settings = replace(
+        base_settings,
+        graph_search=False,
+        index_execution="in-process",
+        broker_mode="off",
+    )
+
+    graph_app = Application(
+        runtime_paths,
+        embedder=embedder,
+        cwd=corpus_root,
+        settings=graph_settings,
+    )
+    project = graph_app.init_project(corpus_root)
+    index_report = graph_app.index_project(project.id, force=True)
+
+    # Share the exact same embedder instance with the baseline application so
+    # query-embedding setup cost does not skew A/B search latency.
+    baseline_app = Application(
+        runtime_paths,
+        embedder=graph_app.embedder,
+        cwd=corpus_root,
+        settings=baseline_settings,
+    )
+
+    # Measure graph compilation, sidecar warm reload, and in-memory hit latency.
+    graph_cache_dir = runtime_paths.data / "lancedb" / "graph-cache"
+    if graph_cache_dir.exists():
+        for bin_file in graph_cache_dir.rglob("*.bin"):
+            bin_file.unlink()
+    graph_app.graph.clear_memory_cache()
+
+    t0 = time.monotonic_ns()
+    compiled_graph = graph_app.graph.get_partition_graph(project.id)
+    cold_compile_ms = round((time.monotonic_ns() - t0) / 1_000_000, 3)
+
+    graph_app.graph.clear_memory_cache()
+    t1 = time.monotonic_ns()
+    warm_graph = graph_app.graph.get_partition_graph(project.id)
+    warm_sidecar_ms = round((time.monotonic_ns() - t1) / 1_000_000, 3)
+
+    t2 = time.monotonic_ns()
+    _ = graph_app.graph.get_partition_graph(project.id)
+    memory_hit_ms = round((time.monotonic_ns() - t2) / 1_000_000, 3)
+
+    sidecar_bytes = (
+        sum(entry.stat().st_size for entry in graph_cache_dir.rglob("*.bin"))
+        if graph_cache_dir.exists()
+        else 0
+    )
+
+    baseline_metrics = _score_graphrag_queries(
+        baseline_app, project.id, queries, iterations=iterations
+    )
+    hybrid_metrics = _score_graphrag_queries(graph_app, project.id, queries, iterations=iterations)
+
+    base_overall = baseline_metrics["overall"]
+    hyb_overall = hybrid_metrics["overall"]
+    base_mh = baseline_metrics["by_category"]["multi_hop"]
+    hyb_mh = hybrid_metrics["by_category"]["multi_hop"]
+    base_exact = baseline_metrics["by_category"]["exact_symbol"]
+    hyb_exact = hybrid_metrics["by_category"]["exact_symbol"]
+
+    graph_ref = warm_graph or compiled_graph
+    return {
+        "schema_version": 1,
+        **_benchmark_metadata(graph_app),
+        "corpus": {
+            "files": index_report.indexed_files,
+            "noise_files": noise_files,
+            "source_bytes": source_bytes,
+            "chunks": index_report.embedded_chunks,
+            "references": index_report.staged_reference_rows,
+            "graph_nodes": len(graph_ref.nodes) if graph_ref is not None else 0,
+            "graph_edges": len(graph_ref.out_indices) if graph_ref is not None else 0,
+            "barrel_files": len(graph_ref.barrel_file_ids) if graph_ref is not None else 0,
+            "queries": len(queries),
+            "digest": digest.hexdigest(),
+        },
+        "iterations": iterations,
+        "graph_cache": {
+            "cold_compile_ms": cold_compile_ms,
+            "warm_sidecar_load_ms": warm_sidecar_ms,
+            "memory_hit_ms": memory_hit_ms,
+            "sidecar_bytes": sidecar_bytes,
+        },
+        "variants": {
+            "baseline": baseline_metrics,
+            "hybrid_graphrag": hybrid_metrics,
+        },
+        "deltas": {
+            "mrr_at_10": round(hyb_overall["mrr_at_10"] - base_overall["mrr_at_10"], 4),
+            "recall_at_5": round(hyb_overall["recall_at_5"] - base_overall["recall_at_5"], 4),
+            "recall_at_10": round(hyb_overall["recall_at_10"] - base_overall["recall_at_10"], 4),
+            "multi_hop_recall_at_5": round(hyb_mh["recall_at_5"] - base_mh["recall_at_5"], 4),
+            "median_latency_ms": round(
+                hybrid_metrics["latency_ms"]["median_ms"]
+                - baseline_metrics["latency_ms"]["median_ms"],
+                3,
+            ),
+        },
+        "gates": {
+            "overall_recall_improved": hyb_overall["recall_at_5"] > base_overall["recall_at_5"],
+            "multi_hop_recall_improved": hyb_mh["recall_at_5"] > base_mh["recall_at_5"],
+            "exact_symbol_no_regression": hyb_exact["mrr_at_10"] >= base_exact["mrr_at_10"],
+        },
+    }
+
+
+def run_graphrag_benchmark_command(
+    paths: RuntimePaths,
+    *,
+    noise_files: int = GRAPHRAG_NOISE_FILES,
+    iterations: int = GRAPHRAG_ITERATIONS,
+    work_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Create an isolated workspace and run the Hybrid GraphRAG A/B benchmark."""
+    if not 0 <= noise_files <= 1_000:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "Benchmark noise_files must be from 0 to 1000",
+        )
+    if not 1 <= iterations <= 20:
+        raise CodeIndexingError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "Benchmark iterations must be from 1 to 20",
+        )
+    if work_dir is not None:
+        workspace = work_dir.expanduser().resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        if (workspace / "corpus").exists() or (workspace / "data").exists():
+            raise CodeIndexingError(
+                ErrorCode.INVALID_CONFIGURATION,
+                f"Benchmark work directory is not fresh: {workspace}",
+            )
+        return run_graphrag_benchmark(
+            paths,
+            workspace,
+            noise_files=noise_files,
+            iterations=iterations,
+        )
+    with tempfile.TemporaryDirectory(prefix="code-indexing-mcp-graphrag-benchmark-") as temporary:
+        return run_graphrag_benchmark(
+            paths,
+            Path(temporary),
+            noise_files=noise_files,
+            iterations=iterations,
+        )

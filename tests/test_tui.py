@@ -893,3 +893,158 @@ async def test_error_retry_remains_bound_to_failed_action() -> None:
         await pilot.pause()
         await pilot.click("#retry-button")
         assert calls == ["failed action"]
+
+
+@pytest.mark.asyncio
+async def test_graph_rank_diagnostics_and_chunk_graph_context_navigation() -> None:
+    from code_indexing_mcp.models import (
+        ChunkGraphContext,
+        CodeChunk,
+        GraphNeighborRef,
+        RankExplanation,
+    )
+
+    fake = FakeApplication()
+    fake.search_hits = [
+        _sample_hit(chunk_id="chk-1", symbol="verify_session").model_copy(
+            update={
+                "explanation": RankExplanation(
+                    vector_rank=2,
+                    fts_rank=None,
+                    graph_score=0.42,
+                    graph_rank=1,
+                    graph_via="authenticate_request",
+                )
+            }
+        )
+    ]
+    fake.chunks["chk-1"] = CodeChunk(
+        chunk_id="chk-1",
+        file_id="file-1",
+        project_id="proj-1",
+        path="src/main.py",
+        language="python",
+        kind="function",
+        symbol="verify_session",
+        qualified_symbol="verify_session",
+        start_byte=0,
+        end_byte=100,
+        start_line=1,
+        end_line=10,
+        content="def verify_session(tok):\n    return decode_token(tok)",
+        content_hash="h1",
+        graph_context=ChunkGraphContext(
+            callers=[
+                GraphNeighborRef(
+                    chunk_id="chk-caller",
+                    path="src/api.py",
+                    language="python",
+                    kind="function",
+                    symbol="authenticate_request",
+                    qualified_symbol="authenticate_request",
+                    start_line=12,
+                    end_line=20,
+                    relation="call",
+                )
+            ],
+            callees=[
+                GraphNeighborRef(
+                    chunk_id="chk-callee",
+                    path="src/crypto.py",
+                    language="python",
+                    kind="function",
+                    symbol="decode_token",
+                    qualified_symbol="decode_token",
+                    start_line=4,
+                    end_line=9,
+                    relation="call",
+                )
+            ],
+        ),
+    )
+    fake.chunks["chk-callee"] = CodeChunk(
+        chunk_id="chk-callee",
+        file_id="file-2",
+        project_id="proj-1",
+        path="src/crypto.py",
+        language="python",
+        kind="function",
+        symbol="decode_token",
+        qualified_symbol="decode_token",
+        start_byte=0,
+        end_byte=80,
+        start_line=4,
+        end_line=9,
+        content="def decode_token(tok):\n    return tok.strip()",
+        content_hash="h2",
+    )
+
+    app = _make_app(fake)
+    async with app.run_test(size=(120, 32)) as pilot:
+        await _wait_for_workers(app, pilot)
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "session token"
+        app.action_submit_query()
+        await _wait_for_preview(app, pilot, "src/main.py")
+
+        results_list = app.query_one("#results-list", OptionList)
+        first_prompt = str(results_list.get_option_at_index(0).prompt)
+        assert "graph#1 via authenticate_request" in first_prompt
+
+        entries = app.query_one("#detail-list", OptionList)
+        assert entries.display
+        assert entries.option_count == 2
+        assert "Caller" in str(entries.get_option_at_index(0).prompt)
+        assert "Callee" in str(entries.get_option_at_index(1).prompt)
+
+        entries.highlighted = 1
+        entries.focus()
+        await pilot.press("enter")
+        await _wait_for_preview(app, pilot, "src/crypto.py")
+        assert "src/crypto.py:4" in str(app.query_one("#detail-title", Label).render())
+        assert "decode_token" in app.query_one("#detail-content", Static).content.code
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert "src/main.py:1" in str(app.query_one("#detail-title", Label).render())
+
+
+@pytest.mark.asyncio
+async def test_impact_direction_and_focus_query_shortcuts() -> None:
+    fake = FakeApplication()
+    app = _make_app(fake)
+    async with app.run_test(size=(120, 32)) as pilot:
+        await _wait_for_workers(app, pilot)
+        await pilot.pause()
+        app.query_one("#query-input", Input).value = "jwt verification"
+        app.action_submit_query()
+        await _wait_for_preview(app, pilot, "src/main.py")
+
+        app.action_show_impact()
+        await _wait_for_workers(app, pilot)
+        await pilot.pause()
+        assert fake.impact_calls[-1]["direction"] == "dependents"
+        assert fake.impact_calls[-1]["focus_query"] is None
+
+        app.query_one("#results-list", OptionList).focus()
+        await pilot.press("d")
+        await _wait_for_workers(app, pilot)
+        await pilot.pause()
+        assert fake.impact_calls[-1]["direction"] == "dependencies"
+        assert "Direction: dependencies [d]" in str(
+            app.query_one("#detail-content", Static).render()
+        )
+
+        await pilot.press("f")
+        await _wait_for_workers(app, pilot)
+        await pilot.pause()
+        assert fake.impact_calls[-1]["direction"] == "dependencies"
+        assert fake.impact_calls[-1]["focus_query"] == "jwt verification"
+        assert "Focus: jwt verification [f]" in str(
+            app.query_one("#detail-content", Static).render()
+        )
+
+        await pilot.press("d")
+        await _wait_for_workers(app, pilot)
+        await pilot.pause()
+        assert fake.impact_calls[-1]["direction"] == "both"

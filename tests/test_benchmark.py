@@ -12,6 +12,8 @@ from code_indexing_mcp.benchmark import (
     _directory_physical_bytes,
     _duration_summary,
     build_retrieval_corpus,
+    run_graphrag_benchmark,
+    run_graphrag_benchmark_command,
     run_index_benchmark,
     run_precision_benchmark,
     run_precision_benchmark_command,
@@ -535,3 +537,40 @@ def test_directory_physical_bytes_ignores_symlinks(tmp_path: Path) -> None:
     (measured / "link.bin").symlink_to(outside)
 
     assert _directory_physical_bytes(measured) == 100
+
+
+def test_graphrag_benchmark_improves_multi_hop_and_preserves_exact_symbols(
+    tmp_path: Path,
+) -> None:
+    from support import DeterministicEmbedder
+
+    paths = RuntimePaths(data=tmp_path / "global_data", cache=tmp_path / "cache")
+    workspace = tmp_path / "graphrag_ws"
+    workspace.mkdir()
+    report = run_graphrag_benchmark(
+        paths,
+        workspace,
+        noise_files=55,
+        iterations=1,
+        embedder=DeterministicEmbedder(),
+    )
+
+    assert report["schema_version"] == 1
+    assert report["corpus"]["graph_nodes"] > 60
+    assert report["corpus"]["graph_edges"] > 60
+    assert report["corpus"]["barrel_files"] >= 1
+    assert report["graph_cache"]["sidecar_bytes"] > 0
+    assert report["graph_cache"]["cold_compile_ms"] >= 0
+    assert report["graph_cache"]["warm_sidecar_load_ms"] >= 0
+    assert report["graph_cache"]["memory_hit_ms"] >= 0
+
+    assert report["gates"]["overall_recall_improved"] is True
+    assert report["gates"]["multi_hop_recall_improved"] is True
+    assert report["gates"]["exact_symbol_no_regression"] is True
+    assert report["deltas"]["recall_at_5"] > 0
+    assert report["deltas"]["multi_hop_recall_at_5"] > 0
+
+    with pytest.raises(CodeIndexingError):
+        run_graphrag_benchmark_command(paths, noise_files=-1, iterations=1)
+    with pytest.raises(CodeIndexingError):
+        run_graphrag_benchmark_command(paths, noise_files=5, iterations=1, work_dir=workspace)
