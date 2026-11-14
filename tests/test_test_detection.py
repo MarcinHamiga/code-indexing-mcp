@@ -1,6 +1,7 @@
 """Tests for test/benchmark detection and search scoping.
 
-Covers C#, Java, Python, Rust, and TypeScript/TSX.
+Covers unambiguous test/benchmark directories across all indexed languages plus
+filename and AST rules for C#, Java, Python, Rust, and TypeScript/TSX.
 """
 
 from __future__ import annotations
@@ -100,9 +101,24 @@ from code_indexing_mcp.test_detection import is_test_file_path
         ("typescript", "src/domain/specs/activeOrder.ts", False),
         ("typescript", "src/types/jest.d.ts", False),
         ("typescript", "src/types/test.d.ts", False),
-        # Non-target languages stay False
-        ("javascript", "tests/auth.test.js", False),
+        # Other languages: unambiguous test/benchmark directories classify as True,
+        # while paths outside test directories stay False (no filename/AST rules yet)
+        ("javascript", "tests/auth.test.js", True),
+        ("javascript", "__tests__/widget.js", True),
+        ("javascript", "__mocks__/api.js", True),
+        ("javascript", "src/auth.test.js", False),
+        ("javascript", "e2e/checkout.js", False),
+        ("json", "tests/fixtures/extractor_snapshot.json", True),
+        ("json", "src/__fixtures__/users.json", True),
+        ("json", "package.json", False),
+        ("yaml", "tests/fixtures/compose.yaml", True),
+        ("yaml", ".github/workflows/ci.yml", False),
+        ("go", "tests/fixtures/resolver_corpus/go/sample.go", True),
         ("go", "pkg/auth_test.go", False),
+        ("kotlin", "app/src/test/kotlin/FooTest.kt", True),
+        ("kotlin", "app/src/main/kotlin/Foo.kt", False),
+        ("sql", "benches/query.sql", True),
+        ("sql", "src/schema.sql", False),
     ],
 )
 def test_is_test_file_path_conventions_and_false_positive_guards(
@@ -1671,3 +1687,130 @@ export { expect };
     assert all(chunk.is_test for chunk in fixtures_res.chunks)
     syms = {c.qualified_symbol: c.is_test for c in fixtures_res.chunks if c.qualified_symbol}
     assert syms["createTestUser"] is True
+
+
+def test_non_ast_languages_in_test_and_benchmark_directories_are_classified_and_scoped(
+    tmp_path: Path,
+) -> None:
+    extractor = TreeSitterExtractor()
+
+    fixture_cases: list[tuple[str, str, bytes]] = [
+        ("tests/fixtures/extractor_snapshot.json", "json", b'{"verifyFixtureToken": true}\n'),
+        (
+            "tests/fixtures/compose.yaml",
+            "yaml",
+            b"services:\n  verify_fixture_token:\n    image: alpine\n",
+        ),
+        (
+            "__tests__/widget.js",
+            "javascript",
+            b"export function verifyFixtureToken() { return true; }\n",
+        ),
+        (
+            "app/src/test/kotlin/FixtureToken.kt",
+            "kotlin",
+            b"package demo\nfun verifyFixtureToken(): Boolean = true\n",
+        ),
+        ("benches/query.sql", "sql", b"CREATE VIEW verify_fixture_token AS SELECT 1;\n"),
+    ]
+    for rel_path, language, source in fixture_cases:
+        res = extractor.extract(Path(rel_path), language, source)
+        assert res.chunks, rel_path
+        assert all(chunk.is_test for chunk in res.chunks), rel_path
+
+    prod_cases: list[tuple[str, str, bytes]] = [
+        ("package.json", "json", b'{"verifyFixtureToken": false}\n'),
+        (".github/workflows/ci.yml", "yaml", b"name: ci\n"),
+        (
+            "src/auth.test.js",
+            "javascript",
+            b"export function verifyFixtureToken() { return false; }\n",
+        ),
+        (
+            "pkg/auth_test.go",
+            "go",
+            b"package auth\nfunc VerifyFixtureToken() bool { return false }\n",
+        ),
+        ("src/schema.sql", "sql", b"CREATE TABLE prod_tokens (id INT);\n"),
+    ]
+    for rel_path, language, source in prod_cases:
+        res = extractor.extract(Path(rel_path), language, source)
+        assert res.chunks, rel_path
+        assert all(not chunk.is_test for chunk in res.chunks), rel_path
+
+    # End-to-end indexing and search/symbol scoping on non-AST fixture vs production files.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "token.js").write_text(
+        "export function verifyFixtureToken() { return true; }\n",
+        encoding="utf-8",
+    )
+    (repo / "package.json").write_text(
+        '{"name": "demo", "verifyFixtureToken": "prod"}\n',
+        encoding="utf-8",
+    )
+    (repo / "tests" / "fixtures").mkdir(parents=True)
+    (repo / "tests" / "fixtures" / "snapshot.json").write_text(
+        '{"verifyFixtureToken": "fixture"}\n',
+        encoding="utf-8",
+    )
+    (repo / "tests" / "fixtures" / "helper.go").write_text(
+        "package fixtures\nfunc verifyFixtureToken() bool { return true }\n",
+        encoding="utf-8",
+    )
+    (repo / "__tests__").mkdir()
+    (repo / "__tests__" / "token.js").write_text(
+        "export function verifyFixtureToken() { return true; }\n",
+        encoding="utf-8",
+    )
+
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=DeterministicEmbedder(),
+        cwd=repo,
+    )
+    project = app.init_project(repo)
+    app.index_project(project.id)
+
+    code_hits = app.search_code("verifyFixtureToken", limit=50).hits
+    assert code_hits
+    assert all(not hit.is_test for hit in code_hits)
+    assert {hit.path for hit in code_hits} == {"src/token.js", "package.json"}
+
+    test_hits = app.search_code("verifyFixtureToken", scope="tests", limit=50).hits
+    assert all(hit.is_test for hit in test_hits)
+    assert {hit.path for hit in test_hits} == {
+        "tests/fixtures/snapshot.json",
+        "tests/fixtures/helper.go",
+        "__tests__/token.js",
+    }
+
+    all_hits = app.search_code("verifyFixtureToken", scope="all", limit=50).hits
+    assert {hit.path for hit in all_hits} == {
+        "src/token.js",
+        "package.json",
+        "tests/fixtures/snapshot.json",
+        "tests/fixtures/helper.go",
+        "__tests__/token.js",
+    }
+
+    code_syms = app.find_symbol("verifyFixtureToken").hits
+    assert [hit.path for hit in code_syms] == ["src/token.js"]
+    assert code_syms[0].is_test is False
+
+    test_syms = app.find_symbol("verifyFixtureToken", scope="tests").hits
+    assert {hit.path for hit in test_syms} == {"tests/fixtures/helper.go", "__tests__/token.js"}
+    assert all(hit.is_test for hit in test_syms)
+
+    example_snippet = "export function verifyFixtureToken() { return true; }\n"
+    ex_code = app.search_by_example(example_snippet, language="javascript", limit=50).hits
+    assert all(not hit.is_test for hit in ex_code)
+    assert {hit.path for hit in ex_code}.isdisjoint(
+        {"tests/fixtures/snapshot.json", "tests/fixtures/helper.go", "__tests__/token.js"}
+    )
+    ex_tests = app.search_by_example(
+        example_snippet, language="javascript", scope="tests", limit=50
+    ).hits
+    assert ex_tests
+    assert all(hit.is_test for hit in ex_tests)

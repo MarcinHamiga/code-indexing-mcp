@@ -899,8 +899,8 @@ def test_hybrid_search_damps_anonymous_module_chunks(tmp_path: Path) -> None:
     assert direct_hits[0]["chunk_id"] == direct_module.chunk_id
 
 
-def test_schema_version_is_bumped_to_10() -> None:
-    assert storage_module.SCHEMA_VERSION == 10
+def test_schema_version_is_bumped_to_11() -> None:
+    assert storage_module.SCHEMA_VERSION == 11
 
 
 def _seed_hybrid_target(store: LanceStore, root: Path) -> ProjectInfo:
