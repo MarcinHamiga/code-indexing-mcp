@@ -592,6 +592,18 @@ class RankComponents(TypedDict):
     vector_rank: int | None
 
 
+def _tag_partition(rows: list[dict[str, Any]], partition_id: str | None) -> list[dict[str, Any]]:
+    """Record the physical partition each row was read from (internal key).
+
+    Chunk ids are content-derived, so identical chunks in two pinned checkouts
+    share an id; consumers needing partition-local data (graph context) read
+    ``_partition_id``. It is never part of a public model.
+    """
+    if partition_id is None:
+        return rows
+    return [{**row, "_partition_id": partition_id} for row in rows]
+
+
 class LanceStore:
     def __init__(
         self,
@@ -2439,10 +2451,10 @@ class LanceStore:
                 partition_id=partition_id,
             )
             if graph_expander is not None and part_rows:
-                return graph_expander(
+                part_rows = graph_expander(
                     project_id, partition_id, query_text, part_rows, condition, limit
                 )
-            return part_rows
+            return _tag_partition(part_rows, partition_id)
 
         rows = self._fan_out_partitions(
             project_ids,
@@ -2531,8 +2543,8 @@ class LanceStore:
                 partition_id=partition_id,
             )
             if graph_expander is not None:
-                return graph_expander(project_id, partition_id, part_rows, condition, limit)
-            return part_rows
+                part_rows = graph_expander(project_id, partition_id, part_rows, condition, limit)
+            return _tag_partition(part_rows, partition_id)
 
         rows = self._fan_out_partitions(
             project_ids,

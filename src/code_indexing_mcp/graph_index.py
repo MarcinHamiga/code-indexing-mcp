@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_GRAPH_CACHE_MAGIC: Final = b"SYNDEX_GRAPH_V1\n"
+_GRAPH_CACHE_MAGIC: Final = b"SYNDEX_GRAPH_V2\n"
 
 # Edge kind -> integer code for compact CSR arrays
 EDGE_KINDS: Final[tuple[str, ...]] = (
@@ -88,6 +88,7 @@ _PRIOR_DAMPING_EXPONENT: Final = 0.25
 _MIN_GRAPH_ACTIVATION: Final = 1e-5
 _MAX_HYBRID_SEED_RANK: Final = 8
 _RELATIVE_RRF_GRAPH_FLOOR: Final = 0.08
+_MAX_COVERAGE_SAMPLES: Final = 8
 
 _IDENTIFIER_SPLIT_RE: Final = re.compile(r"[^a-zA-Z0-9]+")
 _CAMEL_BOUNDARY_RE: Final = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
@@ -169,6 +170,11 @@ class PartitionGraph:
     barrel_file_ids: frozenset[str]
     # barrel_file_id -> tuple of (exported_name_lower, target_node_id)
     barrel_targets_by_file: Mapping[str, tuple[tuple[str, int], ...]]
+    # Structural-coverage gaps reported by the reference compile, as compact
+    # ``(code, explanation, path)`` samples (at most ``_MAX_COVERAGE_SAMPLES``)
+    # plus the full count; the explanations already name sample paths.
+    coverage_limitation_count: int = 0
+    coverage_limitations: tuple[tuple[str, str, str | None], ...] = ()
 
 
 def _via_label(kind_code: int, is_reverse: bool, seed_symbol: str) -> str:
@@ -306,6 +312,8 @@ def _serialize_graph(graph: PartitionGraph) -> bytes:
             fid: [[name, nid] for name, nid in targets]
             for fid, targets in graph.barrel_targets_by_file.items()
         },
+        "coverage_limitation_count": graph.coverage_limitation_count,
+        "coverage_limitations": [list(item) for item in graph.coverage_limitations],
     }
     raw_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return _GRAPH_CACHE_MAGIC + zlib.compress(raw_json, level=3)
@@ -371,6 +379,11 @@ def _deserialize_graph(blob: bytes) -> PartitionGraph | None:
             symbol_to_nodes={sym: tuple(ids) for sym, ids in sym_buckets.items()},
             barrel_file_ids=frozenset(str(x) for x in data["barrel_file_ids"]),
             barrel_targets_by_file=barrel_targets,
+            coverage_limitation_count=int(data["coverage_limitation_count"]),
+            coverage_limitations=tuple(
+                (str(c[0]), str(c[1]), None if c[2] is None else str(c[2]))
+                for c in data["coverage_limitations"]
+            ),
         )
     except Exception:
         logger.debug("Ignoring unreadable sidecar graph cache", exc_info=True)
@@ -737,6 +750,11 @@ class GraphIndexService:
             barrel_targets_by_file={
                 fid: tuple(dict.fromkeys(items)) for fid, items in barrel_targets_map.items()
             },
+            coverage_limitation_count=len(compiled.coverage_limitations),
+            coverage_limitations=tuple(
+                (item.code, item.explanation, item.path)
+                for item in compiled.coverage_limitations[:_MAX_COVERAGE_SAMPLES]
+            ),
         )
 
     def seeded_ppr(
@@ -988,6 +1006,12 @@ class GraphIndexService:
         discover_chunk_ids: list[str] = []
         discover_meta: dict[str, GraphActivation] = {}
 
+        # Genuine PPR activations alone define the peak and the relative floor; synthetic
+        # barrel targets (seed scale, not propagated/prior) must never move either.
+        genuine_peak = max((a.score for a in activations.values()), default=0.0)
+        min_rrf_score = genuine_peak * _RELATIVE_RRF_GRAPH_FLOOR
+        synthetic_score = min_rrf_score if min_rrf_score > 0.0 else 0.01
+
         # Ensure direct barrel targets matching query terms are hydrated even on 1-edge barrels
         for fid in barrel_candidate_file_ids:
             for exp_name, target_nid in graph.barrel_targets_by_file.get(fid, ()):
@@ -999,7 +1023,7 @@ class GraphIndexService:
                     if act is None:
                         act = GraphActivation(
                             node_id=target_nid,
-                            score=seed_weights.get(target_nid, 0.01),
+                            score=synthetic_score,
                             rank=1,
                             via=f"reexport_of:{target_node.qualified_symbol}",
                         )
@@ -1008,8 +1032,6 @@ class GraphIndexService:
         ranked_activations = sorted(
             activations.values(), key=lambda a: (-a.score, graph.nodes[a.node_id].chunk_id)
         )
-        peak_score = ranked_activations[0].score if ranked_activations else 0.0
-        min_rrf_score = peak_score * _RELATIVE_RRF_GRAPH_FLOOR
         ranked_activations = [act for act in ranked_activations if act.score >= min_rrf_score][
             :max_discover
         ]
@@ -1606,15 +1628,50 @@ class GraphIndexService:
                     )
             paths.sort(key=lambda item: (-item.score, len(item.chunk_ids)))
 
+        # Truncation: eligible neighbours of the kept nodes that were left out,
+        # either because max_nodes was reached or because they lie beyond max_hops.
+        node_limited = any(nid not in selected_set for nid in explicit_seed_nids)
+        hop_limited = False
+        for u in selected_nids:
+            if node_limited and hop_limited:
+                break
+            within_hops = hop_dist.get(u, 0) < max_hops
+            for v, _, _, _, _ in neighbors_of(u):
+                if v in selected_set:
+                    continue
+                if within_hops:
+                    node_limited = True
+                else:
+                    hop_limited = True
         has_likely = any(e.resolution == "likely" for e in sub_edges)
-        completeness = CompletenessReport(
-            state="complete_with_dynamic_limitations" if has_likely else "complete",
-            explanation=(
-                "Subgraph includes heuristic likely edges alongside exact bindings."
-                if has_likely
-                else "All subgraph edges resolved from exact syntax bindings."
-            ),
-        )
+        gaps: list[str] = []
+        if graph.coverage_limitation_count:
+            samples = "; ".join(item[1] for item in graph.coverage_limitations[:3])
+            gaps.append(
+                f"Structural coverage is missing for {graph.coverage_limitation_count} "
+                f"limitation group(s), so edges from or to those files are absent: {samples}"
+            )
+        if node_limited or hop_limited:
+            limits = []
+            if node_limited:
+                limits.append(f"max_nodes={max_nodes}")
+            if hop_limited:
+                limits.append(f"max_hops={max_hops}")
+            gaps.append(
+                f"The subgraph was truncated by {' and '.join(limits)}; further eligible "
+                "neighbours exist. Raise the limit to see them."
+            )
+        if gaps:
+            completeness = CompletenessReport(state="incomplete", explanation=" ".join(gaps))
+        else:
+            completeness = CompletenessReport(
+                state="complete_with_dynamic_limitations" if has_likely else "complete",
+                explanation=(
+                    "Subgraph includes heuristic likely edges alongside exact bindings."
+                    if has_likely
+                    else "All subgraph edges resolved from exact syntax bindings."
+                ),
+            )
         return SubgraphResponse(
             project_id=project_id,
             query=query,

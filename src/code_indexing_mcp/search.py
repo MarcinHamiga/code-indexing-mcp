@@ -510,24 +510,57 @@ class SearchService:
                     if cid not in out:
                         out[cid] = by_source[skey]
 
+    def _record_partitions(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        out: dict[str, str],
+    ) -> None:
+        """Map each row's chunk id to the physical partition it was read from."""
+        by_source: dict[tuple[object, ...], str] = {}
+        for row in rows:
+            part_id = row.get("_partition_id")
+            if part_id is None:
+                continue
+            out.setdefault(str(row["chunk_id"]), str(part_id))
+            skey = self._window_source_key(row)
+            if skey is not None:
+                by_source.setdefault(skey, str(part_id))
+        if by_source:
+            for row in rows:
+                skey = self._window_source_key(row)
+                if skey is not None and skey in by_source:
+                    out.setdefault(str(row["chunk_id"]), by_source[skey])
+
     def _attach_hit_graph_context(
         self,
         hits: list[SearchHit],
         selected: Mapping[str, Sequence[PartitionRef]],
+        known_partitions: Mapping[str, str] | None = None,
     ) -> list[SearchHit]:
         if not hits or not self.graph_service.enabled:
             return hits
+        known = known_partitions or {}
         updated: list[SearchHit] = []
         for hit in hits:
-            refs = selected.get(hit.project_id)
-            part_id = refs[0].partition_id if refs else None
+            refs = selected.get(hit.project_id) or []
+            recorded = known.get(hit.chunk_id)
+            if recorded is not None:
+                candidates: list[str | None] = [recorded]
+            elif refs:
+                candidates = [ref.partition_id for ref in refs]
+            else:
+                candidates = [None]
             ctx = None
-            try:
-                ctx = self.graph_service.ego_context(
-                    hit.project_id, hit.chunk_id, partition_id=part_id
-                )
-            except Exception:
-                logger.debug("Hit graph_context failed for %s", hit.chunk_id, exc_info=True)
+            for part_id in candidates:
+                try:
+                    ctx = self.graph_service.ego_context(
+                        hit.project_id, hit.chunk_id, partition_id=part_id
+                    )
+                except Exception:
+                    logger.debug("Hit graph_context failed for %s", hit.chunk_id, exc_info=True)
+                    ctx = None
+                if ctx is not None:
+                    break
             if ctx is not None:
                 updated.append(hit.model_copy(update={"graph_context": ctx}))
             else:
@@ -587,10 +620,12 @@ class SearchService:
         with self.store.partitions_access(preparation.selected):
             known_vector_scores: dict[str, float] = {}
             known_graph_signals: dict[str, tuple[float, str | None]] = {}
+            known_partitions: dict[str, str] = {}
 
             def fetch_hybrid(fetch: int) -> list[dict[str, Any]]:
                 known_vector_scores.clear()
                 known_graph_signals.clear()
+                known_partitions.clear()
                 rows = self.store.hybrid_search(
                     query,
                     query_vector,
@@ -604,6 +639,7 @@ class SearchService:
                     if "_distance" in row:
                         known_vector_scores[str(row["chunk_id"])] = 1.0 - float(row["_distance"])
                 self._record_graph_signals(rows, known_graph_signals)
+                self._record_partitions(rows, known_partitions)
                 return rows
 
             hits = self._window_aware_hits(
@@ -625,7 +661,9 @@ class SearchService:
                     known_graph_signals=known_graph_signals,
                 )
                 if include_graph_context:
-                    hits = self._attach_hit_graph_context(hits, preparation.selected)
+                    hits = self._attach_hit_graph_context(
+                        hits, preparation.selected, known_partitions
+                    )
         return SearchResponse(query=query, hits=hits)
 
     def search_by_example(
@@ -664,10 +702,12 @@ class SearchService:
         with self.store.partitions_access(preparation.selected):
             known_vector_scores: dict[str, float] = {}
             known_graph_signals: dict[str, tuple[float, str | None]] = {}
+            known_partitions: dict[str, str] = {}
 
             def fetch_example(fetch: int) -> list[dict[str, Any]]:
                 known_vector_scores.clear()
                 known_graph_signals.clear()
+                known_partitions.clear()
                 expander = (
                     (
                         lambda proj_id, part_id, part_rows, cond, lim: (
@@ -697,6 +737,7 @@ class SearchService:
                     if "_distance" in row:
                         known_vector_scores[str(row["chunk_id"])] = 1.0 - float(row["_distance"])
                 self._record_graph_signals(rows, known_graph_signals)
+                self._record_partitions(rows, known_partitions)
                 return rows
 
             hits = self._window_aware_hits(
@@ -708,7 +749,7 @@ class SearchService:
             if hits and known_graph_signals:
                 hits = self._explain_example_hits(hits, known_vector_scores, known_graph_signals)
             if hits and include_graph_context:
-                hits = self._attach_hit_graph_context(hits, preparation.selected)
+                hits = self._attach_hit_graph_context(hits, preparation.selected, known_partitions)
         return ExampleSearchResponse(
             language=resolved_language,
             segments=len(passages),

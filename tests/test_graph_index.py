@@ -4,7 +4,13 @@ from datetime import timedelta
 from pathlib import Path
 
 from code_indexing_mcp.extractor import TreeSitterExtractor
-from code_indexing_mcp.graph_index import GraphIndexService
+from code_indexing_mcp.graph_index import (
+    _GRAPH_CACHE_MAGIC,
+    GraphActivation,
+    GraphIndexService,
+    _deserialize_graph,
+    _serialize_graph,
+)
 from code_indexing_mcp.indexing import Indexer
 from code_indexing_mcp.models import DeclarationSelector
 from code_indexing_mcp.projects import initialize_project
@@ -330,3 +336,124 @@ def test_genuine_barrels_still_detected(tmp_path: Path) -> None:
     edges = {(e.barrel_path, e.exported_name, e.target_path) for e in compiled.barrel_reexports}
     assert ("pkg/__init__.py", "Engine", "pkg/core.py") in edges
     assert ("web/index.ts", "f", "web/impl.ts") in edges
+
+
+_CHAIN = {
+    "chain.py": (
+        "def a() -> int:\n    return b()\n\n"
+        "def b() -> int:\n    return c()\n\n"
+        "def c() -> int:\n    return d()\n\n"
+        "def d() -> int:\n    return e()\n\n"
+        "def e() -> int:\n    return 1\n"
+    )
+}
+
+
+def _chain_subgraph(tmp_path: Path, files: dict[str, str], **kwargs: int):  # type: ignore[no-untyped-def]
+    store, ref_service, project_id, _ = _index_repo(tmp_path, files)
+    graph_service = GraphIndexService(store, ref_service)
+    compiled = ref_service.compile_partition_graph(project_id)
+    assert compiled is not None
+    by_qual = {d.qualified_symbol: d for d in compiled.declarations}
+    sub = graph_service.extract_subgraph(project_id, seed_declarations=[by_qual["a"]], **kwargs)
+    return sub, graph_service, project_id
+
+
+def test_subgraph_complete_only_when_untruncated(tmp_path: Path) -> None:
+    sub, _, _ = _chain_subgraph(tmp_path, _CHAIN, max_nodes=15, max_hops=10)
+    assert {n.qualified_symbol for n in sub.nodes} == {"a", "b", "c", "d", "e"}
+    assert sub.completeness.state == "complete"
+
+
+def test_subgraph_truncated_by_max_nodes_is_not_complete(tmp_path: Path) -> None:
+    sub, _, _ = _chain_subgraph(tmp_path, _CHAIN, max_nodes=2, max_hops=10)
+    assert len(sub.nodes) == 2
+    assert sub.completeness.state == "incomplete"
+    assert "max_nodes=2" in sub.completeness.explanation
+
+
+def test_subgraph_truncated_by_max_hops_is_not_complete(tmp_path: Path) -> None:
+    sub, _, _ = _chain_subgraph(tmp_path, _CHAIN, max_nodes=15, max_hops=1)
+    assert len(sub.nodes) < 5
+    assert sub.completeness.state == "incomplete"
+    assert "max_hops=1" in sub.completeness.explanation
+
+
+def test_subgraph_reports_coverage_limitation_as_incomplete(tmp_path: Path) -> None:
+    # Real indexing: a YAML file is indexed for search but has no structural
+    # reference extraction, which compile_partition_graph reports as a limitation.
+    files = {**_CHAIN, "config.yaml": "service:\n  port: 8080\n"}
+    sub, graph_service, project_id = _chain_subgraph(tmp_path, files, max_nodes=15, max_hops=10)
+    graph = graph_service.get_partition_graph(project_id)
+    assert graph is not None
+    assert graph.coverage_limitation_count >= 1
+    assert graph.coverage_limitations[0][0] == "unsupported_language"
+    assert sub.completeness.state == "incomplete"
+    assert "coverage" in sub.completeness.explanation.lower()
+    assert "config.yaml" in sub.completeness.explanation
+
+    # Sidecar round trip preserves the limitation info.
+    restored = _deserialize_graph(_serialize_graph(graph))
+    assert restored is not None
+    assert restored.coverage_limitation_count == graph.coverage_limitation_count
+    assert restored.coverage_limitations == graph.coverage_limitations
+
+    # Cold service loads the persisted V2 sidecar with the limitation intact.
+    cold = GraphIndexService(graph_service.store, graph_service.reference_service)
+    loaded = cold.get_partition_graph(project_id)
+    assert loaded is not None
+    assert loaded.coverage_limitations == graph.coverage_limitations
+
+
+def test_v1_sidecar_blob_is_ignored(tmp_path: Path) -> None:
+    _, graph_service, project_id = _chain_subgraph(tmp_path, _CHAIN)
+    graph = graph_service.get_partition_graph(project_id)
+    assert graph is not None
+    blob = _serialize_graph(graph)
+    assert _GRAPH_CACHE_MAGIC == b"SYNDEX_GRAPH_V2\n"
+    v1 = b"SYNDEX_GRAPH_V1\n" + blob[len(_GRAPH_CACHE_MAGIC) :]
+    assert _deserialize_graph(v1) is None
+    assert _deserialize_graph(blob) is not None
+
+
+def test_synthetic_barrel_activation_never_raises_floor_or_outranks_genuine(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    store, ref_service, project_id, _ = _index_repo(
+        tmp_path,
+        {
+            "pkg/__init__.py": "from .core import Engine\n",
+            "pkg/core.py": "class Engine:\n    pass\n",
+            "other.py": "def unrelated() -> int:\n    return 1\n",
+        },
+    )
+    graph_service = GraphIndexService(store, ref_service)
+    graph = graph_service.get_partition_graph(project_id)
+    assert graph is not None
+    barrel_nid = next(
+        n.node_id for n in graph.nodes if n.is_barrel and n.path.endswith("__init__.py")
+    )
+    engine_nid = graph.path_qual_to_node[("pkg/core.py", "Engine")]
+    other_nid = graph.path_qual_to_node[("other.py", "unrelated")]
+    barrel_rows = store.fetch_search_rows_by_ids(project_id, [graph.nodes[barrel_nid].chunk_id])
+    assert barrel_rows
+    row = {**barrel_rows[0], "_distance": 0.1, "_fts_local_rank": 1}
+
+    # Genuine activation is far below the seed scale (~1+) that the synthetic
+    # barrel target would previously have used as the peak.
+    genuine = GraphActivation(node_id=other_nid, score=0.01, rank=1, via="called_by:x")
+    monkeypatch.setattr(graph_service, "seeded_ppr", lambda *_a, **_k: {other_nid: genuine})
+
+    out = graph_service.expand_hybrid_rows(
+        project_id, None, "engine", [row], None, 8, query_vector=[1.0, 0.5, 0.25, 0.1]
+    )
+    by_nid = {
+        graph.any_chunk_to_node[str(r["chunk_id"])]: r
+        for r in out
+        if "_graph_local_rank" in r and str(r["chunk_id"]) in graph.any_chunk_to_node
+    }
+    assert other_nid in by_nid, "genuine activation must survive the floor"
+    assert engine_nid in by_nid, "synthetic barrel target is still hydrated"
+    assert by_nid[other_nid]["_graph_score"] == 0.01
+    assert by_nid[engine_nid]["_graph_score"] <= by_nid[other_nid]["_graph_score"]
+    assert by_nid[engine_nid]["_graph_local_rank"] >= by_nid[other_nid]["_graph_local_rank"]

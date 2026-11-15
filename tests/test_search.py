@@ -1055,3 +1055,93 @@ def test_search_by_example_uses_ast_structural_cocitation(tmp_path: Path) -> Non
     search.graph_service.enabled = False
     vec_only = search.search_by_example(snippet, [project.id], limit=5)
     assert "record_compliance_entry" not in [h.symbol for h in vec_only.hits]
+
+
+class _RecordingGraphService:
+    """Stub graph service: only the second partition has graph context."""
+
+    enabled = True
+
+    def __init__(self, with_context: dict[str, object]) -> None:
+        self.with_context = with_context
+        self.calls: list[str | None] = []
+
+    def ego_context(
+        self, project_id: str, chunk_id: str, *, partition_id: str | None = None, **_: Any
+    ) -> object:
+        self.calls.append(partition_id)
+        return self.with_context.get(partition_id or "")
+
+
+def _stub_hit(chunk_id: str = "c1", project_id: str = "p") -> Any:
+    from code_indexing_mcp.models import SearchHit
+
+    return SearchHit(
+        chunk_id=chunk_id,
+        project_id=project_id,
+        project_name=project_id,
+        path="a.py",
+        language="python",
+        kind="function",
+        symbol="f",
+        qualified_symbol="f",
+        start_line=1,
+        end_line=2,
+        score=1.0,
+        snippet="def f(): pass",
+        truncated=False,
+        is_test=False,
+    )
+
+
+def test_hit_graph_context_uses_the_partition_the_row_came_from(tmp_path: Path) -> None:
+    """Stub/unit test: one project pins two partitions; the hit came from the second."""
+    from code_indexing_mcp.models import ChunkGraphContext
+
+    search, _ = _indexed_source(tmp_path, "def f():\n    return 1\n")
+    ctx = ChunkGraphContext()
+    stub = _RecordingGraphService({"part-2": ctx})
+    search.graph_service = stub  # type: ignore[assignment]
+    selected = {
+        "p": [PartitionRef("p", "slot-1", "part-1", 1), PartitionRef("p", "slot-2", "part-2", 1)]
+    }
+
+    hits = search._attach_hit_graph_context([_stub_hit()], selected, {"c1": "part-2"})
+    assert stub.calls == ["part-2"]
+    assert hits[0].graph_context is ctx
+
+    # No recorded partition: every pinned partition is tried in order; first non-None wins.
+    stub.calls.clear()
+    hits = search._attach_hit_graph_context([_stub_hit()], selected, {})
+    assert stub.calls == ["part-1", "part-2"]
+    assert hits[0].graph_context is ctx
+
+
+def test_search_rows_are_tagged_with_partition_and_hits_do_not_leak_it(tmp_path: Path) -> None:
+    """Real-index test: rows carry `_partition_id`; the graph context lookup uses it."""
+    search, project = _indexed_source(
+        tmp_path, "def archive_permission():\n    return 1\n\n\ndef other():\n    return 2\n"
+    )
+    part = search.store.active_partition(project).partition_id
+    query = "archive permission"
+    rows = search.store.hybrid_search(
+        query,
+        search.embedder.embed_query(query),
+        [project],
+        None,
+        10,
+        partition_ids={project: [part]},
+    )
+    assert rows and {row["_partition_id"] for row in rows} == {part}
+
+    seen: list[str | None] = []
+    real = search.graph_service.ego_context
+
+    def spy(project_id: str, chunk_id: str, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("partition_id"))
+        return real(project_id, chunk_id, **kwargs)
+
+    search.graph_service.ego_context = spy  # type: ignore[method-assign]
+    response = search.search_code(query, [project], limit=3, include_graph_context=True)
+    assert response.hits and set(seen) == {part}
+    assert "_partition_id" not in response.model_dump_json()
