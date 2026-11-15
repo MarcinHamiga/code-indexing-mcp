@@ -1917,6 +1917,43 @@ class LanceStore:
                     result.append(row)
         return result
 
+    def fts_reference_score(
+        self,
+        project_id: str,
+        query_text: str,
+        *,
+        partition_id: str | None = None,
+    ) -> float:
+        """Return the top boosted FTS score for *query_text* across the whole partition.
+
+        One unrestricted limit-1 probe per FTS column, with the same boosts
+        ``_explanation_probe_rows`` applies. Used as a partition-wide
+        normalisation reference so scores stay comparable across batches.
+        Returns 0.0 when the probe fails or matches nothing; never raises.
+        """
+        tables = self._project_existing_tables(project_id, partition_id=partition_id)
+        if tables is None:
+            return 0.0
+        boosts = {"content": FTS_CONTENT_BOOST, "identifier_terms": FTS_IDENTIFIER_BOOST}
+        best = 0.0
+        for column in _FTS_PROBE_COLUMNS:
+            try:
+                rows = cast(
+                    list[dict[str, Any]],
+                    tables.chunks.search(query_text, query_type="fts", fts_columns=[column])
+                    .limit(1)
+                    .select(["chunk_id", "_score"])
+                    .to_list(),
+                )
+            except Exception:
+                logger.debug(
+                    "FTS reference probe failed for %s.%s", project_id, column, exc_info=True
+                )
+                continue
+            for row in rows:
+                best = max(best, float(row.get("_score", 0.0)) * boosts[column])
+        return best
+
     def score_chunks_for_query(
         self,
         project_id: str,
@@ -1925,39 +1962,54 @@ class LanceStore:
         vector: list[float] | None = None,
         *,
         partition_id: str | None = None,
+        fts_reference: float | None = None,
     ) -> dict[str, float]:
-        """Compute normalized [0, 1] hybrid relevance scores for specific chunk ids."""
+        """Compute normalized [0, 1] hybrid relevance scores for specific chunk ids.
+
+        Ids are probed in batches of at most 256. FTS scores are normalised by
+        a partition-wide reference (``fts_reference``, computed once via
+        ``fts_reference_score`` when omitted) and clamped to [0, 1], so a chunk's
+        score does not depend on which batch or traversal layer it was scored in.
+        """
         wanted = list(dict.fromkeys(chunk_ids))
         if not wanted:
             return {}
-        skip_vec = {cid: 0.0 for cid in wanted} if vector is None else None
+        if fts_reference is None:
+            fts_reference = self.fts_reference_score(
+                project_id, query_text, partition_id=partition_id
+            )
         probe_vec = vector if vector is not None else [0.0] * self.vector_dimension
-        probe_rows = self._explanation_probe_rows(
-            project_id,
-            query_text,
-            probe_vec,
-            None,
-            wanted,
-            partition_id=partition_id,
-            known_vector_scores=skip_vec,
-        )
-        fts_map: dict[str, float] = {}
-        vec_map: dict[str, float] = {}
-        for row in probe_rows:
-            cid = str(row["chunk_id"])
-            if row.get("fts_score") is not None:
-                fts_map[cid] = float(row["fts_score"])
-            if vector is not None and row.get("vector_score") is not None:
-                vec_map[cid] = max(0.0, min(1.0, float(row["vector_score"])))
-        max_fts = max(fts_map.values(), default=0.0)
         scores: dict[str, float] = {}
-        for cid in wanted:
-            f_score = (fts_map[cid] / max_fts) if (cid in fts_map and max_fts > 0.0) else 0.0
-            if vector is None:
-                scores[cid] = round(f_score, 4)
-            else:
-                v_score = vec_map.get(cid, 0.0)
-                scores[cid] = round(0.55 * v_score + 0.45 * f_score, 4)
+        for offset in range(0, len(wanted), 256):
+            batch = wanted[offset : offset + 256]
+            skip_vec = {cid: 0.0 for cid in batch} if vector is None else None
+            probe_rows = self._explanation_probe_rows(
+                project_id,
+                query_text,
+                probe_vec,
+                None,
+                batch,
+                partition_id=partition_id,
+                known_vector_scores=skip_vec,
+            )
+            fts_map: dict[str, float] = {}
+            vec_map: dict[str, float] = {}
+            for row in probe_rows:
+                cid = str(row["chunk_id"])
+                if row.get("fts_score") is not None:
+                    fts_map[cid] = float(row["fts_score"])
+                if vector is not None and row.get("vector_score") is not None:
+                    vec_map[cid] = max(0.0, min(1.0, float(row["vector_score"])))
+            for cid in batch:
+                f_score = (
+                    max(0.0, min(1.0, fts_map[cid] / fts_reference))
+                    if (cid in fts_map and fts_reference > 0.0)
+                    else 0.0
+                )
+                if vector is None:
+                    scores[cid] = round(f_score, 4)
+                else:
+                    scores[cid] = round(0.55 * vec_map.get(cid, 0.0) + 0.45 * f_score, 4)
         return scores
 
     def reference_version(self, project_id: str, *, partition_id: str | None = None) -> int:

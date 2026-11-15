@@ -2220,7 +2220,10 @@ def create_server(
             "toward declarations semantically relevant to a question. Exact edges are traversed "
             "by default; include_likely also traverses possible edges and taints every downstream "
             "result reached through one. Unresolved or unattributable uses stay in review rather "
-            "than becoming graph edges. Always inspect completeness and limitations before "
+            "than becoming graph edges. Edges attach to the exact declaration only, so for a "
+            "container such as a class, 'dependencies' lists just its header references (base "
+            "types, decorators), not what its methods call; select the method to see those. "
+            "Always inspect completeness and limitations before "
             "treating the radius as exhaustive."
         ),
         annotations=_READS_AND_REGISTERS,
@@ -2263,7 +2266,9 @@ def create_server(
             Field(
                 description=(
                     "Traversal direction: 'dependents' (default, inbound callers/importers), "
-                    "'dependencies' (outbound callees/types), or 'both'."
+                    "'dependencies' (outbound callees/types), or 'both'. Neither direction rolls "
+                    "members up into their container: a class's dependencies are only its "
+                    "header references."
                 )
             ),
         ] = "dependents",

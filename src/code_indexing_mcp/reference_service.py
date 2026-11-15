@@ -11,7 +11,7 @@ import json
 import re
 import threading
 from collections import OrderedDict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal, NamedTuple, TypedDict, cast
@@ -2191,6 +2191,7 @@ class ReferenceService:
 
         chunk_id_by_file_qual: dict[tuple[str, str], str] = {}
         score_by_chunk_id: dict[str, float] = {}
+        fts_reference: float | None = None
         if focus_query is not None:
             previews, _ = self.store.list_partition_chunk_metadata(
                 selected.project_id, partition_id=partition.partition_id
@@ -2198,14 +2199,6 @@ class ReferenceService:
             for p in previews:
                 if p.file_id and p.qualified_symbol and p.symbol:
                     chunk_id_by_file_qual.setdefault((p.file_id, p.qualified_symbol), p.chunk_id)
-            if chunk_id_by_file_qual:
-                score_by_chunk_id = self.store.score_chunks_for_query(
-                    selected.project_id,
-                    list(chunk_id_by_file_qual.values()),
-                    focus_query,
-                    focus_vector,
-                    partition_id=partition.partition_id,
-                )
 
         def node_key(node: SelectedDeclaration) -> _ImpactNodeKey:
             return (node.project_id, node.path, node.qualified_symbol)
@@ -2216,15 +2209,50 @@ class ReferenceService:
             cid = chunk_id_by_file_qual.get((node.file_id, node.qualified_symbol))
             return node if cid is None else node.model_copy(update={"chunk_id": cid})
 
+        def node_chunk_id(node: SelectedDeclaration) -> str | None:
+            return node.chunk_id or chunk_id_by_file_qual.get((node.file_id, node.qualified_symbol))
+
+        def ensure_scores(nodes: Iterable[SelectedDeclaration]) -> None:
+            """Score (in one batched call) the not-yet-memoised chunks of *nodes*."""
+            nonlocal fts_reference
+            if focus_query is None:
+                return
+            missing: list[str] = []
+            for node in nodes:
+                cid = node_chunk_id(node)
+                if cid is not None and cid not in score_by_chunk_id and cid not in missing:
+                    missing.append(cid)
+            if not missing:
+                return
+            if fts_reference is None:
+                fts_reference = self.store.fts_reference_score(
+                    selected.project_id, focus_query, partition_id=partition.partition_id
+                )
+            score_by_chunk_id.update(
+                self.store.score_chunks_for_query(
+                    selected.project_id,
+                    missing,
+                    focus_query,
+                    focus_vector,
+                    partition_id=partition.partition_id,
+                    fts_reference=fts_reference,
+                )
+            )
+
         def node_relevance(node: SelectedDeclaration) -> float | None:
             if focus_query is None:
                 return None
-            cid = node.chunk_id or chunk_id_by_file_qual.get((node.file_id, node.qualified_symbol))
+            cid = node_chunk_id(node)
             if cid is None:
                 return 0.0
             return score_by_chunk_id.get(cid, 0.0)
 
-        visited: dict[_ImpactNodeKey, int] = {node_key(selected): 0}
+        # Per-direction visited state drives cycle detection; `visited` holds the
+        # unique nodes across both directions (first-reached depth) for the budget.
+        root_key = node_key(selected)
+        visited: dict[_ImpactNodeKey, int] = {root_key: 0}
+        visited_in: dict[_ImpactNodeKey, int] = {root_key: 0} if want_dependents else {}
+        visited_out: dict[_ImpactNodeKey, int] = {root_key: 0} if want_dependencies else {}
         in_frontier: list[tuple[SelectedDeclaration, bool]] = (
             [(selected, False)] if want_dependents else []
         )
@@ -2322,7 +2350,7 @@ class ReferenceService:
                     target_key = node_key(target)
                     possible = hit.resolution == "likely"
                     tainted = source_tainted or possible
-                    cycle_to_depth = visited.get(target_key)
+                    cycle_to_depth = visited_in.get(target_key)
                     edge_key = (source_key, target_key, "dependents")
                     edge = grouped_edges.get(edge_key)
                     if edge is None:
@@ -2383,7 +2411,7 @@ class ReferenceService:
                     target_key = node_key(target)
                     possible = c_edge.resolution == "likely"
                     tainted = source_tainted or possible
-                    cycle_to_depth = visited.get(target_key)
+                    cycle_to_depth = visited_out.get(target_key)
                     edge_key = (source_key, target_key, "dependencies")
                     edge = grouped_edges.get(edge_key)
                     if edge is None:
@@ -2413,6 +2441,7 @@ class ReferenceService:
                         merged_candidates[key] = val
 
             if focus_query is not None:
+                ensure_scores(val[0] for val in merged_candidates.values())
                 candidate_keys = sorted(
                     merged_candidates,
                     key=lambda k: (-(node_relevance(merged_candidates[k][0]) or 0.0), k),
@@ -2420,20 +2449,27 @@ class ReferenceService:
             else:
                 candidate_keys = sorted(merged_candidates)
 
+            # Nodes already known from the other direction cost no budget; only
+            # genuinely new nodes are capped.
+            new_keys = [k for k in candidate_keys if k not in visited]
+            known_keys = [k for k in candidate_keys if k in visited]
             available = max_nodes - len(visited)
-            allowed_keys = set(candidate_keys[:available])
-            if len(candidate_keys) > available:
-                first_unvisited = merged_candidates[candidate_keys[available]][0]
+            allowed_keys = set(known_keys) | set(new_keys[:available])
+            if len(new_keys) > available:
+                first_unvisited = merged_candidates[new_keys[available]][0]
                 exhaustion = ImpactBudgetExhaustion(
                     depth=depth,
                     node=first_unvisited,
-                    unvisited_frontier=len(candidate_keys) - available,
+                    unvisited_frontier=len(new_keys) - available,
                 )
                 grouped_edges = {
                     key: edge
                     for key, edge in grouped_edges.items()
                     if key[1] in visited or key[1] in allowed_keys
                 }
+
+            if focus_query is not None:
+                ensure_scores(edge.target for edge in grouped_edges.values())
 
             edges = [
                 ImpactEdge(
@@ -2468,7 +2504,11 @@ class ReferenceService:
             )
             all_layers.append(ImpactLayer(depth=depth, edges=edges, review=review))
             for key in allowed_keys:
-                visited[key] = depth
+                visited.setdefault(key, depth)
+                if key in in_candidates:
+                    visited_in[key] = depth
+                if key in out_candidates:
+                    visited_out[key] = depth
             if exhaustion is not None:
                 break
             in_frontier = [in_candidates[k] for k in candidate_keys if k in in_candidates]

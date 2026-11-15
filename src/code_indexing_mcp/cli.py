@@ -189,7 +189,10 @@ def _parser(prog: str = "code-indexing-mcp") -> argparse.ArgumentParser:
         "--direction",
         choices=["dependents", "dependencies", "both"],
         default="dependents",
-        help="Traversal direction (default: dependents)",
+        help=(
+            "Traversal direction (default: dependents); a class's dependencies are only "
+            "its header references (bases, decorators), not what its methods call"
+        ),
     )
     impact_cmd.add_argument(
         "--focus-query",

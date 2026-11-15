@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pytest
@@ -1822,3 +1823,67 @@ def test_impact_radius_supports_dependencies_both_and_query_focus(tmp_path: Path
             selector, direction="dependencies", focus_query="other", limit=1, cursor=paged.cursor
         )
     assert excinfo2.value.code is ErrorCode.INVALID_CURSOR
+
+
+def test_impact_radius_both_tracks_visited_per_direction(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "m.py": (
+                "def root():\n    return b()\n\n"
+                "def a():\n    root()\n    return c()\n\n"
+                "def b():\n    return a()\n\n"
+                "def c():\n    return 1\n"
+            ),
+        },
+    )
+    selector = DeclarationSelector(project=project_id, path="m.py", qualified_symbol="root")
+
+    def nodes_of(result: Any) -> set[str]:
+        return {e.target.qualified_symbol for layer in result.layers for e in layer.edges} - {
+            "root"
+        }
+
+    dependents = service.impact_radius(selector, direction="dependents", max_depth=4)
+    dependencies = service.impact_radius(selector, direction="dependencies", max_depth=4)
+    both = service.impact_radius(selector, direction="both", max_depth=4)
+
+    assert nodes_of(dependents) == {"a", "b"}
+    assert nodes_of(dependencies) == {"a", "b", "c"}
+    assert "c" in nodes_of(both)
+    assert nodes_of(both) >= nodes_of(dependents) | nodes_of(dependencies)
+
+    both_edges = [e for layer in both.layers for e in layer.edges]
+    cyclic = {
+        (e.source.qualified_symbol, e.target.qualified_symbol, e.direction)
+        for e in both_edges
+        if e.cycle_to_depth is not None
+    }
+    assert cyclic == {("b", "root", "dependents"), ("a", "root", "dependencies")}
+    assert all(
+        e.target.qualified_symbol == "root" for e in both_edges if e.cycle_to_depth is not None
+    )
+
+
+def test_impact_radius_dependencies_do_not_roll_up_container_members(tmp_path: Path) -> None:
+    service, project_id = _indexed_service(
+        tmp_path,
+        {
+            "m.py": (
+                "class Base:\n    pass\n\n"
+                "def helper():\n    return 1\n\n"
+                "class Foo(Base):\n    def bar(self):\n        return helper()\n"
+            ),
+        },
+    )
+
+    def targets(symbol: str) -> set[str]:
+        result = service.impact_radius(
+            DeclarationSelector(project=project_id, path="m.py", qualified_symbol=symbol),
+            direction="dependencies",
+            max_depth=1,
+        )
+        return {e.target.qualified_symbol for layer in result.layers for e in layer.edges}
+
+    assert targets("Foo") == {"Base"}
+    assert targets("Foo.bar") == {"helper"}
