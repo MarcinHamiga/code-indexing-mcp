@@ -994,13 +994,23 @@ class ReferenceService:
 
         for b_path, b_rows in reexport_rows_by_path.items():
             has_local_decls = bool(decls_by_path.get(b_path))
-            is_named_barrel = PurePosixPath(b_path).name in barrel_basenames
+            b_name = PurePosixPath(b_path).name
+            is_named_barrel = b_name in barrel_basenames
+            # Only Python's `__init__.py` re-exports through plain `from .x import y`
+            # (no separate re-export syntax); everywhere else an import is a use.
+            imports_reexport = b_name == "__init__.py"
+            # A genuine re-export row names the re-exported symbol (`imported_name`).
+            # C# export rows carry the declaring namespace in `module_path` with no
+            # imported name -- that is not a re-export.
             has_reexport_stmt = any(
-                r["kind"] == "export" and r["module_path"] is not None for r in b_rows
+                r["kind"] == "export"
+                and r["module_path"] is not None
+                and r["imported_name"] is not None
+                for r in b_rows
             )
-            if not has_local_decls and (is_named_barrel or has_reexport_stmt or bool(b_rows)):
+            if not has_local_decls and (is_named_barrel or has_reexport_stmt):
                 barrel_paths.add(b_path)
-            if not (b_path in barrel_paths or has_reexport_stmt or is_named_barrel):
+            if not (has_reexport_stmt or is_named_barrel):
                 continue
             b_fid = file_id_by_path.get(b_path)
             if not b_fid:
@@ -1008,7 +1018,10 @@ class ReferenceService:
             for hop in b_rows:
                 if hop["module_path"] is None:
                     continue
-                if hop["kind"] == "import" and not (b_path in barrel_paths or is_named_barrel):
+                if hop["kind"] == "export":
+                    if hop["imported_name"] is None:
+                        continue
+                elif not imports_reexport:
                     continue
                 target_paths: set[str] = set()
                 for start in module_targets(hop):

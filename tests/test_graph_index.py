@@ -260,3 +260,73 @@ def test_ego_context_and_subgraph_path_extraction(tmp_path: Path) -> None:
         "process_order",
         "persist_order",
     }
+
+
+def test_entry_scripts_are_not_barrels(tmp_path: Path) -> None:
+    store, ref_service, project_id, _ = _index_repo(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/service.py": "def process_order(oid: str) -> str:\n    return oid\n",
+            "main.py": "from app.service import process_order\n\nprocess_order('a1')\n",
+            "web/util.ts": "export function fmt(x: string): string { return x; }\n",
+            "web/run.ts": "import { fmt } from './util';\nconsole.log(fmt('x'));\n",
+        },
+    )
+    compiled = ref_service.compile_partition_graph(project_id)
+    assert compiled is not None
+    assert "main.py" not in compiled.barrel_files
+    assert "web/run.ts" not in compiled.barrel_files
+    assert not {e.barrel_path for e in compiled.barrel_reexports} & {"main.py", "web/run.ts"}
+
+    graph_service = GraphIndexService(store, ref_service)
+    graph = graph_service.get_partition_graph(project_id)
+    assert graph is not None
+    assert not [n for n in graph.nodes if n.is_barrel and n.path in {"main.py", "web/run.ts"}]
+
+    query = "process_order a1"
+    rows = store._hybrid_search_rows(project_id, query, [1.0, 0.5, 0.25, 0.1], None, 20)
+    assert rows
+    expanded = graph_service.expand_hybrid_rows(
+        project_id, None, query, rows, None, 20, query_vector=[1.0, 0.5, 0.25, 0.1]
+    )
+    assert expanded
+    assert not [r for r in expanded if r.get("_barrel_damped")]
+
+
+def test_csharp_using_with_class_is_not_a_barrel(tmp_path: Path) -> None:
+    store, ref_service, project_id, _ = _index_repo(
+        tmp_path,
+        {
+            "Demo/Shop/Order.cs": (
+                "using Demo.Stock;\n\nnamespace Demo.Shop;\n\n"
+                "public class Order\n{\n    public int Id;\n}\n"
+            ),
+            "Demo/Stock/Item.cs": "namespace Demo.Stock;\n\npublic class Item\n{\n}\n",
+        },
+    )
+    compiled = ref_service.compile_partition_graph(project_id)
+    assert compiled is not None
+    assert "Demo/Shop/Order.cs" not in compiled.barrel_files
+    assert compiled.barrel_reexports == []
+    graph = GraphIndexService(store, ref_service).get_partition_graph(project_id)
+    assert graph is not None
+    assert not [n for n in graph.nodes if n.is_barrel]
+
+
+def test_genuine_barrels_still_detected(tmp_path: Path) -> None:
+    _store, ref_service, project_id, _ = _index_repo(
+        tmp_path,
+        {
+            "pkg/__init__.py": "from .core import Engine\n",
+            "pkg/core.py": "class Engine:\n    pass\n",
+            "web/impl.ts": "export function f(): number { return 1; }\n",
+            "web/index.ts": "export { f } from './impl';\n",
+        },
+    )
+    compiled = ref_service.compile_partition_graph(project_id)
+    assert compiled is not None
+    assert {"pkg/__init__.py", "web/index.ts"} <= compiled.barrel_files
+    edges = {(e.barrel_path, e.exported_name, e.target_path) for e in compiled.barrel_reexports}
+    assert ("pkg/__init__.py", "Engine", "pkg/core.py") in edges
+    assert ("web/index.ts", "f", "web/impl.ts") in edges
