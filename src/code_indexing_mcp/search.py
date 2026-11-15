@@ -6,7 +6,7 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -41,8 +41,12 @@ from .path_filter import (
     path_matches,
 )
 from .scanner import LANGUAGES
+from .settings import IndexSettings
 from .storage import LanceStore, PartitionRef, RankComponents, _quoted
 from .token_batching import DEFAULT_MAX_TOKENS, MAX_WINDOWS_PER_CANDIDATE
+
+if TYPE_CHECKING:
+    from .graph_index import GraphIndexService
 
 logger = logging.getLogger(__name__)
 
@@ -143,11 +147,31 @@ def _embed_example_passages(embedder: Embedder, passages: list[str]) -> list[lis
     ]
 
 
-def _example_passages(
+_EXAMPLE_REF_WEIGHTS: dict[str, float] = {
+    "call": 1.0,
+    "inheritance": 0.9,
+    "decorator": 0.7,
+    "type_use": 0.65,
+}
+
+
+def _collect_example_outbound_symbols(result: ExtractionResult) -> dict[str, float]:
+    outbound: dict[str, float] = {}
+    for ref in result.references:
+        if not ref.target_name:
+            continue
+        weight = _EXAMPLE_REF_WEIGHTS.get(ref.kind)
+        if weight is None:
+            continue
+        outbound[ref.target_name] = max(outbound.get(ref.target_name, 0.0), weight)
+    return outbound
+
+
+def _example_passages_with_refs(
     extractor: TreeSitterExtractor,
     example: str,
     language: str | None = None,
-) -> tuple[str | None, list[str]]:
+) -> tuple[str | None, list[str], dict[str, float]]:
     if not example or not example.strip():
         raise CodeIndexingError(
             ErrorCode.INVALID_FILTER, "Example search requires a non-empty code snippet"
@@ -171,7 +195,7 @@ def _example_passages(
         ]
         if not passages:
             passages = [compose_passage("", example)]
-        return language, passages
+        return language, passages, _collect_example_outbound_symbols(result)
 
     detected, detected_result = _detect_example(extractor, example)
     if detected is not None:
@@ -182,8 +206,17 @@ def _example_passages(
         ]
         if not passages:
             passages = [compose_passage("", example)]
-        return detected, passages
-    return None, [compose_passage("", example)]
+        return detected, passages, _collect_example_outbound_symbols(detected_result)
+    return None, [compose_passage("", example)], {}
+
+
+def _example_passages(
+    extractor: TreeSitterExtractor,
+    example: str,
+    language: str | None = None,
+) -> tuple[str | None, list[str]]:
+    resolved_lang, passages, _ = _example_passages_with_refs(extractor, example, language=language)
+    return resolved_lang, passages
 
 
 def _outline_items(
@@ -275,10 +308,24 @@ class SearchService:
         store: LanceStore,
         embedder: Embedder,
         extractor: TreeSitterExtractor | None = None,
+        graph_service: GraphIndexService | None = None,
     ) -> None:
         self.store = store
         self.embedder = embedder
         self.extractor = extractor or TreeSitterExtractor()
+        if graph_service is None:
+            from .graph_index import GraphIndexService
+            from .reference_service import ReferenceService
+
+            settings = IndexSettings.from_environment()
+            self.graph_service = GraphIndexService(
+                store,
+                ReferenceService(store),
+                cache_limit=settings.graph_cache_limit,
+                enabled=settings.graph_search,
+            )
+        else:
+            self.graph_service = graph_service
 
     def _prepare_search(
         self,
@@ -421,6 +468,105 @@ class SearchService:
                 return hits
             fetch = min(maximum, fetch * 2)
 
+    @staticmethod
+    def _window_source_key(row: Mapping[str, Any]) -> tuple[object, ...] | None:
+        if row.get("source_start_byte") is None:
+            return None
+        return (
+            row.get("project_id"),
+            row.get("file_id"),
+            row.get("kind"),
+            row.get("qualified_symbol"),
+            row.get("part_index"),
+            row.get("source_start_byte"),
+            row.get("source_end_byte"),
+        )
+
+    def _record_graph_signals(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        out: dict[str, tuple[float, str | None]],
+    ) -> None:
+        by_source: dict[tuple[object, ...], tuple[float, str | None]] = {}
+        for row in rows:
+            if "_graph_score" not in row:
+                continue
+            cid = str(row["chunk_id"])
+            score = float(row["_graph_score"])
+            via = None if row.get("_graph_via") is None else str(row["_graph_via"])
+            prev = out.get(cid)
+            if prev is None or score > prev[0]:
+                out[cid] = (score, via)
+            skey = self._window_source_key(row)
+            if skey is not None:
+                sprev = by_source.get(skey)
+                if sprev is None or score > sprev[0]:
+                    by_source[skey] = (score, via)
+        if by_source:
+            for row in rows:
+                skey = self._window_source_key(row)
+                if skey is not None and skey in by_source:
+                    cid = str(row["chunk_id"])
+                    if cid not in out:
+                        out[cid] = by_source[skey]
+
+    def _record_partitions(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        out: dict[str, str],
+    ) -> None:
+        """Map each row's chunk id to the physical partition it was read from."""
+        by_source: dict[tuple[object, ...], str] = {}
+        for row in rows:
+            part_id = row.get("_partition_id")
+            if part_id is None:
+                continue
+            out.setdefault(str(row["chunk_id"]), str(part_id))
+            skey = self._window_source_key(row)
+            if skey is not None:
+                by_source.setdefault(skey, str(part_id))
+        if by_source:
+            for row in rows:
+                skey = self._window_source_key(row)
+                if skey is not None and skey in by_source:
+                    out.setdefault(str(row["chunk_id"]), by_source[skey])
+
+    def _attach_hit_graph_context(
+        self,
+        hits: list[SearchHit],
+        selected: Mapping[str, Sequence[PartitionRef]],
+        known_partitions: Mapping[str, str] | None = None,
+    ) -> list[SearchHit]:
+        if not hits or not self.graph_service.enabled:
+            return hits
+        known = known_partitions or {}
+        updated: list[SearchHit] = []
+        for hit in hits:
+            refs = selected.get(hit.project_id) or []
+            recorded = known.get(hit.chunk_id)
+            if recorded is not None:
+                candidates: list[str | None] = [recorded]
+            elif refs:
+                candidates = [ref.partition_id for ref in refs]
+            else:
+                candidates = [None]
+            ctx = None
+            for part_id in candidates:
+                try:
+                    ctx = self.graph_service.ego_context(
+                        hit.project_id, hit.chunk_id, partition_id=part_id
+                    )
+                except Exception:
+                    logger.debug("Hit graph_context failed for %s", hit.chunk_id, exc_info=True)
+                    ctx = None
+                if ctx is not None:
+                    break
+            if ctx is not None:
+                updated.append(hit.model_copy(update={"graph_context": ctx}))
+            else:
+                updated.append(hit)
+        return updated
+
     def search_code(
         self,
         query: str,
@@ -432,6 +578,7 @@ class SearchService:
         scope: SearchScope = "code",
         limit: int = 8,
         partitions: Mapping[str, PartitionRef | Sequence[PartitionRef]] | None = None,
+        include_graph_context: bool = False,
     ) -> SearchResponse:
         """Search every given project's pinned partitions and rank globally.
 
@@ -455,11 +602,30 @@ class SearchService:
         )
         query_vector = self.embedder.embed_query(query)
         names = {project.id: project.name for project in self.store.list_projects()}
+        graph_expander = (
+            (
+                lambda pid, part_id, qtext, rows, cond, lim: self.graph_service.expand_hybrid_rows(
+                    pid,
+                    part_id,
+                    qtext,
+                    rows,
+                    cond,
+                    lim,
+                    query_vector=query_vector,
+                )
+            )
+            if self.graph_service.enabled
+            else None
+        )
         with self.store.partitions_access(preparation.selected):
             known_vector_scores: dict[str, float] = {}
+            known_graph_signals: dict[str, tuple[float, str | None]] = {}
+            known_partitions: dict[str, str] = {}
 
             def fetch_hybrid(fetch: int) -> list[dict[str, Any]]:
                 known_vector_scores.clear()
+                known_graph_signals.clear()
+                known_partitions.clear()
                 rows = self.store.hybrid_search(
                     query,
                     query_vector,
@@ -467,10 +633,13 @@ class SearchService:
                     preparation.condition,
                     fetch,
                     partition_ids=preparation.partition_ids,
+                    graph_expander=graph_expander,
                 )
                 for row in rows:
                     if "_distance" in row:
                         known_vector_scores[str(row["chunk_id"])] = 1.0 - float(row["_distance"])
+                self._record_graph_signals(rows, known_graph_signals)
+                self._record_partitions(rows, known_partitions)
                 return rows
 
             hits = self._window_aware_hits(
@@ -489,7 +658,12 @@ class SearchService:
                     preparation.condition,
                     preparation.selected,
                     known_vector_scores=known_vector_scores,
+                    known_graph_signals=known_graph_signals,
                 )
+                if include_graph_context:
+                    hits = self._attach_hit_graph_context(
+                        hits, preparation.selected, known_partitions
+                    )
         return SearchResponse(query=query, hits=hits)
 
     def search_by_example(
@@ -504,13 +678,16 @@ class SearchService:
         scope: SearchScope = "code",
         limit: int = 8,
         partitions: Mapping[str, PartitionRef | Sequence[PartitionRef]] | None = None,
+        include_graph_context: bool = False,
     ) -> ExampleSearchResponse:
         """Search every given project's pinned partitions by code snippet similarity."""
         if not project_ids:
             raise CodeIndexingError(
                 ErrorCode.INVALID_FILTER, "Example search requires at least one project"
             )
-        resolved_language, passages = _example_passages(self.extractor, example, language=language)
+        resolved_language, passages, outbound_symbols = _example_passages_with_refs(
+            self.extractor, example, language=language
+        )
         preparation = self._prepare_search(
             project_ids,
             languages=languages,
@@ -523,18 +700,56 @@ class SearchService:
         vectors = _embed_example_passages(self.embedder, passages)
         names = {project.id: project.name for project in self.store.list_projects()}
         with self.store.partitions_access(preparation.selected):
-            hits = self._window_aware_hits(
-                lambda fetch: self.store.example_search(
+            known_vector_scores: dict[str, float] = {}
+            known_graph_signals: dict[str, tuple[float, str | None]] = {}
+            known_partitions: dict[str, str] = {}
+
+            def fetch_example(fetch: int) -> list[dict[str, Any]]:
+                known_vector_scores.clear()
+                known_graph_signals.clear()
+                known_partitions.clear()
+                expander = (
+                    (
+                        lambda proj_id, part_id, part_rows, cond, lim: (
+                            self.graph_service.expand_example_rows(
+                                proj_id,
+                                part_id,
+                                outbound_symbols,
+                                part_rows,
+                                cond,
+                                lim,
+                                probe_vectors=vectors,
+                            )
+                        )
+                    )
+                    if self.graph_service.enabled
+                    else None
+                )
+                rows = self.store.example_search(
                     vectors,
                     project_ids,
                     preparation.condition,
                     fetch,
                     partition_ids=preparation.partition_ids,
-                ),
+                    graph_expander=expander,
+                )
+                for row in rows:
+                    if "_distance" in row:
+                        known_vector_scores[str(row["chunk_id"])] = 1.0 - float(row["_distance"])
+                self._record_graph_signals(rows, known_graph_signals)
+                self._record_partitions(rows, known_partitions)
+                return rows
+
+            hits = self._window_aware_hits(
+                fetch_example,
                 names,
                 preparation,
                 include_content_in_key=False,
             )
+            if hits and known_graph_signals:
+                hits = self._explain_example_hits(hits, known_vector_scores, known_graph_signals)
+            if hits and include_graph_context:
+                hits = self._attach_hit_graph_context(hits, preparation.selected, known_partitions)
         return ExampleSearchResponse(
             language=resolved_language,
             segments=len(passages),
@@ -625,6 +840,17 @@ class SearchService:
                 raise ValueError("chunk partition does not belong to project")
             with self.store.partition_access(project_id, partition_id=partition.partition_id):
                 chunk = self.store.get_chunk(chunk_id, partition_id=partition.partition_id)
+                if chunk is not None and self.graph_service.enabled:
+                    try:
+                        ctx = self.graph_service.ego_context(
+                            project_id, chunk.chunk_id, partition_id=partition.partition_id
+                        )
+                        if ctx is not None:
+                            chunk = chunk.model_copy(update={"graph_context": ctx})
+                    except Exception:
+                        logger.debug(
+                            "Chunk graph_context probe failed for %s", chunk_id, exc_info=True
+                        )
         if chunk is None:
             raise CodeIndexingError(
                 ErrorCode.CHUNK_NOT_FOUND,
@@ -633,6 +859,56 @@ class SearchService:
                 chunk_id=chunk_id,
             )
         return chunk
+
+    @staticmethod
+    def _graph_diagnostic_ranks(
+        hits: Sequence[SearchHit],
+        known_graph_signals: Mapping[str, tuple[float, str | None]],
+    ) -> dict[str, int]:
+        graph_cids = [hit.chunk_id for hit in hits if hit.chunk_id in known_graph_signals]
+        graph_cids.sort(key=lambda cid: (-known_graph_signals[cid][0], cid))
+        ranks: dict[str, int] = {}
+        rank = 0
+        prev: float | None = None
+        for pos, cid in enumerate(graph_cids, start=1):
+            rounded = round(known_graph_signals[cid][0], 8)
+            if rounded != prev:
+                rank = pos
+                prev = rounded
+            ranks[cid] = rank
+        return ranks
+
+    def _explain_example_hits(
+        self,
+        hits: list[SearchHit],
+        known_vector_scores: Mapping[str, float],
+        known_graph_signals: Mapping[str, tuple[float, str | None]],
+    ) -> list[SearchHit]:
+        vec_cids = [hit.chunk_id for hit in hits if hit.chunk_id in known_vector_scores]
+        vec_cids.sort(key=lambda cid: (-known_vector_scores[cid], cid))
+        vec_ranks = {cid: pos for pos, cid in enumerate(vec_cids, start=1)}
+        graph_ranks = self._graph_diagnostic_ranks(hits, known_graph_signals)
+        explained: list[SearchHit] = []
+        for hit in hits:
+            v_score = known_vector_scores.get(hit.chunk_id)
+            g_sig = known_graph_signals.get(hit.chunk_id)
+            if v_score is None and g_sig is None:
+                explained.append(hit)
+                continue
+            explained.append(
+                hit.model_copy(
+                    update={
+                        "explanation": RankExplanation(
+                            vector_score=v_score,
+                            vector_rank=vec_ranks.get(hit.chunk_id),
+                            graph_score=g_sig[0] if g_sig is not None else None,
+                            graph_rank=graph_ranks.get(hit.chunk_id),
+                            graph_via=g_sig[1] if g_sig is not None else None,
+                        )
+                    }
+                )
+            )
+        return explained
 
     def _explain_hits(
         self,
@@ -643,6 +919,7 @@ class SearchService:
         selected: dict[str, list[PartitionRef]],
         *,
         known_vector_scores: Mapping[str, float] | None = None,
+        known_graph_signals: Mapping[str, tuple[float, str | None]] | None = None,
     ) -> list[SearchHit]:
         """Attach per-signal ranking explanations; never fails the search.
 
@@ -666,17 +943,24 @@ class SearchService:
             )
         except Exception:
             logger.debug("Ranking explanation probes failed", exc_info=True)
-        if not components:
             return hits
+        graph_signals = known_graph_signals or {}
+        if not components and not graph_signals:
+            return hits
+        graph_ranks = self._graph_diagnostic_ranks(hits, graph_signals)
         explained: list[SearchHit] = []
         for hit in hits:
             component = components.get(hit.chunk_id)
-            if component is None:
+            g_sig = graph_signals.get(hit.chunk_id)
+            if component is None and g_sig is None:
                 explained.append(hit)
             else:
-                explained.append(
-                    hit.model_copy(update={"explanation": RankExplanation(**component)})
-                )
+                base: dict[str, Any] = dict(component) if component is not None else {}
+                if g_sig is not None:
+                    base["graph_score"] = round(g_sig[0], 6)
+                    base["graph_rank"] = graph_ranks.get(hit.chunk_id)
+                    base["graph_via"] = g_sig[1]
+                explained.append(hit.model_copy(update={"explanation": RankExplanation(**base)}))
         return explained
 
     @staticmethod

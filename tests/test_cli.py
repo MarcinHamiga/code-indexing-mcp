@@ -217,6 +217,42 @@ def test_cli_runs_the_precision_benchmark_with_machine_readable_output(
     assert received["work_dir"] == work_dir
 
 
+def test_cli_runs_the_graphrag_benchmark_with_machine_readable_output(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("CODE_INDEXING_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CODE_INDEXING_CACHE_DIR", str(tmp_path / "cache"))
+    received: dict[str, object] = {}
+
+    def fake_benchmark(**kwargs: object) -> dict[str, object]:
+        received.update(kwargs)
+        return {"schema_version": 1, "variants": {"baseline": {}, "hybrid_graphrag": {}}}
+
+    monkeypatch.setattr(cli, "run_graphrag_benchmark_command", fake_benchmark)
+    work_dir = tmp_path / "graphrag_bench"
+
+    assert (
+        main(
+            [
+                "benchmark",
+                "graphrag",
+                "--noise-files",
+                "40",
+                "--iterations",
+                "2",
+                "--work-dir",
+                str(work_dir),
+            ]
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out)["schema_version"] == 1
+    assert received["noise_files"] == 40
+    assert received["iterations"] == 2
+    assert received["work_dir"] == work_dir
+
+
 def test_serve_falls_back_to_direct_when_local_sockets_are_unavailable(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
@@ -770,3 +806,92 @@ def test_cli_tui_subcommand_dispatches_lazily(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(tui_mod, "main", fake_tui_main)
     assert main(["tui"]) == 42
     assert called
+
+
+def test_cli_search_impact_radius_and_subgraph_commands(  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from test_references import TinyEmbedder
+
+    from code_indexing_mcp.application import RuntimePaths
+
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "crypto.py").write_text(
+        "def decode_jwt_token(raw: str) -> str:\n    return raw.strip()\n"
+    )
+    (root / "src" / "auth.py").write_text(
+        "from .crypto import decode_jwt_token\n\n"
+        "def verify_session_header(header: str) -> str:\n"
+        "    return decode_jwt_token(header)\n"
+    )
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=root,
+    )
+    project = app.init_project(root)
+    app.index_project(project.id)
+    monkeypatch.setattr(cli, "Application", lambda *args, **kwargs: app)
+    monkeypatch.setattr(cli, "_update_notice", lambda *args: None)
+
+    assert (
+        main(["search", "verify_session_header", "--project", project.id, "--graph-context"]) == 0
+    )
+    search_payload = json.loads(capsys.readouterr().out)
+    assert search_payload["hits"]
+    top_hit = next(
+        hit for hit in search_payload["hits"] if hit["symbol"] == "verify_session_header"
+    )
+    assert top_hit["graph_context"] is not None
+    assert [c["symbol"] for c in top_hit["graph_context"]["callees"]] == ["decode_jwt_token"]
+
+    assert (
+        main(
+            [
+                "impact-radius",
+                "--project",
+                project.id,
+                "--path",
+                "src/auth.py",
+                "--symbol",
+                "verify_session_header",
+                "--direction",
+                "dependencies",
+                "--focus-query",
+                "jwt token",
+            ]
+        )
+        == 0
+    )
+    impact_payload = json.loads(capsys.readouterr().out)
+    assert impact_payload["direction"] == "dependencies"
+    assert impact_payload["focus_query"] == "jwt token"
+    edge_targets = [
+        edge["target"]["symbol"] for layer in impact_payload["layers"] for edge in layer["edges"]
+    ]
+    assert "decode_jwt_token" in edge_targets
+
+    assert (
+        main(
+            [
+                "subgraph",
+                "--project",
+                project.id,
+                "--symbol",
+                "src/auth.py:verify_session_header",
+                "--query",
+                "decode_jwt_token",
+            ]
+        )
+        == 0
+    )
+    subgraph_payload = json.loads(capsys.readouterr().out)
+    node_symbols = {node["symbol"] for node in subgraph_payload["nodes"]}
+    assert {"verify_session_header", "decode_jwt_token"} <= node_symbols
+
+    # Validation errors return exit code 2 with structured message on stderr
+    assert main(["impact-radius", "--project", project.id]) == 2
+    assert "--chunk-id or both --path and --symbol" in capsys.readouterr().err
+    assert main(["subgraph", "--project", project.id]) == 2
+    assert "INVALID_FILTER" in capsys.readouterr().err

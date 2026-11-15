@@ -214,8 +214,8 @@ def test_length_prefixed_json_frame_round_trip() -> None:
         right.close()
 
 
-def test_protocol_seven_introduces_search_scope() -> None:
-    assert daemon.PROTOCOL_VERSION == 7
+def test_protocol_eight_introduces_graphrag_surface() -> None:
+    assert daemon.PROTOCOL_VERSION == 8
 
 
 def test_chunked_response_round_trip_is_transparent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1867,3 +1867,69 @@ def test_broker_scopes_rootless_requests_to_the_clients_cwd_not_the_daemons(
     assert resolved.id == project_y.id
     assert missing.value.code == ErrorCode.PROJECT_NOT_FOUND
     assert relative.id == project_y.id
+
+
+@requires_local_sockets
+def test_broker_round_trips_explore_subgraph_and_focused_impact_radius(tmp_path: Path) -> None:
+    paths = RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "auth.py").write_text(
+        "def check_hmac(secret: str) -> bool:\n"
+        "    return bool(secret)\n\n"
+        "def verify_session(token: str) -> bool:\n"
+        "    return check_hmac(token)\n\n"
+        "def login_endpoint(token: str) -> bool:\n"
+        "    return verify_session(token)\n"
+    )
+    application = Application(paths, embedder=TinyEmbedder(), cwd=repo)
+    project = application.init_project(repo)
+    application.index_project(project.id)
+    server = DaemonServer(paths, application=application, idle_timeout_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    assert server.ready.wait(timeout=2)
+    broker = BrokerApplication(paths, cwd=repo)
+    try:
+        search_res = broker.search_code("verify_session", include_graph_context=True)
+        assert search_res.hits
+        top = next(h for h in search_res.hits if h.qualified_symbol == "verify_session")
+        assert top.graph_context is not None
+        assert {c.qualified_symbol for c in top.graph_context.callers} == {"login_endpoint"}
+        assert {c.qualified_symbol for c in top.graph_context.callees} == {"check_hmac"}
+
+        sub = broker.explore_subgraph(
+            selectors=[
+                DeclarationSelector(
+                    project=project.id, path="auth.py", qualified_symbol="login_endpoint"
+                ),
+                DeclarationSelector(
+                    project=project.id, path="auth.py", qualified_symbol="check_hmac"
+                ),
+            ],
+            max_hops=3,
+        )
+        assert {n.qualified_symbol for n in sub.nodes} >= {
+            "login_endpoint",
+            "verify_session",
+            "check_hmac",
+        }
+        assert sub.paths
+        assert sub.paths[0].symbols == ["login_endpoint", "verify_session", "check_hmac"]
+
+        impact = broker.impact_radius(
+            DeclarationSelector(
+                project=project.id, path="auth.py", qualified_symbol="verify_session"
+            ),
+            direction="both",
+            focus_query="check_hmac",
+        )
+        assert impact.direction == "both"
+        assert impact.focus_query == "check_hmac"
+        assert {(e.target.qualified_symbol, e.direction) for e in impact.layers[0].edges} == {
+            ("login_endpoint", "dependents"),
+            ("check_hmac", "dependencies"),
+        }
+    finally:
+        broker.stop()
+        thread.join(timeout=2)

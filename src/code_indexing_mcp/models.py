@@ -597,6 +597,9 @@ class DeadCodeReport(FrozenModel):
     snapshot_version: int
 
 
+ImpactDirection = Literal["dependents", "dependencies", "both"]
+
+
 class ImpactEdge(FrozenModel):
     source: SelectedDeclaration
     target: SelectedDeclaration
@@ -604,6 +607,8 @@ class ImpactEdge(FrozenModel):
     possible: bool = False
     tainted: bool = False
     cycle_to_depth: int | None = None
+    direction: Literal["dependents", "dependencies"] = "dependents"
+    relevance_score: float | None = None
 
 
 class ImpactReview(FrozenModel):
@@ -633,6 +638,8 @@ class ImpactRadiusResponse(FrozenModel):
     cursor: str | None = None
     snapshot_version: int = 0
     completeness: CompletenessReport = Field(default_factory=CompletenessReport)
+    direction: ImpactDirection = "dependents"
+    focus_query: str | None = None
 
 
 class RefactorCounts(FrozenModel):
@@ -905,6 +912,31 @@ class ModelStatus(FrozenModel):
     recommended_override: str | None = None
 
 
+class GraphNeighborRef(FrozenModel):
+    """One resolved 1-hop structural neighbor of a symbol or chunk."""
+
+    chunk_id: str
+    path: str
+    language: str
+    kind: str
+    symbol: str
+    qualified_symbol: str
+    start_line: int
+    end_line: int
+    relation: str
+    resolution: Literal["exact", "likely"] = "exact"
+
+
+class ChunkGraphContext(FrozenModel):
+    """Compact 1-hop ego-graph summary around an indexed chunk or search hit."""
+
+    callers: list[GraphNeighborRef] = Field(default_factory=list)
+    callees: list[GraphNeighborRef] = Field(default_factory=list)
+    supertypes: list[GraphNeighborRef] = Field(default_factory=list)
+    subtypes: list[GraphNeighborRef] = Field(default_factory=list)
+    related: list[GraphNeighborRef] = Field(default_factory=list)
+
+
 class RankExplanation(FrozenModel):
     """Per-hit breakdown of why a hybrid search hit ranked where it did.
 
@@ -913,14 +945,19 @@ class RankExplanation(FrozenModel):
     score into weights exists. ``fts_score`` is the best BM25-style ``_score``
     across the content and identifier-terms probes; ``vector_score`` is
     ``1 - cosine distance`` from the vector probe, the same mapping the
-    vector-only path uses. Ranks are 1-based positions within the explained-hit
-    set per modality. A None signal means that probe did not return the chunk.
+    vector-only path uses; ``graph_score`` is the specificity-adjusted
+    Personalized PageRank activation propagated from initial retrieval seeds.
+    Ranks are 1-based positions within the explained-hit set per modality. A
+    None signal means that probe did not return the chunk.
     """
 
     fts_score: float | None = None
     vector_score: float | None = None
+    graph_score: float | None = None
     fts_rank: int | None = None
     vector_rank: int | None = None
+    graph_rank: int | None = None
+    graph_via: str | None = None
 
 
 class SearchHit(FrozenModel):
@@ -939,6 +976,7 @@ class SearchHit(FrozenModel):
     truncated: bool = False
     is_test: bool = False
     explanation: RankExplanation | None = None
+    graph_context: ChunkGraphContext | None = None
 
 
 class SearchResponse(FrozenModel):
@@ -1046,6 +1084,58 @@ class CodeChunk(FrozenModel):
     content: str
     content_hash: str
     part_index: int = 0
+    graph_context: ChunkGraphContext | None = None
+
+
+class SubgraphNode(FrozenModel):
+    """One declaration node inside a multi-hop GraphRAG code subgraph."""
+
+    chunk_id: str
+    project_id: str
+    path: str
+    language: str
+    kind: str
+    symbol: str
+    qualified_symbol: str
+    start_line: int
+    end_line: int
+    score: float = 0.0
+    is_seed: bool = False
+    snippet: str = ""
+    truncated: bool = False
+
+
+class SubgraphEdge(FrozenModel):
+    """Directed structural edge connecting two nodes in a code subgraph."""
+
+    source_chunk_id: str
+    target_chunk_id: str
+    source_symbol: str
+    target_symbol: str
+    kinds: list[str] = Field(default_factory=list)
+    resolution: Literal["exact", "likely"] = "exact"
+    weight: float = 1.0
+
+
+class SubgraphPath(FrozenModel):
+    """High-confidence structural path connecting seed declarations or concepts."""
+
+    chunk_ids: list[str] = Field(default_factory=list)
+    symbols: list[str] = Field(default_factory=list)
+    edge_kinds: list[str] = Field(default_factory=list)
+    score: float = 0.0
+
+
+class SubgraphResponse(FrozenModel):
+    """Focused, connected multi-hop code subgraph around a query or seed symbols."""
+
+    project_id: str
+    query: str | None = None
+    nodes: list[SubgraphNode] = Field(default_factory=list)
+    edges: list[SubgraphEdge] = Field(default_factory=list)
+    paths: list[SubgraphPath] = Field(default_factory=list)
+    snapshot_version: int = 0
+    completeness: CompletenessReport = Field(default_factory=CompletenessReport)
 
 
 # Why an indexing run started. ``schema-rebuild`` and ``maintenance`` are

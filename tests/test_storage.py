@@ -3744,3 +3744,61 @@ def test_chunk_schema_includes_original_end_byte_and_validates_siblings(tmp_path
             [{**row, "original_end_byte": 5}, {**sibling, "original_end_byte": 5}],
         )
     assert invalid.value.code is ErrorCode.INDEX_INCOMPATIBLE
+
+
+def test_score_chunks_for_query_batches_ids_and_normalises_partition_wide(
+    tmp_path: Path,
+) -> None:
+    store = LanceStore(tmp_path / "lancedb", vector_dimension=4)
+    root = tmp_path / "repo"
+    root.mkdir()
+    project = initialize_project(root)
+    store.upsert_project(project, model_id="test/model")
+    chunks = [
+        StoredChunk(
+            chunk_id=f"{project.id}:c{index:04d}",
+            file_id="file-bulk",
+            path="bulk.py",
+            language="python",
+            kind="function",
+            symbol=f"fn{index}",
+            qualified_symbol=f"fn{index}",
+            parent_symbol=None,
+            start_byte=index * 10,
+            end_byte=index * 10 + 9,
+            start_line=index + 1,
+            end_line=index + 1,
+            content="totp totp verify" if index % 2 == 0 else "unrelated words",
+            identifier_terms="totp" if index % 3 == 0 else "other",
+            part_index=0,
+            vector=[1.0, 0.0, 0.0, 0.0],
+        )
+        for index in range(300)
+    ]
+    store.replace_file(stored_file(project.id, file_id="file-bulk"), chunks)
+    store.ensure_indexes(project.id)
+    ids = [chunk.chunk_id for chunk in chunks]
+
+    batch_sizes: list[int] = []
+    original = store._explanation_probe_rows
+
+    def spy(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        batch_sizes.append(len(args[4]))
+        return original(*args, **kwargs)
+
+    with patch.object(store, "_explanation_probe_rows", side_effect=spy):
+        scores = store.score_chunks_for_query(project.id, ids, "totp", [1.0, 0.0, 0.0, 0.0])
+        fts_only = store.score_chunks_for_query(project.id, ids, "totp")
+
+    assert batch_sizes == [256, 44, 256, 44]
+    assert set(scores) == set(ids)
+    assert all(0.0 <= value <= 1.0 for value in scores.values())
+    assert all(0.0 <= value <= 1.0 for value in fts_only.values())
+    assert max(fts_only.values()) > 0.0
+    assert fts_only[ids[0]] > fts_only[ids[1]]
+    # Same partition-wide reference: a chunk scores identically alone or in a batch.
+    alone = store.score_chunks_for_query(project.id, [ids[290]], "totp")
+    assert alone[ids[290]] == fts_only[ids[290]]
+    # A failed/empty reference probe zeroes the FTS contribution without raising.
+    zeroed = store.score_chunks_for_query(project.id, ids[:3], "totp", fts_reference=0.0)
+    assert set(zeroed.values()) == {0.0}

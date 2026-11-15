@@ -27,6 +27,7 @@ from ..errors import CodeIndexingError, ErrorCode
 from ..models import (
     CodeChunk,
     DeclarationSelector,
+    ImpactDirection,
     ImpactRadiusResponse,
     IndexProgress,
     OutlineResponse,
@@ -53,7 +54,9 @@ class HelpScreen(ModalScreen[None]):
                 "/  Search     Enter  Search / open selected entry\n"
                 "Arrow keys  Select entries; highlighted results preview automatically\n"
                 "Tab / Shift+Tab  Move between controls and panes\n"
-                "o  File outline     r  References     i  What depends on this?\n"
+                "o  File outline     r  References     i  Impact radius\n"
+                "d  Cycle impact direction (dependents / dependencies / both)\n"
+                "f  Toggle query-focused impact ranking\n"
                 "Esc  Previous detail view, then results, then search\n"
                 "y  Copy relative path:line     e  Open in VISUAL / EDITOR\n"
                 "F5  Refresh index     a  Indexing & process activity\n"
@@ -99,6 +102,8 @@ class CodeIndexingApp(App[int]):
         Binding("o", "show_outline", "Outline", show=False, priority=False),
         Binding("r", "show_references", "References", show=False, priority=False),
         Binding("i", "show_impact", "Impact", show=False, priority=False),
+        Binding("d", "cycle_impact_direction", "Direction", show=False, priority=False),
+        Binding("f", "toggle_impact_focus", "Focus", show=False, priority=False),
         Binding("f5", "trigger_index", "Index", show=True, priority=False),
         Binding("a", "toggle_activity", "Activity", show=True, priority=False),
         Binding("c", "open_configure", "Configure", show=True, priority=False),
@@ -128,6 +133,8 @@ class CodeIndexingApp(App[int]):
 
         self._active_target: SourceLocation | None = None
         self._detail_mode = "chunk"
+        self._impact_direction: ImpactDirection = "dependents"
+        self._impact_focus_enabled: bool = False
         self._pending_detail: tuple[SourceLocation, str, DetailState | None] | None = None
         self._detail_entries: list[tuple[Text, SourceLocation]] = []
         self._history: list[DetailState] = []
@@ -378,6 +385,8 @@ class CodeIndexingApp(App[int]):
             "show_outline",
             "show_references",
             "show_impact",
+            "cycle_impact_direction",
+            "toggle_impact_focus",
             "copy_location",
             "open_editor",
             "toggle_activity",
@@ -779,7 +788,11 @@ class CodeIndexingApp(App[int]):
             text.append(hit.qualified_symbol or hit.symbol or Path(hit.path).name, style="bold")
             badge = " [test]" if hit.is_test else ""
             text.append(f"  {hit.kind}{badge}\n", style="dim")
-            text.append(f"    {hit.path}:{hit.start_line}-{hit.end_line}", style="dim")
+            loc_line = f"    {hit.path}:{hit.start_line}-{hit.end_line}"
+            if hit.explanation is not None and hit.explanation.graph_rank is not None:
+                via = f" via {hit.explanation.graph_via}" if hit.explanation.graph_via else ""
+                loc_line += f" · graph#{hit.explanation.graph_rank}{via}"
+            text.append(loc_line, style="dim")
             options.append(Option(prompt=text, id=str(i)))
 
         option_list.add_options(options)
@@ -939,6 +952,27 @@ class CodeIndexingApp(App[int]):
             return
         self._navigate_mode("impact")
 
+    def action_cycle_impact_direction(self) -> None:
+        if isinstance(self.focused, Input):
+            return
+        order: tuple[ImpactDirection, ...] = ("dependents", "dependencies", "both")
+        next_idx = (order.index(self._impact_direction) + 1) % len(order)
+        self._impact_direction = order[next_idx]
+        if self._detail_mode == "impact" and self._active_target is not None:
+            self._open_target(self._active_target, "impact", remember=False)
+        else:
+            self._set_status(f"Impact direction set to '{self._impact_direction}'.")
+
+    def action_toggle_impact_focus(self) -> None:
+        if isinstance(self.focused, Input):
+            return
+        self._impact_focus_enabled = not self._impact_focus_enabled
+        if self._detail_mode == "impact" and self._active_target is not None:
+            self._open_target(self._active_target, "impact", remember=False)
+        else:
+            state = "enabled" if self._impact_focus_enabled else "disabled"
+            self._set_status(f"Impact query focus {state}.")
+
     def _load_detail_for_selected(self, action: str) -> None:
         hit = self._get_selected_hit()
         if hit is None:
@@ -963,12 +997,29 @@ class CodeIndexingApp(App[int]):
         def retry() -> None:
             self._open_target(target, action, remember=remember, project=project)
 
+        focus_query: str | None = None
+        if (
+            action == "impact"
+            and self._impact_focus_enabled
+            and self._main_screen_has("#query-input")
+        ):
+            raw_q = self.screen_stack[0].query_one("#query-input", Input).value.strip()
+            focus_query = raw_q or None
+
         self._pending_detail = (target, action, self._capture_detail() if remember else None)
         self.screen_stack[0].query_one("#detail-tabs", Tabs).active = f"{action}-tab"
         self._detail_request_id += 1
         req_id = self._detail_request_id
         self._set_status(f"Loading {action} for {target.path}...")
-        self._run_detail_worker(req_id, action, target, project, retry)
+        self._run_detail_worker(
+            req_id,
+            action,
+            target,
+            project,
+            retry,
+            self._impact_direction,
+            focus_query,
+        )
 
     @work(thread=True, exclusive=True, group="detail")
     def _run_detail_worker(
@@ -978,6 +1029,8 @@ class CodeIndexingApp(App[int]):
         hit: SourceLocation,
         project: ProjectInfo | None,
         retry: Callable[[], None],
+        impact_direction: ImpactDirection = "dependents",
+        focus_query: str | None = None,
     ) -> None:
         try:
             if action == "chunk":
@@ -1013,7 +1066,10 @@ class CodeIndexingApp(App[int]):
                     )
             elif action == "impact":
                 impact = self.service.impact_radius(
-                    self._target_selector(hit, project), project=project
+                    self._target_selector(hit, project),
+                    project=project,
+                    direction=impact_direction,
+                    focus_query=focus_query,
                 )
                 if request_id == self._detail_request_id:
                     self._call_from_worker(
@@ -1075,9 +1131,43 @@ class CodeIndexingApp(App[int]):
             theme="monokai",
         )
         self.screen_stack[0].query_one("#detail-content", Static).update(syntax)
-        self._set_status(
+        entries: list[tuple[Text, SourceLocation]] = []
+        if isinstance(chunk, CodeChunk) and chunk.graph_context is not None:
+            gctx = chunk.graph_context
+            buckets = (
+                ("Caller", gctx.callers),
+                ("Callee", gctx.callees),
+                ("Supertype", gctx.supertypes),
+                ("Subtype", gctx.subtypes),
+                ("Related", gctx.related),
+            )
+            for label, neighbors in buckets:
+                for nb in neighbors:
+                    entries.append(
+                        (
+                            Text(
+                                f"[{label}] {nb.qualified_symbol}  · {nb.kind}  "
+                                f"· {nb.path}:{nb.start_line}"
+                            ),
+                            SourceLocation(
+                                nb.path,
+                                nb.start_line,
+                                nb.end_line,
+                                nb.qualified_symbol,
+                                chunk.language or "text",
+                                nb.kind,
+                                nb.chunk_id,
+                            ),
+                        )
+                    )
+        if entries:
+            self._set_detail_entries(entries)
+        status_msg = (
             f"Showing {chunk.symbol or chunk.path} · lines {chunk.start_line}-{chunk.end_line}"
         )
+        if entries:
+            status_msg += f" · {len(entries)} graph neighbor(s)"
+        self._set_status(status_msg)
 
     def _render_outline(self, outline: OutlineResponse) -> None:
         self.screen_stack[0].query_one("#detail-title", Label).update(
@@ -1152,10 +1242,14 @@ class CodeIndexingApp(App[int]):
             for edge in layer.edges:
                 kinds = ", ".join(edge.kinds)
                 target = edge.target
+                arrow = "<-" if edge.direction == "dependents" else "->"
+                rel_suffix = (
+                    f" · rel {edge.relevance_score:.2f}" if edge.relevance_score is not None else ""
+                )
                 entries.append(
                     (
                         Text(
-                            f"Depth {layer.depth} · {target.qualified_symbol}\n"
+                            f"Depth {layer.depth} {arrow} {target.qualified_symbol}{rel_suffix}\n"
                             f"{target.path}:{target.start_line} ({kinds})"
                         ),
                         SourceLocation(
@@ -1171,7 +1265,7 @@ class CodeIndexingApp(App[int]):
                 )
 
         if entries:
-            text = Text("Select a dependent declaration and press Enter to open its source.\n")
+            text = Text("Select a declaration and press Enter to open its source.\n")
         else:
             text = Text()
             text.append(
@@ -1179,13 +1273,18 @@ class CodeIndexingApp(App[int]):
                 style="bold underline",
             )
             if not impact.layers:
-                text.append("No downstream impact detected within search depth.\n", style="dim")
+                text.append("No impact detected within search depth.\n", style="dim")
             for layer in impact.layers:
                 text.append(f"Depth {layer.depth}:\n", style="yellow bold")
                 for edge in layer.edges:
                     text.append(f"  -> {edge.target.path} ", style="cyan")
                     text.append(f"({', '.join(edge.kinds)})\n", style="dim")
-        text.append("What depends on this declaration? Search depth: 2.\n")
+        focus_label = impact.focus_query or (
+            "on (empty query)" if self._impact_focus_enabled else "off"
+        )
+        text.append(
+            f"Direction: {impact.direction} [d] · Focus: {focus_label} [f] · Search depth: 2.\n"
+        )
         if impact.budget_exhausted:
             text.append("Analysis budget reached; results are incomplete.\n", style="yellow")
         if impact.cursor:

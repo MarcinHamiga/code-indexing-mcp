@@ -38,6 +38,7 @@ from .git_state import (
     probe_git_state,
 )
 from .git_state import slot_id as git_slot_id
+from .graph_index import GraphIndexService
 from .history import HistoryStore
 from .index_worker import IndexWorkerSession, _worker_pythonpath_extension
 from .indexing import Indexer
@@ -52,6 +53,7 @@ from .models import (
     DeclarationSelector,
     ExampleSearchResponse,
     HistoryPage,
+    ImpactDirection,
     ImpactRadiusResponse,
     IndexReport,
     IndexTrigger,
@@ -73,9 +75,11 @@ from .models import (
     ScannedFile,
     SearchResponse,
     SearchScope,
+    SelectedDeclaration,
     SkippedFile,
     StorageStatus,
     StoredFile,
+    SubgraphResponse,
     SymbolResponse,
     content_digest,
 )
@@ -280,6 +284,7 @@ class ApplicationLike(Protocol):
         kinds: list[str] | None = None,
         scope: SearchScope = "code",
         limit: int = 8,
+        include_graph_context: bool = False,
         roots: list[Path] | None = None,
     ) -> SearchResponse: ...
 
@@ -295,6 +300,7 @@ class ApplicationLike(Protocol):
         kinds: list[str] | None = None,
         scope: SearchScope = "code",
         limit: int = 8,
+        include_graph_context: bool = False,
         roots: list[Path] | None = None,
     ) -> ExampleSearchResponse: ...
 
@@ -396,8 +402,23 @@ class ApplicationLike(Protocol):
         max_nodes: int = 500,
         limit: int = 100,
         cursor: str | None = None,
+        direction: ImpactDirection = "dependents",
+        focus_query: str | None = None,
         roots: list[Path] | None = None,
     ) -> ImpactRadiusResponse: ...
+
+    def explore_subgraph(
+        self,
+        *,
+        query: str | None = None,
+        selectors: list[DeclarationSelector] | None = None,
+        project: str | None = None,
+        max_nodes: int = 15,
+        max_hops: int = 3,
+        include_likely: bool = True,
+        scope: SearchScope = "code",
+        roots: list[Path] | None = None,
+    ) -> SubgraphResponse: ...
 
     def analyze_refactor(
         self,
@@ -607,8 +628,19 @@ class Application:
             progress_directory=paths.data / "progress",
             history=self.history,
         )
-        self.search = SearchService(self.store, embedder, extractor=self.indexer.extractor)
         self.references = ReferenceService(self.store)
+        self.graph = GraphIndexService(
+            self.store,
+            self.references,
+            cache_limit=self.settings.graph_cache_limit,
+            enabled=self.settings.graph_search,
+        )
+        self.search = SearchService(
+            self.store,
+            embedder,
+            extractor=self.indexer.extractor,
+            graph_service=self.graph,
+        )
         # Storage maintenance is owned by MaintenanceService (D2). It needs
         # target resolution only Application can provide -- which projects are
         # registered, resolving a selector to a ProjectInfo, and resolving the
@@ -1761,6 +1793,7 @@ class Application:
         kinds: list[str] | None = None,
         scope: SearchScope = "code",
         limit: int = 8,
+        include_graph_context: bool = False,
         roots: list[Path] | None = None,
     ) -> SearchResponse:
         if scope not in SEARCH_SCOPES:
@@ -1782,6 +1815,7 @@ class Application:
                 kinds=kinds,
                 scope=scope,
                 limit=limit,
+                include_graph_context=include_graph_context,
                 partitions={
                     project_id: [target.partition for target in targets.get(project_id, ())]
                     for project_id in project_ids
@@ -1805,6 +1839,7 @@ class Application:
         kinds: list[str] | None = None,
         scope: SearchScope = "code",
         limit: int = 8,
+        include_graph_context: bool = False,
         roots: list[Path] | None = None,
     ) -> ExampleSearchResponse:
         if scope not in SEARCH_SCOPES:
@@ -1827,6 +1862,7 @@ class Application:
                 kinds=kinds,
                 scope=scope,
                 limit=limit,
+                include_graph_context=include_graph_context,
                 partitions={
                     project_id: [target.partition for target in targets.get(project_id, ())]
                     for project_id in project_ids
@@ -2158,9 +2194,15 @@ class Application:
         max_nodes: int = 500,
         limit: int = 100,
         cursor: str | None = None,
+        direction: ImpactDirection = "dependents",
+        focus_query: str | None = None,
         roots: list[Path] | None = None,
     ) -> ImpactRadiusResponse:
         checkouts, project_id = self._resolve_reference_checkouts(selector, roots)
+        normalized_focus = focus_query.strip() or None if focus_query is not None else None
+        focus_vector = (
+            self.embedder.embed_query(normalized_focus) if normalized_focus is not None else None
+        )
         return self._run_repository_stable_query(
             checkouts,
             lambda targets: self._impact_radius_for_target(
@@ -2172,6 +2214,9 @@ class Application:
                 max_nodes=max_nodes,
                 limit=limit,
                 cursor=cursor,
+                direction=direction,
+                focus_query=normalized_focus,
+                focus_vector=focus_vector,
             ),
             include_status=True,
         )
@@ -2187,6 +2232,9 @@ class Application:
         max_nodes: int,
         limit: int,
         cursor: str | None,
+        direction: ImpactDirection,
+        focus_query: str | None,
+        focus_vector: list[float] | None,
     ) -> ImpactRadiusResponse:
         with self._prepared_reference_query(selector, target) as prepared:
             return self.references.impact_radius(
@@ -2197,9 +2245,142 @@ class Application:
                 max_nodes=max_nodes,
                 limit=limit,
                 cursor=cursor,
+                direction=direction,
+                focus_query=focus_query,
+                focus_vector=focus_vector,
                 backfill=prepared.backfill,
                 partition=prepared.partition,
                 root=prepared.root,
+            )
+
+    def explore_subgraph(
+        self,
+        *,
+        query: str | None = None,
+        selectors: list[DeclarationSelector] | None = None,
+        project: str | None = None,
+        max_nodes: int = 15,
+        max_hops: int = 3,
+        include_likely: bool = True,
+        scope: SearchScope = "code",
+        roots: list[Path] | None = None,
+    ) -> SubgraphResponse:
+        normalized_query = query.strip() if query is not None else ""
+        seed_selectors = list(selectors or [])
+        if not normalized_query and not seed_selectors:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                "explore_subgraph requires at least one of 'query' or 'selectors'",
+            )
+        if scope not in SEARCH_SCOPES:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                f"Invalid search scope: {scope!r}; expected 'code', 'tests', or 'all'",
+                scope=scope,
+            )
+        if not 1 <= max_nodes <= 100:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                "max_nodes must be between 1 and 100",
+                max_nodes=max_nodes,
+            )
+        if not 1 <= max_hops <= 6:
+            raise CodeIndexingError(
+                ErrorCode.INVALID_FILTER,
+                "max_hops must be between 1 and 6",
+                max_hops=max_hops,
+            )
+
+        if project is not None:
+            resolved = self.resolve_project(project, roots)
+            checkouts, project_id = [resolved], resolved.id
+        elif seed_selectors:
+            checkouts, project_id = self._resolve_reference_checkouts(seed_selectors[0], roots)
+        else:
+            resolved = self.resolve_project(None, roots)
+            checkouts, project_id = [resolved], resolved.id
+
+        return self._run_repository_stable_query(
+            checkouts,
+            lambda targets: self._explore_subgraph_for_target(
+                self._select_reference_target(seed_selectors[0], targets, project_id)
+                if seed_selectors
+                else self._primary_target(targets, project_id),
+                query=normalized_query or None,
+                selectors=seed_selectors,
+                max_nodes=max_nodes,
+                max_hops=max_hops,
+                include_likely=include_likely,
+                scope=scope,
+                roots=roots,
+            ),
+            include_status=True,
+        )
+
+    def _explore_subgraph_for_target(
+        self,
+        target: ActiveIndexTarget,
+        *,
+        query: str | None,
+        selectors: list[DeclarationSelector],
+        max_nodes: int,
+        max_hops: int,
+        include_likely: bool,
+        scope: SearchScope,
+        roots: list[Path] | None,
+    ) -> SubgraphResponse:
+        self._ensure_query_generations({target.project.id: [target]})
+        self.ensure_reference_index(target.project.id, _target=target)
+
+        seed_declarations: list[SelectedDeclaration] = []
+        with self.store.partition_access(target.project.id, partition_id=target.partition_id):
+            for sel in selectors:
+                if sel.project is not None:
+                    sel_project = self._resolve(sel.project, roots)
+                    if sel_project.id != target.project.id:
+                        raise CodeIndexingError(
+                            ErrorCode.INVALID_FILTER,
+                            "All selectors in explore_subgraph must belong to the same project",
+                        )
+                    prepared_sel = sel.model_copy(update={"project": target.project.id})
+                else:
+                    chunk_project_id = self.store.chunk_project_id(sel.chunk_id or "")
+                    if chunk_project_id is None:
+                        self.search.get_chunk(sel.chunk_id or "", partition=target.partition)
+                        raise AssertionError("get_chunk unexpectedly returned without a project id")
+                    if chunk_project_id != target.project.id:
+                        raise CodeIndexingError(
+                            ErrorCode.INVALID_FILTER,
+                            "All selectors in explore_subgraph must belong to the same project",
+                        )
+                    prepared_sel = sel
+                seed_declarations.append(
+                    self.references._select(prepared_sel, partition_id=target.partition_id)
+                )
+
+        query_seed_chunk_scores: dict[str, float] = {}
+        if query is not None:
+            search_res = self.search.search_code(
+                query,
+                [target.project.id],
+                scope=scope,
+                limit=10,
+                partitions={target.project.id: [target.partition]},
+            )
+            for hit in search_res.hits:
+                query_seed_chunk_scores[hit.chunk_id] = hit.score
+
+        with self.store.partition_access(target.project.id, partition_id=target.partition_id):
+            return self.graph.extract_subgraph(
+                target.project.id,
+                partition_id=target.partition_id,
+                seed_declarations=seed_declarations,
+                query_seed_chunk_scores=query_seed_chunk_scores,
+                query=query,
+                max_nodes=max_nodes,
+                max_hops=max_hops,
+                include_likely=include_likely,
+                scope=scope,
             )
 
     def analyze_refactor(

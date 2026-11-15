@@ -152,13 +152,14 @@ async def test_server_registers_the_focused_tool_suite(tmp_path: Path) -> None:
         "find_references",
         "dead_code_report",
         "impact_radius",
+        "explore_subgraph",
         "analyze_refactor",
         "emit_refactor_patch",
         "file_outline",
         "changed_symbols",
         "get_chunk",
     }
-    assert len(tools) == 21
+    assert len(tools) == 22
     assert all("ctx" not in tool.inputSchema.get("properties", {}) for tool in tools)
 
 
@@ -2336,6 +2337,7 @@ AUTO_REGISTERING_TOOLS = frozenset(
         "find_references",
         "dead_code_report",
         "impact_radius",
+        "explore_subgraph",
         "analyze_refactor",
         "emit_refactor_patch",
         "file_outline",
@@ -2477,6 +2479,7 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "kinds",
         "scope",
         "limit",
+        "include_graph_context",
     }
     assert set(cross_project_schema["required"]) == {"projects"}
     assert cross_project_schema["properties"]["projects"]["minItems"] == 2
@@ -2494,6 +2497,7 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "kinds",
         "scope",
         "limit",
+        "include_graph_context",
     }
     assert set(example_schema["required"]) == {"example"}
     example_limit = example_schema["properties"]["limit"]
@@ -2508,12 +2512,14 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "kinds",
         "scope",
         "limit",
+        "include_graph_context",
     }
     for scoped_tool in (
         "search_code",
         "search_by_example",
         "search_across_projects",
         "find_symbol",
+        "explore_subgraph",
     ):
         assert tools[scoped_tool].inputSchema["properties"]["scope"]["enum"] == [
             "code",
@@ -2535,7 +2541,32 @@ async def test_every_tool_parameter_is_documented_and_bounded(tmp_path: Path) ->
         "max_nodes",
         "limit",
         "cursor",
+        "direction",
+        "focus_query",
     }
+    assert impact_schema["properties"]["direction"]["enum"] == [
+        "dependents",
+        "dependencies",
+        "both",
+    ]
+    subgraph_schema = tools["explore_subgraph"].inputSchema
+    assert set(subgraph_schema["properties"]) == {
+        "query",
+        "selectors",
+        "project",
+        "max_nodes",
+        "max_hops",
+        "include_likely",
+        "scope",
+    }
+    assert (
+        subgraph_schema["properties"]["max_nodes"]["minimum"],
+        subgraph_schema["properties"]["max_nodes"]["maximum"],
+    ) == (1, 100)
+    assert (
+        subgraph_schema["properties"]["max_hops"]["minimum"],
+        subgraph_schema["properties"]["max_hops"]["maximum"],
+    ) == (1, 6)
     assert (
         impact_schema["properties"]["max_depth"]["minimum"],
         impact_schema["properties"]["max_depth"]["maximum"],
@@ -3691,3 +3722,68 @@ async def test_lifespan_teardown_drains_task_group_and_closes_worker_off_loop(
             with suppress(asyncio.CancelledError):
                 await lifespan_task
         app.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_explore_subgraph_and_hybrid_impact_tools(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname = 'project'\n")
+    (root / "service.py").write_text(
+        "def load_signing_key() -> str:\n"
+        "    return 'ed25519'\n\n"
+        "def validate_token() -> str:\n"
+        "    return load_signing_key()\n\n"
+        "def handle_api_request() -> str:\n"
+        "    return validate_token()\n"
+    )
+    app = Application(
+        RuntimePaths(data=tmp_path / "data", cache=tmp_path / "cache"),
+        embedder=TinyEmbedder(),
+        cwd=tmp_path,
+    )
+    server = create_server(app)
+
+    async def list_roots(_: types.ListRootsRequest) -> types.ListRootsResult:
+        return types.ListRootsResult(roots=[types.Root(uri=root.as_uri())])
+
+    async with create_connected_server_and_client_session(
+        server, list_roots_callback=list_roots
+    ) as client:
+        err_res = await client.call_tool("explore_subgraph", {})
+        assert err_res.isError
+
+        sub_res = await client.call_tool(
+            "explore_subgraph",
+            {"query": "handle_api_request", "max_nodes": 10, "max_hops": 3},
+        )
+        assert not sub_res.isError
+        sub_payload = json.loads(sub_res.content[0].text)
+        node_syms = {n["qualified_symbol"] for n in sub_payload["nodes"]}
+        assert {"handle_api_request", "validate_token", "load_signing_key"} <= node_syms
+
+        search_res = await client.call_tool(
+            "search_code",
+            {"query": "validate_token", "include_graph_context": True},
+        )
+        assert not search_res.isError
+        hits = json.loads(search_res.content[0].text)["hits"]
+        vt_hit = next(h for h in hits if h["qualified_symbol"] == "validate_token")
+        assert vt_hit["graph_context"] is not None
+        assert vt_hit["graph_context"]["callers"][0]["qualified_symbol"] == "handle_api_request"
+        assert vt_hit["graph_context"]["callees"][0]["qualified_symbol"] == "load_signing_key"
+
+        impact_res = await client.call_tool(
+            "impact_radius",
+            {
+                "selector": {"chunk_id": vt_hit["chunk_id"]},
+                "direction": "dependencies",
+                "focus_query": "load_signing_key",
+            },
+        )
+        assert not impact_res.isError
+        impact_payload = json.loads(impact_res.content[0].text)
+        assert impact_payload["direction"] == "dependencies"
+        assert impact_payload["layers"][0]["edges"][0]["target"]["qualified_symbol"] == (
+            "load_signing_key"
+        )
