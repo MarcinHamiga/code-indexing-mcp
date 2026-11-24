@@ -392,3 +392,117 @@ def test_slot_identity_is_carried_on_every_published_snapshot() -> None:
     assert [(p.slot_id, p.selector, p.expected_head, p.activation_epoch) for p in seen] == [
         ("slot-a", "ref:refs/heads/main", "0" * 40, 3)
     ]
+
+
+def test_lazy_fields_are_skipped_when_throttled_and_evaluated_on_publish() -> None:
+    clock = iter([0.0, 0.05, 0.10, 0.15, 1.20, 1.25, 1.30])
+    seen: list[IndexProgress] = []
+    lazy_calls = 0
+
+    def compute_lazy() -> dict[str, object]:
+        nonlocal lazy_calls
+        lazy_calls += 1
+        return {
+            "embedding_backend": "cpu",
+            "phase_durations_ms": {"scan": lazy_calls * 10},
+        }
+
+    publisher = ProgressPublisher(
+        "project",
+        listener=seen.append,
+        interval_seconds=1.0,
+        clock=lambda: next(clock),
+    )
+
+    publisher.update(candidates_seen=1, lazy_fields=compute_lazy)
+    assert lazy_calls == 1
+    assert seen[-1].phase_durations_ms == {"scan": 10}
+
+    # Throttled updates must not evaluate lazy_fields or publish.
+    publisher.update(candidates_seen=2, lazy_fields=compute_lazy)
+    publisher.update(candidates_seen=3, lazy_fields=compute_lazy)
+    assert lazy_calls == 1
+    assert len(seen) == 1
+
+    # Interval elapsed: lazy_fields runs and pending buffered fields publish.
+    publisher.update(candidates_seen=4, lazy_fields=compute_lazy)
+    assert lazy_calls == 2
+    assert len(seen) == 2
+    assert seen[-1].candidates_seen == 4
+    assert seen[-1].phase_durations_ms == {"scan": 20}
+
+    # Force always evaluates lazy_fields even inside the throttle interval.
+    publisher.update(candidates_seen=5, force=True, lazy_fields=compute_lazy)
+    assert lazy_calls == 3
+    assert len(seen) == 3
+    assert seen[-1].candidates_seen == 5
+    assert seen[-1].phase_durations_ms == {"scan": 30}
+
+    # Mutable containers returned by lazy_fields are also cloned from caller.
+    shared_durations = {"scan": 99}
+    publisher.update(
+        candidates_seen=6,
+        force=True,
+        lazy_fields=lambda: {"phase_durations_ms": shared_durations},
+    )
+    shared_durations["scan"] = 777
+    assert seen[-1].phase_durations_ms == {"scan": 99}
+
+
+def test_state_property_flushes_pending_throttled_updates_and_clones_collections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter([0.0, 0.05, 0.10, 0.11, 0.15, 0.20, 0.25])
+    seen: list[IndexProgress] = []
+    publisher = ProgressPublisher(
+        "project",
+        listener=seen.append,
+        interval_seconds=1.0,
+        clock=lambda: next(clock),
+    )
+    copy_calls = 0
+    original_model_copy = IndexProgress.model_copy
+
+    def counting_model_copy(self: IndexProgress, **kwargs: object) -> IndexProgress:
+        nonlocal copy_calls
+        copy_calls += 1
+        return original_model_copy(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(IndexProgress, "model_copy", counting_model_copy)
+
+    # First publish flushes once.
+    publisher.update(candidates_seen=1)
+    assert copy_calls == 1
+
+    reasons = {"binary": 2}
+    # Throttled updates must defer model_copy while isolating caller mutations.
+    publisher.update(phase="embedding", candidates_seen=2, skipped_by_reason=reasons)
+    reasons["binary"] = 999
+    publisher.update(candidates_seen=3)
+    assert copy_calls == 1
+    assert len(seen) == 1
+
+    # Reading .state flushes pending buffered updates without publishing.
+    intermediate = publisher.state
+    assert copy_calls == 2
+    assert len(seen) == 1
+    assert intermediate.phase == "embedding"
+    assert intermediate.candidates_seen == 3
+    assert intermediate.skipped_by_reason == {"binary": 2}
+
+    # Forced publish sends the final state while keeping intermediate untouched.
+    publisher.update(candidates_seen=4, skipped_by_reason=reasons, force=True)
+    assert copy_calls == 3
+    assert len(seen) == 2
+    assert intermediate.candidates_seen == 3
+    assert intermediate.skipped_by_reason == {"binary": 2}
+    assert seen[-1].candidates_seen == 4
+    assert seen[-1].skipped_by_reason == {"binary": 999}
+
+    # Assigning .state drops any pending updates and syncs phase tracking.
+    publisher.update(candidates_seen=5)
+    replacement = IndexProgress(project_id="project", phase="committing", phase_started_at=10.0)
+    publisher.state = replacement
+    assert publisher._pending == {}
+    assert publisher.state.phase == "committing"
+    assert publisher.state.candidates_seen == 0

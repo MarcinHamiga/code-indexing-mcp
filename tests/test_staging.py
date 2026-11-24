@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -33,6 +33,7 @@ from code_indexing_mcp.staging import (
     PHASE_STAGING,
     REFERENCES_NAME,
     THREE_TABLE_JOURNAL_FORMAT_VERSION,
+    VARYING_REFERENCE_COLUMNS,
     ChunkRow,
     ReferenceRow,
     StagingJob,
@@ -651,7 +652,7 @@ def test_a_failed_commit_restores_reference_rows_with_files_and_chunks(tmp_path:
             (
                 [file_id],
                 pa.Table.from_pylist(
-                    [reference_row(project.id, file_id).__dict__],
+                    [asdict(reference_row(project.id, file_id))],
                     schema=LanceStore.reference_arrow_schema(),
                 ),
             )
@@ -881,7 +882,7 @@ def test_a_crash_mid_commit_is_rolled_back_by_startup_recovery(tmp_path: Path) -
             (
                 [file_id],
                 pa.Table.from_pylist(
-                    [reference_row(project.id, file_id).__dict__],
+                    [asdict(reference_row(project.id, file_id))],
                     schema=LanceStore.reference_arrow_schema(),
                 ),
             )
@@ -1145,7 +1146,7 @@ def test_upgrade_recovery_rolls_back_a_legacy_two_table_journal(tmp_path: Path) 
         indexed_at=1,
     )
     original_chunk = {
-        **chunk_row(project.id, "file-1", [1.0, 2.0, 3.0, 4.0]).__dict__,
+        **asdict(chunk_row(project.id, "file-1", [1.0, 2.0, 3.0, 4.0])),
         "vector": [1.0, 2.0, 3.0, 4.0],
     }
     files.add([original_file.model_dump()])
@@ -1283,3 +1284,261 @@ def test_staging_phase_leftovers_are_removed_without_touching_live_tables(
     assert recovered == 0
     assert store.list_chunks([project.id]) == chunks_before
     assert list((tmp_path / "staging").glob("*/*/")) == []
+
+
+def test_chunk_and_reference_rows_are_slotted() -> None:
+    chunk = chunk_row("project-1", "file-1", [1.0, 2.0, 3.0, 4.0])
+    reference = reference_row("project-1", "file-1")
+
+    assert not hasattr(chunk, "__dict__")
+    assert not hasattr(reference, "__dict__")
+
+
+def test_varying_reference_columns_cover_the_reference_schema() -> None:
+    schema_names = LanceStore.reference_arrow_schema().names
+    constant_columns = {
+        "file_id",
+        "project_id",
+        "path",
+        "language",
+        "content_hash",
+        "schema_version",
+    }
+
+    assert len(VARYING_REFERENCE_COLUMNS) == 15
+    assert len(set(VARYING_REFERENCE_COLUMNS)) == 15
+    assert set(VARYING_REFERENCE_COLUMNS).isdisjoint(constant_columns)
+    assert set(VARYING_REFERENCE_COLUMNS) | constant_columns == set(schema_names)
+
+
+def test_stage_reference_columns_matches_stage_references_byte_for_byte(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    row_job = make_job(tmp_path, store, "project-1", job_id="job-rows")
+    col_job = make_job(tmp_path, store, "project-1", job_id="job-cols")
+
+    rows = [
+        ReferenceRow(
+            reference_id="ref-1",
+            record_kind="reference",
+            file_id="file-1",
+            project_id="project-1",
+            path="pkg/mod.py",
+            language="python",
+            kind="call",
+            source_qualified_symbol="pkg.mod.run",
+            written_name="helper",
+            target_name="helper",
+            module_path=None,
+            imported_name=None,
+            alias=None,
+            receiver_text="self",
+            start_byte=12,
+            end_byte=18,
+            start_line=2,
+            end_line=2,
+            shape_json='{"positional_count":1}',
+            content_hash="deadbeef",
+            schema_version=3,
+        ),
+        ReferenceRow(
+            reference_id="ref-2",
+            record_kind="import",
+            file_id="file-1",
+            project_id="project-1",
+            path="pkg/mod.py",
+            language="python",
+            kind="import",
+            source_qualified_symbol=None,
+            written_name=None,
+            target_name=None,
+            module_path="pkg.util",
+            imported_name="helper",
+            alias="h",
+            receiver_text=None,
+            start_byte=0,
+            end_byte=10,
+            start_line=1,
+            end_line=1,
+            shape_json=None,
+            content_hash="deadbeef",
+            schema_version=3,
+        ),
+        ReferenceRow(
+            reference_id="cov-1",
+            record_kind="coverage",
+            file_id="file-1",
+            project_id="project-1",
+            path="pkg/mod.py",
+            language="python",
+            kind=None,
+            source_qualified_symbol=None,
+            written_name=None,
+            target_name=None,
+            module_path=None,
+            imported_name=None,
+            alias=None,
+            receiver_text=None,
+            start_byte=None,
+            end_byte=None,
+            start_line=None,
+            end_line=None,
+            shape_json=None,
+            content_hash="deadbeef",
+            schema_version=3,
+        ),
+    ]
+    varying_columns = tuple(
+        [getattr(row, col) for row in rows] for col in VARYING_REFERENCE_COLUMNS
+    )
+
+    row_job.stage_references(rows)
+    col_job.stage_reference_columns(
+        file_id="file-1",
+        project_id="project-1",
+        path="pkg/mod.py",
+        language="python",
+        content_hash="deadbeef",
+        schema_version=3,
+        varying_columns=varying_columns,
+    )
+    row_job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+    col_job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    row_bytes = (row_job.directory / REFERENCES_NAME).read_bytes()
+    col_bytes = (col_job.directory / REFERENCES_NAME).read_bytes()
+    assert col_bytes == row_bytes
+
+    row_table = pa.ipc.open_file(row_job.directory / REFERENCES_NAME).read_all()
+    col_table = pa.ipc.open_file(col_job.directory / REFERENCES_NAME).read_all()
+    assert col_table.equals(row_table, check_metadata=True)
+
+
+def test_stage_reference_columns_validates_empty_lengths_and_contiguity(tmp_path: Path) -> None:
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    job = make_job(tmp_path, store, "project-1")
+
+    empty_columns = tuple([] for _ in VARYING_REFERENCE_COLUMNS)
+    # Empty column batches are a no-op and do not record contiguity state.
+    job.stage_reference_columns(
+        file_id="file-a",
+        project_id="project-1",
+        path="a.py",
+        language="python",
+        content_hash="h1",
+        schema_version=1,
+        varying_columns=empty_columns,
+    )
+
+    sample = reference_row("project-1", "file-b")
+    columns_b = tuple([getattr(sample, col)] for col in VARYING_REFERENCE_COLUMNS)
+    job.stage_reference_columns(
+        file_id="file-b",
+        project_id="project-1",
+        path="b.py",
+        language="python",
+        content_hash="h2",
+        schema_version=1,
+        varying_columns=columns_b,
+    )
+    # file-a had no rows staged earlier, so it can still be staged after file-b.
+    sample_a = reference_row("project-1", "file-a")
+    columns_a = tuple([getattr(sample_a, col)] for col in VARYING_REFERENCE_COLUMNS)
+    job.stage_reference_columns(
+        file_id="file-a",
+        project_id="project-1",
+        path="a.py",
+        language="python",
+        content_hash="h1",
+        schema_version=1,
+        varying_columns=columns_a,
+    )
+    # Contiguous repeat for the active file is allowed.
+    job.stage_reference_columns(
+        file_id="file-a",
+        project_id="project-1",
+        path="a.py",
+        language="python",
+        content_hash="h1",
+        schema_version=1,
+        varying_columns=columns_a,
+    )
+
+    with pytest.raises(ValueError, match="contiguous"):
+        job.stage_reference_columns(
+            file_id="file-b",
+            project_id="project-1",
+            path="b.py",
+            language="python",
+            content_hash="h2",
+            schema_version=1,
+            varying_columns=columns_b,
+        )
+
+    with pytest.raises(ValueError, match="varying reference columns"):
+        job.stage_reference_columns(
+            file_id="file-c",
+            project_id="project-1",
+            path="c.py",
+            language="python",
+            content_hash="h3",
+            schema_version=1,
+            varying_columns=columns_a[:-1],
+        )
+
+    mismatched = list(columns_a)
+    mismatched[0] = ["ref-1", "ref-2"]
+    with pytest.raises(ValueError, match="same length"):
+        job.stage_reference_columns(
+            file_id="file-c",
+            project_id="project-1",
+            path="c.py",
+            language="python",
+            content_hash="h3",
+            schema_version=1,
+            varying_columns=mismatched,
+        )
+
+    empty_first_mismatch = list(empty_columns)
+    empty_first_mismatch[1] = ["reference"]
+    with pytest.raises(ValueError, match="same length"):
+        job.stage_reference_columns(
+            file_id="file-c",
+            project_id="project-1",
+            path="c.py",
+            language="python",
+            content_hash="h3",
+            schema_version=1,
+            varying_columns=empty_first_mismatch,
+        )
+
+
+def test_stage_reference_columns_respects_reordered_reference_schema(tmp_path: Path) -> None:
+    reversed_schema = pa.schema(list(reversed(list(LanceStore.reference_arrow_schema()))))
+    job = StagingJob(
+        tmp_path / "staging",
+        "project-1",
+        file_schema=LanceStore.file_arrow_schema(),
+        chunk_schema=LanceStore.chunk_arrow_schema(4, pa.float16()),
+        reference_schema=reversed_schema,
+        partition=PartitionRef("project-1", "slot-project-1", "project-1", 1),
+    )
+    job.begin()
+    sample = reference_row("project-1", "file-1")
+    varying_columns = tuple([getattr(sample, col)] for col in VARYING_REFERENCE_COLUMNS)
+
+    job.stage_reference_columns(
+        file_id="file-1",
+        project_id="project-1",
+        path="main.py",
+        language="python",
+        content_hash="hash",
+        schema_version=1,
+        varying_columns=varying_columns,
+    )
+    job.begin_commit(TableVersions(files=1, chunks=1, references=1))
+
+    table = pa.ipc.open_file(job.directory / REFERENCES_NAME).read_all()
+    assert table.schema.names == reversed_schema.names
+    assert table.column("reference_id").to_pylist() == ["reference-1"]
+    assert table.column("file_id").to_pylist() == ["file-1"]
+    assert table.column("schema_version").to_pylist() == [1]

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
+import queue
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -16,11 +20,13 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import psutil
 from filelock import FileLock, Timeout
 
 from . import __version__
+from . import scanner as scanner_module
 from .embedding import (
     EmbeddedSegment,
     Embedder,
@@ -72,6 +78,22 @@ from .models import (
     StoredFile,
 )
 from .models import content_digest as _digest
+from .parse_pool import (
+    ENVIRONMENT_ERROR_CODES as ENVIRONMENT_ERROR_CODES,
+)
+from .parse_pool import (
+    PARSE_BATCH_FILES,
+    PARSE_POOL_MIN_FILES,
+    ChunkTuple,
+    ParseTask,
+    ParseWorkerPool,
+    build_reference_columns,
+    process_parse_batch,
+    resolve_parse_workers,
+)
+from .parse_pool import (
+    content_rejection as _content_rejection,
+)
 from .passage_cache import PassageReuseContext
 from .progress import IndexProgress, ProgressPublisher
 from .scanner import SourceScanner
@@ -94,30 +116,23 @@ SEGMENT_TEXT_GROWTH_LIMIT = 2
 # One planning request carries its candidates' text to the worker and their
 # vectors back. Grouping keeps that round trip bounded on files that extract
 # into thousands of chunks, and keeps a retry from re-embedding the whole file.
-CANDIDATE_GROUP_CHARS = 256 * 1024
-CANDIDATE_GROUP_COUNT = 256
+CANDIDATE_GROUP_CHARS = 512 * 1024
+CANDIDATE_GROUP_COUNT = 512
 
-# Failures caused by the environment rather than by a file's own content. They
-# abort the run instead of being recorded against whichever file was in flight.
-ENVIRONMENT_ERROR_CODES = frozenset(
-    {
-        ErrorCode.MODEL_UNAVAILABLE,
-        ErrorCode.INDEX_RESOURCE_LIMIT,
-        ErrorCode.EMBEDDING_WORKER_FAILED,
-        # Strict mode's refusal to fall back is a property of the machine and
-        # the configuration, never of whichever file happened to be in flight.
-        ErrorCode.BACKEND_UNAVAILABLE,
-    }
-)
+_DEFAULT_SCANNER_ITER_SCAN = SourceScanner.iter_scan
+_DEFAULT_EXTRACTOR_EXTRACT = TreeSitterExtractor.extract
+_DEFAULT_EXTRACTOR_MAKE_CHUNK = TreeSitterExtractor._make_chunk
+_DEFAULT_READ_SOURCE = read_source
 
 
 @dataclass
 class _PendingFile:
     record: StoredFile
     chunks: list[ExtractedChunk]
-    references: list[ExtractedReference]
-    declarations: list[ExtractedDeclarationShape]
-    source_chars: int
+    references: list[ExtractedReference] = field(default_factory=list)
+    declarations: list[ExtractedDeclarationShape] = field(default_factory=list)
+    source_chars: int = 0
+    varying_reference_columns: tuple[list[Any], ...] | None = None
     error: Exception | None = None
     embedded_chunks: int = 0
     emitted_chars: int = 0
@@ -127,6 +142,74 @@ class _PendingFile:
 class _PendingCandidate:
     owner: int
     chunk: ExtractedChunk
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedWorkItem:
+    record: StoredFile
+    chunks: list[ExtractedChunk] | None
+    chunk_tuples: list[ChunkTuple] | None
+    varying_reference_columns: tuple[list[Any], ...] | None
+    source_chars: int
+    byte_count: int
+    staged_ref_count: int
+    reference_extraction_ns: int
+    chunk_count: int
+    embedding_chars: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ScanBatchEvent:
+    items: list[tuple[Any, ...]]
+    cum_scan_ns: int
+    cum_parse_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedBatchEvent:
+    files: list[_ParsedWorkItem]
+    cum_scan_ns: int
+    cum_parse_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProducerDoneEvent:
+    cum_scan_ns: int
+    cum_parse_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProducerErrorEvent:
+    error: BaseException
+    cum_scan_ns: int
+    cum_parse_ns: int
+
+
+_ProducerEvent = _ScanBatchEvent | _ParsedBatchEvent | _ProducerDoneEvent | _ProducerErrorEvent
+
+
+def _chunk_from_tuple(row: ChunkTuple) -> ExtractedChunk:
+    return ExtractedChunk.model_construct(
+        kind=row[0],
+        symbol=row[1],
+        qualified_symbol=row[2],
+        parent_symbol=row[3],
+        start_byte=row[4],
+        end_byte=row[5],
+        start_line=row[6],
+        end_line=row[7],
+        content=row[8],
+        embedding_text=row[9],
+        search_text=row[10],
+        part_index=row[11],
+        is_test=row[12],
+        embedding_prefix=row[13],
+        search_suffix=row[14],
+        source_start_byte=None,
+        source_end_byte=None,
+        original_end_byte=None,
+        source_content_hash=None,
+    )
 
 
 def _candidate_groups(
@@ -147,17 +230,6 @@ def _candidate_groups(
         characters += len(candidate.chunk.embedding_text)
     if group:
         yield group
-
-
-def _content_rejection(source: bytes) -> str | None:
-    """Return why *source* cannot be indexed, or None when it can."""
-    if b"\x00" in source:
-        return "binary"
-    try:
-        source.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return "encoding"
-    return None
 
 
 @dataclass
@@ -332,7 +404,10 @@ class _IndexScanState:
             commit_ms=commit_ms,
             fallback_count=self.fallback_count,
             peak_memory_bytes=self.peak_memory_bytes,
-            reference_extraction_duration_ms=self.reference_extraction_ns // 1_000_000,
+            reference_extraction_duration_ms=min(
+                self.reference_extraction_ns, timer.totals.get("parse", 0)
+            )
+            // 1_000_000,
             staged_reference_rows=self.staged_reference_rows,
             failed_files=len(self.errors),
             skip_reasons=self.skipped_by_reason,
@@ -431,8 +506,10 @@ class Indexer:
         progress_directory: Path | None = None,
         history: HistoryStore | None = None,
         memory_ceiling_bytes: int = 2 * 1024**3,
+        parse_workers: int = 0,
     ) -> None:
         self.memory_ceiling_bytes = memory_ceiling_bytes
+        self.parse_workers = parse_workers
         self.store = store
         self.scanner = scanner
         self.extractor = extractor
@@ -445,6 +522,35 @@ class Indexer:
         self.staging_directory = staging_directory or lock_directory.parent / "staging"
         self.progress_directory = progress_directory or lock_directory.parent / "progress"
         self.history = history
+
+    def _can_use_parse_pool(self) -> bool:
+        """Whether this run can safely offload read/parse work to spawned workers."""
+        if multiprocessing.current_process().daemon:
+            return False
+        if resolve_parse_workers(self.parse_workers, self.memory_ceiling_bytes) <= 1:
+            return False
+        if (
+            type(self.scanner) is not SourceScanner
+            or type(self.extractor) is not TreeSitterExtractor
+        ):
+            return False
+        if getattr(scanner_module, "read_source", None) is not getattr(
+            scanner_module, "_default_read_source", None
+        ):
+            return False
+        if read_source is not _DEFAULT_READ_SOURCE:
+            return False
+        if (
+            "iter_scan" in self.scanner.__dict__
+            or type(self.scanner).iter_scan is not _DEFAULT_SCANNER_ITER_SCAN
+        ):
+            return False
+        if "extract" in self.extractor.__dict__ or "_make_chunk" in self.extractor.__dict__:
+            return False
+        return (
+            TreeSitterExtractor.extract is _DEFAULT_EXTRACTOR_EXTRACT
+            and TreeSitterExtractor._make_chunk is _DEFAULT_EXTRACTOR_MAKE_CHUNK
+        )
 
     def index(
         self,
@@ -1006,8 +1112,14 @@ class Indexer:
                         # up as "missing" -- and being misreported as
                         # `parse_error` -- on every future backfill and query
                         # (S10).
-                        staging_job().stage_references(
-                            self._reference_rows(project.id, record, [], [])
+                        staging_job().stage_reference_columns(
+                            file_id=record.file_id,
+                            project_id=project.id,
+                            path=record.path,
+                            language=record.language,
+                            content_hash=record.content_hash,
+                            schema_version=REFERENCE_SCHEMA_VERSION,
+                            varying_columns=build_reference_columns(record.file_id, [], []),
                         )
                         staging_job().mark_references_replaced(record.file_id)
                         files_backfilled += 1
@@ -1062,13 +1174,18 @@ class Indexer:
                     staging_job().mark_references_replaced(record.file_id)
                     incomplete_paths.append(record.path)
                     continue
-                staging_job().stage_references(
-                    self._reference_rows(
-                        project.id,
-                        record,
+                staging_job().stage_reference_columns(
+                    file_id=record.file_id,
+                    project_id=project.id,
+                    path=record.path,
+                    language=record.language,
+                    content_hash=record.content_hash,
+                    schema_version=REFERENCE_SCHEMA_VERSION,
+                    varying_columns=build_reference_columns(
+                        record.file_id,
                         extraction.references,
                         extraction.declarations,
-                    )
+                    ),
                 )
                 staging_job().mark_references_replaced(record.file_id)
                 files_backfilled += 1
@@ -1446,7 +1563,8 @@ class Indexer:
         passage_reuse: PassageReuseContext | None,
     ) -> dict[str, object]:
         """Collect live runtime counters and backend telemetry for progress snapshots."""
-
+        parse_ns = timer.totals.get("parse", 0)
+        reference_extraction_ns = min(state.reference_extraction_ns, parse_ns)
         return {
             "parsed_files": state.parsed,
             "failed_files": len(state.errors),
@@ -1467,7 +1585,7 @@ class Indexer:
                 "parse": timer.milliseconds("parse"),
                 "embed": timer.milliseconds("embed"),
                 "commit": timer.milliseconds("commit"),
-                "reference_extraction": state.reference_extraction_ns // 1_000_000,
+                "reference_extraction": reference_extraction_ns // 1_000_000,
             },
             "recent_errors": state.errors[-10:],
         }
@@ -1580,13 +1698,23 @@ class Indexer:
                     # offsets are unsafe. Retire any previous reference generation.
                     job.mark_references_replaced(target.record.file_id)
                 else:
-                    job.stage_references(
-                        self._reference_rows(
-                            project.id,
-                            target.record,
+                    varying_cols = (
+                        target.varying_reference_columns
+                        if target.varying_reference_columns is not None
+                        else build_reference_columns(
+                            target.record.file_id,
                             target.references,
                             target.declarations,
                         )
+                    )
+                    job.stage_reference_columns(
+                        file_id=target.record.file_id,
+                        project_id=project.id,
+                        path=target.record.path,
+                        language=target.record.language,
+                        content_hash=target.record.content_hash,
+                        schema_version=REFERENCE_SCHEMA_VERSION,
+                        varying_columns=varying_cols,
                     )
                     job.mark_references_replaced(target.record.file_id)
                 state.indexed += 1
@@ -1602,182 +1730,455 @@ class Indexer:
         )
         state.clear_pending()
 
-    def _process_scanned_file(
-        self,
-        project: ProjectInfo,
+    @staticmethod
+    def _is_stat_unchanged(
+        previous: StoredFile | None,
         item: ScannedFile,
-        existing: dict[str, StoredFile],
+        rel_posix: str,
         *,
         force: bool,
-        passage_embedder: PassageEmbedder,
-        progress: ProgressPublisher,
-        timer: _PhaseTimer,
-        process: psutil.Process,
-        state: _IndexScanState,
-        passage_reuse: PassageReuseContext | None = None,
-        verify_paths: frozenset[str] = frozenset(),
-        verify_all: bool = False,
-    ) -> None:
-        path = item.path.as_posix()
-        previous = existing.get(path)
-        # A file whose last replacement genuinely failed is retried (bounded by
-        # MAX_FAILED_ATTEMPTS) instead of trusting its size/mtime or content
-        # hash: the failure stored the old hash with the new metadata.
-        retrying = _is_retryable_failure(previous)
-        if (
+        retrying: bool,
+        verify_paths: frozenset[str],
+        verify_all: bool,
+    ) -> bool:
+        return (
             not force
             and not retrying
             and not verify_all
-            and path not in verify_paths
+            and rel_posix not in verify_paths
             and previous is not None
             and previous.size == item.size
             and previous.mtime_ns == item.mtime_ns
             and previous.language == item.language
             and not _is_racy(previous)
-        ):
-            # Size and mtime alone trusted the filesystem's version of a
-            # branch switch or reset: identical metadata can hide different
-            # content. Paths the validation plan named -- every path after a
-            # HEAD advance it could not diff, and Git's current dirty and
-            # untracked paths -- fall through to the content-hash comparison
-            # below instead, which reuses stored generations byte-for-byte.
-            state.unchanged += 1
-            return
+        )
 
-        content_hash: str | None = None
-        record: StoredFile | None = None
-        try:
-            with timer.measure("scan"):
-                source = (
-                    item.content
-                    if item.content is not None
-                    else read_source(project.root, item.path, project.scan.max_file_bytes)[0]
-                )
-                state.bytes_read += len(source)
-                rejection = _content_rejection(source)
-                content_hash = _digest(source)
-            if rejection is not None:
-                # A tombstone makes rejected content converge to unchanged on later
-                # scans while carrying no chunks or structural rows.
-                rejected_record = StoredFile(
-                    file_id=_digest(f"{project.id}\0{path}"),
+    def _produce_scan_events(
+        self,
+        *,
+        project: ProjectInfo,
+        existing: dict[str, StoredFile],
+        force: bool,
+        verify_paths: frozenset[str],
+        verify_all: bool,
+        guard: _GitGuard | None,
+        use_pool: bool,
+        work_queue: queue.Queue[_ProducerEvent],
+        stop_event: threading.Event,
+    ) -> None:
+        """Background producer scanning, reading, and extracting while embedding runs."""
+        cum_scan_ns = 0
+        cum_parse_ns = 0
+        scan_events: list[tuple[Any, ...]] = []
+        parsed_batch: list[_ParsedWorkItem] = []
+        parsed_chunks = 0
+        parsed_chars = 0
+        last_scan_emit = time.monotonic()
+        pool: ParseWorkerPool | None = None
+        stream: Iterator[ScannedFile | SkippedFile] | None = None
+        aborted = False
+
+        def put_event(event: _ProducerEvent) -> bool:
+            while not stop_event.is_set():
+                try:
+                    work_queue.put(event, timeout=0.05)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def flush_scan_events() -> None:
+            nonlocal scan_events, last_scan_emit
+            if scan_events:
+                events, scan_events = scan_events, []
+                last_scan_emit = time.monotonic()
+                put_event(_ScanBatchEvent(events, cum_scan_ns, cum_parse_ns))
+
+        def add_scan_event(entry: tuple[Any, ...]) -> None:
+            scan_events.append(entry)
+            if len(scan_events) >= 32 or time.monotonic() - last_scan_emit >= 0.05:
+                flush_scan_events()
+
+        def emit_parsed_batch() -> None:
+            nonlocal parsed_batch, parsed_chunks, parsed_chars
+            flush_scan_events()
+            if parsed_batch:
+                batch = parsed_batch
+                parsed_batch = []
+                parsed_chunks = 0
+                parsed_chars = 0
+                put_event(_ParsedBatchEvent(batch, cum_scan_ns, cum_parse_ns))
+
+        def queue_parsed_item(item: _ParsedWorkItem) -> None:
+            nonlocal parsed_chunks, parsed_chars
+            group_count = CANDIDATE_GROUP_COUNT
+            group_chars = CANDIDATE_GROUP_CHARS
+            if parsed_batch and (
+                len(parsed_batch) >= group_count
+                or parsed_chunks + item.chunk_count > group_count
+                or parsed_chars + item.embedding_chars > group_chars
+            ):
+                emit_parsed_batch()
+            parsed_batch.append(item)
+            parsed_chunks += item.chunk_count
+            parsed_chars += item.embedding_chars
+
+        def consume_worker_results(results: list[tuple[Any, ...]]) -> None:
+            for outcome in results:
+                tag = outcome[0]
+                if tag == "fatal_error":
+                    _, code_str, message, details = outcome
+                    raise CodeIndexingError(ErrorCode(code_str), message, **details)
+                if tag == "read_skip":
+                    _, rel_posix, reason, _detail = outcome
+                    add_scan_event(("skip", rel_posix, reason))
+                    continue
+                if tag in {"rejected", "unchanged_hash", "extract_error"}:
+                    add_scan_event(outcome)
+                    continue
+                (
+                    _,
+                    rel_posix,
+                    language,
+                    size,
+                    mtime_ns,
+                    content_hash,
+                    file_id,
+                    byte_count,
+                    has_errors,
+                    chunks_tuples,
+                    varying_columns,
+                    staged_ref_count,
+                    _parse_ns,
+                    ref_ns,
+                ) = outcome
+                embedding_chars = sum(len(row[9]) for row in chunks_tuples)
+                source_chars = sum(len(row[8]) for row in chunks_tuples)
+                record = StoredFile(
+                    file_id=file_id,
                     project_id=project.id,
-                    path=path,
+                    path=rel_posix,
+                    language=language,
+                    size=size,
+                    mtime_ns=mtime_ns,
+                    content_hash=content_hash,
+                    has_errors=has_errors,
+                    indexed_at=time.time_ns(),
+                )
+                queue_parsed_item(
+                    _ParsedWorkItem(
+                        record=record,
+                        chunks=None,
+                        chunk_tuples=chunks_tuples,
+                        varying_reference_columns=varying_columns,
+                        source_chars=source_chars,
+                        byte_count=byte_count,
+                        staged_ref_count=staged_ref_count,
+                        reference_extraction_ns=ref_ns,
+                        chunk_count=len(chunks_tuples),
+                        embedding_chars=embedding_chars,
+                    )
+                )
+
+        def run_pool(scan_stream: Iterator[ScannedFile | SkippedFile]) -> None:
+            nonlocal cum_scan_ns, cum_parse_ns, pool
+            workers = resolve_parse_workers(self.parse_workers, self.memory_ceiling_bytes)
+            root_resolved = project.root.resolve()
+            max_file_bytes = project.scan.max_file_bytes
+            warmup_buffer: list[ParseTask] = []
+            batch_buffer: list[ParseTask] = []
+
+            def drain_ready() -> None:
+                nonlocal cum_parse_ns
+                if pool is None:
+                    return
+                while not stop_event.is_set():
+                    t0 = time.monotonic_ns()
+                    ready = pool.try_drain_one()
+                    cum_parse_ns += time.monotonic_ns() - t0
+                    if ready is None:
+                        break
+                    consume_worker_results(ready)
+
+            def drain_for_capacity() -> None:
+                nonlocal cum_parse_ns
+                if pool is None:
+                    return
+                while pool.pending_count >= pool.max_in_flight and not stop_event.is_set():
+                    t0 = time.monotonic_ns()
+                    batch = pool.drain_one(stop_event)
+                    cum_parse_ns += time.monotonic_ns() - t0
+                    if batch is None:
+                        break
+                    consume_worker_results(batch)
+
+            while not stop_event.is_set():
+                t_scan = time.monotonic_ns()
+                item = next(scan_stream, None)
+                cum_scan_ns += time.monotonic_ns() - t_scan
+                if item is None:
+                    break
+                if isinstance(item, SkippedFile):
+                    add_scan_event(("skip", item.path.as_posix(), item.reason))
+                    drain_ready()
+                    continue
+                rel_posix = item.path.as_posix()
+                previous = existing.get(rel_posix)
+                retrying = _is_retryable_failure(previous)
+                if self._is_stat_unchanged(
+                    previous,
+                    item,
+                    rel_posix,
+                    force=force,
+                    retrying=retrying,
+                    verify_paths=verify_paths,
+                    verify_all=verify_all,
+                ):
+                    add_scan_event(("unchanged", rel_posix))
+                    drain_ready()
+                    continue
+                task: ParseTask = (
+                    rel_posix,
+                    item.language,
+                    previous.content_hash if previous is not None else None,
+                    previous.language if previous is not None else None,
+                    force,
+                    retrying,
+                )
+                if pool is None:
+                    warmup_buffer.append(task)
+                    if len(warmup_buffer) >= PARSE_POOL_MIN_FILES:
+                        t_pool = time.monotonic_ns()
+                        pool = ParseWorkerPool(
+                            workers,
+                            max_chars=self.extractor.max_chars,
+                            max_lines=self.extractor.max_lines,
+                            overlap_lines=self.extractor.overlap_lines,
+                        )
+                        cum_parse_ns += time.monotonic_ns() - t_pool
+                        for offset in range(0, len(warmup_buffer), PARSE_BATCH_FILES):
+                            chunk = warmup_buffer[offset : offset + PARSE_BATCH_FILES]
+                            if len(chunk) == PARSE_BATCH_FILES:
+                                t_sub = time.monotonic_ns()
+                                pool.submit(root_resolved, max_file_bytes, project.id, chunk)
+                                cum_parse_ns += time.monotonic_ns() - t_sub
+                                drain_for_capacity()
+                            else:
+                                batch_buffer.extend(chunk)
+                        warmup_buffer.clear()
+                else:
+                    batch_buffer.append(task)
+                    if len(batch_buffer) >= PARSE_BATCH_FILES:
+                        t_sub = time.monotonic_ns()
+                        pool.submit(root_resolved, max_file_bytes, project.id, batch_buffer)
+                        cum_parse_ns += time.monotonic_ns() - t_sub
+                        batch_buffer.clear()
+                        drain_ready()
+                        drain_for_capacity()
+
+            if stop_event.is_set():
+                return
+
+            if pool is None:
+                if warmup_buffer:
+                    t_total = time.monotonic_ns()
+                    results = process_parse_batch(
+                        root_resolved,
+                        max_file_bytes,
+                        project.id,
+                        warmup_buffer,
+                        self.extractor,
+                    )
+                    elapsed = time.monotonic_ns() - t_total
+                    parse_part = sum(row[12] for row in results if row[0] == "parsed")
+                    bounded_parse = min(elapsed, parse_part)
+                    cum_parse_ns += bounded_parse
+                    cum_scan_ns += max(0, elapsed - bounded_parse)
+                    consume_worker_results(results)
+            else:
+                if batch_buffer:
+                    t_sub = time.monotonic_ns()
+                    pool.submit(root_resolved, max_file_bytes, project.id, batch_buffer)
+                    cum_parse_ns += time.monotonic_ns() - t_sub
+                    batch_buffer.clear()
+                while pool.pending_count > 0 and not stop_event.is_set():
+                    t_drain = time.monotonic_ns()
+                    batch = pool.drain_one(stop_event)
+                    cum_parse_ns += time.monotonic_ns() - t_drain
+                    if batch is None:
+                        break
+                    consume_worker_results(batch)
+
+        def run_in_process(scan_stream: Iterator[ScannedFile | SkippedFile]) -> None:
+            nonlocal cum_scan_ns, cum_parse_ns
+            while not stop_event.is_set():
+                t_scan = time.monotonic_ns()
+                item = next(scan_stream, None)
+                cum_scan_ns += time.monotonic_ns() - t_scan
+                if item is None:
+                    break
+                if isinstance(item, SkippedFile):
+                    add_scan_event(("skip", item.path.as_posix(), item.reason))
+                    continue
+                rel_posix = item.path.as_posix()
+                previous = existing.get(rel_posix)
+                retrying = _is_retryable_failure(previous)
+                if self._is_stat_unchanged(
+                    previous,
+                    item,
+                    rel_posix,
+                    force=force,
+                    retrying=retrying,
+                    verify_paths=verify_paths,
+                    verify_all=verify_all,
+                ):
+                    add_scan_event(("unchanged", rel_posix))
+                    continue
+                content_hash: str | None = None
+                source: bytes | None = None
+                t_read = time.monotonic_ns()
+                try:
+                    source = (
+                        item.content
+                        if item.content is not None
+                        else read_source(project.root, item.path, project.scan.max_file_bytes)[0]
+                    )
+                    rejection = _content_rejection(source)
+                    content_hash = _digest(source)
+                except Exception as exc:
+                    cum_scan_ns += time.monotonic_ns() - t_read
+                    if isinstance(exc, CodeIndexingError) and exc.code in ENVIRONMENT_ERROR_CODES:
+                        raise
+                    add_scan_event(
+                        (
+                            "extract_error",
+                            rel_posix,
+                            item.language,
+                            item.size,
+                            item.mtime_ns,
+                            content_hash,
+                            len(source) if source is not None else 0,
+                            str(exc),
+                        )
+                    )
+                    continue
+                cum_scan_ns += time.monotonic_ns() - t_read
+
+                if rejection is not None:
+                    add_scan_event(
+                        (
+                            "rejected",
+                            rel_posix,
+                            item.language,
+                            item.size,
+                            item.mtime_ns,
+                            content_hash,
+                            rejection,
+                            len(source),
+                        )
+                    )
+                    continue
+                if (
+                    not force
+                    and not retrying
+                    and previous is not None
+                    and previous.content_hash == content_hash
+                    and previous.language == item.language
+                ):
+                    add_scan_event(
+                        (
+                            "unchanged_hash",
+                            rel_posix,
+                            item.language,
+                            item.size,
+                            item.mtime_ns,
+                            content_hash,
+                            len(source),
+                        )
+                    )
+                    continue
+
+                file_id = _digest(f"{project.id}\0{rel_posix}")
+                t_parse = time.monotonic_ns()
+                try:
+                    extraction = self.extractor.extract(item.path, item.language, source)
+                    check_parent_memory_budget()
+                    if not extraction.has_errors:
+                        varying_columns: tuple[list[Any], ...] | None = build_reference_columns(
+                            file_id, extraction.references, extraction.declarations
+                        )
+                        staged_ref_count = len(extraction.references)
+                    else:
+                        varying_columns = None
+                        staged_ref_count = 0
+                except Exception as exc:
+                    cum_parse_ns += time.monotonic_ns() - t_parse
+                    if isinstance(exc, CodeIndexingError) and exc.code in ENVIRONMENT_ERROR_CODES:
+                        raise
+                    add_scan_event(
+                        (
+                            "extract_error",
+                            rel_posix,
+                            item.language,
+                            item.size,
+                            item.mtime_ns,
+                            content_hash,
+                            len(source),
+                            str(exc),
+                        )
+                    )
+                    continue
+                cum_parse_ns += time.monotonic_ns() - t_parse
+
+                record = StoredFile(
+                    file_id=file_id,
+                    project_id=project.id,
+                    path=rel_posix,
                     language=item.language,
                     size=item.size,
                     mtime_ns=item.mtime_ns,
                     content_hash=content_hash,
-                    has_errors=True,
-                    error=f"rejected: {rejection}",
+                    has_errors=extraction.has_errors,
                     indexed_at=time.time_ns(),
                 )
-                with timer.measure("commit"):
-                    job = self._staging_job(project, state)
-                    job.stage_file(rejected_record)
-                    if previous is not None:
-                        job.mark_replaced(rejected_record.file_id)
-                        job.mark_references_replaced(rejected_record.file_id)
-                state.record_skip(path, rejection)
-                return
-            if (
-                not force
-                and not retrying
-                and previous is not None
-                and previous.content_hash == content_hash
-                and previous.language == item.language
-            ):
-                racy = _is_racy(previous)
-                if previous.size == item.size and previous.mtime_ns == item.mtime_ns and not racy:
-                    # Content, stat metadata, and raciness status are already
-                    # identical to the stored row: skip StagingJob creation so
-                    # no-op runs on dirty/untracked files never bump table versions.
-                    state.unchanged += 1
-                    return
-                with timer.measure("commit"):
-                    # A racy row is restamped so it stops being racy once the
-                    # window has passed, instead of being re-hashed forever.
-                    restamp = {"indexed_at": time.time_ns()} if racy else {}
-                    self._staging_job(project, state).stage_file(
-                        previous.model_copy(
-                            update={"size": item.size, "mtime_ns": item.mtime_ns, **restamp}
-                        )
+                queue_parsed_item(
+                    _ParsedWorkItem(
+                        record=record,
+                        chunks=extraction.chunks,
+                        chunk_tuples=None,
+                        varying_reference_columns=varying_columns,
+                        source_chars=sum(len(chunk.content) for chunk in extraction.chunks),
+                        byte_count=len(source),
+                        staged_ref_count=staged_ref_count,
+                        reference_extraction_ns=extraction.reference_extraction_ns,
+                        chunk_count=len(extraction.chunks),
+                        embedding_chars=sum(
+                            len(chunk.embedding_text) for chunk in extraction.chunks
+                        ),
                     )
-                state.metadata_only += 1
-                return
-            record = StoredFile(
-                file_id=_digest(f"{project.id}\0{path}"),
-                project_id=project.id,
-                path=path,
-                language=item.language,
-                size=item.size,
-                mtime_ns=item.mtime_ns,
-                content_hash=content_hash,
-                indexed_at=time.time_ns(),
-            )
-            with timer.measure("parse"):
-                extraction = self.extractor.extract(item.path, item.language, source)
-                check_parent_memory_budget()
-            state.parsed += 1
-            state.chunks_extracted += len(extraction.chunks)
-            state.reference_extraction_ns += extraction.reference_extraction_ns
-            state.staged_reference_rows += len(extraction.references)
-            source_chars = sum(len(chunk.content) for chunk in extraction.chunks)
-        except Exception as exc:
-            if isinstance(exc, CodeIndexingError) and exc.code in ENVIRONMENT_ERROR_CODES:
-                # Environment failures must abort the run rather than poison the
-                # file that happened to be active.
-                raise
-            failed_record = record or StoredFile(
-                file_id=_digest(f"{project.id}\0{path}"),
-                project_id=project.id,
-                path=path,
-                language=item.language,
-                size=item.size,
-                mtime_ns=item.mtime_ns,
-                content_hash=(
-                    content_hash
-                    if content_hash is not None
-                    else previous.content_hash
-                    if previous is not None
-                    else ""
-                ),
-                indexed_at=time.time_ns(),
-            )
-            with timer.measure("commit"):
-                self._stage_file_failure(project, existing, state, failed_record, exc)
-        else:
-            # This block sits outside the except above on purpose. The flush
-            # has already staged chunk rows for the pending files when it can
-            # fail, so swallowing its failure as this file's error would leave
-            # those files queued and re-stage them after other files --
-            # splitting one file across batches (or duplicating its rows).
-            # Flush failures must abort the run with their own error.
-            if state.pending and (
-                len(state.pending) >= CANDIDATE_GROUP_COUNT
-                or state.pending_chunks + len(extraction.chunks) > CANDIDATE_GROUP_COUNT
-                or state.pending_chars
-                + sum(len(chunk.embedding_text) for chunk in extraction.chunks)
-                > CANDIDATE_GROUP_CHARS
-            ):
-                self._flush_pending(
-                    project,
-                    existing,
-                    passage_embedder,
-                    progress,
-                    timer,
-                    process,
-                    state,
-                    passage_reuse,
                 )
-            state.add_pending(
-                _PendingFile(
-                    record=record.model_copy(update={"has_errors": extraction.has_errors}),
-                    chunks=extraction.chunks,
-                    references=extraction.references,
-                    declarations=extraction.declarations,
-                    source_chars=source_chars,
-                )
-            )
+
+        try:
+            stream = self._iter_scan(project, existing, read_contents=not use_pool, guard=guard)
+            if use_pool:
+                run_pool(stream)
+            else:
+                run_in_process(stream)
+            if not stop_event.is_set():
+                emit_parsed_batch()
+                put_event(_ProducerDoneEvent(cum_scan_ns, cum_parse_ns))
+        except BaseException as exc:
+            aborted = True
+            if not stop_event.is_set():
+                put_event(_ProducerErrorEvent(exc, cum_scan_ns, cum_parse_ns))
+        finally:
+            if pool is not None:
+                pool.close(abort=aborted or stop_event.is_set())
+            if stream is not None:
+                close_fn = getattr(stream, "close", None)
+                if callable(close_fn):
+                    with contextlib.suppress(Exception):
+                        close_fn()
 
     def _index_scan(
         self,
@@ -1803,49 +2204,229 @@ class Indexer:
         state = _IndexScanState(partition=partition, guard=guard)
         process = psutil.Process()
         state.sample_memory(process)
-        stream = self._iter_scan(project, existing, guard=guard)
+
+        work_queue: queue.Queue[_ProducerEvent] = queue.Queue(maxsize=4)
+        stop_event = threading.Event()
+        use_pool = self._can_use_parse_pool()
+        context = contextvars.copy_context()
+        producer = threading.Thread(
+            target=context.run,
+            args=(
+                lambda: self._produce_scan_events(
+                    project=project,
+                    existing=existing,
+                    force=force,
+                    verify_paths=verify_paths,
+                    verify_all=verify_all,
+                    guard=guard,
+                    use_pool=use_pool,
+                    work_queue=work_queue,
+                    stop_event=stop_event,
+                ),
+            ),
+            name="index-scan-producer",
+            daemon=True,
+        )
+        producer.start()
+
+        accounted_scan_ns = 0
+        accounted_parse_ns = 0
+
+        def attribute_wait(wait_ns: int, cum_scan_ns: int, cum_parse_ns: int) -> None:
+            nonlocal accounted_scan_ns, accounted_parse_ns
+            scan_delta = max(0, cum_scan_ns - accounted_scan_ns)
+            parse_delta = max(0, cum_parse_ns - accounted_parse_ns)
+            accounted_scan_ns = max(accounted_scan_ns, cum_scan_ns)
+            accounted_parse_ns = max(accounted_parse_ns, cum_parse_ns)
+            total_delta = scan_delta + parse_delta
+            if total_delta > 0:
+                scan_share = (wait_ns * scan_delta) // total_delta
+                parse_share = wait_ns - scan_share
+                timer.totals["scan"] = timer.totals.get("scan", 0) + scan_share
+                timer.totals["parse"] = timer.totals.get("parse", 0) + parse_share
+            else:
+                timer.totals["scan"] = timer.totals.get("scan", 0) + wait_ns
+
+        def apply_scan_entry(entry: tuple[Any, ...]) -> str | None:
+            kind = entry[0]
+            state.candidates_seen += 1
+            if kind == "skip":
+                _, rel_posix, reason = entry
+                state.record_skip(rel_posix, reason)
+                return None
+            if kind == "unchanged":
+                _, rel_posix = entry
+                state.current_paths.add(rel_posix)
+                state.unchanged += 1
+                return str(rel_posix)
+            if kind == "rejected":
+                _, rel_posix, language, size, mtime_ns, content_hash, rejection, byte_count = entry
+                state.current_paths.add(rel_posix)
+                state.bytes_read += byte_count
+                previous = existing.get(rel_posix)
+                rejected_record = StoredFile(
+                    file_id=_digest(f"{project.id}\0{rel_posix}"),
+                    project_id=project.id,
+                    path=rel_posix,
+                    language=language,
+                    size=size,
+                    mtime_ns=mtime_ns,
+                    content_hash=content_hash,
+                    has_errors=True,
+                    error=f"rejected: {rejection}",
+                    indexed_at=time.time_ns(),
+                )
+                with timer.measure("commit"):
+                    job = self._staging_job(project, state)
+                    job.stage_file(rejected_record)
+                    if previous is not None:
+                        job.mark_replaced(rejected_record.file_id)
+                        job.mark_references_replaced(rejected_record.file_id)
+                state.record_skip(rel_posix, rejection)
+                return str(rel_posix)
+            if kind == "unchanged_hash":
+                _, rel_posix, _language, size, mtime_ns, _content_hash, byte_count = entry
+                state.current_paths.add(rel_posix)
+                state.bytes_read += byte_count
+                previous = existing.get(rel_posix)
+                assert previous is not None
+                racy = _is_racy(previous)
+                if previous.size == size and previous.mtime_ns == mtime_ns and not racy:
+                    state.unchanged += 1
+                else:
+                    with timer.measure("commit"):
+                        restamp = {"indexed_at": time.time_ns()} if racy else {}
+                        self._staging_job(project, state).stage_file(
+                            previous.model_copy(
+                                update={"size": size, "mtime_ns": mtime_ns, **restamp}
+                            )
+                        )
+                    state.metadata_only += 1
+                return str(rel_posix)
+            if kind == "extract_error":
+                _, rel_posix, language, size, mtime_ns, content_hash, byte_count, message = entry
+                state.current_paths.add(rel_posix)
+                state.bytes_read += byte_count
+                previous = existing.get(rel_posix)
+                failed_record = StoredFile(
+                    file_id=_digest(f"{project.id}\0{rel_posix}"),
+                    project_id=project.id,
+                    path=rel_posix,
+                    language=language,
+                    size=size,
+                    mtime_ns=mtime_ns,
+                    content_hash=(
+                        content_hash
+                        if content_hash is not None
+                        else previous.content_hash
+                        if previous is not None
+                        else ""
+                    ),
+                    indexed_at=time.time_ns(),
+                )
+                with timer.measure("commit"):
+                    self._stage_file_failure(
+                        project, existing, state, failed_record, RuntimeError(message)
+                    )
+                return str(rel_posix)
+            raise RuntimeError(f"Unexpected scan entry kind: {kind!r}")
+
+        def live_telemetry_fields() -> dict[str, object]:
+            return self._live_telemetry(state, timer, passage_embedder, passage_reuse)
+
         try:
             while True:
-                with timer.measure("scan"):
-                    item = next(stream, None)
-                if item is None:
+                wait_started = time.monotonic_ns()
+                event = work_queue.get()
+                wait_ns = time.monotonic_ns() - wait_started
+                attribute_wait(wait_ns, event.cum_scan_ns, event.cum_parse_ns)
+                if isinstance(event, _ProducerDoneEvent):
                     break
-                state.candidates_seen += 1
-                if isinstance(item, SkippedFile):
-                    state.record_skip(item.path.as_posix(), item.reason)
+                if isinstance(event, _ProducerErrorEvent):
+                    raise event.error
+                if isinstance(event, _ScanBatchEvent):
+                    for entry in event.items:
+                        current_path = apply_scan_entry(entry)
+                        if current_path is None:
+                            progress.update(
+                                phase="scanning",
+                                candidates_seen=state.candidates_seen,
+                                skipped_total=state.skipped,
+                                skipped_by_reason=state.skipped_by_reason,
+                                current_path=None,
+                            )
+                        else:
+                            progress.update(
+                                phase="scanning",
+                                candidates_seen=state.candidates_seen,
+                                eligible_files=len(state.current_paths),
+                                unchanged_files=state.unchanged,
+                                skipped_total=state.skipped,
+                                skipped_by_reason=state.skipped_by_reason,
+                                current_path=current_path,
+                                force=False,
+                                lazy_fields=live_telemetry_fields,
+                            )
+                else:
+                    last_path: str | None = None
+                    for item in event.files:
+                        state.candidates_seen += 1
+                        state.current_paths.add(item.record.path)
+                        state.bytes_read += item.byte_count
+                        state.parsed += 1
+                        state.chunks_extracted += item.chunk_count
+                        state.reference_extraction_ns += item.reference_extraction_ns
+                        state.staged_reference_rows += item.staged_ref_count
+                        last_path = item.record.path
+                        chunks = (
+                            item.chunks
+                            if item.chunks is not None
+                            else [_chunk_from_tuple(row) for row in item.chunk_tuples or ()]
+                        )
+                        if state.pending and (
+                            len(state.pending) >= CANDIDATE_GROUP_COUNT
+                            or state.pending_chunks + len(chunks) > CANDIDATE_GROUP_COUNT
+                            or state.pending_chars + item.embedding_chars > CANDIDATE_GROUP_CHARS
+                        ):
+                            self._flush_pending(
+                                project,
+                                existing,
+                                passage_embedder,
+                                progress,
+                                timer,
+                                process,
+                                state,
+                                passage_reuse,
+                            )
+                        state.add_pending(
+                            _PendingFile(
+                                record=item.record,
+                                chunks=chunks,
+                                source_chars=item.source_chars,
+                                varying_reference_columns=item.varying_reference_columns,
+                            )
+                        )
                     progress.update(
                         phase="scanning",
                         candidates_seen=state.candidates_seen,
+                        eligible_files=len(state.current_paths),
+                        unchanged_files=state.unchanged,
                         skipped_total=state.skipped,
                         skipped_by_reason=state.skipped_by_reason,
-                        current_path=None,
+                        current_path=last_path,
+                        force=False,
+                        lazy_fields=live_telemetry_fields,
                     )
-                    continue
-                path = item.path.as_posix()
-                state.current_paths.add(path)
-                progress.update(
-                    phase="scanning",
-                    candidates_seen=state.candidates_seen,
-                    eligible_files=len(state.current_paths),
-                    unchanged_files=state.unchanged,
-                    current_path=path,
-                    force=False,
-                    **self._live_telemetry(state, timer, passage_embedder, passage_reuse),
-                )
-                self._process_scanned_file(
-                    project,
-                    item,
-                    existing,
-                    force=force,
-                    passage_embedder=passage_embedder,
-                    progress=progress,
-                    timer=timer,
-                    process=process,
-                    state=state,
-                    passage_reuse=passage_reuse,
-                    verify_paths=verify_paths,
-                    verify_all=verify_all,
-                )
+                    self._flush_pending(
+                        project,
+                        existing,
+                        passage_embedder,
+                        progress,
+                        timer,
+                        process,
+                        state,
+                        passage_reuse,
+                    )
 
             self._flush_pending(
                 project,
@@ -1901,11 +2482,26 @@ class Indexer:
                         scanned_git=guard.state if guard is not None else None,
                     )
         except BaseException:
+            stop_event.set()
             # Discard staged bytes unless a failed rollback left a committing
             # journal that startup recovery still needs.
             if state.job is not None:
                 state.job.discard()
             raise
+        finally:
+            stop_event.set()
+            while producer.is_alive():
+                with contextlib.suppress(queue.Empty):
+                    while True:
+                        work_queue.get_nowait()
+                producer.join(timeout=0.05)
+            with contextlib.suppress(queue.Empty):
+                while True:
+                    work_queue.get_nowait()
+            producer.join()
+        state.reference_extraction_ns = min(
+            state.reference_extraction_ns, timer.totals.get("parse", 0)
+        )
         return state.to_report(project.id, timer, self.batch_size)
 
     def _derive_index_state(

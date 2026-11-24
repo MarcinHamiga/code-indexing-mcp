@@ -15,7 +15,9 @@ from code_indexing_mcp.source_io import (
     PinnedDirectoryCache,
     SourceReadError,
     checked_source_stat,
+    open_source,
     read_source,
+    read_source_direct,
 )
 
 
@@ -330,3 +332,225 @@ def test_pinned_directory_cache_recovers_when_a_pinned_directory_is_recreated(
         (root / "gen" / "two.py").unlink()
         with pytest.raises(FileNotFoundError):
             read_source(root, Path("gen/two.py"), 1024, expected_stat=st_two, directory_cache=cache)
+
+
+@pytest.mark.parametrize("size", [0, 128, 128 * 1024])
+def test_read_source_uses_single_os_read_for_small_and_128k_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    payload = b"x" * size
+    (tmp_path / "source.py").write_bytes(payload)
+    original_read = os.read
+    calls: list[int] = []
+
+    def counting_read(descriptor: int, count: int) -> bytes:
+        calls.append(count)
+        return original_read(descriptor, count)
+
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.read", counting_read)
+
+    content, info = read_source(tmp_path, Path("source.py"), 1024 * 1024)
+
+    assert content == payload
+    assert info.st_size == size
+    assert len(calls) == 1
+
+
+def test_read_source_handles_partial_reads_via_slow_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"abcdef" * 100
+    (tmp_path / "source.py").write_bytes(payload)
+    original_read = os.read
+    calls: list[int] = []
+
+    def partial_first_read(descriptor: int, count: int) -> bytes:
+        calls.append(count)
+        if len(calls) == 1:
+            return original_read(descriptor, min(count, 100))
+        return original_read(descriptor, count)
+
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.read", partial_first_read)
+
+    content, info = read_source(tmp_path, Path("source.py"), 1024 * 1024)
+
+    assert content == payload
+    assert info.st_size == len(payload)
+    assert len(calls) >= 2
+
+
+def test_read_source_single_shot_catches_changed_during_read_and_oversized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_bytes(b"hello")
+    original_read = os.read
+
+    def mutate_same_size_after_read(descriptor: int, count: int) -> bytes:
+        data = original_read(descriptor, count)
+        source.write_bytes(b"world")
+        stat_result = source.stat()
+        os.utime(source, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1_000_000))
+        return data
+
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.read", mutate_same_size_after_read)
+    with pytest.raises(SourceReadError, match="changed_during_read"):
+        read_source(tmp_path, Path("source.py"), 1024)
+
+    grew = False
+
+    def grow_within_limit_before_read(descriptor: int, count: int) -> bytes:
+        nonlocal grew
+        if not grew:
+            grew = True
+            with source.open("ab") as writer:
+                writer.write(b"!")
+        return original_read(descriptor, count)
+
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.read", grow_within_limit_before_read)
+    with pytest.raises(SourceReadError, match="changed_during_read"):
+        read_source(tmp_path, Path("source.py"), 1024)
+
+    source.write_bytes(b"hello")
+
+    def grow_past_limit_before_read(descriptor: int, count: int) -> bytes:
+        with source.open("ab") as writer:
+            writer.write(b"x" * 20)
+        return original_read(descriptor, count)
+
+    monkeypatch.setattr("code_indexing_mcp.source_io.os.read", grow_past_limit_before_read)
+    with pytest.raises(SourceReadError, match="oversized"):
+        read_source(tmp_path, Path("source.py"), 8)
+
+
+def test_open_source_still_works_as_context_manager(tmp_path: Path) -> None:
+    (tmp_path / "source.py").write_bytes(b"answer = 42\n")
+    with open_source(tmp_path, Path("source.py"), 1024) as (descriptor, info):
+        assert info.st_size == len(b"answer = 42\n")
+        assert os.read(descriptor, 64) == b"answer = 42\n"
+
+
+def test_read_source_direct_reads_and_validates_constraints(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "a" / "b").mkdir(parents=True)
+    (root / "a" / "b" / "ok.py").write_bytes(b"ok = 1\n")
+    (root / "a" / "b" / "big.py").write_bytes(b"0123456789")
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(b"SECRET = 1\n")
+
+    with PinnedDirectoryCache(root) as cache:
+        content, info = read_source_direct(root, Path("a/b/ok.py"), 1024, directory_cache=cache)
+        assert content == b"ok = 1\n"
+        assert info.st_size == 7
+
+        # Without cache, delegates cleanly to read_source.
+        content_uncached, _ = read_source_direct(
+            root, Path("a/b/ok.py"), 1024, directory_cache=None
+        )
+        assert content_uncached == b"ok = 1\n"
+
+        for bad_path in ("../outside.py", "/outside.py", "."):
+            with pytest.raises(SourceReadError, match="path_escapes_root"):
+                read_source_direct(root, Path(bad_path), 1024, directory_cache=cache)
+
+        with pytest.raises(SourceReadError, match="oversized"):
+            read_source_direct(root, Path("a/b/big.py"), 8, directory_cache=cache)
+
+        if os.open in os.supports_dir_fd:
+            with pytest.raises(SourceReadError, match="not_regular"):
+                read_source_direct(root, Path("a/b"), 1024, directory_cache=cache)
+
+    if os.name != "nt" and os.open in os.supports_dir_fd:
+        (root / "a" / "b" / "link.py").symlink_to(outside)
+        outside_dir = tmp_path / "outside_dir"
+        outside_dir.mkdir()
+        (outside_dir / "file.py").write_bytes(b"SECRET = 2\n")
+        (root / "link_dir").symlink_to(outside_dir, target_is_directory=True)
+        with PinnedDirectoryCache(root) as cache:
+            with pytest.raises(SourceReadError, match="symlink"):
+                read_source_direct(root, Path("a/b/link.py"), 1024, directory_cache=cache)
+            with pytest.raises(SourceReadError, match="symlink"):
+                read_source_direct(root, Path("link_dir/file.py"), 1024, directory_cache=cache)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "mkfifo") or os.open not in os.supports_dir_fd,
+    reason="POSIX FIFO + dir_fd",
+)
+def test_read_source_direct_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    os.mkfifo(tmp_path / "pipe.py")
+    code = (
+        "from pathlib import Path; import sys; "
+        "from code_indexing_mcp.source_io import PinnedDirectoryCache, read_source_direct; "
+        "cache = PinnedDirectoryCache(Path(sys.argv[1])); "
+        "read_source_direct(Path(sys.argv[1]), Path('pipe.py'), 1024, directory_cache=cache)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path)], capture_output=True, timeout=5
+    )
+    assert result.returncode != 0
+    assert b"not_regular" in result.stderr
+
+
+@pytest.mark.skipif(os.open not in os.supports_dir_fd, reason="POSIX dir_fd cache")
+def test_read_source_direct_recovers_when_pinned_directory_is_recreated(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "gen" / "sub").mkdir(parents=True)
+    (root / "gen" / "one.py").write_bytes(b"one = 1\n")
+    (root / "gen" / "two.py").write_bytes(b"two = 1\n")
+    (root / "gen" / "sub" / "three.py").write_bytes(b"three = 1\n")
+
+    with PinnedDirectoryCache(root) as cache:
+        data_one, _ = read_source_direct(root, Path("gen/one.py"), 1024, directory_cache=cache)
+        assert data_one == b"one = 1\n"
+
+        # Deleting the pinned directory triggers ENOENT on os.open(..., dir_fd=parent_fd)
+        # and retries cleanly from a freshly walked chain.
+        shutil.rmtree(root / "gen")
+        (root / "gen" / "sub").mkdir(parents=True)
+        (root / "gen" / "two.py").write_bytes(b"two = 2\n")
+        (root / "gen" / "sub" / "three.py").write_bytes(b"three = 2\n")
+
+        data_two, _ = read_source_direct(root, Path("gen/two.py"), 1024, directory_cache=cache)
+        assert data_two == b"two = 2\n"
+
+        # Deleting a pinned ancestor triggers ENOENT inside open_parent() and retries too.
+        shutil.rmtree(root / "gen")
+        (root / "gen" / "sub").mkdir(parents=True)
+        (root / "gen" / "sub" / "three.py").write_bytes(b"three = 3\n")
+
+        data_three, _ = read_source_direct(
+            root, Path("gen/sub/three.py"), 1024, directory_cache=cache
+        )
+        assert data_three == b"three = 3\n"
+
+        (root / "gen" / "sub" / "three.py").unlink()
+        with pytest.raises(FileNotFoundError):
+            read_source_direct(root, Path("gen/sub/three.py"), 1024, directory_cache=cache)
+
+
+def test_read_source_direct_delegates_without_dir_fd_or_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "source.py").write_bytes(b"ok = 1\n")
+    calls: list[tuple[Path, Path, int, PinnedDirectoryCache | None]] = []
+    sentinel_stat = (tmp_path / "source.py").stat()
+
+    def fake_read_source(
+        root: Path,
+        relative: Path,
+        max_bytes: int,
+        *,
+        directory_cache: PinnedDirectoryCache | None = None,
+    ) -> tuple[bytes, os.stat_result]:
+        calls.append((root, relative, max_bytes, directory_cache))
+        return b"ok = 1\n", sentinel_stat
+
+    monkeypatch.setattr("code_indexing_mcp.source_io.read_source", fake_read_source)
+    read_source_direct(tmp_path, Path("source.py"), 1024, directory_cache=None)
+    assert calls == [(tmp_path, Path("source.py"), 1024, None)]
+
+    with PinnedDirectoryCache(tmp_path) as cache:
+        monkeypatch.setattr(os, "supports_dir_fd", set())
+        read_source_direct(tmp_path, Path("source.py"), 1024, directory_cache=cache)
+        assert calls[-1] == (tmp_path, Path("source.py"), 1024, cache)

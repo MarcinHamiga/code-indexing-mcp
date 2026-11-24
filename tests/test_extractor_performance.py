@@ -118,9 +118,11 @@ def test_memory_budget_check_is_throttled(monkeypatch: pytest.MonkeyPatch) -> No
         result = _extract("python", _many_functions())
     finally:
         memory_budget._current_budget.reset(token)
-    # 600 definitions yield thousands of query matches; unthrottled this read RSS
-    # once per match on top of the once-per-chunk check.
-    assert len(result.chunks) < fake.reads <= len(result.chunks) + 150
+    # 600 definitions yield 600 chunks and thousands of query matches; both
+    # per-match loops and chunk creation are throttled so RSS is sampled far
+    # less than once per chunk while still firing repeatedly inside one file.
+    assert 20 < fake.reads <= 200
+    assert fake.reads < len(result.chunks)
 
 
 def _name_chars(language: str, source: str) -> tuple[int, list]:

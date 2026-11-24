@@ -21,12 +21,12 @@ import logging
 import os
 import shutil
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from functools import partial
 from operator import attrgetter
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import pyarrow as pa
@@ -74,7 +74,7 @@ COMMIT_BATCH_MAX_ROWS = 20_000
 COMMIT_BATCH_MAX_BYTES = 64 * 1024 * 1024
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ChunkRow:
     """One staged chunk: the StoredChunk fields, with the vector still packed.
 
@@ -110,7 +110,7 @@ class ChunkRow:
     source_content_hash: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReferenceRow:
     """One structural reference, declaration shape, or coverage record."""
 
@@ -135,6 +135,31 @@ class ReferenceRow:
     shape_json: str | None
     content_hash: str
     schema_version: int
+
+
+VARYING_REFERENCE_COLUMNS: tuple[str, ...] = (
+    "reference_id",
+    "record_kind",
+    "kind",
+    "source_qualified_symbol",
+    "written_name",
+    "target_name",
+    "module_path",
+    "imported_name",
+    "alias",
+    "receiver_text",
+    "start_byte",
+    "end_byte",
+    "start_line",
+    "end_line",
+    "shape_json",
+)
+_VARYING_REFERENCE_COLUMN_INDEX: dict[str, int] = {
+    name: index for index, name in enumerate(VARYING_REFERENCE_COLUMNS)
+}
+_CONSTANT_REFERENCE_COLUMNS = frozenset(
+    {"file_id", "project_id", "path", "language", "content_hash", "schema_version"}
+)
 
 
 def _write_atomically(path: Path, payload: bytes) -> None:
@@ -324,6 +349,19 @@ class StagingJob:
         self._reference_getters = [
             (attrgetter(field.name), field.type) for field in reference_schema
         ]
+        reference_column_plan: list[
+            tuple[Literal["const"], str, pa.DataType] | tuple[Literal["var"], int, pa.DataType]
+        ] = []
+        for field in reference_schema:
+            varying_index = _VARYING_REFERENCE_COLUMN_INDEX.get(field.name)
+            if varying_index is not None:
+                reference_column_plan.append(("var", varying_index, field.type))
+            elif field.name in _CONSTANT_REFERENCE_COLUMNS:
+                reference_column_plan.append(("const", field.name, field.type))
+            else:
+                reference_column_plan = []
+                break
+        self._reference_column_plan = reference_column_plan
         self.replace_file_ids: list[str] = []
         self.replace_reference_file_ids: list[str] = []
         self._reference_file_ids: set[str] = set()
@@ -437,6 +475,53 @@ class StagingJob:
             pa.array(list(map(getter, rows)), type=field_type)
             for getter, field_type in self._reference_getters
         ]
+        self._references_writer.write_batch(pa.record_batch(columns, schema=self._reference_schema))
+
+    def stage_reference_columns(
+        self,
+        *,
+        file_id: str,
+        project_id: str,
+        path: str,
+        language: str,
+        content_hash: str,
+        schema_version: int,
+        varying_columns: Sequence[Sequence[Any]],
+    ) -> None:
+        """Stage one file's structural rows directly from column arrays."""
+        assert self._references_writer is not None
+        if len(self._reference_column_plan) != len(self._reference_schema):
+            raise ValueError("Reference schema contains unsupported columns for columnar staging")
+        if len(varying_columns) != len(VARYING_REFERENCE_COLUMNS):
+            raise ValueError(
+                f"Expected {len(VARYING_REFERENCE_COLUMNS)} varying reference columns, "
+                f"got {len(varying_columns)}"
+            )
+        row_count = len(varying_columns[0]) if varying_columns else 0
+        if any(len(column) != row_count for column in varying_columns[1:]):
+            raise ValueError("All varying reference columns must have the same length")
+        if row_count == 0:
+            return
+        if file_id in self._reference_file_ids and file_id != self._last_reference_file_id:
+            raise ValueError("Staged reference batches for a file must be contiguous")
+        self._reference_file_ids.add(file_id)
+        self._last_reference_file_id = file_id
+        constants: dict[str, Any] = {
+            "file_id": file_id,
+            "project_id": project_id,
+            "path": path,
+            "language": language,
+            "content_hash": content_hash,
+            "schema_version": schema_version,
+        }
+        columns: list[pa.Array] = []
+        for entry in self._reference_column_plan:
+            if entry[0] == "const":
+                _, field_name, field_type = entry
+                columns.append(pa.array([constants[field_name]] * row_count, type=field_type))
+            else:
+                _, varying_index, field_type = entry
+                columns.append(pa.array(varying_columns[varying_index], type=field_type))
         self._references_writer.write_batch(pa.record_batch(columns, schema=self._reference_schema))
 
     def mark_replaced(self, file_id: str) -> None:
