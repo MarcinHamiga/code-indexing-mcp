@@ -554,3 +554,50 @@ def test_read_source_direct_delegates_without_dir_fd_or_cache(
         monkeypatch.setattr(os, "supports_dir_fd", set())
         read_source_direct(tmp_path, Path("source.py"), 1024, directory_cache=cache)
         assert calls[-1] == (tmp_path, Path("source.py"), 1024, cache)
+
+
+@pytest.mark.skipif(os.open not in os.supports_dir_fd, reason="POSIX dir_fd cache")
+def test_read_source_direct_recovers_when_pinned_directory_is_renamed_and_replaced(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "a.py").write_bytes(b"a = 1\n")
+    (pkg / "b.py").write_bytes(b"b = 'OLD'\n")
+
+    with PinnedDirectoryCache(root) as cache:
+        first, _ = read_source_direct(root, Path("pkg/a.py"), 1024, directory_cache=cache)
+        assert first == b"a = 1\n"
+
+        # Atomically replace pkg/ with a new directory holding a new b.py.
+        pkg.rename(root / "pkg_old")
+        new_pkg = root / "pkg"
+        new_pkg.mkdir()
+        new_b = new_pkg / "b.py"
+        new_b.write_bytes(b"b = 'NEW'\n")
+        new_stat = new_b.stat()
+
+        # Passing expected_identity detects the stale pinned directory and returns NEW bytes.
+        content, info = read_source_direct(
+            root,
+            Path("pkg/b.py"),
+            1024,
+            directory_cache=cache,
+            expected_identity=(new_stat.st_dev, new_stat.st_ino),
+        )
+        assert content == b"b = 'NEW'\n"
+        assert (info.st_dev, info.st_ino) == (new_stat.st_dev, new_stat.st_ino)
+
+        # Legitimate atomic replacement of the leaf after scan time still succeeds on fresh retry.
+        replacement = new_pkg / "b.py.tmp"
+        replacement.write_bytes(b"b = 'REPLACED'\n")
+        replacement.replace(new_b)
+        refreshed, _ = read_source_direct(
+            root,
+            Path("pkg/b.py"),
+            1024,
+            directory_cache=cache,
+            expected_identity=(new_stat.st_dev, new_stat.st_ino),
+        )
+        assert refreshed == b"b = 'REPLACED'\n"

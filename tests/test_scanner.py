@@ -1010,9 +1010,7 @@ def test_iter_scan_keeps_files_of_a_directory_recreated_mid_scan(
     assert seen == [("gen/a.py", b"x = 1\n"), ("gen/b.py", b"x = 2\n"), ("gen/c.py", b"x = 2\n")]
 
 
-def test_walk_mode_skips_nested_git_entries_without_calling_worktree_check(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_walk_mode_skips_nested_git_entries(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
     (root / "main.py").write_text("def main():\n    return 1\n")
@@ -1031,11 +1029,7 @@ def test_walk_mode_skips_nested_git_entries_without_calling_worktree_check(
     (sub_with_git_dir / "notes.md").write_text("ignored subdir\n")
 
     project = initialize_project(root)
-
-    def fail_if_called(_: Path) -> bool:
-        raise AssertionError("_is_repository_worktree should not be called by walk")
-
-    monkeypatch.setattr(SourceScanner, "_is_repository_worktree", staticmethod(fail_if_called))
+    assert not hasattr(SourceScanner, "_is_repository_worktree")
 
     result = SourceScanner().scan(project)
 

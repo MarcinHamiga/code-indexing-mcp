@@ -1701,7 +1701,7 @@ def test_call_shape_model_dump_json_matches_standard_json_across_combinations() 
         constructor,
     ) in product(
         (0, 2),
-        ([], ["alpha", "beta"]),
+        ([], ["alpha", "beta"], ["café"]),
         (False, True),
         (False, True),
         (None, 0, 2),
@@ -1725,6 +1725,7 @@ def test_call_shape_model_dump_json_matches_standard_json_across_combinations() 
                 "constructor": constructor,
             },
             separators=(",", ":"),
+            ensure_ascii=False,
         )
         assert shape.model_dump_json() == expected
 

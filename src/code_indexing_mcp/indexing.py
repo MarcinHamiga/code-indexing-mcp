@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import hashlib
-import json
 import logging
 import multiprocessing
 import os
@@ -84,9 +83,9 @@ from .parse_pool import (
 from .parse_pool import (
     PARSE_BATCH_FILES,
     PARSE_POOL_MIN_FILES,
-    ChunkTuple,
     ParseTask,
     ParseWorkerPool,
+    WireChunk,
     build_reference_columns,
     process_parse_batch,
     resolve_parse_workers,
@@ -148,7 +147,7 @@ class _PendingCandidate:
 class _ParsedWorkItem:
     record: StoredFile
     chunks: list[ExtractedChunk] | None
-    chunk_tuples: list[ChunkTuple] | None
+    chunk_tuples: list[WireChunk] | None
     varying_reference_columns: tuple[list[Any], ...] | None
     source_chars: int
     byte_count: int
@@ -186,30 +185,6 @@ class _ProducerErrorEvent:
 
 
 _ProducerEvent = _ScanBatchEvent | _ParsedBatchEvent | _ProducerDoneEvent | _ProducerErrorEvent
-
-
-def _chunk_from_tuple(row: ChunkTuple) -> ExtractedChunk:
-    return ExtractedChunk.model_construct(
-        kind=row[0],
-        symbol=row[1],
-        qualified_symbol=row[2],
-        parent_symbol=row[3],
-        start_byte=row[4],
-        end_byte=row[5],
-        start_line=row[6],
-        end_line=row[7],
-        content=row[8],
-        embedding_text=row[9],
-        search_text=row[10],
-        part_index=row[11],
-        is_test=row[12],
-        embedding_prefix=row[13],
-        search_suffix=row[14],
-        source_start_byte=None,
-        source_end_byte=None,
-        original_end_byte=None,
-        source_content_hash=None,
-    )
 
 
 def _candidate_groups(
@@ -1773,7 +1748,7 @@ class Indexer:
         parsed_batch: list[_ParsedWorkItem] = []
         parsed_chunks = 0
         parsed_chars = 0
-        last_scan_emit = time.monotonic()
+        last_scan_emit = 0.0
         pool: ParseWorkerPool | None = None
         stream: Iterator[ScannedFile | SkippedFile] | None = None
         aborted = False
@@ -1852,8 +1827,8 @@ class Indexer:
                     _parse_ns,
                     ref_ns,
                 ) = outcome
-                embedding_chars = sum(len(row[9]) for row in chunks_tuples)
-                source_chars = sum(len(row[8]) for row in chunks_tuples)
+                embedding_chars = sum(len(row.embedding_text) for row in chunks_tuples)
+                source_chars = sum(len(row.content) for row in chunks_tuples)
                 record = StoredFile(
                     file_id=file_id,
                     project_id=project.id,
@@ -1879,6 +1854,7 @@ class Indexer:
                         embedding_chars=embedding_chars,
                     )
                 )
+            check_parent_memory_budget()
 
         def run_pool(scan_stream: Iterator[ScannedFile | SkippedFile]) -> None:
             nonlocal cum_scan_ns, cum_parse_ns, pool
@@ -1937,13 +1913,25 @@ class Indexer:
                     add_scan_event(("unchanged", rel_posix))
                     drain_ready()
                     continue
-                task: ParseTask = (
-                    rel_posix,
-                    item.language,
-                    previous.content_hash if previous is not None else None,
-                    previous.language if previous is not None else None,
-                    force,
-                    retrying,
+                task = ParseTask(
+                    rel_posix=rel_posix,
+                    language=item.language,
+                    prev_content_hash=previous.content_hash if previous is not None else None,
+                    prev_language=previous.language if previous is not None else None,
+                    force=force,
+                    retrying=retrying,
+                    size=item.size,
+                    mtime_ns=item.mtime_ns,
+                    expected_identity=(
+                        (item.dev, item.ino)
+                        if item.dev is not None and item.ino is not None
+                        else None
+                    ),
+                    stat_matched_previous=(
+                        previous is not None
+                        and previous.size == item.size
+                        and previous.mtime_ns == item.mtime_ns
+                    ),
                 )
                 if pool is None:
                     warmup_buffer.append(task)
@@ -1954,6 +1942,7 @@ class Indexer:
                             max_chars=self.extractor.max_chars,
                             max_lines=self.extractor.max_lines,
                             overlap_lines=self.extractor.overlap_lines,
+                            memory_ceiling_bytes=self.memory_ceiling_bytes,
                         )
                         cum_parse_ns += time.monotonic_ns() - t_pool
                         for offset in range(0, len(warmup_buffer), PARSE_BATCH_FILES):
@@ -2159,6 +2148,7 @@ class Indexer:
                 )
 
         try:
+            last_scan_emit = time.monotonic()
             stream = self._iter_scan(project, existing, read_contents=not use_pool, guard=guard)
             if use_pool:
                 run_pool(stream)
@@ -2233,6 +2223,12 @@ class Indexer:
         accounted_parse_ns = 0
 
         def attribute_wait(wait_ns: int, cum_scan_ns: int, cum_parse_ns: int) -> None:
+            """Attribute consumer queue-wait wall time proportionally to scan vs parse.
+
+            Charging only consumer wait time preserves the non-overlapping wall-time
+            invariant ``sum(phase_durations_ms) <= duration_ms`` when parsing overlaps
+            with embedding on the background producer thread.
+            """
             nonlocal accounted_scan_ns, accounted_parse_ns
             scan_delta = max(0, cum_scan_ns - accounted_scan_ns)
             parse_delta = max(0, cum_parse_ns - accounted_parse_ns)
@@ -2334,10 +2330,23 @@ class Indexer:
         def live_telemetry_fields() -> dict[str, object]:
             return self._live_telemetry(state, timer, passage_embedder, passage_reuse)
 
+        def next_producer_event() -> _ProducerEvent:
+            while True:
+                try:
+                    return work_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if not producer.is_alive():
+                        try:
+                            return work_queue.get_nowait()
+                        except queue.Empty as exc:
+                            raise RuntimeError(
+                                "Index scan producer exited without completing"
+                            ) from exc
+
         try:
             while True:
                 wait_started = time.monotonic_ns()
-                event = work_queue.get()
+                event = next_producer_event()
                 wait_ns = time.monotonic_ns() - wait_started
                 attribute_wait(wait_ns, event.cum_scan_ns, event.cum_parse_ns)
                 if isinstance(event, _ProducerDoneEvent):
@@ -2381,23 +2390,8 @@ class Indexer:
                         chunks = (
                             item.chunks
                             if item.chunks is not None
-                            else [_chunk_from_tuple(row) for row in item.chunk_tuples or ()]
+                            else [row.to_extracted() for row in item.chunk_tuples or ()]
                         )
-                        if state.pending and (
-                            len(state.pending) >= CANDIDATE_GROUP_COUNT
-                            or state.pending_chunks + len(chunks) > CANDIDATE_GROUP_COUNT
-                            or state.pending_chars + item.embedding_chars > CANDIDATE_GROUP_CHARS
-                        ):
-                            self._flush_pending(
-                                project,
-                                existing,
-                                passage_embedder,
-                                progress,
-                                timer,
-                                process,
-                                state,
-                                passage_reuse,
-                            )
                         state.add_pending(
                             _PendingFile(
                                 record=item.record,
@@ -2774,129 +2768,53 @@ class Indexer:
     ) -> list[ReferenceRow]:
         """Build one deterministic structural generation for *file*.
 
-        A coverage record is deliberately emitted even when the parser found
-        no occurrences. It is the durable proof that the current structural
-        schema parsed this exact content, rather than merely an empty query
-        result from an unindexed legacy project.
+        Delegates to :func:`build_reference_columns` so identity hashing,
+        shape serialization, and coverage-row emission have a single source
+        of truth shared with columnar Arrow staging.
         """
-
-        rows: list[ReferenceRow] = []
-
-        def identity(
-            record_kind: str, kind: str | None, start_byte: int | None, end_byte: int | None
-        ) -> str:
-            # `kind` belongs in the digest because one byte range legitimately
-            # carries two references: a superclass is both `inheritance` and a
-            # `read`, and a decorator call is both `decorator` and `call`.
-            # Omitting it gave those rows one id, and merge_insert rejects two
-            # source rows matching a single target -- which permanently broke
-            # every later incremental index of the project.
-            return _digest(
-                "\0".join(
-                    (
-                        file.file_id,
-                        record_kind,
-                        kind or "",
-                        str(start_byte if start_byte is not None else -1),
-                        str(end_byte if end_byte is not None else -1),
-                        str(REFERENCE_SCHEMA_VERSION),
-                    )
-                )
-            )
-
-        for reference in references:
-            rows.append(
-                ReferenceRow(
-                    reference_id=identity(
-                        "reference", reference.kind, reference.start_byte, reference.end_byte
-                    ),
-                    record_kind="reference",
-                    file_id=file.file_id,
-                    project_id=project_id,
-                    path=file.path,
-                    language=file.language,
-                    kind=reference.kind,
-                    source_qualified_symbol=reference.source_qualified_symbol,
-                    written_name=reference.written_name,
-                    target_name=reference.target_name,
-                    module_path=reference.module_path,
-                    imported_name=reference.imported_name,
-                    alias=reference.alias,
-                    receiver_text=reference.receiver_text,
-                    start_byte=reference.start_byte,
-                    end_byte=reference.end_byte,
-                    start_line=reference.start_line,
-                    end_line=reference.end_line,
-                    shape_json=(
-                        reference.call_shape.model_dump_json()
-                        if reference.call_shape is not None
-                        else None
-                    ),
-                    content_hash=file.content_hash,
-                    schema_version=REFERENCE_SCHEMA_VERSION,
-                )
-            )
-        for declaration in declarations:
-            rows.append(
-                ReferenceRow(
-                    reference_id=identity(
-                        "declaration",
-                        declaration.kind,
-                        declaration.start_byte,
-                        declaration.end_byte,
-                    ),
-                    record_kind="declaration",
-                    file_id=file.file_id,
-                    project_id=project_id,
-                    path=file.path,
-                    language=file.language,
-                    kind=declaration.kind,
-                    source_qualified_symbol=declaration.qualified_symbol,
-                    written_name=declaration.symbol,
-                    target_name=declaration.symbol,
-                    module_path=None,
-                    imported_name=None,
-                    alias=None,
-                    receiver_text=None,
-                    start_byte=declaration.start_byte,
-                    end_byte=declaration.end_byte,
-                    start_line=declaration.start_line,
-                    end_line=declaration.end_line,
-                    shape_json=json.dumps(
-                        [parameter.model_dump(mode="json") for parameter in declaration.parameters],
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ),
-                    content_hash=file.content_hash,
-                    schema_version=REFERENCE_SCHEMA_VERSION,
-                )
-            )
-        rows.append(
+        varying = build_reference_columns(file.file_id, references, declarations)
+        return [
             ReferenceRow(
-                reference_id=identity("coverage", None, None, None),
-                record_kind="coverage",
+                reference_id=reference_id,
+                record_kind=record_kind,
                 file_id=file.file_id,
                 project_id=project_id,
                 path=file.path,
                 language=file.language,
-                kind=None,
-                source_qualified_symbol=None,
-                written_name=None,
-                target_name=None,
-                module_path=None,
-                imported_name=None,
-                alias=None,
-                receiver_text=None,
-                start_byte=None,
-                end_byte=None,
-                start_line=None,
-                end_line=None,
-                shape_json=None,
+                kind=kind,
+                source_qualified_symbol=source_qualified_symbol,
+                written_name=written_name,
+                target_name=target_name,
+                module_path=module_path,
+                imported_name=imported_name,
+                alias=alias,
+                receiver_text=receiver_text,
+                start_byte=start_byte,
+                end_byte=end_byte,
+                start_line=start_line,
+                end_line=end_line,
+                shape_json=shape_json,
                 content_hash=file.content_hash,
                 schema_version=REFERENCE_SCHEMA_VERSION,
             )
-        )
-        return rows
+            for (
+                reference_id,
+                record_kind,
+                kind,
+                source_qualified_symbol,
+                written_name,
+                target_name,
+                module_path,
+                imported_name,
+                alias,
+                receiver_text,
+                start_byte,
+                end_byte,
+                start_line,
+                end_line,
+                shape_json,
+            ) in zip(*varying, strict=True)
+        ]
 
     @staticmethod
     def _chunk_row(

@@ -141,7 +141,9 @@ def _open_through_cache(
     directory_cache: PinnedDirectoryCache,
     relative: Path,
     flags: int,
-    before: os.stat_result | None,
+    expected_identity: tuple[int, int] | None,
+    *,
+    strict_identity: bool = True,
 ) -> tuple[int, os.stat_result]:
     """Open *relative* below the pinned chain, retrying once if the chain went stale.
 
@@ -150,7 +152,10 @@ def _open_through_cache(
     directory: the leaf is then missing or is a different inode than the path
     lstat just reported. Neither is evidence of tampering, so the chain is
     dropped and walked again from *root* with the same O_NOFOLLOW checks. A
-    path that really was redirected fails that second, uncached attempt too.
+    path that really was redirected fails that second, uncached attempt too
+    when *strict_identity* is set; direct reads with an earlier scan identity
+    set *strict_identity=False* so a legitimate atomic file replacement
+    between scan and read succeeds after refreshing the directory chain.
     """
     for attempt in range(2):
         may_be_stale = attempt == 0 and directory_cache.pinned
@@ -172,15 +177,18 @@ def _open_through_cache(
             os.close(descriptor)
             raise
         if (
-            before is not None
+            expected_identity is not None
             and stat.S_ISREG(opened.st_mode)
-            and (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            and (opened.st_dev, opened.st_ino) != expected_identity
         ):
-            os.close(descriptor)
-            directory_cache.close()
             if may_be_stale:
+                os.close(descriptor)
+                directory_cache.close()
                 continue
-            raise SourceReadError("changed_during_open", relative)
+            if strict_identity:
+                os.close(descriptor)
+                directory_cache.close()
+                raise SourceReadError("changed_during_open", relative)
         return descriptor, opened
     raise AssertionError("unreachable")  # pragma: no cover
 
@@ -268,7 +276,9 @@ def _open_source_fd(
             os.close(descriptor)
             raise
     elif directory_cache is not None:
-        descriptor, opened = _open_through_cache(directory_cache, relative, flags, before)
+        descriptor, opened = _open_through_cache(
+            directory_cache, relative, flags, (before.st_dev, before.st_ino), strict_identity=True
+        )
     else:
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         directory = os.open(root, directory_flags)
@@ -390,13 +400,22 @@ def read_source_direct(
     max_bytes: int,
     *,
     directory_cache: PinnedDirectoryCache | None = None,
+    expected_identity: tuple[int, int] | None = None,
 ) -> tuple[bytes, os.stat_result]:
-    """Open via *directory_cache* without a prior ``lstat``, then validate and read."""
+    """Open via *directory_cache* without a prior ``lstat``, then validate and read.
+
+    Passing *expected_identity* ``(st_dev, st_ino)`` from an earlier scan lets
+    the cache detect a renamed-and-replaced pinned directory and retry cleanly
+    from *root* without issuing another ``lstat``. Omitting it only detects
+    deleted pinned directories (``ENOENT`` / ``ESTALE``).
+    """
     if os.open not in os.supports_dir_fd or directory_cache is None:
         return read_source(root, relative, max_bytes, directory_cache=directory_cache)
     _validate_relative_path(relative)
     flags = _source_open_flags()
-    descriptor, opened = _open_through_cache(directory_cache, relative, flags, None)
+    descriptor, opened = _open_through_cache(
+        directory_cache, relative, flags, expected_identity, strict_identity=False
+    )
     try:
         if not stat.S_ISREG(opened.st_mode):
             raise SourceReadError("not_regular", relative)

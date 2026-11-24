@@ -640,19 +640,6 @@ class SourceScanner:
                 yield [(absolute, specs) for absolute, _, specs in item]
 
     @staticmethod
-    def _is_repository_worktree(path: Path) -> bool:
-        """Return whether *path* is its own repository checkout.
-
-        Git treats a directory carrying a ``.git`` entry (a submodule or a
-        nested repository) as a single opaque non-file, so the walk must not
-        descend into it: the parent repository has no claim on those files.
-        """
-        try:
-            return (path / ".git").exists()
-        except OSError:
-            return False
-
-    @staticmethod
     def _in_git_worktree(root: Path) -> bool:
         """Return whether *root* sits inside a Git worktree.
 
@@ -962,6 +949,8 @@ class SourceScanner:
                 size=stat.st_size,
                 mtime_ns=stat.st_mtime_ns,
                 content=content,
+                dev=stat.st_dev,
+                ino=stat.st_ino,
             )
 
     @staticmethod

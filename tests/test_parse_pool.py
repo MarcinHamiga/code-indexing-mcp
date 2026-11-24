@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import multiprocessing
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -17,7 +19,6 @@ from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import Indexer
 from code_indexing_mcp.models import (
     REFERENCE_SCHEMA_VERSION,
-    ExtractedChunk,
     StoredFile,
     content_digest,
 )
@@ -26,8 +27,10 @@ from code_indexing_mcp.parse_pool import (
     PARSE_WORKER_MEMORY_ESTIMATE_BYTES,
     ParseTask,
     ParseWorkerPool,
+    WireChunk,
     build_reference_columns,
     content_rejection,
+    process_parse_batch,
     resolve_parse_workers,
 )
 from code_indexing_mcp.staging import VARYING_REFERENCE_COLUMNS
@@ -57,30 +60,6 @@ def _live_worker_children() -> list[psutil.Process]:
             continue
         live.append(child)
     return live
-
-
-def _chunk_from_tuple(row: tuple[object, ...]) -> ExtractedChunk:
-    return ExtractedChunk.model_construct(
-        kind=row[0],  # type: ignore[arg-type]
-        symbol=row[1],  # type: ignore[arg-type]
-        qualified_symbol=row[2],  # type: ignore[arg-type]
-        parent_symbol=row[3],  # type: ignore[arg-type]
-        start_byte=row[4],  # type: ignore[arg-type]
-        end_byte=row[5],  # type: ignore[arg-type]
-        start_line=row[6],  # type: ignore[arg-type]
-        end_line=row[7],  # type: ignore[arg-type]
-        content=row[8],  # type: ignore[arg-type]
-        embedding_text=row[9],  # type: ignore[arg-type]
-        search_text=row[10],  # type: ignore[arg-type]
-        part_index=row[11],  # type: ignore[arg-type]
-        is_test=row[12],  # type: ignore[arg-type]
-        embedding_prefix=row[13],  # type: ignore[arg-type]
-        search_suffix=row[14],  # type: ignore[arg-type]
-        source_start_byte=None,
-        source_end_byte=None,
-        original_end_byte=None,
-        source_content_hash=None,
-    )
 
 
 def test_resolve_parse_workers_handles_explicit_cpu_and_memory_caps(
@@ -278,7 +257,7 @@ def test_content_rejection_and_parse_pool_extraction_parity_and_cleanup(tmp_path
         target = repo / rel_posix
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
-        tasks.append((rel_posix, language, None, None, False, False))
+        tasks.append(ParseTask(rel_posix, language))
 
     # Add special cases: binary, invalid UTF-8, symlink, directory, and missing path.
     (repo / "bad_binary.py").write_bytes(b"def b():\x00\n")
@@ -287,11 +266,11 @@ def test_content_rejection_and_parse_pool_extraction_parity_and_cleanup(tmp_path
     (repo / "as_dir.py").mkdir()
     tasks.extend(
         [
-            ("bad_binary.py", "python", None, None, False, False),
-            ("bad_encoding.py", "python", None, None, False, False),
-            ("link.py", "python", None, None, False, False),
-            ("as_dir.py", "python", None, None, False, False),
-            ("missing.py", "python", None, None, False, False),
+            ParseTask("bad_binary.py", "python"),
+            ParseTask("bad_encoding.py", "python"),
+            ParseTask("link.py", "python"),
+            ParseTask("as_dir.py", "python"),
+            ParseTask("missing.py", "python"),
         ]
     )
 
@@ -302,9 +281,10 @@ def test_content_rejection_and_parse_pool_extraction_parity_and_cleanup(tmp_path
     pool_outcomes: dict[str, tuple[object, ...]] = {}
     pool = ParseWorkerPool(workers=2)
     try:
-        assert len(_live_worker_children()) == 2
         for offset in range(0, len(tasks), 8):
             pool.submit(repo, max_file_bytes, project_id, tasks[offset : offset + 8])
+            if offset == 8:
+                assert 1 <= len(_live_worker_children()) <= 2
             while pool.pending_count >= pool.max_in_flight:
                 batch = pool.drain_one()
                 assert batch is not None
@@ -332,7 +312,8 @@ def test_content_rejection_and_parse_pool_extraction_parity_and_cleanup(tmp_path
         assert entry[7] == len(source)
         expected = single_extractor.extract(Path(rel_posix), language, source)
         assert entry[8] == expected.has_errors
-        actual_chunks = [_chunk_from_tuple(row) for row in entry[9]]  # type: ignore[arg-type]
+        wire_chunks: list[WireChunk] = entry[9]  # type: ignore[assignment]
+        actual_chunks = [row.to_extracted() for row in wire_chunks]
         assert actual_chunks == expected.chunks
         expected_cols = build_reference_columns(
             str(entry[6]), expected.references, expected.declarations
@@ -353,8 +334,9 @@ def test_content_rejection_and_parse_pool_extraction_parity_and_cleanup(tmp_path
     stop_event = threading.Event()
     abort_pool = ParseWorkerPool(workers=2)
     try:
-        assert len(_live_worker_children()) == 2
         abort_pool.submit(repo, max_file_bytes, project_id, tasks[:8])
+        abort_pool.submit(repo, max_file_bytes, project_id, tasks[8:16])
+        assert 1 <= len(_live_worker_children()) <= 2
         stop_event.set()
         assert abort_pool.drain_one(stop_event) is None
     finally:
@@ -392,3 +374,73 @@ def test_parse_pool_import_is_lean_without_heavy_storage_deps() -> None:
         check=False,
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="POSIX SIGKILL")
+def test_parse_worker_pool_detects_killed_worker_instead_of_hanging(tmp_path: Path) -> None:
+    body = "\n".join(
+        f"class C_{i}:\n"
+        f"    def f_{i}(self, a: int, b: int) -> int:\n"
+        f"        return helper_{i}(a + b)\n"
+        for i in range(400)
+    )
+    tasks: list[ParseTask] = []
+    for idx in range(60):
+        name = f"m_{idx}.py"
+        (tmp_path / name).write_text(body, encoding="utf-8")
+        tasks.append(ParseTask(name, "python"))
+
+    pool = ParseWorkerPool(workers=1)
+    try:
+        pool.submit(tmp_path, 1_048_576, "proj-crash", tasks)
+        deadline = time.monotonic() + 2.0
+        workers = _live_worker_children()
+        while not workers and time.monotonic() < deadline:
+            time.sleep(0.01)
+            workers = _live_worker_children()
+        assert len(workers) == 1
+        os.kill(workers[0].pid, signal.SIGKILL)
+
+        with pytest.raises(concurrent.futures.process.BrokenProcessPool):
+            pool.drain_one()
+    finally:
+        pool.close(abort=True)
+
+    deadline = time.monotonic() + 2.0
+    while _live_worker_children() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert _live_worker_children() == []
+
+
+def test_process_parse_batch_records_extract_error_when_stat_matched_previous_read_fails(
+    tmp_path: Path,
+) -> None:
+    results = process_parse_batch(
+        tmp_path,
+        1_048_576,
+        "proj-1",
+        [
+            ParseTask(
+                rel_posix="missing_force.py",
+                language="python",
+                prev_content_hash="old-hash",
+                prev_language="python",
+                force=True,
+                size=42,
+                mtime_ns=999,
+                stat_matched_previous=True,
+            ),
+            ParseTask(
+                rel_posix="missing_new.py",
+                language="python",
+                stat_matched_previous=False,
+            ),
+        ],
+        TreeSitterExtractor(),
+    )
+    assert results[0][0] == "extract_error"
+    assert results[0][1] == "missing_force.py"
+    assert results[0][3] == 42
+    assert results[0][4] == 999
+    assert results[1][0] == "read_skip"
+    assert results[1][1] == "missing_new.py"

@@ -352,8 +352,13 @@ _KOTLIN_SWIFT_DECL_PARENTS: Final = frozenset(
         "parameter",
     }
 )
+# Ancestor boundaries that terminate the upward `class_heritage` check for
+# JS/TS member accesses. Stops immediately at class bodies, functions, and
+# statements so ordinary reads never walk to the file root, while deliberately
+# allowing member reads inside callbacks passed to mixin heritage expressions.
 _JS_HERITAGE_STOP_TYPES: Final = frozenset(
     {
+        "class_body",
         "statement_block",
         "function_declaration",
         "method_definition",
@@ -570,6 +575,8 @@ def _build_identifier_dispatch(language: str, rules: _LanguageRules) -> _Identif
         excluded_fields_by_parent.setdefault(ptype, ("type",))
     for ptype in rules.parameters_parents:
         excluded_fields_by_parent.setdefault(ptype, ("parameters",))
+    # In C/C++, `_POSITIONAL_CLIMB_PARENTS` previously shadowed `name_only_parents`
+    # for `enumerator`; exclude it here to preserve identical extraction parity.
     name_only = (
         rules.name_only_parents - {"enumerator"}
         if language in {"c", "cpp"}

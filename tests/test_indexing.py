@@ -3229,3 +3229,53 @@ def test_mid_run_cancellation_cleans_up_producer_and_parse_workers(
         t for t in threading.enumerate() if t.ident not in threads_before and t.is_alive()
     ]
     assert not any(t.name == "index-scan-producer" for t in new_alive_threads)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0,
+    reason="POSIX chmod 0o000 permission denial",
+)
+def test_force_reindex_preserves_chunks_on_unreadable_file_with_parse_pool(
+    tmp_path: Path,
+) -> None:
+    """force=True read failure must match in-process behavior (retain chunks, record error)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for idx in range(5):
+        (repo / f"mod_{idx:02d}.py").write_text(
+            f"def fn_{idx}(x: int) -> int:\n    return x + {idx}\n",
+            encoding="utf-8",
+        )
+    project = initialize_project(repo)
+
+    outcomes: dict[int, tuple[int, bool, int, int]] = {}
+    for workers in (1, 2):
+        store = LanceStore(tmp_path / f"data_{workers}", vector_dimension=4)
+        indexer = Indexer(
+            store=store,
+            scanner=SourceScanner(),
+            extractor=TreeSitterExtractor(),
+            embedder=RecordingEmbedder(),
+            lock_directory=tmp_path / f"locks_{workers}",
+            parse_workers=workers,
+        )
+        initial = indexer.index(project)
+        assert initial.indexed_files == 5
+
+        victim = repo / "mod_00.py"
+        os.chmod(victim, 0o000)
+        try:
+            forced = indexer.index(project, force=True)
+            retained_chunks = [c for c in store.list_chunks([project.id]) if c.path == "mod_00.py"]
+            stored_paths = {f.path for f in store.list_files(project.id)}
+            outcomes[workers] = (
+                len(retained_chunks),
+                "mod_00.py" in stored_paths,
+                forced.failed_files,
+                forced.removed_files,
+            )
+        finally:
+            os.chmod(victim, 0o644)
+
+    assert outcomes[1] == (1, True, 1, 0)
+    assert outcomes[2] == outcomes[1]

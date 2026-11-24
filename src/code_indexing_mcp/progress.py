@@ -82,11 +82,40 @@ class ProgressPublisher:
             activation_epoch=activation_epoch,
         )
         self._pending: dict[str, object] = {}
+        self._pending_lazy: Callable[[], Mapping[str, object]] | None = None
         self._current_phase: str = self._state.phase
         self._current_phase_started_at: float = self._state.phase_started_at
 
+    def _merge_pending(self, fields: Mapping[str, object]) -> None:
+        """Clone *fields* into pending updates while tracking monotonic phase transitions."""
+        if not fields:
+            return
+        cloned = _clone_update_fields(fields)
+        phase = cloned.get("phase")
+        if phase is not None and phase != self._current_phase:
+            # Anchor the new phase strictly after the previous one: clocks with
+            # coarse granularity (some Windows runners read milliseconds) can
+            # return the same tick twice, which would make the anchor not
+            # advance and phase durations collapse to zero.
+            phase_started_at = max(self._clock(), self._current_phase_started_at + 1e-6)
+            self._current_phase = phase if isinstance(phase, str) else str(phase)
+            self._current_phase_started_at = phase_started_at
+            cloned["phase_started_at"] = phase_started_at
+        self._pending.update(cloned)
+
+    def _flush_pending_lazy(self) -> None:
+        if self._pending_lazy is None:
+            return
+        lazy = self._pending_lazy
+        self._pending_lazy = None
+        resolved = lazy()
+        if not isinstance(resolved, Mapping):
+            raise TypeError("lazy_fields must return a mapping")
+        self._merge_pending(resolved)
+
     @property
     def state(self) -> IndexProgress:
+        self._flush_pending_lazy()
         if self._pending:
             self._state = self._state.model_copy(update=self._pending)
             self._pending.clear()
@@ -96,6 +125,7 @@ class ProgressPublisher:
     def state(self, value: IndexProgress) -> None:
         self._state = value
         self._pending.clear()
+        self._pending_lazy = None
         self._current_phase = value.phase
         self._current_phase_started_at = value.phase_started_at
 
@@ -135,23 +165,16 @@ class ProgressPublisher:
 
         if not self.enabled:
             return
-        phase = fields.get("phase")
-        if phase is not None and phase != self._current_phase:
-            # Anchor the new phase strictly after the previous one: clocks with
-            # coarse granularity (some Windows runners read milliseconds) can
-            # return the same tick twice, which would make the anchor not
-            # advance and phase durations collapse to zero.
-            phase_started_at = max(self._clock(), self._current_phase_started_at + 1e-6)
-            self._current_phase = phase if isinstance(phase, str) else str(phase)
-            self._current_phase_started_at = phase_started_at
-            fields["phase_started_at"] = phase_started_at
+        if lazy_fields is not None and not callable(lazy_fields):
+            raise TypeError("lazy_fields must be callable")
         # Shallow-copy the merged fields: model_copy never copies the update
         # mapping's values, and a published snapshot must not share a nested
         # value (e.g. the skipped_by_reason dict) with a caller that keeps
         # mutating it. Every retained snapshot stays a true point-in-time
         # picture.
-        if fields:
-            self._pending.update(_clone_update_fields(fields))
+        self._merge_pending(fields)
+        if lazy_fields is not None:
+            self._pending_lazy = lazy_fields
         now = self._clock()
         if (
             not force
@@ -159,13 +182,7 @@ class ProgressPublisher:
             and now - self._last_published < self.interval_seconds
         ):
             return
-        if lazy_fields is not None:
-            if not callable(lazy_fields):
-                raise TypeError("lazy_fields must be callable")
-            resolved = lazy_fields()
-            if not isinstance(resolved, Mapping):
-                raise TypeError("lazy_fields must return a mapping")
-            self._pending.update(_clone_update_fields(resolved))
+        self._flush_pending_lazy()
         self._pending["updated_at"] = time.time()
         self._state = self._state.model_copy(update=self._pending)
         self._pending.clear()

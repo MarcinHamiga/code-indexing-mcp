@@ -277,6 +277,10 @@ class ScannedFile(FrozenModel):
     # Streaming scans attach changed-file bytes so the indexer consumes them
     # without a second read. Collected scans deliberately leave this as None.
     content: bytes | None = None
+    # POSIX (st_dev, st_ino) captured during scan so deferred direct reads can
+    # detect a renamed-and-replaced directory without issuing another lstat.
+    dev: int | None = Field(default=None, exclude=True)
+    ino: int | None = Field(default=None, exclude=True)
 
 
 class SkippedFile(FrozenModel):
@@ -386,6 +390,7 @@ class CallShape:
                 "constructor": self.constructor,
             },
             separators=(",", ":"),
+            ensure_ascii=False,
         )
 
 

@@ -506,3 +506,33 @@ def test_state_property_flushes_pending_throttled_updates_and_clones_collections
     assert publisher._pending == {}
     assert publisher.state.phase == "committing"
     assert publisher.state.candidates_seen == 0
+
+
+def test_lazy_fields_flush_on_state_read_and_track_phase_transitions() -> None:
+    clock = iter([0.0, 0.05, 0.10, 0.15, 0.20, 0.25])
+    seen: list[IndexProgress] = []
+    publisher = ProgressPublisher(
+        "project",
+        listener=seen.append,
+        interval_seconds=1.0,
+        clock=lambda: next(clock),
+    )
+
+    publisher.update(candidates_seen=1, lazy_fields=lambda: {"parsed_files": 1})
+    assert len(seen) == 1
+
+    # Throttled update keeps lazy_fields pending; reading .state must flush both
+    # eager and lazy fields so state is never internally inconsistent.
+    publisher.update(candidates_seen=50, lazy_fields=lambda: {"parsed_files": 50})
+    assert len(seen) == 1
+    snapshot = publisher.state
+    assert snapshot.candidates_seen == 50
+    assert snapshot.parsed_files == 50
+
+    # A phase transition returned by lazy_fields must advance phase_started_at
+    # and synchronize _current_phase.
+    before_anchor = snapshot.phase_started_at
+    publisher.update(force=True, lazy_fields=lambda: {"phase": "embedding"})
+    assert seen[-1].phase == "embedding"
+    assert seen[-1].phase_started_at > before_anchor
+    assert publisher._current_phase == "embedding"
