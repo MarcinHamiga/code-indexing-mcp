@@ -1,6 +1,7 @@
 """Live indexing progress: in-process listeners and the cross-process snapshot."""
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -347,6 +348,57 @@ def test_retained_snapshots_do_not_change_when_the_source_dict_is_mutated() -> N
 
     assert snapshot.skipped_by_reason == {"binary": 1}
     assert publisher.state.skipped_by_reason == {"binary": 99}
+
+
+def test_lazy_field_failure_is_contained_and_never_breaks_publishing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = iter([0.0, 0.05, 0.10, 0.15, 0.20])
+    seen: list[IndexProgress] = []
+    publisher = ProgressPublisher(
+        "project",
+        listener=seen.append,
+        interval_seconds=1.0,
+        clock=lambda: next(clock),
+    )
+
+    def broken() -> dict[str, object]:
+        raise RuntimeError("lazy fields failed")
+
+    publisher.update(candidates_seen=1)
+    publisher.update(candidates_seen=2, lazy_fields=broken)
+    with caplog.at_level(logging.WARNING, logger="code_indexing_mcp.progress"):
+        # A state read evaluates the deferred closure; it must not escape.
+        assert publisher.state.candidates_seen == 2
+        publisher.update(candidates_seen=3, force=True, lazy_fields=broken)
+
+    assert seen[-1].candidates_seen == 3
+    assert "Discarding lazy progress fields" in caplog.text
+
+
+def test_clear_does_not_evaluate_deferred_lazy_fields(tmp_path: Path) -> None:
+    clock = iter([0.0, 0.05, 0.10])
+    publisher = ProgressPublisher(
+        "project",
+        directory=tmp_path,
+        interval_seconds=1.0,
+        clock=lambda: next(clock),
+    )
+    publisher.update(candidates_seen=1)
+    called = False
+
+    def broken() -> dict[str, object]:
+        nonlocal called
+        called = True
+        raise RuntimeError("lazy fields failed")
+
+    publisher.update(candidates_seen=2, lazy_fields=broken)
+    publisher.clear()
+
+    assert called is False
+    assert not progress_path(tmp_path, "project").exists()
+    assert publisher._pending == {}
+    assert publisher._pending_lazy is None
 
 
 def test_a_snapshot_left_behind_by_a_dead_process_is_ignored(tmp_path: Path) -> None:

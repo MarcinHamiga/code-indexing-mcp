@@ -15,6 +15,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from code_indexing_mcp import parse_pool as parse_pool_module
 from code_indexing_mcp.extractor import TreeSitterExtractor
 from code_indexing_mcp.indexing import Indexer
 from code_indexing_mcp.models import (
@@ -30,6 +31,7 @@ from code_indexing_mcp.parse_pool import (
     WireChunk,
     build_reference_columns,
     content_rejection,
+    per_worker_memory_ceiling,
     process_parse_batch,
     resolve_parse_workers,
 )
@@ -95,6 +97,36 @@ def test_resolve_parse_workers_handles_explicit_cpu_and_memory_caps(
         == 3
     )
     assert resolve_parse_workers(0, 2 * _GIB) == 6
+
+
+def test_per_worker_memory_ceiling_divides_the_run_budget() -> None:
+    available = 2 * _GIB - PARSE_MEMORY_RESERVE_BYTES
+    assert per_worker_memory_ceiling(None, 4) is None
+    assert per_worker_memory_ceiling(0, 4) is None
+    assert per_worker_memory_ceiling(2 * _GIB, 1) == available
+    assert per_worker_memory_ceiling(2 * _GIB, 2) == available // 2
+    assert per_worker_memory_ceiling(2 * _GIB, 6) == available // 6
+    # A high explicit worker count must not hand each worker an unusably small
+    # growth budget; the per-worker estimate is the floor.
+    assert per_worker_memory_ceiling(512 * 1024**2, 16) == PARSE_WORKER_MEMORY_ESTIMATE_BYTES
+
+
+def test_parse_worker_pool_passes_the_per_worker_budget_to_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeExecutor:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(parse_pool_module, "ProcessPoolExecutor", FakeExecutor)
+    ParseWorkerPool(2, memory_ceiling_bytes=2 * _GIB)
+
+    assert captured["max_workers"] == 2
+    initargs = captured["initargs"]
+    assert isinstance(initargs, tuple)
+    assert initargs[-1] == per_worker_memory_ceiling(2 * _GIB, 2)
 
 
 def test_varying_reference_columns_matches_schema_and_build_reference_columns() -> None:
@@ -197,6 +229,21 @@ def test_varying_reference_columns_matches_schema_and_build_reference_columns() 
                     col_name,
                 )
             assert expected_row.schema_version == REFERENCE_SCHEMA_VERSION
+
+
+def test_wire_chunk_reconstructs_search_text_without_pickling_it() -> None:
+    chunk = (
+        TreeSitterExtractor()
+        .extract(
+            Path("module.py"), "python", b"def answer(value: int) -> int:\n    return value + 1\n"
+        )
+        .chunks[0]
+    )
+    wire = WireChunk.from_extracted(chunk)
+
+    assert "search_text" not in WireChunk._fields
+    assert wire.to_extracted() == chunk
+    assert wire.to_extracted().search_text == chunk.search_text
 
 
 def test_content_rejection_and_parse_pool_extraction_parity_and_cleanup(tmp_path: Path) -> None:

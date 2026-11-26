@@ -14,6 +14,7 @@ is ignored once it stops being refreshed.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import tempfile
 import time
@@ -27,6 +28,8 @@ from typing import overload
 # comes back.
 from .models import IndexProgress as IndexProgress
 from .models import IndexTrigger as IndexTrigger
+
+logger = logging.getLogger(__name__)
 
 # How long a snapshot stays trustworthy without a refresh. Comfortably above the
 # publish interval, and above the pauses a single slow file can cause between
@@ -108,10 +111,16 @@ class ProgressPublisher:
             return
         lazy = self._pending_lazy
         self._pending_lazy = None
-        resolved = lazy()
-        if not isinstance(resolved, Mapping):
-            raise TypeError("lazy_fields must return a mapping")
-        self._merge_pending(resolved)
+        try:
+            resolved = lazy()
+            if not isinstance(resolved, Mapping):
+                raise TypeError("lazy_fields must return a mapping")
+            self._merge_pending(resolved)
+        except Exception:
+            # Progress is advisory. A caller's lazy closure must never be able
+            # to fail an index, least of all while teardown is already handling
+            # a different failure.
+            logger.warning("Discarding lazy progress fields after an error", exc_info=True)
 
     @property
     def state(self) -> IndexProgress:
@@ -196,10 +205,15 @@ class ProgressPublisher:
     def clear(self) -> None:
         """Remove the snapshot once the run is over."""
 
+        # Drop buffered updates and their closure: teardown must not evaluate
+        # caller code, and it must not keep an embedder alive through a lazy
+        # capture. The project id is fixed at construction and needs no flush.
+        self._pending.clear()
+        self._pending_lazy = None
         if self.directory is None:
             return
         with contextlib.suppress(OSError):
-            progress_path(self.directory, self.state.project_id).unlink(missing_ok=True)
+            progress_path(self.directory, self._state.project_id).unlink(missing_ok=True)
 
     def _write(self, state: IndexProgress) -> None:
         assert self.directory is not None

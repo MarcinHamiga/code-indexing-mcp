@@ -1,4 +1,5 @@
 import itertools
+import logging
 import multiprocessing
 import os
 import sqlite3
@@ -2904,6 +2905,149 @@ def _populate_multilang_repo(root: Path) -> None:
         )
     (root / "empty.py").write_text("# empty\n")
     (root / "binary.py").write_bytes(b"def bin_fn():\x00\n")
+
+
+def _populate_plain_repo(root: Path, count: int) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for idx in range(count):
+        (root / f"mod_{idx:03d}.py").write_text(
+            f"def fn_{idx}(value: int) -> int:\n    return value + {idx}\n"
+        )
+
+
+def _make_pool_indexer(tmp_path: Path, *, parse_workers: int) -> tuple[Indexer, LanceStore]:
+    embedder = RecordingEmbedder()
+    store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
+    return (
+        Indexer(
+            store=store,
+            scanner=SourceScanner(),
+            extractor=TreeSitterExtractor(),
+            embedder=embedder,
+            lock_directory=tmp_path / "locks",
+            parse_workers=parse_workers,
+        ),
+        store,
+    )
+
+
+def test_parse_pool_startup_failure_falls_back_to_in_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pool that cannot start must not turn an otherwise indexable run into a failure."""
+    root = tmp_path / "repo"
+    _populate_plain_repo(root, 30)
+    project = initialize_project(root)
+    indexer, store = _make_pool_indexer(tmp_path, parse_workers=2)
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        raise OSError("process creation is not permitted in this environment")
+
+    monkeypatch.setattr(indexing_module, "ParseWorkerPool", unavailable)
+
+    with caplog.at_level(logging.WARNING, logger=indexing_module.__name__):
+        report = indexer.index(project)
+
+    assert report.errors == []
+    assert report.indexed_files == 30
+    assert len(store.list_files(project.id)) == 30
+    assert "continuing this run in-process" in caplog.text
+
+
+def test_parse_pool_submit_failure_falls_back_and_reprocesses_in_flight_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pool dying after warmup must re-run every un-drained batch exactly once."""
+    root = tmp_path / "repo"
+    _populate_plain_repo(root, 40)
+    project = initialize_project(root)
+    indexer, store = _make_pool_indexer(tmp_path, parse_workers=2)
+
+    real_pool_cls = indexing_module.ParseWorkerPool
+
+    class FailingSubmitPool(real_pool_cls):  # type: ignore[misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            self.submit_calls = 0
+
+        def submit(self, *args: object, **kwargs: object) -> None:
+            self.submit_calls += 1
+            # Three warmup batches precede the first streaming batch.
+            if self.submit_calls == 4:
+                raise OSError("process table exhausted")
+            super().submit(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(indexing_module, "ParseWorkerPool", FailingSubmitPool)
+
+    with caplog.at_level(logging.WARNING, logger=indexing_module.__name__):
+        report = indexer.index(project)
+
+    deadline = time.monotonic() + 2.0
+    while _live_parse_worker_children() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert multiprocessing.active_children() == []
+
+    assert report.errors == []
+    assert report.indexed_files == 40
+    stored = store.list_files(project.id)
+    assert len(stored) == 40
+    chunks = store.list_chunks([project.id])
+    assert len(chunks) == len({chunk.chunk_id for chunk in chunks})
+    assert "continuing this run in-process" in caplog.text
+
+
+def test_parse_pool_drain_failure_falls_back_and_reprocesses_in_flight_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A worker death while draining must not abort a run that can finish in-process."""
+    root = tmp_path / "repo"
+    _populate_plain_repo(root, 40)
+    project = initialize_project(root)
+    indexer, store = _make_pool_indexer(tmp_path, parse_workers=2)
+
+    real_pool_cls = indexing_module.ParseWorkerPool
+
+    class FailingDrainPool(real_pool_cls):  # type: ignore[misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            self.submit_calls = 0
+            self.fail_next_drain = False
+
+        def submit(self, *args: object, **kwargs: object) -> None:
+            self.submit_calls += 1
+            super().submit(*args, **kwargs)  # type: ignore[arg-type]
+            if self.submit_calls == 4:
+                self.fail_next_drain = True
+
+        def try_drain_one(self) -> list[tuple[object, ...]] | None:
+            if self.fail_next_drain:
+                self.fail_next_drain = False
+                raise OSError("worker died while draining")
+            return super().try_drain_one()  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(indexing_module, "ParseWorkerPool", FailingDrainPool)
+
+    with caplog.at_level(logging.WARNING, logger=indexing_module.__name__):
+        report = indexer.index(project)
+
+    deadline = time.monotonic() + 2.0
+    while _live_parse_worker_children() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert multiprocessing.active_children() == []
+
+    assert report.errors == []
+    assert report.indexed_files == 40
+    stored = store.list_files(project.id)
+    assert len(stored) == 40
+    chunks = store.list_chunks([project.id])
+    assert len(chunks) == len({chunk.chunk_id for chunk in chunks})
+    assert "continuing this run in-process" in caplog.text
 
 
 def test_pipelined_scan_and_embed_overlap_produces_identical_output(

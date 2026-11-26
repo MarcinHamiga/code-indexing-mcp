@@ -14,7 +14,8 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections import deque
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1863,6 +1864,73 @@ class Indexer:
             max_file_bytes = project.scan.max_file_bytes
             warmup_buffer: list[ParseTask] = []
             batch_buffer: list[ParseTask] = []
+            # Batches handed to the pool but not consumed yet. A pool failure can
+            # re-run them in-process because nothing has been staged from a batch
+            # until its results reach consume_worker_results.
+            in_flight_tasks: deque[list[ParseTask]] = deque()
+            fallback_tasks: deque[ParseTask] = deque()
+            pool_unavailable = False
+
+            def consume_in_process(tasks: list[ParseTask]) -> None:
+                nonlocal cum_scan_ns, cum_parse_ns
+                if not tasks or stop_event.is_set():
+                    return
+                t_total = time.monotonic_ns()
+                results = process_parse_batch(
+                    root_resolved,
+                    max_file_bytes,
+                    project.id,
+                    tasks,
+                    self.extractor,
+                )
+                elapsed = time.monotonic_ns() - t_total
+                parse_part = sum(row[12] for row in results if row[0] == "parsed")
+                bounded_parse = min(elapsed, parse_part)
+                cum_parse_ns += bounded_parse
+                cum_scan_ns += max(0, elapsed - bounded_parse)
+                consume_worker_results(results)
+
+            def process_fallback_batches() -> None:
+                while len(fallback_tasks) >= PARSE_BATCH_FILES and not stop_event.is_set():
+                    tasks = [fallback_tasks.popleft() for _ in range(PARSE_BATCH_FILES)]
+                    consume_in_process(tasks)
+
+            def activate_fallback(
+                exc: Exception,
+                *,
+                warmup: bool = False,
+                extra_tasks: Sequence[ParseTask] = (),
+            ) -> None:
+                nonlocal pool, pool_unavailable
+                if pool_unavailable:
+                    return
+                pool_unavailable = True
+                logger.warning(
+                    "Parse worker pool is unavailable; continuing this run in-process",
+                    exc_info=True,
+                )
+                if pool is not None:
+                    with contextlib.suppress(Exception):
+                        pool.close(abort=True)
+                    pool = None
+                if warmup:
+                    # Warmup submitted batches whose results we never consumed.
+                    # All warmup tasks are still in warmup_buffer, including any
+                    # partial chunk parked in batch_buffer, so discard both
+                    # futures and the parked copy instead of duplicating work.
+                    in_flight_tasks.clear()
+                    batch_buffer.clear()
+                    fallback_tasks.extend(warmup_buffer)
+                    warmup_buffer.clear()
+                else:
+                    fallback_tasks.extend(task for batch in in_flight_tasks for task in batch)
+                    in_flight_tasks.clear()
+                    fallback_tasks.extend(extra_tasks)
+                    fallback_tasks.extend(batch_buffer)
+                    batch_buffer.clear()
+                    fallback_tasks.extend(warmup_buffer)
+                    warmup_buffer.clear()
+                process_fallback_batches()
 
             def drain_ready() -> None:
                 nonlocal cum_parse_ns
@@ -1870,10 +1938,16 @@ class Indexer:
                     return
                 while not stop_event.is_set():
                     t0 = time.monotonic_ns()
-                    ready = pool.try_drain_one()
+                    try:
+                        ready = pool.try_drain_one()
+                    except Exception as exc:
+                        cum_parse_ns += time.monotonic_ns() - t0
+                        activate_fallback(exc)
+                        return
                     cum_parse_ns += time.monotonic_ns() - t0
                     if ready is None:
                         break
+                    in_flight_tasks.popleft()
                     consume_worker_results(ready)
 
             def drain_for_capacity() -> None:
@@ -1882,11 +1956,32 @@ class Indexer:
                     return
                 while pool.pending_count >= pool.max_in_flight and not stop_event.is_set():
                     t0 = time.monotonic_ns()
-                    batch = pool.drain_one(stop_event)
+                    try:
+                        batch = pool.drain_one(stop_event)
+                    except Exception as exc:
+                        cum_parse_ns += time.monotonic_ns() - t0
+                        activate_fallback(exc)
+                        return
                     cum_parse_ns += time.monotonic_ns() - t0
                     if batch is None:
                         break
+                    in_flight_tasks.popleft()
                     consume_worker_results(batch)
+
+            def submit_batch(tasks: list[ParseTask]) -> None:
+                """Hand one batch to the pool; fall back in-process when it refuses."""
+                nonlocal cum_parse_ns
+                if pool is None:
+                    return
+                t_sub = time.monotonic_ns()
+                try:
+                    pool.submit(root_resolved, max_file_bytes, project.id, tasks)
+                except Exception as exc:
+                    cum_parse_ns += time.monotonic_ns() - t_sub
+                    activate_fallback(exc, extra_tasks=tasks)
+                    return
+                cum_parse_ns += time.monotonic_ns() - t_sub
+                in_flight_tasks.append(list(tasks))
 
             while not stop_event.is_set():
                 t_scan = time.monotonic_ns()
@@ -1934,69 +2029,82 @@ class Indexer:
                     ),
                 )
                 if pool is None:
+                    if pool_unavailable:
+                        fallback_tasks.append(task)
+                        process_fallback_batches()
+                        continue
                     warmup_buffer.append(task)
                     if len(warmup_buffer) >= PARSE_POOL_MIN_FILES:
                         t_pool = time.monotonic_ns()
-                        pool = ParseWorkerPool(
-                            workers,
-                            max_chars=self.extractor.max_chars,
-                            max_lines=self.extractor.max_lines,
-                            overlap_lines=self.extractor.overlap_lines,
-                            memory_ceiling_bytes=self.memory_ceiling_bytes,
-                        )
+                        try:
+                            pool = ParseWorkerPool(
+                                workers,
+                                max_chars=self.extractor.max_chars,
+                                max_lines=self.extractor.max_lines,
+                                overlap_lines=self.extractor.overlap_lines,
+                                memory_ceiling_bytes=self.memory_ceiling_bytes,
+                            )
+                        except Exception as exc:
+                            cum_parse_ns += time.monotonic_ns() - t_pool
+                            activate_fallback(exc, warmup=True)
+                            continue
                         cum_parse_ns += time.monotonic_ns() - t_pool
+                        started = True
                         for offset in range(0, len(warmup_buffer), PARSE_BATCH_FILES):
                             chunk = warmup_buffer[offset : offset + PARSE_BATCH_FILES]
                             if len(chunk) == PARSE_BATCH_FILES:
                                 t_sub = time.monotonic_ns()
-                                pool.submit(root_resolved, max_file_bytes, project.id, chunk)
+                                try:
+                                    pool.submit(root_resolved, max_file_bytes, project.id, chunk)
+                                except Exception as exc:
+                                    cum_parse_ns += time.monotonic_ns() - t_sub
+                                    activate_fallback(exc, warmup=True)
+                                    started = False
+                                    break
                                 cum_parse_ns += time.monotonic_ns() - t_sub
-                                drain_for_capacity()
+                                in_flight_tasks.append(list(chunk))
                             else:
                                 batch_buffer.extend(chunk)
-                        warmup_buffer.clear()
+                        if started:
+                            warmup_buffer.clear()
+                        continue
                 else:
                     batch_buffer.append(task)
                     if len(batch_buffer) >= PARSE_BATCH_FILES:
-                        t_sub = time.monotonic_ns()
-                        pool.submit(root_resolved, max_file_bytes, project.id, batch_buffer)
-                        cum_parse_ns += time.monotonic_ns() - t_sub
+                        tasks = list(batch_buffer)
                         batch_buffer.clear()
+                        submit_batch(tasks)
                         drain_ready()
                         drain_for_capacity()
 
             if stop_event.is_set():
                 return
 
-            if pool is None:
-                if warmup_buffer:
-                    t_total = time.monotonic_ns()
-                    results = process_parse_batch(
-                        root_resolved,
-                        max_file_bytes,
-                        project.id,
-                        warmup_buffer,
-                        self.extractor,
-                    )
-                    elapsed = time.monotonic_ns() - t_total
-                    parse_part = sum(row[12] for row in results if row[0] == "parsed")
-                    bounded_parse = min(elapsed, parse_part)
-                    cum_parse_ns += bounded_parse
-                    cum_scan_ns += max(0, elapsed - bounded_parse)
-                    consume_worker_results(results)
-            else:
-                if batch_buffer:
-                    t_sub = time.monotonic_ns()
-                    pool.submit(root_resolved, max_file_bytes, project.id, batch_buffer)
-                    cum_parse_ns += time.monotonic_ns() - t_sub
-                    batch_buffer.clear()
+            if pool is not None and batch_buffer:
+                tasks = list(batch_buffer)
+                batch_buffer.clear()
+                submit_batch(tasks)
+            if pool is not None:
                 while pool.pending_count > 0 and not stop_event.is_set():
                     t_drain = time.monotonic_ns()
-                    batch = pool.drain_one(stop_event)
+                    try:
+                        batch = pool.drain_one(stop_event)
+                    except Exception as exc:
+                        cum_parse_ns += time.monotonic_ns() - t_drain
+                        activate_fallback(exc)
+                        break
                     cum_parse_ns += time.monotonic_ns() - t_drain
                     if batch is None:
                         break
+                    in_flight_tasks.popleft()
                     consume_worker_results(batch)
+            if pool is None and not stop_event.is_set():
+                fallback_tasks.extend(warmup_buffer)
+                warmup_buffer.clear()
+                process_fallback_batches()
+                if fallback_tasks:
+                    consume_in_process(list(fallback_tasks))
+                    fallback_tasks.clear()
 
         def run_in_process(scan_stream: Iterator[ScannedFile | SkippedFile]) -> None:
             nonlocal cum_scan_ns, cum_parse_ns

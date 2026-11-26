@@ -65,7 +65,14 @@ class ParseTask(NamedTuple):
 
 
 class WireChunk(NamedTuple):
-    """Compact pickleable tuple mirroring ``ExtractedChunk`` fields without Pydantic overhead."""
+    """Compact pickleable tuple mirroring ``ExtractedChunk`` fields without Pydantic overhead.
+
+    ``search_text`` is deliberately absent: it is exactly
+    ``embedding_text + "\\n" + search_suffix`` and no indexing consumer reads it,
+    so sending it would grow every inter-process batch by a normalized copy of
+    the chunk text. :meth:`to_extracted` reconstructs it when a caller iterates
+    the full model.
+    """
 
     kind: str
     symbol: str | None
@@ -77,7 +84,6 @@ class WireChunk(NamedTuple):
     end_line: int
     content: str
     embedding_text: str
-    search_text: str
     part_index: int
     is_test: bool
     embedding_prefix: str
@@ -96,7 +102,6 @@ class WireChunk(NamedTuple):
             end_line=chunk.end_line,
             content=chunk.content,
             embedding_text=chunk.embedding_text,
-            search_text=chunk.search_text,
             part_index=chunk.part_index,
             is_test=chunk.is_test,
             embedding_prefix=chunk.embedding_prefix,
@@ -115,7 +120,7 @@ class WireChunk(NamedTuple):
             end_line=self.end_line,
             content=self.content,
             embedding_text=self.embedding_text,
-            search_text=self.search_text,
+            search_text=f"{self.embedding_text}\n{self.search_suffix}",
             part_index=self.part_index,
             is_test=self.is_test,
             embedding_prefix=self.embedding_prefix,
@@ -150,6 +155,25 @@ def resolve_parse_workers(configured: int, memory_ceiling_bytes: int) -> int:
         (memory_ceiling_bytes - PARSE_MEMORY_RESERVE_BYTES) // PARSE_WORKER_MEMORY_ESTIMATE_BYTES,
     )
     return min(cpu_cap, mem_cap)
+
+
+def per_worker_memory_ceiling(memory_ceiling_bytes: int | None, workers: int) -> int | None:
+    """Divide the run ceiling across workers so their aggregate stays bounded.
+
+    Each worker's budget measures growth from its own post-init RSS, so handing
+    every worker the whole run ceiling let *N* workers grow to *N* times the
+    configured bound. The automatic worker sizing already keeps
+    ``PARSE_MEMORY_RESERVE_BYTES`` for the parent; subtracting it here gives the
+    same total bound when workers are configured explicitly. The per-worker
+    estimate is kept as a floor: an explicit high worker count should not make
+    ordinary extraction trip a budget this small, only cap how far past the
+    estimate each worker may grow.
+    """
+    if memory_ceiling_bytes is None or memory_ceiling_bytes <= 0:
+        return None
+    available = max(0, memory_ceiling_bytes - PARSE_MEMORY_RESERVE_BYTES)
+    share = available // max(1, workers)
+    return max(PARSE_WORKER_MEMORY_ESTIMATE_BYTES, share)
 
 
 def content_rejection(source: bytes) -> str | None:
@@ -503,7 +527,12 @@ class ParseWorkerPool:
             max_workers=workers,
             mp_context=context,
             initializer=_worker_init,
-            initargs=(max_chars, max_lines, overlap_lines, memory_ceiling_bytes),
+            initargs=(
+                max_chars,
+                max_lines,
+                overlap_lines,
+                per_worker_memory_ceiling(memory_ceiling_bytes, workers),
+            ),
         )
 
     @property
