@@ -377,3 +377,35 @@ def test_application_never_reads_offline_from_the_environment(
     )
 
     assert app.embedder.offline is True
+
+
+def test_parse_workers_defaults_to_auto() -> None:
+    assert IndexSettings.from_environment({}).parse_workers == 0
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("auto", 0),
+        ("AUTO", 0),
+        ("  Auto  ", 0),
+        ("0", 0),
+        ("  0  ", 0),
+        ("1", 1),
+        ("4", 4),
+        ("16", 16),
+    ],
+)
+def test_parse_workers_accepts_auto_and_bounded_integers(raw: str, expected: int) -> None:
+    assert IndexSettings.from_environment({"CODE_INDEXING_PARSE_WORKERS": raw}).parse_workers == (
+        expected
+    )
+
+
+@pytest.mark.parametrize("raw", ["-1", "17", "abc", "", "1.5"])
+def test_parse_workers_rejects_out_of_range_or_non_integer_values(raw: str) -> None:
+    with pytest.raises(CodeIndexingError) as caught:
+        IndexSettings.from_environment({"CODE_INDEXING_PARSE_WORKERS": raw})
+
+    assert caught.value.code is ErrorCode.INVALID_CONFIGURATION
+    assert caught.value.details["setting"] == "CODE_INDEXING_PARSE_WORKERS"

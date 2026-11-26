@@ -947,14 +947,19 @@ export CODE_INDEXING_EMBED_THREADS=2
 export CODE_INDEXING_EMBED_CPU_ARENA=0
 export CODE_INDEXING_VECTOR_INDEX=exact     # exact, or hnsw
 export CODE_INDEXING_VECTOR_STORAGE=float16 # float16, or float32
+export CODE_INDEXING_PARSE_WORKERS=auto     # auto, or 1-16; 1 keeps parsing in-process
 export CODE_INDEXING_AUTO_MAINTENANCE=1     # 0 disables scheduled daily compaction and version cleanup
 export CODE_INDEXING_VERSION_RETENTION_HOURS=24 # keep old Lance versions for 24h before verified cleanup (min: 1)
 ```
 
-The ceiling covers indexing memory: the embedding worker plus any growth in the host process while
-indexing runs. Memory the host already held when the worker started — the daemon's query model and
-open Lance datasets — is not charged to the budget, so a warm daemon can still index. `IndexReport`
-reports both the budget and the true combined peak, plus a scan/parse/embed/commit duration split.
+The ceiling covers indexing memory: the embedding worker, the parse workers' share of the budget,
+plus any growth in the host process while indexing runs. Parser workers divide the remaining
+ceiling instead of each receiving the whole of it, with the per-worker estimate as a floor. Memory
+the host already held when the worker started — the daemon's query model and open Lance datasets —
+is not charged to the budget, so a warm daemon can still index. `IndexReport` reports both the
+budget and the true combined peak, plus a scan/parse/embed/commit duration split. If the platform
+refuses to start parser workers, indexing logs a warning and continues in-process rather than
+failing the run.
 
 `CODE_INDEXING_VECTOR_INDEX` selects the vector search strategy. `exact` (the default) scans every
 vector without an index: a full cosine scan of the 56k-chunk measurement index costs about 6 ms,

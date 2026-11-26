@@ -31,7 +31,7 @@ from tree_sitter import Language, Node, Parser, Query, QueryCursor, Tree
 from tree_sitter import Query as StructuralQuery
 from tree_sitter_language_pack import DownloadError, get_language
 
-from .language_rules import _DEFAULT, LANGUAGE_RULES
+from .language_rules import _DEFAULT, LANGUAGE_RULES, _LanguageRules
 from .memory_budget import check_parent_memory_budget
 from .models import (
     CallShape,
@@ -138,7 +138,13 @@ class _ReferenceAdder(Protocol):
 
 
 class _StructuralRecordHandler(Protocol):
-    def __call__(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None: ...
+    def __call__(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None: ...
 
 
 class _TypeLeaf(NamedTuple):
@@ -333,6 +339,326 @@ _PARAMETER_PARENTS: Final = frozenset(
         "ParamDeclList",
     }
 )
+_KOTLIN_SWIFT_DECL_PARENTS: Final = frozenset(
+    {
+        "function_declaration",
+        "protocol_function_declaration",
+        "class_declaration",
+        "protocol_declaration",
+        "object_declaration",
+        "type_alias",
+        "variable_declaration",
+        "enum_entry",
+        "parameter",
+    }
+)
+# Ancestor boundaries that terminate the upward `class_heritage` check for
+# JS/TS member accesses. Stops immediately at class bodies, functions, and
+# statements so ordinary reads never walk to the file root, while deliberately
+# allowing member reads inside callbacks passed to mixin heritage expressions.
+_JS_HERITAGE_STOP_TYPES: Final = frozenset(
+    {
+        "class_body",
+        "statement_block",
+        "function_declaration",
+        "method_definition",
+        "arrow_function",
+        "expression_statement",
+        "variable_declaration",
+        "lexical_declaration",
+        "return_statement",
+        "program",
+    }
+)
+_MEMBER_PARENTS: Final = frozenset({"attribute", "member_expression"})
+_CALL_PARENTS: Final = frozenset({"call", "call_expression", "new_expression", "function_call"})
+_SHARED_OWNER_PARENTS: Final = frozenset(
+    {
+        "function_definition",
+        "function_expression",
+        "generator_function_declaration",
+        "generator_function",
+        "class_definition",
+        "function_declaration",
+        "class_declaration",
+        "method_definition",
+        "variable_declarator",
+        "interface_declaration",
+        "type_alias_declaration",
+        "type_parameter",
+        "jsx_opening_element",
+        "jsx_self_closing_element",
+        "jsx_closing_element",
+        "method_declaration",
+        "type_spec",
+        "type_alias",
+        "field_declaration",
+        "method_elem",
+        "var_spec",
+        "const_spec",
+        "function_item",
+        "function_signature_item",
+        "struct_item",
+        "enum_item",
+        "trait_item",
+        "mod_item",
+        "const_item",
+        "static_item",
+        "enum_variant",
+        "impl_item",
+        "struct_expression",
+    }
+)
+_SHARED_OWNER_FIELDS: Final = ("name", "type", "result", "return_type", "trait")
+# `for_statement` is handled (or shadowed) by `_POSITIONAL_CLIMB_PARENTS` so
+# non-GDScript grammars keep emitting `for` target reads as before.
+_SHARED_LEFT_PARENTS: Final = frozenset(
+    {
+        "assignment",
+        "assignment_expression",
+        "augmented_assignment",
+        "named_expression",
+        "for_in_clause",
+        "for_in_statement",
+        "assignment_statement",
+        "short_var_declaration",
+        "range_clause",
+        "compound_assignment_expr",
+    }
+)
+_SHARED_LEFT_FIELDS: Final = ("left", "name")
+
+_LANGUAGE_FIELD_OVERRIDES: Final[dict[str, dict[str, tuple[str, ...]]]] = {
+    "python": {
+        "function_definition": ("name", "return_type"),
+        "class_definition": ("name",),
+        "type_alias_declaration": ("name",),
+        "type_parameter": ("name", "type"),
+        "assignment": ("left",),
+        "augmented_assignment": ("left",),
+        "named_expression": ("name",),
+        "for_in_clause": ("left",),
+    },
+    "javascript": {
+        "function_declaration": ("name", "return_type"),
+        "function_expression": ("name", "return_type"),
+        "generator_function_declaration": ("name", "return_type"),
+        "generator_function": ("name", "return_type"),
+        "method_definition": ("name", "return_type"),
+        "class_declaration": ("name",),
+        "variable_declarator": ("name",),
+        "interface_declaration": ("name",),
+        "type_alias_declaration": ("name",),
+        "type_parameter": ("name",),
+        "jsx_opening_element": ("name",),
+        "jsx_self_closing_element": ("name",),
+        "jsx_closing_element": ("name",),
+        "assignment_expression": ("left",),
+        "for_in_statement": ("left",),
+    },
+    "go": {
+        "function_declaration": ("name", "result"),
+        "method_declaration": ("name", "result"),
+        "method_elem": ("name", "result"),
+        "type_spec": ("name", "type"),
+        "type_alias": ("name", "type"),
+        "field_declaration": ("name", "type"),
+        "var_spec": ("name", "type"),
+        "const_spec": ("name", "type"),
+        "assignment_statement": ("left",),
+        "short_var_declaration": ("left",),
+        "range_clause": ("left",),
+    },
+    "rust": {
+        "function_item": ("name", "return_type"),
+        "function_signature_item": ("name", "return_type"),
+        "struct_item": ("name",),
+        "enum_item": ("name",),
+        "trait_item": ("name",),
+        "mod_item": ("name",),
+        "enum_variant": ("name",),
+        "struct_expression": ("name",),
+        "const_item": ("name", "type"),
+        "static_item": ("name", "type"),
+        "impl_item": ("trait", "type"),
+        "compound_assignment_expr": ("left",),
+    },
+}
+_LANGUAGE_FIELD_OVERRIDES["typescript"] = _LANGUAGE_FIELD_OVERRIDES["javascript"]
+_LANGUAGE_FIELD_OVERRIDES["tsx"] = _LANGUAGE_FIELD_OVERRIDES["javascript"]
+
+_POSITIONAL_PARENTS_BY_LANGUAGE: Final[dict[str, frozenset[str]]] = {
+    "javascript": frozenset({"new_expression"}),
+    "typescript": frozenset({"new_expression"}),
+    "tsx": frozenset({"new_expression"}),
+    "c": frozenset({"preproc_params", "type_definition", "parameter_declaration"}),
+    "cpp": frozenset(
+        {
+            "preproc_params",
+            "base_class_clause",
+            "type_definition",
+            "parameter_declaration",
+            "new_expression",
+        }
+    ),
+    "go": frozenset({"parameter_declaration"}),
+    "lua": frozenset({"variable_list", "field"}),
+    "gdscript": frozenset({"extends_statement", "enumerator", "for_statement", "attribute_call"}),
+    "gdshader": frozenset(
+        {
+            "struct_definition",
+            "field_definition",
+            "type_hint",
+            "varying_declaration",
+            "parameter_declaration",
+            "uniform_declaration",
+        }
+    ),
+}
+_FIELDLESS_MEMBER_LANGUAGES: Final = frozenset({"gdscript", ""})
+_FIELDLESS_CALL_LANGUAGES: Final = frozenset(
+    {"gdscript", "lua", "kotlin", "swift", "terraform", ""}
+)
+_EACH_LANGUAGE_HAS_FUNCTION_ONLY_CALL: Final = frozenset(
+    {"javascript", "typescript", "tsx", "go", "rust", "c", "cpp", "gdshader"}
+)
+
+
+@dataclass(slots=True, frozen=True)
+class _IdentifierDispatch:
+    """Precomputed per-language parent dispatch tables for `_identifier_record`."""
+
+    immediate_exclude: frozenset[str]
+    excluded_fields_by_parent: dict[str, tuple[str, ...]]
+    parameter_parents: frozenset[str]
+    declarator_parents: frozenset[str]
+    positional_parents: frozenset[str]
+    fieldless_member_possible: bool
+    fieldless_call_possible: bool
+    has_declarators: bool
+    has_positional: bool
+    has_immediate_rules: bool
+    method_name_field_excluded: bool
+    is_kotlin_swift: bool
+    is_swift: bool
+    is_zig: bool
+    is_gdshader: bool
+    is_gdscript: bool
+
+
+def _build_identifier_dispatch(language: str, rules: _LanguageRules) -> _IdentifierDispatch:
+    # `type_parameter` in Java belongs to `_SHARED_OWNER_PARENTS` before
+    # `handler_owned_type_parents` is checked, so keep it out of `immediate_exclude`.
+    handler_owned_excludes = rules.handler_owned_type_parents - _SHARED_OWNER_PARENTS
+    immediate_exclude = (
+        _IDENTIFIER_BINDING_PARENTS
+        | rules.import_owner_parents
+        | handler_owned_excludes
+        | ({"inc_statement", "dec_statement"} if language in {"go", ""} else set())
+    )
+    fieldless_member_possible = language in _FIELDLESS_MEMBER_LANGUAGES
+    fieldless_call_possible = language in _FIELDLESS_CALL_LANGUAGES
+
+    overrides = _LANGUAGE_FIELD_OVERRIDES.get(language, {})
+    excluded_fields_by_parent: dict[str, tuple[str, ...]] = {}
+    for ptype in _SHARED_OWNER_PARENTS:
+        excluded_fields_by_parent[ptype] = overrides.get(ptype, _SHARED_OWNER_FIELDS)
+    for ptype in _SHARED_LEFT_PARENTS:
+        excluded_fields_by_parent.setdefault(ptype, overrides.get(ptype, _SHARED_LEFT_FIELDS))
+    for ptype in ("let_declaration", "for_expression"):
+        excluded_fields_by_parent.setdefault(ptype, ("pattern",))
+    for ptype in rules.name_and_type_parents:
+        excluded_fields_by_parent.setdefault(ptype, ("name", "type"))
+    for ptype in rules.name_and_field_parents:
+        excluded_fields_by_parent.setdefault(ptype, ("name", "field"))
+    for ptype in rules.type_only_parents:
+        excluded_fields_by_parent.setdefault(ptype, ("type",))
+    for ptype in rules.parameters_parents:
+        excluded_fields_by_parent.setdefault(ptype, ("parameters",))
+    # In C/C++, `_POSITIONAL_CLIMB_PARENTS` previously shadowed `name_only_parents`
+    # for `enumerator`; exclude it here to preserve identical extraction parity.
+    name_only = (
+        rules.name_only_parents - {"enumerator"}
+        if language in {"c", "cpp"}
+        else rules.name_only_parents
+    )
+    for ptype in name_only:
+        excluded_fields_by_parent.setdefault(ptype, ("name",))
+    for ptype in rules.left_and_type_parents:
+        excluded_fields_by_parent.setdefault(ptype, ("left", "type"))
+    for ptype in rules.function_and_type_parents:
+        excluded_fields_by_parent.setdefault(ptype, ("function", "type"))
+    excluded_fields_by_parent.setdefault("scoped_identifier", ("path",))
+    excluded_fields_by_parent.setdefault("field_initializer", ("field",))
+    for ptype in ("arrow_function", "lambda"):
+        excluded_fields_by_parent.setdefault(ptype, ("parameter",))
+    if not fieldless_member_possible:
+        excluded_fields_by_parent.setdefault(
+            "attribute", ("attribute",) if language == "python" else ("attribute", "property")
+        )
+        excluded_fields_by_parent.setdefault(
+            "member_expression",
+            ("property",)
+            if language in {"javascript", "typescript", "tsx"}
+            else ("attribute", "property"),
+        )
+    excluded_fields_by_parent.setdefault("dot_index_expression", ("field",))
+    excluded_fields_by_parent.setdefault("method_index_expression", ("method",))
+    excluded_fields_by_parent.setdefault("field_expression", ("field",))
+    excluded_fields_by_parent.setdefault("qualified_identifier", ("scope", "name"))
+    if not fieldless_call_possible:
+        excluded_fields_by_parent.setdefault(
+            "call", ("function",) if language == "python" else ("function", "constructor")
+        )
+        excluded_fields_by_parent.setdefault(
+            "call_expression",
+            ("function",)
+            if language in _EACH_LANGUAGE_HAS_FUNCTION_ONLY_CALL
+            else ("function", "constructor"),
+        )
+        excluded_fields_by_parent.setdefault("function_call", ("function", "constructor"))
+    excluded_fields_by_parent.setdefault("keyword_argument", ("name",))
+    excluded_fields_by_parent.setdefault("as_pattern", ("alias",))
+    excluded_fields_by_parent.setdefault("catch_clause", ("parameter",))
+    excluded_fields_by_parent.setdefault("export_statement", ("value",))
+    for ptype in rules.pair_parents:
+        excluded_fields_by_parent.setdefault(ptype, ("key",))
+
+    positional_parents = (
+        _POSITIONAL_CLIMB_PARENTS
+        if language == ""
+        else _POSITIONAL_PARENTS_BY_LANGUAGE.get(language, frozenset())
+    )
+    is_kotlin_swift = language in {"kotlin", "swift"}
+    is_swift = language == "swift"
+    is_zig = language == "zig"
+    is_gdshader = language == "gdshader"
+    is_gdscript = language == "gdscript"
+    has_immediate_rules = rules.method_name_field_excluded or is_kotlin_swift or is_zig
+    return _IdentifierDispatch(
+        immediate_exclude=immediate_exclude,
+        excluded_fields_by_parent=excluded_fields_by_parent,
+        parameter_parents=_PARAMETER_PARENTS,
+        declarator_parents=rules.declarator_parents,
+        positional_parents=positional_parents,
+        fieldless_member_possible=fieldless_member_possible,
+        fieldless_call_possible=fieldless_call_possible,
+        has_declarators=bool(rules.declarator_parents),
+        has_positional=bool(positional_parents),
+        has_immediate_rules=has_immediate_rules,
+        method_name_field_excluded=rules.method_name_field_excluded,
+        is_kotlin_swift=is_kotlin_swift,
+        is_swift=is_swift,
+        is_zig=is_zig,
+        is_gdshader=is_gdshader,
+        is_gdscript=is_gdscript,
+    )
+
+
+_IDENTIFIER_DISPATCH: Final[dict[str, _IdentifierDispatch]] = {
+    lang: _build_identifier_dispatch(lang, rules) for lang, rules in LANGUAGE_RULES.items()
+}
+_DEFAULT_DISPATCH: Final[_IdentifierDispatch] = _build_identifier_dispatch("", _DEFAULT)
 
 
 def normalize_identifier(value: str) -> str:
@@ -473,9 +799,11 @@ class _DefinitionIndex:
 
 
 # `check_parent_memory_budget` reads process RSS (~9 us); doing it per query match
-# nearly tripled extraction time. Checking every Nth match still catches runaway
-# growth long before it matters, and the once-per-file checks stay unconditional.
-_BUDGET_CHECK_INTERVAL: Final = 64
+# or per chunk multiplied extraction time. Checking every Nth match or chunk
+# still catches runaway growth long before it matters, and the once-per-file
+# checks stay unconditional.
+_BUDGET_CHECK_INTERVAL: Final = 128
+_CHUNK_BUDGET_CHECK_INTERVAL: Final = 16
 
 
 _active_parents: ContextVar[_ParentMap | None] = ContextVar("extractor_parents", default=None)
@@ -504,20 +832,26 @@ class _ParentMap:
     def build(cls, root: Node) -> _ParentMap:
         parents: dict[int, Node] = {}
         cursor = root.walk()
+        goto_first_child = cursor.goto_first_child
+        goto_next_sibling = cursor.goto_next_sibling
+        goto_parent = cursor.goto_parent
         stack: list[Node] = [root]  # open ancestors; stack[-1] parents cursor.node
-        if not cursor.goto_first_child():
+        append = stack.append
+        pop = stack.pop
+        if not goto_first_child():
             return cls(parents)
         while True:
             node = cursor.node
             assert node is not None
-            parents[node.id] = stack[-1]
-            if cursor.goto_first_child():
-                stack.append(node)
+            if node.is_named:
+                parents[node.id] = stack[-1]
+            if goto_first_child():
+                append(node)
                 continue
-            while not cursor.goto_next_sibling():
-                if not cursor.goto_parent():
+            while not goto_next_sibling():
+                if not goto_parent():
                     return cls(parents)
-                stack.pop()
+                pop()
 
     def parent(self, node: Node) -> Node | None:
         return self._parents.get(node.id)
@@ -884,11 +1218,12 @@ class TreeSitterExtractor:
         top_level_end = 0
         budget_chars = min(_SKELETON_MAX_CHARS, self.max_chars)
         budget_lines = min(_SKELETON_MAX_LINES, self.max_lines)
+        next_budget_chunk = _CHUNK_BUDGET_CHECK_INTERVAL
 
         for position, definition in enumerate(definitions):
             if position % _BUDGET_CHECK_INTERVAL == 0:
                 check_parent_memory_budget()
-            outer = self._outer_node(definition.node)
+            outer = self._outer_node(definition.node, parents)
             ancestor = self._nearest_definition_ancestor(definition.node, index, parents)
             if ancestor is None:
                 effective_start = self._effective_start_byte(
@@ -915,7 +1250,12 @@ class TreeSitterExtractor:
             kind, parent, qualified = self._symbol_context(definition, index, parents)
             children = (
                 self._direct_children(
-                    outer, definition.node, index, normalized_source, language=language
+                    outer,
+                    definition.node,
+                    index,
+                    normalized_source,
+                    language=language,
+                    parents=parents,
                 )
                 if kind in _CONTAINER_KINDS
                 else []
@@ -978,6 +1318,9 @@ class TreeSitterExtractor:
                         is_test=definition_is_test,
                     )
                 )
+            if len(chunks) >= next_budget_chunk:
+                check_parent_memory_budget()
+                next_budget_chunk = len(chunks) + _CHUNK_BUDGET_CHECK_INTERVAL
             for gap_start, gap_end in self._container_gaps(outer, children, normalized_source):
                 gap_segments = (
                     [(gap_start, gap_end, True)]
@@ -1002,13 +1345,16 @@ class TreeSitterExtractor:
                                 is_test=seg_is_test,
                             )
                         )
+                        if len(chunks) >= next_budget_chunk:
+                            check_parent_memory_budget()
+                            next_budget_chunk = len(chunks) + _CHUNK_BUDGET_CHECK_INTERVAL
 
         chunks.extend(
             self._module_chunks(path, language, normalized_source, covered, line_index, test_ranges)
         )
         check_parent_memory_budget()
         chunks.sort(key=lambda chunk: (chunk.start_byte, chunk.end_byte, chunk.kind))
-        return ExtractionResult(
+        return ExtractionResult.model_construct(
             chunks=chunks,
             references=references,
             declarations=declarations,
@@ -1081,11 +1427,15 @@ class TreeSitterExtractor:
                 return
             seen.add(key)
             name = written_name or _capture_name(source, node)
+            bound_written = _bound_reference_name(name)
+            bound_target = (
+                bound_written if name is target_name else _bound_reference_name(target_name)
+            )
             references.append(
-                ExtractedReference.model_construct(
+                ExtractedReference(
                     kind=kind,
-                    written_name=_bound_reference_name(name),
-                    target_name=_bound_reference_name(target_name),
+                    written_name=bound_written,
+                    target_name=bound_target,
                     source_qualified_symbol=self._enclosing_symbol(
                         node, declaration_by_node, parents, enclosing_cache
                     ),
@@ -1104,6 +1454,7 @@ class TreeSitterExtractor:
             )
 
         method = self._structural_handlers[language]
+        dispatch = _IDENTIFIER_DISPATCH.get(language, _DEFAULT_DISPATCH)
         for position, (_, captures) in enumerate(matches):
             if position % _BUDGET_CHECK_INTERVAL == 0:
                 check_parent_memory_budget()
@@ -1113,15 +1464,117 @@ class TreeSitterExtractor:
                 for node in nodes:
                     if capture == "reference.identifier":
                         self._identifier_record(
-                            language, node, source, add, parents, safe_identifier_nodes
+                            language,
+                            node,
+                            source,
+                            add,
+                            parents,
+                            safe_identifier_nodes,
+                            dispatch,
                         )
                     else:
                         # Reference-query captures are decorative: every language
                         # handler re-dispatches on `node.type`, so adding a
                         # language is one `.scm` file plus one map entry.
-                        method(node, source, add)
+                        method(node, source, add, parents)
         references.sort(key=lambda item: (item.start_byte, item.end_byte, item.kind))
         return references, declarations
+
+    @staticmethod
+    def _immediate_parent_excludes(
+        dispatch: _IdentifierDispatch,
+        node: Node,
+        node_type: str,
+        parent: Node,
+        ptype: str,
+    ) -> bool:
+        if dispatch.method_name_field_excluded and ptype == "method_declaration":
+            return parent.child_by_field_name("name") != node
+        if dispatch.is_kotlin_swift:
+            if ptype in _KOTLIN_SWIFT_DECL_PARENTS:
+                return node_type in {"simple_identifier", "type_identifier"}
+            if ptype == "class_parameter":
+                return node_type == "simple_identifier"
+            if ptype == "navigation_suffix":
+                return _last_named_child(parent) == node
+            if ptype == "value_argument_label":
+                return True
+            if dispatch.is_swift and ptype == "pattern":
+                return _first_named_child(parent) == node
+        if dispatch.is_zig:
+            if ptype in {"VarDecl", "ContainerField"}:
+                return _first_named_child(parent) == node
+            if ptype == "FieldOrFnCall" and node_type == "IDENTIFIER":
+                return True
+            if ptype == "FieldInit" and node_type == "IDENTIFIER":
+                return _first_named_child(parent) == node
+            if (
+                ptype == "SuffixExpr"
+                and node_type == "IDENTIFIER"
+                and _first_named_child(parent) == node
+            ):
+                return any(
+                    child.type == "FnCallArguments"
+                    for child in parent.named_children
+                    if not child.is_extra
+                )
+        return False
+
+    @staticmethod
+    def _positional_parent_excludes(
+        dispatch: _IdentifierDispatch,
+        node: Node,
+        node_type: str,
+        parent: Node,
+        ptype: str,
+    ) -> tuple[str, ...] | None:
+        if ptype == "type_definition":
+            return (
+                None
+                if (
+                    node_type in {"type_identifier", "identifier"}
+                    and _last_named_child(parent) == node
+                )
+                else ()
+            )
+        if ptype == "parameter_declaration":
+            return None if (node_type == "identifier" and _last_named_child(parent) == node) else ()
+        if ptype == "for_statement":
+            return (
+                None
+                if (
+                    dispatch.is_gdscript
+                    and node_type == "identifier"
+                    and _first_named_child(parent) == node
+                )
+                else ()
+            )
+        if ptype in _PURE_BINDING_PARENTS:
+            return () if (ptype == "enumerator" and not dispatch.is_gdscript) else None
+        if ptype == "attribute_call":
+            return None if _first_named_child(parent) == node else ()
+        if ptype == "new_expression":
+            return (
+                None
+                if parent.child_by_field_name("constructor") is None
+                else ("function", "constructor")
+            )
+        if ptype == "uniform_declaration":
+            if node_type != "identifier":
+                return ()
+            for child in parent.children:
+                if child.type == "=":
+                    break
+                if child == node:
+                    return None
+            return ()
+        if ptype == "field":
+            return (
+                ()
+                if any(not child.is_named and child.type == "[" for child in parent.children)
+                else ("name",)
+            )
+        return ()
 
     @staticmethod
     def _identifier_record(
@@ -1131,471 +1584,125 @@ class TreeSitterExtractor:
         add_reference: _ReferenceAdder,
         parents: _ParentMap,
         safe_nodes: set[int] | None = None,
+        dispatch: _IdentifierDispatch | None = None,
     ) -> None:
         """Record identifier values while excluding bindings and richer structural uses."""
-        rules = LANGUAGE_RULES.get(language, _DEFAULT)
+        if dispatch is None:
+            dispatch = _IDENTIFIER_DISPATCH.get(language, _DEFAULT_DISPATCH)
         parents_get = parents._parents.get
         node_start = node.start_byte
         node_end = node.end_byte
         node_type = node.type
-        import_owner_parents = rules.import_owner_parents
-        declarator_parents = rules.declarator_parents
-        name_and_type_parents = rules.name_and_type_parents
-        name_and_field_parents = rules.name_and_field_parents
-        type_only_parents = rules.type_only_parents
-        parameters_parents = rules.parameters_parents
-        name_only_parents = rules.name_only_parents
-        left_and_type_parents = rules.left_and_type_parents
-        function_and_type_parents = rules.function_and_type_parents
-        pair_parents = rules.pair_parents
-        handler_owned_type_parents = rules.handler_owned_type_parents
-        method_name_field_excluded = rules.method_name_field_excluded
-        is_kotlin_swift = language in {"kotlin", "swift"}
-        is_swift = language == "swift"
-        is_zig = language == "zig"
-        is_gdshader = language == "gdshader"
-        is_gdscript = language == "gdscript"
+        immediate_exclude = dispatch.immediate_exclude
+        excluded_fields_by_parent = dispatch.excluded_fields_by_parent
+        parameter_parents = dispatch.parameter_parents
+        declarator_parents = dispatch.declarator_parents
+        positional_parents = dispatch.positional_parents
+        has_immediate_rules = dispatch.has_immediate_rules
+        has_declarators = dispatch.has_declarators
+        has_positional = dispatch.has_positional
+        fieldless_member_possible = dispatch.fieldless_member_possible
+        fieldless_call_possible = dispatch.fieldless_call_possible
+        is_gdshader = dispatch.is_gdshader
         can_cache = safe_nodes is not None and node_start < node_end
         trail: list[int] | None = [] if can_cache else None
-
-        def contains(outer: Node | None) -> bool:
-            return bool(
-                outer is not None and outer.start_byte <= node_start and node_end <= outer.end_byte
-            )
 
         current = node
         while (parent := parents_get(current.id)) is not None:
             ptype = parent.type
-            if ptype in _IDENTIFIER_BINDING_PARENTS or ptype in import_owner_parents:
+            if ptype in immediate_exclude:
                 return
             step_safe = trail is not None and current is not node
-            if ptype in _PARAMETER_PARENTS:
+            excluded_fields: tuple[str, ...] = ()
+            if ptype in parameter_parents:
                 step_safe = False
                 parameter = node
                 while (step := parents_get(parameter.id)) is not None and step != parent:
                     parameter = step
-                    # TS's `required_parameter`/`optional_parameter` wrapper
-                    # exposes a default under a `value` field; bare JS/TS
-                    # `assignment_pattern` (untyped `a = LIMIT`) exposes it
-                    # under `right` instead (mirrors the E8 note on
-                    # `_parameter_shapes` below). Checking only `value` drops
-                    # every identifier read inside a plain JS default.
-                    if contains(parameter.child_by_field_name("value")) or contains(
-                        parameter.child_by_field_name("right")
+                    value = parameter.child_by_field_name("value")
+                    if (
+                        value is not None
+                        and value.start_byte <= node_start
+                        and node_end <= value.end_byte
+                    ):
+                        break
+                    right = parameter.child_by_field_name("right")
+                    if (
+                        right is not None
+                        and right.start_byte <= node_start
+                        and node_end <= right.end_byte
                     ):
                         break
                     if TreeSitterExtractor._is_default_value_read(parameter, node):
                         break
                 else:
                     return
-            excluded_fields: tuple[str, ...] = ()
-            if (
-                method_name_field_excluded
+            elif (
+                has_immediate_rules
                 and current is node
-                and ptype == "method_declaration"
-                and parent.child_by_field_name("name") != node
+                and TreeSitterExtractor._immediate_parent_excludes(
+                    dispatch, node, node_type, parent, ptype
+                )
             ):
-                # Must win over the shared `method_declaration` owner branch
-                # below: the grammar names no return-type field, so the
-                # identifier directly before the name (the return type, owned
-                # by the handler's `type_use`) would otherwise leak a plain
-                # read. The name is cut by the shared branch's `name` field.
-                # `current is node` keeps this to the identifier's immediate
-                # parent -- the climb revisits ancestors for deeper reads,
-                # which must survive.
                 return
-            if ptype in declarator_parents:
+            elif has_declarators and ptype in declarator_parents:
                 step_safe = False
-                if contains(parent.child_by_field_name("type")):
+                type_field = parent.child_by_field_name("type")
+                if (
+                    type_field is not None
+                    and type_field.start_byte <= node_start
+                    and node_end <= type_field.end_byte
+                ):
                     excluded_fields = ("type",)
                 else:
-                    # The `declarator` span wraps the initializer and the
-                    # parameter list too (`int a = MAX`), so span containment
-                    # on the field would cut the value's reads as well. Only
-                    # the declared name leaf itself is a binding.
                     name_leaf = TreeSitterExtractor._declarator_identifier(
                         parent.child_by_field_name("declarator")
                     )
-                    if name_leaf is not None and contains(name_leaf):
+                    if (
+                        name_leaf is not None
+                        and name_leaf.start_byte <= node_start
+                        and node_end <= name_leaf.end_byte
+                    ):
                         return
-                    excluded_fields = ()
-            elif ptype == "function_definition" and is_gdshader and node_type == "identifier":
-                # Fieldless definition (`float brightness(...)`): the name is
-                # the identifier between the return type and the parameter
-                # list. Other grammars cut definition names through the
-                # `name` field in the shared branch below and never reach
-                # here.
+            elif is_gdshader and ptype == "function_definition" and node_type == "identifier":
                 step_safe = False
                 siblings = [child for child in parent.named_children if not child.is_extra]
                 if len(siblings) >= 2 and siblings[1] == node:
                     return
-                excluded_fields = ()
-            elif (
-                is_kotlin_swift
-                and current is node
-                and ptype
-                in {
-                    "function_declaration",
-                    "protocol_function_declaration",
-                    "class_declaration",
-                    "protocol_declaration",
-                    "object_declaration",
-                    "type_alias",
-                    "variable_declaration",
-                    "enum_entry",
-                    "parameter",
-                }
-            ):
-                # Declaration names the shared field-based branches cannot
-                # cut: Kotlin names no `name` field at all. The declared
-                # name is the only DIRECT identifier child -- receiver
-                # types, type parameters, value parameters, and return
-                # types all nest a level deeper -- so any direct
-                # `simple_identifier`/`type_identifier` is the name, even
-                # with a receiver (`fun String.greet`) or type parameters
-                # (`fun <T> identity`) in front of it. `current is node`
-                # keeps this to the identifier's immediate parent: the
-                # climb revisits ancestors for deeper reads, which must
-                # survive (the method_name_field_excluded branch above
-                # needs the same guard for the same reason).
-                if node_type in {"simple_identifier", "type_identifier"}:
-                    return
-                excluded_fields = ()
-            elif is_swift and current is node and ptype == "pattern":
-                # `let name: String`: the bound name is the first name in
-                # the pattern. (Later names in a tuple pattern stay reads;
-                # destructuring is not modeled for Swift.)
-                if _first_named_child(parent) == node:
-                    return
-                excluded_fields = ()
-            elif is_kotlin_swift and current is node and ptype == "class_parameter":
-                # `class Greeter(val name: String)`: the property name is
-                # the `simple_identifier` beside the type, with the
-                # `val`/`var` marker first so the gate above cannot see it.
-                if node_type == "simple_identifier":
-                    return
-                excluded_fields = ()
-            elif is_kotlin_swift and current is node and ptype == "navigation_suffix":
-                # `foo.bar`: the member is owned by the handler's
-                # whole-span member row; the base keeps its read.
-                if _last_named_child(parent) == node:
-                    return
-                excluded_fields = ()
-            elif is_kotlin_swift and current is node and ptype == "value_argument_label":
-                # A call-site argument label (`name:` in `Greeter(name:)`)
-                # is owned by the call shape's keyword row, never a read.
-                return
-            elif is_zig and current is node and ptype in {"VarDecl", "ContainerField"}:
-                # `const Point = ...` / `x: i32`: the declared name is the
-                # first named child. (FnProto names cut through the
-                # `function` field in function_and_type_parents; parameter
-                # names through ParamDeclList.)
-                if _first_named_child(parent) == node:
-                    return
-                excluded_fields = ()
-            elif (
-                is_zig
-                and current is node
-                and ptype == "FieldOrFnCall"
-                and node_type == "IDENTIFIER"
-            ):
-                # `.debug` in `std.debug`: the member is owned by the
-                # handler's whole-span member row (or the call row); the
-                # base keeps its read.
-                return
-            elif is_zig and current is node and ptype == "FieldInit" and node_type == "IDENTIFIER":
-                # `Store{ .limit = value }`: the field key is a binding,
-                # not a read -- the `field_initializer` branch's rule for
-                # other grammars. The value keeps its read.
-                if _first_named_child(parent) == node:
-                    return
-                excluded_fields = ()
-            elif (
-                is_zig
-                and current is node
-                and ptype == "SuffixExpr"
-                and node_type == "IDENTIFIER"
-                and _first_named_child(parent) == node
-                and any(
-                    child.type == "FnCallArguments"
-                    for child in parent.named_children
-                    if not child.is_extra
-                )
-            ):
-                # A bare call's callee (`add` in `add(1, 2)`) is owned by
-                # the handler's call row, mirroring the fieldless-call cut
-                # in the shared `call_expression` branch below.
-                return
-            elif ptype in _POSITIONAL_CLIMB_PARENTS:
+            elif has_positional and ptype in positional_parents:
                 step_safe = False
-                if ptype == "type_definition":
-                    # C `typedef int myint`: the alias is the trailing name;
-                    # the aliased type stays eligible for the handler.
-                    if not (
-                        node_type in {"type_identifier", "identifier"}
-                        and _last_named_child(parent) == node
-                    ):
-                        excluded_fields = ()
-                    else:
-                        return
-                elif ptype == "parameter_declaration":
-                    # Fieldless parameters (GDShader `vec3 c`): the trailing
-                    # identifier is the binding. Fieldful grammars (C, C++)
-                    # cut through `declarator` above and never reach here.
-                    if not (node_type == "identifier" and _last_named_child(parent) == node):
-                        excluded_fields = ()
-                    else:
-                        return
-                elif ptype == "for_statement":
-                    # GDScript `for i in items`: the leading identifier is the
-                    # loop binding; the iterable keeps its reads. Language-
-                    # gated so C/Python loops (whose bindings hang off fields
-                    # or follow different shapes) never reach here.
-                    if (
-                        not is_gdscript
-                        or node_type != "identifier"
-                        or _first_named_child(parent) != node
-                    ):
-                        excluded_fields = ()
-                    else:
-                        return
-                elif ptype in _PURE_BINDING_PARENTS:
-                    # Lua assignment targets and loop variables, C macro
-                    # parameters, GDScript superclass spellings (the handler
-                    # owns the inheritance/import row), C++ base lists
-                    # (same), GDShader struct names and member names (the
-                    # handler owns the member types), GDShader uniform hints
-                    # (`: hint_color` names a builtin, never a symbol), and
-                    # GDShader varying names (stage plumbing, not symbols).
-                    # The `enumerator` cut is GDScript-only: C/C++ enumerators
-                    # can carry explicit values (`A = B`) whose reads must
-                    # survive, and they already cut through their `name`
-                    # field instead.
-                    if ptype == "enumerator" and not is_gdscript:
-                        excluded_fields = ()
-                    else:
-                        return
-                elif ptype == "attribute_call":
-                    # GDScript `items.append(item)`: the callee is the call
-                    # row's span; the arguments stay eligible reads.
-                    if _first_named_child(parent) == node:
-                        return
-                    excluded_fields = ()
-                elif ptype == "new_expression":
-                    # Fieldless construction (C++ `new Widget(1)`): the call
-                    # row owns the type. Fieldful `new` (JS) applies the
-                    # constructor exclusion to the function and constructor.
-                    if parent.child_by_field_name("constructor") is None:
-                        return
-                    excluded_fields = ("function", "constructor")
-                elif ptype == "uniform_declaration":
-                    # GDShader `uniform vec4 tint : hint = ...`: identifiers
-                    # before the `=` (the name, the hint) are bindings; a
-                    # default after it (`= PI`) stays a real read.
-                    if node_type != "identifier":
-                        excluded_fields = ()
-                    else:
-                        for child in parent.children:
-                            if child.type == "=":
-                                break
-                            if child == node:
-                                return
-                        excluded_fields = ()
-                elif ptype == "field":
-                    # Lua `{ x = 1 }`: the key is a binding, the value stays
-                    # eligible. A computed key (`{ [k] = v }`) reads `k`,
-                    # which the brackets betray. (SQL's `field` never reaches
-                    # here: its query captures no bare identifiers.)
-                    if any(not child.is_named and child.type == "[" for child in parent.children):
-                        excluded_fields = ()
-                    else:
-                        excluded_fields = ("name",)
-                else:
-                    excluded_fields = ()
-            elif ptype in {
-                "function_definition",
-                "function_expression",
-                "generator_function_declaration",
-                "generator_function",
-                "class_definition",
-                "function_declaration",
-                "class_declaration",
-                "method_definition",
-                "variable_declarator",
-                # TS declaration names surface as type_identifier now that the
-                # identifier fallback covers it too (Task 2.2); their own name is
-                # a binding, not a reference.
-                "interface_declaration",
-                "type_alias_declaration",
-                "type_parameter",
-                # JSX element names get their own `type_use`
-                # component-reference row (E14); everything else inside
-                # the element (attribute values, children) stays a plain
-                # identifier reference.
-                "jsx_opening_element",
-                "jsx_self_closing_element",
-                "jsx_closing_element",
-                # Go declaration-name fields surface as identifier or
-                # field_identifier and are bindings, not references. The
-                # receiver/parameter names are already cut by the
-                # parameter_list walk above; these cut the named owners.
-                "method_declaration",
-                "type_spec",
-                "type_alias",
-                "field_declaration",
-                "method_elem",
-                # A var/const spec's annotated type is emitted as `type_use` by
-                # the handler; the spec's own name is a binding.
-                "var_spec",
-                "const_spec",
-                # Rust named owners are bindings; their type fields are owned
-                # by the handler (`return_type` covers the bare `-> Widget`
-                # form, `trait` the implemented trait of an `impl`).
-                "function_item",
-                "function_signature_item",
-                "struct_item",
-                "enum_item",
-                "trait_item",
-                "mod_item",
-                "const_item",
-                "static_item",
-                "enum_variant",
-                "impl_item",
-                "struct_expression",
-            }:
-                # `result` covers a function/method's bare result type
-                # (`func load() Store`): the handler owns its `type_use` row,
-                # so a parallel plain read would only duplicate it with the
-                # wrong kind. Parameters are cut by the parameter_list walk
-                # above; parenthesized results by it too.
-                excluded_fields = ("name", "type", "result", "return_type", "trait")
-            elif ptype in {
-                "assignment",
-                "assignment_expression",
-                "augmented_assignment",
-                "named_expression",
-                "for_statement",
-                "for_in_clause",
-                # JS `for (const item of items)` -- the loop binding is not a
-                # reference to an existing `item` (E11).
-                "for_in_statement",
-                # Go write targets and new bindings: `x = v` writes, `x := v`
-                # declares, `range`'s left side declares. The `write` row for
-                # an LHS member access comes from the selector handler; a bare
-                # LHS identifier is a pure binding here.
-                "assignment_statement",
-                "short_var_declaration",
-                "range_clause",
-                # Rust `count += 1` mutates the existing binding.
-                "compound_assignment_expr",
-            }:
-                excluded_fields = ("left", "name")
-            elif ptype in {"let_declaration", "for_expression"}:
-                # Rust `let x = ...` / `for x in ...`: the pattern names a new
-                # binding; the optional `: Type` annotation is the handler's
-                # `type_use` and the value stays a plain read.
-                excluded_fields = ("pattern",)
-            elif ptype in name_and_type_parents:
-                excluded_fields = ("name", "type")
-            elif ptype in name_and_field_parents:
-                excluded_fields = ("name", "field")
-            elif ptype in type_only_parents:
-                excluded_fields = ("type",)
-            elif ptype in parameters_parents:
-                excluded_fields = ("parameters",)
-            elif ptype in name_only_parents:
-                excluded_fields = ("name",)
-            elif ptype in left_and_type_parents:
-                excluded_fields = ("left", "type")
-            elif ptype in function_and_type_parents:
-                excluded_fields = ("function", "type")
-            elif ptype == "scoped_identifier":
-                # Path segments are namespace spellings; the final `name` may
-                # be a real value read (`State::Ready`) and stays eligible.
-                # Inside a `use` tree the climb above still cuts the leaf.
-                excluded_fields = ("path",)
-            elif ptype == "field_initializer":
-                # `Widget { label: text }` -- the field key is a binding, not
-                # a read of a `label` symbol (a shorthand `Widget { label }`
-                # keeps its read: the identifier is the initializer there).
-                excluded_fields = ("field",)
-            elif ptype in {"inc_statement", "dec_statement"}:
-                # Go `x++`: the bare operand is mutated in place, and the
-                # selector handler owns the write row for `p.x++` -- the same
-                # single-representation rule as the assignment LHS above (the
-                # statement has no named field to exclude, hence the direct
-                # return).
-                return
-            elif ptype in {"arrow_function", "lambda"}:
-                # `parameter` covers a parenless single-identifier arrow param
-                # (`x => x`), which has no `formal_parameters` wrapper of its
-                # own to be caught by the block above. `parameters` is
-                # deliberately NOT excluded here: it names the
-                # `formal_parameters`/`lambda_parameters` node wrapping every
-                # other case, which the parameter-defaults block above has
-                # already walked and decided correctly (including whether an
-                # identifier inside a default value is a real read); blanket-
-                # excluding the whole field here would undo that decision for
-                # every arrow-function/lambda default (`(a = LIMIT) => a`,
-                # `lambda a=LIMIT: a`).
-                excluded_fields = ("parameter",)
-            elif ptype in {"attribute", "member_expression"}:
+                resolved_fields = TreeSitterExtractor._positional_parent_excludes(
+                    dispatch, node, node_type, parent, ptype
+                )
+                if resolved_fields is None:
+                    return
+                excluded_fields = resolved_fields
+            elif fieldless_member_possible and ptype in _MEMBER_PARENTS:
                 if (
                     parent.child_by_field_name("attribute") is None
                     and parent.child_by_field_name("property") is None
                 ):
-                    # Fieldless member access (GDScript `node.hp`): the
-                    # trailing segment is the member name owned by the
-                    # handler's whole-span row; the base stays a read.
                     step_safe = False
                     if _last_named_child(parent) == node:
                         return
-                    excluded_fields = ()
                 else:
                     excluded_fields = ("attribute", "property")
-            elif ptype == "dot_index_expression":
-                # Lua `M.add`: the field is owned by the call/member row.
-                excluded_fields = ("field",)
-            elif ptype == "method_index_expression":
-                # Lua `obj:method`: same ownership as `.` access.
-                excluded_fields = ("method",)
-            elif ptype == "field_expression":
-                # C `s->field` / GDShader `COLOR.rgb`: the field is owned by
-                # the member row; the base stays a read.
-                excluded_fields = ("field",)
-            elif ptype == "qualified_identifier":
-                # C++ `A::create`: the call row owns the span in calls and
-                # the type descent owns it in types; the qualifier is a
-                # namespace spelling, never a symbol.
-                excluded_fields = ("scope", "name")
-            elif ptype in {"call", "call_expression", "new_expression", "function_call"}:
+            elif fieldless_call_possible and ptype in _CALL_PARENTS:
                 if (
                     parent.child_by_field_name("function") is None
                     and parent.child_by_field_name("constructor") is None
                 ):
-                    # Fieldless call (GDScript, Lua): the callee is the first
-                    # operand and the call row owns it; anything else rides a
-                    # deeper node. Fieldful grammars keep the field cut below.
                     step_safe = False
                     if _first_named_child(parent) == node:
                         return
-                    excluded_fields = ()
                 else:
                     excluded_fields = ("function", "constructor")
-            elif ptype == "keyword_argument":
-                excluded_fields = ("name",)
-            elif ptype in {"as_pattern", "catch_clause"}:
-                excluded_fields = ("alias", "parameter")
-            elif ptype == "export_statement":
-                excluded_fields = ("value",)
-            elif ptype in pair_parents:
-                excluded_fields = ("key",)
-            elif ptype in handler_owned_type_parents:
-                return
+            else:
+                mapped = excluded_fields_by_parent.get(ptype)
+                if mapped is not None:
+                    excluded_fields = mapped
+
             if excluded_fields:
-                cstart = current.start_byte
-                cend = current.end_byte
-                cid = current.id
                 for field in excluded_fields:
                     outer = parent.child_by_field_name(field)
                     if outer is not None:
@@ -1603,17 +1710,22 @@ class TreeSitterExtractor:
                         oend = outer.end_byte
                         if ostart <= node_start and node_end <= oend:
                             return
-                        if step_safe and not (
-                            cstart < cend and outer.id != cid and (oend <= cstart or cend <= ostart)
-                        ):
-                            step_safe = False
+                        if step_safe:
+                            cstart = current.start_byte
+                            cend = current.end_byte
+                            if not (
+                                cstart < cend
+                                and outer.id != current.id
+                                and (oend <= cstart or cend <= ostart)
+                            ):
+                                step_safe = False
             if trail is not None:
                 if step_safe:
                     trail.append(current.id)
                 else:
                     trail.clear()
             current = parent
-            if can_cache and safe_nodes is not None and current.id in safe_nodes:
+            if can_cache and current.id in safe_nodes:  # type: ignore[operator]
                 break
 
         if safe_nodes is not None and trail:
@@ -1691,7 +1803,7 @@ class TreeSitterExtractor:
                         max(definition.node.start_byte, definition.node.end_byte - 1)
                     ),
                     parameters=self._parameter_shapes(
-                        language, parameter_nodes.get(definition.node.id)
+                        language, parameter_nodes.get(definition.node.id), parents
                     ),
                 )
             )
@@ -1699,7 +1811,9 @@ class TreeSitterExtractor:
 
     @staticmethod
     def _parameter_shapes(
-        language: str, parameters: Node | None | Sequence[Node | None]
+        language: str,
+        parameters: Node | None | Sequence[Node | None],
+        parents: _ParentMap | None = None,
     ) -> list[ParameterShape]:
         """Shapes for one definition's captured parameter list(s).
 
@@ -1713,14 +1827,18 @@ class TreeSitterExtractor:
         nodes = list(parameters) if not isinstance(parameters, Node) else [parameters]
         rows: list[ParameterShape] = []
         for node in nodes:
-            rows.extend(TreeSitterExtractor._one_parameter_list(language, node))
+            rows.extend(TreeSitterExtractor._one_parameter_list(language, node, parents))
         # Slot positions are semantic (signature-compat analysis compares them
         # caller-to-callee), so they are renumbered over the MERGED lists --
         # Go's receiver+parameters pair would otherwise both start at 0.
         return [row.model_copy(update={"position": index}) for index, row in enumerate(rows)]
 
     @staticmethod
-    def _one_parameter_list(language: str, parameters: Node | None) -> list[ParameterShape]:
+    def _one_parameter_list(
+        language: str,
+        parameters: Node | None,
+        parents: _ParentMap | None = None,
+    ) -> list[ParameterShape]:
         if parameters is None:
             return []
         rules = LANGUAGE_RULES.get(language, _DEFAULT)
@@ -1866,7 +1984,7 @@ class TreeSitterExtractor:
                 or child.child_by_field_name("right") is not None
                 or child.type == "optional_parameter_declaration"
                 or any(not item.is_named and item.type == "=" for item in child.children)
-                or TreeSitterExtractor._has_list_level_default(child)
+                or TreeSitterExtractor._has_list_level_default(child, parents)
             )
             required = not default and child.type != "optional_parameter"
             if rules.variadic_is_optional and kind == "variadic":
@@ -1886,7 +2004,7 @@ class TreeSitterExtractor:
         return rows
 
     @staticmethod
-    def _has_list_level_default(slot: Node) -> bool:
+    def _has_list_level_default(slot: Node, parents: _ParentMap | None = None) -> bool:
         """Whether a bare `=` follows *slot* before the next named sibling.
 
         Some grammars hang a default's `=` beside the parameter instead of
@@ -1896,7 +2014,7 @@ class TreeSitterExtractor:
         the preceding slot's default; any other sibling (`,`, `)`, the next
         slot, or the default value itself) ends the search first.
         """
-        parent = slot.parent
+        parent = parents.parent(slot) if parents is not None else _parent_of(slot)
         if parent is None:
             return False
         siblings = parent.children
@@ -1921,9 +2039,16 @@ class TreeSitterExtractor:
     _ARGUMENT_LIST_TYPES: Final = frozenset(
         {"arguments", "argument_list", "function_arguments", "value_arguments", "FnCallArguments"}
     )
+    _NO_TYPE_ARGUMENTS_LANGUAGES: Final = frozenset({"python", "lua", "c", "gdscript", "gdshader"})
+    _TRAILING_LAMBDA_LANGUAGES: Final = frozenset({"kotlin", "swift", ""})
 
     @staticmethod
-    def _call_shape(node: Node) -> CallShape:
+    def _call_shape(
+        node: Node,
+        language: str = "",
+        *,
+        constructor: bool | None = None,
+    ) -> CallShape:
         arguments = node.child_by_field_name("arguments")
         if arguments is None:
             # A call node that names no `arguments` field (Lua
@@ -1943,61 +2068,69 @@ class TreeSitterExtractor:
         keywords: list[str] = []
         positional_spread = False
         keyword_spread = False
-        if arguments is not None and arguments.type in TreeSitterExtractor._ARGUMENT_LIST_TYPES:
-            for argument in arguments.named_children:
-                if argument.is_extra:
-                    # A comment is a named "extra" node inside the argument
-                    # list, not an argument -- `g(1,  # note\n  2)` must count
-                    # 2 positional args, not 3 (E4-adjacent).
-                    continue
-                if argument.type in {"list_splat", "spread_element"}:
-                    positional_spread = True
-                elif argument.type == "dictionary_splat":
-                    keyword_spread = True
-                elif argument.type == "keyword_argument":
-                    name = argument.child_by_field_name("name")
-                    if name is not None:
-                        keywords.append((name.text or b"").decode("utf-8"))
-                elif argument.type == "value_argument":
-                    # Kotlin/Swift named argument (`name = "y"`, or Swift's
-                    # `label: value` spelling where the label wraps in a
-                    # `value_argument_label`): the name is the leading
-                    # identifier before a bare `=`/`:` -- mirroring the E8
-                    # rule in _one_parameter_list that a bare `=` under the
-                    # node marks the default. Unnamed arguments stay
-                    # positional.
-                    first = _first_named_child(argument)
-                    if first is not None and first.type == "value_argument_label":
-                        first = _first_named_child(first)
-                    if (
-                        first is not None
-                        and first.type == "simple_identifier"
-                        and any(
-                            not item.is_named and item.type in {"=", ":"}
-                            for item in argument.children
-                        )
-                    ):
-                        keywords.append((first.text or b"").decode("utf-8"))
+        if arguments is not None:
+            arg_list_type = arguments.type
+            if arg_list_type in TreeSitterExtractor._ARGUMENT_LIST_TYPES:
+                for argument in arguments.named_children:
+                    if argument.is_extra:
+                        # A comment is a named "extra" node inside the argument
+                        # list, not an argument -- `g(1,  # note\n  2)` must count
+                        # 2 positional args, not 3 (E4-adjacent).
+                        continue
+                    arg_type = argument.type
+                    if arg_type in {"list_splat", "spread_element"}:
+                        positional_spread = True
+                    elif arg_type == "dictionary_splat":
+                        keyword_spread = True
+                    elif arg_type == "keyword_argument":
+                        name = argument.child_by_field_name("name")
+                        if name is not None:
+                            keywords.append((name.text or b"").decode("utf-8"))
+                    elif arg_type == "value_argument":
+                        # Kotlin/Swift named argument (`name = "y"`, or Swift's
+                        # `label: value` spelling where the label wraps in a
+                        # `value_argument_label`): the name is the leading
+                        # identifier before a bare `=`/`:` -- mirroring the E8
+                        # rule in _one_parameter_list that a bare `=` under the
+                        # node marks the default. Unnamed arguments stay
+                        # positional.
+                        first = _first_named_child(argument)
+                        if first is not None and first.type == "value_argument_label":
+                            first = _first_named_child(first)
+                        if (
+                            first is not None
+                            and first.type == "simple_identifier"
+                            and any(
+                                not item.is_named and item.type in {"=", ":"}
+                                for item in argument.children
+                            )
+                        ):
+                            keywords.append((first.text or b"").decode("utf-8"))
+                        else:
+                            positional_count += 1
                     else:
                         positional_count += 1
-                else:
-                    positional_count += 1
-        elif arguments is not None and arguments.type == "generator_expression":
-            # Python `summarize(x for x in items)` -- a single argument whose
-            # contents are not a positional list. Model it as one positional
-            # with spread-like uncertainty so signature analysis routes to
-            # `review` instead of fabricating a match (E4).
-            positional_count = 1
-            positional_spread = True
-        positional_count += sum(
-            child.type in {"annotated_lambda", "lambda_literal"}
-            for child in node.named_children
-            if child != arguments and not child.is_extra
-        )
+            elif arg_list_type == "generator_expression":
+                # Python `summarize(x for x in items)` -- a single argument whose
+                # contents are not a positional list. Model it as one positional
+                # with spread-like uncertainty so signature analysis routes to
+                # `review` instead of fabricating a match (E4).
+                positional_count = 1
+                positional_spread = True
+        if language in TreeSitterExtractor._TRAILING_LAMBDA_LANGUAGES:
+            positional_count += sum(
+                child.type in {"annotated_lambda", "lambda_literal"}
+                for child in node.named_children
+                if child != arguments and not child.is_extra
+            )
         # else: e.g. a tagged template's `template_string` -- no positional
         # args at all; its `string_fragment`/`template_substitution` children
         # are not call arguments and must not be counted (E4).
-        type_arguments = node.child_by_field_name("type_arguments")
+        type_arguments = (
+            None
+            if language in TreeSitterExtractor._NO_TYPE_ARGUMENTS_LANGUAGES
+            else node.child_by_field_name("type_arguments")
+        )
         return CallShape(
             positional_count=positional_count,
             keywords=keywords,
@@ -2008,7 +2141,7 @@ class TreeSitterExtractor:
                 if type_arguments is not None
                 else None
             ),
-            constructor=node.type == "new_expression",
+            constructor=(node.type == "new_expression") if constructor is None else constructor,
         )
 
     @staticmethod
@@ -2251,7 +2384,7 @@ class TreeSitterExtractor:
             )
 
     @staticmethod
-    def _is_heritage_type_node(node: Node) -> bool:
+    def _is_heritage_type_node(node: Node, parents: _ParentMap | None = None) -> bool:
         """Whether *node* is the supertype a Kotlin/Swift heritage clause owns.
 
         A `user_type` directly under a `delegation_specifier` (`class A : C`)
@@ -2262,16 +2395,18 @@ class TreeSitterExtractor:
         it must stay eligible for the handler's `type_use` row instead of
         being suppressed as owned by the heritage capture.
         """
-        parent = node.parent
+        if parents is None:
+            parents = _active_parents.get()
+        parents_get = parents._parents.get if parents is not None else None
+        parent = parents_get(node.id) if parents_get is not None else node.parent
         if parent is None:
             return False
         if parent.type in {"delegation_specifier", "inheritance_specifier"}:
             return True
-        return (
-            parent.type in TreeSitterExtractor._KOTLIN_HERITAGE_WRAPPERS
-            and parent.parent is not None
-            and parent.parent.type == "delegation_specifier"
-        )
+        if parent.type not in TreeSitterExtractor._KOTLIN_HERITAGE_WRAPPERS:
+            return False
+        grandparent = parents_get(parent.id) if parents_get is not None else parent.parent
+        return grandparent is not None and grandparent.type == "delegation_specifier"
 
     _C_DECLARATOR_WRAPPERS: Final = frozenset(
         {
@@ -2409,18 +2544,24 @@ class TreeSitterExtractor:
             add_reference("type_use", name_node, target_name=written, written_name=written)
 
     @staticmethod
-    def _is_assignment_target(node: Node) -> bool:
+    def _is_assignment_target(node: Node, parents: _ParentMap | None = None) -> bool:
         """True if `node` is the LHS of a plain or augmented assignment."""
+        if parents is None:
+            parents = _active_parents.get()
+        parents_get = parents._parents.get if parents is not None else None
         current = node
-        while (up := _parent_of(current)) is not None and up.type in {
+        while (
+            up := (parents_get(current.id) if parents_get is not None else current.parent)
+        ) is not None and up.type in {
             "directly_assignable_expression",
             "ErrorUnionExpr",
         }:
             current = up
-        parent = _parent_of(current)
+        parent = parents_get(current.id) if parents_get is not None else current.parent
         if parent is None:
             return False
-        if parent.type in {
+        ptype = parent.type
+        if ptype in {
             "assignment",
             "augmented_assignment",
             "assignment_expression",
@@ -2444,8 +2585,8 @@ class TreeSitterExtractor:
         # children of their assignment nodes. `short_var_declaration` counts
         # too: `a, p.z := 1, 2` re-assigns the existing `p.z`, so its selector
         # operand is a write, not a read.
-        if parent.type == "expression_list":
-            grandparent = parent.parent
+        if ptype == "expression_list":
+            grandparent = parents_get(parent.id) if parents_get is not None else parent.parent
             if grandparent is not None and grandparent.type in {
                 "assignment_statement",
                 "augmented_assignment",
@@ -2455,19 +2596,25 @@ class TreeSitterExtractor:
         # Go's `p.x++` / `p.x--`: the statement wraps its single operand
         # without a named field, and the operand is exactly the write target.
         # C's `x++` parses as `update_expression` with the same shape.
-        if parent.type in {"inc_statement", "dec_statement", "update_expression"}:
+        if ptype in {"inc_statement", "dec_statement", "update_expression"}:
             return True
         # Lua `t.field = value`: the targets ride a `variable_list` with no
         # fields, so a member target inside one is always the write side.
         # (`for` loop variables ride one too, but only under
         # `for_generic_clause`, never under an assignment.)
-        if parent.type == "variable_list":
-            grandparent = parent.parent
+        if ptype == "variable_list":
+            grandparent = parents_get(parent.id) if parents_get is not None else parent.parent
             return grandparent is not None and grandparent.type == "assignment_statement"
         return False
 
     @staticmethod
-    def _emit_member_access(node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+    def _emit_member_access(
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        language: str = "",
+        parents: _ParentMap | None = None,
+    ) -> None:
         """Emit `read`/`write` for a member-access node that is not itself a call.
 
         Handles Python `attribute` and JS/TS `member_expression` (E5). Three
@@ -2478,43 +2625,60 @@ class TreeSitterExtractor:
         superclass entry (its own `inheritance` row). A Lua `function M.add`
         name and kindred definition spellings are owned by their declaration.
         """
-        parent = node.parent
+        if parents is None:
+            parents = _active_parents.get()
+        parents_get = parents._parents.get if parents is not None else None
+        parent = parents_get(node.id) if parents_get is not None else node.parent
         if parent is not None:
-            ancestor: Node | None = parent
-            while ancestor is not None:
-                if ancestor.type in {"class_heritage", "extends_type_clause"}:
+            if language in {"javascript", "typescript", "tsx", ""}:
+                ancestor: Node | None = parent
+                while ancestor is not None:
+                    atype = ancestor.type
+                    if atype in {"class_heritage", "extends_type_clause"}:
+                        return
+                    if atype in _JS_HERITAGE_STOP_TYPES:
+                        break
+                    ancestor = (
+                        parents_get(ancestor.id) if parents_get is not None else ancestor.parent
+                    )
+            ptype = parent.type
+            if ptype in {"call", "call_expression", "function_call"}:
+                if parent.child_by_field_name("function") == node:
                     return
-                ancestor = _parent_of(ancestor)
-            if (
-                parent.type in {"call", "call_expression", "function_call"}
-                and parent.child_by_field_name("function") == node
+                if (
+                    ptype != "call_expression"
+                    and language in {"gdscript", "lua", ""}
+                    and _first_named_child(parent) == node
+                ):
+                    # Fieldless call (GDScript, Lua): the callee is the first
+                    # operand, and the call row owns the span. Fieldful grammars
+                    # returned through the field check above.
+                    return
+            elif (
+                ptype == "decorator"
+                or (ptype == "new_expression" and parent.child_by_field_name("constructor") == node)
+                or (ptype == "function_declaration" and parent.child_by_field_name("name") == node)
             ):
                 return
-            if parent.type in {"call", "function_call"} and _first_named_child(parent) == node:
-                # Fieldless call (GDScript, Lua): the callee is the first
-                # operand, and the call row owns the span. Fieldful grammars
-                # returned through the field check above.
-                return
-            if parent.type == "function_declaration" and parent.child_by_field_name("name") == node:
-                return
-            if (
-                parent.type == "new_expression"
-                and parent.child_by_field_name("constructor") == node
-            ):
-                return
-            if parent.type == "decorator":
-                return
-            if (
-                parent.type == "argument_list"
-                and parent.parent is not None
-                and parent.parent.type == "class_definition"
-                and parent.parent.child_by_field_name("superclasses") == parent
-            ):
-                return
-        property_field = node.child_by_field_name("attribute") or node.child_by_field_name(
-            "property"
-        )
-        object_field = node.child_by_field_name("object")
+            elif ptype == "argument_list" and language in {"python", ""}:
+                grandparent = parents_get(parent.id) if parents_get is not None else parent.parent
+                if (
+                    grandparent is not None
+                    and grandparent.type == "class_definition"
+                    and grandparent.child_by_field_name("superclasses") == parent
+                ):
+                    return
+        if language == "python":
+            property_field = node.child_by_field_name("attribute")
+            object_field = node.child_by_field_name("object")
+        elif language in {"javascript", "typescript", "tsx"}:
+            property_field = node.child_by_field_name("property")
+            object_field = node.child_by_field_name("object")
+        else:
+            property_field = node.child_by_field_name("attribute") or node.child_by_field_name(
+                "property"
+            )
+            object_field = node.child_by_field_name("object")
         if property_field is None and object_field is None:
             # Fieldless member access (GDScript `node.hp`): the base is the
             # first operand and the member the last. Fieldful grammars always
@@ -2524,7 +2688,9 @@ class TreeSitterExtractor:
                 return
             object_field, property_field = named[0], named[-1]
         text = _capture_name(source, node)
-        kind: ReferenceKind = "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
+        kind: ReferenceKind = (
+            "write" if TreeSitterExtractor._is_assignment_target(node, parents) else "read"
+        )
         add_reference(
             kind,
             node,
@@ -2533,8 +2699,28 @@ class TreeSitterExtractor:
             receiver_text=_capture_name(source, object_field) if object_field is not None else None,
         )
 
-    def _python_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "import_from_statement":
+    def _python_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "call":
+            function = node.child_by_field_name("function")
+            if function is not None:
+                receiver = function.child_by_field_name("object")
+                add_reference(
+                    "call",
+                    function,
+                    target_name=_capture_name(source, function),
+                    receiver_text=_capture_name(source, receiver) if receiver is not None else None,
+                    call_shape=self._call_shape(node, "python"),
+                )
+        elif ntype == "attribute":
+            self._emit_member_access(node, source, add_reference, "python", parents)
+        elif ntype == "import_from_statement":
             module = node.child_by_field_name("module_name")
             module_path = _capture_name(source, module) if module is not None else None
             for child in node.named_children:
@@ -2564,7 +2750,7 @@ class TreeSitterExtractor:
                     imported_name=imported_name,
                     alias=alias,
                 )
-        elif node.type == "import_statement":
+        elif ntype == "import_statement":
             for child in node.named_children:
                 if child.is_extra:
                     continue
@@ -2589,7 +2775,7 @@ class TreeSitterExtractor:
                     imported_name=None,
                     alias=alias,
                 )
-        elif node.type == "decorator":
+        elif ntype == "decorator":
             target = node.child_by_field_name("function") or node.named_child(0)
             if target is not None and target.type == "call":
                 target = target.child_by_field_name("function")
@@ -2600,7 +2786,7 @@ class TreeSitterExtractor:
                     target_name=_capture_name(source, target),
                     written_name=_capture_name(source, target),
                 )
-        elif node.type == "class_definition":
+        elif ntype == "class_definition":
             superclasses = node.child_by_field_name("superclasses")
             if superclasses is not None:
                 for item in superclasses.named_children:
@@ -2620,18 +2806,7 @@ class TreeSitterExtractor:
                         target_name=_capture_name(source, item),
                         written_name=_capture_name(source, item),
                     )
-        elif node.type == "call":
-            function = node.child_by_field_name("function")
-            if function is not None:
-                receiver = function.child_by_field_name("object")
-                add_reference(
-                    "call",
-                    function,
-                    target_name=_capture_name(source, function),
-                    receiver_text=_capture_name(source, receiver) if receiver is not None else None,
-                    call_shape=self._call_shape(node),
-                )
-        elif node.type == "type":
+        elif ntype == "type":
             target = node.named_child(0)
             if target is not None:
                 add_reference(
@@ -2640,9 +2815,7 @@ class TreeSitterExtractor:
                     target_name=_capture_name(source, target),
                     written_name=_capture_name(source, target),
                 )
-        elif node.type == "attribute":
-            self._emit_member_access(node, source, add_reference)
-        elif node.type in {"assignment", "augmented_assignment"}:
+        elif ntype in {"assignment", "augmented_assignment"}:
             # `__all__ = [...]`/`__all__ += [...]` (E13) -- the query already
             # restricts the match to a literal left-hand `__all__` via #eq?,
             # so no name check is needed here. Each string entry becomes an
@@ -2663,9 +2836,49 @@ class TreeSitterExtractor:
                     )
 
     def _javascript_records(
-        self, node: Node, source: bytes, add_reference: _ReferenceAdder
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
     ) -> None:
-        if node.type == "import_statement":
+        ntype = node.type
+        if ntype in {"call_expression", "new_expression"}:
+            function = node.child_by_field_name("function") or node.child_by_field_name(
+                "constructor"
+            )
+            if function is not None:
+                receiver = function.child_by_field_name("object")
+                is_module_call = function.type == "import" or (
+                    function.type == "identifier" and _capture_name(source, function) == "require"
+                )
+                module_path = (
+                    self._string_literal_argument(node, source) if is_module_call else None
+                )
+                add_reference(
+                    "call",
+                    function,
+                    target_name=_capture_name(source, function),
+                    receiver_text=_capture_name(source, receiver) if receiver is not None else None,
+                    call_shape=self._call_shape(node, "javascript"),
+                    module_path=module_path,
+                )
+        elif ntype == "member_expression":
+            self._emit_member_access(node, source, add_reference, "javascript", parents)
+        elif ntype == "type_annotation":
+            # `: A | B`, `: C & D`, `: Widget[]`, `: (e: Event) => Widget` -- unwrap
+            # to the inner type names instead of capturing the whole expression
+            # verbatim (E2). A nested generic_type is also matched by its own
+            # top-level pattern above; `add_reference` dedupes the identical span.
+            # A leading comment (`: /* c */ Widget`) is a named "extra" node
+            # too and must not be mistaken for the annotated type -- that
+            # silently dropped the type_use row entirely.
+            target = _first_named_child(node)
+            self._emit_type_use_names(target, source, add_reference)
+        elif ntype == "generic_type":
+            # `Box<Item>` -- one type_use for `Box`, one per type argument (E2).
+            self._emit_type_use_names(node, source, add_reference)
+        elif ntype == "import_statement":
             source_node = node.child_by_field_name("source")
             module_path = (
                 _capture_name(source, source_node).strip("'\"") if source_node is not None else None
@@ -2732,7 +2945,7 @@ class TreeSitterExtractor:
                     module_path=module_path,
                     imported_name=None,
                 )
-        elif node.type == "export_statement":
+        elif ntype == "export_statement":
             source_node = node.child_by_field_name("source")
             module_path = (
                 _capture_name(source, source_node).strip("'\"") if source_node is not None else None
@@ -2824,7 +3037,7 @@ class TreeSitterExtractor:
                     target_name=_capture_name(source, value),
                     written_name="default",
                 )
-        elif node.type == "decorator":
+        elif ntype == "decorator":
             # `@Name`, `@ns.Name`, `@Factory()` -- mirrors the Python decorator
             # handler (E6). The factory-call form keeps its own `call` row from
             # the `call_expression` branch; this row is additional.
@@ -2838,7 +3051,7 @@ class TreeSitterExtractor:
                     target_name=_capture_name(source, target),
                     written_name=_capture_name(source, target),
                 )
-        elif node.type == "class_heritage":
+        elif ntype == "class_heritage":
             for clause in node.named_children:
                 if clause.type == "extends_clause":
                     # TS: `extends Base<T>` -- the identifier is under a `value`
@@ -2855,7 +3068,7 @@ class TreeSitterExtractor:
                     # JS: the grammar puts the identifier directly under
                     # class_heritage (no extends_clause wrapper); already worked.
                     self._emit_heritage_name(clause, source, add_reference)
-        elif node.type == "extends_type_clause":
+        elif ntype == "extends_type_clause":
             # TS interface heritage: named children are already type_identifier
             # (or generic_type, handled by the E2 generic_type branch below) --
             # left untouched, see hardening plan Task 2.1.
@@ -2870,42 +3083,7 @@ class TreeSitterExtractor:
                     target_name=_capture_name(source, item),
                     written_name=_capture_name(source, item),
                 )
-        elif node.type in {"call_expression", "new_expression"}:
-            function = node.child_by_field_name("function") or node.child_by_field_name(
-                "constructor"
-            )
-            if function is not None:
-                receiver = function.child_by_field_name("object")
-                is_module_call = function.type == "import" or (
-                    function.type == "identifier" and _capture_name(source, function) == "require"
-                )
-                module_path = (
-                    self._string_literal_argument(node, source) if is_module_call else None
-                )
-                add_reference(
-                    "call",
-                    function,
-                    target_name=_capture_name(source, function),
-                    receiver_text=_capture_name(source, receiver) if receiver is not None else None,
-                    call_shape=self._call_shape(node),
-                    module_path=module_path,
-                )
-        elif node.type == "generic_type":
-            # `Box<Item>` -- one type_use for `Box`, one per type argument (E2).
-            self._emit_type_use_names(node, source, add_reference)
-        elif node.type == "type_annotation":
-            # `: A | B`, `: C & D`, `: Widget[]`, `: (e: Event) => Widget` -- unwrap
-            # to the inner type names instead of capturing the whole expression
-            # verbatim (E2). A nested generic_type is also matched by its own
-            # top-level pattern above; `add_reference` dedupes the identical span.
-            # A leading comment (`: /* c */ Widget`) is a named "extra" node
-            # too and must not be mistaken for the annotated type -- that
-            # silently dropped the type_use row entirely.
-            target = _first_named_child(node)
-            self._emit_type_use_names(target, source, add_reference)
-        elif node.type == "member_expression":
-            self._emit_member_access(node, source, add_reference)
-        elif node.type in {
+        elif ntype in {
             "jsx_opening_element",
             "jsx_self_closing_element",
             "jsx_closing_element",
@@ -3002,8 +3180,48 @@ class TreeSitterExtractor:
                 continue
             add_reference("type_use", name_node, target_name=written, written_name=written)
 
-    def _go_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "import_spec":
+    def _go_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is None:
+                return
+            receiver = (
+                function.child_by_field_name("operand")
+                if function.type == "selector_expression"
+                else None
+            )
+            add_reference(
+                "call",
+                function,
+                target_name=_capture_name(source, function),
+                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+                call_shape=self._call_shape(node, "go"),
+            )
+        elif ntype == "selector_expression":
+            parent = parents.parent(node) if parents is not None else _parent_of(node)
+            if (
+                parent is not None
+                and parent.type == "call_expression"
+                and parent.child_by_field_name("function") == node
+            ):
+                # The call row above already owns this span.
+                return
+            field = node.child_by_field_name("field")
+            if field is None:
+                return
+            text = _capture_name(source, node)
+            kind: ReferenceKind = (
+                "write" if TreeSitterExtractor._is_assignment_target(node, parents) else "read"
+            )
+            add_reference(kind, node, target_name=text, written_name=text)
+        elif ntype == "import_spec":
             path_node = node.child_by_field_name("path")
             module_path = (
                 _capture_name(source, path_node).strip("'\"") if path_node is not None else None
@@ -3036,40 +3254,7 @@ class TreeSitterExtractor:
                 imported_name=None,
                 alias=alias,
             )
-        elif node.type == "call_expression":
-            function = node.child_by_field_name("function")
-            if function is None:
-                return
-            receiver = (
-                function.child_by_field_name("operand")
-                if function.type == "selector_expression"
-                else None
-            )
-            add_reference(
-                "call",
-                function,
-                target_name=_capture_name(source, function),
-                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
-                call_shape=self._call_shape(node),
-            )
-        elif node.type == "selector_expression":
-            parent = node.parent
-            if (
-                parent is not None
-                and parent.type == "call_expression"
-                and parent.child_by_field_name("function") == node
-            ):
-                # The call row above already owns this span.
-                return
-            field = node.child_by_field_name("field")
-            if field is None:
-                return
-            text = _capture_name(source, node)
-            kind: ReferenceKind = (
-                "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
-            )
-            add_reference(kind, node, target_name=text, written_name=text)
-        elif node.type == "type_spec":
+        elif ntype == "type_spec":
             declared = node.child_by_field_name("type")
             if declared is None:
                 return
@@ -3081,23 +3266,23 @@ class TreeSitterExtractor:
                 self._go_interface(declared, source, add_reference)
             else:
                 self._go_emit_type_uses(declared, source, add_reference)
-        elif node.type == "type_alias":
+        elif ntype == "type_alias":
             self._go_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
-        elif node.type == "field_declaration":
+        elif ntype == "field_declaration":
             # Reached for anonymous-struct fields inside var specs (nested
             # struct_type fields), and harmlessly alongside the type_spec
             # walk for ordinary struct members -- add_reference dedupes.
             self._go_field_declaration(node, source, add_reference)
-        elif node.type in {
+        elif ntype in {
             "var_spec",
             "parameter_declaration",
             "variadic_parameter_declaration",
             "composite_literal",
         }:
             self._go_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
-        elif node.type == "qualified_type":
+        elif ntype == "qualified_type":
             self._go_emit_type_uses(node, source, add_reference)
-        elif node.type in {"function_declaration", "method_declaration"}:
+        elif ntype in {"function_declaration", "method_declaration"}:
             self._go_exports(node, source, add_reference)
             # A bare result type (`func load() Store`) hangs directly off the
             # declaration, so nothing else captures it; the identifier
@@ -3106,7 +3291,7 @@ class TreeSitterExtractor:
             # result lists are covered by the `parameter_declaration`
             # captures inside them.
             self._go_emit_type_uses(node.child_by_field_name("result"), source, add_reference)
-        elif node.type in {"var_declaration", "const_declaration", "type_declaration"}:
+        elif ntype in {"var_declaration", "const_declaration", "type_declaration"}:
             self._go_exports(node, source, add_reference)
 
     def _go_fields(self, fields: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
@@ -3236,16 +3421,19 @@ class TreeSitterExtractor:
                 continue
             add_reference("export", name_node, target_name=exported, written_name=exported)
 
-    def _rust_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "use_declaration":
-            self._rust_use(node, source, add_reference)
-            self._rust_exports(node, source, add_reference)
-            return
-        if node.type == "call_expression":
+    def _rust_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "call_expression":
             self._rust_call(node, source, add_reference)
             return
-        if node.type == "field_expression":
-            parent = node.parent
+        if ntype == "field_expression":
+            parent = parents.parent(node) if parents is not None else _parent_of(node)
             if (
                 parent is not None
                 and parent.type == "call_expression"
@@ -3255,11 +3443,15 @@ class TreeSitterExtractor:
                 return
             text = _capture_name(source, node)
             kind: ReferenceKind = (
-                "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
+                "write" if TreeSitterExtractor._is_assignment_target(node, parents) else "read"
             )
             add_reference(kind, node, target_name=text, written_name=text)
             return
-        if node.type == "impl_item":
+        if ntype == "use_declaration":
+            self._rust_use(node, source, add_reference)
+            self._rust_exports(node, source, add_reference)
+            return
+        if ntype == "impl_item":
             # `impl Draw for Widget`: the trait is an inheritance edge, the
             # self type a plain type use. The methods' `Type.method`
             # qualification happens in `_symbol_context`.
@@ -3268,10 +3460,10 @@ class TreeSitterExtractor:
             )
             self._rust_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
             return
-        if node.type == "struct_expression":
+        if ntype == "struct_expression":
             self._rust_emit_type_uses(node.child_by_field_name("name"), source, add_reference)
             return
-        if node.type in {"function_item", "function_signature_item"}:
+        if ntype in {"function_item", "function_signature_item"}:
             self._rust_emit_type_uses(
                 node.child_by_field_name("return_type"), source, add_reference
             )
@@ -3284,14 +3476,14 @@ class TreeSitterExtractor:
                         )
             self._rust_exports(node, source, add_reference)
             return
-        if node.type in {"let_declaration", "field_declaration", "parameter"}:
+        if ntype in {"let_declaration", "field_declaration", "parameter"}:
             self._rust_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
             return
-        if node.type in {"const_item", "static_item"}:
+        if ntype in {"const_item", "static_item"}:
             self._rust_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
             self._rust_exports(node, source, add_reference)
             return
-        if node.type == "enum_variant":
+        if ntype == "enum_variant":
             self._rust_emit_type_uses(node.child_by_field_name("body"), source, add_reference)
             return
         self._rust_exports(node, source, add_reference)
@@ -3379,16 +3571,17 @@ class TreeSitterExtractor:
         function = node.child_by_field_name("function")
         if function is None:
             return
-        if function.type == "identifier":
+        ftype = function.type
+        if ftype == "identifier":
             name = _capture_name(source, function)
             add_reference(
                 "call",
                 function,
                 target_name=name,
                 written_name=name,
-                call_shape=self._call_shape(node),
+                call_shape=self._call_shape(node, "rust"),
             )
-        elif function.type == "scoped_identifier":
+        elif ftype == "scoped_identifier":
             segments = self._rust_path_segments(function, source)
             if not segments:
                 return
@@ -3402,16 +3595,16 @@ class TreeSitterExtractor:
                 target_name=".".join(segments),
                 written_name=".".join(segments),
                 receiver_text="::".join(segments[:-1]) or None,
-                call_shape=self._call_shape(node),
+                call_shape=self._call_shape(node, "rust"),
             )
-        elif function.type == "field_expression":
+        elif ftype == "field_expression":
             receiver = function.child_by_field_name("value")
             add_reference(
                 "call",
                 function,
                 target_name=_capture_name(source, function),
                 receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
-                call_shape=self._call_shape(node),
+                call_shape=self._call_shape(node, "rust"),
             )
 
     def _rust_exports(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
@@ -3538,18 +3731,21 @@ class TreeSitterExtractor:
         }
     )
 
-    def _java_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "import_declaration":
-            self._java_import(node, source, add_reference)
-        elif node.type == "method_invocation":
+    def _java_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "method_invocation":
             self._java_call(node, source, add_reference)
-        elif node.type == "object_creation_expression":
-            self._java_constructor_call(node, source, add_reference)
-        elif node.type == "field_access":
+        elif ntype == "field_access":
             receiver = node.child_by_field_name("object")
             text = _capture_name(source, node)
             kind: ReferenceKind = (
-                "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
+                "write" if TreeSitterExtractor._is_assignment_target(node, parents) else "read"
             )
             # The receiver rides the row like Python/JS member access (E5):
             # `this.<field>` can reach `known_owner_member` and any other
@@ -3562,7 +3758,11 @@ class TreeSitterExtractor:
                 written_name=text,
                 receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
             )
-        elif node.type == "superclass":
+        elif ntype == "object_creation_expression":
+            self._java_constructor_call(node, source, add_reference)
+        elif ntype == "import_declaration":
+            self._java_import(node, source, add_reference)
+        elif ntype == "superclass":
             names = TreeSitterExtractor._java_descend_type_names(node)
             if names:
                 head, *rest = names
@@ -3575,13 +3775,13 @@ class TreeSitterExtractor:
                 for leaf in rest:
                     written = _capture_name(source, leaf)
                     add_reference("type_use", leaf, target_name=written, written_name=written)
-        elif node.type in {"super_interfaces", "extends_interfaces"}:
+        elif ntype in {"super_interfaces", "extends_interfaces"}:
             # `implements Runnable, Closeable` / `extends AutoCloseable`:
             # every listed type is an inheritance edge.
             for leaf in TreeSitterExtractor._java_descend_type_names(node):
                 written = _capture_name(source, leaf)
                 add_reference("inheritance", leaf, target_name=written, written_name=written)
-        elif node.type in {
+        elif ntype in {
             "throws",
             "type_bound",
             "catch_type",
@@ -3590,13 +3790,13 @@ class TreeSitterExtractor:
             "array_type",
         }:
             self._java_emit_type_uses(node, source, add_reference)
-        elif node.type in {"marker_annotation", "annotation"}:
+        elif ntype in {"marker_annotation", "annotation"}:
             name = node.child_by_field_name("name")
             if name is not None:
                 written = _capture_name(source, name)
                 add_reference("decorator", name, target_name=written, written_name=written)
-        elif node.type in TreeSitterExtractor._JAVA_DECLARATION_TYPE_NODES:
-            if node.type == "spread_parameter":
+        elif ntype in TreeSitterExtractor._JAVA_DECLARATION_TYPE_NODES:
+            if ntype == "spread_parameter":
                 # `String... parts`: the grammar hangs the element type and
                 # the declarator off the parameter as unnamed children.
                 for child in node.named_children:
@@ -3604,7 +3804,7 @@ class TreeSitterExtractor:
                         self._java_emit_type_uses(child, source, add_reference)
             else:
                 self._java_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
-        elif node.type in {
+        elif ntype in {
             "class_declaration",
             "interface_declaration",
             "record_declaration",
@@ -3675,7 +3875,7 @@ class TreeSitterExtractor:
             target_name=written,
             written_name=written,
             receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
-            call_shape=self._call_shape(node),
+            call_shape=self._call_shape(node, "java"),
             span=span,
         )
 
@@ -3689,7 +3889,7 @@ class TreeSitterExtractor:
         if not names:
             return
         written = _capture_name(source, names[0])
-        shape = self._call_shape(node).model_copy(update={"constructor": True})
+        shape = self._call_shape(node, "java", constructor=True)
         add_reference(
             "call",
             node,
@@ -3787,15 +3987,18 @@ class TreeSitterExtractor:
                 stack.extend(named[-1:])
         return names
 
-    def _csharp_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "using_directive":
-            self._csharp_using(node, source, add_reference)
-        elif node.type == "invocation_expression":
+    def _csharp_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "invocation_expression":
             self._csharp_call(node, source, add_reference)
-        elif node.type == "object_creation_expression":
-            self._csharp_constructor_call(node, source, add_reference)
-        elif node.type == "member_access_expression":
-            parent = node.parent
+        elif ntype == "member_access_expression":
+            parent = parents.parent(node) if parents is not None else _parent_of(node)
             if (
                 parent is not None
                 and parent.type == "invocation_expression"
@@ -3809,7 +4012,7 @@ class TreeSitterExtractor:
                 return
             text = _capture_name(source, node)
             kind: ReferenceKind = (
-                "write" if TreeSitterExtractor._is_assignment_target(node) else "read"
+                "write" if TreeSitterExtractor._is_assignment_target(node, parents) else "read"
             )
             # Same receiver discipline as the Java/Python/JS member rows: a
             # `this.<member>` row can reach `known_owner_member`, and any
@@ -3823,33 +4026,40 @@ class TreeSitterExtractor:
                 written_name=text,
                 receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
             )
-        elif node.type == "base_list":
+        elif ntype == "object_creation_expression":
+            self._csharp_constructor_call(node, source, add_reference)
+        elif ntype == "using_directive":
+            self._csharp_using(node, source, add_reference)
+        elif ntype == "base_list":
             # `: Base, IThing` -- every listed type is an inheritance edge.
             for leaf in TreeSitterExtractor._csharp_descend_type_names(node):
                 written = _capture_name(source, leaf)
                 add_reference("inheritance", leaf, target_name=written, written_name=written)
-        elif node.type == "attribute":
+        elif ntype == "attribute":
             name = node.child_by_field_name("name")
             if name is not None:
                 written = _capture_name(source, name)
                 add_reference("decorator", name, target_name=written, written_name=written)
-        elif node.type == "type_parameter_constraints_clause":
+        elif ntype == "type_parameter_constraints_clause":
             # `where G : IThing`: the clause's bare identifier head names the
             # constrained type parameter (a binding); the constraints are the
             # type uses.
             for child in node.named_children:
                 if child.type != "identifier" and not child.is_extra:
                     self._csharp_emit_type_uses(child, source, add_reference)
-        elif node.type in {"generic_name", "array_type", "nullable_type", "cast_expression"}:
+        elif ntype in {"generic_name", "array_type", "nullable_type", "cast_expression"}:
             self._csharp_emit_type_uses(node, source, add_reference)
-        elif node.type == "qualified_name":
+        elif ntype == "qualified_name":
             # Nested qualified names under a using directive (`System.Collections`
             # inside `System.Collections.Generic`) are namespace spells owned by
             # the import row, as are namespace declaration names; a qualified
             # base is owned by the base-list descent.
-            current = node.parent
+            parents_get = parents._parents.get if parents is not None else None
+            current = parents_get(node.id) if parents_get is not None else _parent_of(node)
             while current is not None and current.type == "qualified_name":
-                current = _parent_of(current)
+                current = (
+                    parents_get(current.id) if parents_get is not None else _parent_of(current)
+                )
             if current is not None and current.type in {
                 "using_directive",
                 "namespace_declaration",
@@ -3858,8 +4068,8 @@ class TreeSitterExtractor:
             }:
                 return
             self._csharp_emit_type_uses(node, source, add_reference)
-        elif node.type in TreeSitterExtractor._CSHARP_DECLARATION_TYPE_NODES:
-            if node.type == "method_declaration":
+        elif ntype in TreeSitterExtractor._CSHARP_DECLARATION_TYPE_NODES:
+            if ntype == "method_declaration":
                 # The grammar names neither the return type nor most other
                 # children: the type sits immediately before the name.
                 name = node.child_by_field_name("name")
@@ -3870,7 +4080,7 @@ class TreeSitterExtractor:
                         self._csharp_emit_type_uses(named[position - 1], source, add_reference)
             else:
                 self._csharp_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
-        elif node.type in {
+        elif ntype in {
             "class_declaration",
             "struct_declaration",
             "interface_declaration",
@@ -3878,7 +4088,7 @@ class TreeSitterExtractor:
             "enum_declaration",
             "delegate_declaration",
         }:
-            self._csharp_exports(node, source, add_reference)
+            self._csharp_exports(node, source, add_reference, parents)
 
     def _csharp_using(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
         alias_node = node.child_by_field_name("name")
@@ -3933,7 +4143,7 @@ class TreeSitterExtractor:
             function,
             target_name=_capture_name(source, function),
             receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
-            call_shape=self._call_shape(node),
+            call_shape=self._call_shape(node, "csharp"),
         )
 
     def _csharp_constructor_call(
@@ -3946,7 +4156,7 @@ class TreeSitterExtractor:
         if not names:
             return
         written = _capture_name(source, names[0])
-        shape = self._call_shape(node).model_copy(update={"constructor": True})
+        shape = self._call_shape(node, "csharp", constructor=True)
         add_reference(
             "call",
             node,
@@ -3956,7 +4166,13 @@ class TreeSitterExtractor:
             span=(type_node.start_byte, type_node.end_byte),
         )
 
-    def _csharp_exports(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+    def _csharp_exports(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
         """Export rows for top-level types, carrying the declared namespace.
 
         Any accessibility exports: `internal` types are visible project-wide.
@@ -3964,7 +4180,7 @@ class TreeSitterExtractor:
         `file_scoped_namespace_declaration` (D2) -- the one per-file fact the
         resolver needs; namespaces never map to directories.
         """
-        if not TreeSitterExtractor._csharp_is_top_level(node):
+        if not TreeSitterExtractor._csharp_is_top_level(node, parents):
             return
         name = node.child_by_field_name("name")
         if name is None:
@@ -3975,20 +4191,24 @@ class TreeSitterExtractor:
             name,
             target_name=exported,
             written_name=exported,
-            module_path=TreeSitterExtractor._csharp_namespace_of(node, source),
+            module_path=TreeSitterExtractor._csharp_namespace_of(node, source, parents),
         )
 
     @staticmethod
-    def _csharp_is_top_level(node: Node) -> bool:
-        current = node.parent
+    def _csharp_is_top_level(node: Node, parents: _ParentMap | None = None) -> bool:
+        if parents is None:
+            parents = _active_parents.get()
+        parents_get = parents._parents.get if parents is not None else None
+        current = parents_get(node.id) if parents_get is not None else node.parent
         while current is not None:
-            if current.type in {
+            ctype = current.type
+            if ctype in {
                 "compilation_unit",
                 "namespace_declaration",
                 "file_scoped_namespace_declaration",
             }:
                 return True
-            if current.type in {
+            if ctype in {
                 "class_declaration",
                 "struct_declaration",
                 "interface_declaration",
@@ -3996,17 +4216,23 @@ class TreeSitterExtractor:
                 "enum_declaration",
             }:
                 return False
-            current = _parent_of(current)
+            current = parents_get(current.id) if parents_get is not None else current.parent
         return False
 
     @staticmethod
-    def _csharp_namespace_of(node: Node, source: bytes) -> str | None:
+    def _csharp_namespace_of(
+        node: Node, source: bytes, parents: _ParentMap | None = None
+    ) -> str | None:
+        if parents is None:
+            parents = _active_parents.get()
+        parents_get = parents._parents.get if parents is not None else None
         current: Node | None = node
         while current is not None:
             if current.type == "namespace_declaration":
                 name = current.child_by_field_name("name")
                 return _capture_name(source, name) if name is not None else None
-            if current.parent is not None and current.parent.type == "compilation_unit":
+            cparent = parents_get(current.id) if parents_get is not None else current.parent
+            if cparent is not None and cparent.type == "compilation_unit":
                 # A file-scoped namespace does not wrap its types: they sit
                 # after it as later siblings under the compilation unit, so
                 # the namespace is the nearest preceding sibling declaration.
@@ -4021,7 +4247,7 @@ class TreeSitterExtractor:
                         return (
                             _capture_name(source, scoped_name) if scoped_name is not None else None
                         )
-            current = _parent_of(current)
+            current = cparent
         return None
 
     def _csharp_emit_type_uses(
@@ -4081,8 +4307,35 @@ class TreeSitterExtractor:
                 stack.extend(reversed(named))
         return names
 
-    def _c_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "preproc_include":
+    def _c_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+        *,
+        language: str = "c",
+    ) -> None:
+        ntype = node.type
+        if ntype == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is None:
+                return
+            receiver = (
+                function.child_by_field_name("argument")
+                if function.type == "field_expression"
+                else None
+            )
+            add_reference(
+                "call",
+                function,
+                target_name=_capture_name(source, function),
+                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
+                call_shape=self._call_shape(node, language),
+            )
+        elif ntype == "field_expression":
+            self._emit_member_access(node, source, add_reference, language, parents)
+        elif ntype == "preproc_include":
             path_node = node.child_by_field_name("path")
             if path_node is None:
                 return
@@ -4101,47 +4354,36 @@ class TreeSitterExtractor:
                 imported_name=None,
                 alias=None,
             )
-        elif node.type == "call_expression":
-            function = node.child_by_field_name("function")
-            if function is None:
-                return
-            receiver = (
-                function.child_by_field_name("argument")
-                if function.type == "field_expression"
-                else None
-            )
-            add_reference(
-                "call",
-                function,
-                target_name=_capture_name(source, function),
-                receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
-                call_shape=self._call_shape(node),
-            )
-        elif node.type == "field_expression":
-            self._emit_member_access(node, source, add_reference)
-        elif node.type in {"declaration", "field_declaration"}:
+        elif ntype in {"declaration", "field_declaration"}:
             self._c_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
-            self._c_exports(node, source, add_reference)
-        elif node.type in {"parameter_declaration", "optional_parameter_declaration"}:
+            self._c_exports(node, source, add_reference, parents)
+        elif ntype in {"parameter_declaration", "optional_parameter_declaration"}:
             self._c_emit_type_uses(
                 node.child_by_field_name("type") or _first_named_child(node),
                 source,
                 add_reference,
             )
-        elif node.type == "type_definition":
+        elif ntype == "type_definition":
             self._c_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
-        elif node.type == "function_definition":
+        elif ntype == "function_definition":
             self._c_emit_type_uses(node.child_by_field_name("type"), source, add_reference)
-            self._c_exports(node, source, add_reference)
+            self._c_exports(node, source, add_reference, parents)
 
-    def _c_exports(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
+    def _c_exports(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
         """Export rows for top-level C declarations with external linkage.
 
         A `static` definition is translation-unit-private and gains no row;
         everything else at file scope (`int count`, `int add(...)`, including
         prototypes) is visible to every file including the header.
         """
-        if node.parent is None or node.parent.type != "translation_unit":
+        parent = parents.parent(node) if parents is not None else _parent_of(node)
+        if parent is None or parent.type != "translation_unit":
             return
         if any(
             child.type == "storage_class_specifier" and "static" in _capture_name(source, child)
@@ -4167,8 +4409,15 @@ class TreeSitterExtractor:
             exported = _capture_name(source, name_node)
             add_reference("export", name_node, target_name=exported, written_name=exported)
 
-    def _cpp_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "base_class_clause":
+    def _cpp_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "base_class_clause":
             for child in node.named_children:
                 if child.is_extra or child.type == "access_specifier":
                     continue
@@ -4183,12 +4432,12 @@ class TreeSitterExtractor:
                     head = False
                     add_reference(kind, leaf, target_name=written, written_name=written)
             return
-        if node.type == "alias_declaration":
+        if ntype == "alias_declaration":
             named = [child for child in node.named_children if not child.is_extra]
             for value in named[1:]:
                 self._c_emit_type_uses(value, source, add_reference)
             return
-        if node.type == "new_expression":
+        if ntype == "new_expression":
             named = [child for child in node.named_children if not child.is_extra]
             if not named:
                 return
@@ -4198,24 +4447,32 @@ class TreeSitterExtractor:
                 target,
                 target_name=_capture_name(source, target),
                 written_name=_capture_name(source, target),
-                call_shape=self._call_shape(node),
+                call_shape=self._call_shape(node, "cpp"),
             )
             return
-        if node.type in {"class_specifier", "struct_specifier"}:
-            if node.parent is not None and node.parent.type == "translation_unit":
+        if ntype in {"class_specifier", "struct_specifier"}:
+            parent = parents.parent(node) if parents is not None else _parent_of(node)
+            if parent is not None and parent.type == "translation_unit":
                 name_node = node.child_by_field_name("name")
                 if name_node is not None:
                     exported = _capture_name(source, name_node)
                     add_reference("export", name_node, target_name=exported, written_name=exported)
             return
-        self._c_records(node, source, add_reference)
+        self._c_records(node, source, add_reference, parents, language="cpp")
 
     # `require`/`dofile` callees that load a whole module. The call row below
     # keeps signature information; the import row records the module edge.
     _LUA_MODULE_LOADERS: Final = frozenset({"require", "dofile"})
 
-    def _lua_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "function_call":
+    def _lua_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "function_call":
             named = [child for child in node.named_children if not child.is_extra]
             if not named:
                 return
@@ -4230,7 +4487,7 @@ class TreeSitterExtractor:
                     prefix,
                     target_name=_capture_name(source, prefix),
                     written_name=_capture_name(source, prefix),
-                    call_shape=self._call_shape(node),
+                    call_shape=self._call_shape(node, "lua"),
                     module_path=module_path,
                 )
                 if module_path is not None:
@@ -4257,10 +4514,10 @@ class TreeSitterExtractor:
                 target_name=_capture_name(source, prefix),
                 written_name=_capture_name(source, prefix),
                 receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
-                call_shape=self._call_shape(node),
+                call_shape=self._call_shape(node, "lua"),
             )
-        elif node.type in {"dot_index_expression", "method_index_expression"}:
-            self._emit_member_access(node, source, add_reference)
+        elif ntype in {"dot_index_expression", "method_index_expression"}:
+            self._emit_member_access(node, source, add_reference, "lua", parents)
 
     @staticmethod
     def _lua_string_argument(node: Node, prefix: Node, source: bytes) -> str | None:
@@ -4293,10 +4550,17 @@ class TreeSitterExtractor:
     # name no symbol (`variable "x" { type = string }`).
     _TERRAFORM_PRIMITIVE_TYPES: Final = frozenset({"string", "number", "bool"})
 
-    def _terraform_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type in {"expression", "template_interpolation"}:
-            self._terraform_emit_traversals(node, source, add_reference)
-        elif node.type == "function_call":
+    def _terraform_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype in {"expression", "template_interpolation"}:
+            self._terraform_emit_traversals(node, source, add_reference, parents)
+        elif ntype == "function_call":
             named = [child for child in node.named_children if not child.is_extra]
             if not named:
                 return
@@ -4307,10 +4571,10 @@ class TreeSitterExtractor:
                     named[0],
                     target_name=name,
                     written_name=name,
-                    call_shape=self._call_shape(node),
+                    call_shape=self._call_shape(node, "terraform"),
                 )
-            self._terraform_emit_traversals(node, source, add_reference)
-        elif node.type == "block":
+            self._terraform_emit_traversals(node, source, add_reference, parents)
+        elif ntype == "block":
             named = [child for child in node.named_children if not child.is_extra]
             if not named or named[0].type != "identifier":
                 return
@@ -4368,16 +4632,23 @@ class TreeSitterExtractor:
                 )
 
     def _terraform_emit_traversals(
-        self, node: Node, source: bytes, add_reference: _ReferenceAdder
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
     ) -> None:
         """Emit a `read` per HCL traversal (`var.x`, `local.p`, `aws.h.web.ip`)."""
+        parents_get = parents._parents.get if parents is not None else None
         stack = [node]
         while stack:
             current = stack.pop()
             if current.type == "expression":
                 named = [child for child in current.named_children if not child.is_extra]
                 if named and named[0].type == "variable_expr":
-                    parent = current.parent
+                    parent = (
+                        parents_get(current.id) if parents_get is not None else _parent_of(current)
+                    )
                     is_key = False
                     if parent is not None and parent.type == "object_elem":
                         first = _first_named_child(parent)
@@ -4447,8 +4718,16 @@ class TreeSitterExtractor:
         }
     )
 
-    def _sql_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "relation":
+    def _sql_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        parents_get = parents._parents.get if parents is not None else None
+        ntype = node.type
+        if ntype == "relation":
             reference = next(
                 (
                     child
@@ -4460,11 +4739,12 @@ class TreeSitterExtractor:
             if reference is None:
                 return
             text = _capture_name(source, reference)
+            parent = parents_get(node.id) if parents_get is not None else _parent_of(node)
             kind: ReferenceKind = (
-                "write" if node.parent is not None and node.parent.type == "update" else "read"
+                "write" if parent is not None and parent.type == "update" else "read"
             )
             add_reference(kind, reference, target_name=text, written_name=text)
-        elif node.type == "field":
+        elif ntype == "field":
             named = [child for child in node.named_children if not child.is_extra]
             if len(named) == 1 and named[0].type == "identifier":
                 text = _capture_name(source, named[0])
@@ -4485,7 +4765,7 @@ class TreeSitterExtractor:
                     written_name=text,
                     receiver_text=receiver,
                 )
-        elif node.type == "invocation":
+        elif ntype == "invocation":
             named = [child for child in node.named_children if not child.is_extra]
             if not named:
                 return
@@ -4503,7 +4783,7 @@ class TreeSitterExtractor:
                 if child.is_extra or child == named[0]:
                     continue
                 self._sql_emit_column_uses(child, source, add_reference)
-        elif node.type == "insert":
+        elif ntype == "insert":
             reference = next(
                 (
                     child
@@ -4516,12 +4796,14 @@ class TreeSitterExtractor:
                 return
             text = _capture_name(source, reference)
             add_reference("write", reference, target_name=text, written_name=text)
-        elif node.type == "object_reference":
-            parent = node.parent
+        elif ntype == "object_reference":
+            parent = parents_get(node.id) if parents_get is not None else _parent_of(node)
             if parent is not None and parent.type in {"relation", "field"}:
                 return
             if parent is not None and parent.type == "from":
-                statement = parent.parent
+                statement = (
+                    parents_get(parent.id) if parents_get is not None else _parent_of(parent)
+                )
                 if (
                     statement is not None
                     and statement.type == "statement"
@@ -4541,7 +4823,9 @@ class TreeSitterExtractor:
                     # Definitions own their name; `insert` owns its table as
                     # a write; a call owns its callee.
                     return
-                ancestor = _parent_of(ancestor)
+                ancestor = (
+                    parents_get(ancestor.id) if parents_get is not None else _parent_of(ancestor)
+                )
             text = _capture_name(source, node)
             add_reference("read", node, target_name=text, written_name=text)
 
@@ -4570,8 +4854,15 @@ class TreeSitterExtractor:
                 continue
             stack.extend(reversed([c for c in current.named_children if not c.is_extra]))
 
-    def _gdscript_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "call":
+    def _gdscript_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "call":
             named = [child for child in node.named_children if not child.is_extra]
             if not named:
                 return
@@ -4583,7 +4874,7 @@ class TreeSitterExtractor:
                     callee,
                     target_name="preload",
                     written_name="preload",
-                    call_shape=self._call_shape(node),
+                    call_shape=self._call_shape(node, "gdscript"),
                     module_path=module_path,
                 )
                 if module_path is not None:
@@ -4609,15 +4900,15 @@ class TreeSitterExtractor:
                 target_name=_capture_name(source, callee),
                 written_name=_capture_name(source, callee),
                 receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
-                call_shape=self._call_shape(node),
+                call_shape=self._call_shape(node, "gdscript"),
             )
-        elif node.type == "attribute_call":
+        elif ntype == "attribute_call":
             named = [child for child in node.named_children if not child.is_extra]
             if not named:
                 return
             callee = named[0]
             method = _capture_name(source, callee)
-            owner = node.parent
+            owner = parents.parent(node) if parents is not None else _parent_of(node)
             receiver = None
             prefix = method
             if owner is not None and owner.type == "attribute":
@@ -4634,16 +4925,16 @@ class TreeSitterExtractor:
                 target_name=prefix,
                 written_name=prefix,
                 receiver_text=(_capture_name(source, receiver) if receiver is not None else None),
-                call_shape=self._call_shape(node),
+                call_shape=self._call_shape(node, "gdscript"),
             )
-        elif node.type == "attribute":
+        elif ntype == "attribute":
             for child in node.named_children:
                 if not child.is_extra and child.type == "attribute_call":
                     # A method call owns the whole span (see above); a bare
                     # member row here would duplicate it as a read.
                     return
-            self._emit_member_access(node, source, add_reference)
-        elif node.type == "extends_statement":
+            self._emit_member_access(node, source, add_reference, "gdscript", parents)
+        elif ntype == "extends_statement":
             named = [child for child in node.named_children if not child.is_extra]
             target = named[-1] if named else None
             if target is None:
@@ -4666,7 +4957,7 @@ class TreeSitterExtractor:
                 if resolved is not None and resolved.type == "identifier":
                     text = _capture_name(source, resolved)
                     add_reference("inheritance", resolved, target_name=text, written_name=text)
-        elif node.type in {"assignment", "augmented_assignment"}:
+        elif ntype in {"assignment", "augmented_assignment"}:
             first = _first_named_child(node)
             if first is not None and first.type == "identifier":
                 # A bare name on the left rebinds an existing local (`var`
@@ -4691,8 +4982,15 @@ class TreeSitterExtractor:
             return _capture_name(source, first).strip("'\"")
         return None
 
-    def _gdshader_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "call_expression":
+    def _gdshader_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "call_expression":
             function = node.child_by_field_name("function")
             if function is None:
                 return
@@ -4704,11 +5002,11 @@ class TreeSitterExtractor:
                 "call",
                 function,
                 target_name=_capture_name(source, function),
-                call_shape=self._call_shape(node),
+                call_shape=self._call_shape(node, "gdshader"),
             )
-        elif node.type == "field_expression":
-            self._emit_member_access(node, source, add_reference)
-        elif node.type == "field_definition":
+        elif ntype == "field_expression":
+            self._emit_member_access(node, source, add_reference, "gdshader", parents)
+        elif ntype == "field_definition":
             named = [child for child in node.named_children if not child.is_extra]
             for type_node in named[:-1]:
                 self._c_emit_type_uses(type_node, source, add_reference)
@@ -4743,8 +5041,47 @@ class TreeSitterExtractor:
         qualifier = full[: len(full) - len(name)].rstrip(".")
         return current, qualifier or None
 
-    def _kotlin_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "import_header":
+    def _kotlin_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "call_expression":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named:
+                return
+            callee, qualifier = TreeSitterExtractor._navigation_callee(named[0], source)
+            suffix = next(
+                (child for child in named if child.type in {"call_suffix", "call_suffix_no_args"}),
+                node,
+            )
+            add_reference(
+                "call",
+                callee,
+                target_name=_capture_name(source, callee),
+                written_name=_capture_name(source, callee),
+                receiver_text=qualifier,
+                call_shape=self._call_shape(suffix, "kotlin"),
+            )
+        elif ntype in {"navigation_expression", "directly_assignable_expression"}:
+            parent = parents.parent(node) if parents is not None else _parent_of(node)
+            if parent is not None and parent.type == "call_expression":
+                siblings = [child for child in parent.named_children if not child.is_extra]
+                if siblings and siblings[0] == node:
+                    # The call row above already owns this span.
+                    return
+            self._emit_member_access(node, source, add_reference, "kotlin", parents)
+        elif ntype == "user_type":
+            # Heritage clauses own their supertype; every other user_type
+            # (`x: Foo`, `: Bar`, `val v: Foo`, call type arguments) is a type
+            # use. Nested user_types under a shared capture re-emit the same
+            # span and are deduplicated by `add`.
+            if not TreeSitterExtractor._is_heritage_type_node(node, parents):
+                self._emit_kotlin_swift_type_uses(node, add_reference)
+        elif ntype == "import_header":
             identifier = next(
                 (
                     child
@@ -4789,32 +5126,7 @@ class TreeSitterExtractor:
                 imported_name=imported,
                 alias=alias,
             )
-        elif node.type == "call_expression":
-            named = [child for child in node.named_children if not child.is_extra]
-            if not named:
-                return
-            callee, qualifier = TreeSitterExtractor._navigation_callee(named[0], source)
-            suffix = next(
-                (child for child in named if child.type in {"call_suffix", "call_suffix_no_args"}),
-                node,
-            )
-            add_reference(
-                "call",
-                callee,
-                target_name=_capture_name(source, callee),
-                written_name=_capture_name(source, callee),
-                receiver_text=qualifier,
-                call_shape=self._call_shape(suffix),
-            )
-        elif node.type in {"navigation_expression", "directly_assignable_expression"}:
-            parent = node.parent
-            if parent is not None and parent.type == "call_expression":
-                siblings = [child for child in parent.named_children if not child.is_extra]
-                if siblings and siblings[0] == node:
-                    # The call row above already owns this span.
-                    return
-            self._emit_member_access(node, source, add_reference)
-        elif node.type == "delegation_specifier":
+        elif ntype == "delegation_specifier":
             # `class A : B(), C` / `class A : B by b` -- each specifier is one
             # supertype. The type sits under a `constructor_invocation` when
             # the delegation is explicit (`B()`), under an
@@ -4831,14 +5143,7 @@ class TreeSitterExtractor:
             TreeSitterExtractor._emit_heritage_leaves(
                 TreeSitterExtractor._kotlin_swift_type_names(specifier), add_reference
             )
-        elif node.type == "user_type":
-            # Heritage clauses own their supertype; every other user_type
-            # (`x: Foo`, `: Bar`, `val v: Foo`, call type arguments) is a type
-            # use. Nested user_types under a shared capture re-emit the same
-            # span and are deduplicated by `add`.
-            if not TreeSitterExtractor._is_heritage_type_node(node):
-                self._emit_kotlin_swift_type_uses(node, add_reference)
-        elif node.type in {
+        elif ntype in {
             "class_declaration",
             "object_declaration",
             "function_declaration",
@@ -4885,8 +5190,47 @@ class TreeSitterExtractor:
         exported = _capture_name(source, name)
         add_reference("export", name, target_name=exported, written_name=exported)
 
-    def _swift_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "import_declaration":
+    def _swift_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        ntype = node.type
+        if ntype == "call_expression":
+            named = [child for child in node.named_children if not child.is_extra]
+            if not named:
+                return
+            callee, qualifier = TreeSitterExtractor._navigation_callee(named[0], source)
+            suffix = next(
+                (child for child in named if child.type in {"call_suffix", "call_suffix_no_args"}),
+                node,
+            )
+            add_reference(
+                "call",
+                callee,
+                target_name=_capture_name(source, callee),
+                written_name=_capture_name(source, callee),
+                receiver_text=qualifier,
+                call_shape=self._call_shape(suffix, "swift"),
+            )
+        elif ntype == "navigation_expression":
+            parent = parents.parent(node) if parents is not None else _parent_of(node)
+            if parent is not None and parent.type == "call_expression":
+                siblings = [child for child in parent.named_children if not child.is_extra]
+                if siblings and siblings[0] == node:
+                    # The call row above already owns this span.
+                    return
+            self._emit_member_access(node, source, add_reference, "swift", parents)
+        elif ntype == "user_type":
+            # Inheritance specifiers own their supertype. Every other
+            # user_type is a type use: parameter and return types, stored
+            # properties, array/optional wrappers, and the extended type of
+            # an `extension`, mirroring Rust's impl self type.
+            if not TreeSitterExtractor._is_heritage_type_node(node, parents):
+                self._emit_kotlin_swift_type_uses(node, add_reference, metatype_suffix=True)
+        elif ntype == "import_declaration":
             identifier = next(
                 (
                     child
@@ -4909,32 +5253,7 @@ class TreeSitterExtractor:
                 imported_name=None,
                 alias=None,
             )
-        elif node.type == "call_expression":
-            named = [child for child in node.named_children if not child.is_extra]
-            if not named:
-                return
-            callee, qualifier = TreeSitterExtractor._navigation_callee(named[0], source)
-            suffix = next(
-                (child for child in named if child.type in {"call_suffix", "call_suffix_no_args"}),
-                node,
-            )
-            add_reference(
-                "call",
-                callee,
-                target_name=_capture_name(source, callee),
-                written_name=_capture_name(source, callee),
-                receiver_text=qualifier,
-                call_shape=self._call_shape(suffix),
-            )
-        elif node.type == "navigation_expression":
-            parent = node.parent
-            if parent is not None and parent.type == "call_expression":
-                siblings = [child for child in parent.named_children if not child.is_extra]
-                if siblings and siblings[0] == node:
-                    # The call row above already owns this span.
-                    return
-            self._emit_member_access(node, source, add_reference)
-        elif node.type == "inheritance_specifier":
+        elif ntype == "inheritance_specifier":
             # `class C: D, E` / `protocol P: Q` -- one specifier per listed
             # supertype, reached through the `inherits_from` field.
             TreeSitterExtractor._emit_heritage_leaves(
@@ -4943,14 +5262,7 @@ class TreeSitterExtractor:
                 ),
                 add_reference,
             )
-        elif node.type == "user_type":
-            # Inheritance specifiers own their supertype. Every other
-            # user_type is a type use: parameter and return types, stored
-            # properties, array/optional wrappers, and the extended type of
-            # an `extension`, mirroring Rust's impl self type.
-            if not TreeSitterExtractor._is_heritage_type_node(node):
-                self._emit_kotlin_swift_type_uses(node, add_reference, metatype_suffix=True)
-        elif node.type in {
+        elif ntype in {
             "class_declaration",
             "protocol_declaration",
             "function_declaration",
@@ -4985,8 +5297,16 @@ class TreeSitterExtractor:
         exported = _capture_name(source, name)
         add_reference("export", name, target_name=exported, written_name=exported)
 
-    def _zig_records(self, node: Node, source: bytes, add_reference: _ReferenceAdder) -> None:
-        if node.type == "Decl":
+    def _zig_records(
+        self,
+        node: Node,
+        source: bytes,
+        add_reference: _ReferenceAdder,
+        parents: _ParentMap | None = None,
+    ) -> None:
+        parents_get = parents._parents.get if parents is not None else None
+        ntype = node.type
+        if ntype == "Decl":
             previous = node.prev_sibling
             if previous is None or previous.type != "pub":
                 return
@@ -5000,10 +5320,10 @@ class TreeSitterExtractor:
                 return
             exported = _capture_name(source, name)
             add_reference("export", name, target_name=exported, written_name=exported)
-        elif node.type == "BUILTINIDENTIFIER":
+        elif ntype == "BUILTINIDENTIFIER":
             if _capture_name(source, node) != "@import":
                 return
-            parent = node.parent
+            parent = parents_get(node.id) if parents_get is not None else _parent_of(node)
             if parent is None:
                 return
             arguments = next(
@@ -5026,7 +5346,7 @@ class TreeSitterExtractor:
                 # left, never a single symbol -- mirroring Go package imports.
                 owner: Node | None = parent
                 while owner is not None and owner.type != "VarDecl":
-                    owner = _parent_of(owner)
+                    owner = parents_get(owner.id) if parents_get is not None else _parent_of(owner)
                 binding_node = (
                     owner.child_by_field_name("variable_type_function")
                     if owner is not None
@@ -5047,7 +5367,7 @@ class TreeSitterExtractor:
                     imported_name=None,
                     alias=binding if binding_node is not None else None,
                 )
-        elif node.type == "FieldOrFnCall":
+        elif ntype == "FieldOrFnCall":
             arguments = next(
                 (
                     child
@@ -5068,7 +5388,7 @@ class TreeSitterExtractor:
             )
             if member is None:
                 return
-            parent = node.parent
+            parent = parents_get(node.id) if parents_get is not None else _parent_of(node)
             receiver = None
             if parent is not None and parent.type == "SuffixExpr":
                 prefix = _capture_name(source, parent)[
@@ -5081,9 +5401,9 @@ class TreeSitterExtractor:
                 target_name=_capture_name(source, member),
                 written_name=_capture_name(source, member),
                 receiver_text=receiver,
-                call_shape=self._call_shape(node),
+                call_shape=self._call_shape(node, "zig"),
             )
-        elif node.type == "SuffixExpr":
+        elif ntype == "SuffixExpr":
             named = [child for child in node.named_children if not child.is_extra]
             if not named or named[0].type == "BUILTINIDENTIFIER":
                 # `@import("...")` is owned by the import row; a bare
@@ -5101,7 +5421,7 @@ class TreeSitterExtractor:
                     named[0],
                     target_name=_capture_name(source, named[0]),
                     written_name=_capture_name(source, named[0]),
-                    call_shape=self._call_shape(node),
+                    call_shape=self._call_shape(node, "zig"),
                 )
                 return
             if any(
@@ -5116,8 +5436,8 @@ class TreeSitterExtractor:
                 # A member call in the chain owns its span through the
                 # FieldOrFnCall call row.
                 return
-            self._emit_member_access(node, source, add_reference)
-        elif node.type in {"VarDecl", "FnProto", "ParamDecl", "ContainerField"}:
+            self._emit_member_access(node, source, add_reference, "zig", parents)
+        elif ntype in {"VarDecl", "FnProto", "ParamDecl", "ContainerField"}:
             self._zig_emit_type_uses(node, source, add_reference)
 
     @staticmethod
@@ -5214,25 +5534,35 @@ class TreeSitterExtractor:
         return sorted(found.values(), key=lambda item: (item.node.start_byte, -item.node.end_byte))
 
     @staticmethod
-    def _outer_node(node: Node) -> Node:
+    def _outer_node(node: Node, parents: _ParentMap | None = None) -> Node:
+        if parents is None:
+            parents = _active_parents.get()
+        parents_get = parents._parents.get if parents is not None else None
         outer = node
-        if node.parent is not None and node.parent.type == "decorated_definition":
-            outer = node.parent
-        if (
-            node.parent is not None
-            and (node.type, node.parent.type) in _SINGLE_ENTRY_WRAPPERS
-            and sum(1 for child in node.parent.named_children if child.type == node.type) == 1
-        ):
-            # `case west`, `const float Z = 1.0;` and `type T struct{}` keep their
-            # keyword when they hold one name; multi-name forms chunk per name.
-            return node.parent
-        if outer.parent is not None and outer.parent.type in {
+        parent = parents_get(node.id) if parents_get is not None else node.parent
+        if parent is not None:
+            ptype = parent.type
+            if ptype == "decorated_definition":
+                outer = parent
+            if (node.type, ptype) in _SINGLE_ENTRY_WRAPPERS and sum(
+                1 for child in parent.named_children if child.type == node.type
+            ) == 1:
+                # `case west`, `const float Z = 1.0;` and `type T struct{}` keep their
+                # keyword when they hold one name; multi-name forms chunk per name.
+                return parent
+        outer_parent = (
+            (parents_get(outer.id) if parents_get is not None else outer.parent)
+            if outer is not node
+            else parent
+        )
+        if outer_parent is not None and outer_parent.type in {
             "export_statement",
             "lexical_declaration",
         }:
-            outer = outer.parent
-        if outer.parent is not None and outer.parent.type == "export_statement":
-            outer = outer.parent
+            outer = outer_parent
+            next_parent = parents_get(outer.id) if parents_get is not None else outer.parent
+            if next_parent is not None and next_parent.type == "export_statement":
+                outer = next_parent
         return outer
 
     @staticmethod
@@ -5465,6 +5795,7 @@ class TreeSitterExtractor:
         source: bytes,
         *,
         language: str = "",
+        parents: _ParentMap | None = None,
     ) -> list[_ChildSpan]:
         """Spans of the definitions nested directly inside a container.
 
@@ -5484,7 +5815,7 @@ class TreeSitterExtractor:
             position += 1
             if candidate.id == node.id or candidate.end_byte > outer.end_byte:
                 continue
-            candidate_outer = TreeSitterExtractor._outer_node(candidate)
+            candidate_outer = TreeSitterExtractor._outer_node(candidate, parents)
             if candidate_outer.start_byte < previous_end:
                 continue
             min_start = max(body_start, previous_end)
@@ -5675,6 +6006,8 @@ class TreeSitterExtractor:
                         )
                     )
                     part += 1
+                    if part % _CHUNK_BUDGET_CHECK_INTERVAL == 0:
+                        check_parent_memory_budget()
                 cursor += 1
                 continue
             part_content = "".join(part_lines).rstrip()
@@ -5698,6 +6031,8 @@ class TreeSitterExtractor:
                     )
                 )
                 part += 1
+                if part % _CHUNK_BUDGET_CHECK_INTERVAL == 0:
+                    check_parent_memory_budget()
             if end_cursor >= len(lines):
                 break
             if len(lines[end_cursor]) > self.max_chars:
@@ -5781,7 +6116,6 @@ class TreeSitterExtractor:
         is_test: bool = False,
         end_line: int | None = None,
     ) -> ExtractedChunk:
-        check_parent_memory_budget()
         # Identity metadata remains exact; repeated embedding/search context has
         # an independent bound so a long identifier cannot multiply per fragment.
         context_path = path.as_posix()[:MAX_CONTEXT_FIELD_CHARS]

@@ -29,6 +29,8 @@ MAX_CROSSOVER_CHARACTERS = 1024**3
 # on demand rather than unlocking a lower floor.
 DEFAULT_VERSION_RETENTION_HOURS = 24
 MAX_VERSION_RETENTION_HOURS = 24 * 30
+# Upper bound on parallel tree-sitter parser processes for large batches; 0 means auto.
+MAX_PARSE_WORKERS = 16
 
 
 class IndexMode(StrEnum):
@@ -136,6 +138,31 @@ def _memory_bytes(environment: Mapping[str, str], default_megabytes: int) -> int
     return _integer(environment, name, default_megabytes, 1024, 1024 * 1024) * 1024 * 1024
 
 
+def _parse_workers(environment: Mapping[str, str]) -> int:
+    """Resolve the configured tree-sitter worker count (0 means automatic)."""
+    raw = environment.get("CODE_INDEXING_PARSE_WORKERS")
+    if raw is None:
+        return 0
+    normalized = raw.strip().lower()
+    if normalized == "auto":
+        return 0
+    try:
+        value = int(normalized)
+    except ValueError as exc:
+        raise _configuration_error(
+            "CODE_INDEXING_PARSE_WORKERS",
+            raw,
+            f"auto or an integer from 0 to {MAX_PARSE_WORKERS}",
+        ) from exc
+    if not 0 <= value <= MAX_PARSE_WORKERS:
+        raise _configuration_error(
+            "CODE_INDEXING_PARSE_WORKERS",
+            raw,
+            f"auto or an integer from 0 to {MAX_PARSE_WORKERS}",
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class IndexSettings:
     mode: IndexMode
@@ -193,6 +220,7 @@ class IndexSettings:
     graph_search: bool = True
     # Maximum number of compiled PartitionGraph snapshots kept warm in memory.
     graph_cache_limit: int = 8
+    parse_workers: int = 0
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> IndexSettings:
@@ -302,4 +330,5 @@ class IndexSettings:
             offline=legacy_offline_value(environment.get("CODE_INDEXING_OFFLINE")),
             graph_search=_boolean(environment, "CODE_INDEXING_GRAPH_SEARCH", True),
             graph_cache_limit=_integer(environment, "CODE_INDEXING_GRAPH_CACHE_LIMIT", 8, 1, 64),
+            parse_workers=_parse_workers(environment),
         )

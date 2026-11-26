@@ -1008,3 +1008,80 @@ def test_iter_scan_keeps_files_of_a_directory_recreated_mid_scan(
                 (root / "gen" / name).write_bytes(b"x = 2\n")
 
     assert seen == [("gen/a.py", b"x = 1\n"), ("gen/b.py", b"x = 2\n"), ("gen/c.py", b"x = 2\n")]
+
+
+def test_walk_mode_skips_nested_git_entries(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("def main():\n    return 1\n")
+
+    sub_with_git_file = root / "sub_file"
+    sub_with_git_file.mkdir()
+    (sub_with_git_file / ".git").write_text("gitdir: ../.git/modules/sub_file\n")
+    (sub_with_git_file / "nested.py").write_text("x = 1\n")
+    (sub_with_git_file / "notes.md").write_text("ignored subdir\n")
+
+    sub_with_git_dir = root / "sub_dir"
+    (sub_with_git_dir / ".git").mkdir(parents=True)
+    (sub_with_git_dir / "nested.py").write_text("x = 2\n")
+    (sub_with_git_dir / "deep").mkdir()
+    (sub_with_git_dir / "deep" / "deep.py").write_text("x = 3\n")
+    (sub_with_git_dir / "notes.md").write_text("ignored subdir\n")
+
+    project = initialize_project(root)
+    assert not hasattr(SourceScanner, "_is_repository_worktree")
+
+    result = SourceScanner().scan(project)
+
+    assert [item.path.as_posix() for item in result.files] == ["main.py"]
+    assert not any(
+        "sub_file" in skip.path.as_posix() or "sub_dir" in skip.path.as_posix()
+        for skip in result.skipped
+    )
+
+
+def test_iter_scan_reuses_known_files_and_config_excludes(tmp_path: Path) -> None:
+    from code_indexing_mcp.models import StoredFile
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "keep.py").write_bytes(b"keep = 1\n")
+    (root / "changed.py").write_bytes(b"changed = 2\n")
+    (root / "excluded.py").write_bytes(b"excluded = 3\n")
+    project = initialize_project(root)
+    project = project.model_copy(
+        update={"scan": project.scan.model_copy(update={"exclude": ["excluded.py"]})}
+    )
+    keep_stat = (root / "keep.py").stat()
+    known_files = {
+        "keep.py": StoredFile(
+            file_id="f1",
+            project_id=project.id,
+            path="keep.py",
+            language="python",
+            size=keep_stat.st_size,
+            mtime_ns=keep_stat.st_mtime_ns,
+            content_hash="h1",
+            indexed_at=0,
+        ),
+        "changed.py": StoredFile(
+            file_id="f2",
+            project_id=project.id,
+            path="changed.py",
+            language="python",
+            size=0,
+            mtime_ns=0,
+            content_hash="h2",
+            indexed_at=0,
+        ),
+    }
+
+    items = list(SourceScanner().iter_scan(project, known_files=known_files, read_contents=True))
+    files = {item.path.as_posix(): item for item in items if isinstance(item, ScannedFile)}
+    skips = {
+        (item.path.as_posix(), item.reason) for item in items if not isinstance(item, ScannedFile)
+    }
+
+    assert files["keep.py"].content is None
+    assert files["changed.py"].content == b"changed = 2\n"
+    assert ("excluded.py", "ignored") in skips

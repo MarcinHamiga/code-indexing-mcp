@@ -1,13 +1,17 @@
 import itertools
+import logging
+import multiprocessing
 import os
 import sqlite3
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+import psutil
 import pyarrow as pa
 import pytest
 from conftest import run_git
@@ -2863,3 +2867,559 @@ def test_noop_index_on_dirty_git_repo_preserves_files_table_version_and_cuts_git
     # in active_partition and once in _capture_git_guard, plus git ls-files; guard
     # verification, scan root checks, and set_slot_state add zero extra spawns.
     assert len(git_calls) <= 8, git_calls
+
+
+def _live_parse_worker_children() -> list[psutil.Process]:
+    """Return live child processes excluding Python's singleton resource_tracker."""
+    live: list[psutil.Process] = []
+    for child in psutil.Process().children(recursive=True):
+        try:
+            cmdline = " ".join(child.cmdline())
+        except psutil.Error:
+            continue
+        if "multiprocessing.resource_tracker" in cmdline:
+            continue
+        live.append(child)
+    return live
+
+
+def _populate_multilang_repo(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for idx in range(10):
+        (root / f"py_mod_{idx}.py").write_text(
+            f"def py_func_{idx}(x: int) -> int:\n"
+            f"    return py_leaf_{idx}(x + {idx})\n\n"
+            f"def py_leaf_{idx}(y: int) -> int:\n    return y * 2\n"
+        )
+    for idx in range(8):
+        (root / f"ts_mod_{idx}.ts").write_text(
+            f"export function tsFunc{idx}(n: number): number {{\n  return n + {idx};\n}}\n"
+        )
+    for idx in range(7):
+        (root / f"go_mod_{idx}.go").write_text(
+            f"package pkg{idx}\n\nfunc GoFunc{idx}(v int) int {{\n    return v + {idx}\n}}\n"
+        )
+    for idx in range(7):
+        (root / f"rs_mod_{idx}.rs").write_text(
+            f"pub fn rs_func_{idx}(v: i32) -> i32 {{\n    v + {idx}\n}}\n"
+        )
+    (root / "empty.py").write_text("# empty\n")
+    (root / "binary.py").write_bytes(b"def bin_fn():\x00\n")
+
+
+def _populate_plain_repo(root: Path, count: int) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for idx in range(count):
+        (root / f"mod_{idx:03d}.py").write_text(
+            f"def fn_{idx}(value: int) -> int:\n    return value + {idx}\n"
+        )
+
+
+def _make_pool_indexer(tmp_path: Path, *, parse_workers: int) -> tuple[Indexer, LanceStore]:
+    embedder = RecordingEmbedder()
+    store = LanceStore(tmp_path / "data", vector_dimension=embedder.dimension)
+    return (
+        Indexer(
+            store=store,
+            scanner=SourceScanner(),
+            extractor=TreeSitterExtractor(),
+            embedder=embedder,
+            lock_directory=tmp_path / "locks",
+            parse_workers=parse_workers,
+        ),
+        store,
+    )
+
+
+def test_parse_pool_startup_failure_falls_back_to_in_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pool that cannot start must not turn an otherwise indexable run into a failure."""
+    root = tmp_path / "repo"
+    _populate_plain_repo(root, 30)
+    project = initialize_project(root)
+    indexer, store = _make_pool_indexer(tmp_path, parse_workers=2)
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        raise OSError("process creation is not permitted in this environment")
+
+    monkeypatch.setattr(indexing_module, "ParseWorkerPool", unavailable)
+
+    with caplog.at_level(logging.WARNING, logger=indexing_module.__name__):
+        report = indexer.index(project)
+
+    assert report.errors == []
+    assert report.indexed_files == 30
+    assert len(store.list_files(project.id)) == 30
+    assert "continuing this run in-process" in caplog.text
+
+
+def test_parse_pool_submit_failure_falls_back_and_reprocesses_in_flight_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pool dying after warmup must re-run every un-drained batch exactly once."""
+    root = tmp_path / "repo"
+    _populate_plain_repo(root, 40)
+    project = initialize_project(root)
+    indexer, store = _make_pool_indexer(tmp_path, parse_workers=2)
+
+    real_pool_cls = indexing_module.ParseWorkerPool
+
+    class FailingSubmitPool(real_pool_cls):  # type: ignore[misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            self.submit_calls = 0
+
+        def submit(self, *args: object, **kwargs: object) -> None:
+            self.submit_calls += 1
+            # Three warmup batches precede the first streaming batch.
+            if self.submit_calls == 4:
+                raise OSError("process table exhausted")
+            super().submit(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(indexing_module, "ParseWorkerPool", FailingSubmitPool)
+
+    with caplog.at_level(logging.WARNING, logger=indexing_module.__name__):
+        report = indexer.index(project)
+
+    deadline = time.monotonic() + 2.0
+    while _live_parse_worker_children() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert multiprocessing.active_children() == []
+
+    assert report.errors == []
+    assert report.indexed_files == 40
+    stored = store.list_files(project.id)
+    assert len(stored) == 40
+    chunks = store.list_chunks([project.id])
+    assert len(chunks) == len({chunk.chunk_id for chunk in chunks})
+    assert "continuing this run in-process" in caplog.text
+
+
+def test_parse_pool_drain_failure_falls_back_and_reprocesses_in_flight_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A worker death while draining must not abort a run that can finish in-process."""
+    root = tmp_path / "repo"
+    _populate_plain_repo(root, 40)
+    project = initialize_project(root)
+    indexer, store = _make_pool_indexer(tmp_path, parse_workers=2)
+
+    real_pool_cls = indexing_module.ParseWorkerPool
+
+    class FailingDrainPool(real_pool_cls):  # type: ignore[misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            self.submit_calls = 0
+            self.fail_next_drain = False
+
+        def submit(self, *args: object, **kwargs: object) -> None:
+            self.submit_calls += 1
+            super().submit(*args, **kwargs)  # type: ignore[arg-type]
+            if self.submit_calls == 4:
+                self.fail_next_drain = True
+
+        def try_drain_one(self) -> list[tuple[object, ...]] | None:
+            if self.fail_next_drain:
+                self.fail_next_drain = False
+                raise OSError("worker died while draining")
+            return super().try_drain_one()  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(indexing_module, "ParseWorkerPool", FailingDrainPool)
+
+    with caplog.at_level(logging.WARNING, logger=indexing_module.__name__):
+        report = indexer.index(project)
+
+    deadline = time.monotonic() + 2.0
+    while _live_parse_worker_children() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert multiprocessing.active_children() == []
+
+    assert report.errors == []
+    assert report.indexed_files == 40
+    stored = store.list_files(project.id)
+    assert len(stored) == 40
+    chunks = store.list_chunks([project.id])
+    assert len(chunks) == len({chunk.chunk_id for chunk in chunks})
+    assert "continuing this run in-process" in caplog.text
+
+
+def test_pipelined_scan_and_embed_overlap_produces_identical_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Producer scan/parse must overlap with consumer embedding across batches."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    for idx in range(10):
+        (repo_root / f"mod_{idx:02d}.py").write_text(
+            f"def fn_{idx}(v: int) -> int:\n    return v + {idx}\n"
+        )
+
+    project = initialize_project(repo_root)
+
+    baseline_indexer, baseline_store = make_indexer(tmp_path / "baseline", RecordingEmbedder())
+    baseline_indexer.index(project)
+
+    parse_intervals: list[tuple[float, float]] = []
+    embed_intervals: list[tuple[float, float]] = []
+
+    class SlowEmbedder(RecordingEmbedder):
+        def embed_passages(self, texts: list[str]) -> list[list[float]]:
+            start = time.monotonic()
+            time.sleep(0.16)
+            end = time.monotonic()
+            embed_intervals.append((start, end))
+            return super().embed_passages(texts)
+
+    pipelined_indexer, pipelined_store = make_indexer(
+        tmp_path / "pipelined", SlowEmbedder(), batch_size=2
+    )
+    real_extract = pipelined_indexer.extractor.extract
+
+    def slow_extract(path: Path, language: str, source: bytes) -> ExtractionResult:
+        start = time.monotonic()
+        time.sleep(0.08)
+        result = real_extract(path, language, source)
+        end = time.monotonic()
+        parse_intervals.append((start, end))
+        return result
+
+    monkeypatch.setattr(pipelined_indexer.extractor, "extract", slow_extract)
+    monkeypatch.setattr(indexing_module, "CANDIDATE_GROUP_COUNT", 2)
+
+    report = pipelined_indexer.index(project)
+
+    assert report.errors == []
+    assert report.indexed_files == 10
+    assert len(parse_intervals) == 10
+    assert len(embed_intervals) == 5
+
+    all_intervals = parse_intervals + embed_intervals
+    work_wall = max(end for _, end in all_intervals) - min(start for start, _ in all_intervals)
+    serial_sleep_sum = sum(e - s for s, e in parse_intervals) + sum(
+        e - s for s, e in embed_intervals
+    )
+    assert work_wall < serial_sleep_sum * 0.85, (
+        f"expected pipelined overlap: work_wall={work_wall:.3f}s "
+        f"vs serial_sum={serial_sleep_sum:.3f}s"
+    )
+    assert any(
+        p_start < e_end and e_start < p_end
+        for p_start, p_end in parse_intervals
+        for e_start, e_end in embed_intervals
+    )
+
+    assert sorted(
+        (r.file_id, r.path, r.language, r.size, r.content_hash, r.has_errors, r.error)
+        for r in pipelined_store.list_files(project.id)
+    ) == sorted(
+        (r.file_id, r.path, r.language, r.size, r.content_hash, r.has_errors, r.error)
+        for r in baseline_store.list_files(project.id)
+    )
+    assert sorted(
+        (
+            c.chunk_id,
+            c.path,
+            c.kind,
+            c.symbol,
+            c.qualified_symbol,
+            c.start_byte,
+            c.end_byte,
+            c.start_line,
+            c.end_line,
+            c.content,
+            c.identifier_terms,
+        )
+        for c in pipelined_store.list_chunks([project.id])
+    ) == sorted(
+        (
+            c.chunk_id,
+            c.path,
+            c.kind,
+            c.symbol,
+            c.qualified_symbol,
+            c.start_byte,
+            c.end_byte,
+            c.start_line,
+            c.end_line,
+            c.content,
+            c.identifier_terms,
+        )
+        for c in baseline_store.list_chunks([project.id])
+    )
+    assert sorted(
+        pipelined_store.list_reference_records(project.id),
+        key=lambda row: row["reference_id"],
+    ) == sorted(
+        baseline_store.list_reference_records(project.id),
+        key=lambda row: row["reference_id"],
+    )
+
+
+def test_parse_worker_pool_end_to_end_parity_and_phase_invariants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Multi-process ParseWorkerPool run matches single-process indexing field-for-field."""
+    repo_root = tmp_path / "repo"
+    _populate_multilang_repo(repo_root)
+    project = initialize_project(repo_root)
+
+    single_store = LanceStore(tmp_path / "single_data", vector_dimension=4)
+    pool_store = LanceStore(tmp_path / "pool_data", vector_dimension=4)
+
+    pool_creations: list[int] = []
+    real_pool_cls = indexing_module.ParseWorkerPool
+
+    class SpyParseWorkerPool(real_pool_cls):  # type: ignore[misc]
+        def __init__(self, workers: int, **kwargs: object) -> None:
+            pool_creations.append(workers)
+            super().__init__(workers, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(indexing_module, "ParseWorkerPool", SpyParseWorkerPool)
+
+    single_indexer = Indexer(
+        store=single_store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=RecordingEmbedder(),
+        lock_directory=tmp_path / "single_locks",
+        parse_workers=1,
+    )
+    pool_indexer = Indexer(
+        store=pool_store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=RecordingEmbedder(),
+        lock_directory=tmp_path / "pool_locks",
+        parse_workers=2,
+    )
+
+    single_report = single_indexer.index(project)
+    assert pool_creations == []
+
+    pool_report = pool_indexer.index(project)
+    assert pool_creations == [2]
+
+    deadline = time.monotonic() + 2.0
+    while _live_parse_worker_children() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert multiprocessing.active_children() == []
+    assert _live_parse_worker_children() == []
+
+    for report in (single_report, pool_report):
+        assert report.errors == []
+        phases = (
+            report.scan_duration_ms,
+            report.parse_duration_ms,
+            report.embed_duration_ms,
+            report.commit_duration_ms,
+        )
+        assert all(phase is not None and phase >= 0 for phase in phases)
+        assert sum(phase or 0 for phase in phases) <= report.duration_ms
+        assert report.reference_extraction_duration_ms is not None
+        assert 0 <= report.reference_extraction_duration_ms <= (report.parse_duration_ms or 0)
+
+    assert pool_report.discovered_files == single_report.discovered_files
+    assert pool_report.indexed_files == single_report.indexed_files
+    assert pool_report.parsed_files == single_report.parsed_files
+    assert pool_report.embedded_chunks == single_report.embedded_chunks
+    assert pool_report.unchanged_files == single_report.unchanged_files
+    assert pool_report.skipped_files == single_report.skipped_files
+    assert pool_report.skip_reasons == single_report.skip_reasons
+    assert pool_report.staged_reference_rows == single_report.staged_reference_rows
+    assert pool_report.bytes_read == single_report.bytes_read
+    assert pool_report.chunks_extracted == single_report.chunks_extracted
+    assert pool_report.chunks_staged == single_report.chunks_staged
+
+    assert sorted(
+        (r.file_id, r.path, r.language, r.size, r.content_hash, r.has_errors, r.error)
+        for r in pool_store.list_files(project.id)
+    ) == sorted(
+        (r.file_id, r.path, r.language, r.size, r.content_hash, r.has_errors, r.error)
+        for r in single_store.list_files(project.id)
+    )
+    assert sorted(
+        (
+            c.chunk_id,
+            c.path,
+            c.kind,
+            c.symbol,
+            c.qualified_symbol,
+            c.start_byte,
+            c.end_byte,
+            c.start_line,
+            c.end_line,
+            c.content,
+            c.identifier_terms,
+            c.part_index,
+            c.is_test,
+        )
+        for c in pool_store.list_chunks([project.id])
+    ) == sorted(
+        (
+            c.chunk_id,
+            c.path,
+            c.kind,
+            c.symbol,
+            c.qualified_symbol,
+            c.start_byte,
+            c.end_byte,
+            c.start_line,
+            c.end_line,
+            c.content,
+            c.identifier_terms,
+            c.part_index,
+            c.is_test,
+        )
+        for c in single_store.list_chunks([project.id])
+    )
+    assert sorted(
+        pool_store.list_reference_records(project.id),
+        key=lambda row: row["reference_id"],
+    ) == sorted(
+        single_store.list_reference_records(project.id),
+        key=lambda row: row["reference_id"],
+    )
+
+
+@pytest.mark.parametrize("mode", ["repository_changed", "stage_error"])
+def test_mid_run_cancellation_cleans_up_producer_and_parse_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Cancellation mid-run leaves zero committed rows, zero staging dirs, and zero workers."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    run_git("init", "-q", "--initial-branch", "main", str(root))
+    for idx in range(32):
+        (root / f"mod_{idx:02d}.py").write_text(f"def fn_{idx}():\n    return {idx}\n")
+    _git_commit(root, "initial")
+    run_git("checkout", "-qb", "feature", cwd=root)
+    run_git("checkout", "-q", "main", cwd=root)
+
+    project = initialize_project(root)
+    store = LanceStore(tmp_path / "data", vector_dimension=4)
+    embedder = RecordingEmbedder()
+    indexer = Indexer(
+        store=store,
+        scanner=SourceScanner(),
+        extractor=TreeSitterExtractor(),
+        embedder=embedder,
+        lock_directory=tmp_path / "locks",
+        staging_directory=tmp_path / "staging",
+        parse_workers=2,
+    )
+    store.upsert_project(project, model_id=embedder.model_id, state="pending")
+    partition = store.active_partition(project.id)
+
+    threads_before = {t.ident for t in threading.enumerate()}
+    pool_starts: list[int] = []
+    real_pool_cls = indexing_module.ParseWorkerPool
+
+    class SpyParseWorkerPool(real_pool_cls):  # type: ignore[misc]
+        def __init__(self, workers: int, **kwargs: object) -> None:
+            pool_starts.append(workers)
+            super().__init__(workers, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(indexing_module, "ParseWorkerPool", SpyParseWorkerPool)
+    monkeypatch.setattr(indexing_module, "CANDIDATE_GROUP_COUNT", 8)
+
+    if mode == "repository_changed":
+        calls = 0
+        real_flush = indexer._flush_pending
+
+        def switch_before_second_flush(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                run_git("checkout", "-q", "feature", cwd=root)
+            real_flush(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(indexer, "_flush_pending", switch_before_second_flush)
+        with pytest.raises(CodeIndexingError) as caught:
+            indexer.index(project, partition=partition)
+        assert caught.value.code is ErrorCode.REPOSITORY_CHANGED
+    else:
+        stage_calls = itertools.count()
+        real_stage_file = staging_module.StagingJob.stage_file
+
+        def failing_stage_file(job: staging_module.StagingJob, record: StoredFile) -> None:
+            if next(stage_calls) == 10:
+                raise RuntimeError("mid-run stage failure")
+            real_stage_file(job, record)
+
+        monkeypatch.setattr(staging_module.StagingJob, "stage_file", failing_stage_file)
+        with pytest.raises(RuntimeError, match="mid-run stage failure"):
+            indexer.index(project, partition=partition)
+
+    assert pool_starts == [2]
+    assert store.list_files(project.id, partition_id=partition.partition_id) == []
+    assert store.list_chunks([project.id], partition_ids={project.id: partition.partition_id}) == []
+    assert store.list_reference_records(project.id, partition_id=partition.partition_id) == []
+    assert list((tmp_path / "staging").rglob("journal.json")) == []
+    assert list((tmp_path / "staging").rglob("*.arrow*")) == []
+
+    deadline = time.monotonic() + 2.0
+    while _live_parse_worker_children() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert multiprocessing.active_children() == []
+    assert _live_parse_worker_children() == []
+    new_alive_threads = [
+        t for t in threading.enumerate() if t.ident not in threads_before and t.is_alive()
+    ]
+    assert not any(t.name == "index-scan-producer" for t in new_alive_threads)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0,
+    reason="POSIX chmod 0o000 permission denial",
+)
+def test_force_reindex_preserves_chunks_on_unreadable_file_with_parse_pool(
+    tmp_path: Path,
+) -> None:
+    """force=True read failure must match in-process behavior (retain chunks, record error)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for idx in range(5):
+        (repo / f"mod_{idx:02d}.py").write_text(
+            f"def fn_{idx}(x: int) -> int:\n    return x + {idx}\n",
+            encoding="utf-8",
+        )
+    project = initialize_project(repo)
+
+    outcomes: dict[int, tuple[int, bool, int, int]] = {}
+    for workers in (1, 2):
+        store = LanceStore(tmp_path / f"data_{workers}", vector_dimension=4)
+        indexer = Indexer(
+            store=store,
+            scanner=SourceScanner(),
+            extractor=TreeSitterExtractor(),
+            embedder=RecordingEmbedder(),
+            lock_directory=tmp_path / f"locks_{workers}",
+            parse_workers=workers,
+        )
+        initial = indexer.index(project)
+        assert initial.indexed_files == 5
+
+        victim = repo / "mod_00.py"
+        os.chmod(victim, 0o000)
+        try:
+            forced = indexer.index(project, force=True)
+            retained_chunks = [c for c in store.list_chunks([project.id]) if c.path == "mod_00.py"]
+            stored_paths = {f.path for f in store.list_files(project.id)}
+            outcomes[workers] = (
+                len(retained_chunks),
+                "mod_00.py" in stored_paths,
+                forced.failed_files,
+                forced.removed_files,
+            )
+        finally:
+            os.chmod(victim, 0o644)
+
+    assert outcomes[1] == (1, True, 1, 0)
+    assert outcomes[2] == outcomes[1]

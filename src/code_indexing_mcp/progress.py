@@ -14,12 +14,13 @@ is ignored once it stops being refreshed.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import tempfile
 import time
-from collections.abc import Callable
-from copy import deepcopy
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import overload
 
 # IndexProgress lives in models.py (ProjectStatus embeds it); it is re-exported
 # here because this module owns everything else about progress. Nothing in this
@@ -27,6 +28,8 @@ from pathlib import Path
 # comes back.
 from .models import IndexProgress as IndexProgress
 from .models import IndexTrigger as IndexTrigger
+
+logger = logging.getLogger(__name__)
 
 # How long a snapshot stays trustworthy without a refresh. Comfortably above the
 # publish interval, and above the pauses a single slow file can cause between
@@ -37,6 +40,14 @@ PUBLISH_INTERVAL_SECONDS = 0.25
 
 def progress_path(directory: Path, project_id: str) -> Path:
     return directory / f"{project_id}.json"
+
+
+def _clone_update_fields(fields: Mapping[str, object]) -> dict[str, object]:
+    """Shallow-copy mutable containers so snapshots stay isolated from callers."""
+    return {
+        key: value.copy() if isinstance(value, dict | list | set) else value
+        for key, value in fields.items()
+    }
 
 
 class ProgressPublisher:
@@ -62,7 +73,7 @@ class ProgressPublisher:
         self.interval_seconds = interval_seconds
         self._clock = clock
         self._last_published: float | None = None
-        self.state = IndexProgress(
+        self._state = IndexProgress(
             project_id=project_id,
             run_id=run_id,
             trigger=trigger,
@@ -73,12 +84,88 @@ class ProgressPublisher:
             expected_head=expected_head,
             activation_epoch=activation_epoch,
         )
+        self._pending: dict[str, object] = {}
+        self._pending_lazy: Callable[[], Mapping[str, object]] | None = None
+        self._current_phase: str = self._state.phase
+        self._current_phase_started_at: float = self._state.phase_started_at
+
+    def _merge_pending(self, fields: Mapping[str, object]) -> None:
+        """Clone *fields* into pending updates while tracking monotonic phase transitions."""
+        if not fields:
+            return
+        cloned = _clone_update_fields(fields)
+        phase = cloned.get("phase")
+        if phase is not None and phase != self._current_phase:
+            # Anchor the new phase strictly after the previous one: clocks with
+            # coarse granularity (some Windows runners read milliseconds) can
+            # return the same tick twice, which would make the anchor not
+            # advance and phase durations collapse to zero.
+            phase_started_at = max(self._clock(), self._current_phase_started_at + 1e-6)
+            self._current_phase = phase if isinstance(phase, str) else str(phase)
+            self._current_phase_started_at = phase_started_at
+            cloned["phase_started_at"] = phase_started_at
+        self._pending.update(cloned)
+
+    def _flush_pending_lazy(self) -> None:
+        if self._pending_lazy is None:
+            return
+        lazy = self._pending_lazy
+        self._pending_lazy = None
+        try:
+            resolved = lazy()
+            if not isinstance(resolved, Mapping):
+                raise TypeError("lazy_fields must return a mapping")
+            self._merge_pending(resolved)
+        except Exception:
+            # Progress is advisory. A caller's lazy closure must never be able
+            # to fail an index, least of all while teardown is already handling
+            # a different failure.
+            logger.warning("Discarding lazy progress fields after an error", exc_info=True)
+
+    @property
+    def state(self) -> IndexProgress:
+        self._flush_pending_lazy()
+        if self._pending:
+            self._state = self._state.model_copy(update=self._pending)
+            self._pending.clear()
+        return self._state
+
+    @state.setter
+    def state(self, value: IndexProgress) -> None:
+        self._state = value
+        self._pending.clear()
+        self._pending_lazy = None
+        self._current_phase = value.phase
+        self._current_phase_started_at = value.phase_started_at
 
     @property
     def enabled(self) -> bool:
         return self.directory is not None or self.listener is not None
 
-    def update(self, *, force: bool = False, **fields: object) -> None:
+    @overload
+    def update(
+        self,
+        *,
+        force: bool = False,
+        lazy_fields: Callable[[], Mapping[str, object]] | None,
+        **fields: object,
+    ) -> None: ...
+
+    @overload
+    def update(
+        self,
+        *,
+        force: bool = False,
+        **fields: object,
+    ) -> None: ...
+
+    def update(
+        self,
+        *,
+        force: bool = False,
+        lazy_fields: object = None,
+        **fields: object,
+    ) -> None:
         """Merge *fields* into the snapshot, publishing at most once per interval.
 
         Publishing is never allowed to break an index: a full disk or a racing
@@ -87,19 +174,16 @@ class ProgressPublisher:
 
         if not self.enabled:
             return
-        phase = fields.get("phase")
-        if phase is not None and phase != self.state.phase:
-            # Anchor the new phase strictly after the previous one: clocks with
-            # coarse granularity (some Windows runners read milliseconds) can
-            # return the same tick twice, which would make the anchor not
-            # advance and phase durations collapse to zero.
-            fields["phase_started_at"] = max(self._clock(), self.state.phase_started_at + 1e-6)
-        # Deep-copy the merged fields: model_copy never copies the update
+        if lazy_fields is not None and not callable(lazy_fields):
+            raise TypeError("lazy_fields must be callable")
+        # Shallow-copy the merged fields: model_copy never copies the update
         # mapping's values, and a published snapshot must not share a nested
         # value (e.g. the skipped_by_reason dict) with a caller that keeps
         # mutating it. Every retained snapshot stays a true point-in-time
         # picture.
-        self.state = self.state.model_copy(update=deepcopy(fields))
+        self._merge_pending(fields)
+        if lazy_fields is not None:
+            self._pending_lazy = lazy_fields
         now = self._clock()
         if (
             not force
@@ -107,21 +191,29 @@ class ProgressPublisher:
             and now - self._last_published < self.interval_seconds
         ):
             return
+        self._flush_pending_lazy()
+        self._pending["updated_at"] = time.time()
+        self._state = self._state.model_copy(update=self._pending)
+        self._pending.clear()
         self._last_published = now
-        self.state.updated_at = time.time()
         if self.listener is not None:
-            self.listener(self.state)
+            self.listener(self._state)
         if self.directory is not None:
             with contextlib.suppress(OSError):
-                self._write(self.state)
+                self._write(self._state)
 
     def clear(self) -> None:
         """Remove the snapshot once the run is over."""
 
+        # Drop buffered updates and their closure: teardown must not evaluate
+        # caller code, and it must not keep an embedder alive through a lazy
+        # capture. The project id is fixed at construction and needs no flush.
+        self._pending.clear()
+        self._pending_lazy = None
         if self.directory is None:
             return
         with contextlib.suppress(OSError):
-            progress_path(self.directory, self.state.project_id).unlink(missing_ok=True)
+            progress_path(self.directory, self._state.project_id).unlink(missing_ok=True)
 
     def _write(self, state: IndexProgress) -> None:
         assert self.directory is not None

@@ -1,7 +1,9 @@
 """Immutable domain models."""
 
 import hashlib
+import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -275,6 +277,10 @@ class ScannedFile(FrozenModel):
     # Streaming scans attach changed-file bytes so the indexer consumes them
     # without a second read. Collected scans deliberately leave this as None.
     content: bytes | None = None
+    # POSIX (st_dev, st_ino) captured during scan so deferred direct reads can
+    # detect a renamed-and-replaced directory without issuing another lstat.
+    dev: int | None = Field(default=None, exclude=True)
+    ino: int | None = Field(default=None, exclude=True)
 
 
 class SkippedFile(FrozenModel):
@@ -348,13 +354,44 @@ class ExtractedChunk(FrozenModel):
     source_content_hash: str | None = Field(default=None, exclude=True)
 
 
-class CallShape(FrozenModel):
+@dataclass(slots=True, frozen=True)
+class CallShape:
     positional_count: int = 0
-    keywords: list[str] = Field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
     has_positional_spread: bool = False
     has_keyword_spread: bool = False
     type_argument_count: int | None = None
     constructor: bool = False
+
+    def model_dump_json(self) -> str:
+        """Emit compact JSON matching Pydantic v2's field order and separators."""
+        if (
+            not self.keywords
+            and not self.has_positional_spread
+            and not self.has_keyword_spread
+            and self.type_argument_count is None
+            and not self.constructor
+        ):
+            return (
+                f'{{"positional_count":{self.positional_count},'
+                '"keywords":[],'
+                '"has_positional_spread":false,'
+                '"has_keyword_spread":false,'
+                '"type_argument_count":null,'
+                '"constructor":false}'
+            )
+        return json.dumps(
+            {
+                "positional_count": self.positional_count,
+                "keywords": self.keywords,
+                "has_positional_spread": self.has_positional_spread,
+                "has_keyword_spread": self.has_keyword_spread,
+                "type_argument_count": self.type_argument_count,
+                "constructor": self.constructor,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
 
 
 class ParameterShape(FrozenModel):
@@ -388,7 +425,8 @@ class ParameterShape(FrozenModel):
     )
 
 
-class ExtractedReference(FrozenModel):
+@dataclass(slots=True, frozen=True, kw_only=True)
+class ExtractedReference:
     kind: ReferenceKind
     written_name: str
     target_name: str

@@ -606,6 +606,7 @@ class Application:
             scanner=SourceScanner(),
             extractor=TreeSitterExtractor(),
             memory_ceiling_bytes=self.settings.index_memory_bytes,
+            parse_workers=self.settings.parse_workers,
             embedder=embedder,
             lock_directory=paths.data / "locks",
             batch_size=self.embedding_batch_size,

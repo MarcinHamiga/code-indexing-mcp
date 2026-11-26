@@ -1,9 +1,12 @@
-from itertools import pairwise
+import json
+from dataclasses import FrozenInstanceError, is_dataclass
+from itertools import pairwise, product
 from pathlib import Path
 
 import pytest
 
 from code_indexing_mcp.extractor import TreeSitterExtractor, normalize_identifier
+from code_indexing_mcp.models import CallShape, ExtractedReference, ExtractionResult
 
 
 def test_extracts_python_symbols_with_qualified_methods_and_module_code() -> None:
@@ -1680,3 +1683,80 @@ export function run() {}
     assert [c for c in ts_result.chunks if c.kind == "module"] == []
     run_fn = next(c for c in ts_result.chunks if c.qualified_symbol == "run")
     assert run_fn.content == "/*! Banner doc */\nexport function run() {}"
+
+
+def test_call_shape_model_dump_json_matches_standard_json_across_combinations() -> None:
+    assert is_dataclass(CallShape)
+    default_shape = CallShape()
+    assert not hasattr(default_shape, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        default_shape.positional_count = 1  # type: ignore[misc]
+
+    for (
+        positional_count,
+        keywords,
+        has_positional_spread,
+        has_keyword_spread,
+        type_argument_count,
+        constructor,
+    ) in product(
+        (0, 2),
+        ([], ["alpha", "beta"], ["café"]),
+        (False, True),
+        (False, True),
+        (None, 0, 2),
+        (False, True),
+    ):
+        shape = CallShape(
+            positional_count=positional_count,
+            keywords=list(keywords),
+            has_positional_spread=has_positional_spread,
+            has_keyword_spread=has_keyword_spread,
+            type_argument_count=type_argument_count,
+            constructor=constructor,
+        )
+        expected = json.dumps(
+            {
+                "positional_count": positional_count,
+                "keywords": list(keywords),
+                "has_positional_spread": has_positional_spread,
+                "has_keyword_spread": has_keyword_spread,
+                "type_argument_count": type_argument_count,
+                "constructor": constructor,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        assert shape.model_dump_json() == expected
+
+
+def test_extracted_reference_is_frozen_slotted_dataclass_inside_extraction_result() -> None:
+    assert is_dataclass(ExtractedReference)
+    with pytest.raises(TypeError):
+        ExtractedReference("read", "x", "x")  # type: ignore[misc]
+
+    shape = CallShape(positional_count=1, keywords=["flag"], constructor=True)
+    ref = ExtractedReference(
+        kind="call",
+        written_name="Widget",
+        target_name="Widget",
+        start_byte=10,
+        end_byte=16,
+        start_line=2,
+        end_line=2,
+        call_shape=shape,
+    )
+    assert not hasattr(ref, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        ref.target_name = "Other"  # type: ignore[misc]
+    assert ref.source_qualified_symbol is None
+    assert ref.module_path is None
+    assert ref.imported_name is None
+    assert ref.alias is None
+    assert ref.receiver_text is None
+
+    result = ExtractionResult(chunks=[], references=[ref])
+    assert result.references == [ref]
+    dumped = result.model_dump(mode="json")
+    round_tripped = ExtractionResult.model_validate(dumped)
+    assert round_tripped == result

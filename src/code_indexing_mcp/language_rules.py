@@ -1130,7 +1130,7 @@ _ImportCandidatesFn = Callable[
 ]
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True, frozen=True)
 class _LanguageRules:
     """Consolidated per-language extraction and resolution rules."""
 

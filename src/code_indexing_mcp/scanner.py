@@ -559,33 +559,38 @@ class SourceScanner:
         stack: list[tuple[Path, Path | None, list[_IgnoreEntry]]] = [(root, None, [])]
         while stack:
             base, rel_base, ignore_specs = stack.pop()
-            try:
-                with os.scandir(base) as it:
-                    entries = list(it)
-            except OSError:
-                continue
             dir_names: list[str] = []
             file_names: list[str] = []
             has_gitignore = False
-            for entry in entries:
-                name = entry.name
-                try:
-                    is_symlink = entry.is_symlink()
-                    is_dir = entry.is_dir() if is_symlink else entry.is_dir(follow_symlinks=False)
-                except OSError:
-                    is_symlink = False
-                    is_dir = False
-                if is_dir:
-                    if (
-                        not is_symlink
-                        and name not in HARD_EXCLUDED_DIRECTORIES
-                        and not SourceScanner._is_repository_worktree(base / name)
-                    ):
-                        dir_names.append(name)
-                else:
-                    if name == ".gitignore":
-                        has_gitignore = True
-                    file_names.append(name)
+            is_nested_repo = False
+            try:
+                with os.scandir(base) as it:
+                    for entry in it:
+                        name = entry.name
+                        if rel_base is not None and name == ".git":
+                            is_nested_repo = True
+                            break
+                        try:
+                            is_symlink = entry.is_symlink()
+                            is_dir = (
+                                entry.is_dir()
+                                if is_symlink
+                                else entry.is_dir(follow_symlinks=False)
+                            )
+                        except OSError:
+                            is_symlink = False
+                            is_dir = False
+                        if is_dir:
+                            if not is_symlink and name not in HARD_EXCLUDED_DIRECTORIES:
+                                dir_names.append(name)
+                        else:
+                            if name == ".gitignore":
+                                has_gitignore = True
+                            file_names.append(name)
+            except OSError:
+                continue
+            if is_nested_repo:
+                continue
 
             if has_gitignore:
                 loaded = self._load_ignore_spec_at(base / ".gitignore", rel_base or Path("."))
@@ -633,19 +638,6 @@ class SourceScanner:
                 yield item
             else:
                 yield [(absolute, specs) for absolute, _, specs in item]
-
-    @staticmethod
-    def _is_repository_worktree(path: Path) -> bool:
-        """Return whether *path* is its own repository checkout.
-
-        Git treats a directory carrying a ``.git`` entry (a submodule or a
-        nested repository) as a single opaque non-file, so the walk must not
-        descend into it: the parent repository has no claim on those files.
-        """
-        try:
-            return (path / ".git").exists()
-        except OSError:
-            return False
 
     @staticmethod
     def _in_git_worktree(root: Path) -> bool:
@@ -864,6 +856,7 @@ class SourceScanner:
             vetted_directories = set()
         if run_check_ignore and entries:
             ignored_paths = self._git_ignored_paths(root, [absolute for absolute, _, _ in entries])
+        known_files_get = known_files.get if (read_contents and known_files) else None
         for absolute, relative, ignore_specs in entries:
             if not already_included and SourceScanner._in_hard_excluded_directory(relative):
                 continue
@@ -903,17 +896,29 @@ class SourceScanner:
             # or a tracked-but-ignored file would be dropped as "ignored"
             # instead of staying eligible (the index wins).
             effective_specs = [] if run_check_ignore else ignore_specs
+            rel_posix: str | None = None
+            is_ignored = bool(ignored_paths) and relative in ignored_paths
+            if not is_ignored and config_excludes is not None:
+                rel_posix = relative.as_posix()
+                is_ignored = config_excludes.match_file(rel_posix)
             if (
-                (bool(ignored_paths) and relative in ignored_paths)
-                or (config_excludes is not None and config_excludes.match_file(relative.as_posix()))
-                or (bool(effective_specs) and SourceScanner._is_ignored(relative, effective_specs))
+                not is_ignored
+                and effective_specs
+                and SourceScanner._is_ignored(relative, effective_specs)
             ):
+                is_ignored = True
+            if is_ignored:
                 yield SkippedFile(path=relative, reason="ignored")
                 continue
             if stat.st_size > max_file_bytes:
                 yield SkippedFile(path=relative, reason="oversized")
                 continue
-            previous = known_files.get(relative.as_posix()) if known_files else None
+            if known_files_get is not None:
+                if rel_posix is None:
+                    rel_posix = relative.as_posix()
+                previous = known_files_get(rel_posix)
+            else:
+                previous = None
             content: bytes | None = None
             if read_contents and (
                 previous is None
@@ -944,6 +949,8 @@ class SourceScanner:
                 size=stat.st_size,
                 mtime_ns=stat.st_mtime_ns,
                 content=content,
+                dev=stat.st_dev,
+                ino=stat.st_ino,
             )
 
     @staticmethod
